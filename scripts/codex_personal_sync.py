@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -609,6 +610,7 @@ def sync_reference_only_automation_prompts(
             raise SyncError(f"automation target parent is not a directory: {target_dir}")
 
         action = "create"
+        existing_mode: int | None = None
         if _path_exists_or_is_link(target):
             if target.is_symlink():
                 try:
@@ -628,6 +630,7 @@ def sync_reference_only_automation_prompts(
             if current_bytes not in _known_reference_bytes(home, reference):
                 print(f"skipped automation prompt with local edits: {target}")
                 continue
+            existing_mode = stat.S_IMODE(target.stat().st_mode)
             action = "update"
 
         if dry_run:
@@ -638,6 +641,8 @@ def sync_reference_only_automation_prompts(
         tmp_target = target.with_name(f".{target.name}.tmp-{os.getpid()}")
         try:
             tmp_target.write_bytes(source_bytes)
+            if existing_mode is not None:
+                tmp_target.chmod(existing_mode)
             os.replace(tmp_target, target)
         finally:
             if tmp_target.exists():

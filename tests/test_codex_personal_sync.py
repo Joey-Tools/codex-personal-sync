@@ -600,6 +600,35 @@ class CodexPersonalSyncTests(unittest.TestCase):
         )
         self.assertEqual((automation_dir / "memory.md").read_text(encoding="utf-8"), "keep\n")
 
+    def test_install_release_tree_preserves_automation_prompt_mode_on_update(self) -> None:
+        release_one = self.root / "release-one"
+        release_two = self.root / "release-two"
+        home = self.root / "home" / ".codex"
+        write_automation_reference_release(
+            release_one,
+            prompt_text='prompt = "old"\n',
+            agent_text="one\n",
+        )
+        write_automation_reference_release(
+            release_two,
+            prompt_text='prompt = "new"\n',
+            agent_text="two\n",
+        )
+        automation_dir = home / "automations" / "daily-example"
+        automation_dir.mkdir(parents=True)
+        prompt = automation_dir / "automation.toml"
+        prompt.write_text('prompt = "old"\n', encoding="utf-8")
+        self.run_quietly(MODULE.install_release_tree, release_one, home, SHA1, dry_run=False)
+        prompt.chmod(0o640)
+
+        self.run_quietly(MODULE.install_release_tree, release_two, home, SHA2, dry_run=False)
+
+        self.assertEqual(
+            prompt.read_text(encoding="utf-8"),
+            'prompt = "new"\n',
+        )
+        self.assertEqual(prompt.stat().st_mode & 0o777, 0o640)
+
     def test_install_release_tree_preserves_local_automation_prompt_edits(self) -> None:
         release_one = self.root / "release-one"
         release_two = self.root / "release-two"
