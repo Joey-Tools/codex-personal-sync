@@ -627,6 +627,43 @@ class CodexPersonalSyncTests(unittest.TestCase):
             'prompt = "local"\n',
         )
 
+    def test_install_release_tree_ignores_unlisted_reference_bytes_for_local_edits(
+        self,
+    ) -> None:
+        release_one = self.root / "release-one"
+        release_two = self.root / "release-two"
+        home = self.root / "home" / ".codex"
+        write_automation_reference_release(
+            release_one,
+            prompt_text='prompt = "old"\n',
+            agent_text="one\n",
+        )
+        write_automation_reference_release(
+            release_two,
+            prompt_text='prompt = "new"\n',
+            agent_text="two\n",
+        )
+        automation_dir = home / "automations" / "daily-example"
+        automation_dir.mkdir(parents=True)
+        (automation_dir / "automation.toml").write_text('prompt = "old"\n', encoding="utf-8")
+        self.run_quietly(MODULE.install_release_tree, release_one, home, SHA1, dry_run=False)
+        (automation_dir / "automation.toml").write_text('prompt = "local"\n', encoding="utf-8")
+        unlisted_release = home / "personal-sync" / "releases" / SHA3
+        write_minimal_release(unlisted_release, agent_text="three\n")
+        unlisted_automation = unlisted_release / "personal_codex" / "automations" / "daily-example"
+        unlisted_automation.mkdir(parents=True)
+        (unlisted_automation / "automation.toml").write_text(
+            'prompt = "local"\n',
+            encoding="utf-8",
+        )
+
+        self.run_quietly(MODULE.install_release_tree, release_two, home, SHA2, dry_run=False)
+
+        self.assertEqual(
+            (automation_dir / "automation.toml").read_text(encoding="utf-8"),
+            'prompt = "local"\n',
+        )
+
     def test_install_release_tree_rejects_non_symlink_current_pointer(self) -> None:
         release_root = self.root / "release"
         home = self.root / "home" / ".codex"

@@ -573,6 +573,12 @@ def _known_reference_bytes(home: Path, reference: PurePosixPath) -> set[bytes]:
     known: set[bytes] = set()
     relative_path = Path(*reference.parts)
     for release_root in _installed_release_roots(home):
+        try:
+            validate_release_tree(release_root)
+            if reference not in load_reference_only_paths(release_root):
+                continue
+        except SyncError:
+            continue
         path = release_root / relative_path
         if not path.is_file():
             continue
