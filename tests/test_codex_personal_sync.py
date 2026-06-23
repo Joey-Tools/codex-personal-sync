@@ -664,6 +664,29 @@ class CodexPersonalSyncTests(unittest.TestCase):
             'prompt = "local"\n',
         )
 
+    def test_install_release_tree_skips_broken_automation_prompt_symlink(self) -> None:
+        release_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_automation_reference_release(
+            release_root,
+            prompt_text='prompt = "new"\n',
+        )
+        automation_dir = home / "automations" / "daily-example"
+        automation_dir.mkdir(parents=True)
+        prompt = automation_dir / "automation.toml"
+        prompt.symlink_to("missing.toml")
+
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+
+        self.assertTrue(prompt.is_symlink())
+        self.assertEqual(os.readlink(prompt), "missing.toml")
+
     def test_install_release_tree_rejects_non_symlink_current_pointer(self) -> None:
         release_root = self.root / "release"
         home = self.root / "home" / ".codex"

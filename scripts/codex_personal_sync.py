@@ -611,7 +611,12 @@ def sync_reference_only_automation_prompts(
         action = "create"
         if _path_exists_or_is_link(target):
             if target.is_symlink():
-                if target.read_bytes() == source_bytes:
+                try:
+                    target_bytes = target.read_bytes()
+                except OSError:
+                    print(f"skipped automation prompt symlink target: {target}")
+                    continue
+                if target_bytes == source_bytes:
                     continue
                 print(f"skipped automation prompt symlink target: {target}")
                 continue
