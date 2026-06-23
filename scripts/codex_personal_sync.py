@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -150,6 +151,23 @@ def load_manifest(release_root: Path) -> list[LinkEntry]:
             raise SyncError(f"reference_only path is missing: {reference}")
 
     return entries
+
+
+def load_reference_only_paths(release_root: Path) -> list[PurePosixPath]:
+    manifest_path = release_root / MANIFEST_RELATIVE_PATH
+    data = _load_json(manifest_path)
+    if data.get("version") != 1:
+        raise SyncError("sync manifest version must be 1")
+    raw_references = data.get("reference_only", [])
+    if not isinstance(raw_references, list):
+        raise SyncError("reference_only must be an array when present")
+    references: list[PurePosixPath] = []
+    for raw_reference in raw_references:
+        reference = _validate_relative_path(raw_reference, "reference_only")
+        if not (release_root / Path(*reference.parts)).exists():
+            raise SyncError(f"reference_only path is missing: {reference}")
+        references.append(reference)
+    return references
 
 
 def select_release_assets(release: dict[str, Any]) -> ReleaseAssets:
@@ -517,6 +535,121 @@ def _copy_release_tree(source_root: Path, release_dir: Path) -> None:
         raise
 
 
+def _automation_prompt_id(reference: PurePosixPath) -> str | None:
+    parts = reference.parts
+    if (
+        len(parts) == 4
+        and parts[0] == "personal_codex"
+        and parts[1] == "automations"
+        and parts[3] == "automation.toml"
+    ):
+        return parts[2]
+    return None
+
+
+def _installed_release_roots(home: Path) -> list[Path]:
+    roots: list[Path] = []
+    releases_root = _releases_root(home)
+    if releases_root.is_dir():
+        roots.extend(
+            path
+            for path in releases_root.iterdir()
+            if path.is_dir() and RELEASE_DIR_RE.fullmatch(path.name)
+        )
+    overlays_root = _personal_sync_root(home) / "overlays"
+    if overlays_root.is_dir():
+        for overlay_root in overlays_root.iterdir():
+            overlay_releases = overlay_root / "releases"
+            if not overlay_releases.is_dir():
+                continue
+            roots.extend(
+                path
+                for path in overlay_releases.iterdir()
+                if path.is_dir() and RELEASE_DIR_RE.fullmatch(path.name)
+            )
+    return roots
+
+
+def _known_reference_bytes(home: Path, reference: PurePosixPath) -> set[bytes]:
+    known: set[bytes] = set()
+    relative_path = Path(*reference.parts)
+    for release_root in _installed_release_roots(home):
+        try:
+            validate_release_tree(release_root)
+            if reference not in load_reference_only_paths(release_root):
+                continue
+        except SyncError:
+            continue
+        path = release_root / relative_path
+        if not path.is_file():
+            continue
+        try:
+            known.add(path.read_bytes())
+        except OSError:
+            continue
+    return known
+
+
+def sync_reference_only_automation_prompts(
+    release_root: Path,
+    home: Path,
+    *,
+    dry_run: bool,
+) -> None:
+    for reference in load_reference_only_paths(release_root):
+        automation_id = _automation_prompt_id(reference)
+        if automation_id is None:
+            continue
+        source = release_root / Path(*reference.parts)
+        source_bytes = source.read_bytes()
+        target_dir = home / "automations" / automation_id
+        target = target_dir / "automation.toml"
+        if not target_dir.exists():
+            continue
+        if not target_dir.is_dir():
+            raise SyncError(f"automation target parent is not a directory: {target_dir}")
+
+        action = "create"
+        existing_mode: int | None = None
+        if _path_exists_or_is_link(target):
+            if target.is_symlink():
+                try:
+                    target_bytes = target.read_bytes()
+                except OSError:
+                    print(f"skipped automation prompt symlink target: {target}")
+                    continue
+                if target_bytes == source_bytes:
+                    continue
+                print(f"skipped automation prompt symlink target: {target}")
+                continue
+            if not target.is_file():
+                raise SyncError(f"automation prompt target is not a file: {target}")
+            current_bytes = target.read_bytes()
+            if current_bytes == source_bytes:
+                continue
+            if current_bytes not in _known_reference_bytes(home, reference):
+                print(f"skipped automation prompt with local edits: {target}")
+                continue
+            existing_mode = stat.S_IMODE(target.stat().st_mode)
+            action = "update"
+
+        if dry_run:
+            print(f"would {action} automation prompt {target}")
+            continue
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp_target = target.with_name(f".{target.name}.tmp-{os.getpid()}")
+        try:
+            tmp_target.write_bytes(source_bytes)
+            if existing_mode is not None:
+                tmp_target.chmod(existing_mode)
+            os.replace(tmp_target, target)
+        finally:
+            if tmp_target.exists():
+                tmp_target.unlink()
+        print(f"{action}d automation prompt {target}")
+
+
 def _switch_current(home: Path, sha: str, *, dry_run: bool) -> None:
     sync_root = _personal_sync_root(home)
     current = _current_link(home)
@@ -550,6 +683,7 @@ def install_release_tree(source_root: Path, home: Path, sha: str, *, dry_run: bo
         _switch_current(home, sha, dry_run=True)
         apply_link_actions(actions, dry_run=True)
         apply_link_actions(removals, dry_run=True)
+        sync_reference_only_automation_prompts(source_root, home, dry_run=True)
         if not actions and not removals:
             print("all managed symlinks already point at current")
         return
@@ -570,6 +704,7 @@ def install_release_tree(source_root: Path, home: Path, sha: str, *, dry_run: bo
         _switch_current(home, sha, dry_run=False)
         apply_link_actions(actions, dry_run=False)
         apply_link_actions(stale_removals, dry_run=False)
+        sync_reference_only_automation_prompts(source_root, home, dry_run=False)
         repair_removals = plan_stale_current_link_removals(home, entries)
         apply_link_actions(repair_removals, dry_run=False)
         if not actions and not stale_removals and not repair_removals:
@@ -786,6 +921,7 @@ def rollback(home: Path, to_sha: str | None) -> None:
             _switch_current(home, sha, dry_run=False)
         apply_link_actions(actions, dry_run=False)
         apply_link_actions(stale_removals, dry_run=False)
+        sync_reference_only_automation_prompts(release_root, home, dry_run=False)
         repair_removals = plan_stale_current_link_removals(home, entries)
         apply_link_actions(repair_removals, dry_run=False)
         if not actions and not stale_removals and not repair_removals:

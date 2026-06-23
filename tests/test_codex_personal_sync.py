@@ -111,6 +111,39 @@ def write_agent_only_release(release_root: Path, *, agent_text: str = "agent\n")
     )
 
 
+def write_automation_reference_release(
+    release_root: Path,
+    *,
+    prompt_text: str,
+    agent_text: str = "agent\n",
+) -> None:
+    personal_root = release_root / "personal_codex"
+    automation_root = personal_root / "automations" / "daily-example"
+    personal_root.mkdir(parents=True)
+    automation_root.mkdir(parents=True)
+    (personal_root / "AGENTS.md").write_text(agent_text, encoding="utf-8")
+    (automation_root / "automation.toml").write_text(prompt_text, encoding="utf-8")
+    (personal_root / "sync-manifest.json").write_text(
+        """
+{
+  "version": 1,
+  "links": [
+    {
+      "source": "personal_codex/AGENTS.md",
+      "target": "AGENTS.md",
+      "kind": "file"
+    }
+  ],
+  "reference_only": [
+    "personal_codex/automations/daily-example/automation.toml"
+  ]
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def write_rules_release(release_root: Path, *, agent_text: str = "agent\n") -> None:
     personal_root = release_root / "personal_codex"
     rules_root = personal_root / "rules"
@@ -538,6 +571,151 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertTrue((home / "skills" / ".system").is_dir())
         self.assertTrue((home / "skills" / "host-local").is_dir())
 
+    def test_install_release_tree_updates_reference_only_automation_prompt(self) -> None:
+        release_one = self.root / "release-one"
+        release_two = self.root / "release-two"
+        home = self.root / "home" / ".codex"
+        write_automation_reference_release(
+            release_one,
+            prompt_text='prompt = "old"\n',
+            agent_text="one\n",
+        )
+        write_automation_reference_release(
+            release_two,
+            prompt_text='prompt = "new"\n',
+            agent_text="two\n",
+        )
+        automation_dir = home / "automations" / "daily-example"
+        automation_dir.mkdir(parents=True)
+        (automation_dir / "automation.toml").write_text('prompt = "old"\n', encoding="utf-8")
+        (automation_dir / "memory.md").write_text("keep\n", encoding="utf-8")
+        self.run_quietly(MODULE.install_release_tree, release_one, home, SHA1, dry_run=False)
+
+        self.run_quietly(MODULE.install_release_tree, release_two, home, SHA2, dry_run=False)
+
+        self.assertFalse((automation_dir / "automation.toml").is_symlink())
+        self.assertEqual(
+            (automation_dir / "automation.toml").read_text(encoding="utf-8"),
+            'prompt = "new"\n',
+        )
+        self.assertEqual((automation_dir / "memory.md").read_text(encoding="utf-8"), "keep\n")
+
+    def test_install_release_tree_preserves_automation_prompt_mode_on_update(self) -> None:
+        release_one = self.root / "release-one"
+        release_two = self.root / "release-two"
+        home = self.root / "home" / ".codex"
+        write_automation_reference_release(
+            release_one,
+            prompt_text='prompt = "old"\n',
+            agent_text="one\n",
+        )
+        write_automation_reference_release(
+            release_two,
+            prompt_text='prompt = "new"\n',
+            agent_text="two\n",
+        )
+        automation_dir = home / "automations" / "daily-example"
+        automation_dir.mkdir(parents=True)
+        prompt = automation_dir / "automation.toml"
+        prompt.write_text('prompt = "old"\n', encoding="utf-8")
+        self.run_quietly(MODULE.install_release_tree, release_one, home, SHA1, dry_run=False)
+        prompt.chmod(0o640)
+
+        self.run_quietly(MODULE.install_release_tree, release_two, home, SHA2, dry_run=False)
+
+        self.assertEqual(
+            prompt.read_text(encoding="utf-8"),
+            'prompt = "new"\n',
+        )
+        self.assertEqual(prompt.stat().st_mode & 0o777, 0o640)
+
+    def test_install_release_tree_preserves_local_automation_prompt_edits(self) -> None:
+        release_one = self.root / "release-one"
+        release_two = self.root / "release-two"
+        home = self.root / "home" / ".codex"
+        write_automation_reference_release(
+            release_one,
+            prompt_text='prompt = "old"\n',
+            agent_text="one\n",
+        )
+        write_automation_reference_release(
+            release_two,
+            prompt_text='prompt = "new"\n',
+            agent_text="two\n",
+        )
+        automation_dir = home / "automations" / "daily-example"
+        automation_dir.mkdir(parents=True)
+        (automation_dir / "automation.toml").write_text('prompt = "old"\n', encoding="utf-8")
+        self.run_quietly(MODULE.install_release_tree, release_one, home, SHA1, dry_run=False)
+        (automation_dir / "automation.toml").write_text('prompt = "local"\n', encoding="utf-8")
+
+        self.run_quietly(MODULE.install_release_tree, release_two, home, SHA2, dry_run=False)
+
+        self.assertEqual(
+            (automation_dir / "automation.toml").read_text(encoding="utf-8"),
+            'prompt = "local"\n',
+        )
+
+    def test_install_release_tree_ignores_unlisted_reference_bytes_for_local_edits(
+        self,
+    ) -> None:
+        release_one = self.root / "release-one"
+        release_two = self.root / "release-two"
+        home = self.root / "home" / ".codex"
+        write_automation_reference_release(
+            release_one,
+            prompt_text='prompt = "old"\n',
+            agent_text="one\n",
+        )
+        write_automation_reference_release(
+            release_two,
+            prompt_text='prompt = "new"\n',
+            agent_text="two\n",
+        )
+        automation_dir = home / "automations" / "daily-example"
+        automation_dir.mkdir(parents=True)
+        (automation_dir / "automation.toml").write_text('prompt = "old"\n', encoding="utf-8")
+        self.run_quietly(MODULE.install_release_tree, release_one, home, SHA1, dry_run=False)
+        (automation_dir / "automation.toml").write_text('prompt = "local"\n', encoding="utf-8")
+        unlisted_release = home / "personal-sync" / "releases" / SHA3
+        write_minimal_release(unlisted_release, agent_text="three\n")
+        unlisted_automation = unlisted_release / "personal_codex" / "automations" / "daily-example"
+        unlisted_automation.mkdir(parents=True)
+        (unlisted_automation / "automation.toml").write_text(
+            'prompt = "local"\n',
+            encoding="utf-8",
+        )
+
+        self.run_quietly(MODULE.install_release_tree, release_two, home, SHA2, dry_run=False)
+
+        self.assertEqual(
+            (automation_dir / "automation.toml").read_text(encoding="utf-8"),
+            'prompt = "local"\n',
+        )
+
+    def test_install_release_tree_skips_broken_automation_prompt_symlink(self) -> None:
+        release_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_automation_reference_release(
+            release_root,
+            prompt_text='prompt = "new"\n',
+        )
+        automation_dir = home / "automations" / "daily-example"
+        automation_dir.mkdir(parents=True)
+        prompt = automation_dir / "automation.toml"
+        prompt.symlink_to("missing.toml")
+
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+
+        self.assertTrue(prompt.is_symlink())
+        self.assertEqual(os.readlink(prompt), "missing.toml")
+
     def test_install_release_tree_rejects_non_symlink_current_pointer(self) -> None:
         release_root = self.root / "release"
         home = self.root / "home" / ".codex"
@@ -650,6 +828,34 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
         self.assertEqual(current_target(home), f"releases/{SHA1}")
         self.assertEqual((home / "AGENTS.md").read_text(encoding="utf-8"), "one\n")
+
+    def test_rollback_restores_reference_only_automation_prompt(self) -> None:
+        release_one = self.root / "release-one"
+        release_two = self.root / "release-two"
+        home = self.root / "home" / ".codex"
+        write_automation_reference_release(
+            release_one,
+            prompt_text='prompt = "old"\n',
+            agent_text="one\n",
+        )
+        write_automation_reference_release(
+            release_two,
+            prompt_text='prompt = "new"\n',
+            agent_text="two\n",
+        )
+        automation_dir = home / "automations" / "daily-example"
+        automation_dir.mkdir(parents=True)
+        (automation_dir / "automation.toml").write_text('prompt = "old"\n', encoding="utf-8")
+        self.run_quietly(MODULE.install_release_tree, release_one, home, SHA1, dry_run=False)
+        self.run_quietly(MODULE.install_release_tree, release_two, home, SHA2, dry_run=False)
+
+        self.run_quietly(MODULE.rollback, home, SHA1[:8])
+
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+        self.assertEqual(
+            (automation_dir / "automation.toml").read_text(encoding="utf-8"),
+            'prompt = "old"\n',
+        )
 
     def test_rollback_removes_stale_links_after_manifest_shrink(self) -> None:
         release_one = self.root / "release-one"
