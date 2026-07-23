@@ -1,0 +1,60 @@
+{
+  "canonical_repository": "Joey-Tools/codex-personal-sync",
+  "hash_algorithm": "sha256",
+  "mirrors": {
+    "private": {
+      "files": {
+        "engine": "scripts/codex_personal_sync.py",
+        "manifest_schema": "schema/sync-manifest.schema.json",
+        "reconciliation_safety_tests": "tests/test_personal_sync_reconciliation_safety.py",
+        "release_retention_tests": "tests/test_release_retention.py",
+        "scheduler_doctor_tests": "tests/test_scheduler_doctor.py"
+      },
+      "repository": "Joey-Tools/codex-private-workflows"
+    },
+    "toolbox": {
+      "files": {
+        "engine": "scripts/codex_personal_sync.py",
+        "engine_tests": "tests/test_codex_personal_sync.py",
+        "manifest_schema": "schema/sync-manifest.schema.json",
+        "reconciliation_safety_tests": "tests/test_personal_sync_reconciliation_safety.py",
+        "release_retention_tests": "tests/test_release_retention.py",
+        "scheduler_doctor_tests": "tests/test_scheduler_doctor.py"
+      },
+      "repository": "Joey-Tools/codex-toolbox"
+    }
+  },
+  "sources": {
+    "engine": {
+      "mode": "0755",
+      "path": "scripts/codex_personal_sync.py",
+      "sha256": "a044fb452b8186ab17586837675a7b7a8ef5de4ca7813e52abab4bf447898df5"
+    },
+    "engine_tests": {
+      "mode": "0644",
+      "path": "tests/test_codex_personal_sync.py",
+      "sha256": "6d06f5a728a6fc6e01e7750e1c0082b43fd9acb0a928211f6bafb4a74146ca9b"
+    },
+    "manifest_schema": {
+      "mode": "0644",
+      "path": "schema/sync-manifest.schema.json",
+      "sha256": "b4c14caa311fc279bb7220cfad2f8feb987eba094551caf8d9634b786ee48672"
+    },
+    "reconciliation_safety_tests": {
+      "mode": "0644",
+      "path": "tests/test_personal_sync_reconciliation_safety.py",
+      "sha256": "4d9190f293c23cf19aabfba4a047bdd90c723aa3cd05a0cc0a8e4224eec63f98"
+    },
+    "release_retention_tests": {
+      "mode": "0644",
+      "path": "tests/test_release_retention.py",
+      "sha256": "45da5ecc297dee101a8a12b8e3443d2df3250c94dd2cb22389944f06304920f8"
+    },
+    "scheduler_doctor_tests": {
+      "mode": "0644",
+      "path": "tests/test_scheduler_doctor.py",
+      "sha256": "d51a67ac5d0de0892f86d3cb82c6d46e32b199dbed59e2f81eca2b42bd406ba9"
+    }
+  },
+  "version": 1
+}

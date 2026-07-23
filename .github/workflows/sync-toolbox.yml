@@ -1,0 +1,421 @@
+name: Sync toolbox mirror
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-toolbox-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync-toolbox:
+    name: Generate scoped toolbox sync PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CANONICAL_ROOT: ${{ github.workspace }}/canonical
+      TARGET_ROOT: ${{ github.workspace }}/toolbox
+      TARGET_OWNER: Joey-Tools
+      TARGET_REPOSITORY: Joey-Tools/codex-toolbox
+      TARGET_BASE: master
+      SYNC_BRANCH: automation/canonical-personal-sync
+      MIRROR_NAME: toolbox
+      CANONICAL_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Validate sync credential
+        shell: bash
+        env:
+          CODEX_TOOLBOX_SYNC_TOKEN: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CODEX_TOOLBOX_SYNC_TOKEN}" ]]; then
+            echo "::error title=Missing CODEX_TOOLBOX_SYNC_TOKEN::Configure a fine-grained token scoped only to Joey-Tools/codex-toolbox with Contents read/write and Pull requests read/write."
+            exit 1
+          fi
+
+      - name: Check out exact canonical commit
+        uses: actions/checkout@v4
+        with:
+          path: canonical
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify canonical master and source lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != "refs/heads/master" ]]; then
+            echo "::error title=Unsupported canonical ref::Toolbox sync is restricted to canonical master."
+            exit 1
+          fi
+          observed_sha="$(git -C "${CANONICAL_ROOT}" rev-parse --verify HEAD)"
+          if [[ "${observed_sha}" != "${CANONICAL_SHA}" ]]; then
+            echo "::error title=Canonical commit mismatch::Checkout HEAD does not match the triggering canonical commit."
+            exit 1
+          fi
+          python3 "${CANONICAL_ROOT}/scripts/sync_canonical_mirrors.py" refresh-lock --check
+
+      - name: Check out toolbox master
+        uses: actions/checkout@v4
+        with:
+          repository: Joey-Tools/codex-toolbox
+          token: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
+          path: toolbox
+          ref: master
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare scoped sync branch
+        id: prepare
+        shell: bash
+        env:
+          CODEX_TOOLBOX_SYNC_TOKEN: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          allowed_paths_file="${RUNNER_TEMP}/toolbox-sync-allowed-paths.json"
+          git_with_token() {
+            local basic_token
+            basic_token="$(
+              printf 'x-access-token:%s' "${CODEX_TOOLBOX_SYNC_TOKEN}" |
+                base64 -w 0
+            )"
+            GIT_CONFIG_COUNT=1 \
+              GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${basic_token}" \
+              git "$@"
+          }
+
+          if [[ "${SYNC_BRANCH}" == "${TARGET_BASE}" ]]; then
+            echo "::error title=Unsafe sync branch::The generated branch must differ from the target base."
+            exit 1
+          fi
+          if ! jq -e \
+            --arg repository "${TARGET_REPOSITORY}" \
+            --arg mirror "${MIRROR_NAME}" \
+            '.mirrors[$mirror].repository == $repository' \
+            "${CANONICAL_ROOT}/sync-source-lock.json" >/dev/null; then
+            echo "::error title=Toolbox lock mismatch::The canonical source lock does not name the expected target repository."
+            exit 1
+          fi
+          jq -c \
+            --arg mirror "${MIRROR_NAME}" \
+            '[.mirrors[$mirror].files[], "generated-sync-source-lock.json"] | unique | sort' \
+            "${CANONICAL_ROOT}/sync-source-lock.json" >"${allowed_paths_file}"
+
+          is_allowed_path() {
+            local path="$1"
+            jq -e --arg path "${path}" 'index($path) != null' \
+              "${allowed_paths_file}" >/dev/null
+          }
+          assert_allowed_paths() {
+            local label="$1"
+            shift
+            local unexpected=0
+            local paths_file
+            paths_file="$(
+              mktemp "${RUNNER_TEMP}/toolbox-sync-paths.XXXXXX"
+            )"
+            if ! "$@" >"${paths_file}"; then
+              echo "::error title=Toolbox scope inspection failed::${label} could not be enumerated safely."
+              rm -f "${paths_file}"
+              exit 1
+            fi
+            while IFS= read -r -d '' path; do
+              if ! is_allowed_path "${path}"; then
+                echo "::error title=Out-of-scope toolbox branch::${label} contains a path outside the canonical toolbox mirror."
+                printf 'Unexpected path: %q\n' "${path}" >&2
+                unexpected=1
+              fi
+            done <"${paths_file}"
+            rm -f "${paths_file}"
+            if ((unexpected != 0)); then
+              exit 1
+            fi
+          }
+
+          git -C "${TARGET_ROOT}" config user.name "github-actions[bot]"
+          git -C "${TARGET_ROOT}" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git_with_token -C "${TARGET_ROOT}" fetch --no-tags origin \
+            "refs/heads/${TARGET_BASE}:refs/remotes/origin/${TARGET_BASE}"
+
+          remote_branch="$(
+            git_with_token -C "${TARGET_ROOT}" ls-remote --heads origin \
+              "refs/heads/${SYNC_BRANCH}"
+          )"
+          if [[ -n "${remote_branch}" ]]; then
+            git_with_token -C "${TARGET_ROOT}" fetch --no-tags origin \
+              "refs/heads/${SYNC_BRANCH}:refs/remotes/origin/${SYNC_BRANCH}"
+            git -C "${TARGET_ROOT}" switch --create "${SYNC_BRANCH}" \
+              --track "origin/${SYNC_BRANCH}"
+            assert_allowed_paths \
+              "The existing generated branch" \
+              git -C "${TARGET_ROOT}" diff --no-renames --name-only -z \
+                "origin/${TARGET_BASE}...HEAD"
+          else
+            git -C "${TARGET_ROOT}" switch --create "${SYNC_BRANCH}" \
+              "origin/${TARGET_BASE}"
+          fi
+
+          target_base_sha="$(
+            git -C "${TARGET_ROOT}" rev-parse --verify \
+              "refs/remotes/origin/${TARGET_BASE}"
+          )"
+          git -C "${TARGET_ROOT}" merge --no-edit "origin/${TARGET_BASE}"
+          assert_allowed_paths \
+            "The merged generated branch" \
+            git -C "${TARGET_ROOT}" diff --no-renames --name-only -z \
+              "origin/${TARGET_BASE}...HEAD"
+          echo "target_base_sha=${target_base_sha}" >>"${GITHUB_OUTPUT}"
+
+      - name: Validate existing sync PR ownership
+        id: existing-pr
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          pull_requests="$(
+            gh pr list \
+              --repo "${TARGET_REPOSITORY}" \
+              --state open \
+              --base "${TARGET_BASE}" \
+              --head "${SYNC_BRANCH}" \
+              --limit 10 \
+              --json number,body,baseRefName,headRefName,headRepositoryOwner,isCrossRepository
+          )"
+          count="$(jq 'length' <<<"${pull_requests}")"
+          if ((count > 1)); then
+            echo "::error title=Ambiguous sync PR::More than one open PR uses the scoped toolbox sync branch."
+            exit 1
+          fi
+          if ((count == 1)); then
+            if ! jq -e \
+              --arg owner "${TARGET_OWNER}" \
+              '
+                .[0].isCrossRepository == false and
+                .[0].headRepositoryOwner.login == $owner and
+                (.[0].body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
+              ' \
+              <<<"${pull_requests}" >/dev/null; then
+              echo "::error title=Unowned sync PR::The existing PR is cross-repository, has the wrong owner, or lacks the canonical automation marker and will not be edited."
+              exit 1
+            fi
+            echo "number=$(jq -r '.[0].number' <<<"${pull_requests}")" \
+              >>"${GITHUB_OUTPUT}"
+          else
+            echo "number=" >>"${GITHUB_OUTPUT}"
+          fi
+
+      - name: Generate and verify exact toolbox mirror
+        shell: bash
+        run: |
+          set -euo pipefail
+          observed_sha="$(git -C "${CANONICAL_ROOT}" rev-parse --verify HEAD)"
+          if [[ "${observed_sha}" != "${CANONICAL_SHA}" ]]; then
+            echo "::error title=Canonical commit changed::Refusing to generate from a commit other than the triggering SHA."
+            exit 1
+          fi
+          python3 "${CANONICAL_ROOT}/scripts/sync_canonical_mirrors.py" generate \
+            --target-root "${TARGET_ROOT}" \
+            --mirror "${MIRROR_NAME}" \
+            --source-commit "${CANONICAL_SHA}"
+          python3 "${CANONICAL_ROOT}/scripts/sync_canonical_mirrors.py" check \
+            --target-root "${TARGET_ROOT}" \
+            --mirror "${MIRROR_NAME}"
+
+      - name: Commit scoped generated changes
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          allowed_paths_file="${RUNNER_TEMP}/toolbox-sync-allowed-paths.json"
+
+          is_allowed_path() {
+            local path="$1"
+            jq -e --arg path "${path}" 'index($path) != null' \
+              "${allowed_paths_file}" >/dev/null
+          }
+          assert_allowed_paths() {
+            local label="$1"
+            shift
+            local unexpected=0
+            local paths_file
+            paths_file="$(
+              mktemp "${RUNNER_TEMP}/toolbox-sync-paths.XXXXXX"
+            )"
+            if ! "$@" >"${paths_file}"; then
+              echo "::error title=Generated scope inspection failed::${label} could not be enumerated safely."
+              rm -f "${paths_file}"
+              exit 1
+            fi
+            while IFS= read -r -d '' path; do
+              if ! is_allowed_path "${path}"; then
+                echo "::error title=Out-of-scope generated change::${label} contains a path outside the canonical toolbox mirror."
+                printf 'Unexpected path: %q\n' "${path}" >&2
+                unexpected=1
+              fi
+            done <"${paths_file}"
+            rm -f "${paths_file}"
+            if ((unexpected != 0)); then
+              exit 1
+            fi
+          }
+
+          assert_allowed_paths \
+            "The generated working tree" \
+            git -C "${TARGET_ROOT}" diff --no-renames --name-only -z
+          assert_allowed_paths \
+            "The generated untracked set" \
+            git -C "${TARGET_ROOT}" ls-files --others --exclude-standard -z
+
+          while IFS= read -r -d '' path; do
+            git -C "${TARGET_ROOT}" add -- "${path}"
+          done < <(jq -j '.[] | ., "\u0000"' "${allowed_paths_file}")
+
+          if ! git -C "${TARGET_ROOT}" diff --quiet; then
+            echo "::error title=Unstaged generated change::The generator changed a tracked path outside the staged toolbox scope."
+            exit 1
+          fi
+          if [[ -n "$(
+            git -C "${TARGET_ROOT}" ls-files --others --exclude-standard
+          )" ]]; then
+            echo "::error title=Untracked generated change::The generator left an untracked path outside the staged toolbox scope."
+            exit 1
+          fi
+          assert_allowed_paths \
+            "The staged generated diff" \
+            git -C "${TARGET_ROOT}" diff --cached --no-renames --name-only -z
+          git -C "${TARGET_ROOT}" diff --cached --check
+
+          if ! git -C "${TARGET_ROOT}" diff --cached --quiet; then
+            git -C "${TARGET_ROOT}" commit \
+              -m "chore(sync): update canonical personal sync mirror" \
+              -m "Canonical-source: ${GITHUB_REPOSITORY}@${CANONICAL_SHA}"
+          fi
+
+          assert_allowed_paths \
+            "The final sync branch" \
+            git -C "${TARGET_ROOT}" diff --no-renames --name-only -z \
+              "origin/${TARGET_BASE}...HEAD"
+          if git -C "${TARGET_ROOT}" diff --quiet \
+            "origin/${TARGET_BASE}...HEAD"; then
+            echo "has_changes=false" >>"${GITHUB_OUTPUT}"
+          else
+            echo "has_changes=true" >>"${GITHUB_OUTPUT}"
+          fi
+          echo "head_sha=$(git -C "${TARGET_ROOT}" rev-parse HEAD)" \
+            >>"${GITHUB_OUTPUT}"
+
+      - name: Push scoped sync branch
+        if: steps.commit.outputs.has_changes == 'true'
+        shell: bash
+        env:
+          CODEX_TOOLBOX_SYNC_TOKEN: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          git_with_token() {
+            local basic_token
+            basic_token="$(
+              printf 'x-access-token:%s' "${CODEX_TOOLBOX_SYNC_TOKEN}" |
+                base64 -w 0
+            )"
+            GIT_CONFIG_COUNT=1 \
+              GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${basic_token}" \
+              git "$@"
+          }
+          remote_base="$(
+            git_with_token -C "${TARGET_ROOT}" ls-remote --heads origin \
+              "refs/heads/${TARGET_BASE}" |
+              awk 'NR == 1 {print $1}'
+          )"
+          if [[ "${remote_base}" != "${{ steps.prepare.outputs.target_base_sha }}" ]]; then
+            echo "::error title=Toolbox master advanced::The target base changed during generation; rerun against the new base."
+            exit 1
+          fi
+          git_with_token -C "${TARGET_ROOT}" push origin \
+            "HEAD:refs/heads/${SYNC_BRANCH}"
+          remote_head="$(
+            git_with_token -C "${TARGET_ROOT}" ls-remote --heads origin \
+              "refs/heads/${SYNC_BRANCH}" |
+              awk 'NR == 1 {print $1}'
+          )"
+          if [[ "${remote_head}" != "${{ steps.commit.outputs.head_sha }}" ]]; then
+            echo "::error title=Sync branch verification failed::Remote branch does not match the generated commit."
+            exit 1
+          fi
+
+      - name: Publish or update toolbox sync PR
+        if: steps.commit.outputs.has_changes == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
+          EXISTING_PR: ${{ steps.existing-pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          pr_body_file="${RUNNER_TEMP}/toolbox-sync-pr.md"
+          short_sha="${CANONICAL_SHA:0:12}"
+          {
+            echo "<!-- codex-personal-sync-toolbox-automation -->"
+            echo
+            echo "Synchronizes the generated \`${MIRROR_NAME}\` mirror from the exact canonical master commit [\`${GITHUB_REPOSITORY}@${CANONICAL_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${CANONICAL_SHA})."
+            echo
+            echo "Generation contract:"
+            echo
+            echo '```text'
+            echo "python3 scripts/sync_canonical_mirrors.py generate --target-root <explicit-toolbox-checkout> --mirror ${MIRROR_NAME} --source-commit ${CANONICAL_SHA}"
+            echo "python3 scripts/sync_canonical_mirrors.py check --target-root <explicit-toolbox-checkout> --mirror ${MIRROR_NAME}"
+            echo '```'
+            echo
+            echo "Scope is limited to the \`${MIRROR_NAME}\` target paths declared by \`sync-source-lock.json\` plus \`generated-sync-source-lock.json\`. The workflow refuses unrelated branch, working-tree, staged, or PR changes and never writes directly to \`${TARGET_BASE}\`."
+            echo
+            echo "Canonical automation source: \`${GITHUB_WORKFLOW}\` run \`${GITHUB_RUN_ID}\`."
+          } >"${pr_body_file}"
+
+          title="chore(sync): canonical personal sync ${short_sha}"
+          if [[ -n "${EXISTING_PR}" ]]; then
+            current_pull_request="$(
+              gh pr view "${EXISTING_PR}" \
+                --repo "${TARGET_REPOSITORY}" \
+                --json body,state,baseRefName,headRefName,headRepositoryOwner,isCrossRepository
+            )"
+            if ! jq -e \
+              --arg base "${TARGET_BASE}" \
+              --arg head "${SYNC_BRANCH}" \
+              --arg owner "${TARGET_OWNER}" \
+              '
+                .state == "OPEN" and
+                .baseRefName == $base and
+                .headRefName == $head and
+                .isCrossRepository == false and
+                .headRepositoryOwner.login == $owner and
+                (.body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
+              ' <<<"${current_pull_request}" >/dev/null; then
+              echo "::error title=Sync PR changed::The existing PR no longer matches the owned automation scope."
+              exit 1
+            fi
+            gh pr edit "${EXISTING_PR}" \
+              --repo "${TARGET_REPOSITORY}" \
+              --title "${title}" \
+              --body-file "${pr_body_file}"
+          else
+            gh pr create \
+              --repo "${TARGET_REPOSITORY}" \
+              --base "${TARGET_BASE}" \
+              --head "${SYNC_BRANCH}" \
+              --title "${title}" \
+              --body-file "${pr_body_file}"
+          fi
+
+      - name: Report no toolbox changes
+        if: steps.commit.outputs.has_changes != 'true'
+        shell: bash
+        run: echo "Toolbox mirror already matches canonical commit ${CANONICAL_SHA}."
