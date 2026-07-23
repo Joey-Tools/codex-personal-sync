@@ -1,18 +1,18 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 import unittest
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = REPOSITORY_ROOT / ".github" / "workflows" / "sync-toolbox.yml"
-DOCUMENTATION_PATH = (
-    REPOSITORY_ROOT / "docs" / "automation" / "sync-toolbox.md"
-)
+DOCUMENTATION_PATH = REPOSITORY_ROOT / "docs" / "automation" / "sync-toolbox.md"
 SYNTHETIC_ACCESS_TOKEN_ID = "access-a"
 SYNTHETIC_ACCESS_TOKEN = "codex_synth_v1_access_a"
 
@@ -78,12 +78,8 @@ class SyncToolboxAutomationTests(unittest.TestCase):
         )
 
     def test_missing_secret_fails_before_target_checkout(self) -> None:
-        validation_index = self.workflow.index(
-            "- name: Validate sync credential"
-        )
-        target_checkout_index = self.workflow.index(
-            "- name: Check out toolbox master"
-        )
+        validation_index = self.workflow.index("- name: Validate sync credential")
+        target_checkout_index = self.workflow.index("- name: Check out toolbox master")
         self.assertLess(validation_index, target_checkout_index)
         self.assertIn(
             "token: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}",
@@ -156,8 +152,28 @@ class SyncToolboxAutomationTests(unittest.TestCase):
         self.assertIn(generate, script)
         self.assertIn(check, script)
         self.assertLess(script.index(generate), script.index(check))
+        commit_script = self._step_run("Commit scoped generated changes")
+        self.assertNotIn('git -C "${TARGET_ROOT}" add', commit_script)
         self.assertIn(
-            "python3 \"${CANONICAL_ROOT}/scripts/sync_canonical_mirrors.py\" "
+            'git -C "${TARGET_ROOT}" hash-object \\\n'
+            '        --no-filters -w --stdin <"${target_path}"',
+            commit_script,
+        )
+        self.assertIn(
+            'git -C "${TARGET_ROOT}" update-index --add --cacheinfo',
+            commit_script,
+        )
+        self.assertIn(
+            'git -C "${TARGET_ROOT}" update-index --force-remove -- "${path}"',
+            commit_script,
+        )
+        self.assertIn(check, commit_script)
+        self.assertGreater(
+            commit_script.index(check),
+            commit_script.index("commit-tree"),
+        )
+        self.assertIn(
+            'python3 "${CANONICAL_ROOT}/scripts/sync_canonical_mirrors.py" '
             "refresh-lock --check",
             self._step_run("Verify canonical master and source lock"),
         )
@@ -195,7 +211,7 @@ class SyncToolboxAutomationTests(unittest.TestCase):
             self.workflow,
         )
         self.assertIn(
-            'jq -j \'.[] | ., "\\u0000"\'',
+            "jq -j '.[] | ., \"\\u0000\"'",
             self.workflow,
         )
         self.assertGreaterEqual(
@@ -234,7 +250,7 @@ class SyncToolboxAutomationTests(unittest.TestCase):
         self.assertIn('gh pr edit "${EXISTING_PR}"', publish)
         self.assertIn("gh pr create", publish)
         self.assertIn("gh pr view", publish)
-        self.assertIn(".state == \"OPEN\"", publish)
+        self.assertIn('.state == "OPEN"', publish)
 
     def test_allowed_path_stream_is_nul_delimited(self) -> None:
         jq = shutil.which("jq")
@@ -251,6 +267,181 @@ class SyncToolboxAutomationTests(unittest.TestCase):
             completed.stdout.split(b"\0"),
             [b"one path", b"two\nlines", b""],
         )
+
+    def test_commit_step_stages_raw_bytes_without_running_clean_filter(
+        self,
+    ) -> None:
+        jq = shutil.which("jq")
+        if jq is None:
+            self.skipTest("jq is unavailable")
+        with tempfile.TemporaryDirectory(
+            prefix="sync-toolbox-filter-free."
+        ) as temporary_directory:
+            root = Path(temporary_directory)
+            canonical_root = root / "canonical"
+            target_root = root / "toolbox"
+            runner_temp = root / "runner"
+            canonical_root.mkdir()
+            target_root.mkdir()
+            runner_temp.mkdir()
+
+            def git(*arguments: str, check: bool = True) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    ["git", "-C", str(target_root), *arguments],
+                    check=check,
+                    capture_output=True,
+                    env={
+                        **os.environ,
+                        "GIT_CONFIG_NOSYSTEM": "1",
+                        "GIT_TERMINAL_PROMPT": "0",
+                        "LC_ALL": "C",
+                    },
+                )
+
+            git("init", "-q")
+            git("switch", "-q", "-c", "master")
+            git("config", "user.name", "Toolbox Fixture")
+            git("config", "user.email", "toolbox@example.invalid")
+            git("config", "commit.gpgsign", "false")
+            (target_root / "scripts").mkdir()
+            engine_path = target_root / "scripts" / "engine.py"
+            receipt_path = target_root / "generated-sync-source-lock.json"
+            obsolete_path = target_root / "obsolete.txt"
+            engine_path.write_bytes(b"old engine\n")
+            receipt_path.write_bytes(b'{"old":true}\n')
+            obsolete_path.write_bytes(b"obsolete\n")
+            (target_root / ".gitattributes").write_text(
+                "scripts/engine.py filter=fixture\n"
+                "generated-sync-source-lock.json filter=fixture\n"
+                "obsolete.txt filter=fixture\n",
+                encoding="utf-8",
+            )
+            git("add", "-A")
+            git("commit", "--no-gpg-sign", "-q", "-m", "fixture base")
+            git("update-ref", "refs/remotes/origin/master", "HEAD")
+
+            filter_marker = root / "clean-filter-ran"
+            filter_script = root / "clean-filter.sh"
+            filter_script.write_text(
+                "#!/bin/sh\n"
+                "set -eu\n"
+                "printf 'invoked\\n' >>\"${FILTER_MARKER:?}\"\n"
+                "exec /usr/bin/sed 's/canonical/filtered/g'\n",
+                encoding="utf-8",
+            )
+            filter_script.chmod(0o755)
+            git("config", "filter.fixture.clean", str(filter_script))
+            git("config", "filter.fixture.required", "true")
+
+            canonical_engine = b"canonical engine bytes\n"
+            canonical_receipt = b'{"canonical":"receipt"}\n'
+            engine_path.write_bytes(canonical_engine)
+            engine_path.chmod(0o755)
+            receipt_path.write_bytes(canonical_receipt)
+            obsolete_path.unlink()
+
+            expected_root = canonical_root / "expected"
+            expected_root.mkdir()
+            (expected_root / "engine.py").write_bytes(canonical_engine)
+            (expected_root / "receipt.json").write_bytes(canonical_receipt)
+            generator_path = canonical_root / "scripts" / "sync_canonical_mirrors.py"
+            generator_path.parent.mkdir()
+            generator_path.write_text(
+                "from pathlib import Path\n"
+                "import argparse\n"
+                "parser = argparse.ArgumentParser()\n"
+                "parser.add_argument('command')\n"
+                "parser.add_argument('--target-root', required=True)\n"
+                "parser.add_argument('--mirror', required=True)\n"
+                "arguments = parser.parse_args()\n"
+                "if arguments.command != 'check':\n"
+                "    raise SystemExit('unexpected command')\n"
+                "root = Path(arguments.target_root)\n"
+                "expected = Path(__file__).resolve().parents[1] / 'expected'\n"
+                "if (root / 'scripts/engine.py').read_bytes() != "
+                "(expected / 'engine.py').read_bytes():\n"
+                "    raise SystemExit('engine mismatch')\n"
+                "if (root / 'generated-sync-source-lock.json').read_bytes() != "
+                "(expected / 'receipt.json').read_bytes():\n"
+                "    raise SystemExit('receipt mismatch')\n",
+                encoding="utf-8",
+            )
+
+            allowed_paths = [
+                "generated-sync-source-lock.json",
+                "obsolete.txt",
+                "scripts/engine.py",
+            ]
+            (runner_temp / "toolbox-sync-allowed-paths.json").write_text(
+                json.dumps(allowed_paths),
+                encoding="utf-8",
+            )
+            github_output = root / "github-output"
+            environment = {
+                **os.environ,
+                "CANONICAL_ROOT": str(canonical_root),
+                "CANONICAL_SHA": "1" * 40,
+                "FILTER_MARKER": str(filter_marker),
+                "GITHUB_OUTPUT": str(github_output),
+                "GITHUB_REPOSITORY": "Joey-Tools/codex-personal-sync",
+                "MIRROR_NAME": "toolbox",
+                "RUNNER_TEMP": str(runner_temp),
+                "TARGET_BASE": "master",
+                "TARGET_ROOT": str(target_root),
+            }
+            completed = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-euo",
+                    "pipefail",
+                    "-c",
+                    self._step_run("Commit scoped generated changes"),
+                ],
+                cwd=REPOSITORY_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                completed.stdout + completed.stderr,
+            )
+            self.assertFalse(filter_marker.exists())
+            self.assertEqual(
+                git("show", "HEAD:scripts/engine.py").stdout,
+                canonical_engine,
+            )
+            self.assertEqual(
+                git(
+                    "show",
+                    "HEAD:generated-sync-source-lock.json",
+                ).stdout,
+                canonical_receipt,
+            )
+            self.assertEqual(
+                git(
+                    "ls-tree",
+                    "HEAD",
+                    "scripts/engine.py",
+                ).stdout.split(maxsplit=1)[0],
+                b"100755",
+            )
+            self.assertNotEqual(
+                git(
+                    "cat-file",
+                    "-e",
+                    "HEAD:obsolete.txt",
+                    check=False,
+                ).returncode,
+                0,
+            )
+            self.assertIn(
+                "has_changes=true",
+                github_output.read_text(encoding="utf-8"),
+            )
 
     def test_documented_secret_interface_is_least_privilege_and_explicit(
         self,

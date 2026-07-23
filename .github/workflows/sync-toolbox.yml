@@ -270,20 +270,37 @@ jobs:
           }
 
           assert_allowed_paths \
-            "The generated working tree" \
-            git -C "${TARGET_ROOT}" diff --no-renames --name-only -z
-          assert_allowed_paths \
             "The generated untracked set" \
             git -C "${TARGET_ROOT}" ls-files --others --exclude-standard -z
 
           while IFS= read -r -d '' path; do
-            git -C "${TARGET_ROOT}" add -- "${path}"
+            target_path="${TARGET_ROOT}/${path}"
+            if [[ -L "${target_path}" || \
+              ( -e "${target_path}" && ! -f "${target_path}" ) ]]; then
+              echo "::error title=Unsafe generated path::Refusing to stage a non-regular generated path."
+              printf 'Unsafe path: %q\n' "${path}" >&2
+              exit 1
+            fi
+            if [[ -e "${target_path}" ]]; then
+              git_mode="100644"
+              if [[ -x "${target_path}" ]]; then
+                git_mode="100755"
+              fi
+              object_id="$(
+                git -C "${TARGET_ROOT}" hash-object \
+                  --no-filters -w --stdin <"${target_path}"
+              )"
+              if [[ ! "${object_id}" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "::error title=Raw staging failed::Git did not return a full object ID."
+                exit 1
+              fi
+              git -C "${TARGET_ROOT}" update-index --add --cacheinfo \
+                "${git_mode},${object_id},${path}"
+            else
+              git -C "${TARGET_ROOT}" update-index --force-remove -- "${path}"
+            fi
           done < <(jq -j '.[] | ., "\u0000"' "${allowed_paths_file}")
 
-          if ! git -C "${TARGET_ROOT}" diff --quiet; then
-            echo "::error title=Unstaged generated change::The generator changed a tracked path outside the staged toolbox scope."
-            exit 1
-          fi
           if [[ -n "$(
             git -C "${TARGET_ROOT}" ls-files --others --exclude-standard
           )" ]]; then
@@ -296,10 +313,21 @@ jobs:
           git -C "${TARGET_ROOT}" diff --cached --check
 
           if ! git -C "${TARGET_ROOT}" diff --cached --quiet; then
-            git -C "${TARGET_ROOT}" commit \
-              -m "chore(sync): update canonical personal sync mirror" \
-              -m "Canonical-source: ${GITHUB_REPOSITORY}@${CANONICAL_SHA}"
+            parent_sha="$(git -C "${TARGET_ROOT}" rev-parse --verify HEAD)"
+            tree_sha="$(git -C "${TARGET_ROOT}" write-tree)"
+            commit_sha="$(
+              git -C "${TARGET_ROOT}" commit-tree "${tree_sha}" \
+                -p "${parent_sha}" \
+                -m "chore(sync): update canonical personal sync mirror" \
+                -m "Canonical-source: ${GITHUB_REPOSITORY}@${CANONICAL_SHA}"
+            )"
+            git -C "${TARGET_ROOT}" update-ref HEAD \
+              "${commit_sha}" "${parent_sha}"
           fi
+
+          python3 "${CANONICAL_ROOT}/scripts/sync_canonical_mirrors.py" check \
+            --target-root "${TARGET_ROOT}" \
+            --mirror "${MIRROR_NAME}"
 
           assert_allowed_paths \
             "The final sync branch" \

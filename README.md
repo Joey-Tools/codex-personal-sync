@@ -69,13 +69,16 @@ for the complete transaction, uses cooperative root-bound locks, and rejects
 symlink ancestors or targets. It also binds the fixed Git executable and each
 repository's `.git` marker, admin/common directories, and object directory;
 then it double-reads those bound control files into a parent-private frozen
-snapshot before launching Git. Git calls use only that snapshot, are
-deadline/output bounded, and reject unsafe config includes, replace refs,
-alternates, and lazy object fetching. Canonical and consumer origins must match
-the lock, roots must not overlap in either ancestry direction, and managed
-paths may never enter the Git control plane. Target validation also rejects
-case-insensitive/NFC collisions and overlap in either ancestry direction with
-the receipt, transaction markers, or per-target exchange journals.
+snapshot before launching Git. The copied content-addressed object store is
+fully verified once and its root remains identity/access-policy bound; each Git
+call revalidates the smaller config/ref/index control plane without rereading
+pack contents. Git calls use only that snapshot, are deadline/output bounded,
+and reject unsafe config includes, replace refs, alternates, and lazy object
+fetching. Canonical and consumer origins must match the lock, roots must not
+overlap in either ancestry direction, and managed paths may never enter the Git
+control plane. Target validation also rejects case-insensitive/NFC collisions
+and overlap in either ancestry direction with the receipt, transaction
+markers, or per-target exchange journals.
 
 The live Git binding includes `HEAD`, its resolved loose ref when present,
 `packed-refs`, common/worktree config, the index, and explicit absence records

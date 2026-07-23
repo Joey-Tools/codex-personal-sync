@@ -45,6 +45,7 @@ PRIVATE_GIT_CONTROL_PARENT = Path(
     "/private/tmp" if sys.platform == "darwin" else "/var/tmp"
 )
 PRIVATE_TOOL_ROOT_NAME = "codex-sync-canonical-mirrors"
+PRIVATE_OBJECTS_PATH = PurePosixPath("objects")
 MAX_LOCK_BYTES = 1024 * 1024
 MAX_SOURCE_BYTES = 32 * 1024 * 1024
 MAX_GIT_STDOUT_BYTES = MAX_SOURCE_BYTES
@@ -178,6 +179,7 @@ class GitControlBinding:
     source_absences: tuple[ControlAbsenceBinding, ...]
     private_parent: ControlObjectBinding
     private: ControlObjectBinding
+    private_objects: ControlObjectBinding
     private_name: str
     private_path: Path
     private_manifest: tuple[tuple[object, ...], ...]
@@ -687,6 +689,7 @@ def _snapshot_git_directory_tree(
     prefix: PurePosixPath,
     budget: dict[str, int],
     operation: OperationBudget | None = None,
+    skip_descendants: frozenset[PurePosixPath] = frozenset(),
 ) -> list[tuple[object, ...]]:
     _operation_checkpoint(operation, f"snapshotting Git control tree {prefix}")
     try:
@@ -762,15 +765,21 @@ def _snapshot_git_directory_tree(
                         _access_policy(opened_metadata),
                     )
                 )
-                manifest.extend(
-                    _snapshot_git_directory_tree(
-                        child_source_fd,
-                        (child_destination_fd if child_destination_fd >= 0 else None),
-                        prefix=relative_path,
-                        budget=budget,
-                        operation=operation,
+                if relative_path not in skip_descendants:
+                    manifest.extend(
+                        _snapshot_git_directory_tree(
+                            child_source_fd,
+                            (
+                                child_destination_fd
+                                if child_destination_fd >= 0
+                                else None
+                            ),
+                            prefix=relative_path,
+                            budget=budget,
+                            operation=operation,
+                            skip_descendants=skip_descendants,
+                        )
                     )
-                )
             finally:
                 if child_destination_fd >= 0:
                     os.close(child_destination_fd)
@@ -871,9 +880,20 @@ def _logical_git_snapshot_manifest(
     return tuple(logical)
 
 
-def _scan_private_git_control(
+def _git_control_plane_manifest(
+    manifest: tuple[tuple[object, ...], ...],
+) -> tuple[tuple[object, ...], ...]:
+    object_prefix = PRIVATE_OBJECTS_PATH.as_posix() + "/"
+    return tuple(
+        record for record in manifest if not str(record[1]).startswith(object_prefix)
+    )
+
+
+def _scan_private_git_tree(
     private_fd: int,
     operation: OperationBudget | None = None,
+    *,
+    skip_descendants: frozenset[PurePosixPath] = frozenset(),
 ) -> tuple[tuple[object, ...], ...]:
     first_budget = {"entries": 0, "bytes": 0}
     first = _snapshot_git_directory_tree(
@@ -882,6 +902,7 @@ def _scan_private_git_control(
         prefix=PurePosixPath(),
         budget=first_budget,
         operation=operation,
+        skip_descendants=skip_descendants,
     )
     second_budget = {"entries": 0, "bytes": 0}
     second = _snapshot_git_directory_tree(
@@ -890,6 +911,7 @@ def _scan_private_git_control(
         prefix=PurePosixPath(),
         budget=second_budget,
         operation=operation,
+        skip_descendants=skip_descendants,
     )
     first_logical = _logical_git_snapshot_manifest(first)
     second_logical = _logical_git_snapshot_manifest(second)
@@ -898,6 +920,17 @@ def _scan_private_git_control(
             "private Git control snapshot changed while validating it"
         )
     return first_logical
+
+
+def _scan_private_git_control(
+    private_fd: int,
+    operation: OperationBudget | None = None,
+) -> tuple[tuple[object, ...], ...]:
+    return _scan_private_git_tree(
+        private_fd,
+        operation,
+        skip_descendants=frozenset({PRIVATE_OBJECTS_PATH}),
+    )
 
 
 def _replace_private_control_file(
@@ -1319,7 +1352,7 @@ def _materialize_private_git_control(
                 "Git common control tree changed during private snapshot"
             )
         source_manifest = _logical_git_snapshot_manifest(first_manifest)
-        copied_manifest = _scan_private_git_control(
+        copied_manifest = _scan_private_git_tree(
             private.fd,
             root.operation,
         )
@@ -1358,7 +1391,7 @@ def _materialize_private_git_control(
                     continue
                 source_files.append(binding)
         os.fsync(private.fd)
-        final_manifest = _scan_private_git_control(
+        final_tree_manifest = _scan_private_git_tree(
             private.fd,
             root.operation,
         )
@@ -1366,9 +1399,17 @@ def _materialize_private_git_control(
             source_manifest,
             overrides,
         )
-        if final_manifest != expected_manifest:
+        if final_tree_manifest != expected_manifest:
             raise MirrorSyncError(
                 "private Git control snapshot differs from bound source bytes"
+            )
+        final_manifest = _scan_private_git_control(
+            private.fd,
+            root.operation,
+        )
+        if final_manifest != _git_control_plane_manifest(expected_manifest):
+            raise MirrorSyncError(
+                "private Git control plane differs from bound source bytes"
             )
         _set_owner_record_phase(
             owner_record,
@@ -1717,6 +1758,7 @@ def _revalidate_private_git_control(
 ) -> None:
     _revalidate_control_object(root, binding.private_parent)
     _revalidate_control_object(root, binding.private)
+    _revalidate_control_object(root, binding.private_objects)
     observed = _scan_private_git_control(
         binding.private.fd,
         root.operation,
@@ -2422,6 +2464,7 @@ def _close_bound_root(root: BoundRoot) -> None:
             root.git_control.objects,
             *root.git_control.source_files,
             *root.git_control.source_directories,
+            root.git_control.private_objects,
             root.git_control.private,
             root.git_control.private_parent,
             root.git_control.owner_record,
@@ -4205,6 +4248,7 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
     commondir_file: ControlObjectBinding | None = None
     private_path: Path | None = None
     private: ControlObjectBinding | None = None
+    private_objects: ControlObjectBinding | None = None
     private_parent: ControlObjectBinding | None = None
     private_name: str | None = None
     private_manifest: tuple[tuple[object, ...], ...] = ()
@@ -4284,6 +4328,13 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
             admin,
             common,
         )
+        private_objects = _bind_relative_control_directory(
+            private,
+            PRIVATE_OBJECTS_PATH.as_posix(),
+            "private Git object directory",
+        )
+        if private_objects is None:
+            raise MirrorSyncError("private Git object directory is missing")
         (
             source_files,
             source_directories,
@@ -4315,6 +4366,7 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
             source_absences=source_absences,
             private_parent=private_parent,
             private=private,
+            private_objects=private_objects,
             private_name=private_name,
             private_path=private_path,
             private_manifest=private_manifest,
@@ -4371,6 +4423,8 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
                     os.close(owner_record.fd)
                 os.close(private.fd)
                 os.close(private_parent.fd)
+        if private_objects is not None:
+            os.close(private_objects.fd)
         for binding in controls:
             os.close(binding.fd)
         raise

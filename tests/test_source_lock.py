@@ -1195,6 +1195,71 @@ class MirrorGeneratorTests(unittest.TestCase):
             bound_root.operation = None
             MIRROR_MODULE._finish_bound_roots(bound_root)
 
+    def test_generate_and_check_bound_a_realistic_packed_object_store_once(
+        self,
+    ) -> None:
+        packed_payload = self.canonical_root / "packed-fixture.bin"
+        with packed_payload.open("wb") as stream:
+            for _chunk in range(24):
+                stream.write(os.urandom(1024 * 1024))
+        self.source_commit = self._commit(
+            self.canonical_root,
+            "add realistic packed fixture",
+        )
+        self._git(
+            self.canonical_root,
+            "gc",
+            "--prune=now",
+        )
+        pack_sizes = [
+            path.stat().st_size
+            for path in (self.canonical_root / ".git" / "objects" / "pack").glob(
+                "*.pack"
+            )
+        ]
+        self.assertTrue(pack_sizes)
+        self.assertGreater(max(pack_sizes), 20 * 1024 * 1024)
+
+        operation_limit = 384 * 1024 * 1024
+        operations: list[MIRROR_MODULE.OperationBudget] = []
+
+        def new_operation_budget() -> MIRROR_MODULE.OperationBudget:
+            operation = MIRROR_MODULE.OperationBudget(
+                deadline=time.monotonic() + MIRROR_MODULE.OPERATION_TIMEOUT_SECONDS,
+                remaining_bytes=operation_limit,
+                remaining_entries=MIRROR_MODULE.MAX_OPERATION_ENTRIES,
+            )
+            operations.append(operation)
+            return operation
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "MAX_OPERATION_BYTES",
+                operation_limit,
+            ),
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_new_operation_budget",
+                side_effect=new_operation_budget,
+            ),
+        ):
+            self.assertEqual(self._generate(), 1)
+            self.assertEqual(
+                MIRROR_MODULE.check_mirror(
+                    self.canonical_root,
+                    self.target_root,
+                    "toolbox",
+                ),
+                1,
+            )
+
+        self.assertEqual(len(operations), 2)
+        for operation in operations:
+            consumed_bytes = operation_limit - operation.remaining_bytes
+            self.assertGreater(consumed_bytes, max(pack_sizes))
+            self.assertLess(consumed_bytes, 256 * 1024 * 1024)
+
     def test_bound_git_control_rejects_marker_replacement(self) -> None:
         bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
         moved_marker = self.canonical_root / ".git-bound-original"
@@ -1446,7 +1511,7 @@ class MirrorGeneratorTests(unittest.TestCase):
 
     def test_private_git_destination_is_read_back_and_bound(self) -> None:
         bound_root = MIRROR_MODULE._bind_root(self.target_root)
-        real_scan = MIRROR_MODULE._scan_private_git_control
+        real_scan = MIRROR_MODULE._scan_private_git_tree
         scan_count = 0
 
         def corrupt_after_initial_destination_scan(
@@ -1473,7 +1538,7 @@ class MirrorGeneratorTests(unittest.TestCase):
             with (
                 mock.patch.object(
                     MIRROR_MODULE,
-                    "_scan_private_git_control",
+                    "_scan_private_git_tree",
                     side_effect=corrupt_after_initial_destination_scan,
                 ),
                 self.assertRaisesRegex(

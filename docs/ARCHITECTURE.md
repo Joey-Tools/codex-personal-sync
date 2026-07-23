@@ -13,7 +13,7 @@
 
 `check` 还要求所有 managed target 与 receipt 的 clean stage-0 index 精确等于 `HEAD`，因此 staged-only 漂移也会失败。`generate` 可以留下预期的未提交 generated diff 供审阅，但不会把 index/worktree 内容当作 canonical 输入。canonical `master` 到 toolbox 的自动化只通过 [sync-toolbox workflow](automation/sync-toolbox.md) 创建或更新固定范围的 PR；缺失显式的最小权限 secret 时会在 target checkout 前失败，不会自建凭据或直接写 target `master`。
 
-Git 验证不执行 repository-controlled `git status`，而是用 raw tree/index blob 与 no-follow worktree bytes 做 filter-free exact parity。Live control binding 覆盖 `HEAD`、resolved loose ref（存在时）、`packed-refs`、common/worktree config、index 及 optional-control absence，并在每个 Git/文件系统 gate 前后重验证。固定的 isolated Python launcher 通过 private Git directory fd 切换 cwd 后 `execve` 固定 Git，不使用 `preexec_fn` 或 pathname cwd。
+Git 验证不执行 repository-controlled `git status`，而是用 raw tree/index blob 与 no-follow worktree bytes 做 filter-free exact parity。Live control binding 覆盖 `HEAD`、resolved loose ref（存在时）、`packed-refs`、common/worktree config、index 及 optional-control absence，并在每个 Git/文件系统 gate 前后重验证。Private snapshot 的 content-addressed `objects/` 在 materialization 时完整复制并验证一次；后续每个 Git 子命令只重验 object-root identity/access policy 和小型 control-plane manifest，不再按命令次数重复读取 pack。固定的 isolated Python launcher 通过 private Git directory fd 切换 cwd 后 `execve` 固定 Git，不使用 `preexec_fn` 或 pathname cwd。
 
 Target layout 对 NFC+casefold 后的 portable spelling 做比较，并双向拒绝 managed target 与 receipt、transaction markers、per-target exchange journal 的 exact/ancestor/descendant overlap；因此 reserved metadata 不能伪装成 target，target 也不能把 reserved path 包在自己的子树中。
 
@@ -76,6 +76,7 @@ macOS 使用 user `launchd`，Linux 使用 user `systemd`。默认 runner 固定
 - runner、command、mode、repo、base repo、owner 和 interval 全部匹配时，不改写配置文件；`enable=true` 仍执行 daemon reload/enable repair，以恢复被外部禁用的服务状态。
 - unsafe、不可解析或不完整的配置会报错，不会被当作可保留配置。
 - semantic audit 直接解析 caller 捕获的完整配置 snapshot；配置匹配分支在调用 daemon 前重验证该 snapshot，配置变更分支则把同一 snapshot 传给 conditional write。macOS 绑定单个 plist，Linux 绑定完整 service/timer pair，audit 后出现的同 inode 内容变化或路径替换都不会被覆盖。
+- 替换现有 plist/unit 前，会先为 exact original object 创建、验证并 fsync 同目录 hard-link recovery evidence。若 exchange 后的 displaced pathname 被替换，绝不把该 pathname 交换回 live；可信 staged config 保持 live，原 object 以 identity-bound recovery evidence 保留并 fail closed。
 - Linux service/timer 以 durable pair transaction 更新。每个 conditional write 绑定 caller 捕获的完整 before snapshot；crash recovery 只接受记录中的 before/after content 与 access policy，未知并发编辑一律保留 marker 并 fail closed。新 after 文件固定 mode `0600`，因此 group identity 不具备 access-bearing semantics（不影响访问权限）且不作为 after-state 匹配信号；legacy before-state 仍完整绑定原 gid/mode。
 - 回滚 legacy before-state 时，staged file 会在 publication 前验证 caller group membership，并按记录的 gid 执行 `fchown`，随后重新应用完整 mode；任一步失败都在替换目标前停止。
 - 调用 `launchctl` / `systemctl` 时使用固定的 root-owned executable 与 closed environment，不继承 loader、shell 或 Python runtime injection 变量。

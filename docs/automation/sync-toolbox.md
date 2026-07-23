@@ -37,6 +37,12 @@ administrators must provision and rotate the secret outside this workflow.
 - Existing branch history, working-tree changes, staged changes, and final PR
   diff are restricted to the toolbox targets declared by
   `sync-source-lock.json` plus `generated-sync-source-lock.json`.
+- Generated regular files are staged from their exact worktree bytes with
+  `git hash-object --no-filters` and `git update-index --cacheinfo`; missing
+  allowed paths use an explicit index removal. The commit is assembled from
+  that index with Git plumbing, so target/system attributes, clean/LFS
+  filters, and working-tree encodings cannot rewrite the audited bytes. Mirror
+  `check` runs again after the commit.
 - An existing pull request is edited only when it has the automation ownership
   marker. Otherwise the run fails without changing PR metadata.
 - The target `master` SHA is checked again before push. If it advanced during

@@ -20578,6 +20578,9 @@ def _atomic_write_scheduler_config(
     file_fd = -1
     published = False
     retained_old = False
+    recovery_name: str | None = None
+    preserve_recovery = False
+    exchanged = False
     try:
         before = _read_managed_state_file_snapshot(
             user_home,
@@ -20646,39 +20649,113 @@ def _atomic_write_scheduler_config(
         ):
             raise SyncError(f"scheduler config staging failed: {path}")
         if before.exists:
+            assert before.file_identity is not None
+            recovery_name = f"{temporary_name}.original"
+            try:
+                os.link(
+                    path.name,
+                    recovery_name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise SyncError(
+                    f"cannot preserve scheduler config recovery evidence: "
+                    f"{path}: {error}"
+                ) from error
+            os.fsync(parent_fd)
+            recovery_path = path.with_name(recovery_name)
+            recovery = _read_managed_state_file_snapshot(
+                user_home,
+                recovery_path,
+                parent_fd,
+                expected_identity=before.file_identity,
+            )
+            current_before = _read_managed_state_file_snapshot(
+                user_home,
+                path,
+                parent_fd,
+                expected_identity=before.file_identity,
+            )
+            if (
+                not _managed_state_snapshot_matches_file_evidence(
+                    recovery,
+                    before,
+                )
+                or not _managed_state_snapshot_matches_file_evidence(
+                    current_before,
+                    before,
+                )
+            ):
+                preserve_recovery = True
+                raise SyncError(
+                    f"scheduler config changed while preserving recovery "
+                    f"evidence: {path}"
+                )
             _rename_exchange_at(
                 parent_fd,
                 temporary_name,
                 parent_fd,
                 path.name,
             )
+            exchanged = True
             retained_old = True
             os.fsync(parent_fd)
-            displaced = _read_managed_state_file_snapshot(
-                user_home,
-                temporary_path,
-                parent_fd,
-            )
-            if not _managed_state_snapshot_matches_file_evidence(
-                displaced,
-                before,
+            try:
+                displaced = _read_managed_state_file_snapshot(
+                    user_home,
+                    temporary_path,
+                    parent_fd,
+                )
+            except SyncError:
+                displaced = None
+            if (
+                displaced is None
+                or not _managed_state_snapshot_matches_file_evidence(
+                    displaced,
+                    before,
+                )
             ):
-                try:
-                    _rename_exchange_at(
-                        parent_fd,
-                        temporary_name,
-                        parent_fd,
-                        path.name,
+                preserve_recovery = True
+                installed_after_mismatch = _read_managed_state_file_snapshot(
+                    user_home,
+                    path,
+                    parent_fd,
+                    expected_identity=staged.file_identity,
+                )
+                recovery = _read_managed_state_file_snapshot(
+                    user_home,
+                    recovery_path,
+                    parent_fd,
+                    expected_identity=before.file_identity,
+                )
+                if (
+                    not _managed_state_snapshot_matches_file_evidence(
+                        installed_after_mismatch,
+                        staged,
                     )
-                    retained_old = False
-                    os.fsync(parent_fd)
-                except (OSError, SyncError) as rollback_error:
+                    or not _managed_state_snapshot_matches_file_evidence(
+                        recovery,
+                        before,
+                    )
+                    or not _bound_directory_matches(
+                        user_home,
+                        path.parent,
+                        parent_fd,
+                    )
+                ):
+                    preserve_recovery = True
                     raise SyncError(
-                        f"scheduler config changed during publication and "
-                        f"rollback failed: {path}: {rollback_error}"
-                    ) from rollback_error
+                        f"scheduler config and recovery evidence changed during "
+                        f"publication: {path}"
+                    )
+                published = True
+                retained_old = False
                 raise SyncError(
-                    f"scheduler config changed during publication: {path}"
+                    f"scheduler config displaced path changed during "
+                    f"publication; the trusted staged config remains live and "
+                    f"the exact original is preserved as {recovery_path}"
                 )
         else:
             _rename_noreplace_at(
@@ -20728,6 +20805,31 @@ def _atomic_write_scheduler_config(
                 label=f"scheduler config backup {path}",
             )
             retained_old = False
+        if recovery_name is not None:
+            recovery_path = path.with_name(recovery_name)
+            recovery = _read_managed_state_file_snapshot(
+                user_home,
+                recovery_path,
+                parent_fd,
+                expected_identity=before.file_identity,
+            )
+            if not _managed_state_snapshot_matches_file_evidence(
+                recovery,
+                before,
+            ):
+                preserve_recovery = True
+                raise SyncError(
+                    f"scheduler config recovery evidence changed after "
+                    f"publication: {path}"
+                )
+            _isolate_and_delete_pending_cleanup_file(
+                user_home,
+                recovery_path,
+                parent_fd,
+                recovery,
+                label=f"scheduler config recovery evidence {path}",
+            )
+            recovery_name = None
     except OSError as error:
         raise SyncError(f"failed to publish scheduler config {path}: {error}") from error
     finally:
@@ -20747,6 +20849,28 @@ def _atomic_write_scheduler_config(
                         parent_fd,
                         staged_cleanup,
                         label=f"scheduler config staging file {path}",
+                    )
+            except (OSError, SyncError):
+                pass
+        if recovery_name is not None and not preserve_recovery and not exchanged:
+            try:
+                recovery_path = path.with_name(recovery_name)
+                recovery_cleanup = _read_managed_state_file_snapshot(
+                    user_home,
+                    recovery_path,
+                    parent_fd,
+                    expected_identity=before.file_identity,
+                )
+                if _managed_state_snapshot_matches_file_evidence(
+                    recovery_cleanup,
+                    before,
+                ):
+                    _isolate_and_delete_pending_cleanup_file(
+                        user_home,
+                        recovery_path,
+                        parent_fd,
+                        recovery_cleanup,
+                        label=f"scheduler config recovery evidence {path}",
                     )
             except (OSError, SyncError):
                 pass

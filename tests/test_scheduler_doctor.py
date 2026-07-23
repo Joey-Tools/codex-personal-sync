@@ -1251,6 +1251,101 @@ class SchedulerDoctorTests(unittest.TestCase):
         self.assertEqual(paths.systemd_timer.read_bytes(), original_timer)
         self.assertTrue(MODULE._scheduler_pair_transaction_path(paths).is_file())
 
+    def test_scheduler_exchange_never_restores_a_replaced_displaced_path(
+        self,
+    ) -> None:
+        paths = (
+            self.user_home
+            / "Library"
+            / "LaunchAgents"
+            / "com.openai.codex-personal-sync.plist",
+            self.user_home
+            / ".config"
+            / "systemd"
+            / "user"
+            / "codex-personal-sync.service",
+        )
+        for config_path in paths:
+            with self.subTest(path=config_path):
+                config_path.parent.mkdir(parents=True, exist_ok=True)
+                original = f"original:{config_path.name}\n".encode()
+                replacement = f"replacement:{config_path.name}\n".encode()
+                attacker = f"attacker:{config_path.name}\n".encode()
+                config_path.write_bytes(original)
+                config_path.chmod(0o600)
+                original_identity = (
+                    config_path.stat().st_dev,
+                    config_path.stat().st_ino,
+                )
+                expected = MODULE._scheduler_config_snapshot(config_path)
+                real_exchange = MODULE._rename_exchange_at
+                exchange_count = 0
+
+                def exchange_then_replace_displaced(
+                    first_parent_fd: int,
+                    first_name: str,
+                    second_parent_fd: int,
+                    second_name: str,
+                ) -> None:
+                    nonlocal exchange_count
+                    real_exchange(
+                        first_parent_fd,
+                        first_name,
+                        second_parent_fd,
+                        second_name,
+                    )
+                    exchange_count += 1
+                    if exchange_count == 1:
+                        displaced_path = config_path.with_name(first_name)
+                        displaced_path.unlink()
+                        displaced_path.write_bytes(attacker)
+                        displaced_path.chmod(0o600)
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_rename_exchange_at",
+                        side_effect=exchange_then_replace_displaced,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "trusted staged config remains live.*exact original "
+                        "is preserved",
+                    ),
+                ):
+                    MODULE._atomic_write_scheduler_config(
+                        config_path,
+                        replacement,
+                        expected_snapshot=expected,
+                    )
+
+                self.assertEqual(exchange_count, 1)
+                self.assertEqual(config_path.read_bytes(), replacement)
+                self.assertNotEqual(config_path.read_bytes(), attacker)
+                recovery_paths = list(
+                    config_path.parent.glob(
+                        f".{config_path.name}.personal-sync-write-*.original"
+                    )
+                )
+                self.assertEqual(len(recovery_paths), 1)
+                self.assertEqual(recovery_paths[0].read_bytes(), original)
+                self.assertEqual(
+                    (
+                        recovery_paths[0].stat().st_dev,
+                        recovery_paths[0].stat().st_ino,
+                    ),
+                    original_identity,
+                )
+                displaced_paths = [
+                    candidate
+                    for candidate in config_path.parent.glob(
+                        f".{config_path.name}.personal-sync-write-*"
+                    )
+                    if not candidate.name.endswith(".original")
+                ]
+                self.assertEqual(len(displaced_paths), 1)
+                self.assertEqual(displaced_paths[0].read_bytes(), attacker)
+
     def test_matching_scheduler_revalidates_semantic_audit_before_daemon(
         self,
     ) -> None:
