@@ -105,11 +105,6 @@ jobs:
             echo "::error title=Toolbox lock mismatch::The canonical source lock does not name the expected target repository."
             exit 1
           fi
-          jq -c \
-            --arg mirror "${MIRROR_NAME}" \
-            '[.mirrors[$mirror].files[], "generated-sync-source-lock.json"] | unique | sort' \
-            "${CANONICAL_ROOT}/sync-source-lock.json" >"${allowed_paths_file}"
-
           is_allowed_path() {
             local path="$1"
             jq -e --arg path "${path}" 'index($path) != null' \
@@ -145,6 +140,18 @@ jobs:
           git -C "${TARGET_ROOT}" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git_with_token -C "${TARGET_ROOT}" fetch --no-tags origin \
             "refs/heads/${TARGET_BASE}:refs/remotes/origin/${TARGET_BASE}"
+          git -C "${TARGET_ROOT}" switch --detach \
+            "refs/remotes/origin/${TARGET_BASE}"
+          python3 "${CANONICAL_ROOT}/scripts/sync_canonical_mirrors.py" \
+            managed-paths \
+            --target-root "${TARGET_ROOT}" \
+            --mirror "${MIRROR_NAME}" >"${allowed_paths_file}"
+          if ! jq -e \
+            'type == "array" and all(.[]; type == "string")' \
+            "${allowed_paths_file}" >/dev/null; then
+            echo "::error title=Invalid managed path scope::The canonical generator did not return a valid managed path list."
+            exit 1
+          fi
 
           remote_branch="$(
             git_with_token -C "${TARGET_ROOT}" ls-remote --heads origin \
@@ -403,7 +410,7 @@ jobs:
             echo "python3 scripts/sync_canonical_mirrors.py check --target-root <explicit-toolbox-checkout> --mirror ${MIRROR_NAME}"
             echo '```'
             echo
-            echo "Scope is limited to the \`${MIRROR_NAME}\` target paths declared by \`sync-source-lock.json\` plus \`generated-sync-source-lock.json\`. The workflow refuses unrelated branch, working-tree, staged, or PR changes and never writes directly to \`${TARGET_BASE}\`."
+            echo "Scope is limited to the current \`${MIRROR_NAME}\` targets plus clean retired paths proven by the prior committed \`generated-sync-source-lock.json\` receipt. The workflow refuses unrelated branch, working-tree, staged, or PR changes and never writes directly to \`${TARGET_BASE}\`."
             echo
             echo "Canonical automation source: \`${GITHUB_WORKFLOW}\` run \`${GITHUB_RUN_ID}\`."
           } >"${pr_body_file}"

@@ -207,9 +207,28 @@ class SyncToolboxAutomationTests(unittest.TestCase):
             self.workflow,
         )
         self.assertIn(
-            '.mirrors[$mirror].files[], "generated-sync-source-lock.json"',
+            "managed-paths",
             self.workflow,
         )
+        self.assertIn(
+            "clean retired paths proven by the prior committed",
+            self.workflow,
+        )
+        prepare = self._step_run("Prepare scoped sync branch")
+        detached_base = (
+            'git -C "${TARGET_ROOT}" switch --detach \\\n'
+            '  "refs/remotes/origin/${TARGET_BASE}"'
+        )
+        managed_paths = (
+            'sync_canonical_mirrors.py" \\\n'
+            "  managed-paths \\\n"
+            '  --target-root "${TARGET_ROOT}" \\\n'
+            '  --mirror "${MIRROR_NAME}" >"${allowed_paths_file}"'
+        )
+        self.assertIn(detached_base, prepare)
+        self.assertIn(managed_paths, prepare)
+        self.assertLess(prepare.index(detached_base), prepare.index(managed_paths))
+        self.assertLess(prepare.index(managed_paths), prepare.index("remote_branch="))
         self.assertIn(
             "jq -j '.[] | ., \"\\u0000\"'",
             self.workflow,

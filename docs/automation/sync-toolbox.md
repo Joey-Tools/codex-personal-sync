@@ -34,9 +34,17 @@ administrators must provision and rotate the secret outside this workflow.
 - The fixed target branch is `automation/canonical-personal-sync`. Updates use
   ordinary merge/fast-forward history and a normal push; there is no force
   push.
+- Before switching to the automation branch, the target is detached at the
+  freshly fetched target-base SHA. The canonical `managed-paths` command then
+  validates the prior committed receipt and returns the exact allowlist:
+  current toolbox targets, the receipt, and any clean receipt-bound paths that
+  the new mapping retires. Receipt digests plus target `HEAD`/stage-0
+  index/worktree parity must all agree; a consumer edit or forged/inconsistent
+  receipt fails before generation.
 - Existing branch history, working-tree changes, staged changes, and final PR
-  diff are restricted to the toolbox targets declared by
-  `sync-source-lock.json` plus `generated-sync-source-lock.json`.
+  diff are restricted to that generated allowlist. This permits an exact
+  canonical rename/removal while preventing the workflow from staging an
+  unrelated deletion.
 - Generated regular files are staged from their exact worktree bytes with
   `git hash-object --no-filters` and `git update-index --cacheinfo`; missing
   allowed paths use an explicit index removal. The commit is assembled from

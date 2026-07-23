@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -214,6 +215,189 @@ class MirrorGeneratorTests(unittest.TestCase):
             )
         self.assertEqual(self.source_path.read_bytes(), original_source)
 
+    def test_generate_conditionally_retires_a_renamed_receipt_target(self) -> None:
+        self._generate()
+        self._commit(self.target_root, "track first generated mirror")
+        old_target = self.target_root / "scripts" / "engine.py"
+        new_target = self.target_root / "generated" / "engine.py"
+
+        lock_path = self.canonical_root / MIRROR_MODULE.LOCK_PATH.as_posix()
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        lock["mirrors"]["toolbox"]["files"]["engine"] = "generated/engine.py"
+        lock_path.write_text(
+            json.dumps(lock, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.source_commit = self._commit(
+            self.canonical_root,
+            "rename generated target",
+        )
+
+        self.assertEqual(
+            {
+                path.as_posix()
+                for path in MIRROR_MODULE.managed_mirror_paths(
+                    self.canonical_root,
+                    self.target_root,
+                    "toolbox",
+                )
+            },
+            {
+                "generated-sync-source-lock.json",
+                "generated/engine.py",
+                "scripts/engine.py",
+            },
+        )
+        self.assertEqual(self._generate(), 1)
+        self.assertFalse(old_target.exists())
+        self.assertEqual(new_target.read_bytes(), self.source_path.read_bytes())
+        status = self._git(
+            self.target_root,
+            "status",
+            "--short",
+            "--untracked-files=all",
+        )
+        self.assertIn(b" D scripts/engine.py", status)
+        self.assertIn(b"?? generated/engine.py", status)
+        self._commit(self.target_root, "track renamed generated mirror")
+        self.assertEqual(
+            MIRROR_MODULE.check_mirror(
+                self.canonical_root,
+                self.target_root,
+                "toolbox",
+            ),
+            1,
+        )
+
+    def test_generate_conditionally_retires_a_removed_receipt_target(self) -> None:
+        extra_source = self.canonical_root / "scripts" / "extra.py"
+        extra_source.write_bytes(b"canonical extra\n")
+        extra_source.chmod(0o644)
+        lock_path = self.canonical_root / MIRROR_MODULE.LOCK_PATH.as_posix()
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        lock["sources"]["extra"] = {
+            "path": "scripts/extra.py",
+            "sha256": hashlib.sha256(extra_source.read_bytes()).hexdigest(),
+            "mode": "0644",
+        }
+        for mirror in lock["mirrors"].values():
+            mirror["files"]["extra"] = "scripts/extra.py"
+        lock_path.write_text(
+            json.dumps(lock, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.source_commit = self._commit(
+            self.canonical_root,
+            "add second generated target",
+        )
+        self._generate()
+        self._commit(self.target_root, "track two generated targets")
+        removed_target = self.target_root / "scripts" / "extra.py"
+
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        del lock["mirrors"]["toolbox"]["files"]["extra"]
+        lock_path.write_text(
+            json.dumps(lock, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.source_commit = self._commit(
+            self.canonical_root,
+            "retire second generated target",
+        )
+
+        self.assertEqual(self._generate(), 1)
+        self.assertFalse(removed_target.exists())
+        self.assertTrue((self.target_root / "scripts" / "engine.py").exists())
+
+    def test_generate_preserves_a_racing_retired_target_replacement(self) -> None:
+        self._generate()
+        self._commit(self.target_root, "track first generated mirror")
+        old_target = self.target_root / "scripts" / "engine.py"
+        lock_path = self.canonical_root / MIRROR_MODULE.LOCK_PATH.as_posix()
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        lock["mirrors"]["toolbox"]["files"]["engine"] = "generated/engine.py"
+        lock_path.write_text(
+            json.dumps(lock, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.source_commit = self._commit(
+            self.canonical_root,
+            "rename generated target",
+        )
+        real_remove = MIRROR_MODULE._atomic_remove_relative
+
+        def replace_before_remove(root, relative_path, expected_snapshot):
+            old_target.write_bytes(b"racing consumer replacement\n")
+            return real_remove(root, relative_path, expected_snapshot)
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_atomic_remove_relative",
+                side_effect=replace_before_remove,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "conditional retired target changed",
+            ),
+        ):
+            self._generate()
+        self.assertEqual(
+            old_target.read_bytes(),
+            b"racing consumer replacement\n",
+        )
+
+    def test_generate_recovers_after_a_retired_target_removal_crash(self) -> None:
+        class SimulatedCrash(BaseException):
+            pass
+
+        self._generate()
+        self._commit(self.target_root, "track first generated mirror")
+        old_target = self.target_root / "scripts" / "engine.py"
+        new_target = self.target_root / "generated" / "engine.py"
+        lock_path = self.canonical_root / MIRROR_MODULE.LOCK_PATH.as_posix()
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        lock["mirrors"]["toolbox"]["files"]["engine"] = "generated/engine.py"
+        lock_path.write_text(
+            json.dumps(lock, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.source_commit = self._commit(
+            self.canonical_root,
+            "rename generated target",
+        )
+        real_remove = MIRROR_MODULE._atomic_remove_relative
+        crashed = False
+
+        def crash_after_remove(root, relative_path, expected_snapshot):
+            nonlocal crashed
+            result = real_remove(root, relative_path, expected_snapshot)
+            if not crashed:
+                crashed = True
+                raise SimulatedCrash()
+            return result
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_atomic_remove_relative",
+                side_effect=crash_after_remove,
+            ),
+            self.assertRaises(SimulatedCrash),
+        ):
+            self._generate()
+        self.assertFalse(old_target.exists())
+        self.assertTrue(new_target.exists())
+        self.assertTrue(
+            (self.target_root / MIRROR_MODULE.TRANSACTION_PATH.as_posix()).exists()
+        )
+
+        self.assertEqual(self._generate(), 1)
+        self.assertFalse(old_target.exists())
+        self.assertFalse(
+            (self.target_root / MIRROR_MODULE.TRANSACTION_PATH.as_posix()).exists()
+        )
+
     def test_generate_preserves_dirty_consumer_mirror_edits(self) -> None:
         self._generate()
         self._commit(self.target_root, "track generated mirror")
@@ -253,7 +437,12 @@ class MirrorGeneratorTests(unittest.TestCase):
         real_require_index = MIRROR_MODULE._require_same_target_index
         checks = 0
 
-        def inject_index_drift(target_root, mirror, expected):
+        def inject_index_drift(
+            target_root,
+            mirror,
+            expected,
+            additional_paths=frozenset(),
+        ):
             nonlocal checks
             checks += 1
             if checks == 2:
@@ -275,7 +464,12 @@ class MirrorGeneratorTests(unittest.TestCase):
                     "--cacheinfo",
                     f"100755,{object_id},scripts/engine.py",
                 )
-            return real_require_index(target_root, mirror, expected)
+            return real_require_index(
+                target_root,
+                mirror,
+                expected,
+                additional_paths,
+            )
 
         with (
             mock.patch.object(
@@ -1586,6 +1780,107 @@ class MirrorGeneratorTests(unittest.TestCase):
         finally:
             MIRROR_MODULE._finish_bound_roots(bound_root)
 
+    def test_git_child_rejects_transient_loose_object_tampering(self) -> None:
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            assert bound_root.git_control is not None
+            private_objects = bound_root.git_control.private_path / "objects"
+            loose_objects = [
+                path
+                for path in private_objects.rglob("*")
+                if (
+                    path.is_file()
+                    and re.fullmatch(r"[0-9a-f]{2}", path.parent.name)
+                    and re.fullmatch(r"[0-9a-f]{38}", path.name)
+                )
+            ]
+            self.assertTrue(loose_objects)
+            object_path = loose_objects[0]
+            original = object_path.read_bytes()
+            original_mode = stat.S_IMODE(object_path.stat().st_mode)
+            real_collect = MIRROR_MODULE._collect_bounded_git_output
+
+            def tamper_while_child_runs(process, operation=None):
+                object_path.chmod(0o644)
+                mutated = bytes([original[0] ^ 0x01]) + original[1:]
+                object_path.write_bytes(mutated)
+                try:
+                    return real_collect(process, operation)
+                finally:
+                    object_path.write_bytes(original)
+                    object_path.chmod(original_mode)
+
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_collect_bounded_git_output",
+                    side_effect=tamper_while_child_runs,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "object snapshot content-stability proof was invalidated",
+                ),
+            ):
+                MIRROR_MODULE._run_git(
+                    bound_root,
+                    "rev-parse",
+                    "--verify",
+                    "HEAD^{commit}",
+                )
+        finally:
+            # The deliberately invalidated binding must not be reaccepted merely
+            # because the bytes were restored after the child. Close directly so
+            # the private snapshot can be removed without claiming revalidation.
+            MIRROR_MODULE._close_bound_root(bound_root)
+
+    def test_git_child_rejects_transient_packed_object_tampering(self) -> None:
+        self._git(self.target_root, "gc", "--prune=now")
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            assert bound_root.git_control is not None
+            pack_files = sorted(
+                (bound_root.git_control.private_path / "objects" / "pack").glob(
+                    "*.pack"
+                )
+            )
+            self.assertTrue(pack_files)
+            pack_path = pack_files[0]
+            original = pack_path.read_bytes()
+            original_mode = stat.S_IMODE(pack_path.stat().st_mode)
+            real_collect = MIRROR_MODULE._collect_bounded_git_output
+
+            def tamper_while_child_runs(process, operation=None):
+                pack_path.chmod(0o644)
+                mutated = bytes([original[0] ^ 0x01]) + original[1:]
+                pack_path.write_bytes(mutated)
+                try:
+                    return real_collect(process, operation)
+                finally:
+                    pack_path.write_bytes(original)
+                    pack_path.chmod(original_mode)
+
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_collect_bounded_git_output",
+                    side_effect=tamper_while_child_runs,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "object snapshot content-stability proof was invalidated",
+                ),
+            ):
+                MIRROR_MODULE._run_git(
+                    bound_root,
+                    "rev-parse",
+                    "--verify",
+                    "HEAD^{commit}",
+                )
+        finally:
+            MIRROR_MODULE._close_bound_root(bound_root)
+
     def test_private_git_snapshot_ignores_ambient_tmpdir_and_rejects_overlap(
         self,
     ) -> None:
@@ -2689,6 +2984,74 @@ class MirrorGeneratorTests(unittest.TestCase):
         )
         self.assertFalse(absent_temp.exists())
 
+    def test_exchange_journal_recovers_retired_target_removal_states(self) -> None:
+        target_path = MIRROR_MODULE.PurePosixPath("retired-crash.txt")
+        target = self.target_root / target_path.as_posix()
+        target.write_bytes(b"receipt-bound bytes\n")
+        expected = MIRROR_MODULE._safe_read_snapshot(
+            self.target_root,
+            target_path,
+        )
+        temporary_name = f".{target_path.name}.tmp-{os.getpid()}-0123456789abcdef"
+        root_fd = os.open(self.target_root, os.O_RDONLY)
+        try:
+            MIRROR_MODULE._write_exchange_journal(
+                root_fd,
+                target_path,
+                temporary_name,
+                expected,
+                None,
+            )
+            MIRROR_MODULE._rename_directory_entry_noreplace(
+                root_fd,
+                target_path.name,
+                temporary_name,
+            )
+            os.fsync(root_fd)
+        finally:
+            os.close(root_fd)
+
+        MIRROR_MODULE._recover_exchange_journal(
+            self.target_root,
+            target_path,
+        )
+        self.assertEqual(target.read_bytes(), expected.payload)
+        self.assertFalse((self.target_root / temporary_name).exists())
+
+        expected = MIRROR_MODULE._safe_read_snapshot(
+            self.target_root,
+            target_path,
+        )
+        root_fd = os.open(self.target_root, os.O_RDONLY)
+        try:
+            MIRROR_MODULE._write_exchange_journal(
+                root_fd,
+                target_path,
+                temporary_name,
+                expected,
+                None,
+            )
+            MIRROR_MODULE._rename_directory_entry_noreplace(
+                root_fd,
+                target_path.name,
+                temporary_name,
+            )
+            os.unlink(temporary_name, dir_fd=root_fd)
+            os.fsync(root_fd)
+        finally:
+            os.close(root_fd)
+
+        MIRROR_MODULE._recover_exchange_journal(
+            self.target_root,
+            target_path,
+        )
+        self.assertFalse(target.exists())
+        self.assertFalse(
+            (
+                self.target_root / MIRROR_MODULE._exchange_journal_name(target_path)
+            ).exists()
+        )
+
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are unavailable")
     def test_generate_rejects_symlink_ancestor(self) -> None:
         outside = self.root / "outside"
@@ -2721,11 +3084,13 @@ class MirrorGeneratorTests(unittest.TestCase):
 
         self.assertEqual(outside.read_bytes(), b"outside\n")
 
-    def test_check_and_generate_require_explicit_target_and_mirror(self) -> None:
+    def test_mirror_commands_require_explicit_target_and_mirror(self) -> None:
         parser = MIRROR_MODULE.build_parser()
         for argv in (
             ["check", "--mirror", "toolbox"],
             ["check", "--target-root", str(self.target_root)],
+            ["managed-paths", "--mirror", "toolbox"],
+            ["managed-paths", "--target-root", str(self.target_root)],
             ["generate", "--mirror", "toolbox"],
             ["generate", "--target-root", str(self.target_root)],
             [

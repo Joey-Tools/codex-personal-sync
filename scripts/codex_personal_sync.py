@@ -10,7 +10,7 @@ import contextlib
 from contextvars import ContextVar
 import ctypes
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 from graphlib import CycleError, TopologicalSorter
 import gzip
@@ -21295,6 +21295,54 @@ def install_scheduler(
     selected_platform = _scheduler_platform(platform_name)
     runner_path = _scheduler_runner(home, runner)
     paths = _scheduler_paths(selected_platform, home)
+    if dry_run:
+        _install_scheduler_transaction(
+            home,
+            repo,
+            interval_minutes,
+            selected_platform,
+            runner_path,
+            paths,
+            dry_run=True,
+            enable=enable,
+            mode=mode,
+            base_repo=base_repo,
+            owner=owner,
+        )
+        return
+    # Preserve the no-write failure behavior for an unusable runner, then
+    # revalidate the same property inside the transaction lock below.
+    _validate_scheduler_runner(runner_path, dry_run=False)
+    with installation_lock(home):
+        _install_scheduler_transaction(
+            home,
+            repo,
+            interval_minutes,
+            selected_platform,
+            runner_path,
+            paths,
+            dry_run=False,
+            enable=enable,
+            mode=mode,
+            base_repo=base_repo,
+            owner=owner,
+        )
+
+
+def _install_scheduler_transaction(
+    home: Path,
+    repo: str,
+    interval_minutes: int | None,
+    selected_platform: str,
+    runner_path: Path,
+    paths: SchedulerPaths,
+    *,
+    dry_run: bool,
+    enable: bool,
+    mode: str,
+    base_repo: str,
+    owner: str,
+) -> None:
     _recover_scheduler_pair_transaction(paths, dry_run=dry_run)
     _validate_scheduler_runner(runner_path, dry_run=dry_run)
     config_audit = _audit_scheduler_config(paths)
@@ -21505,6 +21553,33 @@ def uninstall_scheduler(
     home = home.expanduser()
     selected_platform = _scheduler_platform(platform_name)
     paths = _scheduler_paths(selected_platform, home)
+    if dry_run:
+        _uninstall_scheduler_transaction(
+            home,
+            selected_platform,
+            paths,
+            dry_run=True,
+            disable=disable,
+        )
+        return
+    with installation_lock(home):
+        _uninstall_scheduler_transaction(
+            home,
+            selected_platform,
+            paths,
+            dry_run=False,
+            disable=disable,
+        )
+
+
+def _uninstall_scheduler_transaction(
+    home: Path,
+    selected_platform: str,
+    paths: SchedulerPaths,
+    *,
+    dry_run: bool,
+    disable: bool,
+) -> None:
     _recover_scheduler_pair_transaction(paths, dry_run=dry_run)
     if selected_platform == "macos":
         assert paths.launchd_plist is not None
@@ -22570,6 +22645,131 @@ def _scheduler_runtime_payload(
     }
 
 
+def _next_scheduler_attempt(previous: dict[str, Any] | None) -> str:
+    """Return a canonical UTC attempt timestamp newer than the recorded one."""
+    selected = datetime.now(timezone.utc)
+    previous_attempt = (
+        previous.get("last_attempt")
+        if previous is not None
+        else None
+    )
+    if isinstance(previous_attempt, str):
+        try:
+            previous_time = datetime.fromisoformat(previous_attempt)
+        except ValueError:
+            previous_time = None
+        if previous_time is not None:
+            if previous_time.tzinfo is None:
+                previous_time = previous_time.replace(tzinfo=timezone.utc)
+            else:
+                previous_time = previous_time.astimezone(timezone.utc)
+            if previous_time >= selected:
+                selected = previous_time + timedelta(microseconds=1)
+    attempt = selected.isoformat()
+    if attempt == previous_attempt:
+        attempt = (selected + timedelta(microseconds=1)).isoformat()
+    return attempt
+
+
+def _scheduler_runtime_target_matches(
+    state: dict[str, Any],
+    *,
+    mode: str,
+    repo: str,
+    base_repo: str | None,
+    owner: str | None,
+) -> bool:
+    return (
+        state.get("mode") == mode
+        and state.get("repo") == repo
+        and state.get("base_repo") == base_repo
+        and state.get("owner") == owner
+    )
+
+
+def _begin_scheduler_attempt(
+    home: Path,
+    *,
+    mode: str,
+    repo: str,
+    base_repo: str | None,
+    owner: str | None,
+) -> str:
+    # The existing per-Codex-home install lock is the scheduler-state compare
+    # and swap boundary. It makes attempt allocation monotonic across processes
+    # without holding a global lock during network or installation work.
+    with installation_lock(home):
+        previous = _read_scheduler_runtime_state(home)
+        attempt = _next_scheduler_attempt(previous)
+        _write_scheduler_runtime_state(
+            home,
+            _scheduler_runtime_payload(
+                previous=previous,
+                attempt=attempt,
+                success=False,
+                failure_reason="scheduled sync did not complete",
+                failure_code="scheduled-sync-incomplete",
+                mode=mode,
+                repo=repo,
+                base_repo=base_repo,
+                owner=owner,
+            ),
+        )
+    return attempt
+
+
+def _complete_scheduler_attempt(
+    home: Path,
+    *,
+    attempt: str,
+    success: bool,
+    failure_reason: str | None,
+    failure_code: str | None,
+    release_trees: dict[str, dict[str, str]] | None = None,
+    mode: str,
+    repo: str,
+    base_repo: str | None,
+    owner: str | None,
+) -> bool:
+    # Compare and publish while holding the same per-home lock used to allocate
+    # attempts. A completion from an older overlapping run never replaces the
+    # state of the currently recorded attempt.
+    with installation_lock(home):
+        current = _read_scheduler_runtime_state(home)
+        if (
+            current is None
+            or current.get("last_attempt") != attempt
+            or not _scheduler_runtime_target_matches(
+                current,
+                mode=mode,
+                repo=repo,
+                base_repo=base_repo,
+                owner=owner,
+            )
+        ):
+            print(
+                "scheduled sync attempt was superseded; "
+                f"left newer runtime state unchanged: {attempt}"
+            )
+            return False
+        _write_scheduler_runtime_state(
+            home,
+            _scheduler_runtime_payload(
+                previous=current,
+                attempt=attempt,
+                success=success,
+                failure_reason=failure_reason,
+                failure_code=failure_code,
+                release_trees=release_trees,
+                mode=mode,
+                repo=repo,
+                base_repo=base_repo,
+                owner=owner,
+            ),
+        )
+    return True
+
+
 def _capture_scheduler_release_trees(
     home: Path,
     *,
@@ -22623,21 +22823,12 @@ def run_scheduled(
     else:
         effective_base_repo = repo
         effective_owner = PUBLIC_OWNER
-    previous = _read_scheduler_runtime_state(home)
-    attempt = datetime.now(timezone.utc).isoformat()
-    _write_scheduler_runtime_state(
+    attempt = _begin_scheduler_attempt(
         home,
-        _scheduler_runtime_payload(
-            previous=previous,
-            attempt=attempt,
-            success=False,
-            failure_reason="scheduled sync did not complete",
-            failure_code="scheduled-sync-incomplete",
-            mode=mode,
-            repo=repo,
-            base_repo=effective_base_repo,
-            owner=effective_owner,
-        ),
+        mode=mode,
+        repo=repo,
+        base_repo=effective_base_repo,
+        owner=effective_owner,
     )
     try:
         if mode == "public":
@@ -22656,35 +22847,29 @@ def run_scheduled(
             owner=owner,
         )
     except SyncError as error:
-        _write_scheduler_runtime_state(
+        _complete_scheduler_attempt(
             home,
-            _scheduler_runtime_payload(
-                previous=previous,
-                attempt=attempt,
-                success=False,
-                failure_reason=str(error)[:4096],
-                failure_code=error.code,
-                mode=mode,
-                repo=repo,
-                base_repo=effective_base_repo,
-                owner=effective_owner,
-            ),
-        )
-        raise
-    _write_scheduler_runtime_state(
-        home,
-        _scheduler_runtime_payload(
-            previous=previous,
             attempt=attempt,
-            success=True,
-            failure_reason=None,
-            failure_code=None,
-            release_trees=release_trees,
+            success=False,
+            failure_reason=str(error)[:4096],
+            failure_code=error.code,
             mode=mode,
             repo=repo,
             base_repo=effective_base_repo,
             owner=effective_owner,
-        ),
+        )
+        raise
+    _complete_scheduler_attempt(
+        home,
+        attempt=attempt,
+        success=True,
+        failure_reason=None,
+        failure_code=None,
+        release_trees=release_trees,
+        mode=mode,
+        repo=repo,
+        base_repo=effective_base_repo,
+        owner=effective_owner,
     )
 
 

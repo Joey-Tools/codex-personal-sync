@@ -183,6 +183,7 @@ class GitControlBinding:
     private_name: str
     private_path: Path
     private_manifest: tuple[tuple[object, ...], ...]
+    private_objects_manifest: tuple[tuple[object, ...], ...]
     owner_record: ControlObjectBinding
     owner_record_name: str
     owner_nonce: str
@@ -931,6 +932,215 @@ def _scan_private_git_control(
         operation,
         skip_descendants=frozenset({PRIVATE_OBJECTS_PATH}),
     )
+
+
+def _private_object_content_signal(
+    metadata: os.stat_result,
+) -> tuple[object, ...]:
+    # Unlike mutable directory timestamps, the selected timestamps on a
+    # private object file are change signals for the protected content-stability
+    # property. Git is only allowed to read this private snapshot. A timestamp
+    # change therefore invalidates the proof even if a later read happens to
+    # recover the original bytes; it is not reported as proof of a byte mismatch.
+    return (
+        _object_identity(metadata),
+        _access_policy(metadata),
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _inventory_private_git_objects(
+    objects_fd: int,
+    operation: OperationBudget | None,
+    *,
+    bind_content: bool,
+) -> tuple[tuple[object, ...], ...]:
+    records: list[tuple[object, ...]] = []
+    budget = {"entries": 0, "bytes": 0}
+
+    def visit(directory_fd: int, prefix: PurePosixPath) -> None:
+        _operation_checkpoint(
+            operation,
+            f"binding private Git object snapshot {prefix}",
+        )
+        try:
+            names = sorted(os.listdir(directory_fd))
+        except OSError as error:
+            raise MirrorSyncError(
+                f"cannot inventory private Git object directory {prefix}: {error}"
+            ) from error
+        for name in names:
+            if not isinstance(name, str) or name in {"", ".", ".."} or "/" in name:
+                raise MirrorSyncError(
+                    f"private Git object directory has an unsafe entry: {name!r}"
+                )
+            relative_path = prefix / name
+            budget["entries"] += 1
+            _consume_operation_budget(
+                operation,
+                entry_count=1,
+                label=f"binding private Git object entry {relative_path}",
+            )
+            if budget["entries"] > MAX_GIT_SNAPSHOT_ENTRIES:
+                raise MirrorSyncError(
+                    "private Git object snapshot exceeds its entry limit"
+                )
+            try:
+                path_metadata = os.stat(
+                    name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise MirrorSyncError(
+                    f"cannot inspect private Git object {relative_path}: {error}"
+                ) from error
+            if stat.S_ISDIR(path_metadata.st_mode):
+                try:
+                    child_fd = os.open(
+                        name,
+                        _DIRECTORY_FLAGS,
+                        dir_fd=directory_fd,
+                    )
+                except OSError as error:
+                    raise MirrorSyncError(
+                        f"cannot open private Git object directory "
+                        f"{relative_path}: {error}"
+                    ) from error
+                try:
+                    opened_metadata = os.fstat(child_fd)
+                    if _object_identity(path_metadata) != _object_identity(
+                        opened_metadata
+                    ) or _access_policy(path_metadata) != _access_policy(
+                        opened_metadata
+                    ):
+                        raise MirrorSyncError(
+                            "private Git object directory was replaced while "
+                            f"binding it: {relative_path}"
+                        )
+                    records.append(
+                        (
+                            "directory",
+                            relative_path.as_posix(),
+                            _object_identity(opened_metadata),
+                            _access_policy(opened_metadata),
+                        )
+                    )
+                    visit(child_fd, relative_path)
+                finally:
+                    os.close(child_fd)
+                continue
+            if not stat.S_ISREG(path_metadata.st_mode):
+                raise MirrorSyncError(
+                    "private Git object entry is not a regular file/directory: "
+                    f"{relative_path}"
+                )
+            try:
+                file_fd = os.open(
+                    name,
+                    _FILE_READ_FLAGS,
+                    dir_fd=directory_fd,
+                )
+            except OSError as error:
+                raise MirrorSyncError(
+                    f"cannot open private Git object file {relative_path}: {error}"
+                ) from error
+            try:
+                opened_metadata = os.fstat(file_fd)
+                if _object_identity(path_metadata) != _object_identity(
+                    opened_metadata
+                ) or _access_policy(path_metadata) != _access_policy(opened_metadata):
+                    raise MirrorSyncError(
+                        "private Git object file was replaced while binding it: "
+                        f"{relative_path}"
+                    )
+                signal = _private_object_content_signal(opened_metadata)
+                digest: bytes | None = None
+                if bind_content:
+                    remaining = MAX_GIT_SNAPSHOT_BYTES - budget["bytes"]
+                    if remaining <= 0:
+                        raise MirrorSyncError(
+                            "private Git object snapshot exceeds its byte limit"
+                        )
+                    payload, _bound_metadata = _read_git_snapshot_file(
+                        file_fd,
+                        PRIVATE_OBJECTS_PATH / relative_path,
+                        remaining,
+                    )
+                    final_metadata = os.fstat(file_fd)
+                    if _private_object_content_signal(final_metadata) != signal:
+                        raise MirrorSyncError(
+                            "private Git object content-stability proof was "
+                            f"invalidated while binding it: {relative_path}"
+                        )
+                    budget["bytes"] += len(payload)
+                    _consume_operation_budget(
+                        operation,
+                        byte_count=len(payload),
+                        label=f"binding private Git object {relative_path}",
+                    )
+                    digest = hashlib.sha256(payload).digest()
+                records.append(
+                    (
+                        "file",
+                        relative_path.as_posix(),
+                        *signal,
+                        digest,
+                    )
+                )
+            finally:
+                os.close(file_fd)
+
+    visit(objects_fd, PurePosixPath())
+    return tuple(records)
+
+
+def _object_manifest_without_digests(
+    manifest: tuple[tuple[object, ...], ...],
+) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        record[:-1] + (None,) if record[0] == "file" else record for record in manifest
+    )
+
+
+def _bind_private_git_objects_manifest(
+    objects_fd: int,
+    operation: OperationBudget | None,
+) -> tuple[tuple[object, ...], ...]:
+    manifest = _inventory_private_git_objects(
+        objects_fd,
+        operation,
+        bind_content=True,
+    )
+    observed = _inventory_private_git_objects(
+        objects_fd,
+        operation,
+        bind_content=False,
+    )
+    if observed != _object_manifest_without_digests(manifest):
+        raise MirrorSyncError(
+            "private Git object snapshot changed while binding its content"
+        )
+    return manifest
+
+
+def _revalidate_private_git_objects(
+    objects_fd: int,
+    expected: tuple[tuple[object, ...], ...],
+    operation: OperationBudget | None,
+) -> None:
+    observed = _inventory_private_git_objects(
+        objects_fd,
+        operation,
+        bind_content=False,
+    )
+    if observed != _object_manifest_without_digests(expected):
+        raise MirrorSyncError(
+            "private Git object snapshot content-stability proof was "
+            "invalidated before transaction completion"
+        )
 
 
 def _replace_private_control_file(
@@ -1759,6 +1969,11 @@ def _revalidate_private_git_control(
     _revalidate_control_object(root, binding.private_parent)
     _revalidate_control_object(root, binding.private)
     _revalidate_control_object(root, binding.private_objects)
+    _revalidate_private_git_objects(
+        binding.private_objects.fd,
+        binding.private_objects_manifest,
+        root.operation,
+    )
     observed = _scan_private_git_control(
         binding.private.fd,
         root.operation,
@@ -3179,7 +3394,7 @@ def _write_exchange_journal(
     relative_path: PurePosixPath,
     temporary_name: str,
     expected_snapshot: FileSnapshot | None,
-    replacement_snapshot: FileSnapshot,
+    replacement_snapshot: FileSnapshot | None,
 ) -> tuple[str, FileSnapshot]:
     journal_name = _exchange_journal_name(relative_path)
     document = {
@@ -3189,7 +3404,11 @@ def _write_exchange_journal(
         "expected": (
             None if expected_snapshot is None else _snapshot_record(expected_snapshot)
         ),
-        "replacement": _snapshot_record(replacement_snapshot),
+        "replacement": (
+            None
+            if replacement_snapshot is None
+            else _snapshot_record(replacement_snapshot)
+        ),
     }
     payload = (
         json.dumps(
@@ -3341,7 +3560,34 @@ def _recover_exchange_journal(
             temporary_snapshot,
             document["replacement"],
         )
-        if expected_is_absent and target_is_replacement and temporary_is_replacement:
+        removing_target = document["replacement"] is None
+        if removing_target:
+            if expected_is_absent:
+                raise MirrorSyncError(
+                    f"exchange removal journal has no expected target: {relative_path}"
+                )
+            if target_is_expected and temporary_snapshot is None:
+                pass
+            elif target_snapshot is None and temporary_is_expected:
+                assert temporary_snapshot is not None
+                _rename_directory_entry_noreplace(
+                    parent_fd,
+                    temporary_name,
+                    relative_path.name,
+                )
+                os.fsync(parent_fd)
+                if _safe_read_snapshot(root, relative_path) != temporary_snapshot:
+                    raise MirrorSyncError(
+                        f"removed target changed while restoring it: {relative_path}"
+                    )
+            elif target_snapshot is None and temporary_snapshot is None:
+                pass
+            else:
+                raise MirrorSyncError(
+                    f"exchange removal recovery state is ambiguous; preserving "
+                    f"artifacts: {relative_path}"
+                )
+        elif expected_is_absent and target_is_replacement and temporary_is_replacement:
             _remove_exchange_artifact(
                 parent_fd,
                 temporary_name,
@@ -3696,6 +3942,98 @@ def _atomic_write_relative(
             except MirrorSyncError:
                 # Ambiguous recovery artifacts are intentionally preserved.
                 pass
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        if close_root:
+            os.close(root_fd)
+
+
+def _atomic_remove_relative(
+    root: Root,
+    relative_path: PurePosixPath,
+    expected_snapshot: FileSnapshot,
+) -> None:
+    _recover_exchange_journal(root, relative_path)
+    if _safe_read_snapshot(root, relative_path) != expected_snapshot:
+        raise MirrorSyncError(
+            f"conditional retired target changed before removal: {relative_path}"
+        )
+    root_fd, close_root = _borrow_root_fd(root)
+    parent_fd = -1
+    try:
+        parent_fd = _open_parent_directory(
+            root_fd,
+            relative_path,
+            create=False,
+            bound_root=root if isinstance(root, BoundRoot) else None,
+        )
+        _validate_target_leaf(parent_fd, relative_path)
+        temporary_name = (
+            f".{relative_path.name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+        )
+        journal_name, journal_snapshot = _write_exchange_journal(
+            parent_fd,
+            relative_path,
+            temporary_name,
+            expected_snapshot,
+            None,
+        )
+        journal_path = relative_path.parent / journal_name
+        if (
+            _safe_read_snapshot(root, relative_path) != expected_snapshot
+            or _safe_read_snapshot(root, journal_path) != journal_snapshot
+        ):
+            raise MirrorSyncError(
+                f"retired target or removal journal changed before isolation: "
+                f"{relative_path}"
+            )
+        try:
+            _rename_directory_entry_noreplace(
+                parent_fd,
+                relative_path.name,
+                temporary_name,
+            )
+            os.fsync(parent_fd)
+        except OSError as error:
+            raise MirrorSyncError(
+                f"cannot isolate retired target before removal: "
+                f"{relative_path}: {error}"
+            ) from error
+        temporary_path = relative_path.parent / temporary_name
+        moved = _safe_read_snapshot(root, temporary_path)
+        if (
+            moved != expected_snapshot
+            or _optional_safe_read_snapshot(root, relative_path) is not None
+            or _safe_read_snapshot(root, journal_path) != journal_snapshot
+        ):
+            raise MirrorSyncError(
+                f"retired target changed during conditional isolation: {relative_path}"
+            )
+        try:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except OSError as error:
+            raise MirrorSyncError(
+                f"cannot remove isolated retired target; preserving "
+                f"{temporary_path}: {error}"
+            ) from error
+        if _optional_safe_read_snapshot(root, relative_path) is not None:
+            raise MirrorSyncError(
+                f"retired target reappeared after removal: {relative_path}"
+            )
+        if _safe_read_snapshot(root, journal_path) != journal_snapshot:
+            raise MirrorSyncError(
+                f"retired target removal journal changed before cleanup: "
+                f"{relative_path}"
+            )
+        _remove_exchange_artifact(
+            parent_fd,
+            journal_name,
+            relative_path,
+            journal_snapshot,
+        )
+        os.fsync(parent_fd)
+    finally:
         if parent_fd >= 0:
             os.close(parent_fd)
         if close_root:
@@ -4252,6 +4590,7 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
     private_parent: ControlObjectBinding | None = None
     private_name: str | None = None
     private_manifest: tuple[tuple[object, ...], ...] = ()
+    private_objects_manifest: tuple[tuple[object, ...], ...] = ()
     source_files: tuple[ControlObjectBinding, ...] = ()
     source_directories: tuple[ControlObjectBinding, ...] = ()
     source_absences: tuple[ControlAbsenceBinding, ...] = ()
@@ -4335,6 +4674,10 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
         )
         if private_objects is None:
             raise MirrorSyncError("private Git object directory is missing")
+        private_objects_manifest = _bind_private_git_objects_manifest(
+            private_objects.fd,
+            root.operation,
+        )
         (
             source_files,
             source_directories,
@@ -4370,6 +4713,7 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
             private_name=private_name,
             private_path=private_path,
             private_manifest=private_manifest,
+            private_objects_manifest=private_objects_manifest,
             owner_record=owner_record,
             owner_record_name=owner_record_name,
             owner_nonce=owner_nonce,
@@ -4893,6 +5237,7 @@ def _control_path_below_root(
 def _reject_git_control_targets(
     target_root: BoundRoot,
     mirror: MirrorSpec,
+    additional_paths: set[PurePosixPath] | frozenset[PurePosixPath] = frozenset(),
 ) -> None:
     _ensure_git_control_binding(target_root)
     assert target_root.git_control is not None
@@ -4907,7 +5252,7 @@ def _reject_git_control_targets(
         for binding in controls
         if (path := _control_path_below_root(target_root, binding)) is not None
     ]
-    for target_path in mirror.files.values():
+    for target_path in {*mirror.files.values(), *additional_paths}:
         if target_path.parts[0].casefold() == ".git" or any(
             _paths_overlap(target_path, control_path) for control_path in protected
         ):
@@ -4916,62 +5261,75 @@ def _reject_git_control_targets(
             )
 
 
+def _target_clean_snapshot(
+    target_root: BoundRoot,
+    path: PurePosixPath,
+    head_commit: str,
+) -> FileSnapshot | None:
+    snapshot = _optional_safe_read_snapshot(target_root, path)
+    index_entry = _git_index_entry(
+        target_root,
+        path,
+    )
+    head_entry = _git_tree_entry(
+        target_root,
+        head_commit,
+        path,
+    )
+    if index_entry is None:
+        if snapshot is not None or head_entry is not None:
+            raise MirrorSyncError(
+                f"target managed path is dirty or untracked relative to "
+                f"HEAD/index/worktree: {path}"
+            )
+        return None
+    if head_entry != index_entry:
+        raise MirrorSyncError(f"target managed index differs from HEAD: {path}")
+    if snapshot is None:
+        raise MirrorSyncError(
+            f"target managed path is dirty or untracked because its "
+            f"stage-0 entry is missing from the worktree: {path}"
+        )
+    index_payload = _git_blob_payload(
+        target_root,
+        index_entry.object_id,
+        path,
+    )
+    if snapshot.payload != index_payload or snapshot.mode != index_entry.mode:
+        raise MirrorSyncError(
+            f"target managed path is dirty or untracked relative to its "
+            f"clean index entry: {path}"
+        )
+    return snapshot
+
+
 def _target_managed_snapshots(
     target_root: BoundRoot,
     mirror: MirrorSpec,
+    additional_paths: set[PurePosixPath] | frozenset[PurePosixPath] = frozenset(),
 ) -> dict[PurePosixPath, FileSnapshot | None]:
     paths = sorted(
-        {RECEIPT_PATH, *mirror.files.values()},
+        {RECEIPT_PATH, *mirror.files.values(), *additional_paths},
         key=PurePosixPath.as_posix,
     )
     head_commit = _current_commit(target_root)
     snapshots: dict[PurePosixPath, FileSnapshot | None] = {}
     for path in paths:
-        snapshot = _optional_safe_read_snapshot(target_root, path)
-        index_entry = _git_index_entry(
+        snapshots[path] = _target_clean_snapshot(
             target_root,
             path,
-        )
-        head_entry = _git_tree_entry(
-            target_root,
             head_commit,
-            path,
         )
-        if index_entry is None:
-            if snapshot is not None or head_entry is not None:
-                raise MirrorSyncError(
-                    f"target managed path is dirty or untracked relative to "
-                    f"HEAD/index/worktree: {path}"
-                )
-            snapshots[path] = None
-            continue
-        if head_entry != index_entry:
-            raise MirrorSyncError(f"target managed index differs from HEAD: {path}")
-        if snapshot is None:
-            raise MirrorSyncError(
-                f"target managed path is dirty or untracked because its "
-                f"stage-0 entry is missing from the worktree: {path}"
-            )
-        index_payload = _git_blob_payload(
-            target_root,
-            index_entry.object_id,
-            path,
-        )
-        if snapshot.payload != index_payload or snapshot.mode != index_entry.mode:
-            raise MirrorSyncError(
-                f"target managed path is dirty or untracked relative to its "
-                f"clean index entry: {path}"
-            )
-        snapshots[path] = snapshot
     return snapshots
 
 
 def _require_target_head_index_parity(
     target_root: BoundRoot,
     mirror: MirrorSpec,
+    additional_paths: set[PurePosixPath] | frozenset[PurePosixPath] = frozenset(),
 ) -> None:
     head_commit = _current_commit(target_root)
-    for path in _mirror_managed_paths(mirror):
+    for path in _mirror_managed_paths(mirror, additional_paths):
         if _git_index_entry(target_root, path) != _git_tree_entry(
             target_root,
             head_commit,
@@ -4985,9 +5343,10 @@ def _require_target_head_index_parity(
 def _target_index_snapshot(
     target_root: BoundRoot,
     mirror: MirrorSpec,
+    additional_paths: set[PurePosixPath] | frozenset[PurePosixPath] = frozenset(),
 ) -> bytes:
     paths = sorted(
-        {RECEIPT_PATH, *mirror.files.values()},
+        {RECEIPT_PATH, *mirror.files.values(), *additional_paths},
         key=PurePosixPath.as_posix,
     )
     return _run_git(
@@ -5005,8 +5364,9 @@ def _require_same_target_index(
     target_root: BoundRoot,
     mirror: MirrorSpec,
     expected: bytes,
+    additional_paths: set[PurePosixPath] | frozenset[PurePosixPath] = frozenset(),
 ) -> None:
-    if _target_index_snapshot(target_root, mirror) != expected:
+    if _target_index_snapshot(target_root, mirror, additional_paths) != expected:
         raise MirrorSyncError("target managed stage-0 index changed during generation")
 
 
@@ -5022,20 +5382,34 @@ def _snapshot_matches_desired(
     snapshot: FileSnapshot | None,
     record: object,
 ) -> bool:
+    if record is None:
+        return snapshot is None
     if snapshot is None or not isinstance(record, dict):
         return False
     return record == _desired_file_record(snapshot.payload, snapshot.mode)
 
 
-def _mirror_managed_paths(mirror: MirrorSpec) -> list[PurePosixPath]:
+def _desired_path_record(
+    desired: tuple[bytes, int] | None,
+) -> dict[str, object] | None:
+    return None if desired is None else _desired_file_record(*desired)
+
+
+def _mirror_managed_paths(
+    mirror: MirrorSpec,
+    additional_paths: set[PurePosixPath] | frozenset[PurePosixPath] = frozenset(),
+) -> list[PurePosixPath]:
     return sorted(
-        {RECEIPT_PATH, *mirror.files.values()},
+        {RECEIPT_PATH, *mirror.files.values(), *additional_paths},
         key=PurePosixPath.as_posix,
     )
 
 
-def _mirror_operation_paths(mirror: MirrorSpec) -> list[PurePosixPath]:
-    managed = _mirror_managed_paths(mirror)
+def _mirror_operation_paths(
+    mirror: MirrorSpec,
+    additional_paths: set[PurePosixPath] | frozenset[PurePosixPath] = frozenset(),
+) -> list[PurePosixPath]:
+    managed = _mirror_managed_paths(mirror, additional_paths)
     return sorted(
         {
             *managed,
@@ -5051,14 +5425,16 @@ def _mirror_operation_paths(mirror: MirrorSpec) -> list[PurePosixPath]:
 def _recover_mirror_exchange_journals(
     target_root: BoundRoot,
     mirror: MirrorSpec,
+    additional_paths: set[PurePosixPath] | frozenset[PurePosixPath] = frozenset(),
 ) -> None:
-    for path in _mirror_managed_paths(mirror):
+    for path in _mirror_managed_paths(mirror, additional_paths):
         _recover_exchange_journal(target_root, path)
 
 
 def _reject_pending_exchange_journals(
     target_root: BoundRoot,
     mirror: MirrorSpec,
+    additional_paths: set[PurePosixPath] | frozenset[PurePosixPath] = frozenset(),
 ) -> None:
     if (
         _optional_safe_read_snapshot(target_root, TRANSACTION_PATH) is not None
@@ -5077,7 +5453,7 @@ def _reject_pending_exchange_journals(
             "consumer mirror has a pending generation transaction; rerun "
             "generate before check"
         )
-    for path in _mirror_managed_paths(mirror):
+    for path in _mirror_managed_paths(mirror, additional_paths):
         journal_path = path.parent / _exchange_journal_name(path)
         if _optional_safe_read_snapshot(target_root, journal_path) is not None:
             raise MirrorSyncError(
@@ -5091,7 +5467,7 @@ def _transaction_document(
     source_commit: str,
     initial_index: bytes,
     initial_snapshots: dict[PurePosixPath, FileSnapshot | None],
-    desired_files: dict[PurePosixPath, tuple[bytes, int]],
+    desired_files: dict[PurePosixPath, tuple[bytes, int] | None],
     invalid_receipt: bytes,
     final_receipt: bytes,
 ) -> dict[str, object]:
@@ -5109,7 +5485,7 @@ def _transaction_document(
                     if initial_snapshots[path] is None
                     else _snapshot_record(initial_snapshots[path])
                 ),
-                "desired": _desired_file_record(*desired_files[path]),
+                "desired": _desired_path_record(desired_files[path]),
             }
             for path in sorted(desired_files, key=PurePosixPath.as_posix)
         },
@@ -5308,6 +5684,29 @@ def _load_transaction_journal(
     return snapshot, raw
 
 
+def _transaction_managed_paths(document: dict[str, Any]) -> set[PurePosixPath]:
+    raw_files = document.get("files")
+    if not isinstance(raw_files, dict) or not raw_files:
+        raise MirrorSyncError("generation transaction has an invalid managed file set")
+    paths: set[PurePosixPath] = set()
+    for raw_path in raw_files:
+        path = _validate_relative_path(
+            raw_path,
+            "generation transaction managed path",
+        )
+        if path.parts[0].casefold() == ".git":
+            raise MirrorSyncError(
+                f"generation transaction path enters the Git control plane: {path}"
+            )
+        if path.name.endswith(".sync-exchange.json"):
+            raise MirrorSyncError(
+                f"generation transaction path collides with recovery metadata: {path}"
+            )
+        paths.add(path)
+    _validate_target_layout(sorted(paths, key=PurePosixPath.as_posix), "transaction")
+    return paths
+
+
 def _remove_transaction_journal(
     target_root: BoundRoot,
     expected: FileSnapshot,
@@ -5379,7 +5778,7 @@ def _resume_transaction_state(
     mirror: MirrorSpec,
     source_commit: str,
     current_index: bytes,
-    desired_files: dict[PurePosixPath, tuple[bytes, int]],
+    desired_files: dict[PurePosixPath, tuple[bytes, int] | None],
     invalid_receipt: bytes,
     final_receipt: bytes,
 ) -> tuple[
@@ -5424,7 +5823,7 @@ def _resume_transaction_state(
         if (
             not isinstance(record, dict)
             or set(record) != {"initial", "desired"}
-            or record["desired"] != _desired_file_record(*desired)
+            or record["desired"] != _desired_path_record(desired)
         ):
             raise MirrorSyncError(
                 f"generation transaction desired file changed: {path}"
@@ -5611,6 +6010,35 @@ def _parse_receipt(payload: bytes) -> dict[str, Any]:
         or receipt["receipt_version"] != RECEIPT_VERSION
     ):
         raise MirrorSyncError(f"provenance receipt version must be {RECEIPT_VERSION}")
+    if (
+        type(receipt["generator_contract_version"]) is not int
+        or receipt["generator_contract_version"] != GENERATOR_CONTRACT_VERSION
+    ):
+        raise MirrorSyncError(
+            "provenance receipt generator contract version must be "
+            f"{GENERATOR_CONTRACT_VERSION}"
+        )
+    if (
+        type(receipt["rules_contract_version"]) is not int
+        or receipt["rules_contract_version"] != RULES_CONTRACT_VERSION
+    ):
+        raise MirrorSyncError(
+            "provenance receipt rules contract version must be "
+            f"{RULES_CONTRACT_VERSION}"
+        )
+    if receipt["hash_algorithm"] != HASH_ALGORITHM:
+        raise MirrorSyncError(
+            f"provenance receipt hash_algorithm must be {HASH_ALGORITHM}"
+        )
+    _validate_repository(
+        receipt["canonical_repository"],
+        "provenance receipt canonical_repository",
+    )
+    _validate_name(receipt["mirror"], "provenance receipt mirror")
+    _validate_repository(
+        receipt["mirror_repository"],
+        "provenance receipt mirror_repository",
+    )
     canonical_commit = receipt["canonical_commit"]
     if (
         not isinstance(canonical_commit, str)
@@ -5627,6 +6055,111 @@ def _parse_receipt(payload: bytes) -> dict[str, Any]:
             )
     if not isinstance(receipt["files"], list):
         raise MirrorSyncError("provenance receipt files must be an array")
+    if not receipt["files"]:
+        raise MirrorSyncError("provenance receipt files must not be empty")
+    source_names: set[str] = set()
+    target_paths: list[PurePosixPath] = []
+    validated_files: list[dict[str, object]] = []
+    for index, raw_file in enumerate(receipt["files"]):
+        item = _expect_object(
+            raw_file,
+            f"provenance receipt files[{index}]",
+        )
+        item_fields = {
+            "source_name",
+            "source_path",
+            "target_path",
+            "sha256",
+            "mode",
+        }
+        _check_fields(
+            item,
+            allowed=item_fields,
+            required=item_fields,
+            field_name=f"provenance receipt files[{index}]",
+        )
+        source_name = _validate_name(
+            item["source_name"],
+            f"provenance receipt files[{index}].source_name",
+        )
+        if source_name in source_names:
+            raise MirrorSyncError(
+                f"provenance receipt has duplicate source name: {source_name}"
+            )
+        source_names.add(source_name)
+        source_path = _validate_relative_path(
+            item["source_path"],
+            f"provenance receipt files[{index}].source_path",
+        )
+        target_path = _validate_relative_path(
+            item["target_path"],
+            f"provenance receipt files[{index}].target_path",
+        )
+        if target_path.parts[0].casefold() == ".git":
+            raise MirrorSyncError(
+                "provenance receipt target must not enter the Git control "
+                f"plane: {target_path}"
+            )
+        if target_path.name.endswith(".sync-exchange.json"):
+            raise MirrorSyncError(
+                "provenance receipt target collides with recovery metadata: "
+                f"{target_path}"
+            )
+        sha256 = item["sha256"]
+        if not isinstance(sha256, str) or SHA256_RE.fullmatch(sha256) is None:
+            raise MirrorSyncError(
+                f"provenance receipt files[{index}].sha256 must be lowercase hex"
+            )
+        mode = item["mode"]
+        if (
+            not isinstance(mode, str)
+            or MODE_RE.fullmatch(mode) is None
+            or int(mode, 8) not in {0o644, 0o755}
+        ):
+            raise MirrorSyncError(
+                f"provenance receipt files[{index}].mode must be 0644 or 0755"
+            )
+        target_paths.append(target_path)
+        validated_files.append(
+            {
+                "source_name": source_name,
+                "source_path": source_path.as_posix(),
+                "target_path": target_path.as_posix(),
+                "sha256": sha256,
+                "mode": mode,
+            }
+        )
+    _validate_target_layout(target_paths, receipt["mirror"])
+    mapping = [
+        {
+            "source_name": item["source_name"],
+            "source_path": item["source_path"],
+            "target_path": item["target_path"],
+        }
+        for item in validated_files
+    ]
+    file_set = sorted(str(item["target_path"]) for item in validated_files)
+    tree = [
+        {
+            "target_path": item["target_path"],
+            "sha256": item["sha256"],
+            "mode": item["mode"],
+        }
+        for item in sorted(
+            validated_files,
+            key=lambda item: str(item["target_path"]),
+        )
+    ]
+    expected_digests = {
+        "mapping_digest": _deterministic_digest(mapping),
+        "file_set_digest": _deterministic_digest(file_set),
+        "tree_digest": _deterministic_digest(tree),
+    }
+    for field_name, expected in expected_digests.items():
+        if receipt[field_name] != expected:
+            raise MirrorSyncError(
+                f"provenance receipt {field_name} does not match its files"
+            )
     return receipt
 
 
@@ -5644,6 +6177,73 @@ def _load_receipt(target_root: Root) -> tuple[FileSnapshot, dict[str, Any]]:
     return snapshot, _parse_receipt(snapshot.payload)
 
 
+def _receipt_file_records(
+    receipt: dict[str, Any],
+) -> dict[PurePosixPath, dict[str, object]]:
+    records: dict[PurePosixPath, dict[str, object]] = {}
+    for item in receipt["files"]:
+        path = PurePosixPath(item["target_path"])
+        records[path] = {
+            "sha256": item["sha256"],
+            "mode": int(item["mode"], 8),
+            "size": None,
+        }
+    return records
+
+
+def _prior_receipt_file_records(
+    target_root: BoundRoot,
+    source_lock: SourceLock,
+    mirror: MirrorSpec,
+) -> dict[PurePosixPath, dict[str, object]]:
+    head_commit = _current_commit(target_root)
+    snapshot = _target_clean_snapshot(
+        target_root,
+        RECEIPT_PATH,
+        head_commit,
+    )
+    if snapshot is None:
+        return {}
+    if snapshot.mode != 0o644:
+        raise MirrorSyncError(
+            f"prior provenance receipt mode must be 0644, not {snapshot.mode:04o}"
+        )
+    receipt = _parse_receipt(snapshot.payload)
+    if (
+        receipt["canonical_repository"] != source_lock.canonical_repository
+        or receipt["mirror"] != mirror.name
+        or receipt["mirror_repository"] != mirror.repository
+    ):
+        raise MirrorSyncError(
+            "prior provenance receipt names the wrong canonical repository, "
+            "mirror, or target repository"
+        )
+    return _receipt_file_records(receipt)
+
+
+def _require_receipt_file_parity(
+    snapshots: dict[PurePosixPath, FileSnapshot | None],
+    receipt_records: dict[PurePosixPath, dict[str, object]],
+) -> None:
+    for path, record in sorted(
+        receipt_records.items(),
+        key=lambda item: item[0].as_posix(),
+    ):
+        snapshot = snapshots[path]
+        if snapshot is None:
+            raise MirrorSyncError(
+                f"prior receipt managed path is missing from HEAD/index/worktree: "
+                f"{path}"
+            )
+        if (
+            hashlib.sha256(snapshot.payload).hexdigest() != record["sha256"]
+            or snapshot.mode != record["mode"]
+        ):
+            raise MirrorSyncError(
+                f"prior receipt managed path differs from its receipt: {path}"
+            )
+
+
 def _require_same_file_group(
     root: Root,
     expected: dict[PurePosixPath, FileSnapshot],
@@ -5657,6 +6257,18 @@ def _require_same_file_group(
         if observed != expected_snapshot:
             raise MirrorSyncError(
                 f"{group_name} changed before transaction completion: {path}"
+            )
+
+
+def _require_paths_absent(
+    root: Root,
+    paths: set[PurePosixPath] | frozenset[PurePosixPath],
+    group_name: str,
+) -> None:
+    for path in sorted(paths, key=PurePosixPath.as_posix):
+        if _optional_safe_read_snapshot(root, path) is not None:
+            raise MirrorSyncError(
+                f"{group_name} reappeared before transaction completion: {path}"
             )
 
 
@@ -5682,7 +6294,13 @@ def _check_mirror_bound(
     initial_index = _target_index_snapshot(target_root, mirror)
     _require_target_head_index_parity(target_root, mirror)
     _require_same_target_index(target_root, mirror, initial_index)
-    receipt_snapshot, receipt = _load_receipt(target_root)
+    try:
+        receipt_snapshot, receipt = _load_receipt(target_root)
+    except MirrorSyncError as error:
+        raise MirrorSyncError(
+            "provenance receipt is stale or tampered for the current "
+            f"mapping/rules/source tree: {error}"
+        ) from error
     receipt_payload = receipt_snapshot.payload
     if (
         receipt.get("canonical_repository") != source_lock.canonical_repository
@@ -5765,6 +6383,92 @@ def check_mirror(
         _finish_bound_roots(canonical, target)
 
 
+def managed_mirror_paths(
+    repository_root: Path,
+    target_root: Path,
+    mirror_name: str,
+) -> list[PurePosixPath]:
+    operation = _new_operation_budget()
+    _reject_canonical_target(repository_root, target_root)
+    canonical = _bind_root(repository_root)
+    canonical.operation = operation
+    try:
+        target = _bind_root(target_root)
+        target.operation = operation
+    except BaseException:
+        _finish_bound_roots(canonical)
+        raise
+    try:
+        _ensure_git_control_binding(canonical)
+        _ensure_git_control_binding(target)
+        source_lock = load_source_lock(canonical)
+        mirror = _selected_mirror(source_lock, mirror_name)
+        _verify_canonical_repository(
+            canonical,
+            source_lock.canonical_repository,
+        )
+        source_commit = _current_commit(canonical)
+        _verify_committed_sources(
+            canonical,
+            source_commit,
+            source_lock,
+        )
+        _verify_target_repository(target, mirror.repository)
+        receipt_records = _prior_receipt_file_records(
+            target,
+            source_lock,
+            mirror,
+        )
+        additional_paths = set(receipt_records)
+        managed_targets = set(mirror.files.values()) | additional_paths
+        _validate_target_layout(
+            sorted(managed_targets, key=PurePosixPath.as_posix),
+            mirror.name,
+        )
+        _configure_managed_ancestors(
+            target,
+            _mirror_operation_paths(mirror, additional_paths),
+        )
+        _reject_git_control_targets(
+            target,
+            mirror,
+            additional_paths,
+        )
+        _reject_pending_exchange_journals(
+            target,
+            mirror,
+            additional_paths,
+        )
+        initial_index = _target_index_snapshot(
+            target,
+            mirror,
+            additional_paths,
+        )
+        snapshots = _target_managed_snapshots(
+            target,
+            mirror,
+            additional_paths,
+        )
+        _require_receipt_file_parity(
+            snapshots,
+            receipt_records,
+        )
+        _require_target_head_index_parity(
+            target,
+            mirror,
+            additional_paths,
+        )
+        _require_same_target_index(
+            target,
+            mirror,
+            initial_index,
+            additional_paths,
+        )
+        return _mirror_managed_paths(mirror, additional_paths)
+    finally:
+        _finish_bound_roots(canonical, target)
+
+
 def _generate_mirror_bound(
     repository_root: BoundRoot,
     target_root: BoundRoot,
@@ -5775,10 +6479,12 @@ def _generate_mirror_bound(
     requested_source_commit = source_commit
     pending_transaction = _load_transaction_journal(target_root)
     recovering_prior_transaction = pending_transaction is not None
+    transaction_paths: set[PurePosixPath] = set()
     if pending_transaction is None:
         source_lock = load_source_lock(repository_root)
     else:
         _transaction_snapshot, transaction_document = pending_transaction
+        transaction_paths = _transaction_managed_paths(transaction_document)
         journal_commit = transaction_document.get("canonical_commit")
         journal_mirror = transaction_document.get("mirror")
         if (
@@ -5795,17 +6501,47 @@ def _generate_mirror_bound(
             source_commit,
         )
     mirror = _selected_mirror(source_lock, mirror_name)
+    prior_receipt_records: dict[
+        PurePosixPath,
+        dict[str, object],
+    ] = {}
+    if pending_transaction is None:
+        prior_receipt_records = _prior_receipt_file_records(
+            target_root,
+            source_lock,
+            mirror,
+        )
+        managed_additional_paths = set(prior_receipt_records)
+    else:
+        managed_additional_paths = transaction_paths
+    current_target_paths = set(mirror.files.values())
+    _validate_target_layout(
+        sorted(
+            current_target_paths | managed_additional_paths,
+            key=PurePosixPath.as_posix,
+        ),
+        mirror.name,
+    )
+    retired_paths = managed_additional_paths - current_target_paths
     _configure_managed_ancestors(
         target_root,
-        _mirror_operation_paths(mirror),
+        _mirror_operation_paths(mirror, managed_additional_paths),
     )
     _verify_canonical_repository(
         repository_root,
         source_lock.canonical_repository,
     )
     _verify_target_repository(target_root, mirror.repository)
-    _reject_git_control_targets(target_root, mirror)
-    _recover_mirror_exchange_journals(target_root, mirror)
+    _reject_git_control_targets(
+        target_root,
+        mirror,
+        managed_additional_paths,
+    )
+    _recover_mirror_exchange_journals(
+        target_root,
+        mirror,
+        managed_additional_paths,
+    )
 
     def verify_active_sources() -> dict[str, tuple[bytes, int]]:
         if recovering_prior_transaction:
@@ -5839,14 +6575,32 @@ def _generate_mirror_bound(
         },
         pretty=True,
     )
-    desired_files = {
+    desired_files: dict[PurePosixPath, tuple[bytes, int] | None] = {
         target_path: sources[source_name]
         for source_name, target_path in mirror.files.items()
     }
-    initial_index = _target_index_snapshot(target_root, mirror)
+    desired_files.update({path: None for path in retired_paths})
+    initial_index = _target_index_snapshot(
+        target_root,
+        mirror,
+        managed_additional_paths,
+    )
     if pending_transaction is None:
-        target_snapshots = _target_managed_snapshots(target_root, mirror)
-        _require_same_target_index(target_root, mirror, initial_index)
+        target_snapshots = _target_managed_snapshots(
+            target_root,
+            mirror,
+            managed_additional_paths,
+        )
+        _require_receipt_file_parity(
+            target_snapshots,
+            prior_receipt_records,
+        )
+        _require_same_target_index(
+            target_root,
+            mirror,
+            initial_index,
+            managed_additional_paths,
+        )
         transaction_document = _transaction_document(
             source_lock,
             mirror,
@@ -5880,7 +6634,12 @@ def _generate_mirror_bound(
             invalid_receipt,
             receipt_payload,
         )
-    _require_same_target_index(target_root, mirror, initial_index)
+    _require_same_target_index(
+        target_root,
+        mirror,
+        initial_index,
+        managed_additional_paths,
+    )
     if receipt_state == "initial":
         _atomic_write_relative(
             target_root,
@@ -5906,7 +6665,9 @@ def _generate_mirror_bound(
                 "valid receipt exists for an incomplete pending generation"
             )
         final_group = {
-            path: _safe_read_snapshot(target_root, path) for path in desired_files
+            path: _safe_read_snapshot(target_root, path)
+            for path, desired in desired_files.items()
+            if desired is not None
         }
         final_group[RECEIPT_PATH] = _safe_read_snapshot(
             target_root,
@@ -5929,11 +6690,21 @@ def _generate_mirror_bound(
             source_lock.canonical_repository,
         )
         _verify_target_repository(target_root, mirror.repository)
-        _require_same_target_index(target_root, mirror, initial_index)
+        _require_same_target_index(
+            target_root,
+            mirror,
+            initial_index,
+            managed_additional_paths,
+        )
         _require_same_file_group(
             target_root,
             final_group,
             "resumed completed consumer mirror group",
+        )
+        _require_paths_absent(
+            target_root,
+            retired_paths,
+            "resumed retired consumer mirror group",
         )
         _remove_transaction_journal(
             target_root,
@@ -5950,7 +6721,12 @@ def _generate_mirror_bound(
             )
             continue
         target_snapshot = target_snapshots[target_path]
-        _require_same_target_index(target_root, mirror, initial_index)
+        _require_same_target_index(
+            target_root,
+            mirror,
+            initial_index,
+            managed_additional_paths,
+        )
         _atomic_write_relative(
             target_root,
             target_path,
@@ -5969,6 +6745,30 @@ def _generate_mirror_bound(
                 f"generated mirror path changed after publication: {target_path}"
             )
         published_target_group[target_path] = generated_snapshot
+    for retired_path in sorted(retired_paths, key=PurePosixPath.as_posix):
+        if retired_path in already_desired:
+            continue
+        retired_snapshot = target_snapshots[retired_path]
+        if retired_snapshot is None:
+            raise MirrorSyncError(
+                f"retired target has no exact initial snapshot: {retired_path}"
+            )
+        _require_same_target_index(
+            target_root,
+            mirror,
+            initial_index,
+            managed_additional_paths,
+        )
+        _atomic_remove_relative(
+            target_root,
+            retired_path,
+            retired_snapshot,
+        )
+    _require_paths_absent(
+        target_root,
+        retired_paths,
+        "pre-receipt retired target group",
+    )
     pre_receipt_sources = verify_active_sources()
     if pre_receipt_sources != sources:
         raise MirrorSyncError(
@@ -5983,7 +6783,12 @@ def _generate_mirror_bound(
         repository_root,
         source_lock.canonical_repository,
     )
-    _require_same_target_index(target_root, mirror, initial_index)
+    _require_same_target_index(
+        target_root,
+        mirror,
+        initial_index,
+        managed_additional_paths,
+    )
     _atomic_write_relative(
         target_root,
         RECEIPT_PATH,
@@ -6008,11 +6813,21 @@ def _generate_mirror_bound(
             source_lock.canonical_repository,
         )
         _verify_target_repository(target_root, mirror.repository)
-        _require_same_target_index(target_root, mirror, initial_index)
+        _require_same_target_index(
+            target_root,
+            mirror,
+            initial_index,
+            managed_additional_paths,
+        )
         _require_same_file_group(
             target_root,
             published_target_group,
             "generated consumer mirror group",
+        )
+        _require_paths_absent(
+            target_root,
+            retired_paths,
+            "generated retired target group",
         )
     except MirrorSyncError as terminal_error:
         try:
@@ -6173,7 +6988,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("check", "generate"):
+    for command in ("check", "generate", "managed-paths"):
         subparser = subparsers.add_parser(
             command,
             help=f"{command.capitalize()} one explicitly selected consumer mirror",
@@ -6214,6 +7029,18 @@ def _run(args: argparse.Namespace) -> int:
     if args.command == "check":
         count = check_mirror(REPOSITORY_ROOT, args.target_root, args.mirror)
         print(f"mirror {args.mirror} is synchronized ({count} files)")
+    elif args.command == "managed-paths":
+        paths = managed_mirror_paths(
+            REPOSITORY_ROOT,
+            args.target_root,
+            args.mirror,
+        )
+        sys.stdout.buffer.write(
+            _canonical_json(
+                [path.as_posix() for path in paths],
+                pretty=True,
+            )
+        )
     elif args.command == "generate":
         count = generate_mirror(
             REPOSITORY_ROOT,

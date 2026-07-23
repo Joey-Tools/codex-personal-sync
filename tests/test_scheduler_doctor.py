@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from datetime import datetime
 import importlib.util
 import io
 import json
@@ -11,6 +12,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -646,6 +648,103 @@ class SchedulerDoctorTests(unittest.TestCase):
             final,
         )
 
+    def test_overlapping_scheduled_completion_cannot_replace_newer_failure(
+        self,
+    ) -> None:
+        older_install_entered = threading.Event()
+        release_older_install = threading.Event()
+        errors: dict[str, BaseException] = {}
+
+        def interleaved_install(
+            repo: str,
+            home: Path,
+            *,
+            dry_run: bool,
+        ) -> None:
+            self.assertEqual(repo, "owner/public-sync")
+            self.assertEqual(home, self.home)
+            self.assertFalse(dry_run)
+            if threading.current_thread().name == "older-scheduled-run":
+                older_install_entered.set()
+                if not release_older_install.wait(5):
+                    raise AssertionError("older scheduled run was not released")
+                return
+            raise MODULE.SyncError(
+                "newer scheduled run failed",
+                code="newer-attempt-failed",
+            )
+
+        def run(name: str) -> None:
+            try:
+                MODULE.run_scheduled(
+                    self.home,
+                    "owner/public-sync",
+                    mode="public",
+                    base_repo="owner/ignored",
+                    owner="private",
+                )
+            except BaseException as error:
+                errors[name] = error
+
+        older = threading.Thread(
+            target=run,
+            args=("older",),
+            name="older-scheduled-run",
+            daemon=True,
+        )
+        newer = threading.Thread(
+            target=run,
+            args=("newer",),
+            name="newer-scheduled-run",
+            daemon=True,
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "install_from_github",
+                side_effect=interleaved_install,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_capture_scheduler_release_trees",
+                return_value={},
+            ),
+        ):
+            try:
+                older.start()
+                self.assertTrue(older_install_entered.wait(5))
+                older_incomplete = MODULE._read_scheduler_runtime_state(self.home)
+                assert older_incomplete is not None
+
+                newer.start()
+                newer.join(5)
+                self.assertFalse(newer.is_alive())
+                newer_failure = MODULE._read_scheduler_runtime_state(self.home)
+                assert newer_failure is not None
+                self.assertIsInstance(errors.get("newer"), MODULE.SyncError)
+                self.assertFalse(newer_failure["success"])
+                self.assertEqual(
+                    newer_failure["failure_code"],
+                    "newer-attempt-failed",
+                )
+                self.assertGreater(
+                    datetime.fromisoformat(newer_failure["last_attempt"]),
+                    datetime.fromisoformat(older_incomplete["last_attempt"]),
+                )
+            finally:
+                release_older_install.set()
+                if older.ident is not None:
+                    older.join(5)
+                if newer.ident is not None:
+                    newer.join(5)
+            self.assertFalse(older.is_alive())
+
+        self.assertNotIn("older", errors)
+        self.assertEqual(
+            MODULE._read_scheduler_runtime_state(self.home),
+            newer_failure,
+        )
+
     def test_audit_and_doctor_detect_skill_issues_without_deletion(self) -> None:
         duplicate_one = self.write_skill("duplicate-one", "duplicate-name")
         duplicate_two = self.write_skill("duplicate-two", "duplicate-name")
@@ -1124,6 +1223,125 @@ class SchedulerDoctorTests(unittest.TestCase):
         assert config is not None
         self.assertEqual(config.repo, "owner/new")
         self.assertEqual(config.interval_minutes, 17)
+
+    def test_concurrent_linux_installs_serialize_recovery_through_cleanup(
+        self,
+    ) -> None:
+        self.write_runner()
+        paths = MODULE._scheduler_paths("linux", self.home)
+        assert paths.systemd_service is not None
+        first_publication_paused = threading.Event()
+        release_first_publication = threading.Event()
+        second_install_started = threading.Event()
+        second_recovery_entered = threading.Event()
+        errors: dict[str, BaseException] = {}
+        real_write = MODULE._write_text
+        real_recover = MODULE._recover_scheduler_pair_transaction
+
+        def pause_first_publication(
+            path: Path,
+            content: str,
+            *,
+            dry_run: bool,
+            expected_snapshot: MODULE.ManagedStateFileSnapshot | None = None,
+        ) -> None:
+            if (
+                threading.current_thread().name == "first-scheduler-install"
+                and path == paths.systemd_service
+            ):
+                first_publication_paused.set()
+                if not release_first_publication.wait(5):
+                    raise AssertionError(
+                        "first scheduler publication was not released"
+                    )
+            real_write(
+                path,
+                content,
+                dry_run=dry_run,
+                expected_snapshot=expected_snapshot,
+            )
+
+        def observe_recovery(
+            selected_paths: MODULE.SchedulerPaths,
+            *,
+            dry_run: bool,
+        ) -> bool:
+            if threading.current_thread().name == "second-scheduler-install":
+                second_recovery_entered.set()
+            return real_recover(selected_paths, dry_run=dry_run)
+
+        def install(name: str, repo: str, interval: int) -> None:
+            if name == "second":
+                second_install_started.set()
+            try:
+                MODULE.install_scheduler(
+                    self.home,
+                    repo,
+                    interval,
+                    "linux",
+                    None,
+                    dry_run=False,
+                    enable=False,
+                )
+            except BaseException as error:
+                errors[name] = error
+
+        first = threading.Thread(
+            target=install,
+            args=("first", "owner/first", 17),
+            name="first-scheduler-install",
+            daemon=True,
+        )
+        second = threading.Thread(
+            target=install,
+            args=("second", "owner/second", 29),
+            name="second-scheduler-install",
+            daemon=True,
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_write_text",
+                side_effect=pause_first_publication,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_recover_scheduler_pair_transaction",
+                side_effect=observe_recovery,
+            ),
+        ):
+            try:
+                first.start()
+                self.assertTrue(first_publication_paused.wait(5))
+                self.assertTrue(
+                    MODULE._scheduler_pair_transaction_path(paths).is_file()
+                )
+
+                second.start()
+                self.assertTrue(second_install_started.wait(5))
+                self.assertFalse(second_recovery_entered.wait(0.2))
+                self.assertTrue(
+                    MODULE._scheduler_pair_transaction_path(paths).is_file()
+                )
+            finally:
+                release_first_publication.set()
+                if first.ident is not None:
+                    first.join(5)
+                if second.ident is not None:
+                    second.join(5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, {})
+        self.assertTrue(second_recovery_entered.is_set())
+        self.assertFalse(
+            MODULE._scheduler_pair_transaction_path(paths).exists()
+        )
+        config = MODULE._load_linux_scheduler_config(paths)
+        self.assertIsNotNone(config)
+        assert config is not None
+        self.assertEqual(config.repo, "owner/second")
+        self.assertEqual(config.interval_minutes, 29)
 
     def test_linux_pair_transaction_refuses_concurrent_editor_state(
         self,

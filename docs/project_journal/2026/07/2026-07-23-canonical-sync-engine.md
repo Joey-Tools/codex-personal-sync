@@ -45,9 +45,16 @@ superseded_by:
   roots and managed ancestors, frozen live Git controls, an fd-addressed fixed
   launcher, durable private snapshot ownership/recovery, bounded operations,
   prior-commit journal recovery, and bidirectional reserved-path rejection.
-- Private Git object-store bytes are copied and fully verified once during
-  materialization. Per-command revalidation retains config/ref/index/control
-  identity checks and no-fetch gates without rescanning pack contents.
+- Private Git object-store bytes are copied and fully hashed during
+  materialization. Per-command revalidation now binds the complete
+  pack/idx/loose manifest and rejects any invalidated content-stability signal
+  before or after Git without repeatedly rereading stable pack bytes.
+- A prior generated receipt can authorize only exact, clean retired paths:
+  receipt digests plus target `HEAD`, stage-0 index, worktree bytes/mode, and
+  recovery state must agree. Rename/removal uses desired-absent group
+  transactions and recoverable per-target removal journals. Toolbox automation
+  consumes the read-only `managed-paths` result so those exact deletions can be
+  staged without widening the PR scope.
 - Scheduler config exchange preserves an identity-bound hard link to the exact
   original before publication. A replaced displaced pathname is never
   exchanged into the live plist/unit; trusted staged bytes remain live and the

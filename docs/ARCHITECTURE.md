@@ -6,20 +6,22 @@
 
 - `toolbox` 和 `private` mirrors 都消费 lock 声明的引擎、schema，以及 reconciliation safety、release retention、scheduler/doctor 定向测试。
 - 只有面向 `Joey-Tools/codex-toolbox` 的 `toolbox` mirror 额外消费完整 `tests/test_codex_personal_sync.py`；`private` mirror 面向 `Joey-Tools/codex-private-workflows`。
-- `refresh-lock` 只读取 canonical source；`generate` 只执行 canonical → consumer 的原子写入；`check` 只比较已声明的 bytes 和 mode。任何 canonical hash/mode 漂移都会先失败。
+- `refresh-lock` 只读取 canonical source；`managed-paths` 只读地返回当前 target 与经旧 receipt/HEAD/index/worktree 共同证明的退役 target；`generate` 只执行 canonical → consumer 的条件写入/删除；`check` 只比较已声明的 bytes 和 mode。任何 canonical hash/mode 漂移都会先失败。
 - consumer 中的生成文件不是反向输入，也不应手工修补。新增 mirror 文件必须先进入 source lock，不能靠目录级复制扩大边界。
 
 镜像工具对 root、祖先目录和文件执行 no-follow 检查，以 `(st_dev, st_ino)` 绑定已打开对象。文件的受保护性质是 object identity、access policy、完整 size/hash/bytes；同一已打开文件会完整读取两次并比较内容。`mtime`/`ctime` 不参与内容稳定性判断，单独的时间戳变化不是 mutation 证据。
 
 `check` 还要求所有 managed target 与 receipt 的 clean stage-0 index 精确等于 `HEAD`，因此 staged-only 漂移也会失败。`generate` 可以留下预期的未提交 generated diff 供审阅，但不会把 index/worktree 内容当作 canonical 输入。canonical `master` 到 toolbox 的自动化只通过 [sync-toolbox workflow](automation/sync-toolbox.md) 创建或更新固定范围的 PR；缺失显式的最小权限 secret 时会在 target checkout 前失败，不会自建凭据或直接写 target `master`。
 
-Git 验证不执行 repository-controlled `git status`，而是用 raw tree/index blob 与 no-follow worktree bytes 做 filter-free exact parity。Live control binding 覆盖 `HEAD`、resolved loose ref（存在时）、`packed-refs`、common/worktree config、index 及 optional-control absence，并在每个 Git/文件系统 gate 前后重验证。Private snapshot 的 content-addressed `objects/` 在 materialization 时完整复制并验证一次；后续每个 Git 子命令只重验 object-root identity/access policy 和小型 control-plane manifest，不再按命令次数重复读取 pack。固定的 isolated Python launcher 通过 private Git directory fd 切换 cwd 后 `execve` 固定 Git，不使用 `preexec_fn` 或 pathname cwd。
+Git 验证不执行 repository-controlled `git status`，而是用 raw tree/index blob 与 no-follow worktree bytes 做 filter-free exact parity。Live control binding 覆盖 `HEAD`、resolved loose ref（存在时）、`packed-refs`、common/worktree config、index 及 optional-control absence，并在每个 Git/文件系统 gate 前后重验证。Private snapshot 的 content-addressed `objects/` 在 materialization 时完整复制，并把每个 pack/idx/loose file 的 path identity、access policy、size、change signal 和 SHA-256 绑定为 manifest；每个 Git 子命令前后重验完整 manifest。稳定期间不重复读取 pack bytes，但任一 file/entry identity、policy、size 或 mtime/ctime change signal 漂移都会使 content-stability proof 失效并 fail closed，不能用“后来恢复成相同 bytes”重新接纳。目录时间戳仍不参与判断，普通 child-entry churn 本身不是对象替换证据。固定的 isolated Python launcher 通过 private Git directory fd 切换 cwd 后 `execve` 固定 Git，不使用 `preexec_fn` 或 pathname cwd。
 
 Target layout 对 NFC+casefold 后的 portable spelling 做比较，并双向拒绝 managed target 与 receipt、transaction markers、per-target exchange journal 的 exact/ancestor/descendant overlap；因此 reserved metadata 不能伪装成 target，target 也不能把 reserved path 包在自己的子树中。
 
 Private Git snapshot 位于两个 repository 之外的 durable 0700 current-owner tool root。Owner/phase record 全程持锁；tool-root 临界区覆盖 stale scan、snapshot directory 创建和 owner publication，避免 live directory 被误判为 orphan。Stale cleanup 只删除 record 绑定的 exact identity，未知/替换状态进入 bounded quarantine 或 fail closed。单个 canonical source 与单条 Git stdout 都限制为 32 MiB；同一 operation 共享 deadline、aggregate byte budget 和 entry budget，覆盖 snapshot、Git、recovery、generation 与 cleanup。
 
 若 target 中已有 pending generation，recovery 必须先读取 journal 所绑定的旧 canonical commit 与旧 source lock；不能用新 `HEAD` 重解释旧 transaction。若 caller 同时请求了不同的新 commit，本次调用在完成旧 recovery 后明确失败并要求先审阅/提交恢复结果，不能把旧 receipt 静默当作新生成成功。
+
+新 lock 删除或重命名 target 时，旧 receipt 不是宽泛删除授权。Generator 会完整重算旧 receipt 的 mapping/file-set/tree digests，并要求 receipt 本身及其中每个旧 target 都与 consumer 的 `HEAD`、stage-0 index 和 worktree 精确一致；只有不再出现在新 mapping 中的这部分 exact objects 才进入 desired-absent transaction。Removal 先写 per-target journal，再 no-replace isolate，崩溃恢复会根据 exact before/absent state 还原或完成交易；任何 replacement、dirty bytes 或不明确状态均保留证据并停止。
 
 ## 安装模型与所有权
 
@@ -79,9 +81,10 @@ macOS 使用 user `launchd`，Linux 使用 user `systemd`。默认 runner 固定
 - 替换现有 plist/unit 前，会先为 exact original object 创建、验证并 fsync 同目录 hard-link recovery evidence。若 exchange 后的 displaced pathname 被替换，绝不把该 pathname 交换回 live；可信 staged config 保持 live，原 object 以 identity-bound recovery evidence 保留并 fail closed。
 - Linux service/timer 以 durable pair transaction 更新。每个 conditional write 绑定 caller 捕获的完整 before snapshot；crash recovery 只接受记录中的 before/after content 与 access policy，未知并发编辑一律保留 marker 并 fail closed。新 after 文件固定 mode `0600`，因此 group identity 不具备 access-bearing semantics（不影响访问权限）且不作为 after-state 匹配信号；legacy before-state 仍完整绑定原 gid/mode。
 - 回滚 legacy before-state 时，staged file 会在 publication 前验证 caller group membership，并按记录的 gid 执行 `fchown`，随后重新应用完整 mode；任一步失败都在替换目标前停止。
+- 非 dry-run 的 scheduler install/uninstall 使用现有 per-Codex-home install lock 覆盖 recovery、audit、transaction marker、config publication、legacy cleanup 和 daemon publication；并发配置操作不能观察或回滚另一操作尚未完成的 pair transaction。
 - 调用 `launchctl` / `systemctl` 时使用固定的 root-owned executable 与 closed environment，不继承 loader、shell 或 Python runtime injection 变量。
 
-每次 scheduled run 先以 mode `0600` 原子写入 version 2 的 `personal-sync/state/scheduler-status.json`，记录本次 attempt 尚未完成；成功后写入 `last_success`，并为每个 current `owner@sha` 保存经过完整 release-tree 验证的 SHA-256 baseline。失败后仅在 target 未变时保留上次成功时间和 baseline，并记录 bounded `failure_reason` 与稳定 `failure_code`。读取端兼容 version 1；旧 runtime target 与当前配置不一致时，不展示或消费旧 target 的 attempt/success/failure/baseline。没有可信 baseline 会单独报告 `immutable-release-baseline-missing`，不会把当前本地树直接补录成可信值。
+每次 scheduled run 在 per-Codex-home install lock 内分配严格递增的 UTC attempt timestamp，再以 mode `0600` 原子写入 version 2 的 `personal-sync/state/scheduler-status.json`，记录本次 attempt 尚未完成。成功或失败完成时，在同一锁内比较 attempt timestamp 与完整 target identity；只有仍是 current 的 attempt 才能提交终态，较旧的重叠 run 不会覆盖较新 attempt 的结果。成功后写入 `last_success`，并为每个 current `owner@sha` 保存经过完整 release-tree 验证的 SHA-256 baseline。失败后仅在 target 未变时保留上次成功时间和 baseline，并记录 bounded `failure_reason` 与稳定 `failure_code`。读取端兼容 version 1；旧 runtime target 与当前配置不一致时，不展示或消费旧 target 的 attempt/success/failure/baseline。没有可信 baseline 会单独报告 `immutable-release-baseline-missing`，不会把当前本地树直接补录成可信值。
 
 `status-scheduler` 的文本和 JSON 视图共同遵守以下字段合同：
 
