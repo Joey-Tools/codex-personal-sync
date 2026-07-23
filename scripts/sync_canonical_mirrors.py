@@ -47,6 +47,8 @@ PRIVATE_GIT_CONTROL_PARENT = Path(
 PRIVATE_TOOL_ROOT_NAME = "codex-sync-canonical-mirrors"
 DURABLE_QUARANTINE_ROOT_NAME = ".codex-sync-canonical-mirror-quarantine"
 MAX_DURABLE_QUARANTINE_ENTRIES = 10_000
+QUARANTINE_RECOVERY_KIND = "recovery"
+QUARANTINE_TRANSIENT_KIND = "transient"
 PRIVATE_OBJECTS_PATH = PurePosixPath("objects")
 MAX_LOCK_BYTES = 1024 * 1024
 MAX_SOURCE_BYTES = 32 * 1024 * 1024
@@ -71,6 +73,11 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 MODE_RE = re.compile(r"^0[0-7]{3}$")
 PRIVATE_SNAPSHOT_RE = re.compile(r"^sync-canonical-git-control\.[0-9]+\.[0-9a-f]{32}$")
+QUARANTINE_FILE_RE = re.compile(
+    r"^(recovery|transient)-file-"
+    r"([0-9a-f]+)-([0-9a-f]+)-([0-7]{4})-"
+    r"([0-9a-f]+)-([0-9a-f]+)-([0-9a-f]{16})-([0-9a-f]{32})$"
+)
 _DIRECTORY_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_CLOEXEC", 0)
@@ -1344,12 +1351,11 @@ def _create_owner_record(
                 PurePosixPath(owner_name),
             )
             if owner_snapshot.identity == _object_identity(owner_metadata):
-                _isolate_and_remove_file(
+                _remove_stale_owner_record(
                     root,
-                    tool_root.fd,
+                    tool_root,
                     owner_name,
                     owner_snapshot,
-                    PurePosixPath(owner_name),
                 )
         except (OSError, MirrorSyncError):
             # An ambiguous record is retained for bounded stale recovery.
@@ -2153,6 +2159,39 @@ def _quarantine_tool_entry(
     return quarantine_name
 
 
+def _remove_stale_owner_record(
+    root: BoundRoot,
+    tool_root: ControlObjectBinding,
+    owner_name: str,
+    owner_snapshot: FileSnapshot,
+    *,
+    quarantine: ControlObjectBinding | None = None,
+) -> None:
+    durable_quarantine = (
+        quarantine
+        if quarantine is not None
+        else _bind_durable_quarantine_root(
+            root,
+            quarantine_parent=PRIVATE_GIT_CONTROL_PARENT,
+            source_parent_fd=tool_root.fd,
+        )
+    )
+    close_quarantine = quarantine is None
+    try:
+        _isolate_and_remove_file(
+            root,
+            tool_root.fd,
+            owner_name,
+            owner_snapshot,
+            PurePosixPath(owner_name),
+            quarantine=durable_quarantine,
+            retention_kind=QUARANTINE_TRANSIENT_KIND,
+        )
+    finally:
+        if close_quarantine:
+            os.close(durable_quarantine.fd)
+
+
 def _recover_stale_private_snapshots(
     root: BoundRoot,
     tool_root: ControlObjectBinding,
@@ -2316,12 +2355,11 @@ def _recover_stale_private_snapshots(
                     follow_symlinks=False,
                 )
             except FileNotFoundError:
-                _isolate_and_remove_file(
+                _remove_stale_owner_record(
                     root,
-                    tool_root.fd,
+                    tool_root,
                     owner_name,
                     owner_snapshot,
-                    PurePosixPath(owner_name),
                 )
                 cleaned += 1
                 continue
@@ -2374,22 +2412,30 @@ def _recover_stale_private_snapshots(
                     access_policy=_access_policy(private_metadata),
                     content_digest=None,
                 )
-                _remove_bound_private_directory(
+                quarantine = _bind_durable_quarantine_root(
                     root,
-                    tool_root,
-                    private,
-                    private_name,
-                    None,
+                    quarantine_parent=PRIVATE_GIT_CONTROL_PARENT,
+                    source_parent_fd=tool_root.fd,
                 )
+                try:
+                    _remove_bound_private_directory(
+                        root,
+                        tool_root,
+                        private,
+                        private_name,
+                        None,
+                    )
+                    _remove_stale_owner_record(
+                        root,
+                        tool_root,
+                        owner_name,
+                        owner_snapshot,
+                        quarantine=quarantine,
+                    )
+                finally:
+                    os.close(quarantine.fd)
             finally:
                 os.close(private_fd)
-            _isolate_and_remove_file(
-                root,
-                tool_root.fd,
-                owner_name,
-                owner_snapshot,
-                PurePosixPath(owner_name),
-            )
             cleaned += 1
         finally:
             if owner_fd >= 0:
@@ -2526,6 +2572,7 @@ def _remove_bound_owner_record(
         owner_snapshot,
         PurePosixPath(owner_name),
         quarantine=quarantine,
+        retention_kind=QUARANTINE_TRANSIENT_KIND,
     )
     os.fsync(private_parent.fd)
 
@@ -3321,6 +3368,90 @@ def _rename_directory_entry_noreplace_between(
         )
 
 
+def _quarantine_file_name(
+    expected: FileSnapshot,
+    retention_kind: str,
+) -> str:
+    if retention_kind not in {
+        QUARANTINE_RECOVERY_KIND,
+        QUARANTINE_TRANSIENT_KIND,
+    }:
+        raise MirrorSyncError(
+            f"unsupported durable quarantine retention kind: {retention_kind}"
+        )
+    digest = hashlib.sha256(expected.payload).hexdigest()[:16]
+    return (
+        f"{retention_kind}-file-{expected.identity[0]:x}-"
+        f"{expected.identity[1]:x}-{expected.access_policy[0]:04o}-"
+        f"{expected.access_policy[1]:x}-{expected.access_policy[2]:x}-"
+        f"{digest}-{secrets.token_hex(16)}"
+    )
+
+
+def _quarantine_file_name_matches(
+    name: str,
+    expected: FileSnapshot,
+    retention_kind: str,
+) -> bool:
+    matched = QUARANTINE_FILE_RE.fullmatch(name)
+    if matched is None or matched.group(1) != retention_kind:
+        return False
+    return (
+        int(matched.group(2), 16) == expected.identity[0]
+        and int(matched.group(3), 16) == expected.identity[1]
+        and int(matched.group(4), 8) == expected.access_policy[0]
+        and int(matched.group(5), 16) == expected.access_policy[1]
+        and int(matched.group(6), 16) == expected.access_policy[2]
+        and matched.group(7) == hashlib.sha256(expected.payload).hexdigest()[:16]
+    )
+
+
+def _durable_quarantine_entry_count(quarantine_fd: int) -> int:
+    try:
+        with os.scandir(quarantine_fd) as entries:
+            count = 0
+            for count, _entry in enumerate(entries, start=1):
+                if count > MAX_DURABLE_QUARANTINE_ENTRIES:
+                    raise MirrorSyncError(
+                        "durable quarantine root exceeds its bounded entry "
+                        "limit; manual identity-aware cleanup is required"
+                    )
+            return count
+    except OSError as error:
+        raise MirrorSyncError(
+            f"cannot inventory durable quarantine capacity: {error}"
+        ) from error
+
+
+def _require_new_durable_quarantine_entry(
+    quarantine_fd: int,
+    quarantine_name: str,
+) -> None:
+    try:
+        os.stat(
+            quarantine_name,
+            dir_fd=quarantine_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise MirrorSyncError(
+            "cannot verify durable quarantine destination absence: "
+            f"{quarantine_name}: {error}"
+        ) from error
+    else:
+        raise MirrorSyncError(
+            "durable quarantine destination already exists; preserving the "
+            f"source artifact: {quarantine_name}"
+        )
+    if _durable_quarantine_entry_count(quarantine_fd) >= MAX_DURABLE_QUARANTINE_ENTRIES:
+        raise MirrorSyncError(
+            "durable quarantine root reached its bounded entry limit; "
+            "preserving the source artifact for identity-aware recovery"
+        )
+
+
 def _bind_durable_quarantine_root(
     root: Root,
     *,
@@ -3414,13 +3545,7 @@ def _bind_durable_quarantine_root(
         finally:
             if close_root:
                 os.close(root_fd)
-        with os.scandir(quarantine_fd) as entries:
-            for index, _entry in enumerate(entries, start=1):
-                if index >= MAX_DURABLE_QUARANTINE_ENTRIES:
-                    raise MirrorSyncError(
-                        "durable quarantine root reached its bounded entry "
-                        "limit; manual identity-aware cleanup is required"
-                    )
+        _durable_quarantine_entry_count(quarantine_fd)
         quarantine_path = parent_path / DURABLE_QUARANTINE_ROOT_NAME
         binding = ControlObjectBinding(
             label="durable mirror quarantine root",
@@ -3472,40 +3597,62 @@ def _persist_quarantined_file(
     source_name: str,
     expected: FileSnapshot,
     display_path: PurePosixPath,
+    *,
+    retention_kind: str,
+    quarantine_name: str | None = None,
+    quarantine_locked: bool = False,
+    capacity_checked: bool = False,
 ) -> Path:
     _revalidate_durable_quarantine_root(quarantine)
-    digest = hashlib.sha256(expected.payload).hexdigest()[:16]
-    quarantine_name = (
-        f"file-{expected.identity[0]:x}-{expected.identity[1]:x}-"
-        f"{digest}-{secrets.token_hex(16)}"
-    )
+    if quarantine_name is None:
+        quarantine_name = _quarantine_file_name(expected, retention_kind)
+    elif not _quarantine_file_name_matches(
+        quarantine_name,
+        expected,
+        retention_kind,
+    ):
+        raise MirrorSyncError(
+            "preallocated durable quarantine name does not bind the expected "
+            f"object/content: {display_path}"
+        )
     assert quarantine.path is not None
     quarantine_path = quarantine.path / quarantine_name
+    if not quarantine_locked:
+        fcntl.flock(quarantine.fd, fcntl.LOCK_EX)
     try:
-        _rename_directory_entry_noreplace_between(
-            source_parent_fd,
-            source_name,
+        if not capacity_checked:
+            _require_new_durable_quarantine_entry(
+                quarantine.fd,
+                quarantine_name,
+            )
+        try:
+            _rename_directory_entry_noreplace_between(
+                source_parent_fd,
+                source_name,
+                quarantine.fd,
+                quarantine_name,
+            )
+            os.fsync(source_parent_fd)
+            os.fsync(quarantine.fd)
+        except OSError as error:
+            raise MirrorSyncError(
+                f"cannot persist isolated file in durable quarantine; "
+                f"preserving {source_name}: {display_path}: {error}"
+            ) from error
+        moved = _safe_read_leaf_snapshot(
             quarantine.fd,
             quarantine_name,
+            PurePosixPath(quarantine_name),
         )
-        os.fsync(source_parent_fd)
-        os.fsync(quarantine.fd)
-    except OSError as error:
-        raise MirrorSyncError(
-            f"cannot persist isolated file in durable quarantine; "
-            f"preserving {source_name}: {display_path}: {error}"
-        ) from error
+        if moved != expected:
+            raise MirrorSyncError(
+                "isolated file changed before durable quarantine; "
+                f"preserving evidence at {quarantine_path}: {display_path}"
+            )
+    finally:
+        if not quarantine_locked:
+            fcntl.flock(quarantine.fd, fcntl.LOCK_UN)
     _revalidate_durable_quarantine_root(quarantine)
-    moved = _safe_read_leaf_snapshot(
-        quarantine.fd,
-        quarantine_name,
-        PurePosixPath(quarantine_name),
-    )
-    if moved != expected:
-        raise MirrorSyncError(
-            "isolated file changed before durable quarantine; "
-            f"preserving evidence at {quarantine_path}: {display_path}"
-        )
     return quarantine_path
 
 
@@ -3517,11 +3664,17 @@ def _isolate_and_remove_file(
     display_path: PurePosixPath,
     *,
     quarantine: ControlObjectBinding | None = None,
-) -> None:
+    retention_kind: str = QUARANTINE_RECOVERY_KIND,
+    quarantine_locked: bool = False,
+) -> Path:
     # Bind and validate the durable destination before changing the source
     # pathname. A later bind through a BoundRoot would recursively revalidate
     # control paths, including an owner record that this operation has already
     # isolated.
+    if quarantine_locked and quarantine is None:
+        raise MirrorSyncError(
+            "a caller-held durable quarantine lock requires a bound quarantine"
+        )
     durable_quarantine = (
         quarantine
         if quarantine is not None
@@ -3539,8 +3692,17 @@ def _isolate_and_remove_file(
         raise MirrorSyncError(
             "durable quarantine root and source directory are on different filesystems"
         )
+    quarantine_name = _quarantine_file_name(expected, retention_kind)
     isolated_name = f".sync-remove-{os.getpid()}-{secrets.token_hex(16)}"
+    acquired_quarantine_lock = False
     try:
+        if not quarantine_locked:
+            fcntl.flock(durable_quarantine.fd, fcntl.LOCK_EX)
+            acquired_quarantine_lock = True
+        _require_new_durable_quarantine_entry(
+            durable_quarantine.fd,
+            quarantine_name,
+        )
         try:
             _rename_directory_entry_noreplace(
                 parent_fd,
@@ -3584,14 +3746,20 @@ def _isolate_and_remove_file(
             raise MirrorSyncError(
                 f"recovery artifact changed before cleanup: {display_path}"
             )
-        _persist_quarantined_file(
+        return _persist_quarantined_file(
             durable_quarantine,
             parent_fd,
             isolated_name,
             expected,
             display_path,
+            retention_kind=retention_kind,
+            quarantine_name=quarantine_name,
+            quarantine_locked=True,
+            capacity_checked=True,
         )
     finally:
+        if acquired_quarantine_lock:
+            fcntl.flock(durable_quarantine.fd, fcntl.LOCK_UN)
         if close_quarantine:
             os.close(durable_quarantine.fd)
 
@@ -3651,10 +3819,32 @@ def _write_exchange_journal(
     temporary_name: str,
     expected_snapshot: FileSnapshot | None,
     replacement_snapshot: FileSnapshot | None,
+    *,
+    removal_quarantine_name: str | None = None,
 ) -> tuple[str, FileSnapshot]:
     journal_name = _exchange_journal_name(relative_path)
+    removing_target = replacement_snapshot is None
+    if removing_target:
+        if (
+            expected_snapshot is None
+            or removal_quarantine_name is None
+            or not _quarantine_file_name_matches(
+                removal_quarantine_name,
+                expected_snapshot,
+                QUARANTINE_RECOVERY_KIND,
+            )
+        ):
+            raise MirrorSyncError(
+                f"exchange removal journal requires exact durable quarantine "
+                f"evidence: {relative_path}"
+            )
+    elif removal_quarantine_name is not None:
+        raise MirrorSyncError(
+            f"exchange write journal must not name removal quarantine evidence: "
+            f"{relative_path}"
+        )
     document = {
-        "version": 1,
+        "version": 2 if removing_target else 1,
         "target_path": relative_path.as_posix(),
         "temporary_name": temporary_name,
         "expected": (
@@ -3666,6 +3856,13 @@ def _write_exchange_journal(
             else _snapshot_record(replacement_snapshot)
         ),
     }
+    if removing_target:
+        assert expected_snapshot is not None
+        document["removal_quarantine"] = {
+            "name": removal_quarantine_name,
+            "expected": _snapshot_record(expected_snapshot),
+            "phase_contract": "matching-durable-entry-proves-removal",
+        }
     payload = (
         json.dumps(
             document,
@@ -3708,27 +3905,101 @@ def _write_exchange_journal(
     return journal_name, journal_snapshot
 
 
+def _require_exact_removal_quarantine_evidence(
+    quarantine: ControlObjectBinding,
+    quarantine_name: str,
+    expected: FileSnapshot,
+    relative_path: PurePosixPath,
+    phase: str,
+) -> FileSnapshot:
+    _revalidate_durable_quarantine_root(quarantine)
+    try:
+        observed = _safe_read_leaf_snapshot(
+            quarantine.fd,
+            quarantine_name,
+            PurePosixPath(quarantine_name),
+        )
+    except MissingPathError as error:
+        raise MirrorSyncError(
+            "exchange removal durable quarantine evidence is missing "
+            f"{phase}; preserving recovery artifacts: {relative_path}"
+        ) from error
+    if observed != expected or not _quarantine_file_name_matches(
+        quarantine_name,
+        observed,
+        QUARANTINE_RECOVERY_KIND,
+    ):
+        raise MirrorSyncError(
+            "exchange removal durable quarantine evidence changed "
+            f"{phase}; preserving recovery artifacts: {relative_path}"
+        )
+    _revalidate_durable_quarantine_root(quarantine)
+    return observed
+
+
 def _remove_exchange_artifact(
     root: Root,
     parent_fd: int,
     name: str,
     relative_path: PurePosixPath,
     expected: FileSnapshot,
-) -> None:
+    *,
+    quarantine: ControlObjectBinding | None = None,
+    quarantine_locked: bool = False,
+    required_removal_evidence: tuple[str, FileSnapshot] | None = None,
+) -> Path | None:
+    if required_removal_evidence is not None and (
+        quarantine is None or not quarantine_locked
+    ):
+        raise MirrorSyncError(
+            "exchange removal evidence cleanup requires the caller-held "
+            f"durable quarantine lock: {relative_path}"
+        )
+    if required_removal_evidence is not None:
+        assert quarantine is not None
+        evidence_name, evidence_snapshot = required_removal_evidence
+        _require_exact_removal_quarantine_evidence(
+            quarantine,
+            evidence_name,
+            evidence_snapshot,
+            relative_path,
+            "immediately before journal cleanup",
+        )
     try:
-        _isolate_and_remove_file(
+        retained_path = _isolate_and_remove_file(
             root,
             parent_fd,
             name,
             expected,
             relative_path.parent / name,
+            quarantine=quarantine,
+            retention_kind=QUARANTINE_TRANSIENT_KIND,
+            quarantine_locked=quarantine_locked,
         )
     except FileNotFoundError:
-        return
+        return None
     except MirrorSyncError as error:
         raise MirrorSyncError(
             f"cannot remove exchange recovery artifact for {relative_path}: {error}"
         ) from error
+    if required_removal_evidence is not None:
+        assert quarantine is not None
+        evidence_name, evidence_snapshot = required_removal_evidence
+        try:
+            _require_exact_removal_quarantine_evidence(
+                quarantine,
+                evidence_name,
+                evidence_snapshot,
+                relative_path,
+                "during journal cleanup",
+            )
+        except MirrorSyncError as error:
+            raise MirrorSyncError(
+                "exchange removal evidence changed while retiring the active "
+                f"journal; recovery journal retained at {retained_path}: "
+                f"{relative_path}"
+            ) from error
+    return retained_path
 
 
 def _recover_exchange_journal(
@@ -3737,6 +4008,8 @@ def _recover_exchange_journal(
 ) -> None:
     root_fd, close_root = _borrow_root_fd(root)
     parent_fd = -1
+    removal_quarantine: ControlObjectBinding | None = None
+    removal_quarantine_locked = False
     try:
         try:
             parent_fd = _open_parent_directory(
@@ -3757,26 +4030,38 @@ def _recover_exchange_journal(
                 f"exchange recovery journal has unsafe mode: {relative_path}"
             )
         try:
-            document = json.loads(journal_snapshot.payload.decode("utf-8"))
+            document = json.loads(
+                journal_snapshot.payload.decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_keys,
+            )
         except (
             UnicodeDecodeError,
             json.JSONDecodeError,
             RecursionError,
+            MirrorSyncError,
         ) as error:
             raise MirrorSyncError(
                 f"exchange recovery journal is invalid: {relative_path}"
             ) from error
+        base_fields = {
+            "version",
+            "target_path",
+            "temporary_name",
+            "expected",
+            "replacement",
+        }
+        legacy_document = (
+            isinstance(document, dict)
+            and set(document) == base_fields
+            and document.get("version") == 1
+        )
+        evidence_document = (
+            isinstance(document, dict)
+            and set(document) == base_fields | {"removal_quarantine"}
+            and document.get("version") == 2
+        )
         if (
-            not isinstance(document, dict)
-            or set(document)
-            != {
-                "version",
-                "target_path",
-                "temporary_name",
-                "expected",
-                "replacement",
-            }
-            or document["version"] != 1
+            not (legacy_document or evidence_document)
             or document["target_path"] != relative_path.as_posix()
             or not isinstance(document["temporary_name"], str)
             or re.fullmatch(
@@ -3819,6 +4104,89 @@ def _recover_exchange_journal(
             document["replacement"],
         )
         removing_target = document["replacement"] is None
+        removal_quarantine_snapshot: FileSnapshot | None = None
+        removal_quarantine_is_expected = False
+        if evidence_document:
+            if not removing_target or expected_is_absent:
+                raise MirrorSyncError(
+                    f"exchange recovery journal has invalid removal evidence: "
+                    f"{relative_path}"
+                )
+            removal_record = document["removal_quarantine"]
+            expected_record = document["expected"]
+            quarantine_name_match = (
+                QUARANTINE_FILE_RE.fullmatch(removal_record.get("name", ""))
+                if isinstance(removal_record, dict)
+                and isinstance(removal_record.get("name"), str)
+                else None
+            )
+            if (
+                not isinstance(removal_record, dict)
+                or set(removal_record) != {"name", "expected", "phase_contract"}
+                or removal_record["expected"] != expected_record
+                or removal_record["phase_contract"]
+                != "matching-durable-entry-proves-removal"
+                or not isinstance(removal_record["name"], str)
+                or quarantine_name_match is None
+                or quarantine_name_match.group(1) != QUARANTINE_RECOVERY_KIND
+                or not isinstance(expected_record, dict)
+                or not isinstance(expected_record.get("identity"), list)
+                or len(expected_record["identity"]) != 3
+                or not all(
+                    isinstance(item, int) for item in expected_record["identity"]
+                )
+                or not isinstance(expected_record.get("access_policy"), list)
+                or len(expected_record["access_policy"]) != 3
+                or not all(
+                    isinstance(item, int) for item in expected_record["access_policy"]
+                )
+                or quarantine_name_match.group(2)
+                != f"{expected_record['identity'][0]:x}"
+                or quarantine_name_match.group(3)
+                != f"{expected_record['identity'][1]:x}"
+                or quarantine_name_match.group(4)
+                != f"{expected_record['access_policy'][0]:04o}"
+                or quarantine_name_match.group(5)
+                != f"{expected_record['access_policy'][1]:x}"
+                or quarantine_name_match.group(6)
+                != f"{expected_record['access_policy'][2]:x}"
+                or not isinstance(expected_record.get("sha256"), str)
+                or quarantine_name_match.group(7) != expected_record["sha256"][:16]
+            ):
+                raise MirrorSyncError(
+                    f"exchange removal journal has invalid durable quarantine "
+                    f"record: {relative_path}"
+                )
+            removal_quarantine = _bind_durable_quarantine_root(
+                root,
+                source_parent_fd=parent_fd,
+            )
+            fcntl.flock(removal_quarantine.fd, fcntl.LOCK_EX)
+            removal_quarantine_locked = True
+            quarantine_name = removal_record["name"]
+            try:
+                removal_quarantine_snapshot = _safe_read_leaf_snapshot(
+                    removal_quarantine.fd,
+                    quarantine_name,
+                    PurePosixPath(quarantine_name),
+                )
+            except MissingPathError:
+                removal_quarantine_snapshot = None
+            if removal_quarantine_snapshot is not None:
+                removal_quarantine_is_expected = _snapshot_matches_record(
+                    removal_quarantine_snapshot,
+                    removal_record["expected"],
+                ) and _quarantine_file_name_matches(
+                    quarantine_name,
+                    removal_quarantine_snapshot,
+                    QUARANTINE_RECOVERY_KIND,
+                )
+                if not removal_quarantine_is_expected:
+                    raise MirrorSyncError(
+                        "exchange removal durable quarantine evidence is "
+                        f"mismatched; preserving artifacts: {relative_path}"
+                    )
+        required_removal_evidence: tuple[str, FileSnapshot] | None = None
         if removing_target:
             if expected_is_absent:
                 raise MirrorSyncError(
@@ -3839,7 +4207,16 @@ def _recover_exchange_journal(
                         f"removed target changed while restoring it: {relative_path}"
                     )
             elif target_snapshot is None and temporary_snapshot is None:
-                pass
+                if not evidence_document or not removal_quarantine_is_expected:
+                    raise MirrorSyncError(
+                        "exchange removal recovery has no exact durable "
+                        f"quarantine evidence; preserving journal: {relative_path}"
+                    )
+                assert removal_quarantine_snapshot is not None
+                required_removal_evidence = (
+                    quarantine_name,
+                    removal_quarantine_snapshot,
+                )
             else:
                 raise MirrorSyncError(
                     f"exchange removal recovery state is ambiguous; preserving "
@@ -3900,9 +4277,16 @@ def _recover_exchange_journal(
             journal_name,
             relative_path,
             journal_snapshot,
+            quarantine=removal_quarantine,
+            quarantine_locked=removal_quarantine_locked,
+            required_removal_evidence=required_removal_evidence,
         )
         os.fsync(parent_fd)
     finally:
+        if removal_quarantine is not None and removal_quarantine_locked:
+            fcntl.flock(removal_quarantine.fd, fcntl.LOCK_UN)
+        if removal_quarantine is not None:
+            os.close(removal_quarantine.fd)
         if parent_fd >= 0:
             os.close(parent_fd)
         if close_root:
@@ -4063,6 +4447,7 @@ def _atomic_write_relative(
                     temporary_name,
                     replacement_snapshot,
                     quarantine_path,
+                    retention_kind=QUARANTINE_TRANSIENT_KIND,
                 )
                 temporary_name = None
                 os.fsync(parent_fd)
@@ -4170,6 +4555,7 @@ def _atomic_write_relative(
                     temporary_name,
                     expected_snapshot,
                     quarantine_path,
+                    retention_kind=QUARANTINE_TRANSIENT_KIND,
                 )
                 temporary_name = None
                 os.fsync(parent_fd)
@@ -4210,6 +4596,7 @@ def _atomic_write_relative(
                         temporary_name,
                         replacement_snapshot,
                         relative_path.parent / temporary_name,
+                        retention_kind=QUARANTINE_TRANSIENT_KIND,
                     )
             except MirrorSyncError:
                 # Ambiguous recovery artifacts are intentionally preserved.
@@ -4233,6 +4620,7 @@ def _atomic_remove_relative(
     root_fd, close_root = _borrow_root_fd(root)
     parent_fd = -1
     quarantine: ControlObjectBinding | None = None
+    quarantine_locked = False
     try:
         parent_fd = _open_parent_directory(
             root_fd,
@@ -4248,12 +4636,23 @@ def _atomic_remove_relative(
         temporary_name = (
             f".{relative_path.name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
         )
+        removal_quarantine_name = _quarantine_file_name(
+            expected_snapshot,
+            QUARANTINE_RECOVERY_KIND,
+        )
+        fcntl.flock(quarantine.fd, fcntl.LOCK_EX)
+        quarantine_locked = True
+        _require_new_durable_quarantine_entry(
+            quarantine.fd,
+            removal_quarantine_name,
+        )
         journal_name, journal_snapshot = _write_exchange_journal(
             parent_fd,
             relative_path,
             temporary_name,
             expected_snapshot,
             None,
+            removal_quarantine_name=removal_quarantine_name,
         )
         journal_path = relative_path.parent / journal_name
         if (
@@ -4292,6 +4691,10 @@ def _atomic_remove_relative(
             temporary_name,
             expected_snapshot,
             temporary_path,
+            retention_kind=QUARANTINE_RECOVERY_KIND,
+            quarantine_name=removal_quarantine_name,
+            quarantine_locked=True,
+            capacity_checked=True,
         )
         os.fsync(parent_fd)
         if _optional_safe_read_snapshot(root, relative_path) is not None:
@@ -4309,9 +4712,17 @@ def _atomic_remove_relative(
             journal_name,
             relative_path,
             journal_snapshot,
+            quarantine=quarantine,
+            quarantine_locked=True,
+            required_removal_evidence=(
+                removal_quarantine_name,
+                expected_snapshot,
+            ),
         )
         os.fsync(parent_fd)
     finally:
+        if quarantine is not None and quarantine_locked:
+            fcntl.flock(quarantine.fd, fcntl.LOCK_UN)
         if parent_fd >= 0:
             os.close(parent_fd)
         if quarantine is not None:
@@ -5884,6 +6295,7 @@ def _write_transaction_journal(
             temporary_name,
             temporary_snapshot,
             TRANSACTION_TEMP_PATH,
+            retention_kind=QUARANTINE_TRANSIENT_KIND,
         )
         temporary_name = ""
         os.fsync(target_root.fd)
@@ -5905,6 +6317,7 @@ def _write_transaction_journal(
                         temporary_name,
                         temporary_snapshot,
                         TRANSACTION_TEMP_PATH,
+                        retention_kind=QUARANTINE_TRANSIENT_KIND,
                     )
             except MirrorSyncError:
                 pass
@@ -5950,6 +6363,7 @@ def _load_transaction_journal(
             TRANSACTION_COMPLETE_PATH.as_posix(),
             completion,
             TRANSACTION_COMPLETE_PATH,
+            retention_kind=QUARANTINE_TRANSIENT_KIND,
         )
     temporary = _optional_safe_read_snapshot(
         target_root,
@@ -5967,6 +6381,7 @@ def _load_transaction_journal(
                 TRANSACTION_TEMP_PATH.as_posix(),
                 temporary,
                 TRANSACTION_TEMP_PATH,
+                retention_kind=QUARANTINE_TRANSIENT_KIND,
             )
             temporary = None
         elif published != temporary:
@@ -5980,6 +6395,7 @@ def _load_transaction_journal(
                 TRANSACTION_TEMP_PATH.as_posix(),
                 temporary,
                 TRANSACTION_TEMP_PATH,
+                retention_kind=QUARANTINE_TRANSIENT_KIND,
             )
     snapshot = published
     if snapshot is None:
@@ -6087,6 +6503,7 @@ def _remove_transaction_journal(
         TRANSACTION_COMPLETE_PATH.as_posix(),
         expected,
         TRANSACTION_COMPLETE_PATH,
+        retention_kind=QUARANTINE_TRANSIENT_KIND,
     )
 
 
@@ -7010,6 +7427,50 @@ def _generate_mirror_bound(
             initial_index,
             managed_additional_paths,
         )
+        all_targets_already_desired = all(
+            _snapshot_matches_desired(
+                target_snapshots[path],
+                _desired_path_record(desired),
+            )
+            for path, desired in desired_files.items()
+        )
+        receipt_already_final = _snapshot_matches_desired(
+            target_snapshots[RECEIPT_PATH],
+            _desired_file_record(receipt_payload, 0o644),
+        )
+        if all_targets_already_desired and receipt_already_final:
+            unchanged_group = {
+                path: snapshot
+                for path, snapshot in target_snapshots.items()
+                if snapshot is not None and path not in retired_paths
+            }
+            unchanged_sources = verify_active_sources()
+            if unchanged_sources != sources:
+                raise MirrorSyncError(
+                    "canonical source group changed during no-op generation"
+                )
+            _verify_canonical_repository(
+                repository_root,
+                source_lock.canonical_repository,
+            )
+            _verify_target_repository(target_root, mirror.repository)
+            _require_same_target_index(
+                target_root,
+                mirror,
+                initial_index,
+                managed_additional_paths,
+            )
+            _require_same_file_group(
+                target_root,
+                unchanged_group,
+                "unchanged consumer mirror group",
+            )
+            _require_paths_absent(
+                target_root,
+                retired_paths,
+                "unchanged retired consumer mirror group",
+            )
+            return completed_file_count()
         transaction_document = _transaction_document(
             source_lock,
             mirror,
@@ -7024,7 +7485,14 @@ def _generate_mirror_bound(
             target_root,
             transaction_document,
         )
-        already_desired: set[PurePosixPath] = set()
+        already_desired = {
+            path
+            for path, desired in desired_files.items()
+            if _snapshot_matches_desired(
+                target_snapshots[path],
+                _desired_path_record(desired),
+            )
+        }
         receipt_state = "initial"
     else:
         transaction_snapshot, transaction_document = pending_transaction

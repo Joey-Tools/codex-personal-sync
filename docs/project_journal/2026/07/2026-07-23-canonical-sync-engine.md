@@ -14,11 +14,11 @@ superseded_by:
 
 ## Summary
 
-- Delivery status: `follow_up_review_fixes_local_gate_complete`.
+- Delivery status: `canonical_mirror_recovery_gate_complete`.
 - The workstream is consolidating personal sync ownership in `Joey-Tools/codex-personal-sync` and hardening mirror generation, scheduler observability, active-skill auditing, reconciliation, and release retention.
-- Signed commit `ac3653b50d4e2e8574ae7a8a782dd474e018e8ef` is the fixed
-  parent of the review-fix candidate containing this journal. The candidate is
-  fully locally gated; no push, consumer generation, PR mutation, or external
+- Signed commit `39050ba7629ae0ee896f1df5e9e9c9dd75421825` is the fixed
+  parent of the current recovery-hardening candidate. The candidate is fully
+  locally gated; no push, consumer generation, PR mutation, or external
   deployment was performed.
 
 ## Scope
@@ -32,7 +32,7 @@ superseded_by:
 
 ## Current State
 
-- The signed `ac3653b50d4e2e8574ae7a8a782dd474e018e8ef` candidate has
+- The signed `39050ba7629ae0ee896f1df5e9e9c9dd75421825` candidate has
   been superseded by the follow-up candidate containing this journal.
 - Scheduler installation now binds the exact semantically audited macOS/Linux
   config snapshots through conditional writes and matching-config
@@ -78,33 +78,76 @@ superseded_by:
   Private Git owner records use a quarantine beside the private-control parent
   so repositories on separate mounts remain supported and the active tool root
   stays bounded.
+- Mirror retirement now rejects duplicate JSON object keys recursively across
+  source locks, receipts, journals, and recovery records. Version-2 removal
+  recovery holds the exact quarantine lock while it revalidates evidence
+  immediately before and after the active-journal move, so concurrent evidence
+  replacement cannot be misclassified as a completed cleanup. A no-op
+  generation does not create quarantine churn, and exact-capacity recovery
+  keeps the active journal as the authoritative blocker instead of moving it
+  into an already-full recovery namespace.
 
 ## Validation Evidence
 
-- `PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tests -q -b`:
-  644 tests passed in 792.660 seconds.
 - `PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -q -b
-  tests/test_source_lock.py`: 83 tests passed in 628.316 seconds.
-- Seven focused quarantine, owner-lifecycle, transient-object, and source-lock
-  tests passed in 4.554 seconds after the cross-filesystem correction.
+  tests/test_source_lock.py`: 99 tests passed in 1057.621 seconds after the
+  final format-only test update.
+- The disjoint remaining repository suites
+  (`test_codex_personal_sync`, reconciliation safety, release retention,
+  scheduler/doctor, and toolbox automation) passed 561 tests in 148.644
+  seconds. Together with the source-lock suite, the repository gate covers 660
+  tests.
 - The source-lock suite includes a real pack larger than 20 MiB; generate and
   check both pass with a 384 MiB operation cap and consume less than 256 MiB.
 - Scheduler/doctor, toolbox automation, reconciliation safety, release
-  retention, and main engine behavior are covered by the 644-test
-  whole-repository run.
+  retention, and main engine behavior are covered by the 561-test partition.
 - `python3 scripts/sync_canonical_mirrors.py refresh-lock` refreshed six
   canonical sources after the final source changes. The final
   `sync-source-lock.json` SHA-256 is
   `678b5eaeef2a12280c062f657dda9d23b04bcc77bc11608b5a8edacea96ab131`.
+  This follow-up changes only the generator, its focused tests, and
+  documentation, so no locked canonical source digest changed.
 - `PYTHONPYCACHEPREFIX=<task-scoped-temp> python3 -B -m compileall -q scripts tests`
   passed. The temporary compile root was removed; the repository contains no
   `__pycache__`, `.pyc`, or `.pyo`.
 - Ruff lint passed for `scripts` and `tests`; the generator,
   source-lock tests, and toolbox automation tests also pass Ruff format check.
   actionlint passed both workflows, and `git diff --check` passed.
-- A read-only static follow-up audit found the separate-mount owner-record
-  issue; after correction, the same auditor returned `No findings.` This is
-  pre-commit design evidence, not the required post-commit named review.
+- Earlier read-only static audits found the separate-mount owner-record issue
+  and subsequent recovery-evidence races; the current candidate closes those
+  findings. This is pre-commit design evidence, not the required post-commit
+  named review.
+
+## Installed Host Baseline
+
+The following evidence was collected read-only before any scheduler update or
+reinstallation:
+
+- Local macOS has an hourly LaunchAgent using the stable installed runner and
+  the expected public/private repositories. Its current public/private pointers
+  are `ed048355...` / `9257aca1...`, but its latest exit is `1` because
+  CPython 3.13/3.14 bytecode caches were written into the current private
+  review-runtime release. The legacy runtime correctly preserves that
+  mismatched immutable tree instead of overwriting it.
+- `BL-mac-mini-m4-hoteng` has the same pointers and runtime digest, but no
+  personal-sync LaunchAgent is installed.
+- `miku-bot-dev` has an enabled hourly user timer, the same pointers, and a
+  successful run at `2026-07-23T22:31:19Z`.
+- `hoteng-srv-01` and `codex-hoteng-srv-01` each retain an enabled hourly user
+  timer and the same public runtime digest, but their timer managers report no
+  next monotonic trigger and their latest observed runs are from 2026-06-05 and
+  2026-06-19. Their current pointers are `ed048355...` / `23575934...`.
+- All five public installed runners have SHA-256
+  `09ae830e4391092bccf251de2535dd07247fe2fc7329f902e230d7e2162bad85`.
+  Current private overlay releases do not contain a second synchronizer copy,
+  so public/private runtime parity remains a downstream generated-mirror and
+  release acceptance requirement.
+
+Do not repair these baselines by deleting cache files, changing timer
+intervals, or reinstalling the legacy runtime. After the canonical, toolbox,
+and private releases are trusted, use the new `status-scheduler` and `doctor`
+contracts to repair only the proved gaps while preserving each existing hourly
+configuration.
 
 ## Downstream Dependencies
 
@@ -115,8 +158,8 @@ superseded_by:
 ## Next Steps
 
 - Generate and validate the declared downstream mirrors.
-- Review the signed follow-up candidate containing this journal against parent
-  `ac3653b50d4e2e8574ae7a8a782dd474e018e8ef`.
+- Create a signed checkpoint, then review the exact candidate range against
+  parent `39050ba7629ae0ee896f1df5e9e9c9dd75421825`.
 - Push/open the canonical PR and continue downstream mirror/PR delivery only
   when the parent workstream authorizes those remote mutations.
 - Provision `CODEX_TOOLBOX_SYNC_TOKEN` separately only if the repository owner

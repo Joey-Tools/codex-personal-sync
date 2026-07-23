@@ -215,6 +215,73 @@ class MirrorGeneratorTests(unittest.TestCase):
             )
         self.assertEqual(self.source_path.read_bytes(), original_source)
 
+    def test_repeated_exact_generate_is_a_quarantine_stable_no_op(self) -> None:
+        self.assertEqual(self._generate(), 1)
+        self._commit(self.target_root, "track generated mirror")
+        target = self.target_root / "scripts" / "engine.py"
+        receipt = self.target_root / MIRROR_MODULE.RECEIPT_PATH.as_posix()
+        target_identity = (target.stat().st_dev, target.stat().st_ino)
+        receipt_identity = (receipt.stat().st_dev, receipt.stat().st_ino)
+        quarantine = (
+            self.target_root.parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        )
+        quarantine_names = (
+            sorted(path.name for path in quarantine.iterdir())
+            if quarantine.exists()
+            else []
+        )
+
+        for _index in range(5):
+            self.assertEqual(self._generate(), 1)
+
+        self.assertEqual((target.stat().st_dev, target.stat().st_ino), target_identity)
+        self.assertEqual(
+            (receipt.stat().st_dev, receipt.stat().st_ino),
+            receipt_identity,
+        )
+        self.assertEqual(
+            (
+                sorted(path.name for path in quarantine.iterdir())
+                if quarantine.exists()
+                else []
+            ),
+            quarantine_names,
+        )
+        self.assertEqual(
+            self._git(self.target_root, "status", "--porcelain"),
+            b"",
+        )
+        for marker in (
+            MIRROR_MODULE.TRANSACTION_PATH,
+            MIRROR_MODULE.TRANSACTION_TEMP_PATH,
+            MIRROR_MODULE.TRANSACTION_COMPLETE_PATH,
+        ):
+            self.assertFalse((self.target_root / marker.as_posix()).exists())
+
+    def test_new_commit_with_unchanged_source_does_not_replace_target(self) -> None:
+        self.assertEqual(self._generate(), 1)
+        self._commit(self.target_root, "track generated mirror")
+        target = self.target_root / "scripts" / "engine.py"
+        target_identity = (target.stat().st_dev, target.stat().st_ino)
+        (self.canonical_root / "UNRELATED.md").write_text(
+            "Unrelated canonical metadata.\n",
+            encoding="utf-8",
+        )
+        self.source_commit = self._commit(
+            self.canonical_root,
+            "advance canonical commit without source changes",
+        )
+
+        self.assertEqual(self._generate(), 1)
+
+        self.assertEqual((target.stat().st_dev, target.stat().st_ino), target_identity)
+        receipt = json.loads(
+            (self.target_root / MIRROR_MODULE.RECEIPT_PATH.as_posix()).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(receipt["canonical_commit"], self.source_commit)
+
     def test_generate_conditionally_retires_a_renamed_receipt_target(self) -> None:
         self._generate()
         self._commit(self.target_root, "track first generated mirror")
@@ -508,6 +575,7 @@ class MirrorGeneratorTests(unittest.TestCase):
             source_name,
             expected,
             display_path,
+            **kwargs,
         ):
             nonlocal injected
             if not injected:
@@ -535,6 +603,7 @@ class MirrorGeneratorTests(unittest.TestCase):
                 source_name,
                 expected,
                 display_path,
+                **kwargs,
             )
 
         try:
@@ -591,6 +660,7 @@ class MirrorGeneratorTests(unittest.TestCase):
             source_name,
             expected_snapshot,
             display_path,
+            **kwargs,
         ):
             nonlocal injected
             if not injected:
@@ -618,6 +688,7 @@ class MirrorGeneratorTests(unittest.TestCase):
                 source_name,
                 expected_snapshot,
                 display_path,
+                **kwargs,
             )
 
         with (
@@ -1929,6 +2000,159 @@ class MirrorGeneratorTests(unittest.TestCase):
         self.assertFalse(private_path.exists())
         self.assertFalse(owner_path.exists())
 
+    def test_stale_owner_recovery_uses_private_control_filesystem_quarantine(
+        self,
+    ) -> None:
+        initial_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            MIRROR_MODULE._ensure_git_control_binding(initial_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(initial_root)
+
+        tool_root_path = (
+            MIRROR_MODULE.PRIVATE_GIT_CONTROL_PARENT
+            / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        )
+        private_name = (
+            f"sync-canonical-git-control.{os.getpid()}.0123456789abcdef0123456789abcdef"
+        )
+        owner_name = f"{private_name}.owner.json"
+        owner_path = tool_root_path / owner_name
+        owner_path.write_bytes(
+            MIRROR_MODULE._owner_record_payload(
+                private_name,
+                (123, 456, stat.S_IFDIR),
+                "abcdef0123456789abcdef0123456789",
+                "cleanup",
+            )
+        )
+        owner_path.chmod(0o600)
+        os.chown(owner_path, os.geteuid(), os.getegid())
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        tool_root = MIRROR_MODULE._bind_absolute_control_object(
+            tool_root_path,
+            "test private Git tool root",
+            require_directory=True,
+        )
+        real_bind = MIRROR_MODULE._bind_durable_quarantine_root
+        observed_private_parent = False
+
+        def require_private_parent(root, **kwargs):
+            nonlocal observed_private_parent
+            self.assertEqual(
+                kwargs.get("quarantine_parent"),
+                MIRROR_MODULE.PRIVATE_GIT_CONTROL_PARENT,
+            )
+            self.assertEqual(
+                kwargs.get("source_parent_fd"),
+                tool_root.fd,
+            )
+            observed_private_parent = True
+            return real_bind(root, **kwargs)
+
+        try:
+            MIRROR_MODULE.fcntl.flock(tool_root.fd, MIRROR_MODULE.fcntl.LOCK_EX)
+            with mock.patch.object(
+                MIRROR_MODULE,
+                "_bind_durable_quarantine_root",
+                side_effect=require_private_parent,
+            ):
+                MIRROR_MODULE._recover_stale_private_snapshots(
+                    bound_root,
+                    tool_root,
+                )
+        finally:
+            MIRROR_MODULE.fcntl.flock(tool_root.fd, MIRROR_MODULE.fcntl.LOCK_UN)
+            os.close(tool_root.fd)
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        self.assertTrue(observed_private_parent)
+        self.assertFalse(owner_path.exists())
+
+    def test_stale_owner_recovery_binds_quarantine_before_private_removal(
+        self,
+    ) -> None:
+        initial_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            MIRROR_MODULE._ensure_git_control_binding(initial_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(initial_root)
+
+        tool_root_path = (
+            MIRROR_MODULE.PRIVATE_GIT_CONTROL_PARENT
+            / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        )
+        private_name = (
+            f"sync-canonical-git-control.{os.getpid()}.fedcba9876543210fedcba9876543210"
+        )
+        owner_name = f"{private_name}.owner.json"
+        private_path = tool_root_path / private_name
+        owner_path = tool_root_path / owner_name
+        private_path.mkdir(mode=0o700)
+        private_identity = MIRROR_MODULE._object_identity(private_path.stat())
+        owner_path.write_bytes(
+            MIRROR_MODULE._owner_record_payload(
+                private_name,
+                private_identity,
+                "fedcba9876543210fedcba9876543210",
+                "cleanup",
+            )
+        )
+        owner_path.chmod(0o600)
+        os.chown(owner_path, os.geteuid(), os.getegid())
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        tool_root = MIRROR_MODULE._bind_absolute_control_object(
+            tool_root_path,
+            "test private Git tool root",
+            require_directory=True,
+        )
+        real_bind = MIRROR_MODULE._bind_durable_quarantine_root
+        real_remove_private = MIRROR_MODULE._remove_bound_private_directory
+        quarantine_bound = False
+
+        def observe_quarantine_bind(root, **kwargs):
+            nonlocal quarantine_bound
+            self.assertEqual(
+                kwargs.get("quarantine_parent"),
+                MIRROR_MODULE.PRIVATE_GIT_CONTROL_PARENT,
+            )
+            self.assertEqual(kwargs.get("source_parent_fd"), tool_root.fd)
+            quarantine_bound = True
+            return real_bind(root, **kwargs)
+
+        def require_prebound_quarantine(*args, **kwargs):
+            self.assertTrue(quarantine_bound)
+            return real_remove_private(*args, **kwargs)
+
+        try:
+            MIRROR_MODULE.fcntl.flock(tool_root.fd, MIRROR_MODULE.fcntl.LOCK_EX)
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_bind_durable_quarantine_root",
+                    side_effect=observe_quarantine_bind,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_remove_bound_private_directory",
+                    side_effect=require_prebound_quarantine,
+                ),
+            ):
+                MIRROR_MODULE._recover_stale_private_snapshots(
+                    bound_root,
+                    tool_root,
+                )
+        finally:
+            MIRROR_MODULE.fcntl.flock(tool_root.fd, MIRROR_MODULE.fcntl.LOCK_UN)
+            os.close(tool_root.fd)
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        self.assertTrue(quarantine_bound)
+        self.assertFalse(private_path.exists())
+        self.assertFalse(owner_path.exists())
+
     def test_quarantine_rejects_cross_filesystem_source_before_isolation(
         self,
     ) -> None:
@@ -1965,6 +2189,211 @@ class MirrorGeneratorTests(unittest.TestCase):
         finally:
             os.close(source_fd)
             MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_quarantine_retains_transient_and_recovery_artifacts(self) -> None:
+        parent_fd = os.open(self.target_root, MIRROR_MODULE._DIRECTORY_FLAGS)
+        try:
+            transient = self.target_root / "transaction-temporary"
+            transient.write_bytes(b"internal transaction bytes\n")
+            transient_snapshot = MIRROR_MODULE._safe_read_leaf_snapshot(
+                parent_fd,
+                transient.name,
+                MIRROR_MODULE.PurePosixPath(transient.name),
+            )
+            MIRROR_MODULE._isolate_and_remove_file(
+                self.target_root,
+                parent_fd,
+                transient.name,
+                transient_snapshot,
+                MIRROR_MODULE.PurePosixPath(transient.name),
+                retention_kind=MIRROR_MODULE.QUARANTINE_TRANSIENT_KIND,
+            )
+
+            recovery = self.target_root / "retired-user-target"
+            recovery.write_bytes(b"receipt-bound recovery bytes\n")
+            recovery_snapshot = MIRROR_MODULE._safe_read_leaf_snapshot(
+                parent_fd,
+                recovery.name,
+                MIRROR_MODULE.PurePosixPath(recovery.name),
+            )
+            MIRROR_MODULE._isolate_and_remove_file(
+                self.target_root,
+                parent_fd,
+                recovery.name,
+                recovery_snapshot,
+                MIRROR_MODULE.PurePosixPath(recovery.name),
+                retention_kind=MIRROR_MODULE.QUARANTINE_RECOVERY_KIND,
+            )
+
+            quarantine = MIRROR_MODULE._bind_durable_quarantine_root(
+                self.target_root,
+                source_parent_fd=parent_fd,
+            )
+            os.close(quarantine.fd)
+        finally:
+            os.close(parent_fd)
+
+        quarantine_path = (
+            self.target_root.parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        )
+        names = sorted(path.name for path in quarantine_path.iterdir())
+        transient_paths = [
+            quarantine_path / name
+            for name in names
+            if name.startswith("transient-file-")
+        ]
+        recovery_paths = [
+            quarantine_path / name
+            for name in names
+            if name.startswith("recovery-file-")
+        ]
+        self.assertEqual(
+            [path.read_bytes() for path in transient_paths],
+            [transient_snapshot.payload],
+        )
+        self.assertEqual(
+            [path.read_bytes() for path in recovery_paths],
+            [recovery_snapshot.payload],
+        )
+
+    def test_quarantine_name_binds_identity_content_and_access_policy(self) -> None:
+        parent_fd = os.open(self.target_root, MIRROR_MODULE._DIRECTORY_FLAGS)
+        try:
+            source = self.target_root / "quarantine-name-source"
+            source.write_bytes(b"name-bound bytes\n")
+            expected = MIRROR_MODULE._safe_read_leaf_snapshot(
+                parent_fd,
+                source.name,
+                MIRROR_MODULE.PurePosixPath(source.name),
+            )
+        finally:
+            os.close(parent_fd)
+
+        name = MIRROR_MODULE._quarantine_file_name(
+            expected,
+            MIRROR_MODULE.QUARANTINE_TRANSIENT_KIND,
+        )
+        self.assertTrue(
+            MIRROR_MODULE._quarantine_file_name_matches(
+                name,
+                expected,
+                MIRROR_MODULE.QUARANTINE_TRANSIENT_KIND,
+            )
+        )
+        changed_identity = MIRROR_MODULE.FileSnapshot(
+            payload=expected.payload,
+            mode=expected.mode,
+            identity=(
+                expected.identity[0],
+                expected.identity[1] + 1,
+                expected.identity[2],
+            ),
+            access_policy=expected.access_policy,
+            size=expected.size,
+        )
+        changed_content = MIRROR_MODULE.FileSnapshot(
+            payload=b"same-size changed\n",
+            mode=expected.mode,
+            identity=expected.identity,
+            access_policy=expected.access_policy,
+            size=expected.size,
+        )
+        changed_policy = MIRROR_MODULE.FileSnapshot(
+            payload=expected.payload,
+            mode=expected.mode ^ 0o020,
+            identity=expected.identity,
+            access_policy=(
+                expected.access_policy[0] ^ 0o020,
+                expected.access_policy[1],
+                expected.access_policy[2],
+            ),
+            size=expected.size,
+        )
+        for changed in (changed_identity, changed_content, changed_policy):
+            self.assertFalse(
+                MIRROR_MODULE._quarantine_file_name_matches(
+                    name,
+                    changed,
+                    MIRROR_MODULE.QUARANTINE_TRANSIENT_KIND,
+                )
+            )
+
+    def test_quarantine_retains_legacy_unclassified_transient_name(self) -> None:
+        quarantine_path = (
+            self.target_root.parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        )
+        quarantine_path.mkdir(mode=0o700)
+        placeholder = quarantine_path / "legacy-transient-placeholder"
+        placeholder.write_bytes(b"legacy transient bytes\n")
+        metadata = placeholder.stat()
+        digest = hashlib.sha256(placeholder.read_bytes()).hexdigest()[:16]
+        legacy_name = (
+            f"transient-file-{metadata.st_dev:x}-{metadata.st_ino:x}-"
+            f"{digest}-0123456789abcdef0123456789abcdef"
+        )
+        legacy_path = placeholder.with_name(legacy_name)
+        placeholder.rename(legacy_path)
+        parent_fd = os.open(self.target_root, MIRROR_MODULE._DIRECTORY_FLAGS)
+        try:
+            quarantine = MIRROR_MODULE._bind_durable_quarantine_root(
+                self.target_root,
+                source_parent_fd=parent_fd,
+            )
+            os.close(quarantine.fd)
+        finally:
+            os.close(parent_fd)
+
+        self.assertEqual(legacy_path.read_bytes(), b"legacy transient bytes\n")
+
+    def test_quarantine_capacity_is_checked_before_source_isolation(self) -> None:
+        parent_fd = os.open(self.target_root, MIRROR_MODULE._DIRECTORY_FLAGS)
+        source = self.target_root / "capacity-bound-temporary"
+        source.write_bytes(b"capacity-preserved bytes\n")
+        expected = MIRROR_MODULE._safe_read_leaf_snapshot(
+            parent_fd,
+            source.name,
+            MIRROR_MODULE.PurePosixPath(source.name),
+        )
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_durable_quarantine_entry_count",
+                    return_value=MIRROR_MODULE.MAX_DURABLE_QUARANTINE_ENTRIES,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "reached its bounded entry limit",
+                ),
+            ):
+                MIRROR_MODULE._isolate_and_remove_file(
+                    self.target_root,
+                    parent_fd,
+                    source.name,
+                    expected,
+                    MIRROR_MODULE.PurePosixPath(source.name),
+                    retention_kind=MIRROR_MODULE.QUARANTINE_TRANSIENT_KIND,
+                )
+        finally:
+            os.close(parent_fd)
+
+        self.assertEqual(source.read_bytes(), expected.payload)
+
+    def test_quarantine_at_capacity_can_still_be_bound_for_recovery(self) -> None:
+        parent_fd = os.open(self.target_root, MIRROR_MODULE._DIRECTORY_FLAGS)
+        try:
+            with mock.patch.object(
+                MIRROR_MODULE,
+                "_durable_quarantine_entry_count",
+                return_value=MIRROR_MODULE.MAX_DURABLE_QUARANTINE_ENTRIES,
+            ):
+                quarantine = MIRROR_MODULE._bind_durable_quarantine_root(
+                    self.target_root,
+                    source_parent_fd=parent_fd,
+                )
+            os.close(quarantine.fd)
+        finally:
+            os.close(parent_fd)
 
     def test_stale_recovery_rejects_owner_path_replacement_after_lock(
         self,
@@ -3379,6 +3808,10 @@ class MirrorGeneratorTests(unittest.TestCase):
             target_path,
         )
         temporary_name = f".{target_path.name}.tmp-{os.getpid()}-0123456789abcdef"
+        quarantine_name = MIRROR_MODULE._quarantine_file_name(
+            expected,
+            MIRROR_MODULE.QUARANTINE_RECOVERY_KIND,
+        )
         root_fd = os.open(self.target_root, os.O_RDONLY)
         try:
             MIRROR_MODULE._write_exchange_journal(
@@ -3387,6 +3820,7 @@ class MirrorGeneratorTests(unittest.TestCase):
                 temporary_name,
                 expected,
                 None,
+                removal_quarantine_name=quarantine_name,
             )
             MIRROR_MODULE._rename_directory_entry_noreplace(
                 root_fd,
@@ -3408,6 +3842,10 @@ class MirrorGeneratorTests(unittest.TestCase):
             self.target_root,
             target_path,
         )
+        quarantine_name = MIRROR_MODULE._quarantine_file_name(
+            expected,
+            MIRROR_MODULE.QUARANTINE_RECOVERY_KIND,
+        )
         root_fd = os.open(self.target_root, os.O_RDONLY)
         try:
             MIRROR_MODULE._write_exchange_journal(
@@ -3416,6 +3854,7 @@ class MirrorGeneratorTests(unittest.TestCase):
                 temporary_name,
                 expected,
                 None,
+                removal_quarantine_name=quarantine_name,
             )
             MIRROR_MODULE._rename_directory_entry_noreplace(
                 root_fd,
@@ -3425,6 +3864,68 @@ class MirrorGeneratorTests(unittest.TestCase):
             os.unlink(temporary_name, dir_fd=root_fd)
             os.fsync(root_fd)
         finally:
+            os.close(root_fd)
+
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "no exact durable quarantine evidence",
+        ):
+            MIRROR_MODULE._recover_exchange_journal(
+                self.target_root,
+                target_path,
+            )
+        self.assertFalse(target.exists())
+        self.assertTrue(
+            (
+                self.target_root / MIRROR_MODULE._exchange_journal_name(target_path)
+            ).exists()
+        )
+
+    def test_exchange_journal_accepts_exact_durable_removal_evidence(self) -> None:
+        target_path = MIRROR_MODULE.PurePosixPath("retired-durable-crash.txt")
+        target = self.target_root / target_path.as_posix()
+        target.write_bytes(b"receipt-bound durable bytes\n")
+        expected = MIRROR_MODULE._safe_read_snapshot(
+            self.target_root,
+            target_path,
+        )
+        temporary_name = f".{target_path.name}.tmp-{os.getpid()}-abcdef0123456789"
+        quarantine_name = MIRROR_MODULE._quarantine_file_name(
+            expected,
+            MIRROR_MODULE.QUARANTINE_RECOVERY_KIND,
+        )
+        root_fd = os.open(self.target_root, os.O_RDONLY)
+        quarantine = None
+        try:
+            quarantine = MIRROR_MODULE._bind_durable_quarantine_root(
+                self.target_root,
+                source_parent_fd=root_fd,
+            )
+            MIRROR_MODULE._write_exchange_journal(
+                root_fd,
+                target_path,
+                temporary_name,
+                expected,
+                None,
+                removal_quarantine_name=quarantine_name,
+            )
+            MIRROR_MODULE._rename_directory_entry_noreplace(
+                root_fd,
+                target_path.name,
+                temporary_name,
+            )
+            MIRROR_MODULE._persist_quarantined_file(
+                quarantine,
+                root_fd,
+                temporary_name,
+                expected,
+                MIRROR_MODULE.PurePosixPath(temporary_name),
+                retention_kind=MIRROR_MODULE.QUARANTINE_RECOVERY_KIND,
+                quarantine_name=quarantine_name,
+            )
+        finally:
+            if quarantine is not None:
+                os.close(quarantine.fd)
             os.close(root_fd)
 
         MIRROR_MODULE._recover_exchange_journal(
@@ -3437,6 +3938,329 @@ class MirrorGeneratorTests(unittest.TestCase):
                 self.target_root / MIRROR_MODULE._exchange_journal_name(target_path)
             ).exists()
         )
+        quarantine_path = (
+            self.target_root.parent
+            / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+            / quarantine_name
+        )
+        self.assertEqual(quarantine_path.read_bytes(), expected.payload)
+
+    def test_exchange_recovery_rechecks_evidence_before_journal_cleanup(
+        self,
+    ) -> None:
+        target_path = MIRROR_MODULE.PurePosixPath("retired-evidence-race.txt")
+        target = self.target_root / target_path.as_posix()
+        target.write_bytes(b"receipt-bound race bytes\n")
+        expected = MIRROR_MODULE._safe_read_snapshot(
+            self.target_root,
+            target_path,
+        )
+        temporary_name = f".{target_path.name}.tmp-{os.getpid()}-1234567890abcdef"
+        quarantine_name = MIRROR_MODULE._quarantine_file_name(
+            expected,
+            MIRROR_MODULE.QUARANTINE_RECOVERY_KIND,
+        )
+        root_fd = os.open(self.target_root, os.O_RDONLY)
+        quarantine = None
+        try:
+            quarantine = MIRROR_MODULE._bind_durable_quarantine_root(
+                self.target_root,
+                source_parent_fd=root_fd,
+            )
+            journal_name, journal_snapshot = MIRROR_MODULE._write_exchange_journal(
+                root_fd,
+                target_path,
+                temporary_name,
+                expected,
+                None,
+                removal_quarantine_name=quarantine_name,
+            )
+            MIRROR_MODULE._rename_directory_entry_noreplace(
+                root_fd,
+                target_path.name,
+                temporary_name,
+            )
+            MIRROR_MODULE._persist_quarantined_file(
+                quarantine,
+                root_fd,
+                temporary_name,
+                expected,
+                MIRROR_MODULE.PurePosixPath(temporary_name),
+                retention_kind=MIRROR_MODULE.QUARANTINE_RECOVERY_KIND,
+                quarantine_name=quarantine_name,
+            )
+        finally:
+            if quarantine is not None:
+                os.close(quarantine.fd)
+            os.close(root_fd)
+
+        quarantine_root = (
+            self.target_root.parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        )
+        evidence_path = quarantine_root / quarantine_name
+        saved_evidence_path = quarantine_root / "saved-racing-removal-evidence"
+        journal_path = self.target_root / journal_name
+        real_safe_read_leaf = MIRROR_MODULE._safe_read_leaf_snapshot
+        evidence_reads = 0
+
+        def remove_evidence_before_revalidation(
+            parent_fd,
+            name,
+            display_path,
+        ):
+            nonlocal evidence_reads
+            if name == quarantine_name:
+                evidence_reads += 1
+                if evidence_reads == 2:
+                    evidence_path.rename(saved_evidence_path)
+            return real_safe_read_leaf(parent_fd, name, display_path)
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_safe_read_leaf_snapshot",
+                side_effect=remove_evidence_before_revalidation,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "missing immediately before journal cleanup",
+            ),
+        ):
+            MIRROR_MODULE._recover_exchange_journal(
+                self.target_root,
+                target_path,
+            )
+
+        self.assertEqual(evidence_reads, 2)
+        self.assertEqual(journal_path.read_bytes(), journal_snapshot.payload)
+        self.assertEqual(saved_evidence_path.read_bytes(), expected.payload)
+        self.assertFalse(target.exists())
+
+    def test_atomic_remove_rechecks_evidence_during_journal_cleanup(self) -> None:
+        target_path = MIRROR_MODULE.PurePosixPath("retired-live-race.txt")
+        target = self.target_root / target_path.as_posix()
+        target.write_bytes(b"receipt-bound live race bytes\n")
+        expected = MIRROR_MODULE._safe_read_snapshot(
+            self.target_root,
+            target_path,
+        )
+        journal_name = MIRROR_MODULE._exchange_journal_name(target_path)
+        quarantine_root = (
+            self.target_root.parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        )
+        real_isolate = MIRROR_MODULE._isolate_and_remove_file
+        retained_journal_path = None
+        saved_evidence_path = quarantine_root / "saved-live-removal-evidence"
+
+        def replace_evidence_during_journal_cleanup(*args, **kwargs):
+            nonlocal retained_journal_path
+            retained_path = real_isolate(*args, **kwargs)
+            if args[2] == journal_name:
+                evidence_paths = sorted(
+                    quarantine_root.glob(
+                        f"{MIRROR_MODULE.QUARANTINE_RECOVERY_KIND}-file-*"
+                    )
+                )
+                self.assertEqual(len(evidence_paths), 1)
+                evidence_paths[0].rename(saved_evidence_path)
+                retained_journal_path = retained_path
+            return retained_path
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_isolate_and_remove_file",
+                side_effect=replace_evidence_during_journal_cleanup,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "recovery journal retained at",
+            ),
+        ):
+            MIRROR_MODULE._atomic_remove_relative(
+                self.target_root,
+                target_path,
+                expected,
+            )
+
+        self.assertFalse(target.exists())
+        self.assertFalse((self.target_root / journal_name).exists())
+        self.assertIsNotNone(retained_journal_path)
+        assert retained_journal_path is not None
+        retained_document = json.loads(
+            retained_journal_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(retained_document["version"], 2)
+        self.assertEqual(retained_document["target_path"], target_path.as_posix())
+        self.assertEqual(saved_evidence_path.read_bytes(), expected.payload)
+
+    def test_exchange_recovery_at_exact_capacity_preserves_active_journal(
+        self,
+    ) -> None:
+        target_path = MIRROR_MODULE.PurePosixPath("retired-capacity-crash.txt")
+        target = self.target_root / target_path.as_posix()
+        target.write_bytes(b"receipt-bound capacity bytes\n")
+        expected = MIRROR_MODULE._safe_read_snapshot(
+            self.target_root,
+            target_path,
+        )
+        temporary_name = f".{target_path.name}.tmp-{os.getpid()}-abcdef1234567890"
+        quarantine_name = MIRROR_MODULE._quarantine_file_name(
+            expected,
+            MIRROR_MODULE.QUARANTINE_RECOVERY_KIND,
+        )
+        root_fd = os.open(self.target_root, os.O_RDONLY)
+        quarantine = None
+        try:
+            quarantine = MIRROR_MODULE._bind_durable_quarantine_root(
+                self.target_root,
+                source_parent_fd=root_fd,
+            )
+            journal_name, journal_snapshot = MIRROR_MODULE._write_exchange_journal(
+                root_fd,
+                target_path,
+                temporary_name,
+                expected,
+                None,
+                removal_quarantine_name=quarantine_name,
+            )
+            MIRROR_MODULE._rename_directory_entry_noreplace(
+                root_fd,
+                target_path.name,
+                temporary_name,
+            )
+            MIRROR_MODULE._persist_quarantined_file(
+                quarantine,
+                root_fd,
+                temporary_name,
+                expected,
+                MIRROR_MODULE.PurePosixPath(temporary_name),
+                retention_kind=MIRROR_MODULE.QUARANTINE_RECOVERY_KIND,
+                quarantine_name=quarantine_name,
+            )
+        finally:
+            if quarantine is not None:
+                os.close(quarantine.fd)
+            os.close(root_fd)
+
+        journal_path = self.target_root / journal_name
+        evidence_path = (
+            self.target_root.parent
+            / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+            / quarantine_name
+        )
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_durable_quarantine_entry_count",
+                return_value=MIRROR_MODULE.MAX_DURABLE_QUARANTINE_ENTRIES,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "reached its bounded entry limit",
+            ),
+        ):
+            MIRROR_MODULE._recover_exchange_journal(
+                self.target_root,
+                target_path,
+            )
+
+        self.assertEqual(journal_path.read_bytes(), journal_snapshot.payload)
+        self.assertEqual(evidence_path.read_bytes(), expected.payload)
+        self.assertFalse(target.exists())
+        self.assertFalse((self.target_root / temporary_name).exists())
+
+    def test_legacy_removal_journal_double_missing_is_ambiguous(self) -> None:
+        target_path = MIRROR_MODULE.PurePosixPath("retired-legacy-crash.txt")
+        target = self.target_root / target_path.as_posix()
+        target.write_bytes(b"legacy receipt-bound bytes\n")
+        expected = MIRROR_MODULE._safe_read_snapshot(
+            self.target_root,
+            target_path,
+        )
+        temporary_name = f".{target_path.name}.tmp-{os.getpid()}-fedcba9876543210"
+        journal_path = self.target_root / MIRROR_MODULE._exchange_journal_name(
+            target_path
+        )
+        journal_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "target_path": target_path.as_posix(),
+                    "temporary_name": temporary_name,
+                    "expected": MIRROR_MODULE._snapshot_record(expected),
+                    "replacement": None,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        journal_path.chmod(0o600)
+        os.rename(target, self.target_root / temporary_name)
+        os.unlink(self.target_root / temporary_name)
+
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "no exact durable quarantine evidence",
+        ):
+            MIRROR_MODULE._recover_exchange_journal(
+                self.target_root,
+                target_path,
+            )
+        self.assertTrue(journal_path.exists())
+
+    def test_exchange_recovery_rejects_duplicate_journal_keys(self) -> None:
+        target_path = MIRROR_MODULE.PurePosixPath("duplicate-journal.txt")
+        journal_path = self.target_root / MIRROR_MODULE._exchange_journal_name(
+            target_path
+        )
+        journal_path.write_text(
+            '{"version":1,"version":2}\n',
+            encoding="utf-8",
+        )
+        journal_path.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "exchange recovery journal is invalid",
+        ):
+            MIRROR_MODULE._recover_exchange_journal(
+                self.target_root,
+                target_path,
+            )
+
+        self.assertTrue(journal_path.exists())
+
+    def test_exchange_recovery_rejects_duplicate_nested_removal_keys(self) -> None:
+        target_path = MIRROR_MODULE.PurePosixPath("duplicate-removal-journal.txt")
+        journal_path = self.target_root / MIRROR_MODULE._exchange_journal_name(
+            target_path
+        )
+        journal_path.write_text(
+            (
+                '{"version":2,'
+                f'"target_path":"{target_path.as_posix()}",'
+                '"temporary_name":".duplicate-removal-journal.txt.'
+                'tmp-1-0123456789abcdef",'
+                '"expected":{},"replacement":null,'
+                '"removal_quarantine":{"name":"first","name":"second"}}\n'
+            ),
+            encoding="utf-8",
+        )
+        journal_path.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "exchange recovery journal is invalid",
+        ):
+            MIRROR_MODULE._recover_exchange_journal(
+                self.target_root,
+                target_path,
+            )
+
+        self.assertTrue(journal_path.exists())
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are unavailable")
     def test_generate_rejects_symlink_ancestor(self) -> None:
