@@ -45,7 +45,7 @@ jobs:
         with:
           path: canonical
           ref: ${{ github.sha }}
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Verify canonical master and source lock

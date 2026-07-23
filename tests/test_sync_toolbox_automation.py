@@ -77,6 +77,19 @@ class SyncToolboxAutomationTests(unittest.TestCase):
             r"\b(?:actions|checks|issues|pull-requests|statuses):\s*write\b",
         )
 
+    def test_canonical_checkout_retains_history_for_receipt_validation(self) -> None:
+        canonical_checkout = re.search(
+            r"(?ms)- name: Check out exact canonical commit.*?"
+            r"(?=^      - name: )",
+            self.workflow,
+        )
+        self.assertIsNotNone(canonical_checkout)
+        assert canonical_checkout is not None
+        checkout = canonical_checkout.group(0)
+        self.assertIn("ref: ${{ github.sha }}", checkout)
+        self.assertIn("fetch-depth: 0", checkout)
+        self.assertIn("persist-credentials: false", checkout)
+
     def test_missing_secret_fails_before_target_checkout(self) -> None:
         validation_index = self.workflow.index("- name: Validate sync credential")
         target_checkout_index = self.workflow.index("- name: Check out toolbox master")

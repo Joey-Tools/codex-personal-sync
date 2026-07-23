@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import contextlib
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import importlib.util
 import io
 import json
@@ -744,6 +744,130 @@ class SchedulerDoctorTests(unittest.TestCase):
             MODULE._read_scheduler_runtime_state(self.home),
             newer_failure,
         )
+
+    def test_scheduler_attempt_recovers_from_unbounded_or_noncanonical_time(
+        self,
+    ) -> None:
+        invalid_attempts = (
+            "9999-12-31T23:59:59.999999+00:00",
+            "9999-12-31T23:59:59.999999-23:59",
+            "2026-07-23T09:15:00Z",
+            "2026-07-23T09:15:00",
+            "not-a-timestamp",
+        )
+
+        for previous_attempt in invalid_attempts:
+            with self.subTest(previous_attempt=previous_attempt):
+                attempt = MODULE._next_scheduler_attempt(
+                    {"last_attempt": previous_attempt}
+                )
+                parsed = datetime.fromisoformat(attempt)
+                self.assertEqual(parsed.utcoffset(), timedelta(0))
+                self.assertEqual(parsed.isoformat(), attempt)
+                self.assertNotEqual(attempt, previous_attempt)
+                self.assertLess(parsed.year, 9999)
+
+    def test_scheduler_attempt_rejects_far_future_but_preserves_cas_order(
+        self,
+    ) -> None:
+        far_future = (
+            datetime.now(timezone.utc)
+            + MODULE.MAX_SCHEDULER_ATTEMPT_FUTURE_SKEW
+            + timedelta(days=1)
+        ).isoformat()
+        attempt = MODULE._begin_scheduler_attempt(
+            self.home,
+            mode="public",
+            repo="owner/public-sync",
+            base_repo="owner/public-sync",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+        MODULE._write_scheduler_runtime_state(
+            self.home,
+            {
+                "version": 2,
+                "last_attempt": far_future,
+                "last_success": far_future,
+                "success": True,
+                "failure_reason": "injected future state",
+                "failure_code": "injected-future-state",
+                "release_trees": {
+                    MODULE.PUBLIC_OWNER: {
+                        "sha": PUBLIC_SHA,
+                        "tree_sha256": "a" * 64,
+                    }
+                },
+                "mode": "public",
+                "repo": "owner/public-sync",
+                "base_repo": "owner/public-sync",
+                "owner": MODULE.PUBLIC_OWNER,
+            },
+        )
+        with self.assertRaises(MODULE.SyncError) as invalid_state:
+            MODULE._read_scheduler_runtime_state(self.home)
+        self.assertEqual(
+            invalid_state.exception.code,
+            "scheduler-state-timestamp-invalid",
+        )
+
+        replacement_attempt = MODULE._begin_scheduler_attempt(
+            self.home,
+            mode="public",
+            repo="owner/public-sync",
+            base_repo="owner/public-sync",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+        self.assertNotEqual(replacement_attempt, far_future)
+        self.assertFalse(
+            MODULE._complete_scheduler_attempt(
+                self.home,
+                attempt=attempt,
+                success=True,
+                failure_reason=None,
+                failure_code=None,
+                mode="public",
+                repo="owner/public-sync",
+                base_repo="owner/public-sync",
+                owner=MODULE.PUBLIC_OWNER,
+            )
+        )
+        state = MODULE._read_scheduler_runtime_state(self.home)
+        assert state is not None
+        self.assertEqual(state["last_attempt"], replacement_attempt)
+        self.assertIsNone(state["last_success"])
+        self.assertEqual(state["release_trees"], {})
+
+    def test_timestamp_recovery_does_not_accept_unsafe_runtime_file(self) -> None:
+        status_path = MODULE._scheduler_status_path(self.home)
+        status_path.parent.mkdir(parents=True)
+        status_path.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "last_attempt": "not-a-timestamp",
+                    "last_success": None,
+                    "success": False,
+                    "failure_reason": None,
+                    "failure_code": None,
+                    "release_trees": {},
+                    "mode": "public",
+                    "repo": "owner/public-sync",
+                    "base_repo": "owner/public-sync",
+                    "owner": MODULE.PUBLIC_OWNER,
+                }
+            ),
+            encoding="utf-8",
+        )
+        status_path.chmod(0o644)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "scheduler runtime state is invalid",
+        ):
+            MODULE._read_scheduler_runtime_state(
+                self.home,
+                recover_timestamps=True,
+            )
 
     def test_audit_and_doctor_detect_skill_issues_without_deletion(self) -> None:
         duplicate_one = self.write_skill("duplicate-one", "duplicate-name")

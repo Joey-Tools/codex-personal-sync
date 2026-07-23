@@ -309,6 +309,148 @@ class MirrorGeneratorTests(unittest.TestCase):
         self.assertFalse(removed_target.exists())
         self.assertTrue((self.target_root / "scripts" / "engine.py").exists())
 
+    def test_generate_rejects_self_consistent_forged_prior_receipt(self) -> None:
+        self._generate()
+        user_file = self.target_root / "user-owned.txt"
+        user_file.write_bytes(b"user-owned data\n")
+        receipt_path = self.target_root / MIRROR_MODULE.RECEIPT_PATH.as_posix()
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["files"].append(
+            {
+                "source_name": "forged_user_file",
+                "source_path": "README.md",
+                "target_path": "user-owned.txt",
+                "sha256": hashlib.sha256(user_file.read_bytes()).hexdigest(),
+                "mode": "0644",
+            }
+        )
+        receipt["files"].sort(key=lambda item: item["source_name"])
+        receipt["mapping_digest"] = MIRROR_MODULE._deterministic_digest(
+            [
+                {
+                    "source_name": item["source_name"],
+                    "source_path": item["source_path"],
+                    "target_path": item["target_path"],
+                }
+                for item in receipt["files"]
+            ]
+        )
+        receipt["file_set_digest"] = MIRROR_MODULE._deterministic_digest(
+            sorted(item["target_path"] for item in receipt["files"])
+        )
+        receipt["tree_digest"] = MIRROR_MODULE._deterministic_digest(
+            [
+                {
+                    "target_path": item["target_path"],
+                    "sha256": item["sha256"],
+                    "mode": item["mode"],
+                }
+                for item in sorted(
+                    receipt["files"],
+                    key=lambda item: item["target_path"],
+                )
+            ]
+        )
+        receipt_path.write_text(
+            json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self._commit(self.target_root, "forge self-consistent receipt")
+
+        self.source_path.write_bytes(b"next canonical engine\n")
+        MIRROR_MODULE.refresh_source_lock(self.canonical_root, check=False)
+        self.source_commit = self._commit(
+            self.canonical_root,
+            "advance canonical engine",
+        )
+
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "does not exactly match its historical canonical source lock",
+        ):
+            self._generate()
+        self.assertEqual(user_file.read_bytes(), b"user-owned data\n")
+
+    def test_generate_rejects_mode_0600_journal_path_expansion(self) -> None:
+        class SimulatedCrash(BaseException):
+            pass
+
+        user_file = self.target_root / "user-owned.txt"
+        user_file.write_bytes(b"user-owned data\n")
+        self._commit(self.target_root, "track user-owned file")
+        real_atomic_write = MIRROR_MODULE._atomic_write_relative
+        crashed = False
+
+        def crash_after_target_write(
+            root,
+            relative_path,
+            payload,
+            mode,
+            **kwargs,
+        ):
+            nonlocal crashed
+            result = real_atomic_write(
+                root,
+                relative_path,
+                payload,
+                mode,
+                **kwargs,
+            )
+            if (
+                relative_path == MIRROR_MODULE.PurePosixPath("scripts/engine.py")
+                and not crashed
+            ):
+                crashed = True
+                raise SimulatedCrash()
+            return result
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_atomic_write_relative",
+                side_effect=crash_after_target_write,
+            ),
+            self.assertRaises(SimulatedCrash),
+        ):
+            self._generate()
+
+        journal_path = self.target_root / MIRROR_MODULE.TRANSACTION_PATH.as_posix()
+        document = json.loads(journal_path.read_text(encoding="utf-8"))
+        document["files"]["user-owned.txt"] = {
+            "initial": MIRROR_MODULE._desired_file_record(
+                user_file.read_bytes(),
+                0o644,
+            ),
+            "desired": None,
+        }
+        source_lock = MIRROR_MODULE.load_source_lock(self.canonical_root)
+        mirror = MIRROR_MODULE._selected_mirror(source_lock, "toolbox")
+        bound_target = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            MIRROR_MODULE._ensure_git_control_binding(bound_target)
+            index_snapshot = MIRROR_MODULE._target_index_snapshot(
+                bound_target,
+                mirror,
+                {MIRROR_MODULE.PurePosixPath("user-owned.txt")},
+            )
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_target)
+        document["index_sha256"] = hashlib.sha256(index_snapshot).hexdigest()
+        journal_path.write_text(
+            json.dumps(document, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        journal_path.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "managed paths exceed the HEAD/index-bound prior receipt",
+        ):
+            self._generate()
+        self.assertEqual(user_file.read_bytes(), b"user-owned data\n")
+        self.assertTrue(journal_path.exists())
+        self.assertEqual(stat.S_IMODE(journal_path.stat().st_mode), 0o600)
+
     def test_generate_preserves_a_racing_retired_target_replacement(self) -> None:
         self._generate()
         self._commit(self.target_root, "track first generated mirror")
@@ -345,6 +487,171 @@ class MirrorGeneratorTests(unittest.TestCase):
         self.assertEqual(
             old_target.read_bytes(),
             b"racing consumer replacement\n",
+        )
+
+    def test_isolated_cleanup_quarantines_final_move_replacement(self) -> None:
+        artifact = self.target_root / "cleanup-artifact"
+        artifact.write_bytes(b"expected cleanup artifact\n")
+        artifact.chmod(0o600)
+        saved = self.target_root / "saved-original"
+        replacement_payload = b"concurrent replacement\n"
+        bound_target = MIRROR_MODULE._bind_root(
+            self.target_root,
+            exclusive=True,
+        )
+        real_persist = MIRROR_MODULE._persist_quarantined_file
+        injected = False
+
+        def replace_before_durable_quarantine(
+            quarantine,
+            source_parent_fd,
+            source_name,
+            expected,
+            display_path,
+        ):
+            nonlocal injected
+            if not injected:
+                injected = True
+                os.rename(
+                    source_name,
+                    saved.name,
+                    src_dir_fd=source_parent_fd,
+                    dst_dir_fd=source_parent_fd,
+                )
+                replacement_fd = os.open(
+                    source_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    expected.mode,
+                    dir_fd=source_parent_fd,
+                )
+                try:
+                    os.write(replacement_fd, replacement_payload)
+                    os.fsync(replacement_fd)
+                finally:
+                    os.close(replacement_fd)
+            return real_persist(
+                quarantine,
+                source_parent_fd,
+                source_name,
+                expected,
+                display_path,
+            )
+
+        try:
+            snapshot = MIRROR_MODULE._safe_read_snapshot(
+                bound_target,
+                MIRROR_MODULE.PurePosixPath(artifact.name),
+            )
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_persist_quarantined_file",
+                    side_effect=replace_before_durable_quarantine,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "changed before durable quarantine",
+                ),
+            ):
+                MIRROR_MODULE._isolate_and_remove_file(
+                    bound_target,
+                    bound_target.fd,
+                    artifact.name,
+                    snapshot,
+                    MIRROR_MODULE.PurePosixPath(artifact.name),
+                )
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_target)
+
+        self.assertEqual(saved.read_bytes(), b"expected cleanup artifact\n")
+        quarantine = (
+            self.target_root.parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        )
+        self.assertIn(
+            replacement_payload,
+            [path.read_bytes() for path in quarantine.iterdir()],
+        )
+
+    def test_retired_target_quarantines_final_move_replacement(self) -> None:
+        retired = self.target_root / "retired.txt"
+        retired.write_bytes(b"expected retired target\n")
+        retired.chmod(0o644)
+        saved = self.target_root / "saved-retired-original"
+        replacement_payload = b"retired replacement sentinel\n"
+        expected = MIRROR_MODULE._safe_read_snapshot(
+            self.target_root,
+            MIRROR_MODULE.PurePosixPath(retired.name),
+        )
+        real_persist = MIRROR_MODULE._persist_quarantined_file
+        injected = False
+
+        def replace_before_durable_quarantine(
+            quarantine,
+            source_parent_fd,
+            source_name,
+            expected_snapshot,
+            display_path,
+        ):
+            nonlocal injected
+            if not injected:
+                injected = True
+                os.rename(
+                    source_name,
+                    saved.name,
+                    src_dir_fd=source_parent_fd,
+                    dst_dir_fd=source_parent_fd,
+                )
+                replacement_fd = os.open(
+                    source_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    expected_snapshot.mode,
+                    dir_fd=source_parent_fd,
+                )
+                try:
+                    os.write(replacement_fd, replacement_payload)
+                    os.fsync(replacement_fd)
+                finally:
+                    os.close(replacement_fd)
+            return real_persist(
+                quarantine,
+                source_parent_fd,
+                source_name,
+                expected_snapshot,
+                display_path,
+            )
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_persist_quarantined_file",
+                side_effect=replace_before_durable_quarantine,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "changed before durable quarantine",
+            ),
+        ):
+            MIRROR_MODULE._atomic_remove_relative(
+                self.target_root,
+                MIRROR_MODULE.PurePosixPath(retired.name),
+                expected,
+            )
+
+        self.assertEqual(saved.read_bytes(), b"expected retired target\n")
+        self.assertTrue(
+            (
+                self.target_root
+                / MIRROR_MODULE._exchange_journal_name(
+                    MIRROR_MODULE.PurePosixPath(retired.name)
+                )
+            ).exists()
+        )
+        quarantine = (
+            self.target_root.parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        )
+        self.assertIn(
+            replacement_payload,
+            [path.read_bytes() for path in quarantine.iterdir()],
         )
 
     def test_generate_recovers_after_a_retired_target_removal_crash(self) -> None:
@@ -1546,7 +1853,7 @@ class MirrorGeneratorTests(unittest.TestCase):
         real_create_owner = MIRROR_MODULE._create_owner_record
         observed_lock = False
 
-        def assert_locked(tool_root, private_name, private):
+        def assert_locked(root, tool_root, private_name, private):
             nonlocal observed_lock
             assert tool_root.path is not None
             competitor_fd = os.open(
@@ -1563,6 +1870,7 @@ class MirrorGeneratorTests(unittest.TestCase):
             finally:
                 os.close(competitor_fd)
             return real_create_owner(
+                root,
                 tool_root,
                 private_name,
                 private,
@@ -1578,6 +1886,84 @@ class MirrorGeneratorTests(unittest.TestCase):
                 MIRROR_MODULE._ensure_git_control_binding(bound_root)
             self.assertTrue(observed_lock)
         finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_private_cleanup_binds_quarantine_before_control_paths_move(
+        self,
+    ) -> None:
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        assert bound_root.git_control is not None
+        private_path = bound_root.git_control.private.path
+        owner_path = bound_root.git_control.owner_record.path
+        assert private_path is not None
+        assert owner_path is not None
+        real_bind = MIRROR_MODULE._bind_durable_quarantine_root
+        observed_pre_teardown_paths = False
+
+        def assert_control_paths_still_exist(root, **kwargs):
+            nonlocal observed_pre_teardown_paths
+            self.assertTrue(private_path.exists())
+            self.assertTrue(owner_path.exists())
+            observed_pre_teardown_paths = True
+            quarantine = real_bind(root, **kwargs)
+            self.assertEqual(
+                quarantine.path,
+                MIRROR_MODULE.PRIVATE_GIT_CONTROL_PARENT
+                / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME,
+            )
+            self.assertEqual(
+                os.fstat(quarantine.fd).st_dev,
+                os.fstat(bound_root.git_control.private_parent.fd).st_dev,
+            )
+            return quarantine
+
+        with mock.patch.object(
+            MIRROR_MODULE,
+            "_bind_durable_quarantine_root",
+            side_effect=assert_control_paths_still_exist,
+        ):
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        self.assertTrue(observed_pre_teardown_paths)
+        self.assertFalse(private_path.exists())
+        self.assertFalse(owner_path.exists())
+
+    def test_quarantine_rejects_cross_filesystem_source_before_isolation(
+        self,
+    ) -> None:
+        source_directory = self.target_root / "nested-source"
+        source_directory.mkdir()
+        source_fd = os.open(source_directory, MIRROR_MODULE._DIRECTORY_FLAGS)
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        real_fstat = os.fstat
+
+        def report_distinct_source_device(fd):
+            metadata = real_fstat(fd)
+            if fd != source_fd:
+                return metadata
+            values = list(metadata)
+            values[2] = metadata.st_dev + 1
+            return os.stat_result(values)
+
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE.os,
+                    "fstat",
+                    side_effect=report_distinct_source_device,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "different filesystems",
+                ),
+            ):
+                MIRROR_MODULE._bind_durable_quarantine_root(
+                    bound_root,
+                    source_parent_fd=source_fd,
+                )
+        finally:
+            os.close(source_fd)
             MIRROR_MODULE._finish_bound_roots(bound_root)
 
     def test_stale_recovery_rejects_owner_path_replacement_after_lock(

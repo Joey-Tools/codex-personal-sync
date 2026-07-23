@@ -17,11 +17,13 @@ Git 验证不执行 repository-controlled `git status`，而是用 raw tree/inde
 
 Target layout 对 NFC+casefold 后的 portable spelling 做比较，并双向拒绝 managed target 与 receipt、transaction markers、per-target exchange journal 的 exact/ancestor/descendant overlap；因此 reserved metadata 不能伪装成 target，target 也不能把 reserved path 包在自己的子树中。
 
-Private Git snapshot 位于两个 repository 之外的 durable 0700 current-owner tool root。Owner/phase record 全程持锁；tool-root 临界区覆盖 stale scan、snapshot directory 创建和 owner publication，避免 live directory 被误判为 orphan。Stale cleanup 只删除 record 绑定的 exact identity，未知/替换状态进入 bounded quarantine 或 fail closed。单个 canonical source 与单条 Git stdout 都限制为 32 MiB；同一 operation 共享 deadline、aggregate byte budget 和 entry budget，覆盖 snapshot、Git、recovery、generation 与 cleanup。
+Private Git snapshot 位于两个 repository 之外的 durable 0700 current-owner tool root。Owner/phase record 全程持锁；tool-root 临界区覆盖 stale scan、snapshot directory 创建和 owner publication，避免 live directory 被误判为 orphan。Stale cleanup 只删除 record 绑定的 exact identity，未知/替换状态进入 bounded quarantine 或 fail closed。正常 owner-record cleanup 在任何 control pathname 移动前，预绑定 private-control parent 旁边、同一 verified filesystem 上的独立 durable quarantine；因此不会跨 repository mount，也不会让 active tool root 被预期 cleanup 记录填满。单个 canonical source 与单条 Git stdout 都限制为 32 MiB；同一 operation 共享 deadline、aggregate byte budget 和 entry budget，覆盖 snapshot、Git、recovery、generation 与 cleanup。
 
 若 target 中已有 pending generation，recovery 必须先读取 journal 所绑定的旧 canonical commit 与旧 source lock；不能用新 `HEAD` 重解释旧 transaction。若 caller 同时请求了不同的新 commit，本次调用在完成旧 recovery 后明确失败并要求先审阅/提交恢复结果，不能把旧 receipt 静默当作新生成成功。
 
-新 lock 删除或重命名 target 时，旧 receipt 不是宽泛删除授权。Generator 会完整重算旧 receipt 的 mapping/file-set/tree digests，并要求 receipt 本身及其中每个旧 target 都与 consumer 的 `HEAD`、stage-0 index 和 worktree 精确一致；只有不再出现在新 mapping 中的这部分 exact objects 才进入 desired-absent transaction。Removal 先写 per-target journal，再 no-replace isolate，崩溃恢复会根据 exact before/absent state 还原或完成交易；任何 replacement、dirty bytes 或不明确状态均保留证据并停止。
+新 lock 删除或重命名 target 时，旧 receipt 不是宽泛删除授权。Generator 要求 receipt 指向 locally available 且可达当前 canonical commit 的历史 commit，从该 commit 的 source lock、source tree 和 mirror mapping 逐字节重建 receipt；仅内部 digest 自洽不构成 provenance。它还要求 receipt 及其中每个旧 target 都与 consumer 的 `HEAD`、stage-0 index 和 worktree 精确一致。Pending journal 的 path set 必须精确等于可信旧 receipt 与当前 mapping 的独立并集，不能自行扩张 retirement authority。只有不再出现在新 mapping 中的 exact objects 才进入 desired-absent transaction。
+
+Removal 先写 per-target journal，再 no-replace isolate。通用 macOS/Linux 没有 compare-by-inode unlink，因此不可逆终态不是按 pathname 删除，而是原子移动到 target sibling 的 `.codex-sync-canonical-mirror-quarantine`。该 root 必须为当前 uid 所有、mode `0700`、与 repository 不重叠并受 10,000 entry 上限约束；移动后再次验证 object identity、content 和 access policy。任何 replacement、dirty bytes、跨文件系统失败或不明确状态均保留 journal/quarantine 证据并停止。物理删除需要单独的 identity-aware 人工维护，不属于 generation transaction。
 
 ## 安装模型与所有权
 
@@ -84,7 +86,7 @@ macOS 使用 user `launchd`，Linux 使用 user `systemd`。默认 runner 固定
 - 非 dry-run 的 scheduler install/uninstall 使用现有 per-Codex-home install lock 覆盖 recovery、audit、transaction marker、config publication、legacy cleanup 和 daemon publication；并发配置操作不能观察或回滚另一操作尚未完成的 pair transaction。
 - 调用 `launchctl` / `systemctl` 时使用固定的 root-owned executable 与 closed environment，不继承 loader、shell 或 Python runtime injection 变量。
 
-每次 scheduled run 在 per-Codex-home install lock 内分配严格递增的 UTC attempt timestamp，再以 mode `0600` 原子写入 version 2 的 `personal-sync/state/scheduler-status.json`，记录本次 attempt 尚未完成。成功或失败完成时，在同一锁内比较 attempt timestamp 与完整 target identity；只有仍是 current 的 attempt 才能提交终态，较旧的重叠 run 不会覆盖较新 attempt 的结果。成功后写入 `last_success`，并为每个 current `owner@sha` 保存经过完整 release-tree 验证的 SHA-256 baseline。失败后仅在 target 未变时保留上次成功时间和 baseline，并记录 bounded `failure_reason` 与稳定 `failure_code`。读取端兼容 version 1；旧 runtime target 与当前配置不一致时，不展示或消费旧 target 的 attempt/success/failure/baseline。没有可信 baseline 会单独报告 `immutable-release-baseline-missing`，不会把当前本地树直接补录成可信值。
+每次 scheduled run 在 per-Codex-home install lock 内分配 canonical `+00:00` UTC attempt timestamp，再以 mode `0600` 原子写入 version 2 的 `personal-sync/state/scheduler-status.json`，记录本次 attempt 尚未完成。先前 attempt 只有在 canonical round-trip 成立、可安全递增且不超过当前时间 5 分钟时才参与单调分配；timestamp-only corruption 会在锁内清除不可信 attempt/success 与 release baseline 后自愈，结构、mode、target identity 等其他错误仍 fail closed。成功或失败完成时，在同一锁内比较 attempt timestamp 与完整 target identity；只有仍是 current 的 attempt 才能提交终态，较旧的重叠 run 不会覆盖较新 attempt 的结果。成功后写入 `last_success`，并为每个 current `owner@sha` 保存经过完整 release-tree 验证的 SHA-256 baseline。失败后仅在 target 未变且旧 `last_success <= attempt` 时保留上次成功时间和 baseline，并记录 bounded `failure_reason` 与稳定 `failure_code`。读取端兼容 version 1；旧 runtime target 与当前配置不一致时，不展示或消费旧 target 的 attempt/success/failure/baseline。没有可信 baseline 会单独报告 `immutable-release-baseline-missing`，不会把当前本地树直接补录成可信值。
 
 `status-scheduler` 的文本和 JSON 视图共同遵守以下字段合同：
 

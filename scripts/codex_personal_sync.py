@@ -177,6 +177,7 @@ MACOS_SCHEDULER_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin
 LINUX_SCHEDULER_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 SCHEDULER_STATUS_RELATIVE_PATH = Path("state/scheduler-status.json")
 MAX_SCHEDULER_STATUS_BYTES = 64 * 1024
+MAX_SCHEDULER_ATTEMPT_FUTURE_SKEW = timedelta(minutes=5)
 MAX_SCHEDULER_RUNNER_BYTES = 16 * 1024 * 1024
 SCHEDULER_PAIR_TRANSACTION_NAME = (
     ".codex-personal-sync-scheduler-transaction.json"
@@ -22433,7 +22434,54 @@ def _scheduler_status_path(home: Path) -> Path:
     return _personal_sync_root(home) / SCHEDULER_STATUS_RELATIVE_PATH
 
 
-def _read_scheduler_runtime_state(home: Path) -> dict[str, Any] | None:
+def _parse_scheduler_utc_timestamp(
+    value: object,
+    field_name: str,
+    *,
+    now: datetime,
+) -> datetime | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+            r"[0-9]{2}:[0-9]{2}:[0-9]{2}"
+            r"(?:\.[0-9]{6})?\+00:00",
+            value,
+        )
+        is None
+    ):
+        raise SyncError(
+            f"scheduler runtime state {field_name} is not canonical UTC",
+            code="scheduler-state-timestamp-invalid",
+        )
+    try:
+        parsed = datetime.fromisoformat(value)
+        upper_bound = now + MAX_SCHEDULER_ATTEMPT_FUTURE_SKEW
+    except (OverflowError, ValueError) as error:
+        raise SyncError(
+            f"scheduler runtime state {field_name} is invalid",
+            code="scheduler-state-timestamp-invalid",
+        ) from error
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() != timedelta(0)
+        or parsed.isoformat() != value
+        or parsed > upper_bound
+    ):
+        raise SyncError(
+            f"scheduler runtime state {field_name} is invalid",
+            code="scheduler-state-timestamp-invalid",
+        )
+    return parsed
+
+
+def _read_scheduler_runtime_state(
+    home: Path,
+    *,
+    recover_timestamps: bool = False,
+) -> dict[str, Any] | None:
     path = _scheduler_status_path(home)
     if not _ensure_safe_internal_parent(
         home,
@@ -22534,6 +22582,40 @@ def _read_scheduler_runtime_state(home: Path) -> dict[str, Any] | None:
     owner = data.get("owner")
     if owner is not None:
         _validate_owner(owner, "scheduler runtime state owner")
+    now = datetime.now(timezone.utc)
+    try:
+        last_attempt = _parse_scheduler_utc_timestamp(
+            data.get("last_attempt"),
+            "last_attempt",
+            now=now,
+        )
+        last_success = _parse_scheduler_utc_timestamp(
+            data.get("last_success"),
+            "last_success",
+            now=now,
+        )
+        if last_success is not None and (
+            last_attempt is None or last_success > last_attempt
+        ):
+            raise SyncError(
+                "scheduler runtime state last_success exceeds last_attempt",
+                code="scheduler-state-timestamp-invalid",
+            )
+        if data["success"] and last_success != last_attempt:
+            raise SyncError(
+                "successful scheduler runtime state has mismatched timestamps",
+                code="scheduler-state-timestamp-invalid",
+            )
+    except SyncError as error:
+        if not recover_timestamps or error.code != "scheduler-state-timestamp-invalid":
+            raise
+        data = dict(data)
+        data["last_attempt"] = None
+        data["last_success"] = None
+        data["success"] = False
+        data["failure_reason"] = "invalid scheduler timestamp was recovered"
+        data["failure_code"] = "scheduler-state-timestamp-recovered"
+        data["release_trees"] = {}
     return data
 
 
@@ -22617,10 +22699,33 @@ def _scheduler_runtime_payload(
         and previous.get("base_repo") == base_repo
         and previous.get("owner") == owner
     )
+    attempt_time = _parse_scheduler_utc_timestamp(
+        attempt,
+        "attempt",
+        now=datetime.now(timezone.utc),
+    )
+    assert attempt_time is not None
+    previous_success: str | None = None
+    if same_target and previous is not None:
+        candidate_success = previous.get("last_success")
+        try:
+            candidate_success_time = _parse_scheduler_utc_timestamp(
+                candidate_success,
+                "last_success",
+                now=attempt_time,
+            )
+        except SyncError:
+            candidate_success_time = None
+        if (
+            candidate_success_time is not None
+            and candidate_success_time <= attempt_time
+            and isinstance(candidate_success, str)
+        ):
+            previous_success = candidate_success
     if release_trees is None:
         previous_release_trees = (
             previous.get("release_trees", {})
-            if same_target and previous is not None
+            if previous_success is not None and previous is not None
             else {}
         )
         release_trees = (
@@ -22631,9 +22736,7 @@ def _scheduler_runtime_payload(
     return {
         "version": 2,
         "last_attempt": attempt,
-        "last_success": attempt if success else (
-            previous.get("last_success") if same_target else None
-        ),
+        "last_success": attempt if success else previous_success,
         "success": success,
         "failure_reason": failure_reason,
         "failure_code": failure_code,
@@ -22645,26 +22748,51 @@ def _scheduler_runtime_payload(
     }
 
 
+def _validated_previous_scheduler_attempt(
+    value: object,
+    *,
+    now: datetime,
+) -> datetime | None:
+    """Return a bounded canonical UTC attempt or reject it as stale metadata."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        offset = parsed.utcoffset()
+    except (OverflowError, ValueError):
+        return None
+    if (
+        parsed.tzinfo is None
+        or offset != timedelta(0)
+        or parsed.isoformat() != value
+    ):
+        return None
+    try:
+        upper_bound = now + MAX_SCHEDULER_ATTEMPT_FUTURE_SKEW
+        incrementable_limit = datetime.max.replace(
+            tzinfo=timezone.utc,
+        ) - timedelta(microseconds=1)
+    except OverflowError:
+        return None
+    if parsed > upper_bound or parsed > incrementable_limit:
+        return None
+    return parsed
+
+
 def _next_scheduler_attempt(previous: dict[str, Any] | None) -> str:
-    """Return a canonical UTC attempt timestamp newer than the recorded one."""
+    """Return a canonical UTC attempt token safe for equality-based CAS."""
     selected = datetime.now(timezone.utc)
     previous_attempt = (
         previous.get("last_attempt")
         if previous is not None
         else None
     )
-    if isinstance(previous_attempt, str):
-        try:
-            previous_time = datetime.fromisoformat(previous_attempt)
-        except ValueError:
-            previous_time = None
-        if previous_time is not None:
-            if previous_time.tzinfo is None:
-                previous_time = previous_time.replace(tzinfo=timezone.utc)
-            else:
-                previous_time = previous_time.astimezone(timezone.utc)
-            if previous_time >= selected:
-                selected = previous_time + timedelta(microseconds=1)
+    previous_time = _validated_previous_scheduler_attempt(
+        previous_attempt,
+        now=selected,
+    )
+    if previous_time is not None and previous_time >= selected:
+        selected = previous_time + timedelta(microseconds=1)
     attempt = selected.isoformat()
     if attempt == previous_attempt:
         attempt = (selected + timedelta(microseconds=1)).isoformat()
@@ -22699,7 +22827,10 @@ def _begin_scheduler_attempt(
     # and swap boundary. It makes attempt allocation monotonic across processes
     # without holding a global lock during network or installation work.
     with installation_lock(home):
-        previous = _read_scheduler_runtime_state(home)
+        previous = _read_scheduler_runtime_state(
+            home,
+            recover_timestamps=True,
+        )
         attempt = _next_scheduler_attempt(previous)
         _write_scheduler_runtime_state(
             home,

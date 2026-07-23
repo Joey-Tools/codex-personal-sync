@@ -45,6 +45,8 @@ PRIVATE_GIT_CONTROL_PARENT = Path(
     "/private/tmp" if sys.platform == "darwin" else "/var/tmp"
 )
 PRIVATE_TOOL_ROOT_NAME = "codex-sync-canonical-mirrors"
+DURABLE_QUARANTINE_ROOT_NAME = ".codex-sync-canonical-mirror-quarantine"
+MAX_DURABLE_QUARANTINE_ENTRIES = 10_000
 PRIVATE_OBJECTS_PATH = PurePosixPath("objects")
 MAX_LOCK_BYTES = 1024 * 1024
 MAX_SOURCE_BYTES = 32 * 1024 * 1024
@@ -1298,6 +1300,7 @@ def _owner_record_payload(
 
 
 def _create_owner_record(
+    root: BoundRoot,
     tool_root: ControlObjectBinding,
     private_name: str,
     private: ControlObjectBinding,
@@ -1342,6 +1345,7 @@ def _create_owner_record(
             )
             if owner_snapshot.identity == _object_identity(owner_metadata):
                 _isolate_and_remove_file(
+                    root,
                     tool_root.fd,
                     owner_name,
                     owner_snapshot,
@@ -1511,6 +1515,7 @@ def _materialize_private_git_control(
             private_parent
         )
         owner_name, owner_nonce, owner_record = _create_owner_record(
+            root,
             private_parent,
             private_name,
             private,
@@ -2312,6 +2317,7 @@ def _recover_stale_private_snapshots(
                 )
             except FileNotFoundError:
                 _isolate_and_remove_file(
+                    root,
                     tool_root.fd,
                     owner_name,
                     owner_snapshot,
@@ -2378,6 +2384,7 @@ def _recover_stale_private_snapshots(
             finally:
                 os.close(private_fd)
             _isolate_and_remove_file(
+                root,
                 tool_root.fd,
                 owner_name,
                 owner_snapshot,
@@ -2496,6 +2503,7 @@ def _remove_bound_owner_record(
     private_parent: ControlObjectBinding,
     owner_record: ControlObjectBinding,
     owner_name: str,
+    quarantine: ControlObjectBinding,
 ) -> None:
     _revalidate_control_object(root, private_parent)
     _revalidate_control_object(root, owner_record)
@@ -2512,10 +2520,12 @@ def _remove_bound_owner_record(
     ):
         raise MirrorSyncError("private Git owner record changed before cleanup")
     _isolate_and_remove_file(
+        root,
         private_parent.fd,
         owner_name,
         owner_snapshot,
         PurePosixPath(owner_name),
+        quarantine=quarantine,
     )
     os.fsync(private_parent.fd)
 
@@ -2530,26 +2540,39 @@ def _cleanup_private_git_control(
     owner_name: str,
     owner_nonce: str,
 ) -> None:
-    _set_owner_record_phase(
-        owner_record,
-        private_name,
-        private.identity,
-        owner_nonce,
-        "cleanup",
-    )
-    _remove_bound_private_directory(
+    # Bind the durable destination while every Git control path still exists.
+    # Removing the private snapshot first intentionally invalidates its path,
+    # so a later BoundRoot-based bind would fail recursive control-plane
+    # revalidation before the owner record could be preserved.
+    quarantine = _bind_durable_quarantine_root(
         root,
-        private_parent,
-        private,
-        private_name,
-        expected_manifest,
+        quarantine_parent=PRIVATE_GIT_CONTROL_PARENT,
+        source_parent_fd=private_parent.fd,
     )
-    _remove_bound_owner_record(
-        root,
-        private_parent,
-        owner_record,
-        owner_name,
-    )
+    try:
+        _set_owner_record_phase(
+            owner_record,
+            private_name,
+            private.identity,
+            owner_nonce,
+            "cleanup",
+        )
+        _remove_bound_private_directory(
+            root,
+            private_parent,
+            private,
+            private_name,
+            expected_manifest,
+        )
+        _remove_bound_owner_record(
+            root,
+            private_parent,
+            owner_record,
+            owner_name,
+            quarantine,
+        )
+    finally:
+        os.close(quarantine.fd)
 
 
 def _bind_root(root: Path, *, exclusive: bool = False) -> BoundRoot:
@@ -2599,7 +2622,7 @@ def _bind_root(root: Path, *, exclusive: bool = False) -> BoundRoot:
     )
 
 
-def _revalidate_bound_root(root: BoundRoot) -> None:
+def _revalidate_bound_root_directory(root: BoundRoot) -> None:
     _operation_checkpoint(root.operation, f"revalidating root {root.path}")
     try:
         path_metadata = os.stat(root.path, follow_symlinks=False)
@@ -2631,6 +2654,10 @@ def _revalidate_bound_root(root: BoundRoot) -> None:
         raise MirrorSyncError(
             f"root access policy changed before transaction completion: {root.path}"
         )
+
+
+def _revalidate_bound_root(root: BoundRoot) -> None:
+    _revalidate_bound_root_directory(root)
     _revalidate_control_object(root, root.git_executable)
     _revalidate_control_object(root, root.launcher_executable)
     for binding in root.managed_ancestors.values():
@@ -3233,6 +3260,20 @@ def _rename_directory_entry_noreplace(
     source_name: str,
     destination_name: str,
 ) -> None:
+    _rename_directory_entry_noreplace_between(
+        directory_fd,
+        source_name,
+        directory_fd,
+        destination_name,
+    )
+
+
+def _rename_directory_entry_noreplace_between(
+    source_directory_fd: int,
+    source_name: str,
+    destination_directory_fd: int,
+    destination_name: str,
+) -> None:
     source = os.fsencode(source_name)
     destination = os.fsencode(destination_name)
     libc = ctypes.CDLL(None, use_errno=True)
@@ -3265,9 +3306,9 @@ def _rename_directory_entry_noreplace(
     )
     rename_noreplace.restype = ctypes.c_int
     result = rename_noreplace(
-        directory_fd,
+        source_directory_fd,
         source,
-        directory_fd,
+        destination_directory_fd,
         destination,
         flags,
     )
@@ -3280,64 +3321,279 @@ def _rename_directory_entry_noreplace(
         )
 
 
+def _bind_durable_quarantine_root(
+    root: Root,
+    *,
+    quarantine_parent: Path | None = None,
+    source_parent_fd: int | None = None,
+) -> ControlObjectBinding:
+    root_path = _root_path(root)
+    parent_path = (
+        root_path.parent
+        if quarantine_parent is None
+        else Path(os.path.abspath(quarantine_parent))
+    )
+    parent = _bind_absolute_control_object(
+        parent_path,
+        "durable quarantine parent",
+        require_directory=True,
+    )
+    quarantine_fd = -1
+    try:
+        try:
+            os.mkdir(
+                DURABLE_QUARANTINE_ROOT_NAME,
+                0o700,
+                dir_fd=parent.fd,
+            )
+            os.fsync(parent.fd)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise MirrorSyncError(
+                f"cannot create durable quarantine root: {error}"
+            ) from error
+        path_metadata = os.stat(
+            DURABLE_QUARANTINE_ROOT_NAME,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(path_metadata.st_mode):
+            raise MirrorSyncError("durable quarantine root must be a directory")
+        quarantine_fd = os.open(
+            DURABLE_QUARANTINE_ROOT_NAME,
+            _DIRECTORY_FLAGS,
+            dir_fd=parent.fd,
+        )
+        opened_metadata = os.fstat(quarantine_fd)
+        if _object_identity(path_metadata) != _object_identity(
+            opened_metadata
+        ) or _access_policy(path_metadata) != _access_policy(opened_metadata):
+            raise MirrorSyncError(
+                "durable quarantine root was replaced while binding it"
+            )
+        if (
+            stat.S_IMODE(opened_metadata.st_mode) != 0o700
+            or opened_metadata.st_uid != os.geteuid()
+        ):
+            raise MirrorSyncError(
+                "durable quarantine root must be mode 0700 and owned by the current uid"
+            )
+        if isinstance(root, BoundRoot):
+            # Quarantine placement protects only the target root directory's
+            # identity/access policy and the non-overlap relationship. Cleanup
+            # may intentionally follow a previously detected Git-control
+            # content-stability failure, so it must not reaccept or recursively
+            # revalidate that invalidated control plane merely to bind a
+            # separate durable destination.
+            _revalidate_bound_root_directory(root)
+            root_fd = root.fd
+            close_root = False
+        else:
+            root_fd = _open_root(Path(root))
+            close_root = True
+        try:
+            if _directory_bindings_overlap(quarantine_fd, root_fd):
+                raise MirrorSyncError(
+                    "durable quarantine root overlaps the target repository"
+                )
+            if source_parent_fd is not None:
+                source_metadata = os.fstat(source_parent_fd)
+                if source_metadata.st_dev != opened_metadata.st_dev:
+                    raise MirrorSyncError(
+                        "durable quarantine root and source directory are on "
+                        "different filesystems"
+                    )
+                if _directory_bindings_overlap(
+                    quarantine_fd,
+                    source_parent_fd,
+                ):
+                    raise MirrorSyncError(
+                        "durable quarantine root overlaps the source directory"
+                    )
+        finally:
+            if close_root:
+                os.close(root_fd)
+        with os.scandir(quarantine_fd) as entries:
+            for index, _entry in enumerate(entries, start=1):
+                if index >= MAX_DURABLE_QUARANTINE_ENTRIES:
+                    raise MirrorSyncError(
+                        "durable quarantine root reached its bounded entry "
+                        "limit; manual identity-aware cleanup is required"
+                    )
+        quarantine_path = parent_path / DURABLE_QUARANTINE_ROOT_NAME
+        binding = ControlObjectBinding(
+            label="durable mirror quarantine root",
+            path=quarantine_path,
+            relative_path=None,
+            fd=quarantine_fd,
+            identity=_object_identity(opened_metadata),
+            access_policy=_access_policy(opened_metadata),
+            content_digest=None,
+        )
+        quarantine_fd = -1
+        return binding
+    except OSError as error:
+        raise MirrorSyncError(
+            f"cannot bind durable quarantine root: {error}"
+        ) from error
+    finally:
+        if quarantine_fd >= 0:
+            os.close(quarantine_fd)
+        os.close(parent.fd)
+
+
+def _revalidate_durable_quarantine_root(
+    quarantine: ControlObjectBinding,
+) -> None:
+    assert quarantine.path is not None
+    try:
+        path_metadata = os.stat(quarantine.path, follow_symlinks=False)
+        descriptor_metadata = os.fstat(quarantine.fd)
+    except OSError as error:
+        raise MirrorSyncError(
+            f"durable quarantine root became unavailable: {error}"
+        ) from error
+    if (
+        _object_identity(path_metadata) != quarantine.identity
+        or _object_identity(descriptor_metadata) != quarantine.identity
+    ):
+        raise MirrorSyncError("durable quarantine root was replaced")
+    if (
+        _access_policy(path_metadata) != quarantine.access_policy
+        or _access_policy(descriptor_metadata) != quarantine.access_policy
+    ):
+        raise MirrorSyncError("durable quarantine root access policy changed")
+
+
+def _persist_quarantined_file(
+    quarantine: ControlObjectBinding,
+    source_parent_fd: int,
+    source_name: str,
+    expected: FileSnapshot,
+    display_path: PurePosixPath,
+) -> Path:
+    _revalidate_durable_quarantine_root(quarantine)
+    digest = hashlib.sha256(expected.payload).hexdigest()[:16]
+    quarantine_name = (
+        f"file-{expected.identity[0]:x}-{expected.identity[1]:x}-"
+        f"{digest}-{secrets.token_hex(16)}"
+    )
+    assert quarantine.path is not None
+    quarantine_path = quarantine.path / quarantine_name
+    try:
+        _rename_directory_entry_noreplace_between(
+            source_parent_fd,
+            source_name,
+            quarantine.fd,
+            quarantine_name,
+        )
+        os.fsync(source_parent_fd)
+        os.fsync(quarantine.fd)
+    except OSError as error:
+        raise MirrorSyncError(
+            f"cannot persist isolated file in durable quarantine; "
+            f"preserving {source_name}: {display_path}: {error}"
+        ) from error
+    _revalidate_durable_quarantine_root(quarantine)
+    moved = _safe_read_leaf_snapshot(
+        quarantine.fd,
+        quarantine_name,
+        PurePosixPath(quarantine_name),
+    )
+    if moved != expected:
+        raise MirrorSyncError(
+            "isolated file changed before durable quarantine; "
+            f"preserving evidence at {quarantine_path}: {display_path}"
+        )
+    return quarantine_path
+
+
 def _isolate_and_remove_file(
+    root: Root,
     parent_fd: int,
     name: str,
     expected: FileSnapshot,
     display_path: PurePosixPath,
+    *,
+    quarantine: ControlObjectBinding | None = None,
 ) -> None:
+    # Bind and validate the durable destination before changing the source
+    # pathname. A later bind through a BoundRoot would recursively revalidate
+    # control paths, including an owner record that this operation has already
+    # isolated.
+    durable_quarantine = (
+        quarantine
+        if quarantine is not None
+        else _bind_durable_quarantine_root(
+            root,
+            source_parent_fd=parent_fd,
+        )
+    )
+    close_quarantine = quarantine is None
+    source_metadata = os.fstat(parent_fd)
+    quarantine_metadata = os.fstat(durable_quarantine.fd)
+    if source_metadata.st_dev != quarantine_metadata.st_dev:
+        if close_quarantine:
+            os.close(durable_quarantine.fd)
+        raise MirrorSyncError(
+            "durable quarantine root and source directory are on different filesystems"
+        )
     isolated_name = f".sync-remove-{os.getpid()}-{secrets.token_hex(16)}"
     try:
-        _rename_directory_entry_noreplace(
-            parent_fd,
-            name,
-            isolated_name,
-        )
-        os.fsync(parent_fd)
-    except OSError as error:
-        raise MirrorSyncError(
-            f"cannot isolate recovery artifact {display_path}: {error}"
-        ) from error
-    try:
-        moved = _safe_read_leaf_snapshot(
-            parent_fd,
-            isolated_name,
-            display_path,
-        )
-    except MirrorSyncError as error:
-        raise MirrorSyncError(
-            f"isolated recovery artifact is unreadable; preserving "
-            f"{isolated_name}: {display_path}: {error}"
-        ) from error
-    if moved != expected:
         try:
             _rename_directory_entry_noreplace(
                 parent_fd,
-                isolated_name,
                 name,
+                isolated_name,
             )
             os.fsync(parent_fd)
-        except OSError as restore_error:
+        except OSError as error:
             raise MirrorSyncError(
-                f"recovery artifact changed during isolation; preserving "
-                f"{isolated_name}: {display_path}: {restore_error}"
-            ) from restore_error
-        restored = _safe_read_leaf_snapshot(parent_fd, name, display_path)
-        if restored != moved:
-            raise MirrorSyncError(
-                f"recovery artifact changed while restoring it: {display_path}"
+                f"cannot isolate recovery artifact {display_path}: {error}"
+            ) from error
+        try:
+            moved = _safe_read_leaf_snapshot(
+                parent_fd,
+                isolated_name,
+                display_path,
             )
-        raise MirrorSyncError(
-            f"recovery artifact changed before cleanup: {display_path}"
+        except MirrorSyncError as error:
+            raise MirrorSyncError(
+                f"isolated recovery artifact is unreadable; preserving "
+                f"{isolated_name}: {display_path}: {error}"
+            ) from error
+        if moved != expected:
+            try:
+                _rename_directory_entry_noreplace(
+                    parent_fd,
+                    isolated_name,
+                    name,
+                )
+                os.fsync(parent_fd)
+            except OSError as restore_error:
+                raise MirrorSyncError(
+                    f"recovery artifact changed during isolation; preserving "
+                    f"{isolated_name}: {display_path}: {restore_error}"
+                ) from restore_error
+            restored = _safe_read_leaf_snapshot(parent_fd, name, display_path)
+            if restored != moved:
+                raise MirrorSyncError(
+                    f"recovery artifact changed while restoring it: {display_path}"
+                )
+            raise MirrorSyncError(
+                f"recovery artifact changed before cleanup: {display_path}"
+            )
+        _persist_quarantined_file(
+            durable_quarantine,
+            parent_fd,
+            isolated_name,
+            expected,
+            display_path,
         )
-    try:
-        os.unlink(isolated_name, dir_fd=parent_fd)
-        os.fsync(parent_fd)
-    except OSError as error:
-        raise MirrorSyncError(
-            f"cannot remove isolated recovery artifact; preserving "
-            f"{isolated_name}: {display_path}: {error}"
-        ) from error
+    finally:
+        if close_quarantine:
+            os.close(durable_quarantine.fd)
 
 
 def _restore_exchanged_target(
@@ -3453,6 +3709,7 @@ def _write_exchange_journal(
 
 
 def _remove_exchange_artifact(
+    root: Root,
     parent_fd: int,
     name: str,
     relative_path: PurePosixPath,
@@ -3460,6 +3717,7 @@ def _remove_exchange_artifact(
 ) -> None:
     try:
         _isolate_and_remove_file(
+            root,
             parent_fd,
             name,
             expected,
@@ -3589,6 +3847,7 @@ def _recover_exchange_journal(
                 )
         elif expected_is_absent and target_is_replacement and temporary_is_replacement:
             _remove_exchange_artifact(
+                root,
                 parent_fd,
                 temporary_name,
                 relative_path,
@@ -3596,6 +3855,7 @@ def _recover_exchange_journal(
             )
         elif expected_is_absent and target_is_expected and temporary_is_replacement:
             _remove_exchange_artifact(
+                root,
                 parent_fd,
                 temporary_name,
                 relative_path,
@@ -3611,6 +3871,7 @@ def _recover_exchange_journal(
                 temporary_snapshot,
             )
             _remove_exchange_artifact(
+                root,
                 parent_fd,
                 temporary_name,
                 relative_path,
@@ -3618,6 +3879,7 @@ def _recover_exchange_journal(
             )
         elif target_is_expected and temporary_is_replacement:
             _remove_exchange_artifact(
+                root,
                 parent_fd,
                 temporary_name,
                 relative_path,
@@ -3633,6 +3895,7 @@ def _recover_exchange_journal(
                 f"{relative_path}"
             )
         _remove_exchange_artifact(
+            root,
             parent_fd,
             journal_name,
             relative_path,
@@ -3777,6 +4040,7 @@ def _atomic_write_relative(
                     )
                 except FileExistsError as error:
                     _remove_exchange_artifact(
+                        root,
                         parent_fd,
                         journal_name,
                         relative_path,
@@ -3794,6 +4058,7 @@ def _atomic_write_relative(
                         f"no-clobber publication changed unexpectedly: {relative_path}"
                     )
                 _isolate_and_remove_file(
+                    root,
                     parent_fd,
                     temporary_name,
                     replacement_snapshot,
@@ -3806,6 +4071,7 @@ def _atomic_write_relative(
                         f"exchange journal changed before cleanup: {relative_path}"
                     )
                 _remove_exchange_artifact(
+                    root,
                     parent_fd,
                     journal_name,
                     relative_path,
@@ -3823,6 +4089,7 @@ def _atomic_write_relative(
                     os.fsync(parent_fd)
                 except (MirrorSyncError, OSError):
                     _remove_exchange_artifact(
+                        root,
                         parent_fd,
                         journal_name,
                         relative_path,
@@ -3852,6 +4119,7 @@ def _atomic_write_relative(
                         preserve_temporary = True
                         raise
                     _remove_exchange_artifact(
+                        root,
                         parent_fd,
                         journal_name,
                         relative_path,
@@ -3878,6 +4146,7 @@ def _atomic_write_relative(
                         preserve_temporary = True
                         raise
                     _remove_exchange_artifact(
+                        root,
                         parent_fd,
                         journal_name,
                         relative_path,
@@ -3896,6 +4165,7 @@ def _atomic_write_relative(
                         f"exchange journal changed before cleanup: {relative_path}"
                     )
                 _isolate_and_remove_file(
+                    root,
                     parent_fd,
                     temporary_name,
                     expected_snapshot,
@@ -3904,6 +4174,7 @@ def _atomic_write_relative(
                 temporary_name = None
                 os.fsync(parent_fd)
                 _remove_exchange_artifact(
+                    root,
                     parent_fd,
                     journal_name,
                     relative_path,
@@ -3934,6 +4205,7 @@ def _atomic_write_relative(
                 )
                 if observed_temporary == replacement_snapshot:
                     _isolate_and_remove_file(
+                        root,
                         parent_fd,
                         temporary_name,
                         replacement_snapshot,
@@ -3960,12 +4232,17 @@ def _atomic_remove_relative(
         )
     root_fd, close_root = _borrow_root_fd(root)
     parent_fd = -1
+    quarantine: ControlObjectBinding | None = None
     try:
         parent_fd = _open_parent_directory(
             root_fd,
             relative_path,
             create=False,
             bound_root=root if isinstance(root, BoundRoot) else None,
+        )
+        quarantine = _bind_durable_quarantine_root(
+            root,
+            source_parent_fd=parent_fd,
         )
         _validate_target_leaf(parent_fd, relative_path)
         temporary_name = (
@@ -4009,14 +4286,14 @@ def _atomic_remove_relative(
             raise MirrorSyncError(
                 f"retired target changed during conditional isolation: {relative_path}"
             )
-        try:
-            os.unlink(temporary_name, dir_fd=parent_fd)
-            os.fsync(parent_fd)
-        except OSError as error:
-            raise MirrorSyncError(
-                f"cannot remove isolated retired target; preserving "
-                f"{temporary_path}: {error}"
-            ) from error
+        _persist_quarantined_file(
+            quarantine,
+            parent_fd,
+            temporary_name,
+            expected_snapshot,
+            temporary_path,
+        )
+        os.fsync(parent_fd)
         if _optional_safe_read_snapshot(root, relative_path) is not None:
             raise MirrorSyncError(
                 f"retired target reappeared after removal: {relative_path}"
@@ -4027,6 +4304,7 @@ def _atomic_remove_relative(
                 f"{relative_path}"
             )
         _remove_exchange_artifact(
+            root,
             parent_fd,
             journal_name,
             relative_path,
@@ -4036,6 +4314,8 @@ def _atomic_remove_relative(
     finally:
         if parent_fd >= 0:
             os.close(parent_fd)
+        if quarantine is not None:
+            os.close(quarantine.fd)
         if close_root:
             os.close(root_fd)
 
@@ -5046,6 +5326,39 @@ def _source_lock_at_commit(
     return _parse_source_lock(payload)
 
 
+def _require_ancestral_commit(
+    repository_root: Root,
+    candidate_commit: str,
+    descendant_commit: str,
+    label: str,
+) -> None:
+    if (
+        GIT_SHA_RE.fullmatch(candidate_commit) is None
+        or GIT_SHA_RE.fullmatch(descendant_commit) is None
+    ):
+        raise MirrorSyncError(f"{label} must use exact full Git commit IDs")
+    object_type = _run_git(
+        repository_root,
+        "cat-file",
+        "-t",
+        candidate_commit,
+    )
+    if object_type != b"commit\n":
+        raise MirrorSyncError(f"{label} does not name a Git commit")
+    try:
+        _run_git(
+            repository_root,
+            "merge-base",
+            "--is-ancestor",
+            candidate_commit,
+            descendant_commit,
+        )
+    except MirrorSyncError as error:
+        raise MirrorSyncError(
+            f"{label} is not an available ancestor of {descendant_commit}"
+        ) from error
+
+
 def _committed_sources(
     repository_root: Root,
     source_commit: str,
@@ -5566,6 +5879,7 @@ def _write_transaction_journal(
                 "generation transaction journal changed during publication"
             )
         _isolate_and_remove_file(
+            target_root,
             target_root.fd,
             temporary_name,
             temporary_snapshot,
@@ -5586,6 +5900,7 @@ def _write_transaction_journal(
                 )
                 if observed_temporary == temporary_snapshot:
                     _isolate_and_remove_file(
+                        target_root,
                         target_root.fd,
                         temporary_name,
                         temporary_snapshot,
@@ -5630,6 +5945,7 @@ def _load_transaction_journal(
                 "generation transaction completion and journal differ"
             )
         _isolate_and_remove_file(
+            target_root,
             target_root.fd,
             TRANSACTION_COMPLETE_PATH.as_posix(),
             completion,
@@ -5646,6 +5962,7 @@ def _load_transaction_journal(
             # therefore a pre-mutation crash and can be discarded, even if its
             # JSON write was interrupted.
             _isolate_and_remove_file(
+                target_root,
                 target_root.fd,
                 TRANSACTION_TEMP_PATH.as_posix(),
                 temporary,
@@ -5658,6 +5975,7 @@ def _load_transaction_journal(
             )
         else:
             _isolate_and_remove_file(
+                target_root,
                 target_root.fd,
                 TRANSACTION_TEMP_PATH.as_posix(),
                 temporary,
@@ -5764,6 +6082,7 @@ def _remove_transaction_journal(
             "generation transaction completion marker changed before cleanup"
         )
     _isolate_and_remove_file(
+        target_root,
         target_root.fd,
         TRANSACTION_COMPLETE_PATH.as_posix(),
         expected,
@@ -6191,24 +6510,54 @@ def _receipt_file_records(
     return records
 
 
+def _target_head_index_file(
+    target_root: BoundRoot,
+    path: PurePosixPath,
+    head_commit: str,
+) -> tuple[bytes, int] | None:
+    index_entry = _git_index_entry(target_root, path)
+    head_entry = _git_tree_entry(target_root, head_commit, path)
+    if head_entry != index_entry:
+        raise MirrorSyncError(f"target managed index differs from HEAD: {path}")
+    if index_entry is None:
+        return None
+    return (
+        _git_blob_payload(target_root, index_entry.object_id, path),
+        index_entry.mode,
+    )
+
+
 def _prior_receipt_file_records(
+    repository_root: BoundRoot,
     target_root: BoundRoot,
     source_lock: SourceLock,
     mirror: MirrorSpec,
+    source_commit: str,
+    *,
+    require_clean_worktree: bool,
 ) -> dict[PurePosixPath, dict[str, object]]:
     head_commit = _current_commit(target_root)
-    snapshot = _target_clean_snapshot(
-        target_root,
-        RECEIPT_PATH,
-        head_commit,
-    )
-    if snapshot is None:
-        return {}
-    if snapshot.mode != 0o644:
-        raise MirrorSyncError(
-            f"prior provenance receipt mode must be 0644, not {snapshot.mode:04o}"
+    if require_clean_worktree:
+        snapshot = _target_clean_snapshot(
+            target_root,
+            RECEIPT_PATH,
+            head_commit,
         )
-    receipt = _parse_receipt(snapshot.payload)
+        receipt_file = None if snapshot is None else (snapshot.payload, snapshot.mode)
+    else:
+        receipt_file = _target_head_index_file(
+            target_root,
+            RECEIPT_PATH,
+            head_commit,
+        )
+    if receipt_file is None:
+        return {}
+    receipt_payload, receipt_mode = receipt_file
+    if receipt_mode != 0o644:
+        raise MirrorSyncError(
+            f"prior provenance receipt mode must be 0644, not {receipt_mode:04o}"
+        )
+    receipt = _parse_receipt(receipt_payload)
     if (
         receipt["canonical_repository"] != source_lock.canonical_repository
         or receipt["mirror"] != mirror.name
@@ -6217,6 +6566,46 @@ def _prior_receipt_file_records(
         raise MirrorSyncError(
             "prior provenance receipt names the wrong canonical repository, "
             "mirror, or target repository"
+        )
+    historical_commit = receipt["canonical_commit"]
+    _require_ancestral_commit(
+        repository_root,
+        historical_commit,
+        source_commit,
+        "prior provenance receipt canonical commit",
+    )
+    historical_lock = _source_lock_at_commit(
+        repository_root,
+        historical_commit,
+    )
+    if historical_lock.canonical_repository != source_lock.canonical_repository:
+        raise MirrorSyncError(
+            "prior provenance receipt historical source lock names the wrong "
+            "canonical repository"
+        )
+    historical_mirror = _selected_mirror(
+        historical_lock,
+        mirror.name,
+    )
+    if historical_mirror.repository != mirror.repository:
+        raise MirrorSyncError(
+            "prior provenance receipt historical mirror names the wrong "
+            "target repository"
+        )
+    _committed_sources(
+        repository_root,
+        historical_commit,
+        historical_lock,
+    )
+    expected_payload = _receipt_payload(
+        historical_lock,
+        historical_mirror,
+        historical_commit,
+    )
+    if receipt_payload != expected_payload:
+        raise MirrorSyncError(
+            "prior provenance receipt does not exactly match its historical "
+            "canonical source lock"
         )
     return _receipt_file_records(receipt)
 
@@ -6415,9 +6804,12 @@ def managed_mirror_paths(
         )
         _verify_target_repository(target, mirror.repository)
         receipt_records = _prior_receipt_file_records(
+            canonical,
             target,
             source_lock,
             mirror,
+            source_commit,
+            require_clean_worktree=True,
         )
         additional_paths = set(receipt_records)
         managed_targets = set(mirror.files.values()) | additional_paths
@@ -6480,6 +6872,7 @@ def _generate_mirror_bound(
     pending_transaction = _load_transaction_journal(target_root)
     recovering_prior_transaction = pending_transaction is not None
     transaction_paths: set[PurePosixPath] = set()
+    canonical_head_commit = _current_commit(repository_root)
     if pending_transaction is None:
         source_lock = load_source_lock(repository_root)
     else:
@@ -6496,28 +6889,44 @@ def _generate_mirror_bound(
                 "pending generation transaction has invalid recovery identity"
             )
         source_commit = journal_commit
+        _require_ancestral_commit(
+            repository_root,
+            source_commit,
+            canonical_head_commit,
+            "pending generation canonical commit",
+        )
         source_lock = _source_lock_at_commit(
             repository_root,
             source_commit,
         )
     mirror = _selected_mirror(source_lock, mirror_name)
-    prior_receipt_records: dict[
-        PurePosixPath,
-        dict[str, object],
-    ] = {}
-    if pending_transaction is None:
-        prior_receipt_records = _prior_receipt_file_records(
-            target_root,
-            source_lock,
-            mirror,
-        )
-        managed_additional_paths = set(prior_receipt_records)
-    else:
-        managed_additional_paths = transaction_paths
+    _verify_canonical_repository(
+        repository_root,
+        source_lock.canonical_repository,
+    )
+    _verify_target_repository(target_root, mirror.repository)
+    prior_receipt_records = _prior_receipt_file_records(
+        repository_root,
+        target_root,
+        source_lock,
+        mirror,
+        source_commit,
+        require_clean_worktree=pending_transaction is None,
+    )
+    managed_additional_paths = set(prior_receipt_records)
     current_target_paths = set(mirror.files.values())
+    allowed_transaction_paths = current_target_paths | managed_additional_paths
+    if (
+        pending_transaction is not None
+        and transaction_paths != allowed_transaction_paths
+    ):
+        raise MirrorSyncError(
+            "pending generation transaction managed paths exceed the "
+            "HEAD/index-bound prior receipt"
+        )
     _validate_target_layout(
         sorted(
-            current_target_paths | managed_additional_paths,
+            allowed_transaction_paths,
             key=PurePosixPath.as_posix,
         ),
         mirror.name,

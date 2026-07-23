@@ -26,8 +26,11 @@ administrators must provision and rotate the secret outside this workflow.
 - Triggers are restricted to canonical `master` pushes and trusted manual
   dispatches on canonical `master`; the workflow does not run for pull-request
   events.
-- The canonical checkout is detached at the exact triggering SHA. A
-  `refresh-lock --check` gate runs before generation.
+- The canonical checkout is detached at the exact triggering SHA with full
+  local history. The generator never fetches implicitly: it reconstructs a
+  prior receipt from the exact reachable canonical commit named by that
+  receipt, and missing history fails closed. A `refresh-lock --check` gate runs
+  before generation.
 - Canonical and target checkouts are explicit sibling roots. Generation always
   supplies `--target-root`, `--mirror toolbox`, and the exact
   `--source-commit`, then runs `check` against the same target.
@@ -38,9 +41,10 @@ administrators must provision and rotate the secret outside this workflow.
   freshly fetched target-base SHA. The canonical `managed-paths` command then
   validates the prior committed receipt and returns the exact allowlist:
   current toolbox targets, the receipt, and any clean receipt-bound paths that
-  the new mapping retires. Receipt digests plus target `HEAD`/stage-0
-  index/worktree parity must all agree; a consumer edit or forged/inconsistent
-  receipt fails before generation.
+  the new mapping retires. The prior receipt must byte-match a deterministic
+  reconstruction from its reachable canonical source-lock commit. Receipt
+  digests plus target `HEAD`/stage-0 index/worktree parity must all agree; a
+  consumer edit or forged/inconsistent receipt fails before generation.
 - Existing branch history, working-tree changes, staged changes, and final PR
   diff are restricted to that generated allowlist. This permits an exact
   canonical rename/removal while preventing the workflow from staging an

@@ -14,10 +14,10 @@ superseded_by:
 
 ## Summary
 
-- Delivery status: `signed_candidate_local_gate_complete`.
+- Delivery status: `follow_up_review_fixes_local_gate_complete`.
 - The workstream is consolidating personal sync ownership in `Joey-Tools/codex-personal-sync` and hardening mirror generation, scheduler observability, active-skill auditing, reconciliation, and release retention.
-- Signed commit `e2459178d4d85509dbf3b20fecf2e727e8eb02cb` is the fixed
-  parent of the follow-up candidate containing this journal. The candidate is
+- Signed commit `ac3653b50d4e2e8574ae7a8a782dd474e018e8ef` is the fixed
+  parent of the review-fix candidate containing this journal. The candidate is
   fully locally gated; no push, consumer generation, PR mutation, or external
   deployment was performed.
 
@@ -32,7 +32,7 @@ superseded_by:
 
 ## Current State
 
-- The signed `e2459178d4d85509dbf3b20fecf2e727e8eb02cb` candidate has
+- The signed `ac3653b50d4e2e8574ae7a8a782dd474e018e8ef` candidate has
   been superseded by the follow-up candidate containing this journal.
 - Scheduler installation now binds the exact semantically audited macOS/Linux
   config snapshots through conditional writes and matching-config
@@ -64,29 +64,47 @@ superseded_by:
   exists and none was invented or installed. Generated files are staged with
   filter-free Git plumbing, deletion is explicit, and mirror parity is checked
   again after the generated commit.
+- Scheduler runtime timestamps use a bounded canonical UTC representation,
+  reject impossible or far-future values, and recover only timestamp
+  corruption under the state lock without accepting unsafe structure or mode.
+- Historical receipts now derive retirement authority only from a locally
+  available canonical ancestor whose source lock, committed source bytes, and
+  mirror mapping reconstruct the receipt byte-for-byte. Recovery journals
+  cannot expand the exact current-mapping plus trusted-prior-receipt path set.
+- File retirement and internal owner-record cleanup no longer finish with a
+  compare-then-pathname unlink. They move the exact isolated object into a
+  pre-bound durable mode-0700 quarantine, revalidate identity, content, and
+  access policy, and fail before isolation on a cross-filesystem destination.
+  Private Git owner records use a quarantine beside the private-control parent
+  so repositories on separate mounts remain supported and the active tool root
+  stays bounded.
 
 ## Validation Evidence
 
-- `python3 -B -m unittest discover -s tests -q -b`: 625 tests passed in
-  544.789 seconds.
-- `python3 -B -m unittest -q -b tests/test_source_lock.py`: 70 tests passed in
-  383.091 seconds after the final lock refresh.
+- `PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tests -q -b`:
+  644 tests passed in 792.660 seconds.
+- `PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -q -b
+  tests/test_source_lock.py`: 83 tests passed in 628.316 seconds.
+- Seven focused quarantine, owner-lifecycle, transient-object, and source-lock
+  tests passed in 4.554 seconds after the cross-filesystem correction.
 - The source-lock suite includes a real pack larger than 20 MiB; generate and
   check both pass with a 384 MiB operation cap and consume less than 256 MiB.
-- Focused suites passed on the frozen implementation: scheduler/doctor 34 and
-  toolbox automation 9. The prior candidate's reconciliation safety 305,
-  release retention 26, and main engine behavior 181 tests are covered again
-  by the 625-test whole-repository run.
-- `python3 -B scripts/sync_canonical_mirrors.py refresh-lock` refreshed six
-  canonical sources; the final `refresh-lock --check` passed. The final
+- Scheduler/doctor, toolbox automation, reconciliation safety, release
+  retention, and main engine behavior are covered by the 644-test
+  whole-repository run.
+- `python3 scripts/sync_canonical_mirrors.py refresh-lock` refreshed six
+  canonical sources after the final source changes. The final
   `sync-source-lock.json` SHA-256 is
-  `7f30db0897aecb4877089c78a975327d52c0c1136bf960d00b9b6e8c4fe5b460`.
+  `678b5eaeef2a12280c062f657dda9d23b04bcc77bc11608b5a8edacea96ab131`.
 - `PYTHONPYCACHEPREFIX=<task-scoped-temp> python3 -B -m compileall -q scripts tests`
-  passed. Eight temporary `.pyc` files were removed with the temporary
-  directory; the repository contains no `__pycache__`, `.pyc`, or `.pyo`.
-- Ruff 0.13.2 lint passed for `scripts` and `tests`; the generator,
+  passed. The temporary compile root was removed; the repository contains no
+  `__pycache__`, `.pyc`, or `.pyo`.
+- Ruff lint passed for `scripts` and `tests`; the generator,
   source-lock tests, and toolbox automation tests also pass Ruff format check.
-  actionlint 1.7.12 passed both workflows, and `git diff --check` passed.
+  actionlint passed both workflows, and `git diff --check` passed.
+- A read-only static follow-up audit found the separate-mount owner-record
+  issue; after correction, the same auditor returned `No findings.` This is
+  pre-commit design evidence, not the required post-commit named review.
 
 ## Downstream Dependencies
 
@@ -98,7 +116,7 @@ superseded_by:
 
 - Generate and validate the declared downstream mirrors.
 - Review the signed follow-up candidate containing this journal against parent
-  `e2459178d4d85509dbf3b20fecf2e727e8eb02cb`.
+  `ac3653b50d4e2e8574ae7a8a782dd474e018e8ef`.
 - Push/open the canonical PR and continue downstream mirror/PR delivery only
   when the parent workstream authorizes those remote mutations.
 - Provision `CODEX_TOOLBOX_SYNC_TOKEN` separately only if the repository owner
