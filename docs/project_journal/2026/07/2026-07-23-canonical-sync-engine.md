@@ -14,7 +14,7 @@ superseded_by:
 
 ## Summary
 
-- Delivery status: `canonical_mirror_pr_terminal_gate_complete`.
+- Delivery status: `canonical_mirror_pr_response_recovery_gate_complete`.
 - The workstream is consolidating personal sync ownership in `Joey-Tools/codex-personal-sync` and hardening mirror generation, scheduler observability, active-skill auditing, reconciliation, and release retention.
 - Signed commit `39050ba7629ae0ee896f1df5e9e9c9dd75421825` is the fixed
   parent of the current recovery-hardening candidate. The candidate is fully
@@ -139,6 +139,18 @@ superseded_by:
   same-repository shape, and owner for create recovery, edit, and close. The
   focused suite remains 16 tests and passes with actionlint, Ruff lint/format,
   and `git diff --check`.
+- The next fresh named-single pass found that a server-side PR creation could
+  outlive a failing or unrecognized `gh pr create` response and that number
+  plus endpoint-OID predicates were not each exercised independently. Create
+  now captures command status and output without `set -e` escape, queries the
+  bounded exact base/head scope after every abnormal response, records only
+  fully identity-matching candidate locators, and never closes a candidate
+  whose request lineage was not proved. Compensating closure now binds
+  base/head OIDs before and after close. Dynamic create/edit/close matrices
+  independently mutate number, marker, lifecycle, base/head names and OIDs,
+  same-repository shape, and owner; response-failure tests prove the exact
+  candidate is reported but left unchanged. The focused 16-test suite,
+  actionlint, Ruff lint/format, and `git diff --check` pass.
 - `python3 -B -m unittest tests.test_sync_toolbox_automation
   tests.test_source_lock`: 119 tests passed in 956.398 seconds after the
   fresh-review fixes. The added matrix covers unsupported/old/malformed Git

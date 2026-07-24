@@ -615,6 +615,44 @@ jobs:
               return 1
             fi
           }
+          report_create_recovery_candidates() {
+            local reason="$1"
+            local candidates
+            local candidate_numbers
+            if candidates="$(query_sync_prs 2>/dev/null)" && \
+              jq -e 'type == "array"' <<<"${candidates}" >/dev/null; then
+              if candidate_numbers="$(
+                jq -r \
+                  --arg owner "${TARGET_OWNER}" \
+                  --arg base "${TARGET_BASE}" \
+                  --arg base_oid "${PREPARED_TARGET_BASE_SHA}" \
+                  --arg head "${SYNC_BRANCH}" \
+                  --arg head_oid "${DESIRED_HEAD_SHA}" \
+                  '
+                    .[] |
+                    select(
+                      (.number | type) == "number" and
+                      .number > 0 and
+                      .state == "OPEN" and
+                      .baseRefName == $base and
+                      .baseRefOid == $base_oid and
+                      .headRefName == $head and
+                      .headRefOid == $head_oid and
+                      .isCrossRepository == false and
+                      .headRepositoryOwner.login == $owner and
+                      (.body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
+                    ) |
+                    .number
+                  ' <<<"${candidates}" 2>/dev/null
+              )" && [[ -n "${candidate_numbers}" ]]; then
+                while IFS= read -r candidate_number; do
+                  echo "::error title=Sync PR recovery required::${reason}; inspect candidate ${TARGET_REPOSITORY}#${candidate_number}. The response did not prove request lineage, so automation left it unchanged."
+                done <<<"${candidate_numbers}"
+                return
+              fi
+            fi
+            echo "::error title=Sync PR recovery required::${reason}; inspect open PRs for ${TARGET_REPOSITORY} base=${TARGET_BASE} head=${SYNC_BRANCH}. No exact request-bound candidate was proved, so automation left every PR unchanged."
+          }
           close_created_pr_after_failed_postcondition() {
             local created_number="$1"
             local created_pr
@@ -626,7 +664,7 @@ jobs:
             if ! created_pr="$(
               gh pr view "${created_number}" \
                 --repo "${TARGET_REPOSITORY}" \
-                --json number,body,state,baseRefName,headRefName,headRepositoryOwner,isCrossRepository
+                --json number,body,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepositoryOwner,isCrossRepository
             )"; then
               echo "::error title=Sync PR recovery required::Could not inspect created PR ${TARGET_REPOSITORY}#${created_number}; preserve it for manual recovery."
               return 1
@@ -635,12 +673,16 @@ jobs:
               --arg number "${created_number}" \
               --arg owner "${TARGET_OWNER}" \
               --arg base "${TARGET_BASE}" \
+              --arg base_oid "${PREPARED_TARGET_BASE_SHA}" \
               --arg head "${SYNC_BRANCH}" \
+              --arg head_oid "${DESIRED_HEAD_SHA}" \
               '
                 (.number | tostring) == $number and
                 .state == "OPEN" and
                 .baseRefName == $base and
+                .baseRefOid == $base_oid and
                 .headRefName == $head and
+                .headRefOid == $head_oid and
                 .isCrossRepository == false and
                 .headRepositoryOwner.login == $owner and
                 (.body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
@@ -656,17 +698,21 @@ jobs:
             if ! closed_pr="$(
               gh pr view "${created_number}" \
                 --repo "${TARGET_REPOSITORY}" \
-                --json number,body,state,baseRefName,headRefName,headRepositoryOwner,isCrossRepository
+                --json number,body,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepositoryOwner,isCrossRepository
             )" || ! jq -e \
               --arg number "${created_number}" \
               --arg owner "${TARGET_OWNER}" \
               --arg base "${TARGET_BASE}" \
+              --arg base_oid "${PREPARED_TARGET_BASE_SHA}" \
               --arg head "${SYNC_BRANCH}" \
+              --arg head_oid "${DESIRED_HEAD_SHA}" \
               '
                 (.number | tostring) == $number and
                 .state == "CLOSED" and
                 .baseRefName == $base and
+                .baseRefOid == $base_oid and
                 .headRefName == $head and
+                .headRefOid == $head_oid and
                 .isCrossRepository == false and
                 .headRepositoryOwner.login == $owner and
                 (.body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
@@ -694,22 +740,33 @@ jobs:
             fi
             require_target_base_sha
             require_sync_branch_sha
-            created_pr_url="$(
+            if created_pr_url="$(
               gh pr create \
                 --repo "${TARGET_REPOSITORY}" \
                 --base "${TARGET_BASE}" \
                 --head "${SYNC_BRANCH}" \
                 --title "${title}" \
                 --body-file "${pr_body_file}"
-            )"
+            )"; then
+              created_pr_status=0
+            else
+              created_pr_status=$?
+            fi
+            if ((created_pr_status != 0)); then
+              report_create_recovery_candidates \
+                "gh pr create returned status ${created_pr_status} after the request"
+              exit 1
+            fi
             expected_pr_url_prefix="https://github.com/${TARGET_REPOSITORY}/pull/"
             if [[ "${created_pr_url}" != "${expected_pr_url_prefix}"* ]]; then
-              echo "::error title=Unexpected sync PR response::The created PR URL does not identify the exact target repository."
+              report_create_recovery_candidates \
+                "gh pr create returned an unrecognized response after the request"
               exit 1
             fi
             published_pr_number="${created_pr_url#"${expected_pr_url_prefix}"}"
             if [[ ! "${published_pr_number}" =~ ^[1-9][0-9]*$ ]]; then
-              echo "::error title=Unexpected sync PR response::The created PR URL does not end in one canonical positive PR number."
+              report_create_recovery_candidates \
+                "gh pr create did not return one canonical positive PR number"
               exit 1
             fi
           fi

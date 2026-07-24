@@ -359,6 +359,8 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                 "elif args[:2] == ['pr', 'create']:\n"
                 "    Path(os.environ['CREATED_STATE']).write_text('created', encoding='ascii')\n"
                 "    print(os.environ['CREATED_PR_URL'])\n"
+                "    if os.environ['CREATE_FAILURE'] == '1':\n"
+                "        raise SystemExit(17)\n"
                 "elif args[:2] == ['pr', 'view']:\n"
                 "    if args[2] != os.environ['ACTUAL_CREATED_NUMBER']:\n"
                 "        raise SystemExit(1)\n"
@@ -396,16 +398,15 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                 }
             ]
             drifted_payload = [{**exact_payload[0], "headRefOid": "6" * 40}]
-            recovery_payload = {
-                key: value
-                for key, value in exact_payload[0].items()
-                if key not in {"baseRefOid", "headRefOid"}
-            }
+            recovery_payload = exact_payload[0]
             identity_mutations = (
+                ("number", {"number": 30}),
                 ("marker", {"body": "ordinary pull request\n"}),
                 ("state", {"state": "CLOSED"}),
                 ("base name", {"baseRefName": "other"}),
+                ("base OID", {"baseRefOid": "7" * 40}),
                 ("head name", {"headRefName": "other"}),
+                ("head OID", {"headRefOid": "6" * 40}),
                 ("cross repository", {"isCrossRepository": True}),
                 (
                     "owner",
@@ -448,6 +449,14 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                         "base_after": "7" * 40,
                         "close_attempted": True,
                         "close_recorded": True,
+                    },
+                    {
+                        "name": "create command failed after server creation",
+                        "create_failure": True,
+                    },
+                    {
+                        "name": "create response format invalid",
+                        "created_url": "created pull request",
                     },
                     {
                         "name": "returned number mismatch",
@@ -505,6 +514,7 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                         "CLOSE_STAYS_OPEN": (
                             "1" if case.get("close_stays_open") else "0"
                         ),
+                        "CREATE_FAILURE": ("1" if case.get("create_failure") else "0"),
                         "CREATED_PR_URL": str(
                             case.get(
                                 "created_url",
@@ -590,11 +600,20 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                         "base drift after create",
                     }:
                         self.assertIn("Rejected created sync PR", completed.stdout)
-                    if (
-                        name.startswith("recovery ")
-                        or name == "returned number mismatch"
-                    ):
+                    if name.startswith("recovery ") or name in {
+                        "create command failed after server creation",
+                        "create response format invalid",
+                        "returned number mismatch",
+                    }:
                         self.assertIn("Sync PR recovery required", completed.stdout)
+                    if name in {
+                        "create command failed after server creation",
+                        "create response format invalid",
+                    }:
+                        self.assertIn(
+                            "Joey-Tools/codex-toolbox#29",
+                            completed.stdout,
+                        )
 
     def test_existing_pr_edit_revalidates_refs_and_ownership(self) -> None:
         jq = shutil.which("jq")
@@ -648,12 +667,14 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                     "isCrossRepository": False,
                 }
             ]
-            wrong_head = [{**exact_payload[0], "headRefOid": "6" * 40}]
             identity_mutations = (
+                ("number", {"number": 18}),
                 ("marker", {"body": "ordinary pull request\n"}),
                 ("state", {"state": "CLOSED"}),
                 ("base name", {"baseRefName": "other"}),
+                ("base OID", {"baseRefOid": "7" * 40}),
                 ("head name", {"headRefName": "other"}),
+                ("head OID", {"headRefOid": "6" * 40}),
                 ("cross repository", {"isCrossRepository": True}),
                 (
                     "owner",
@@ -677,11 +698,6 @@ class SyncToolboxAutomationTests(unittest.TestCase):
             )
             cases = (
                 {"name": "exact", "expected_failure": 0},
-                {
-                    "name": "PR head drift before edit",
-                    "before_payload": wrong_head,
-                    "should_edit": False,
-                },
                 {
                     "name": "base drift before edit",
                     "base_before": "7" * 40,
@@ -1461,6 +1477,7 @@ class SyncToolboxAutomationTests(unittest.TestCase):
             }
             closed_payload = {**exact_payload, "state": "CLOSED"}
             identity_mutations = (
+                ("number", {"number": 18}, {"number": 18}),
                 (
                     "marker",
                     {"body": "ordinary pull request\n"},
@@ -1473,9 +1490,19 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                     {"baseRefName": "other"},
                 ),
                 (
+                    "base OID",
+                    {"baseRefOid": "7" * 40},
+                    {"baseRefOid": "7" * 40},
+                ),
+                (
                     "head name",
                     {"headRefName": "other"},
                     {"headRefName": "other"},
+                ),
+                (
+                    "head OID",
+                    {"headRefOid": "6" * 40},
+                    {"headRefOid": "6" * 40},
                 ),
                 (
                     "cross repository",
@@ -1509,16 +1536,6 @@ class SyncToolboxAutomationTests(unittest.TestCase):
             )
             cases = (
                 {"name": "exact", "expected_failure": 0},
-                {
-                    "name": "head OID drift before close",
-                    "payload": {**exact_payload, "headRefOid": "6" * 40},
-                    "should_close": False,
-                },
-                {
-                    "name": "base OID drift before close",
-                    "payload": {**exact_payload, "baseRefOid": "7" * 40},
-                    "should_close": False,
-                },
                 {
                     "name": "live base drift before close",
                     "live_base_sha": "8" * 40,
