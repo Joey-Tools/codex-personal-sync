@@ -364,21 +364,19 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                 "elif args[:2] == ['pr', 'view']:\n"
                 "    if args[2] != os.environ['ACTUAL_CREATED_NUMBER']:\n"
                 "        raise SystemExit(1)\n"
-                "    payload = json.loads(os.environ['RECOVERY_PR_PAYLOAD'])\n"
                 "    if Path(os.environ['CLOSED_STATE']).exists():\n"
-                "        if os.environ['CLOSE_STAYS_OPEN'] == '1':\n"
-                "            payload['state'] = 'OPEN'\n"
-                "        else:\n"
-                "            payload['state'] = 'CLOSED'\n"
-                "        if os.environ['POST_CLOSE_IDENTITY_DRIFT'] == '1':\n"
-                "            payload['headRepositoryOwner'] = {'login': 'someone-else'}\n"
+                "        payload = json.loads(os.environ['POST_CLOSE_PR_PAYLOAD'])\n"
+                "    else:\n"
+                "        payload = json.loads(os.environ['RECOVERY_PR_PAYLOAD'])\n"
                 "    print(json.dumps(payload))\n"
                 "elif args[:2] == ['pr', 'close']:\n"
                 "    if args[2] != os.environ['ACTUAL_CREATED_NUMBER']:\n"
                 "        raise SystemExit(1)\n"
                 "    if os.environ['CLOSE_FAILURE'] == '1':\n"
                 "        raise SystemExit(1)\n"
-                "    Path(os.environ['CLOSED_STATE']).write_text('closed', encoding='ascii')\n",
+                "    Path(os.environ['CLOSED_STATE']).write_text('closed', encoding='ascii')\n"
+                "    if os.environ['CLOSE_RESPONSE_FAILURE'] == '1':\n"
+                "        raise SystemExit(19)\n",
                 encoding="utf-8",
             )
             fake_gh.chmod(0o755)
@@ -399,27 +397,84 @@ class SyncToolboxAutomationTests(unittest.TestCase):
             ]
             drifted_payload = [{**exact_payload[0], "headRefOid": "6" * 40}]
             recovery_payload = exact_payload[0]
+            closed_recovery_payload = {**recovery_payload, "state": "CLOSED"}
             identity_mutations = (
-                ("number", {"number": 30}),
-                ("marker", {"body": "ordinary pull request\n"}),
-                ("state", {"state": "CLOSED"}),
-                ("base name", {"baseRefName": "other"}),
-                ("base OID", {"baseRefOid": "7" * 40}),
-                ("head name", {"headRefName": "other"}),
-                ("head OID", {"headRefOid": "6" * 40}),
-                ("cross repository", {"isCrossRepository": True}),
+                ("number", {"number": 30}, {"number": 30}),
+                (
+                    "marker",
+                    {"body": "ordinary pull request\n"},
+                    {"body": "ordinary pull request\n"},
+                ),
+                ("state", {"state": "CLOSED"}, {"state": "OPEN"}),
+                (
+                    "base name",
+                    {"baseRefName": "other"},
+                    {"baseRefName": "other"},
+                ),
+                (
+                    "base OID",
+                    {"baseRefOid": "7" * 40},
+                    {"baseRefOid": "7" * 40},
+                ),
+                (
+                    "head name",
+                    {"headRefName": "other"},
+                    {"headRefName": "other"},
+                ),
+                (
+                    "head OID",
+                    {"headRefOid": "6" * 40},
+                    {"headRefOid": "6" * 40},
+                ),
+                (
+                    "cross repository",
+                    {"isCrossRepository": True},
+                    {"isCrossRepository": True},
+                ),
                 (
                     "owner",
+                    {"headRepositoryOwner": {"login": "someone-else"}},
                     {"headRepositoryOwner": {"login": "someone-else"}},
                 ),
             )
             recovery_identity_cases = tuple(
                 {
                     "name": f"recovery {label} drift",
-                    "after_payload": [{**exact_payload[0], **updates}],
-                    "recovery_payload": {**recovery_payload, **updates},
+                    "after_payload": [{**exact_payload[0], **before_updates}],
+                    "recovery_payload": {
+                        **recovery_payload,
+                        **before_updates,
+                    },
                 }
-                for label, updates in identity_mutations
+                for label, before_updates, _post_updates in identity_mutations
+            )
+            post_close_identity_cases = tuple(
+                {
+                    "name": f"recovery {label} drift after close",
+                    "after_payload": drifted_payload,
+                    "close_attempted": True,
+                    "close_recorded": True,
+                    "post_close_payload": {
+                        **closed_recovery_payload,
+                        **post_updates,
+                    },
+                }
+                for label, _before_updates, post_updates in identity_mutations
+            )
+            malformed_candidate_cases = tuple(
+                {
+                    "name": f"create recovery rejects {label} number",
+                    "after_payload": [{**exact_payload[0], "number": value}],
+                    "broad_recovery": True,
+                    "create_failure": True,
+                }
+                for label, value in (
+                    ("fractional", 29.5),
+                    ("string", "29"),
+                    ("null", None),
+                    ("zero", 0),
+                    ("negative", -1),
+                )
             )
             cases = (
                 (
@@ -465,7 +520,9 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                         ),
                     },
                 )
+                + malformed_candidate_cases
                 + recovery_identity_cases
+                + post_close_identity_cases
                 + (
                     {
                         "name": "recovery close failure",
@@ -475,20 +532,12 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                         "close_failure": True,
                     },
                     {
-                        "name": "recovery remains open",
+                        "name": "recovery close response lost",
                         "head_after": "6" * 40,
                         "after_payload": drifted_payload,
                         "close_attempted": True,
                         "close_recorded": True,
-                        "close_stays_open": True,
-                    },
-                    {
-                        "name": "recovery post-close identity drift",
-                        "head_after": "6" * 40,
-                        "after_payload": drifted_payload,
-                        "close_attempted": True,
-                        "close_recorded": True,
-                        "post_close_identity_drift": True,
+                        "close_response_failure": True,
                     },
                 )
             )
@@ -511,8 +560,8 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                         "CANONICAL_SHA": "3" * 40,
                         "CLOSED_STATE": str(closed_state),
                         "CLOSE_FAILURE": ("1" if case.get("close_failure") else "0"),
-                        "CLOSE_STAYS_OPEN": (
-                            "1" if case.get("close_stays_open") else "0"
+                        "CLOSE_RESPONSE_FAILURE": (
+                            "1" if case.get("close_response_failure") else "0"
                         ),
                         "CREATE_FAILURE": ("1" if case.get("create_failure") else "0"),
                         "CREATED_PR_URL": str(
@@ -542,8 +591,11 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                         "MIRROR_NAME": "toolbox",
                         "PATH": (f"{fake_bin}:{Path(jq).parent}:/usr/bin:/bin"),
                         "PREPARED_TARGET_BASE_SHA": prepared_base_sha,
-                        "POST_CLOSE_IDENTITY_DRIFT": (
-                            "1" if case.get("post_close_identity_drift") else "0"
+                        "POST_CLOSE_PR_PAYLOAD": json.dumps(
+                            case.get(
+                                "post_close_payload",
+                                closed_recovery_payload,
+                            )
                         ),
                         "RECOVERY_PR_PAYLOAD": json.dumps(
                             case.get("recovery_payload", recovery_payload)
@@ -600,7 +652,10 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                         "base drift after create",
                     }:
                         self.assertIn("Rejected created sync PR", completed.stdout)
-                    if name.startswith("recovery ") or name in {
+                    if (
+                        name.startswith("recovery ")
+                        and name != "recovery close response lost"
+                    ) or name in {
                         "create command failed after server creation",
                         "create response format invalid",
                         "returned number mismatch",
@@ -612,6 +667,16 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                     }:
                         self.assertIn(
                             "Joey-Tools/codex-toolbox#29",
+                            completed.stdout,
+                        )
+                    if case.get("broad_recovery"):
+                        self.assertIn(
+                            "base=master head=automation/canonical-personal-sync",
+                            completed.stdout,
+                        )
+                    if name == "recovery close response lost":
+                        self.assertIn(
+                            "Sync PR closure response lost",
                             completed.stdout,
                         )
 
@@ -1454,6 +1519,8 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                 "    if os.environ['CLOSE_FAILURE'] == '1':\n"
                 "        raise SystemExit(1)\n"
                 "    Path(os.environ['CLOSED_STATE']).write_text('closed', encoding='ascii')\n"
+                "    if os.environ['CLOSE_RESPONSE_FAILURE'] == '1':\n"
+                "        raise SystemExit(19)\n"
                 "elif args[:1] == ['api']:\n"
                 "    if '/heads/master' in args[1]:\n"
                 "        print(os.environ['LIVE_BASE_SHA'])\n"
@@ -1552,6 +1619,12 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                     "should_close": True,
                 },
                 {
+                    "name": "close response lost after server closure",
+                    "close_response_failure": True,
+                    "expected_failure": 0,
+                    "should_close": True,
+                },
+                {
                     "name": "close remains open",
                     "post_close_payload": exact_payload,
                     "should_close": True,
@@ -1569,6 +1642,9 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                         **os.environ,
                         "CLOSED_STATE": str(closed_state),
                         "CLOSE_FAILURE": ("1" if case.get("close_failure") else "0"),
+                        "CLOSE_RESPONSE_FAILURE": (
+                            "1" if case.get("close_response_failure") else "0"
+                        ),
                         "DESIRED_HEAD_SHA": desired_sha,
                         "EXISTING_PR": "17",
                         "FAKE_GH_LOG": str(gh_log),
@@ -1621,6 +1697,11 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                     if expected_failure and should_close:
                         self.assertIn(
                             "Sync PR recovery required",
+                            completed.stdout + completed.stderr,
+                        )
+                    if name == "close response lost after server closure":
+                        self.assertIn(
+                            "Sync PR closure response lost",
                             completed.stdout + completed.stderr,
                         )
 

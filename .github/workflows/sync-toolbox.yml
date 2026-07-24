@@ -633,6 +633,8 @@ jobs:
                     select(
                       (.number | type) == "number" and
                       .number > 0 and
+                      .number == (.number | floor) and
+                      (.number | tostring | test("^[1-9][0-9]*$")) and
                       .state == "OPEN" and
                       .baseRefName == $base and
                       .baseRefOid == $base_oid and
@@ -657,6 +659,7 @@ jobs:
             local created_number="$1"
             local created_pr
             local closed_pr
+            local close_status
             if [[ ! "${created_number}" =~ ^[1-9][0-9]*$ ]]; then
               echo "::error title=Sync PR recovery required::A created PR may need manual inspection, but its returned number is invalid."
               return 1
@@ -690,10 +693,11 @@ jobs:
               echo "::error title=Sync PR recovery required::Created PR ${TARGET_REPOSITORY}#${created_number} no longer matches the exact automation identity; preserve it for manual recovery."
               return 1
             fi
-            if ! gh pr close "${created_number}" \
+            if gh pr close "${created_number}" \
               --repo "${TARGET_REPOSITORY}"; then
-              echo "::error title=Sync PR recovery required::Failed to close created PR ${TARGET_REPOSITORY}#${created_number} after its postcondition failed."
-              return 1
+              close_status=0
+            else
+              close_status=$?
             fi
             if ! closed_pr="$(
               gh pr view "${created_number}" \
@@ -717,8 +721,11 @@ jobs:
                 .headRepositoryOwner.login == $owner and
                 (.body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
               ' <<<"${closed_pr}" >/dev/null; then
-              echo "::error title=Sync PR recovery required::Closure of created PR ${TARGET_REPOSITORY}#${created_number} is unverified; preserve the exact locator for manual recovery."
+              echo "::error title=Sync PR recovery required::Closure of created PR ${TARGET_REPOSITORY}#${created_number} is unverified after gh pr close status ${close_status}; preserve the exact locator for manual recovery."
               return 1
+            fi
+            if ((close_status != 0)); then
+              echo "::warning title=Sync PR closure response lost::gh pr close returned status ${close_status}, but exact terminal evidence proves ${TARGET_REPOSITORY}#${created_number} is closed."
             fi
             echo "::warning title=Rejected created sync PR::Closed ${TARGET_REPOSITORY}#${created_number} because its exact post-publication evidence did not match."
           }
@@ -840,10 +847,11 @@ jobs:
             echo "::error title=Sync branch advanced::The generated branch changed after publication; refusing to close the sync PR."
             exit 1
           fi
-          if ! gh pr close "${EXISTING_PR}" \
+          if gh pr close "${EXISTING_PR}" \
             --repo "${TARGET_REPOSITORY}"; then
-            echo "::error title=Sync PR recovery required::Failed to close ${TARGET_REPOSITORY}#${EXISTING_PR}; preserve the exact locator for manual recovery."
-            exit 1
+            close_status=0
+          else
+            close_status=$?
           fi
           if ! closed_pull_request="$(
             gh pr view "${EXISTING_PR}" \
@@ -871,8 +879,11 @@ jobs:
               .headRepositoryOwner.login == $owner and
               (.body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
             ' <<<"${closed_pull_request}" >/dev/null; then
-            echo "::error title=Sync PR recovery required::Closure of ${TARGET_REPOSITORY}#${EXISTING_PR} is unverified; preserve the exact locator for manual recovery."
+            echo "::error title=Sync PR recovery required::Closure of ${TARGET_REPOSITORY}#${EXISTING_PR} is unverified after gh pr close status ${close_status}; preserve the exact locator for manual recovery."
             exit 1
+          fi
+          if ((close_status != 0)); then
+            echo "::warning title=Sync PR closure response lost::gh pr close returned status ${close_status}, but exact terminal evidence proves ${TARGET_REPOSITORY}#${EXISTING_PR} is closed."
           fi
 
       - name: Report no toolbox changes

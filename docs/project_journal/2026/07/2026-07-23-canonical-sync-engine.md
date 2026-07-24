@@ -14,7 +14,7 @@ superseded_by:
 
 ## Summary
 
-- Delivery status: `canonical_mirror_pr_response_recovery_gate_complete`.
+- Delivery status: `canonical_mirror_pr_terminal_evidence_gate_complete`.
 - The workstream is consolidating personal sync ownership in `Joey-Tools/codex-personal-sync` and hardening mirror generation, scheduler observability, active-skill auditing, reconciliation, and release retention.
 - Signed commit `39050ba7629ae0ee896f1df5e9e9c9dd75421825` is the fixed
   parent of the current recovery-hardening candidate. The candidate is fully
@@ -151,6 +151,18 @@ superseded_by:
   same-repository shape, and owner; response-failure tests prove the exact
   candidate is reported but left unchanged. The focused 16-test suite,
   actionlint, Ruff lint/format, and `git diff --check` pass.
+- The following fresh named-single pass found that nonzero close responses
+  skipped terminal inspection, compensating-close tests covered most
+  predicates only before closure, and recovery-candidate parsing accepted
+  fractional JSON numbers. Both ordinary and compensating closure now capture
+  the CLI status but always query and validate exact terminal evidence; a
+  nonzero response can succeed only when the fully bound closed state is
+  proved. The compensating matrix mutates every identity predicate separately
+  before and after close, and candidate numbers must be canonical positive
+  integers. Fractional, string, null, zero, and negative candidate numbers
+  retain the broad base/head recovery scope instead of producing a false PR
+  locator. The focused 16-test suite, actionlint, Ruff lint/format, and
+  `git diff --check` pass.
 - `python3 -B -m unittest tests.test_sync_toolbox_automation
   tests.test_source_lock`: 119 tests passed in 956.398 seconds after the
   fresh-review fixes. The added matrix covers unsupported/old/malformed Git
