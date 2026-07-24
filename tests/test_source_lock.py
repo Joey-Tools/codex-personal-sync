@@ -1598,6 +1598,8 @@ class MirrorGeneratorTests(unittest.TestCase):
             Path("pack") / "fixture.PrOmIsOr",
             Path("info") / "alternates",
             Path("info") / "http-alternates",
+            Path("InFo") / "AlTeRnAtEs",
+            Path("INFO") / "HTTP-AlTeRnAtEs",
         )
         for relative_path in cases:
             with self.subTest(path=relative_path.as_posix()):

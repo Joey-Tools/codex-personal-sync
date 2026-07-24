@@ -5377,6 +5377,10 @@ def _verify_static_git_profile(bound_root: BoundRoot) -> None:
         _revalidate_bound_root(bound_root)
         return
 
+    alternate_marker_keys = {
+        _path_collision_key(PurePosixPath("info/alternates")),
+        _path_collision_key(PurePosixPath("info/http-alternates")),
+    }
     for record in binding.private_objects_manifest:
         if len(record) < 2 or not isinstance(record[1], str):
             raise MirrorSyncError(
@@ -5387,10 +5391,7 @@ def _verify_static_git_profile(bound_root: BoundRoot) -> None:
             raise MirrorSyncError(
                 f"partial/promisor Git object state is not allowed: {relative_path}"
             )
-        if relative_path.as_posix() in {
-            "info/alternates",
-            "info/http-alternates",
-        }:
+        if _path_collision_key(relative_path) in alternate_marker_keys:
             raise MirrorSyncError(
                 f"Git object alternates are not allowed: {relative_path}"
             )
