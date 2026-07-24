@@ -263,16 +263,41 @@ superseded_by:
   private materialization, every Git boundary, and terminal validation.
   Case-sensitive alias/add-and-rename fixtures plus simulated
   case-insensitive/NFC inventories exercise the retained set.
-- The superseding final validation passed 108 source-lock tests in 1163.809
-  seconds and 563 complete
-  personal-sync/scheduler/reconciliation/retention tests in 147.848 seconds,
-  for 671 disjoint repository tests. Focused scheduler activation and
-  recovery tests passed before the full partitions, and an independent
-  read-only property audit found no remaining defect in the four reviewed
-  bindings. Ruff lint, isolated compileall, project-journal validation,
-  source-lock check, and `git diff --check` passed; no bytecode, formatter
-  backup, or reject artifact remains. The refreshed source-lock SHA-256 is
-  `a52fffe15f750abff47f1e84eef84610e0873b8010038a9ad43accf26e304adf`.
+- A later fresh named-single pass found that runtime publication could expose
+  staged success after an ambiguous CAS and that systemd pair validation did
+  not retain both unit bindings across an interleaved read. Runtime writes now
+  create a durable fixed-name blocking marker before any live mutation; exact
+  marker unlink is the final commit linearization point after all live,
+  preimage-cleanup, and parent validation. Readers check the marker plus
+  bounded status-transaction residue before and after their status snapshot,
+  so even consecutive marker-rebuild failures remain fail closed without a
+  second exchange. Recovery binding now covers name, descriptor, parent,
+  identity, bytes, and access policy; link preservation begins immediately
+  after `link(2)`, and cleanup removes `.original` while the displaced
+  preimage remains independently durable. Linux activation carries the exact
+  writer-returned service/timer snapshots and revalidates both descriptors,
+  both canonical names, and their shared parent after both unit reads.
+- The closing fresh single review found one portable-name gap in the runtime
+  reader. It now directly stats the fixed publication marker through the bound
+  parent descriptor and compares scanned marker/transaction/retained evidence
+  with NFC+casefold keys. Case-only and NFC/NFD aliases block reads, while
+  multiple equivalent spellings in the protected namespace are classified as
+  ambiguous and fail closed. This remains a cooperative same-UID design:
+  exact descriptor/path revalidation detects observed replacements, but
+  portable `stat` followed by `unlink` is not an inode-conditional deletion
+  primitive and does not claim isolation from a malicious same-UID writer with
+  parent-directory access.
+- The superseding final validation passed 108 source-lock tests in 871.124
+  seconds and 576 complete
+  personal-sync/scheduler/reconciliation/retention tests in 130.934 seconds,
+  for 684 disjoint repository tests. The scheduler module independently passed
+  57 tests in 1.293 seconds and the engine module passed 188 tests in 28.348
+  seconds; the four new portable-name fixtures also passed in 0.039 seconds
+  before the full partitions. Ruff lint and changed-range formatting, isolated
+  compileall, project-journal validation, source-lock check, and
+  `git diff --check` passed; no bytecode, formatter backup, or reject artifact
+  remains. The refreshed source-lock SHA-256 is
+  `f6037083cc2b20df71a754103f8603a9a85ce162248111ef471e40f2cd5974a7`.
 
 ## Installed Host Baseline
 

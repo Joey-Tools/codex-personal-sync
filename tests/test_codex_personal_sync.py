@@ -6658,6 +6658,152 @@ class CodexPersonalSyncTests(unittest.TestCase):
             ],
         )
 
+    def test_linux_enable_keeps_exact_published_unit_snapshot(
+        self,
+    ) -> None:
+        for drift in ("same-content-replacement", "mode"):
+            with self.subTest(drift=drift):
+                case_user_home = self.root / f"home-{drift}"
+                home = case_user_home / ".codex"
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    write_scheduler_runner(home)
+                    paths = MODULE._scheduler_paths("linux", home)
+                    assert paths.systemd_service is not None
+                    marker_path = MODULE._scheduler_pair_transaction_path(paths)
+                    real_remove = MODULE._remove_scheduler_config_if_snapshot
+                    native_calls: list[list[str]] = []
+                    injected = False
+
+                    def drift_before_pair_commit(
+                        path: Path,
+                        expected: MODULE.ManagedStateFileSnapshot,
+                    ) -> None:
+                        nonlocal injected
+                        if path == marker_path and not injected:
+                            injected = True
+                            if drift == "same-content-replacement":
+                                payload = paths.systemd_service.read_bytes()
+                                paths.systemd_service.unlink()
+                                paths.systemd_service.write_bytes(payload)
+                                paths.systemd_service.chmod(0o600)
+                            else:
+                                paths.systemd_service.chmod(0o640)
+                        real_remove(path, expected)
+
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_remove_scheduler_config_if_snapshot",
+                            side_effect=drift_before_pair_commit,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_run_native_command",
+                            side_effect=lambda args, **_kwargs: native_calls.append(
+                                args
+                            ),
+                        ),
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            "published systemd scheduler service/timer pair changed",
+                        ),
+                    ):
+                        MODULE.install_scheduler(
+                            home,
+                            "owner/repo",
+                            60,
+                            "linux",
+                            None,
+                            dry_run=False,
+                            enable=True,
+                        )
+
+                    self.assertTrue(injected)
+                    self.assertEqual(native_calls, [])
+
+    def test_systemd_pair_revalidation_detects_interleaved_service_drift(
+        self,
+    ) -> None:
+        for drift in ("same-content-replacement", "mode"):
+            with self.subTest(drift=drift):
+                case_user_home = self.root / f"pair-read-{drift}"
+                home = case_user_home / ".codex"
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    write_scheduler_runner(home)
+                    self.run_quietly(
+                        MODULE.install_scheduler,
+                        home,
+                        "owner/repo",
+                        60,
+                        "linux",
+                        None,
+                        dry_run=False,
+                        enable=False,
+                    )
+                    paths = MODULE._scheduler_paths("linux", home)
+                    assert paths.systemd_service is not None
+                    assert paths.systemd_timer is not None
+                    expected = (
+                        MODULE._scheduler_config_snapshot(paths.systemd_service),
+                        MODULE._scheduler_config_snapshot(paths.systemd_timer),
+                    )
+                    real_open = MODULE.os.open
+                    injected = False
+
+                    def drift_before_timer_open(
+                        path: str | bytes,
+                        flags: int,
+                        mode: int = 0o777,
+                        *,
+                        dir_fd: int | None = None,
+                    ) -> int:
+                        nonlocal injected
+                        if (
+                            path == paths.systemd_timer.name
+                            and dir_fd is not None
+                            and not injected
+                        ):
+                            injected = True
+                            if drift == "same-content-replacement":
+                                payload = paths.systemd_service.read_bytes()
+                                paths.systemd_service.unlink()
+                                paths.systemd_service.write_bytes(payload)
+                                paths.systemd_service.chmod(0o600)
+                            else:
+                                paths.systemd_service.chmod(0o640)
+                        return real_open(
+                            path,
+                            flags,
+                            mode,
+                            dir_fd=dir_fd,
+                        )
+
+                    with (
+                        mock.patch.object(
+                            MODULE.os,
+                            "open",
+                            side_effect=drift_before_timer_open,
+                        ),
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            "published systemd scheduler service/timer pair changed",
+                        ),
+                    ):
+                        MODULE._revalidate_published_systemd_pair(
+                            paths,
+                            expected,
+                        )
+
+                    self.assertTrue(injected)
+
     def test_linux_uninstall_preserves_foreign_drop_in_and_blocks_reinstall(
         self,
     ) -> None:

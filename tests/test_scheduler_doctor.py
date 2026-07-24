@@ -914,9 +914,11 @@ class SchedulerDoctorTests(unittest.TestCase):
             owner=MODULE.PUBLIC_OWNER,
         )
         status_path = MODULE._scheduler_status_path(self.home)
+        marker_path = MODULE._scheduler_runtime_publication_marker_path(status_path)
         newer = b"foreign state that won the late race\n"
         real_exchange = MODULE._rename_exchange_at
         exchange_count = 0
+        reader_blocked = False
 
         def replace_live_then_exchange(
             first_parent_fd: int,
@@ -924,9 +926,21 @@ class SchedulerDoctorTests(unittest.TestCase):
             second_parent_fd: int,
             second_name: str,
         ) -> None:
-            nonlocal exchange_count
+            nonlocal exchange_count, reader_blocked
             exchange_count += 1
             if exchange_count == 1:
+                try:
+                    MODULE._read_scheduler_runtime_state(self.home)
+                except MODULE.SyncError as error:
+                    reader_blocked = (
+                        error.code == "scheduler-state-publication-incomplete"
+                    )
+                else:
+                    self.fail(
+                        "runtime reader accepted state while publication marker "
+                        "was active"
+                    )
+                marker_path.unlink()
                 status_path.unlink()
                 status_path.write_bytes(newer)
                 status_path.chmod(0o600)
@@ -962,6 +976,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             )
 
         self.assertEqual(exchange_count, 1)
+        self.assertTrue(reader_blocked)
         self.assertNotEqual(status_path.read_bytes(), newer)
         self.assertEqual(
             json.loads(status_path.read_text(encoding="utf-8"))["last_attempt"],
@@ -976,6 +991,113 @@ class SchedulerDoctorTests(unittest.TestCase):
         ]
         self.assertEqual(len(displaced_paths), 1)
         self.assertEqual(displaced_paths[0].read_bytes(), newer)
+        self.assertTrue(marker_path.is_file())
+        self.assertTrue(json.loads(status_path.read_text(encoding="utf-8"))["success"])
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "unresolved publication marker",
+        ) as error_context:
+            MODULE._read_scheduler_runtime_state(self.home)
+        self.assertEqual(
+            error_context.exception.code,
+            "scheduler-state-publication-incomplete",
+        )
+        report = MODULE.scheduler_report(self.home, "linux")
+        self.assertEqual(
+            report.failure_code,
+            "scheduler-state-publication-incomplete",
+        )
+        self.assertIsNone(report.last_attempt)
+        self.assertIsNone(report.recent_success)
+
+    def test_scheduler_runtime_residue_blocks_when_marker_rebuild_fails(
+        self,
+    ) -> None:
+        attempt = MODULE._begin_scheduler_attempt(
+            self.home,
+            mode="public",
+            repo="owner/public-sync",
+            base_repo="owner/public-sync",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+        status_path = MODULE._scheduler_status_path(self.home)
+        marker_path = MODULE._scheduler_runtime_publication_marker_path(status_path)
+        newer = b"foreign state that won the late race\n"
+        real_create = MODULE._create_scheduler_runtime_publication_marker
+        real_exchange = MODULE._rename_exchange_at
+        create_calls = 0
+
+        def create_once_then_fail(
+            user_home: Path,
+            path: Path,
+            parent_fd: int,
+            payload: bytes,
+        ) -> MODULE.ManagedStateFileSnapshot:
+            nonlocal create_calls
+            create_calls += 1
+            if create_calls == 1:
+                return real_create(
+                    user_home,
+                    path,
+                    parent_fd,
+                    payload,
+                )
+            raise MODULE.SyncError("injected marker recreation failure")
+
+        def delete_marker_and_replace_live(
+            first_parent_fd: int,
+            first_name: str,
+            second_parent_fd: int,
+            second_name: str,
+        ) -> None:
+            marker_path.unlink()
+            status_path.unlink()
+            status_path.write_bytes(newer)
+            status_path.chmod(0o600)
+            real_exchange(
+                first_parent_fd,
+                first_name,
+                second_parent_fd,
+                second_name,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_create_scheduler_runtime_publication_marker",
+                side_effect=create_once_then_fail,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_rename_exchange_at",
+                side_effect=delete_marker_and_replace_live,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "marker recreation failure",
+            ),
+        ):
+            MODULE._complete_scheduler_attempt(
+                self.home,
+                attempt=attempt,
+                success=True,
+                failure_reason=None,
+                failure_code=None,
+                mode="public",
+                repo="owner/public-sync",
+                base_repo="owner/public-sync",
+                owner=MODULE.PUBLIC_OWNER,
+            )
+
+        self.assertEqual(create_calls, 3)
+        self.assertFalse(marker_path.exists())
+        self.assertTrue(json.loads(status_path.read_text(encoding="utf-8"))["success"])
+        with self.assertRaises(MODULE.SyncError) as error_context:
+            MODULE._read_scheduler_runtime_state(self.home)
+        self.assertEqual(
+            error_context.exception.code,
+            "scheduler-state-publication-incomplete",
+        )
 
     def test_scheduler_runtime_cas_never_swaps_unproven_temp_back_to_live(
         self,
@@ -1066,6 +1188,328 @@ class SchedulerDoctorTests(unittest.TestCase):
         self.assertEqual(len(displaced_paths), 1)
         self.assertEqual(displaced_paths[0].read_bytes(), attacker)
         self.assertEqual(saved_displaced.read_bytes(), original)
+        self.assertTrue(
+            MODULE._scheduler_runtime_publication_marker_path(status_path).is_file()
+        )
+
+    def test_scheduler_runtime_reader_rejects_marker_appearing_after_read(
+        self,
+    ) -> None:
+        MODULE._begin_scheduler_attempt(
+            self.home,
+            mode="public",
+            repo="owner/public-sync",
+            base_repo="owner/public-sync",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+        status_path = MODULE._scheduler_status_path(self.home)
+        marker_path = MODULE._scheduler_runtime_publication_marker_path(status_path)
+        real_check = MODULE._scheduler_runtime_publication_is_incomplete
+        checks = 0
+
+        def appear_on_post_check(
+            home: Path,
+            checked_status_path: Path,
+            parent_fd: int,
+        ) -> bool:
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                marker_path.write_text(
+                    '{"version":1,"status":"incomplete"}\n',
+                    encoding="utf-8",
+                )
+                marker_path.chmod(0o600)
+            return real_check(home, checked_status_path, parent_fd)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_scheduler_runtime_publication_is_incomplete",
+                side_effect=appear_on_post_check,
+            ),
+            self.assertRaises(MODULE.SyncError) as error_context,
+        ):
+            MODULE._read_scheduler_runtime_state(self.home)
+
+        self.assertEqual(checks, 2)
+        self.assertEqual(
+            error_context.exception.code,
+            "scheduler-state-publication-incomplete",
+        )
+
+    def test_scheduler_runtime_reader_directly_stats_fixed_marker(self) -> None:
+        MODULE._begin_scheduler_attempt(
+            self.home,
+            mode="public",
+            repo="owner/public-sync",
+            base_repo="owner/public-sync",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+        status_path = MODULE._scheduler_status_path(self.home)
+        marker_path = MODULE._scheduler_runtime_publication_marker_path(status_path)
+        marker_path.write_text(
+            '{"version":1,"status":"incomplete"}\n',
+            encoding="utf-8",
+        )
+        marker_path.chmod(0o600)
+        parent_fd = MODULE._open_directory_beneath(
+            self.home,
+            status_path.parent,
+        )
+        try:
+            with mock.patch.object(
+                MODULE,
+                "_directory_member_names",
+                return_value=(status_path.name,),
+            ):
+                self.assertTrue(
+                    MODULE._scheduler_runtime_publication_is_incomplete(
+                        self.home,
+                        status_path,
+                        parent_fd,
+                    )
+                )
+        finally:
+            MODULE._close_fd_quietly(parent_fd)
+
+    def test_scheduler_runtime_reader_rejects_casefold_aliases(self) -> None:
+        MODULE._begin_scheduler_attempt(
+            self.home,
+            mode="public",
+            repo="owner/public-sync",
+            base_repo="owner/public-sync",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+        status_path = MODULE._scheduler_status_path(self.home)
+        marker_path = MODULE._scheduler_runtime_publication_marker_path(status_path)
+        transaction_prefix = f".{status_path.name}.personal-sync-write-"
+        retained_marker_prefix = (
+            f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}{marker_path.name}-"
+        )
+        retained_transaction_prefix = (
+            f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}{transaction_prefix}"
+        )
+        aliases = (
+            marker_path.name.swapcase(),
+            f"{transaction_prefix.swapcase()}case-alias",
+            f"{retained_marker_prefix.swapcase()}case-alias",
+            f"{retained_transaction_prefix.swapcase()}case-alias",
+        )
+        parent_fd = MODULE._open_directory_beneath(
+            self.home,
+            status_path.parent,
+        )
+        try:
+            for alias in aliases:
+                with (
+                    self.subTest(alias=alias),
+                    mock.patch.object(
+                        MODULE,
+                        "_directory_member_names",
+                        return_value=(status_path.name, alias),
+                    ),
+                ):
+                    self.assertTrue(
+                        MODULE._scheduler_runtime_publication_is_incomplete(
+                            self.home,
+                            status_path,
+                            parent_fd,
+                        )
+                    )
+        finally:
+            MODULE._close_fd_quietly(parent_fd)
+
+    def test_scheduler_runtime_reader_rejects_nfd_residue_alias(self) -> None:
+        MODULE._begin_scheduler_attempt(
+            self.home,
+            mode="public",
+            repo="owner/public-sync",
+            base_repo="owner/public-sync",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+        canonical_status_path = MODULE._scheduler_status_path(self.home)
+        status_path = canonical_status_path.with_name("scheduler-Café.json")
+        nfd_residue = ".scheduler-Cafe\u0301.json.personal-sync-write-nfd-alias"
+        parent_fd = MODULE._open_directory_beneath(
+            self.home,
+            status_path.parent,
+        )
+        try:
+            with mock.patch.object(
+                MODULE,
+                "_directory_member_names",
+                return_value=(canonical_status_path.name, nfd_residue),
+            ):
+                self.assertTrue(
+                    MODULE._scheduler_runtime_publication_is_incomplete(
+                        self.home,
+                        status_path,
+                        parent_fd,
+                    )
+                )
+        finally:
+            MODULE._close_fd_quietly(parent_fd)
+
+    def test_scheduler_runtime_reader_rejects_normalized_alias_collision(
+        self,
+    ) -> None:
+        MODULE._begin_scheduler_attempt(
+            self.home,
+            mode="public",
+            repo="owner/public-sync",
+            base_repo="owner/public-sync",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+        canonical_status_path = MODULE._scheduler_status_path(self.home)
+        status_path = canonical_status_path.with_name("scheduler-Café.json")
+        nfc_residue = ".scheduler-Café.json.personal-sync-write-normalized-alias"
+        nfd_residue = ".scheduler-Cafe\u0301.json.personal-sync-write-normalized-alias"
+        parent_fd = MODULE._open_directory_beneath(
+            self.home,
+            status_path.parent,
+        )
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_directory_member_names",
+                    return_value=(
+                        canonical_status_path.name,
+                        nfc_residue,
+                        nfd_residue,
+                    ),
+                ),
+                self.assertRaises(MODULE.SyncError) as error_context,
+            ):
+                MODULE._scheduler_runtime_publication_is_incomplete(
+                    self.home,
+                    status_path,
+                    parent_fd,
+                )
+        finally:
+            MODULE._close_fd_quietly(parent_fd)
+        self.assertEqual(
+            error_context.exception.code,
+            "scheduler-state-publication-incomplete",
+        )
+        self.assertIn(
+            "ambiguous portable aliases",
+            str(error_context.exception),
+        )
+
+    def test_scheduler_runtime_writer_refuses_preexisting_marker(self) -> None:
+        attempt = MODULE._begin_scheduler_attempt(
+            self.home,
+            mode="public",
+            repo="owner/public-sync",
+            base_repo="owner/public-sync",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+        status_path = MODULE._scheduler_status_path(self.home)
+        original = status_path.read_bytes()
+        marker_path = MODULE._scheduler_runtime_publication_marker_path(status_path)
+        marker_path.write_text(
+            '{"version":1,"status":"incomplete"}\n',
+            encoding="utf-8",
+        )
+        marker_path.chmod(0o600)
+
+        with self.assertRaises(MODULE.SyncError) as error_context:
+            MODULE._complete_scheduler_attempt(
+                self.home,
+                attempt=attempt,
+                success=True,
+                failure_reason=None,
+                failure_code=None,
+                mode="public",
+                repo="owner/public-sync",
+                base_repo="owner/public-sync",
+                owner=MODULE.PUBLIC_OWNER,
+            )
+
+        self.assertEqual(
+            error_context.exception.code,
+            "scheduler-state-publication-incomplete",
+        )
+        self.assertEqual(status_path.read_bytes(), original)
+
+    def test_scheduler_runtime_marker_cleanup_failure_remains_fail_closed(
+        self,
+    ) -> None:
+        attempt = MODULE._begin_scheduler_attempt(
+            self.home,
+            mode="public",
+            repo="owner/public-sync",
+            base_repo="owner/public-sync",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+        status_path = MODULE._scheduler_status_path(self.home)
+        marker_path = MODULE._scheduler_runtime_publication_marker_path(status_path)
+        real_commit = MODULE._commit_scheduler_runtime_publication_marker
+        injected = False
+        reader_blocked = False
+
+        def replace_marker_before_commit(
+            user_home: Path,
+            path: Path,
+            parent_fd: int,
+            expected: MODULE.ManagedStateFileSnapshot,
+        ) -> None:
+            nonlocal injected, reader_blocked
+            if not injected:
+                injected = True
+                try:
+                    MODULE._read_scheduler_runtime_state(self.home)
+                except MODULE.SyncError as error:
+                    reader_blocked = (
+                        error.code == "scheduler-state-publication-incomplete"
+                    )
+                else:
+                    self.fail(
+                        "runtime reader accepted state before the marker commit "
+                        "linearization point"
+                    )
+                marker_path.unlink()
+                marker_path.write_bytes(b"foreign marker replacement\n")
+                marker_path.chmod(0o600)
+            real_commit(
+                user_home,
+                path,
+                parent_fd,
+                expected,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_commit_scheduler_runtime_publication_marker",
+                side_effect=replace_marker_before_commit,
+            ),
+            self.assertRaises(MODULE.SyncError),
+        ):
+            MODULE._complete_scheduler_attempt(
+                self.home,
+                attempt=attempt,
+                success=True,
+                failure_reason=None,
+                failure_code=None,
+                mode="public",
+                repo="owner/public-sync",
+                base_repo="owner/public-sync",
+                owner=MODULE.PUBLIC_OWNER,
+            )
+
+        self.assertTrue(injected)
+        self.assertTrue(reader_blocked)
+        self.assertTrue(json.loads(status_path.read_text(encoding="utf-8"))["success"])
+        self.assertTrue(marker_path.exists())
+        with self.assertRaises(MODULE.SyncError) as error_context:
+            MODULE._read_scheduler_runtime_state(self.home)
+        self.assertEqual(
+            error_context.exception.code,
+            "scheduler-state-publication-incomplete",
+        )
 
     def test_scheduler_runtime_cas_rejects_same_inode_content_and_access_drift(
         self,
@@ -1263,6 +1707,9 @@ class SchedulerDoctorTests(unittest.TestCase):
         assert state is not None
         self.assertTrue(state["success"])
         self.assertEqual(state["last_attempt"], attempt)
+        self.assertFalse(
+            MODULE._scheduler_runtime_publication_marker_path(status_path).exists()
+        )
 
     def test_scheduler_runtime_cas_rejects_parent_rotation_with_same_file_inode(
         self,
@@ -1818,12 +2265,12 @@ class SchedulerDoctorTests(unittest.TestCase):
             *,
             dry_run: bool,
             expected_snapshot: MODULE.ManagedStateFileSnapshot | None = None,
-        ) -> None:
+        ) -> MODULE.ManagedStateFileSnapshot | None:
             nonlocal injected
             if path == paths.systemd_timer and not injected:
                 injected = True
                 raise MODULE.SyncError("injected pair crash")
-            real_write(
+            return real_write(
                 path,
                 content,
                 dry_run=dry_run,
@@ -1844,17 +2291,13 @@ class SchedulerDoctorTests(unittest.TestCase):
                 "linux",
             )
 
-        self.assertTrue(
-            MODULE._scheduler_pair_transaction_path(paths).is_file()
-        )
+        self.assertTrue(MODULE._scheduler_pair_transaction_path(paths).is_file())
         self.install_scheduler_quietly(
             "owner/new",
             None,
             "linux",
         )
-        self.assertFalse(
-            MODULE._scheduler_pair_transaction_path(paths).exists()
-        )
+        self.assertFalse(MODULE._scheduler_pair_transaction_path(paths).exists())
         config = MODULE._load_linux_scheduler_config(paths)
         self.assertIsNotNone(config)
         assert config is not None
@@ -1881,17 +2324,15 @@ class SchedulerDoctorTests(unittest.TestCase):
             *,
             dry_run: bool,
             expected_snapshot: MODULE.ManagedStateFileSnapshot | None = None,
-        ) -> None:
+        ) -> MODULE.ManagedStateFileSnapshot | None:
             if (
                 threading.current_thread().name == "first-scheduler-install"
                 and path == paths.systemd_service
             ):
                 first_publication_paused.set()
                 if not release_first_publication.wait(5):
-                    raise AssertionError(
-                        "first scheduler publication was not released"
-                    )
-            real_write(
+                    raise AssertionError("first scheduler publication was not released")
+            return real_write(
                 path,
                 content,
                 dry_run=dry_run,
@@ -1971,9 +2412,7 @@ class SchedulerDoctorTests(unittest.TestCase):
         self.assertFalse(second.is_alive())
         self.assertEqual(errors, {})
         self.assertTrue(second_recovery_entered.is_set())
-        self.assertFalse(
-            MODULE._scheduler_pair_transaction_path(paths).exists()
-        )
+        self.assertFalse(MODULE._scheduler_pair_transaction_path(paths).exists())
         config = MODULE._load_linux_scheduler_config(paths)
         self.assertIsNotNone(config)
         assert config is not None
@@ -1998,13 +2437,13 @@ class SchedulerDoctorTests(unittest.TestCase):
             *,
             dry_run: bool,
             expected_snapshot: MODULE.ManagedStateFileSnapshot | None = None,
-        ) -> None:
+        ) -> MODULE.ManagedStateFileSnapshot | None:
             nonlocal injected
             if path == paths.systemd_service and not injected:
                 injected = True
                 path.write_text("user edit\n", encoding="utf-8")
                 path.chmod(0o600)
-            real_write(
+            return real_write(
                 path,
                 content,
                 dry_run=dry_run,
@@ -2200,6 +2639,191 @@ class SchedulerDoctorTests(unittest.TestCase):
                 ]
                 self.assertEqual(len(displaced_paths), 1)
                 self.assertEqual(displaced_paths[0].read_bytes(), attacker)
+
+    def test_scheduler_cleanup_removes_recovery_before_displaced_preimage(
+        self,
+    ) -> None:
+        config_path = (
+            self.user_home
+            / "Library"
+            / "LaunchAgents"
+            / "com.openai.codex-personal-sync.plist"
+        )
+        config_path.parent.mkdir(parents=True)
+        original = b"original scheduler config\n"
+        replacement = b"replacement scheduler config\n"
+        config_path.write_bytes(original)
+        config_path.chmod(0o600)
+        expected = MODULE._scheduler_config_snapshot(config_path)
+        cleanup_labels: list[str] = []
+        real_cleanup = MODULE._isolate_and_delete_pending_cleanup_file
+
+        def observe_cleanup(
+            home: Path,
+            path: Path,
+            parent_fd: int,
+            snapshot: MODULE.ManagedStateFileSnapshot,
+            *,
+            label: str,
+        ) -> None:
+            cleanup_labels.append(label)
+            if "recovery evidence" in label:
+                displaced = [
+                    candidate
+                    for candidate in config_path.parent.glob(
+                        f".{config_path.name}.personal-sync-write-*"
+                    )
+                    if not candidate.name.endswith(".original")
+                ]
+                self.assertEqual(len(displaced), 1)
+                self.assertEqual(displaced[0].read_bytes(), original)
+            real_cleanup(
+                home,
+                path,
+                parent_fd,
+                snapshot,
+                label=label,
+            )
+
+        with mock.patch.object(
+            MODULE,
+            "_isolate_and_delete_pending_cleanup_file",
+            side_effect=observe_cleanup,
+        ):
+            installed = MODULE._atomic_write_scheduler_config(
+                config_path,
+                replacement,
+                expected_snapshot=expected,
+            )
+
+        self.assertEqual(installed.payload, replacement)
+        self.assertEqual(config_path.read_bytes(), replacement)
+        scheduler_cleanup_labels = [
+            label for label in cleanup_labels if label.startswith("scheduler config ")
+        ]
+        self.assertEqual(
+            scheduler_cleanup_labels,
+            [
+                f"scheduler config recovery evidence {config_path}",
+                f"scheduler config backup {config_path}",
+            ],
+        )
+
+    def test_scheduler_recovery_cleanup_races_preserve_displaced_preimage(
+        self,
+    ) -> None:
+        for race in ("unlink", "replace"):
+            with self.subTest(race=race):
+                config_path = self.user_home / race / "codex-personal-sync.service"
+                config_path.parent.mkdir(parents=True)
+                original = f"original:{race}\n".encode()
+                replacement = f"replacement:{race}\n".encode()
+                config_path.write_bytes(original)
+                config_path.chmod(0o600)
+                expected = MODULE._scheduler_config_snapshot(config_path)
+                real_cleanup = MODULE._isolate_and_delete_pending_cleanup_file
+                injected = False
+
+                def race_recovery_cleanup(
+                    home: Path,
+                    path: Path,
+                    parent_fd: int,
+                    snapshot: MODULE.ManagedStateFileSnapshot,
+                    *,
+                    label: str,
+                ) -> None:
+                    nonlocal injected
+                    if "recovery evidence" in label and not injected:
+                        injected = True
+                        path.unlink()
+                        if race == "replace":
+                            # Preserve content and access while replacing the
+                            # named object identity.
+                            path.write_bytes(original)
+                            path.chmod(0o600)
+                    real_cleanup(
+                        home,
+                        path,
+                        parent_fd,
+                        snapshot,
+                        label=label,
+                    )
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_isolate_and_delete_pending_cleanup_file",
+                        side_effect=race_recovery_cleanup,
+                    ),
+                    self.assertRaises(MODULE.SyncError),
+                ):
+                    MODULE._atomic_write_scheduler_config(
+                        config_path,
+                        replacement,
+                        expected_snapshot=expected,
+                    )
+
+                self.assertTrue(injected)
+                self.assertEqual(config_path.read_bytes(), replacement)
+                displaced = [
+                    candidate
+                    for candidate in config_path.parent.glob(
+                        f".{config_path.name}.personal-sync-write-*"
+                    )
+                    if not candidate.name.endswith(".original")
+                ]
+                self.assertEqual(len(displaced), 1)
+                self.assertEqual(displaced[0].read_bytes(), original)
+
+    def test_scheduler_recovery_link_survives_parent_fsync_failure(self) -> None:
+        config_path = (
+            self.user_home
+            / ".config"
+            / "systemd"
+            / "user"
+            / "codex-personal-sync.service"
+        )
+        config_path.parent.mkdir(parents=True)
+        original = b"original scheduler config\n"
+        config_path.write_bytes(original)
+        config_path.chmod(0o600)
+        expected = MODULE._scheduler_config_snapshot(config_path)
+        real_fsync = MODULE.os.fsync
+        parent_fsyncs = 0
+
+        def fail_recovery_parent_fsync(file_fd: int) -> None:
+            nonlocal parent_fsyncs
+            if stat.S_ISDIR(os.fstat(file_fd).st_mode):
+                parent_fsyncs += 1
+                if parent_fsyncs == 2:
+                    raise OSError("injected recovery parent fsync failure")
+            real_fsync(file_fd)
+
+        with (
+            mock.patch.object(
+                MODULE.os,
+                "fsync",
+                side_effect=fail_recovery_parent_fsync,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "failed to publish scheduler config",
+            ),
+        ):
+            MODULE._atomic_write_scheduler_config(
+                config_path,
+                b"replacement scheduler config\n",
+                expected_snapshot=expected,
+            )
+
+        recovery_paths = list(
+            config_path.parent.glob(
+                f".{config_path.name}.personal-sync-write-*.original"
+            )
+        )
+        self.assertEqual(len(recovery_paths), 1)
+        self.assertEqual(recovery_paths[0].read_bytes(), original)
+        self.assertEqual(config_path.read_bytes(), original)
 
     def test_matching_scheduler_revalidates_semantic_audit_before_daemon(
         self,
