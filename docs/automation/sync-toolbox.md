@@ -58,10 +58,12 @@ administrators must provision and rotate the secret outside this workflow.
   filters, and working-tree encodings cannot rewrite the audited bytes. Mirror
   `check` runs again after the commit.
 - An existing pull request is mutable only when its live lifecycle, repository
-  owner, base, head branch, head OID, same-repository status, and automation
-  marker all match the prepared branch evidence. The workflow repeats those
-  checks immediately around publication rather than trusting an earlier PR
-  listing.
+  owner, base name and exact base OID, head branch and exact head OID,
+  same-repository status, and automation marker all match the prepared branch
+  evidence. The workflow also queries the live target-base ref immediately
+  before every create, edit, or close mutation and verifies both the ref and
+  PR evidence again after create/edit. It does not trust an earlier PR listing
+  or assume that an unchanged branch name implies an unchanged base.
 - `pr_has_changes` and `branch_needs_update` are independent. A stale generated
   branch can become tree-equal to `master` after reconciliation while still
   requiring an ordinary fast-forward push. After that push, an exact owned
@@ -83,5 +85,9 @@ administrators must provision and rotate the secret outside this workflow.
   on the scoped branch, malformed or ambiguous remote-ref output, a fetch/ref
   mismatch, ambiguous or unowned pull requests, missing credentials, or a
   moving target base/branch. It does not repair or overwrite those states.
+- GitHub does not offer this workflow an atomic "mutate only if base ref still
+  equals this OID" PR operation. The immediate precondition checks and
+  post-create/edit validation narrow and detect base movement, but they do not
+  claim to eliminate a server-side ref change in the final request window.
 - GitHub branch protection and required checks remain authoritative before the
   generated pull request can merge.

@@ -104,6 +104,13 @@ superseded_by:
 
 ## Validation Evidence
 
+- A final orchestration audit found that target-base OID revalidation covered
+  push but not the no-push pull-request create/edit/close paths. The workflow
+  now binds `baseRefOid` in owned-PR evidence, queries the exact live target
+  ref immediately before each PR mutation, and revalidates the base plus owned
+  PR after create/edit. Focused toolbox workflow tests add PR-base and live-ref
+  drift cases; `python3 -m unittest tests.test_sync_toolbox_automation` passed
+  14 tests, and actionlint plus Ruff passed for the follow-up.
 - `python3 -B -m unittest tests.test_sync_toolbox_automation
   tests.test_source_lock`: 119 tests passed in 956.398 seconds after the
   fresh-review fixes. The added matrix covers unsupported/old/malformed Git

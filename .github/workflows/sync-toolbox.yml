@@ -221,7 +221,7 @@ jobs:
               --base "${TARGET_BASE}" \
               --head "${SYNC_BRANCH}" \
               --limit 10 \
-              --json number,body,state,baseRefName,headRefName,headRefOid,headRepositoryOwner,isCrossRepository
+              --json number,body,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepositoryOwner,isCrossRepository
           )"
           count="$(jq 'length' <<<"${pull_requests}")"
           if ((count > 1)); then
@@ -236,6 +236,7 @@ jobs:
             if ! jq -e \
               --arg owner "${TARGET_OWNER}" \
               --arg base "${TARGET_BASE}" \
+              --arg base_oid "${{ steps.prepare.outputs.target_base_sha }}" \
               --arg head "${SYNC_BRANCH}" \
               --arg head_oid "${{ steps.prepare.outputs.remote_branch_sha }}" \
               '
@@ -243,6 +244,7 @@ jobs:
                 .[0].isCrossRepository == false and
                 .[0].headRepositoryOwner.login == $owner and
                 .[0].baseRefName == $base and
+                .[0].baseRefOid == $base_oid and
                 .[0].headRefName == $head and
                 .[0].headRefOid == $head_oid and
                 (.[0].body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
@@ -519,6 +521,7 @@ jobs:
           GH_TOKEN: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
           DESIRED_HEAD_SHA: ${{ steps.commit.outputs.head_sha }}
           EXISTING_PR: ${{ steps.existing-pr.outputs.number }}
+          PREPARED_TARGET_BASE_SHA: ${{ steps.prepare.outputs.target_base_sha }}
         run: |
           set -euo pipefail
           pr_body_file="${RUNNER_TEMP}/toolbox-sync-pr.md"
@@ -548,7 +551,21 @@ jobs:
               --base "${TARGET_BASE}" \
               --head "${SYNC_BRANCH}" \
               --limit 10 \
-              --json number,body,state,baseRefName,headRefName,headRefOid,headRepositoryOwner,isCrossRepository
+              --json number,body,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepositoryOwner,isCrossRepository
+          }
+          require_target_base_sha() {
+            local observed_base_sha
+            observed_base_sha="$(
+              gh api \
+                "repos/${TARGET_REPOSITORY}/git/ref/heads/${TARGET_BASE}" \
+                --jq '.object.sha'
+            )"
+            if [[ ! "${PREPARED_TARGET_BASE_SHA}" =~ ^[0-9a-f]{40}$ || \
+              ! "${observed_base_sha}" =~ ^[0-9a-f]{40}$ || \
+              "${observed_base_sha}" != "${PREPARED_TARGET_BASE_SHA}" ]]; then
+              echo "::error title=Toolbox master advanced::The target base changed after generation; refusing to mutate a sync PR."
+              exit 1
+            fi
           }
           require_owned_sync_pr() {
             local pull_requests="$1"
@@ -562,12 +579,14 @@ jobs:
             if ! jq -e \
               --arg owner "${TARGET_OWNER}" \
               --arg base "${TARGET_BASE}" \
+              --arg base_oid "${PREPARED_TARGET_BASE_SHA}" \
               --arg head "${SYNC_BRANCH}" \
               --arg head_oid "${DESIRED_HEAD_SHA}" \
               --arg expected_number "${expected_number}" \
               '
                 .[0].state == "OPEN" and
                 .[0].baseRefName == $base and
+                .[0].baseRefOid == $base_oid and
                 .[0].headRefName == $head and
                 .[0].headRefOid == $head_oid and
                 .[0].isCrossRepository == false and
@@ -586,6 +605,7 @@ jobs:
           before_publish="$(query_sync_prs)"
           if [[ -n "${EXISTING_PR}" ]]; then
             require_owned_sync_pr "${before_publish}" "${EXISTING_PR}"
+            require_target_base_sha
             gh pr edit "${EXISTING_PR}" \
               --repo "${TARGET_REPOSITORY}" \
               --title "${title}" \
@@ -595,6 +615,7 @@ jobs:
               echo "::error title=Sync PR appeared::An open sync PR appeared after preparation; refusing to adopt or overwrite it."
               exit 1
             fi
+            require_target_base_sha
             gh pr create \
               --repo "${TARGET_REPOSITORY}" \
               --base "${TARGET_BASE}" \
@@ -602,6 +623,7 @@ jobs:
               --title "${title}" \
               --body-file "${pr_body_file}"
           fi
+          require_target_base_sha
           require_owned_sync_pr "$(query_sync_prs)" "${EXISTING_PR}"
 
       - name: Close clean owned toolbox sync PR
@@ -611,16 +633,18 @@ jobs:
           GH_TOKEN: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
           DESIRED_HEAD_SHA: ${{ steps.commit.outputs.head_sha }}
           EXISTING_PR: ${{ steps.existing-pr.outputs.number }}
+          PREPARED_TARGET_BASE_SHA: ${{ steps.prepare.outputs.target_base_sha }}
         run: |
           set -euo pipefail
           current_pull_request="$(
             gh pr view "${EXISTING_PR}" \
               --repo "${TARGET_REPOSITORY}" \
-              --json number,body,state,baseRefName,headRefName,headRefOid,headRepositoryOwner,isCrossRepository
+              --json number,body,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepositoryOwner,isCrossRepository
           )"
           if ! jq -e \
             --arg number "${EXISTING_PR}" \
             --arg base "${TARGET_BASE}" \
+            --arg base_oid "${PREPARED_TARGET_BASE_SHA}" \
             --arg head "${SYNC_BRANCH}" \
             --arg head_oid "${DESIRED_HEAD_SHA}" \
             --arg owner "${TARGET_OWNER}" \
@@ -628,6 +652,7 @@ jobs:
               (.number | tostring) == $number and
               .state == "OPEN" and
               .baseRefName == $base and
+              .baseRefOid == $base_oid and
               .headRefName == $head and
               .headRefOid == $head_oid and
               .isCrossRepository == false and
@@ -635,6 +660,17 @@ jobs:
               (.body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
             ' <<<"${current_pull_request}" >/dev/null; then
             echo "::error title=Sync PR changed::The clean PR no longer exactly matches the owned automation scope and generated head."
+            exit 1
+          fi
+          observed_base_sha="$(
+            gh api \
+              "repos/${TARGET_REPOSITORY}/git/ref/heads/${TARGET_BASE}" \
+              --jq '.object.sha'
+          )"
+          if [[ ! "${PREPARED_TARGET_BASE_SHA}" =~ ^[0-9a-f]{40}$ || \
+            ! "${observed_base_sha}" =~ ^[0-9a-f]{40}$ || \
+            "${observed_base_sha}" != "${PREPARED_TARGET_BASE_SHA}" ]]; then
+            echo "::error title=Toolbox master advanced::The target base changed after generation; refusing to close the sync PR."
             exit 1
           fi
           gh pr close "${EXISTING_PR}" \

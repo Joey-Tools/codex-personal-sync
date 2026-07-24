@@ -304,12 +304,15 @@ class SyncToolboxAutomationTests(unittest.TestCase):
         self.assertIn('gh pr edit "${EXISTING_PR}"', publish)
         self.assertIn("gh pr create", publish)
         self.assertIn("query_sync_prs", publish)
+        self.assertIn("require_target_base_sha", publish)
         self.assertIn('.state == "OPEN"', publish)
+        self.assertIn(".baseRefOid == $base_oid", publish)
         self.assertIn(".headRefOid == $head_oid", publish)
         close = self._step_run("Close clean owned toolbox sync PR")
         self.assertIn('gh pr view "${EXISTING_PR}"', close)
         self.assertIn('gh pr close "${EXISTING_PR}"', close)
         self.assertNotIn("--delete-branch", close)
+        self.assertIn(".baseRefOid == $base_oid", close)
         self.assertIn(".headRefOid == $head_oid", close)
 
     def test_allowed_path_stream_is_nul_delimited(self) -> None:
@@ -968,26 +971,31 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                 "with Path(os.environ['FAKE_GH_LOG']).open('a', encoding='utf-8') as stream:\n"
                 "    stream.write(' '.join(args) + '\\n')\n"
                 "if args[:2] == ['pr', 'view']:\n"
-                "    print(os.environ['PR_PAYLOAD'])\n",
+                "    print(os.environ['PR_PAYLOAD'])\n"
+                "elif args[:1] == ['api']:\n"
+                "    print(os.environ['LIVE_BASE_SHA'])\n",
                 encoding="utf-8",
             )
             fake_gh.chmod(0o755)
             desired_sha = "5" * 40
+            prepared_base_sha = "4" * 40
             exact_payload = {
                 "number": 17,
                 "body": "<!-- codex-personal-sync-toolbox-automation -->\n",
                 "state": "OPEN",
                 "baseRefName": "master",
+                "baseRefOid": prepared_base_sha,
                 "headRefName": "automation/canonical-personal-sync",
                 "headRefOid": desired_sha,
                 "headRepositoryOwner": {"login": "Joey-Tools"},
                 "isCrossRepository": False,
             }
             cases = (
-                ("exact", exact_payload, 0, True),
+                ("exact", exact_payload, prepared_base_sha, 0, True),
                 (
                     "head drift",
                     {**exact_payload, "headRefOid": "6" * 40},
+                    prepared_base_sha,
                     1,
                     False,
                 ),
@@ -997,11 +1005,32 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                         **exact_payload,
                         "headRepositoryOwner": {"login": "someone-else"},
                     },
+                    prepared_base_sha,
+                    1,
+                    False,
+                ),
+                (
+                    "pr base drift",
+                    {**exact_payload, "baseRefOid": "7" * 40},
+                    prepared_base_sha,
+                    1,
+                    False,
+                ),
+                (
+                    "live base drift",
+                    exact_payload,
+                    "8" * 40,
                     1,
                     False,
                 ),
             )
-            for name, payload, expected_failure, should_close in cases:
+            for (
+                name,
+                payload,
+                live_base_sha,
+                expected_failure,
+                should_close,
+            ) in cases:
                 with self.subTest(name=name):
                     gh_log = root / f"gh-log-{name.replace(' ', '-')}"
                     environment = {
@@ -1010,7 +1039,9 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                         "EXISTING_PR": "17",
                         "FAKE_GH_LOG": str(gh_log),
                         "GH_TOKEN": SYNTHETIC_ACCESS_TOKEN,
+                        "LIVE_BASE_SHA": live_base_sha,
                         "PATH": (f"{fake_bin}:{Path(jq).parent}:/usr/bin:/bin"),
+                        "PREPARED_TARGET_BASE_SHA": prepared_base_sha,
                         "PR_PAYLOAD": json.dumps(payload),
                         "SYNC_BRANCH": "automation/canonical-personal-sync",
                         "TARGET_BASE": "master",
