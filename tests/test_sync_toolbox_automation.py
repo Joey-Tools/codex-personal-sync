@@ -316,6 +316,9 @@ class SyncToolboxAutomationTests(unittest.TestCase):
         self.assertNotIn("--delete-branch", close)
         self.assertIn(".baseRefOid == $base_oid", close)
         self.assertIn(".headRefOid == $head_oid", close)
+        self.assertGreaterEqual(close.count('gh pr view "${EXISTING_PR}"'), 2)
+        self.assertIn('.state == "CLOSED"', close)
+        self.assertIn("Sync PR recovery required", close)
 
     def test_pr_create_binds_live_head_and_returned_number(self) -> None:
         jq = shutil.which("jq")
@@ -398,73 +401,87 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                 for key, value in exact_payload[0].items()
                 if key not in {"baseRefOid", "headRefOid"}
             }
-            recovery_wrong_owner = {
-                **recovery_payload,
-                "headRepositoryOwner": {"login": "someone-else"},
-            }
+            identity_mutations = (
+                ("marker", {"body": "ordinary pull request\n"}),
+                ("state", {"state": "CLOSED"}),
+                ("base name", {"baseRefName": "other"}),
+                ("head name", {"headRefName": "other"}),
+                ("cross repository", {"isCrossRepository": True}),
+                (
+                    "owner",
+                    {"headRepositoryOwner": {"login": "someone-else"}},
+                ),
+            )
+            recovery_identity_cases = tuple(
+                {
+                    "name": f"recovery {label} drift",
+                    "after_payload": [{**exact_payload[0], **updates}],
+                    "recovery_payload": {**recovery_payload, **updates},
+                }
+                for label, updates in identity_mutations
+            )
             cases = (
-                {"name": "exact", "expected_failure": 0},
-                {
-                    "name": "head drift before create",
-                    "head_before": "6" * 40,
-                    "head_after": "6" * 40,
-                    "after_payload": drifted_payload,
-                    "should_create": False,
-                },
-                {
-                    "name": "head drift after create",
-                    "head_after": "6" * 40,
-                    "after_payload": drifted_payload,
-                    "close_attempted": True,
-                    "close_recorded": True,
-                },
-                {
-                    "name": "base drift before create",
-                    "base_before": "7" * 40,
-                    "base_after": "7" * 40,
-                    "should_create": False,
-                },
-                {
-                    "name": "base drift after create",
-                    "base_after": "7" * 40,
-                    "close_attempted": True,
-                    "close_recorded": True,
-                },
-                {
-                    "name": "returned number mismatch",
-                    "created_url": (
-                        "https://github.com/Joey-Tools/codex-toolbox/pull/30"
-                    ),
-                },
-                {
-                    "name": "recovery identity drift",
-                    "head_after": "6" * 40,
-                    "after_payload": drifted_payload,
-                    "recovery_payload": recovery_wrong_owner,
-                },
-                {
-                    "name": "recovery close failure",
-                    "head_after": "6" * 40,
-                    "after_payload": drifted_payload,
-                    "close_attempted": True,
-                    "close_failure": True,
-                },
-                {
-                    "name": "recovery remains open",
-                    "head_after": "6" * 40,
-                    "after_payload": drifted_payload,
-                    "close_attempted": True,
-                    "close_recorded": True,
-                    "close_stays_open": True,
-                },
-                {
-                    "name": "recovery post-close identity drift",
-                    "head_after": "6" * 40,
-                    "after_payload": drifted_payload,
-                    "close_attempted": True,
-                    "close_recorded": True,
-                    "post_close_identity_drift": True,
-                },
+                (
+                    {"name": "exact", "expected_failure": 0},
+                    {
+                        "name": "head drift before create",
+                        "head_before": "6" * 40,
+                        "head_after": "6" * 40,
+                        "after_payload": drifted_payload,
+                        "should_create": False,
+                    },
+                    {
+                        "name": "head drift after create",
+                        "head_after": "6" * 40,
+                        "after_payload": drifted_payload,
+                        "close_attempted": True,
+                        "close_recorded": True,
+                    },
+                    {
+                        "name": "base drift before create",
+                        "base_before": "7" * 40,
+                        "base_after": "7" * 40,
+                        "should_create": False,
+                    },
+                    {
+                        "name": "base drift after create",
+                        "base_after": "7" * 40,
+                        "close_attempted": True,
+                        "close_recorded": True,
+                    },
+                    {
+                        "name": "returned number mismatch",
+                        "created_url": (
+                            "https://github.com/Joey-Tools/codex-toolbox/pull/30"
+                        ),
+                    },
+                )
+                + recovery_identity_cases
+                + (
+                    {
+                        "name": "recovery close failure",
+                        "head_after": "6" * 40,
+                        "after_payload": drifted_payload,
+                        "close_attempted": True,
+                        "close_failure": True,
+                    },
+                    {
+                        "name": "recovery remains open",
+                        "head_after": "6" * 40,
+                        "after_payload": drifted_payload,
+                        "close_attempted": True,
+                        "close_recorded": True,
+                        "close_stays_open": True,
+                    },
+                    {
+                        "name": "recovery post-close identity drift",
+                        "head_after": "6" * 40,
+                        "after_payload": drifted_payload,
+                        "close_attempted": True,
+                        "close_recorded": True,
+                        "post_close_identity_drift": True,
+                    },
+                )
             )
             for case in cases:
                 name = str(case["name"])
@@ -631,20 +648,35 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                     "isCrossRepository": False,
                 }
             ]
-            wrong_owner = [
-                {
-                    **exact_payload[0],
-                    "headRepositoryOwner": {"login": "someone-else"},
-                }
-            ]
             wrong_head = [{**exact_payload[0], "headRefOid": "6" * 40}]
+            identity_mutations = (
+                ("marker", {"body": "ordinary pull request\n"}),
+                ("state", {"state": "CLOSED"}),
+                ("base name", {"baseRefName": "other"}),
+                ("head name", {"headRefName": "other"}),
+                ("cross repository", {"isCrossRepository": True}),
+                (
+                    "owner",
+                    {"headRepositoryOwner": {"login": "someone-else"}},
+                ),
+            )
+            identity_cases = tuple(
+                case
+                for label, updates in identity_mutations
+                for case in (
+                    {
+                        "name": f"PR {label} drift before edit",
+                        "before_payload": [{**exact_payload[0], **updates}],
+                        "should_edit": False,
+                    },
+                    {
+                        "name": f"PR {label} drift after edit",
+                        "after_payload": [{**exact_payload[0], **updates}],
+                    },
+                )
+            )
             cases = (
                 {"name": "exact", "expected_failure": 0},
-                {
-                    "name": "PR owner drift before edit",
-                    "before_payload": wrong_owner,
-                    "should_edit": False,
-                },
                 {
                     "name": "PR head drift before edit",
                     "before_payload": wrong_head,
@@ -668,11 +700,7 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                     "name": "head drift after edit",
                     "head_after": "6" * 40,
                 },
-                {
-                    "name": "PR owner drift after edit",
-                    "after_payload": wrong_owner,
-                },
-            )
+            ) + identity_cases
             for case in cases:
                 name = str(case["name"])
                 expected_failure = int(case.get("expected_failure", 1))
@@ -1396,6 +1424,7 @@ class SyncToolboxAutomationTests(unittest.TestCase):
             fake_gh = fake_bin / "gh"
             fake_gh.write_text(
                 "#!/usr/bin/python3\n"
+                "import json\n"
                 "import os\n"
                 "import sys\n"
                 "from pathlib import Path\n"
@@ -1403,7 +1432,12 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                 "with Path(os.environ['FAKE_GH_LOG']).open('a', encoding='utf-8') as stream:\n"
                 "    stream.write(' '.join(args) + '\\n')\n"
                 "if args[:2] == ['pr', 'view']:\n"
-                "    print(os.environ['PR_PAYLOAD'])\n"
+                "    key = 'POST_CLOSE_PR_PAYLOAD' if Path(os.environ['CLOSED_STATE']).exists() else 'PR_PAYLOAD'\n"
+                "    print(os.environ[key])\n"
+                "elif args[:2] == ['pr', 'close']:\n"
+                "    if os.environ['CLOSE_FAILURE'] == '1':\n"
+                "        raise SystemExit(1)\n"
+                "    Path(os.environ['CLOSED_STATE']).write_text('closed', encoding='ascii')\n"
                 "elif args[:1] == ['api']:\n"
                 "    if '/heads/master' in args[1]:\n"
                 "        print(os.environ['LIVE_BASE_SHA'])\n"
@@ -1425,80 +1459,113 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                 "headRepositoryOwner": {"login": "Joey-Tools"},
                 "isCrossRepository": False,
             }
-            cases = (
+            closed_payload = {**exact_payload, "state": "CLOSED"}
+            identity_mutations = (
                 (
-                    "exact",
-                    exact_payload,
-                    prepared_base_sha,
-                    desired_sha,
-                    0,
-                    True,
+                    "marker",
+                    {"body": "ordinary pull request\n"},
+                    {"body": "ordinary pull request\n"},
+                ),
+                ("state", {"state": "CLOSED"}, {"state": "OPEN"}),
+                (
+                    "base name",
+                    {"baseRefName": "other"},
+                    {"baseRefName": "other"},
                 ),
                 (
-                    "head drift",
-                    {**exact_payload, "headRefOid": "6" * 40},
-                    prepared_base_sha,
-                    desired_sha,
-                    1,
-                    False,
+                    "head name",
+                    {"headRefName": "other"},
+                    {"headRefName": "other"},
                 ),
                 (
-                    "owner drift",
-                    {
-                        **exact_payload,
-                        "headRepositoryOwner": {"login": "someone-else"},
-                    },
-                    prepared_base_sha,
-                    desired_sha,
-                    1,
-                    False,
+                    "cross repository",
+                    {"isCrossRepository": True},
+                    {"isCrossRepository": True},
                 ),
                 (
-                    "pr base drift",
-                    {**exact_payload, "baseRefOid": "7" * 40},
-                    prepared_base_sha,
-                    desired_sha,
-                    1,
-                    False,
-                ),
-                (
-                    "live base drift",
-                    exact_payload,
-                    "8" * 40,
-                    desired_sha,
-                    1,
-                    False,
-                ),
-                (
-                    "live head drift",
-                    exact_payload,
-                    prepared_base_sha,
-                    "9" * 40,
-                    1,
-                    False,
+                    "owner",
+                    {"headRepositoryOwner": {"login": "someone-else"}},
+                    {"headRepositoryOwner": {"login": "someone-else"}},
                 ),
             )
-            for (
-                name,
-                payload,
-                live_base_sha,
-                live_head_sha,
-                expected_failure,
-                should_close,
-            ) in cases:
+            identity_cases = tuple(
+                case
+                for label, before_updates, after_updates in identity_mutations
+                for case in (
+                    {
+                        "name": f"{label} drift before close",
+                        "payload": {**exact_payload, **before_updates},
+                        "should_close": False,
+                    },
+                    {
+                        "name": f"{label} drift after close",
+                        "post_close_payload": {
+                            **closed_payload,
+                            **after_updates,
+                        },
+                        "should_close": True,
+                    },
+                )
+            )
+            cases = (
+                {"name": "exact", "expected_failure": 0},
+                {
+                    "name": "head OID drift before close",
+                    "payload": {**exact_payload, "headRefOid": "6" * 40},
+                    "should_close": False,
+                },
+                {
+                    "name": "base OID drift before close",
+                    "payload": {**exact_payload, "baseRefOid": "7" * 40},
+                    "should_close": False,
+                },
+                {
+                    "name": "live base drift before close",
+                    "live_base_sha": "8" * 40,
+                    "should_close": False,
+                },
+                {
+                    "name": "live head drift before close",
+                    "live_head_sha": "9" * 40,
+                    "should_close": False,
+                },
+                {
+                    "name": "close command failure",
+                    "close_failure": True,
+                    "should_close": True,
+                },
+                {
+                    "name": "close remains open",
+                    "post_close_payload": exact_payload,
+                    "should_close": True,
+                },
+            )
+            cases += identity_cases
+            for case in cases:
+                name = str(case["name"])
+                expected_failure = int(case.get("expected_failure", 1))
+                should_close = bool(case.get("should_close", True))
                 with self.subTest(name=name):
                     gh_log = root / f"gh-log-{name.replace(' ', '-')}"
+                    closed_state = root / f"closed-{name.replace(' ', '-')}"
                     environment = {
                         **os.environ,
+                        "CLOSED_STATE": str(closed_state),
+                        "CLOSE_FAILURE": ("1" if case.get("close_failure") else "0"),
                         "DESIRED_HEAD_SHA": desired_sha,
                         "EXISTING_PR": "17",
                         "FAKE_GH_LOG": str(gh_log),
                         "GH_TOKEN": SYNTHETIC_ACCESS_TOKEN,
-                        "LIVE_BASE_SHA": live_base_sha,
-                        "LIVE_HEAD_SHA": live_head_sha,
+                        "LIVE_BASE_SHA": str(
+                            case.get("live_base_sha", prepared_base_sha)
+                        ),
+                        "LIVE_HEAD_SHA": str(case.get("live_head_sha", desired_sha)),
                         "PATH": (f"{fake_bin}:{Path(jq).parent}:/usr/bin:/bin"),
+                        "POST_CLOSE_PR_PAYLOAD": json.dumps(
+                            case.get("post_close_payload", closed_payload)
+                        ),
                         "PREPARED_TARGET_BASE_SHA": prepared_base_sha,
-                        "PR_PAYLOAD": json.dumps(payload),
+                        "PR_PAYLOAD": json.dumps(case.get("payload", exact_payload)),
                         "SYNC_BRANCH": "automation/canonical-personal-sync",
                         "TARGET_BASE": "master",
                         "TARGET_OWNER": "Joey-Tools",
@@ -1529,7 +1596,16 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                         )
                     commands = gh_log.read_text(encoding="utf-8")
                     self.assertEqual("pr close 17" in commands, should_close)
+                    self.assertEqual(
+                        closed_state.exists(),
+                        should_close and not case.get("close_failure", False),
+                    )
                     self.assertNotIn("--delete-branch", commands)
+                    if expected_failure and should_close:
+                        self.assertIn(
+                            "Sync PR recovery required",
+                            completed.stdout + completed.stderr,
+                        )
 
     def test_documented_secret_interface_is_least_privilege_and_explicit(
         self,

@@ -14,7 +14,7 @@ superseded_by:
 
 ## Summary
 
-- Delivery status: `canonical_mirror_recovery_gate_complete`.
+- Delivery status: `canonical_mirror_pr_terminal_gate_complete`.
 - The workstream is consolidating personal sync ownership in `Joey-Tools/codex-personal-sync` and hardening mirror generation, scheduler observability, active-skill auditing, reconciliation, and release retention.
 - Signed commit `39050ba7629ae0ee896f1df5e9e9c9dd75421825` is the fixed
   parent of the current recovery-hardening candidate. The candidate is fully
@@ -128,6 +128,17 @@ superseded_by:
   identity drift, close failure, an unclosed result, and post-close identity
   drift. The focused workflow suite now passes 16 tests, with actionlint and
   Ruff still clean.
+- A subsequent fresh named-single pass found that ordinary clean-PR closure
+  trusted the `gh pr close` return code without proving the terminal state and
+  that its executable matrix did not independently protect every automation
+  identity predicate. Ordinary closure now re-reads the exact PR number and
+  requires the expected closed lifecycle, base/head names and OIDs, same-repo
+  shape, owner, and marker; failed commands, unreadable evidence, reopen/no-op,
+  or identity drift retain the exact PR locator for manual recovery. Dynamic
+  before/after matrices now exercise marker, lifecycle, base/head names,
+  same-repository shape, and owner for create recovery, edit, and close. The
+  focused suite remains 16 tests and passes with actionlint, Ruff lint/format,
+  and `git diff --check`.
 - `python3 -B -m unittest tests.test_sync_toolbox_automation
   tests.test_source_lock`: 119 tests passed in 956.398 seconds after the
   fresh-review fixes. The added matrix covers unsupported/old/malformed Git

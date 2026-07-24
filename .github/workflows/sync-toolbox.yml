@@ -783,8 +783,40 @@ jobs:
             echo "::error title=Sync branch advanced::The generated branch changed after publication; refusing to close the sync PR."
             exit 1
           fi
-          gh pr close "${EXISTING_PR}" \
-            --repo "${TARGET_REPOSITORY}"
+          if ! gh pr close "${EXISTING_PR}" \
+            --repo "${TARGET_REPOSITORY}"; then
+            echo "::error title=Sync PR recovery required::Failed to close ${TARGET_REPOSITORY}#${EXISTING_PR}; preserve the exact locator for manual recovery."
+            exit 1
+          fi
+          if ! closed_pull_request="$(
+            gh pr view "${EXISTING_PR}" \
+              --repo "${TARGET_REPOSITORY}" \
+              --json number,body,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepositoryOwner,isCrossRepository
+          )"; then
+            echo "::error title=Sync PR recovery required::Could not verify closure of ${TARGET_REPOSITORY}#${EXISTING_PR}; preserve the exact locator for manual recovery."
+            exit 1
+          fi
+          if ! jq -e \
+            --arg number "${EXISTING_PR}" \
+            --arg base "${TARGET_BASE}" \
+            --arg base_oid "${PREPARED_TARGET_BASE_SHA}" \
+            --arg head "${SYNC_BRANCH}" \
+            --arg head_oid "${DESIRED_HEAD_SHA}" \
+            --arg owner "${TARGET_OWNER}" \
+            '
+              (.number | tostring) == $number and
+              .state == "CLOSED" and
+              .baseRefName == $base and
+              .baseRefOid == $base_oid and
+              .headRefName == $head and
+              .headRefOid == $head_oid and
+              .isCrossRepository == false and
+              .headRepositoryOwner.login == $owner and
+              (.body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
+            ' <<<"${closed_pull_request}" >/dev/null; then
+            echo "::error title=Sync PR recovery required::Closure of ${TARGET_REPOSITORY}#${EXISTING_PR} is unverified; preserve the exact locator for manual recovery."
+            exit 1
+          fi
 
       - name: Report no toolbox changes
         if: steps.commit.outputs.pr_has_changes != 'true'
