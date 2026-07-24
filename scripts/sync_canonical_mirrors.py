@@ -61,6 +61,7 @@ MAX_GIT_VERSION_STDOUT_BYTES = 1024
 MAX_GIT_VERSION_STDERR_BYTES = 4096
 MAX_GIT_SNAPSHOT_ENTRIES = 100_000
 MAX_GIT_SNAPSHOT_BYTES = 512 * 1024 * 1024
+MAX_CONSUMER_TRACKED_ENTRIES = 100_000
 MAX_ROOT_ANCESTOR_DEPTH = 256
 MAX_TOOL_ROOT_ENTRIES = 256
 MAX_STALE_SNAPSHOTS_PER_OPERATION = 8
@@ -6468,23 +6469,222 @@ def _require_target_head_index_parity(
             )
 
 
+def _parse_consumer_tracked_entries(
+    target_root: BoundRoot,
+    payload: bytes,
+    *,
+    source: str,
+) -> dict[bytes, tuple[bytes, bytes]]:
+    if payload and not payload.endswith(b"\0"):
+        raise MirrorSyncError(
+            f"consumer {source} tracked-path inventory is not NUL terminated"
+        )
+    records = payload.split(b"\0")
+    if records and records[-1] == b"":
+        records.pop()
+    if len(records) > MAX_CONSUMER_TRACKED_ENTRIES:
+        raise MirrorSyncError(
+            f"consumer {source} tracked-path inventory exceeds the "
+            f"{MAX_CONSUMER_TRACKED_ENTRIES}-entry limit"
+        )
+    entries: dict[bytes, tuple[bytes, bytes]] = {}
+    for record in records:
+        _consume_operation_budget(
+            target_root.operation,
+            entry_count=1,
+            label=f"parsing consumer {source} tracked paths",
+        )
+        try:
+            metadata, raw_path = record.split(b"\t", 1)
+            if source == "index":
+                raw_mode, raw_object, raw_stage = metadata.split(b" ", 2)
+                if raw_stage != b"0":
+                    raise MirrorSyncError(
+                        "consumer index contains unmerged/non-stage-0 entries"
+                    )
+                raw_kind = b"commit" if raw_mode == b"160000" else b"blob"
+            else:
+                raw_mode, raw_kind, raw_object = metadata.split(b" ", 2)
+        except ValueError as error:
+            raise MirrorSyncError(
+                f"cannot parse consumer {source} tracked-path entry"
+            ) from error
+        if raw_mode not in {b"100644", b"100755", b"120000", b"160000"}:
+            raise MirrorSyncError(
+                f"consumer {source} tracked path has unsupported mode"
+            )
+        expected_kind = b"commit" if raw_mode == b"160000" else b"blob"
+        try:
+            object_id = raw_object.decode("ascii", errors="strict")
+        except UnicodeDecodeError as error:
+            raise MirrorSyncError(
+                f"consumer {source} tracked path has invalid object metadata"
+            ) from error
+        if raw_kind != expected_kind or GIT_SHA_RE.fullmatch(object_id) is None:
+            raise MirrorSyncError(
+                f"consumer {source} tracked path has invalid object metadata"
+            )
+        if not raw_path or raw_path in entries:
+            raise MirrorSyncError(
+                f"consumer {source} tracked-path inventory is ambiguous"
+            )
+        try:
+            decoded_path = raw_path.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise MirrorSyncError(
+                f"consumer {source} tracked path is not valid UTF-8"
+            ) from error
+        path = _validate_relative_path(
+            decoded_path,
+            f"consumer {source} tracked path",
+        )
+        if path.as_posix().encode("utf-8") != raw_path:
+            raise MirrorSyncError(
+                f"consumer {source} tracked path has ambiguous encoding"
+            )
+        if path.parts[0].casefold() == ".git":
+            raise MirrorSyncError(
+                f"consumer {source} tracked path enters the Git control plane: {path}"
+            )
+        entries[raw_path] = (raw_mode, raw_object)
+    return entries
+
+
+def _validate_consumer_portable_layout(
+    managed_paths: set[PurePosixPath],
+    tracked_paths: set[PurePosixPath],
+    tracked_symlink_paths: set[PurePosixPath],
+    mirror_name: str,
+) -> None:
+    protected_paths = {
+        *managed_paths,
+        TRANSACTION_PATH,
+        TRANSACTION_TEMP_PATH,
+        TRANSACTION_COMPLETE_PATH,
+        *(path.parent / _exchange_journal_name(path) for path in managed_paths),
+    }
+    entries = [
+        ("protected", path, _path_collision_key(path)) for path in protected_paths
+    ]
+    entries.extend(
+        ("tracked", path, _path_collision_key(path))
+        for path in tracked_paths
+        if path not in managed_paths
+    )
+    trie: dict[str, Any] = {}
+    terminal_key = object()
+
+    def reject_cross_kind(
+        kind: str,
+        path: PurePosixPath,
+        prior_kind: str,
+        prior_path: PurePosixPath,
+    ) -> None:
+        if kind == prior_kind:
+            return
+        tracked = path if kind == "tracked" else prior_path
+        protected = prior_path if kind == "tracked" else path
+        if (
+            tracked in tracked_symlink_paths
+            and tracked != protected
+            and protected.is_relative_to(tracked)
+        ):
+            raise MirrorSyncError(
+                f"directory ancestor must not be a symlink: {tracked}"
+            )
+        raise MirrorSyncError(
+            f"consumer tracked path collides with mirror {mirror_name} "
+            f"managed/recovery path under NFC+casefold portability rules: "
+            f"{tracked} and {protected}"
+        )
+
+    for kind, path, collision_key in sorted(
+        entries,
+        key=lambda item: (len(item[2]), item[2], item[0]),
+    ):
+        node = trie
+        for component in collision_key:
+            for prior_kind, prior_path in node.get(terminal_key, ()):
+                reject_cross_kind(kind, path, prior_kind, prior_path)
+            node = node.setdefault(component, {})
+        existing = node.setdefault(terminal_key, [])
+        for prior_kind, prior_path in existing:
+            reject_cross_kind(kind, path, prior_kind, prior_path)
+        existing.append((kind, path))
+
+
 def _target_index_snapshot(
     target_root: BoundRoot,
     mirror: MirrorSpec,
     additional_paths: set[PurePosixPath] | frozenset[PurePosixPath] = frozenset(),
 ) -> bytes:
-    paths = sorted(
-        {RECEIPT_PATH, *mirror.files.values(), *additional_paths},
-        key=PurePosixPath.as_posix,
-    )
-    return _run_git(
+    head_before = _current_commit(target_root)
+    raw_index = _run_git(
         target_root,
         "ls-files",
         "--full-name",
         "--stage",
         "-z",
-        "--",
-        *(_top_literal_pathspec(path) for path in paths),
+    )
+    raw_head = _run_git(
+        target_root,
+        "ls-tree",
+        "--full-tree",
+        "-r",
+        "-z",
+        head_before,
+    )
+    index_entries = _parse_consumer_tracked_entries(
+        target_root,
+        raw_index,
+        source="index",
+    )
+    head_entries = _parse_consumer_tracked_entries(
+        target_root,
+        raw_head,
+        source="HEAD",
+    )
+    if index_entries != head_entries:
+        raise MirrorSyncError("consumer complete stage-0 index differs from HEAD")
+    head_after = _current_commit(target_root)
+    if head_after != head_before:
+        raise MirrorSyncError("consumer HEAD changed during tracked-path inventory")
+    try:
+        tracked_entries = {
+            _validate_relative_path(
+                raw_path.decode("utf-8", errors="strict"),
+                "consumer tracked path",
+            ): metadata
+            for raw_path, metadata in index_entries.items()
+        }
+    except UnicodeDecodeError as error:
+        raise MirrorSyncError("consumer tracked path is not valid UTF-8") from error
+    tracked_paths = set(tracked_entries)
+    tracked_symlink_paths = {
+        path
+        for path, (mode, _object_id) in tracked_entries.items()
+        if mode == b"120000"
+    }
+    managed_paths = {
+        RECEIPT_PATH,
+        *mirror.files.values(),
+        *additional_paths,
+    }
+    _validate_consumer_portable_layout(
+        managed_paths,
+        tracked_paths,
+        tracked_symlink_paths,
+        mirror.name,
+    )
+    return b"".join(
+        (
+            b"consumer-tracked-namespace-v1\0",
+            head_before.encode("ascii"),
+            len(raw_index).to_bytes(8, "big"),
+            raw_index,
+            len(raw_head).to_bytes(8, "big"),
+            raw_head,
+        )
     )
 
 
@@ -7490,18 +7690,18 @@ def _check_mirror_bound(
     _reject_canonical_target(repository_root, target_root)
     source_lock = load_source_lock(repository_root)
     mirror = _selected_mirror(source_lock, mirror_name)
-    _configure_managed_ancestors(
-        target_root,
-        _mirror_operation_paths(mirror),
-    )
     _verify_canonical_repository(
         repository_root,
         source_lock.canonical_repository,
     )
     _verify_target_repository(target_root, mirror.repository)
+    initial_index = _target_index_snapshot(target_root, mirror)
+    _configure_managed_ancestors(
+        target_root,
+        _mirror_operation_paths(mirror),
+    )
     _reject_git_control_targets(target_root, mirror)
     _reject_pending_exchange_journals(target_root, mirror)
-    initial_index = _target_index_snapshot(target_root, mirror)
     _require_target_head_index_parity(target_root, mirror)
     _require_same_target_index(target_root, mirror, initial_index)
     try:
@@ -7638,6 +7838,11 @@ def managed_mirror_paths(
             sorted(managed_targets, key=PurePosixPath.as_posix),
             mirror.name,
         )
+        initial_index = _target_index_snapshot(
+            target,
+            mirror,
+            additional_paths,
+        )
         _configure_managed_ancestors(
             target,
             _mirror_operation_paths(mirror, additional_paths),
@@ -7648,11 +7853,6 @@ def managed_mirror_paths(
             additional_paths,
         )
         _reject_pending_exchange_journals(
-            target,
-            mirror,
-            additional_paths,
-        )
-        initial_index = _target_index_snapshot(
             target,
             mirror,
             additional_paths,
@@ -7753,6 +7953,11 @@ def _generate_mirror_bound(
         mirror.name,
     )
     retired_paths = managed_additional_paths - current_target_paths
+    initial_index = _target_index_snapshot(
+        target_root,
+        mirror,
+        managed_additional_paths,
+    )
     _configure_managed_ancestors(
         target_root,
         _mirror_operation_paths(mirror, managed_additional_paths),
@@ -7810,9 +8015,10 @@ def _generate_mirror_bound(
         for source_name, target_path in mirror.files.items()
     }
     desired_files.update({path: None for path in retired_paths})
-    initial_index = _target_index_snapshot(
+    _require_same_target_index(
         target_root,
         mirror,
+        initial_index,
         managed_additional_paths,
     )
     if pending_transaction is None:

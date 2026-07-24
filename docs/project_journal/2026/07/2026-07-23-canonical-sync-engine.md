@@ -14,7 +14,7 @@ superseded_by:
 
 ## Summary
 
-- Delivery status: `canonical_mirror_pr_terminal_evidence_gate_complete`.
+- Delivery status: `delivery_gate_complete`.
 - The workstream is consolidating personal sync ownership in `Joey-Tools/codex-personal-sync` and hardening mirror generation, scheduler observability, active-skill auditing, reconciliation, and release retention.
 - Signed commit `39050ba7629ae0ee896f1df5e9e9c9dd75421825` is the fixed
   parent of the current recovery-hardening candidate. The candidate is fully
@@ -45,6 +45,19 @@ superseded_by:
   roots and managed ancestors, frozen live Git controls, an fd-addressed fixed
   launcher, durable private snapshot ownership/recovery, bounded operations,
   prior-commit journal recovery, and bidirectional reserved-path rejection.
+- macOS launchd installation now retains the writer-returned plist snapshot,
+  parent fd, and plist fd through legacy cleanup and every native activation
+  action. Each action is bracketed by exact path/parent/object/content/access
+  revalidation; missing, unreadable, replacement, content, and access-policy
+  failures remain distinct and suppress the success report, while mtime-only
+  churn remains benign.
+- Mirror generation now inventories the complete raw stage-0 index and
+  recursive `HEAD` tree before managed-ancestor configuration. Exact
+  path/mode/object parity, strict UTF-8 raw-path parsing, entry/byte/time caps,
+  and a consumer-wide NFC+casefold trie prevent new managed/recovery paths from
+  aliasing or enclosing non-managed tracked paths. Exact clean managed targets
+  remain valid, and the complete namespace snapshot is revalidated before
+  publication boundaries.
 - Private Git object-store bytes are copied and fully hashed during
   materialization. Per-command revalidation now binds the complete
   pack/idx/loose manifest and rejects any invalidated content-stability signal
@@ -298,6 +311,21 @@ superseded_by:
   `git diff --check` passed; no bytecode, formatter backup, or reject artifact
   remains. The refreshed source-lock SHA-256 is
   `f6037083cc2b20df71a754103f8603a9a85ce162248111ef471e40f2cd5974a7`.
+- The final-review follow-up adds 2 scheduler test methods with 30 adversarial
+  native-boundary subcases plus an mtime-only success path, and 11 source-lock
+  tests for case/NFC/NFD aliases, tracked ancestor/descendant collisions,
+  exact managed targets, unmerged stages, full index/HEAD disagreement,
+  invalid raw path bytes, capacity exhaustion, non-managed index drift, and
+  target `HEAD` drift.
+  Focused runs passed all added cases. An initial full source-lock run exposed
+  one diagnostic-order regression for an exact tracked symlink ancestor; the
+  guard continued to fail closed, but its error no longer matched the existing
+  contract. The fix restores the precise symlink-ancestor diagnostic without
+  weakening case/NFC portability rejection. The superseding final gate passed
+  595 personal-sync, reconciliation, retention, scheduler, and automation tests
+  in 390.258 seconds plus 119 source-lock tests in 1427.115 seconds, for 714
+  disjoint repository tests. The refreshed source-lock SHA-256 is
+  `4dd4ab9e9fa6751f3a83388e791937a10a8478e92a9913086a4ff4c9347463ba`.
 
 ## Installed Host Baseline
 
@@ -339,8 +367,9 @@ configuration.
 ## Next Steps
 
 - Generate and validate the declared downstream mirrors.
-- Create a signed checkpoint, then review the exact candidate range against
-  parent `39050ba7629ae0ee896f1df5e9e9c9dd75421825`.
+- Create a signed append checkpoint after the final repository gate; the fixed
+  workstream review base remains
+  `ca66cca229fdf92713d1b1d2c6477d9927670b53`.
 - Push/open the canonical PR and continue downstream mirror/PR delivery only
   when the parent workstream authorizes those remote mutations.
 - Provision `CODEX_TOOLBOX_SYNC_TOKEN` separately only if the repository owner

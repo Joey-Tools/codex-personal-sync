@@ -623,6 +623,15 @@ class SchedulerConfigAudit:
     systemd_drop_ins: tuple[SystemdDropInSnapshot, ...] = ()
 
 
+@dataclass
+class SchedulerActivationBinding:
+    home: Path
+    path: Path
+    parent_fd: int
+    file_fd: int
+    expected: ManagedStateFileSnapshot
+
+
 @dataclass(frozen=True)
 class SchedulerReport:
     platform: str
@@ -20384,6 +20393,7 @@ def _cleanup_legacy_launchd_schedulers(
     dry_run: bool,
     disable: bool,
     remove: bool,
+    activation_binding: SchedulerActivationBinding | None = None,
 ) -> None:
     if paths.launchd_plist is None:
         return
@@ -20393,15 +20403,17 @@ def _cleanup_legacy_launchd_schedulers(
     for label in LEGACY_LAUNCHD_LABELS:
         legacy_plist = _legacy_launchd_plist(paths, label)
         if disable:
-            _run_native_command(
+            _run_native_scheduler_action(
                 ["launchctl", "bootout", domain, str(legacy_plist)],
                 dry_run=dry_run,
                 allow_fail=True,
+                activation_binding=activation_binding,
             )
-            _run_native_command(
+            _run_native_scheduler_action(
                 ["launchctl", "disable", f"{domain}/{label}"],
                 dry_run=dry_run,
                 allow_fail=True,
+                activation_binding=activation_binding,
             )
         _unlink_file(legacy_plist, dry_run=dry_run)
 
@@ -20604,6 +20616,278 @@ def _run_native_command(args: list[str], *, dry_run: bool, allow_fail: bool = Fa
             print(f"ignored failed command {' '.join(args)}: {message}")
             return
         raise SyncError(message or f"command failed: {' '.join(args)}")
+
+
+def _launchd_activation_failure(
+    binding: SchedulerActivationBinding,
+    boundary: str,
+    failure: str,
+) -> SyncError:
+    return SyncError(f"launchd scheduler config {failure} {boundary}: {binding.path}")
+
+
+def _revalidate_launchd_activation_binding(
+    binding: SchedulerActivationBinding,
+    *,
+    boundary: str,
+) -> None:
+    expected = binding.expected
+    if (
+        not _managed_state_snapshot_has_complete_file_evidence(expected)
+        or expected.parent_identity is None
+        or expected.file_type != stat.S_IFREG
+        or expected.payload is None
+        or expected.size is None
+        or expected.mode is None
+        or expected.uid is None
+        or expected.gid is None
+        or expected.file_identity is None
+    ):
+        raise _launchd_activation_failure(
+            binding,
+            boundary,
+            "has incomplete activation evidence",
+        )
+    try:
+        parent_identity = _directory_identity(binding.parent_fd)
+    except (OSError, SyncError) as error:
+        raise _launchd_activation_failure(
+            binding,
+            boundary,
+            "parent descriptor became unreadable",
+        ) from error
+    if parent_identity != expected.parent_identity or not _bound_directory_matches(
+        binding.home,
+        binding.path.parent,
+        binding.parent_fd,
+    ):
+        raise _launchd_activation_failure(
+            binding,
+            boundary,
+            "parent chain changed",
+        )
+    try:
+        named_before = os.stat(
+            binding.path.name,
+            dir_fd=binding.parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as error:
+        raise _launchd_activation_failure(
+            binding,
+            boundary,
+            "is missing",
+        ) from error
+    except OSError as error:
+        raise _launchd_activation_failure(
+            binding,
+            boundary,
+            "is unreadable",
+        ) from error
+
+    expected_identity = expected.file_identity
+    expected_access = (
+        expected.file_type,
+        expected.mode,
+        expected.uid,
+        expected.gid,
+    )
+
+    def validate_metadata(metadata: os.stat_result) -> None:
+        if (metadata.st_dev, metadata.st_ino) != expected_identity:
+            raise _launchd_activation_failure(
+                binding,
+                boundary,
+                "object identity changed",
+            )
+        if (
+            stat.S_IFMT(metadata.st_mode),
+            stat.S_IMODE(metadata.st_mode),
+            metadata.st_uid,
+            metadata.st_gid,
+        ) != expected_access:
+            raise _launchd_activation_failure(
+                binding,
+                boundary,
+                "access policy changed",
+            )
+        if metadata.st_size != expected.size:
+            raise _launchd_activation_failure(
+                binding,
+                boundary,
+                "content changed",
+            )
+
+    validate_metadata(named_before)
+    try:
+        opened_metadata = os.fstat(binding.file_fd)
+    except OSError as error:
+        raise _launchd_activation_failure(
+            binding,
+            boundary,
+            "is unreadable",
+        ) from error
+    validate_metadata(opened_metadata)
+    try:
+        os.lseek(binding.file_fd, 0, os.SEEK_SET)
+        payload = _read_managed_state_bytes(
+            binding.file_fd,
+            binding.path,
+            max(expected.size, 1),
+        )
+        os.lseek(binding.file_fd, 0, os.SEEK_SET)
+        confirmed_payload = _read_managed_state_bytes(
+            binding.file_fd,
+            binding.path,
+            max(expected.size, 1),
+        )
+    except SyncError as error:
+        raise _launchd_activation_failure(
+            binding,
+            boundary,
+            "is unreadable",
+        ) from error
+    except OSError as error:
+        raise _launchd_activation_failure(
+            binding,
+            boundary,
+            "is unreadable",
+        ) from error
+    if payload != expected.payload or confirmed_payload != expected.payload:
+        raise _launchd_activation_failure(
+            binding,
+            boundary,
+            "content changed",
+        )
+    try:
+        validate_metadata(os.fstat(binding.file_fd))
+        named_after = os.stat(
+            binding.path.name,
+            dir_fd=binding.parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as error:
+        raise _launchd_activation_failure(
+            binding,
+            boundary,
+            "is missing",
+        ) from error
+    except OSError as error:
+        raise _launchd_activation_failure(
+            binding,
+            boundary,
+            "is unreadable",
+        ) from error
+    validate_metadata(named_after)
+    try:
+        final_parent_identity = _directory_identity(binding.parent_fd)
+    except (OSError, SyncError) as error:
+        raise _launchd_activation_failure(
+            binding,
+            boundary,
+            "parent descriptor became unreadable",
+        ) from error
+    if (
+        final_parent_identity != expected.parent_identity
+        or not _bound_directory_matches(
+            binding.home,
+            binding.path.parent,
+            binding.parent_fd,
+        )
+    ):
+        raise _launchd_activation_failure(
+            binding,
+            boundary,
+            "parent chain changed",
+        )
+
+
+@contextlib.contextmanager
+def _retain_launchd_activation_binding(
+    path: Path,
+    expected: ManagedStateFileSnapshot,
+) -> Iterator[SchedulerActivationBinding]:
+    user_home = Path.home().expanduser()
+    try:
+        path.relative_to(user_home)
+    except ValueError as error:
+        raise SyncError(
+            f"launchd scheduler config must remain beneath the user home: {path}"
+        ) from error
+    parent_fd = -1
+    file_fd = -1
+    try:
+        try:
+            parent_fd = _open_directory_beneath(user_home, path.parent)
+        except FileNotFoundError as error:
+            raise SyncError(
+                f"launchd scheduler config parent chain is missing: {path.parent}"
+            ) from error
+        except (OSError, SyncError) as error:
+            raise SyncError(
+                f"launchd scheduler config parent chain is unreadable: {path.parent}"
+            ) from error
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        try:
+            file_fd = os.open(path.name, flags, dir_fd=parent_fd)
+        except FileNotFoundError as error:
+            raise SyncError(
+                f"launchd scheduler config is missing before activation: {path}"
+            ) from error
+        except OSError as error:
+            raise SyncError(
+                f"launchd scheduler config is unreadable before activation: {path}"
+            ) from error
+        binding = SchedulerActivationBinding(
+            home=user_home,
+            path=path,
+            parent_fd=parent_fd,
+            file_fd=file_fd,
+            expected=expected,
+        )
+        _revalidate_launchd_activation_binding(
+            binding,
+            boundary="before activation",
+        )
+        yield binding
+        _revalidate_launchd_activation_binding(
+            binding,
+            boundary="after activation",
+        )
+    finally:
+        if file_fd >= 0:
+            _close_fd_quietly(file_fd)
+        if parent_fd >= 0:
+            _close_fd_quietly(parent_fd)
+
+
+def _run_native_scheduler_action(
+    args: list[str],
+    *,
+    dry_run: bool,
+    allow_fail: bool = False,
+    activation_binding: SchedulerActivationBinding | None = None,
+) -> None:
+    action = " ".join(args[:3])
+    if activation_binding is not None:
+        _revalidate_launchd_activation_binding(
+            activation_binding,
+            boundary=f"before native action {action}",
+        )
+    try:
+        _run_native_command(
+            args,
+            dry_run=dry_run,
+            allow_fail=allow_fail,
+        )
+    finally:
+        if activation_binding is not None:
+            _revalidate_launchd_activation_binding(
+                activation_binding,
+                boundary=f"after native action {action}",
+            )
 
 
 def _scheduler_daemon_enabled(paths: SchedulerPaths) -> bool | None:
@@ -22154,6 +22438,7 @@ def _install_scheduler_transaction(
         )
     if selected_platform == "macos":
         assert paths.launchd_plist is not None
+        published_launchd_snapshot: ManagedStateFileSnapshot | None
         if not dry_run:
             _ensure_safe_internal_directory(
                 home,
@@ -22161,7 +22446,7 @@ def _install_scheduler_transaction(
                 create=True,
             )
         if not config_matches:
-            _write_plist(
+            published_launchd_snapshot = _write_plist(
                 paths.launchd_plist,
                 _launchd_plist(
                     home,
@@ -22177,27 +22462,46 @@ def _install_scheduler_transaction(
             )
         else:
             _revalidate_scheduler_config_audit(paths, config_audit)
-        _cleanup_legacy_launchd_schedulers(
-            paths,
-            dry_run=dry_run,
-            disable=enable,
-            remove=enable,
-        )
-        if enable:
-            domain = f"gui/{os.getuid()}"
-            _run_native_command(
-                ["launchctl", "bootout", domain, str(paths.launchd_plist)],
+            published_launchd_snapshot = None if dry_run else config_audit.snapshots[0]
+
+        def activate(
+            binding: SchedulerActivationBinding | None,
+        ) -> None:
+            _cleanup_legacy_launchd_schedulers(
+                paths,
                 dry_run=dry_run,
-                allow_fail=True,
+                disable=enable,
+                remove=enable,
+                activation_binding=binding,
             )
-            _run_native_command(
-                ["launchctl", "bootstrap", domain, str(paths.launchd_plist)],
-                dry_run=dry_run,
-            )
-            _run_native_command(
-                ["launchctl", "enable", f"{domain}/{LAUNCHD_LABEL}"],
-                dry_run=dry_run,
-            )
+            if enable:
+                domain = f"gui/{os.getuid()}"
+                _run_native_scheduler_action(
+                    ["launchctl", "bootout", domain, str(paths.launchd_plist)],
+                    dry_run=dry_run,
+                    allow_fail=True,
+                    activation_binding=binding,
+                )
+                _run_native_scheduler_action(
+                    ["launchctl", "bootstrap", domain, str(paths.launchd_plist)],
+                    dry_run=dry_run,
+                    activation_binding=binding,
+                )
+                _run_native_scheduler_action(
+                    ["launchctl", "enable", f"{domain}/{LAUNCHD_LABEL}"],
+                    dry_run=dry_run,
+                    activation_binding=binding,
+                )
+
+        if dry_run:
+            activate(None)
+        else:
+            assert published_launchd_snapshot is not None
+            with _retain_launchd_activation_binding(
+                paths.launchd_plist,
+                published_launchd_snapshot,
+            ) as activation_binding:
+                activate(activation_binding)
         print(f"installed macOS launchd scheduler: {paths.launchd_plist}")
         return
 

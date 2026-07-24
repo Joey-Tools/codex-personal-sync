@@ -2510,6 +2510,186 @@ class SchedulerDoctorTests(unittest.TestCase):
 
         self.assertEqual(paths.launchd_plist.read_bytes(), replacement)
 
+    def test_macos_install_revalidates_bound_plist_at_every_native_boundary(
+        self,
+    ) -> None:
+        action_names = (
+            "legacy-bootout",
+            "legacy-disable",
+            "current-bootout",
+            "bootstrap",
+            "enable",
+        )
+        mutations = (
+            ("replacement", "object identity changed"),
+            ("content", "content changed"),
+            ("mode", "access policy changed"),
+            ("parent", "parent chain changed"),
+            ("missing", "is missing"),
+            ("unreadable", "is unreadable"),
+        )
+        for action_index, action_name in enumerate(action_names):
+            for mutation, expected_error in mutations:
+                with self.subTest(action=action_name, mutation=mutation):
+                    case_user_home = self.root / f"{action_index}-{mutation}" / "home"
+                    case_home = case_user_home / ".codex"
+                    runner = case_home / "bin" / "codex-personal-sync"
+                    runner.parent.mkdir(parents=True)
+                    runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                    runner.chmod(0o755)
+                    paths = MODULE.SchedulerPaths(
+                        platform="macos",
+                        launchd_plist=(
+                            case_user_home
+                            / "Library"
+                            / "LaunchAgents"
+                            / f"{MODULE.LAUNCHD_LABEL}.plist"
+                        ),
+                    )
+                    assert paths.launchd_plist is not None
+                    native_calls = 0
+                    force_unreadable = False
+                    real_read = MODULE._read_managed_state_bytes
+
+                    def mutate_during_native(
+                        _args: list[str],
+                        *,
+                        dry_run: bool,
+                        allow_fail: bool = False,
+                    ) -> None:
+                        del dry_run, allow_fail
+                        nonlocal force_unreadable, native_calls
+                        current_call = native_calls
+                        native_calls += 1
+                        if current_call != action_index:
+                            return
+                        plist = paths.launchd_plist
+                        if mutation == "replacement":
+                            replacement = plist.with_name(plist.name + ".replacement")
+                            replacement.write_bytes(plist.read_bytes())
+                            replacement.chmod(0o600)
+                            os.replace(replacement, plist)
+                        elif mutation == "content":
+                            payload = bytearray(plist.read_bytes())
+                            payload[len(payload) // 2] ^= 1
+                            plist.write_bytes(payload)
+                            plist.chmod(0o600)
+                        elif mutation == "mode":
+                            plist.chmod(0o644)
+                        elif mutation == "parent":
+                            old_parent = plist.parent.with_name(
+                                plist.parent.name + ".replaced"
+                            )
+                            plist.parent.rename(old_parent)
+                            plist.parent.mkdir()
+                            replacement = plist.parent / plist.name
+                            replacement.write_bytes(
+                                (old_parent / plist.name).read_bytes()
+                            )
+                            replacement.chmod(0o600)
+                        elif mutation == "missing":
+                            plist.unlink()
+                        else:
+                            force_unreadable = True
+
+                    def fail_bound_read(
+                        file_fd: int,
+                        path: Path,
+                        maximum_bytes: int = MODULE.MAX_MANAGED_STATE_BYTES,
+                    ) -> bytes:
+                        if force_unreadable and path == paths.launchd_plist:
+                            raise MODULE.SyncError("injected read failure")
+                        return real_read(file_fd, path, maximum_bytes)
+
+                    output = io.StringIO()
+                    with (
+                        mock.patch.object(
+                            MODULE.Path,
+                            "home",
+                            return_value=case_user_home,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_run_native_command",
+                            side_effect=mutate_during_native,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_read_managed_state_bytes",
+                            side_effect=fail_bound_read,
+                        ),
+                        contextlib.redirect_stdout(output),
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            expected_error,
+                        ),
+                    ):
+                        MODULE.install_scheduler(
+                            case_home,
+                            "owner/public-sync",
+                            17,
+                            "macos",
+                            None,
+                            dry_run=False,
+                            enable=True,
+                        )
+
+                    self.assertEqual(native_calls, action_index + 1)
+                    self.assertNotIn(
+                        "installed macOS launchd scheduler",
+                        output.getvalue(),
+                    )
+
+    def test_macos_install_allows_mtime_only_churn_at_native_boundaries(
+        self,
+    ) -> None:
+        self.write_runner()
+        paths = MODULE._scheduler_paths("macos", self.home)
+        assert paths.launchd_plist is not None
+        native_calls = 0
+
+        def touch_during_native(
+            _args: list[str],
+            *,
+            dry_run: bool,
+            allow_fail: bool = False,
+        ) -> None:
+            del dry_run, allow_fail
+            nonlocal native_calls
+            native_calls += 1
+            metadata = paths.launchd_plist.stat()
+            os.utime(
+                paths.launchd_plist,
+                ns=(
+                    metadata.st_atime_ns,
+                    metadata.st_mtime_ns + 1_000_000,
+                ),
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_run_native_command",
+                side_effect=touch_during_native,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            MODULE.install_scheduler(
+                self.home,
+                "owner/public-sync",
+                17,
+                "macos",
+                None,
+                dry_run=False,
+                enable=True,
+            )
+
+        self.assertEqual(
+            native_calls,
+            len(MODULE.LEGACY_LAUNCHD_LABELS) * 2 + 3,
+        )
+        self.assertIsNotNone(MODULE._load_macos_scheduler_config(paths))
+
     def test_linux_install_binds_semantically_audited_pair(self) -> None:
         self.write_runner()
         self.install_scheduler_quietly("owner/old", 17, "linux")

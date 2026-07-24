@@ -3318,6 +3318,275 @@ class MirrorGeneratorTests(unittest.TestCase):
             MIRROR_MODULE.PurePosixPath("state/generated-sync-source-lock.json.backup"),
         )
 
+    def test_generate_rejects_casefold_alias_of_consumer_tracked_path(
+        self,
+    ) -> None:
+        existing = self.target_root / "Scripts" / "Engine.py"
+        existing.parent.mkdir()
+        existing.write_bytes(b"consumer-owned case alias\n")
+        self._commit(self.target_root, "add consumer case alias")
+
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "tracked path collides.*NFC\\+casefold",
+        ):
+            self._generate()
+
+        self.assertEqual(existing.read_bytes(), b"consumer-owned case alias\n")
+
+    def test_generate_rejects_nfd_alias_of_consumer_tracked_path(
+        self,
+    ) -> None:
+        lock_path = self.canonical_root / MIRROR_MODULE.LOCK_PATH.as_posix()
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        lock["mirrors"]["toolbox"]["files"]["engine"] = "docs/Caf\u00e9.py"
+        lock_path.write_text(
+            json.dumps(lock, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        self.source_commit = self._commit(
+            self.canonical_root,
+            "use NFC generated target",
+        )
+        existing = self.target_root / "docs" / "Cafe\u0301.py"
+        existing.parent.mkdir()
+        existing.write_bytes(b"consumer-owned NFD alias\n")
+        object_id = self._git_with_input(
+            self.target_root,
+            existing.read_bytes(),
+            "hash-object",
+            "-w",
+            "--stdin",
+        ).strip()
+        self._git_with_input(
+            self.target_root,
+            b"100644 " + object_id + b" 0\tdocs/Cafe\xcc\x81.py\0",
+            "update-index",
+            "-z",
+            "--index-info",
+        )
+        self._git(
+            self.target_root,
+            "commit",
+            "--no-gpg-sign",
+            "-q",
+            "-m",
+            "add consumer NFD alias",
+        )
+
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "tracked path collides.*NFC\\+casefold",
+        ):
+            self._generate()
+
+        self.assertEqual(existing.read_bytes(), b"consumer-owned NFD alias\n")
+
+    def test_generate_rejects_tracked_ancestor_of_new_target(self) -> None:
+        existing = self.target_root / "scripts"
+        existing.write_bytes(b"consumer-owned ancestor\n")
+        self._commit(self.target_root, "add consumer ancestor")
+
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "tracked path collides.*managed/recovery",
+        ):
+            self._generate()
+
+        self.assertEqual(existing.read_bytes(), b"consumer-owned ancestor\n")
+
+    def test_generate_rejects_tracked_descendant_of_new_target(self) -> None:
+        existing = self.target_root / "scripts" / "engine.py" / "child.txt"
+        existing.parent.mkdir(parents=True)
+        existing.write_bytes(b"consumer-owned descendant\n")
+        self._commit(self.target_root, "add consumer descendant")
+
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "tracked path collides.*managed/recovery",
+        ):
+            self._generate()
+
+        self.assertEqual(existing.read_bytes(), b"consumer-owned descendant\n")
+
+    def test_generate_allows_the_exact_existing_managed_target(self) -> None:
+        target = self.target_root / "scripts" / "engine.py"
+        target.parent.mkdir()
+        target.write_bytes(b"tracked prior managed content\n")
+        sibling = target.with_name("consumer-helper.py")
+        sibling.write_bytes(b"tracked consumer sibling\n")
+        self._commit(self.target_root, "track exact managed target")
+
+        self.assertEqual(self._generate(), 1)
+        self.assertEqual(target.read_bytes(), self.source_path.read_bytes())
+        self.assertEqual(sibling.read_bytes(), b"tracked consumer sibling\n")
+
+    def test_generate_rejects_unmerged_consumer_index_entries(self) -> None:
+        object_id = self._git_with_input(
+            self.target_root,
+            b"conflict fixture\n",
+            "hash-object",
+            "-w",
+            "--stdin",
+        ).strip()
+        conflict_records = b"".join(
+            b"100644 "
+            + object_id
+            + b" "
+            + str(stage).encode("ascii")
+            + b"\tconflict.txt\0"
+            for stage in (1, 2, 3)
+        )
+        self._git_with_input(
+            self.target_root,
+            conflict_records,
+            "update-index",
+            "-z",
+            "--index-info",
+        )
+
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "unmerged/non-stage-0",
+        ):
+            self._generate()
+
+    def test_generate_rejects_complete_index_head_disagreement(self) -> None:
+        readme = self.target_root / "README.md"
+        readme.write_text("# Staged consumer change\n", encoding="utf-8")
+        self._git(self.target_root, "add", "--", "README.md")
+
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "complete stage-0 index differs from HEAD",
+        ):
+            self._generate()
+
+    def test_generate_rejects_invalid_raw_consumer_path_bytes(self) -> None:
+        object_id = self._git_with_input(
+            self.target_root,
+            b"invalid path fixture\n",
+            "hash-object",
+            "-w",
+            "--stdin",
+        ).strip()
+        self._git_with_input(
+            self.target_root,
+            b"100644 " + object_id + b" 0\tinvalid-\xff.txt\0",
+            "update-index",
+            "-z",
+            "--index-info",
+        )
+
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "tracked path is not valid UTF-8",
+        ):
+            self._generate()
+
+    def test_generate_rejects_consumer_tracked_path_cap_exhaustion(self) -> None:
+        (self.target_root / "SECOND.md").write_text(
+            "Second tracked path.\n",
+            encoding="utf-8",
+        )
+        self._commit(self.target_root, "add second consumer path")
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "MAX_CONSUMER_TRACKED_ENTRIES",
+                1,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "tracked-path inventory exceeds the 1-entry limit",
+            ),
+        ):
+            self._generate()
+
+    def test_generate_rejects_nonmanaged_index_drift_before_write(self) -> None:
+        real_require_index = MIRROR_MODULE._require_same_target_index
+        checks = 0
+
+        def inject_index_drift(
+            target_root,
+            mirror,
+            expected,
+            additional_paths=frozenset(),
+        ):
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                readme = self.target_root / "README.md"
+                readme.write_text("# Racing staged change\n", encoding="utf-8")
+                self._git(self.target_root, "add", "--", "README.md")
+            return real_require_index(
+                target_root,
+                mirror,
+                expected,
+                additional_paths,
+            )
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_require_same_target_index",
+                side_effect=inject_index_drift,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "complete stage-0 index differs from HEAD|"
+                "Git index control file was replaced",
+            ),
+        ):
+            self._generate()
+
+        self.assertFalse((self.target_root / "scripts" / "engine.py").exists())
+
+    def test_generate_rejects_consumer_head_drift_before_write(self) -> None:
+        real_require_index = MIRROR_MODULE._require_same_target_index
+        checks = 0
+
+        def inject_head_drift(
+            target_root,
+            mirror,
+            expected,
+            additional_paths=frozenset(),
+        ):
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                self._git(
+                    self.target_root,
+                    "commit",
+                    "--allow-empty",
+                    "--no-gpg-sign",
+                    "-q",
+                    "-m",
+                    "racing target head",
+                )
+            return real_require_index(
+                target_root,
+                mirror,
+                expected,
+                additional_paths,
+            )
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_require_same_target_index",
+                side_effect=inject_head_drift,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "HEAD|Git .*control|tracked namespace|stage-0 index changed",
+            ),
+        ):
+            self._generate()
+
+        self.assertFalse((self.target_root / "scripts" / "engine.py").exists())
+
     def test_check_rejects_missing_and_tampered_receipts(self) -> None:
         self._generate()
         receipt_path = self.target_root / MIRROR_MODULE.RECEIPT_PATH.as_posix()
