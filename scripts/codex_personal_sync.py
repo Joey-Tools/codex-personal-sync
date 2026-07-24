@@ -186,6 +186,11 @@ SCHEDULER_PAIR_TRANSACTION_NAME = (
     ".codex-personal-sync-scheduler-transaction.json"
 )
 MAX_SCHEDULER_PAIR_TRANSACTION_BYTES = 4 * 1024 * 1024
+SCHEDULER_UNINSTALL_TRANSACTION_NAME = (
+    ".codex-personal-sync-scheduler-uninstall-incomplete.json"
+)
+MAX_SCHEDULER_UNINSTALL_TRANSACTION_BYTES = 64 * 1024
+NATIVE_FAILURE_ALREADY_ABSENT = "already-absent"
 RELEASE_PINS_RELATIVE_PATH = Path("pins")
 RELEASE_RETENTION_RECORD_NAME = "release-retention.json"
 RELEASE_RETENTION_POINTER_NAME = ".personal-sync-pending-release-retention.json"
@@ -634,6 +639,22 @@ class SchedulerActivationBinding:
     failure_code: str | None = None
     removed: bool = False
 
+
+@dataclass
+class SystemdPairRecoveryMember:
+    path: Path
+    expected: ManagedStateFileSnapshot
+    file_fd: int = -1
+
+@dataclass
+class SystemdPairRecoveryGroup:
+    home: Path
+    parent_path: Path
+    parent_fd: int
+    parent_identity: tuple[int, int]
+    marker: SystemdPairRecoveryMember
+    service: SystemdPairRecoveryMember
+    timer: SystemdPairRecoveryMember
 
 @dataclass(frozen=True)
 class SchedulerDaemonQuery:
@@ -20593,6 +20614,7 @@ def _cleanup_legacy_launchd_schedulers(
     dry_run: bool,
     disable: bool,
     remove: bool,
+    native_failure_policy: bool | str = True,
     activation_bindings: tuple[SchedulerActivationBinding, ...] = (),
     retained_legacy_bindings: tuple[SchedulerActivationBinding, ...] | None = None,
 ) -> None:
@@ -20628,13 +20650,13 @@ def _cleanup_legacy_launchd_schedulers(
             _run_native_scheduler_action(
                 ["launchctl", "bootout", domain, str(legacy_plist)],
                 dry_run=dry_run,
-                allow_fail=True,
+                allow_fail=native_failure_policy,
                 activation_bindings=live_bindings(complete_bindings),
             )
             _run_native_scheduler_action(
                 ["launchctl", "disable", f"{domain}/{label}"],
                 dry_run=dry_run,
-                allow_fail=True,
+                allow_fail=native_failure_policy,
                 activation_bindings=live_bindings(complete_bindings),
             )
         if dry_run:
@@ -20864,7 +20886,75 @@ def _scheduler_native_environment() -> dict[str, str]:
     return environment
 
 
-def _run_native_command(args: list[str], *, dry_run: bool, allow_fail: bool = False) -> None:
+def _native_scheduler_failure_is_already_absent(
+    args: list[str],
+    completed: subprocess.CompletedProcess[str],
+) -> bool:
+    if len(completed.stdout) > 64 * 1024 or len(completed.stderr) > 64 * 1024:
+        return False
+    evidence = re.sub(
+        r"\s+",
+        " ",
+        (completed.stdout + "\n" + completed.stderr).strip().casefold(),
+    )
+    if not evidence:
+        return False
+    terminal_punctuation = r"[.;]?"
+    if (
+        len(args) >= 2
+        and args[0] == "launchctl"
+        and args[1]
+        in {
+            "bootout",
+            "disable",
+        }
+    ):
+        return (
+            re.fullmatch(
+                (
+                    r"(?:could not find specified service|"
+                    r"could not find service in domain|"
+                    r"service not found in domain)"
+                    + terminal_punctuation
+                ),
+                evidence,
+            )
+            is not None
+            or re.fullmatch(
+                (
+                    r"(?:boot-out|bootout) failed: 3: no such process"
+                    + terminal_punctuation
+                ),
+                evidence,
+            )
+            is not None
+        )
+    if (
+        len(args) == 5
+        and args[:4] == ["systemctl", "--user", "disable", "--now"]
+        and args[4] == f"{SYSTEMD_UNIT}.timer"
+    ):
+        unit = re.escape(args[4].casefold())
+        return (
+            re.fullmatch(
+                (
+                    rf"(?:failed to disable unit: )?unit {unit} "
+                    rf"(?:not loaded|could not be found){terminal_punctuation}"
+                ),
+                evidence,
+            )
+            is not None
+        )
+    return False
+
+def _run_native_command(
+    args: list[str],
+    *,
+    dry_run: bool,
+    allow_fail: bool | str = False,
+) -> None:
+    if not isinstance(allow_fail, bool) and allow_fail != NATIVE_FAILURE_ALREADY_ABSENT:
+        raise SyncError("unsupported native scheduler failure policy")
     if dry_run:
         print("would run: " + " ".join(args))
         return
@@ -20879,13 +20969,21 @@ def _run_native_command(args: list[str], *, dry_run: bool, allow_fail: bool = Fa
             env=_scheduler_native_environment(),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        if allow_fail:
+        if allow_fail is True:
             print(f"ignored failed command {' '.join(args)}: {error}")
             return
         raise SyncError(f"failed to run {' '.join(args)}: {error}") from error
     if completed.returncode != 0:
         message = completed.stderr.strip() or completed.stdout.strip()
-        if allow_fail:
+        if (
+            allow_fail == NATIVE_FAILURE_ALREADY_ABSENT
+            and _native_scheduler_failure_is_already_absent(args, completed)
+        ):
+            print(
+                f"ignored already-absent scheduler command {' '.join(args)}: {message}"
+            )
+            return
+        if allow_fail is True:
             print(f"ignored failed command {' '.join(args)}: {message}")
             return
         raise SyncError(message or f"command failed: {' '.join(args)}")
@@ -21155,6 +21253,7 @@ def _retain_launchd_activation_binding(
     *,
     description: str = "launchd scheduler config",
     failure_code: str | None = None,
+    revalidate_on_exit: bool = True,
 ) -> Iterator[SchedulerActivationBinding]:
     user_home = Path.home().expanduser()
     try:
@@ -21209,10 +21308,11 @@ def _retain_launchd_activation_binding(
             boundary="before activation",
         )
         yield binding
-        _revalidate_launchd_activation_binding(
-            binding,
-            boundary="after activation",
-        )
+        if revalidate_on_exit:
+            _revalidate_launchd_activation_binding(
+                binding,
+                boundary="after activation",
+            )
     finally:
         if file_fd >= 0:
             _close_fd_quietly(file_fd)
@@ -21278,7 +21378,7 @@ def _run_native_scheduler_action(
     args: list[str],
     *,
     dry_run: bool,
-    allow_fail: bool = False,
+    allow_fail: bool | str = False,
     activation_binding: SchedulerActivationBinding | None = None,
     activation_bindings: tuple[SchedulerActivationBinding, ...] = (),
 ) -> None:
@@ -21315,72 +21415,101 @@ def _scheduler_daemon_enabled(
     config_audit: SchedulerConfigAudit | None = None,
     activation_bindings: tuple[SchedulerActivationBinding, ...] = (),
 ) -> SchedulerDaemonQuery:
-    if paths.platform == "macos":
-        args = [
-            "launchctl",
-            "print",
-            f"gui/{os.getuid()}/{LAUNCHD_LABEL}",
-        ]
-    elif paths.platform == "linux":
-        args = [
-            "systemctl",
-            "--user",
-            "is-enabled",
-            f"{SYSTEMD_UNIT}.timer",
-        ]
-    else:
-        return SchedulerDaemonQuery(
-            "unavailable",
-            "scheduler daemon query is unsupported on this platform",
-        )
-    for binding in activation_bindings:
-        _revalidate_launchd_activation_binding(
-            binding,
-            boundary="before native scheduler status",
-        )
-    if config_audit is not None:
-        _revalidate_scheduler_status_audit(paths, config_audit)
-    try:
-        try:
-            native_args = _native_scheduler_argv(args)
-            completed = subprocess.run(
-                native_args,
-                check=False,
-                text=True,
-                capture_output=True,
-                timeout=10,
-                env=_scheduler_native_environment(),
-            )
-        except subprocess.TimeoutExpired:
-            return SchedulerDaemonQuery(
-                "unavailable",
-                "scheduler daemon query timed out",
-            )
-        except SyncError:
-            return SchedulerDaemonQuery(
-                "unavailable",
-                "scheduler daemon query executable is unavailable",
-            )
-        except OSError:
-            return SchedulerDaemonQuery(
-                "unavailable",
-                "scheduler daemon query could not start",
-            )
-    finally:
+    def revalidate(boundary: str) -> None:
         for binding in activation_bindings:
             _revalidate_launchd_activation_binding(
                 binding,
-                boundary="after native scheduler status",
+                boundary=boundary,
             )
         if config_audit is not None:
             _revalidate_scheduler_status_audit(paths, config_audit)
-    if len(completed.stdout) > 64 * 1024 or len(completed.stderr) > 64 * 1024:
-        return SchedulerDaemonQuery(
-            "unavailable",
-            "scheduler daemon query output exceeded its byte limit",
+
+    def run_query(
+        args: list[str],
+        *,
+        description: str,
+    ) -> subprocess.CompletedProcess[str] | SchedulerDaemonQuery:
+        revalidate(f"before native scheduler {description}")
+        try:
+            try:
+                native_args = _native_scheduler_argv(args)
+                return subprocess.run(
+                    native_args,
+                    check=False,
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    env=_scheduler_native_environment(),
+                )
+            except subprocess.TimeoutExpired:
+                return SchedulerDaemonQuery(
+                    "unavailable",
+                    f"scheduler daemon {description} timed out",
+                )
+            except SyncError:
+                return SchedulerDaemonQuery(
+                    "unavailable",
+                    f"scheduler daemon {description} executable is unavailable",
+                )
+            except OSError:
+                return SchedulerDaemonQuery(
+                    "unavailable",
+                    f"scheduler daemon {description} could not start",
+                )
+        finally:
+            revalidate(f"after native scheduler {description}")
+
+    def output_is_bounded(
+        completed: subprocess.CompletedProcess[str],
+    ) -> bool:
+        return len(completed.stdout) <= 64 * 1024 and len(completed.stderr) <= 64 * 1024
+
+    def systemd_unavailable_reason(
+        completed: subprocess.CompletedProcess[str],
+        *,
+        description: str,
+    ) -> str:
+        evidence = (completed.stdout + "\n" + completed.stderr).strip().casefold()
+        if any(
+            marker in evidence
+            for marker in (
+                "failed to connect to bus",
+                "no medium found",
+                "system has not been booted with systemd",
+            )
+        ):
+            return "systemd user bus is unavailable"
+        if any(
+            marker in evidence
+            for marker in (
+                "operation not permitted",
+                "permission denied",
+                "access denied",
+            )
+        ):
+            return f"systemd scheduler {description} was denied"
+        return (
+            f"systemd scheduler {description} returned no recognized "
+            "daemon-state evidence"
         )
-    evidence = (completed.stdout + "\n" + completed.stderr).strip().casefold()
+
     if paths.platform == "macos":
+        completed = run_query(
+            [
+                "launchctl",
+                "print",
+                f"gui/{os.getuid()}/{LAUNCHD_LABEL}",
+            ],
+            description="query",
+        )
+        if isinstance(completed, SchedulerDaemonQuery):
+            return completed
+        if not output_is_bounded(completed):
+            return SchedulerDaemonQuery(
+                "unavailable",
+                "scheduler daemon query output exceeded its byte limit",
+            )
+        evidence = (completed.stdout + "\n" + completed.stderr).strip().casefold()
         if completed.returncode == 0:
             return SchedulerDaemonQuery("enabled")
         if "could not find service" in evidence or "service not found" in evidence:
@@ -21403,49 +21532,127 @@ def _scheduler_daemon_enabled(
             )
         return SchedulerDaemonQuery("unavailable", reason)
 
-    state = completed.stdout.strip().casefold()
-    if completed.returncode == 0 and state in {"enabled", "enabled-runtime"}:
+    if paths.platform != "linux":
+        return SchedulerDaemonQuery(
+            "unavailable",
+            "scheduler daemon query is unsupported on this platform",
+        )
+    enabled_result = run_query(
+        [
+            "systemctl",
+            "--user",
+            "is-enabled",
+            f"{SYSTEMD_UNIT}.timer",
+        ],
+        description="enablement query",
+    )
+    if isinstance(enabled_result, SchedulerDaemonQuery):
+        return enabled_result
+    active_result = run_query(
+        [
+            "systemctl",
+            "--user",
+            "is-active",
+            f"{SYSTEMD_UNIT}.timer",
+        ],
+        description="activity query",
+    )
+    if isinstance(active_result, SchedulerDaemonQuery):
+        return active_result
+    if not output_is_bounded(enabled_result) or not output_is_bounded(active_result):
+        return SchedulerDaemonQuery(
+            "unavailable",
+            "scheduler daemon query output exceeded its byte limit",
+        )
+    enabled_state = enabled_result.stdout.strip().casefold()
+    if not (
+        enabled_result.returncode == 0
+        and enabled_state in {"enabled", "enabled-runtime"}
+    ):
+        if enabled_state in {
+            "alias",
+            "disabled",
+            "disabled-runtime",
+            "generated",
+            "indirect",
+            "linked",
+            "linked-runtime",
+            "masked",
+            "masked-runtime",
+            "not-found",
+            "static",
+            "transient",
+        }:
+            return SchedulerDaemonQuery(
+                "disabled",
+                f"systemd reports scheduler unit state {enabled_state}",
+            )
+        return SchedulerDaemonQuery(
+            "unavailable",
+            systemd_unavailable_reason(
+                enabled_result,
+                description="enablement query",
+            ),
+        )
+    active_state = active_result.stdout.strip().casefold()
+    if active_result.returncode == 0 and active_state == "active":
         return SchedulerDaemonQuery("enabled")
-    if state in {
-        "alias",
-        "disabled",
-        "disabled-runtime",
-        "generated",
-        "indirect",
-        "linked",
-        "linked-runtime",
-        "masked",
-        "masked-runtime",
+    if active_state in {
+        "activating",
+        "deactivating",
+        "failed",
+        "inactive",
+        "maintenance",
         "not-found",
-        "static",
-        "transient",
+        "reloading",
+        "unknown",
     }:
         return SchedulerDaemonQuery(
             "disabled",
-            f"systemd reports scheduler unit state {state}",
+            f"systemd scheduler timer is enabled but not active (state {active_state})",
         )
-    if any(
-        marker in evidence
-        for marker in (
-            "failed to connect to bus",
-            "no medium found",
-            "system has not been booted with systemd",
-        )
-    ):
-        reason = "systemd user bus is unavailable"
-    elif any(
-        marker in evidence
-        for marker in (
-            "operation not permitted",
-            "permission denied",
-            "access denied",
-        )
-    ):
-        reason = "systemd scheduler query was denied"
-    else:
-        reason = "systemd scheduler query returned no recognized daemon-state evidence"
-    return SchedulerDaemonQuery("unavailable", reason)
+    return SchedulerDaemonQuery(
+        "unavailable",
+        systemd_unavailable_reason(
+            active_result,
+            description="activity query",
+        ),
+    )
 
+
+def _scheduler_config_snapshot_at(
+    user_home: Path,
+    path: Path,
+    parent_fd: int,
+    maximum_bytes: int = 1024 * 1024,
+) -> ManagedStateFileSnapshot:
+    try:
+        path.relative_to(user_home)
+    except ValueError as error:
+        raise SyncError(
+            f"scheduler config must remain beneath the user home: {path}"
+        ) from error
+    snapshot = _read_managed_state_file_snapshot(
+        user_home,
+        path,
+        parent_fd,
+        maximum_bytes=maximum_bytes,
+    )
+    if not snapshot.exists:
+        return snapshot
+    if (
+        not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+        or snapshot.file_type != stat.S_IFREG
+        or snapshot.uid != os.geteuid()
+        or snapshot.mode is None
+        or snapshot.mode & 0o022
+        or snapshot.payload is None
+        or len(snapshot.payload) > maximum_bytes
+    ):
+        raise SyncError(
+            f"scheduler config must be a bounded user-owned regular file: {path}"
+        )
+    return snapshot
 
 def _scheduler_config_snapshot(
     path: Path,
@@ -21463,29 +21670,14 @@ def _scheduler_config_snapshot(
     except FileNotFoundError:
         return ManagedStateFileSnapshot(exists=False)
     try:
-        snapshot = _read_managed_state_file_snapshot(
+        return _scheduler_config_snapshot_at(
             user_home,
             path,
             parent_fd,
-            maximum_bytes=maximum_bytes,
+            maximum_bytes,
         )
     finally:
         _close_fd_quietly(parent_fd)
-    if not snapshot.exists:
-        return snapshot
-    if (
-        not _managed_state_snapshot_has_complete_file_evidence(snapshot)
-        or snapshot.file_type != stat.S_IFREG
-        or snapshot.uid != os.geteuid()
-        or snapshot.mode is None
-        or snapshot.mode & 0o022
-        or snapshot.payload is None
-        or len(snapshot.payload) > maximum_bytes
-    ):
-        raise SyncError(
-            f"scheduler config must be a bounded user-owned regular file: {path}"
-        )
-    return snapshot
 
 
 def _scheduler_file_snapshots_match(
@@ -22543,6 +22735,95 @@ def _scheduler_pair_transaction_path(paths: SchedulerPaths) -> Path:
     assert paths.systemd_service is not None
     return paths.systemd_service.parent / SCHEDULER_PAIR_TRANSACTION_NAME
 
+def _scheduler_uninstall_transaction_path(paths: SchedulerPaths) -> Path:
+    return _scheduler_config_parent(paths) / SCHEDULER_UNINSTALL_TRANSACTION_NAME
+
+def _scheduler_uninstall_transaction_payload(
+    home: Path,
+    paths: SchedulerPaths,
+    *,
+    disable: bool,
+) -> bytes:
+    return _bounded_json_document(
+        {
+            "version": 1,
+            "platform": paths.platform,
+            "home": str(home.expanduser()),
+            "disable": disable,
+            "phase": "prepared",
+        },
+        max_bytes=MAX_SCHEDULER_UNINSTALL_TRANSACTION_BYTES,
+        overflow_error="scheduler uninstall transaction exceeds the size limit",
+    )
+
+def _scheduler_uninstall_transaction_state(
+    home: Path,
+    paths: SchedulerPaths,
+) -> tuple[ManagedStateFileSnapshot, bool | None]:
+    marker = _scheduler_uninstall_transaction_path(paths)
+    try:
+        snapshot = _scheduler_config_snapshot(
+            marker,
+            MAX_SCHEDULER_UNINSTALL_TRANSACTION_BYTES,
+        )
+    except SyncError as error:
+        raise SyncError(
+            f"scheduler uninstall transaction is invalid: {marker}: {error}",
+            code="scheduler-uninstall-state-invalid",
+        ) from error
+    if not snapshot.exists:
+        return snapshot, None
+    assert snapshot.payload is not None
+    try:
+        data = _decode_managed_state_json(snapshot.payload, marker)
+    except SyncError as error:
+        raise SyncError(
+            f"scheduler uninstall transaction is invalid: {marker}: {error}",
+            code="scheduler-uninstall-state-invalid",
+        ) from error
+    if set(data) != {
+        "version",
+        "platform",
+        "home",
+        "disable",
+        "phase",
+    }:
+        raise SyncError(
+            f"scheduler uninstall transaction has unsupported fields: {marker}",
+            code="scheduler-uninstall-state-invalid",
+        )
+    disable = data.get("disable")
+    if (
+        data.get("version") != 1
+        or data.get("platform") != paths.platform
+        or data.get("home") != str(home.expanduser())
+        or type(disable) is not bool
+        or data.get("phase") != "prepared"
+        or snapshot.payload
+        != _scheduler_uninstall_transaction_payload(
+            home,
+            paths,
+            disable=disable,
+        )
+    ):
+        raise SyncError(
+            f"scheduler uninstall transaction is not canonical: {marker}",
+            code="scheduler-uninstall-state-invalid",
+        )
+    return snapshot, disable
+
+def _assert_scheduler_uninstall_not_pending(
+    home: Path,
+    paths: SchedulerPaths,
+) -> None:
+    snapshot, _disable = _scheduler_uninstall_transaction_state(home, paths)
+    if snapshot.exists:
+        marker = _scheduler_uninstall_transaction_path(paths)
+        raise SyncError(
+            f"scheduler has an incomplete uninstall transaction: {marker}",
+            code="scheduler-uninstall-incomplete",
+        )
+
 
 def _scheduler_pair_transaction_payload(
     *,
@@ -22745,6 +23026,270 @@ def _restore_scheduler_config_snapshot(
     )
 
 
+def _systemd_pair_recovery_members(
+    group: SystemdPairRecoveryGroup,
+) -> tuple[
+    SystemdPairRecoveryMember,
+    SystemdPairRecoveryMember,
+    SystemdPairRecoveryMember,
+]:
+    return group.marker, group.service, group.timer
+
+def _revalidate_systemd_pair_recovery_group(
+    group: SystemdPairRecoveryGroup,
+    *,
+    boundary: str,
+) -> None:
+    try:
+        if _directory_identity(
+            group.parent_fd
+        ) != group.parent_identity or not _bound_directory_matches(
+            group.home,
+            group.parent_path,
+            group.parent_fd,
+        ):
+            raise SyncError("unit parent identity changed")
+        # A member-level check double-reads one descriptor. Run two complete
+        # group passes so drift of an earlier object while a later object is
+        # checked is observed before the marker commit.
+        for _verification_round in range(2):
+            for member in _systemd_pair_recovery_members(group):
+                expected = member.expected
+                if expected.parent_identity != group.parent_identity:
+                    raise SyncError(f"incomplete parent evidence for {member.path}")
+                if expected.exists:
+                    if not _scheduler_recovery_binding_matches(
+                        group.home,
+                        member.file_fd,
+                        member.path,
+                        group.parent_fd,
+                        expected,
+                    ):
+                        raise SyncError(f"object binding changed for {member.path}")
+                    continue
+                if any(
+                    value is not None
+                    for value in (
+                        expected.payload,
+                        expected.mode,
+                        expected.file_identity,
+                        expected.file_type,
+                        expected.size,
+                        expected.uid,
+                        expected.gid,
+                    )
+                ):
+                    raise SyncError(f"incomplete absence evidence for {member.path}")
+                try:
+                    os.stat(
+                        member.path.name,
+                        dir_fd=group.parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    raise SyncError(
+                        f"absence is unreadable for {member.path}"
+                    ) from error
+                else:
+                    raise SyncError(f"absent object appeared at {member.path}")
+        # Bind the last full-pass results to canonical names immediately before
+        # returning to the marker commit.
+        for member in _systemd_pair_recovery_members(group):
+            expected = member.expected
+            if not expected.exists:
+                continue
+            assert expected.file_identity is not None
+            assert expected.file_type is not None
+            assert expected.mode is not None
+            assert expected.uid is not None
+            assert expected.gid is not None
+            assert expected.size is not None
+            expected_metadata = (
+                expected.file_identity[0],
+                expected.file_identity[1],
+                expected.file_type,
+                expected.mode,
+                expected.uid,
+                expected.gid,
+                expected.size,
+            )
+            named = os.stat(
+                member.path.name,
+                dir_fd=group.parent_fd,
+                follow_symlinks=False,
+            )
+            opened = os.fstat(member.file_fd)
+            if (
+                _managed_state_metadata_snapshot(named) != expected_metadata
+                or _managed_state_metadata_snapshot(opened) != expected_metadata
+            ):
+                raise SyncError(f"object binding changed for {member.path}")
+        if _directory_identity(
+            group.parent_fd
+        ) != group.parent_identity or not _bound_directory_matches(
+            group.home,
+            group.parent_path,
+            group.parent_fd,
+        ):
+            raise SyncError("unit parent identity changed")
+    except (OSError, SyncError) as error:
+        raise SyncError(
+            f"systemd scheduler pair recovery object group changed {boundary}"
+        ) from error
+
+def _bind_systemd_pair_recovery_member(
+    home: Path,
+    path: Path,
+    parent_fd: int,
+    *,
+    maximum_bytes: int = 1024 * 1024,
+) -> SystemdPairRecoveryMember:
+    expected = _scheduler_config_snapshot_at(
+        home,
+        path,
+        parent_fd,
+        maximum_bytes,
+    )
+    file_fd = (
+        _open_scheduler_recovery_binding(path, parent_fd, expected)
+        if expected.exists
+        else -1
+    )
+    return SystemdPairRecoveryMember(
+        path=path,
+        expected=expected,
+        file_fd=file_fd,
+    )
+
+@contextlib.contextmanager
+def _retain_systemd_pair_recovery_group(
+    paths: SchedulerPaths,
+) -> Iterator[SystemdPairRecoveryGroup]:
+    assert paths.systemd_service is not None
+    assert paths.systemd_timer is not None
+    marker = _scheduler_pair_transaction_path(paths)
+    parent_path = paths.systemd_service.parent
+    if paths.systemd_timer.parent != parent_path or marker.parent != parent_path:
+        raise SyncError("systemd scheduler pair recovery parents disagree")
+    home = Path.home().expanduser()
+    parent_fd = -1
+    members: list[SystemdPairRecoveryMember] = []
+    try:
+        parent_fd = _open_directory_beneath(home, parent_path)
+        parent_identity = _directory_identity(parent_fd)
+        if not _bound_directory_matches(home, parent_path, parent_fd):
+            raise SyncError(
+                "systemd scheduler pair recovery parent changed before binding"
+            )
+        members.append(
+            _bind_systemd_pair_recovery_member(
+                home,
+                marker,
+                parent_fd,
+                maximum_bytes=MAX_SCHEDULER_PAIR_TRANSACTION_BYTES,
+            )
+        )
+        members.append(
+            _bind_systemd_pair_recovery_member(
+                home,
+                paths.systemd_service,
+                parent_fd,
+            )
+        )
+        members.append(
+            _bind_systemd_pair_recovery_member(
+                home,
+                paths.systemd_timer,
+                parent_fd,
+            )
+        )
+        group = SystemdPairRecoveryGroup(
+            home=home,
+            parent_path=parent_path,
+            parent_fd=parent_fd,
+            parent_identity=parent_identity,
+            marker=members[0],
+            service=members[1],
+            timer=members[2],
+        )
+        _revalidate_systemd_pair_recovery_group(
+            group,
+            boundary="while binding the transaction",
+        )
+        yield group
+    finally:
+        for member in members:
+            if member.file_fd >= 0:
+                _close_fd_quietly(member.file_fd)
+        if parent_fd >= 0:
+            _close_fd_quietly(parent_fd)
+
+def _refresh_systemd_pair_recovery_member(
+    group: SystemdPairRecoveryGroup,
+    member: SystemdPairRecoveryMember,
+    desired: ManagedStateFileSnapshot,
+) -> None:
+    if _directory_identity(
+        group.parent_fd
+    ) != group.parent_identity or not _bound_directory_matches(
+        group.home,
+        group.parent_path,
+        group.parent_fd,
+    ):
+        raise SyncError(
+            "systemd scheduler pair recovery parent changed during rollback"
+        )
+    refreshed = _scheduler_config_snapshot_at(
+        group.home,
+        member.path,
+        group.parent_fd,
+    )
+    if (
+        refreshed.parent_identity != group.parent_identity
+        or not _scheduler_file_logical_state_matches(refreshed, desired)
+    ):
+        raise SyncError(
+            "systemd scheduler pair transaction rollback could not be verified"
+        )
+    refreshed_fd = (
+        _open_scheduler_recovery_binding(
+            member.path,
+            group.parent_fd,
+            refreshed,
+        )
+        if refreshed.exists
+        else -1
+    )
+    old_fd = member.file_fd
+    member.expected = refreshed
+    member.file_fd = refreshed_fd
+    if old_fd >= 0:
+        _close_fd_quietly(old_fd)
+    _revalidate_systemd_pair_recovery_group(
+        group,
+        boundary=f"after rollback of {member.path.name}",
+    )
+
+def _commit_systemd_pair_recovery_marker(
+    group: SystemdPairRecoveryGroup,
+) -> None:
+    _revalidate_systemd_pair_recovery_group(
+        group,
+        boundary="before transaction marker commit",
+    )
+    os.fsync(group.parent_fd)
+    try:
+        os.unlink(
+            group.marker.path.name,
+            dir_fd=group.parent_fd,
+        )
+    except OSError as error:
+        raise SyncError(
+            "failed to commit recovered systemd scheduler pair transaction"
+        ) from error
+
 def _recover_scheduler_pair_transaction(
     paths: SchedulerPaths,
     *,
@@ -22755,79 +23300,86 @@ def _recover_scheduler_pair_transaction(
     assert paths.systemd_service is not None
     assert paths.systemd_timer is not None
     marker = _scheduler_pair_transaction_path(paths)
-    if not _path_exists_or_is_link(marker):
+    try:
+        recovery_context = _retain_systemd_pair_recovery_group(paths)
+        group = recovery_context.__enter__()
+    except FileNotFoundError:
         return False
-    marker_snapshot = _scheduler_config_snapshot(
-        marker,
-        MAX_SCHEDULER_PAIR_TRANSACTION_BYTES,
-    )
-    if not marker_snapshot.exists or marker_snapshot.payload is None:
-        raise SyncError(f"scheduler pair transaction disappeared: {marker}")
-    marker_payload = marker_snapshot.payload
-    (
-        service_before,
-        timer_before,
-        service_after,
-        timer_after,
-    ) = _parse_scheduler_pair_transaction(marker_payload, marker)
-    service_current = _scheduler_config_snapshot(paths.systemd_service)
-    timer_current = _scheduler_config_snapshot(paths.systemd_timer)
-    service_matches_before = _scheduler_file_logical_state_matches(
-        service_current,
-        service_before,
-    )
-    timer_matches_before = _scheduler_file_logical_state_matches(
-        timer_current,
-        timer_before,
-    )
-    service_matches_after = _scheduler_snapshot_matches_after_payload(
-        service_current,
-        service_after,
-    )
-    timer_matches_after = _scheduler_snapshot_matches_after_payload(
-        timer_current,
-        timer_after,
-    )
-    if not service_matches_before and not service_matches_after:
-        raise SyncError(
-            "scheduler service changed during pending pair transaction"
+    try:
+        if not group.marker.expected.exists:
+            _revalidate_systemd_pair_recovery_group(
+                group,
+                boundary="while confirming transaction absence",
+            )
+            return False
+        if group.marker.expected.payload is None:
+            raise SyncError(f"scheduler pair transaction disappeared: {marker}")
+        (
+            service_before,
+            timer_before,
+            service_after,
+            timer_after,
+        ) = _parse_scheduler_pair_transaction(
+            group.marker.expected.payload,
+            marker,
         )
-    if not timer_matches_before and not timer_matches_after:
-        raise SyncError(
-            "scheduler timer changed during pending pair transaction"
+        service_current = group.service.expected
+        timer_current = group.timer.expected
+        service_matches_before = _scheduler_file_logical_state_matches(
+            service_current,
+            service_before,
         )
-    both_after = service_matches_after and timer_matches_after
-    action = "commit" if both_after else "roll back"
-    if dry_run:
-        raise SyncError(
-            "scheduler pair transaction requires recovery before dry-run: "
-            f"{marker} ({action})"
+        timer_matches_before = _scheduler_file_logical_state_matches(
+            timer_current,
+            timer_before,
         )
-    if not both_after:
-        _restore_scheduler_config_snapshot(
-            paths.systemd_service,
-            current=service_current,
-            desired=service_before,
+        service_matches_after = _scheduler_snapshot_matches_after_payload(
+            service_current,
+            service_after,
         )
-        _restore_scheduler_config_snapshot(
-            paths.systemd_timer,
-            current=timer_current,
-            desired=timer_before,
+        timer_matches_after = _scheduler_snapshot_matches_after_payload(
+            timer_current,
+            timer_after,
         )
-        if (
-            not _scheduler_file_logical_state_matches(
-                _scheduler_config_snapshot(paths.systemd_service),
+        if not service_matches_before and not service_matches_after:
+            raise SyncError("scheduler service changed during pending pair transaction")
+        if not timer_matches_before and not timer_matches_after:
+            raise SyncError("scheduler timer changed during pending pair transaction")
+        both_after = service_matches_after and timer_matches_after
+        action = "commit" if both_after else "roll back"
+        if dry_run:
+            raise SyncError(
+                "scheduler pair transaction requires recovery before dry-run: "
+                f"{marker} ({action})"
+            )
+        if not both_after:
+            _revalidate_systemd_pair_recovery_group(
+                group,
+                boundary="before service rollback",
+            )
+            _restore_scheduler_config_snapshot(
+                paths.systemd_service,
+                current=service_current,
+                desired=service_before,
+            )
+            _refresh_systemd_pair_recovery_member(
+                group,
+                group.service,
                 service_before,
             )
-            or not _scheduler_file_logical_state_matches(
-                _scheduler_config_snapshot(paths.systemd_timer),
+            _restore_scheduler_config_snapshot(
+                paths.systemd_timer,
+                current=timer_current,
+                desired=timer_before,
+            )
+            _refresh_systemd_pair_recovery_member(
+                group,
+                group.timer,
                 timer_before,
             )
-        ):
-            raise SyncError(
-                "scheduler pair transaction rollback could not be verified"
-            )
-    _remove_scheduler_config_if_snapshot(marker, marker_snapshot)
+        _commit_systemd_pair_recovery_marker(group)
+    finally:
+        recovery_context.__exit__(None, None, None)
     print(f"recovered scheduler pair transaction ({action}): {marker}")
     return True
 
@@ -22916,6 +23468,7 @@ def _install_scheduler_transaction(
     base_repo: str,
     owner: str,
 ) -> None:
+    _assert_scheduler_uninstall_not_pending(home, paths)
     initial_systemd_drop_ins: tuple[SystemdDropInSnapshot, ...] = ()
     if selected_platform == "linux":
         assert paths.systemd_service is not None
@@ -23263,6 +23816,74 @@ def _report_preserved_systemd_drop_ins(paths: SchedulerPaths) -> None:
             )
 
 
+def _commit_scheduler_uninstall_transaction(
+    marker_binding: SchedulerActivationBinding,
+    *,
+    related_bindings: tuple[SchedulerActivationBinding, ...],
+) -> None:
+    bindings = (*related_bindings, marker_binding)
+    if len({id(binding) for binding in bindings}) != len(bindings):
+        raise SyncError("scheduler uninstall commit received duplicate file bindings")
+    for binding in bindings:
+        _revalidate_launchd_activation_binding(
+            binding,
+            boundary="before uninstall transaction commit",
+        )
+    try:
+        os.fsync(marker_binding.parent_fd)
+        os.unlink(
+            marker_binding.path.name,
+            dir_fd=marker_binding.parent_fd,
+        )
+    except OSError as error:
+        raise SyncError(
+            f"failed to commit scheduler uninstall transaction: {marker_binding.path}"
+        ) from error
+    # The exact marker unlink is the uninstall commit point. Context cleanup
+    # below only closes descriptors and performs no further validation.
+    marker_binding.expected = ManagedStateFileSnapshot(
+        exists=False,
+        parent_identity=marker_binding.expected.parent_identity,
+    )
+    marker_binding.removed = True
+
+def _retain_scheduler_uninstall_transaction(
+    stack: contextlib.ExitStack,
+    home: Path,
+    paths: SchedulerPaths,
+    *,
+    disable: bool,
+    before: ManagedStateFileSnapshot,
+    recorded_disable: bool | None,
+) -> SchedulerActivationBinding:
+    marker = _scheduler_uninstall_transaction_path(paths)
+    if before.exists:
+        if recorded_disable != disable:
+            raise SyncError(
+                f"scheduler uninstall retry changed the --no-disable policy: {marker}",
+                code="scheduler-uninstall-incomplete",
+            )
+        installed = before
+    else:
+        installed = _atomic_write_scheduler_config(
+            marker,
+            _scheduler_uninstall_transaction_payload(
+                home,
+                paths,
+                disable=disable,
+            ),
+            expected_snapshot=before,
+        )
+    return stack.enter_context(
+        _retain_launchd_activation_binding(
+            marker,
+            installed,
+            description="scheduler uninstall transaction",
+            failure_code="scheduler-uninstall-incomplete",
+            revalidate_on_exit=False,
+        )
+    )
+
 def uninstall_scheduler(
     home: Path,
     platform_name: str,
@@ -23313,6 +23934,15 @@ def _uninstall_scheduler_transaction(
             f"config parent is missing: {_scheduler_config_parent(paths)}"
         )
         return
+    uninstall_marker_before, recorded_disable = _scheduler_uninstall_transaction_state(
+        home, paths
+    )
+    if dry_run and uninstall_marker_before.exists:
+        raise SyncError(
+            "scheduler uninstall transaction requires recovery before dry-run: "
+            f"{_scheduler_uninstall_transaction_path(paths)}",
+            code="scheduler-uninstall-incomplete",
+        )
     if selected_platform == "macos":
         assert paths.launchd_plist is not None
         binding_specs = (
@@ -23329,49 +23959,58 @@ def _uninstall_scheduler_transaction(
             ),
         )
         snapshots = tuple(
-            _scheduler_config_snapshot(path)
-            for path, _description in binding_specs
+            _scheduler_config_snapshot(path) for path, _description in binding_specs
         )
 
         def uninstall_macos(
             binding: SchedulerActivationBinding | None,
             bindings: tuple[SchedulerActivationBinding, ...],
             legacy_bindings: tuple[SchedulerActivationBinding, ...] | None,
+            marker_binding: SchedulerActivationBinding | None,
         ) -> None:
+            complete_bindings = (
+                (*bindings, marker_binding) if marker_binding is not None else bindings
+            )
             if disable:
                 domain = f"gui/{os.getuid()}"
                 _run_native_scheduler_action(
                     ["launchctl", "bootout", domain, str(paths.launchd_plist)],
                     dry_run=dry_run,
-                    allow_fail=True,
-                    activation_bindings=bindings,
+                    allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
+                    activation_bindings=complete_bindings,
                 )
                 _run_native_scheduler_action(
                     ["launchctl", "disable", f"{domain}/{LAUNCHD_LABEL}"],
                     dry_run=dry_run,
-                    allow_fail=True,
-                    activation_bindings=bindings,
+                    allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
+                    activation_bindings=complete_bindings,
                 )
             _cleanup_legacy_launchd_schedulers(
                 paths,
                 dry_run=dry_run,
                 disable=disable,
                 remove=True,
-                activation_bindings=bindings,
+                native_failure_policy=NATIVE_FAILURE_ALREADY_ABSENT,
+                activation_bindings=complete_bindings,
                 retained_legacy_bindings=legacy_bindings,
             )
             if dry_run:
                 _unlink_file(paths.launchd_plist, dry_run=True)
             else:
                 assert binding is not None
+                assert marker_binding is not None
                 _conditionally_remove_bound_scheduler_config(
                     binding,
                     boundary="before conditional scheduler removal",
+                    related_bindings=complete_bindings,
+                )
+                _commit_scheduler_uninstall_transaction(
+                    marker_binding,
                     related_bindings=bindings,
                 )
 
         if dry_run:
-            uninstall_macos(None, (), None)
+            uninstall_macos(None, (), None, None)
         else:
             with contextlib.ExitStack() as stack:
                 bindings = tuple(
@@ -23380,6 +24019,7 @@ def _uninstall_scheduler_transaction(
                             path,
                             snapshot,
                             description=description,
+                            revalidate_on_exit=False,
                         )
                     )
                     for (path, description), snapshot in zip(
@@ -23387,10 +24027,19 @@ def _uninstall_scheduler_transaction(
                         snapshots,
                     )
                 )
+                marker_binding = _retain_scheduler_uninstall_transaction(
+                    stack,
+                    home,
+                    paths,
+                    disable=disable,
+                    before=uninstall_marker_before,
+                    recorded_disable=recorded_disable,
+                )
                 uninstall_macos(
                     bindings[0],
                     bindings,
                     bindings[1:],
+                    marker_binding,
                 )
         print(f"removed macOS launchd scheduler: {paths.launchd_plist}")
         return
@@ -23405,7 +24054,11 @@ def _uninstall_scheduler_transaction(
 
         def uninstall_linux(
             bindings: tuple[SchedulerActivationBinding, ...],
+            marker_binding: SchedulerActivationBinding | None,
         ) -> None:
+            complete_bindings = (
+                (*bindings, marker_binding) if marker_binding is not None else bindings
+            )
             if disable:
                 _run_native_scheduler_action(
                     [
@@ -23416,35 +24069,41 @@ def _uninstall_scheduler_transaction(
                         f"{SYSTEMD_UNIT}.timer",
                     ],
                     dry_run=dry_run,
-                    allow_fail=True,
-                    activation_bindings=bindings,
+                    allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
+                    activation_bindings=complete_bindings,
                 )
             if dry_run:
                 _unlink_file(paths.systemd_timer, dry_run=True)
                 _unlink_file(paths.systemd_service, dry_run=True)
             else:
+                assert marker_binding is not None
                 service_binding, timer_binding = bindings
                 _conditionally_remove_bound_scheduler_config(
                     timer_binding,
                     boundary="before conditional scheduler timer removal",
-                    related_bindings=bindings,
+                    related_bindings=complete_bindings,
                 )
                 _conditionally_remove_bound_scheduler_config(
                     service_binding,
                     boundary="before conditional scheduler service removal",
-                    related_bindings=bindings,
+                    related_bindings=complete_bindings,
                 )
             _report_preserved_systemd_drop_ins(paths)
             if disable:
                 _run_native_scheduler_action(
                     ["systemctl", "--user", "daemon-reload"],
                     dry_run=dry_run,
-                    allow_fail=True,
-                    activation_bindings=bindings,
+                    activation_bindings=complete_bindings,
+                )
+            if not dry_run:
+                assert marker_binding is not None
+                _commit_scheduler_uninstall_transaction(
+                    marker_binding,
+                    related_bindings=bindings,
                 )
 
         if dry_run:
-            uninstall_linux(())
+            uninstall_linux((), None)
         else:
             with contextlib.ExitStack() as stack:
                 bindings = tuple(
@@ -23453,6 +24112,7 @@ def _uninstall_scheduler_transaction(
                             path,
                             snapshot,
                             description=description,
+                            revalidate_on_exit=False,
                         )
                     )
                     for path, snapshot, description in (
@@ -23468,7 +24128,15 @@ def _uninstall_scheduler_transaction(
                         ),
                     )
                 )
-                uninstall_linux(bindings)
+                marker_binding = _retain_scheduler_uninstall_transaction(
+                    stack,
+                    home,
+                    paths,
+                    disable=disable,
+                    before=uninstall_marker_before,
+                    recorded_disable=recorded_disable,
+                )
+                uninstall_linux(bindings, marker_binding)
         print(f"removed Linux systemd user scheduler: {paths.systemd_timer}")
         return
 
@@ -24244,6 +24912,8 @@ def doctor(
                 "scheduler-daemon-unavailable",
                 "scheduler-daemon-disabled",
                 "scheduler-runner-drift",
+                "scheduler-uninstall-incomplete",
+                "scheduler-uninstall-state-invalid",
             }
             else "scheduler-failure"
         )
@@ -24254,7 +24924,17 @@ def doctor(
                     (
                         _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
                         if issue_code.startswith("quarantine-")
-                        else (report.config_paths[0] if report.config_paths else home)
+                        else (
+                            _scheduler_uninstall_transaction_path(
+                                _scheduler_paths(report.platform, home)
+                            )
+                            if issue_code.startswith("scheduler-uninstall-")
+                            else (
+                                report.config_paths[0]
+                                if report.config_paths
+                                else home
+                            )
+                        )
                     ),
                     failure_reason,
                 )
@@ -25138,6 +25818,23 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
         else:
             failures.append(entry)
 
+    try:
+        uninstall_snapshot, _recorded_disable = (
+            _scheduler_uninstall_transaction_state(home, paths)
+        )
+        if uninstall_snapshot.exists:
+            marker = _scheduler_uninstall_transaction_path(paths)
+            record_failure(
+                "scheduler-uninstall-incomplete",
+                f"scheduler has an incomplete uninstall transaction: {marker}",
+                primary=True,
+            )
+    except SyncError as error:
+        record_failure(
+            error.code or "scheduler-uninstall-state-invalid",
+            str(error),
+            primary=True,
+        )
     try:
         config_audit = _audit_scheduler_config(paths)
         config = config_audit.config

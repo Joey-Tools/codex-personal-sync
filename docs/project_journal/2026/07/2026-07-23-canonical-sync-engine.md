@@ -3,7 +3,7 @@ id: 20260723-canonical-sync-engine
 title: Canonical Sync Engine
 status: active
 created: 2026-07-23
-updated: 2026-07-24
+updated: 2026-07-25
 branch: codex/canonical-sync-engine
 pr:
 supersedes: []
@@ -129,6 +129,15 @@ superseded_by:
   no-follow component opens, so intermediate symlinks and uncertain identity
   fail closed while only a confirmed missing component remains an idempotent
   no-op.
+- The fourth scheduler follow-up gives uninstall a durable incomplete-state
+  marker that survives every unclassified native failure and remains visible
+  to status/doctor even after unit removal. Only exact bounded
+  already-absent/not-loaded responses are benign; timeout, permission, bus,
+  unknown, and reload failures fail closed. Linux status now requires both
+  enabled and active timer evidence. Pair recovery holds one unit-parent
+  descriptor and treats marker/service/timer as one object group, including
+  two complete byte/access/name passes plus final identity and parent
+  revalidation before the marker commit.
 
 ## Validation Evidence
 
@@ -409,6 +418,21 @@ superseded_by:
   source-lock verification, and `git diff --check` passed. The final
   source-lock SHA-256 is
   `4a47eb34ea208dc841b19d6ebcb46a490d8c84b0531c982fb87ef8a0603e7688`.
+- The fourth scheduler findings follow-up adds eight scheduler test methods
+  covering timeout, permission, and unknown native failures; strict
+  already-absent parsing; reload failure recovery; per-unit replacement;
+  parent rotation/ABA recovery; interleaved earlier-member replacement;
+  partial-binding descriptor cleanup; and enabled-but-not-active status.
+  Scheduler/doctor passed 85 tests in 6.095 seconds. The exact final bytes then
+  passed 627 personal-sync, reconciliation, retention, scheduler, and
+  automation tests in 810.036 seconds plus all 119 source-lock tests in
+  2388.623 seconds, for 746 disjoint repository tests. The first aggregate run
+  exposed one older temporary-home fixture that did not bind `Path.home()` to
+  its simulated user home; that test contract was corrected, its focused test
+  passed, and the complete 627-test partition passed on rerun. Compileall,
+  Ruff, actionlint, project-journal validation, source-lock verification, and
+  `git diff --check` passed. The final source-lock SHA-256 is
+  `cf666337879638a7f12b353d9b9a14538e249644840d0e5502452d5c31596005`.
 
 ## Installed Host Baseline
 

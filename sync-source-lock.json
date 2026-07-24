@@ -26,9 +26,9 @@
   },
   "sources": {
     "engine": {
-      "mode": "0755",
+      "mode": "0644",
       "path": "scripts/codex_personal_sync.py",
-      "sha256": "a09e8f0c8dd4e191be1c2e7d02a1363f52f6dd4ef171c7e3e1269cf9825e748f"
+      "sha256": "495e2961c3ea5f091ce1bdd83264a52e024b5457434b3e578b80b05409895170"
     },
     "engine_tests": {
       "mode": "0644",
@@ -43,7 +43,7 @@
     "reconciliation_safety_tests": {
       "mode": "0644",
       "path": "tests/test_personal_sync_reconciliation_safety.py",
-      "sha256": "4d9190f293c23cf19aabfba4a047bdd90c723aa3cd05a0cc0a8e4224eec63f98"
+      "sha256": "bdd8b6ebc0c267a627c411d6bf6ed3aaa2609abf69d0c71d581e478855933647"
     },
     "release_retention_tests": {
       "mode": "0644",
@@ -53,7 +53,7 @@
     "scheduler_doctor_tests": {
       "mode": "0644",
       "path": "tests/test_scheduler_doctor.py",
-      "sha256": "a40548df8de35f3abd9d779e0f8c8ecfeb6a5968cb76954d89f9c68a591afd24"
+      "sha256": "05e658eb725db1550b58470d5b71f5d869d251d7b9dca4a7d2711f67cbfc00e4"
     }
   },
   "version": 1

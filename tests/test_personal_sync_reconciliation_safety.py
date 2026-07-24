@@ -13205,6 +13205,11 @@ class SchedulerInternalPathSafetyTests(unittest.TestCase):
 
             with (
                 mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=Path(temp_dir),
+                ),
+                mock.patch.object(
                     MODULE,
                     "_scheduler_paths",
                     return_value=paths,

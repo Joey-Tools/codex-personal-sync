@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import plistlib
+import re
 import shutil
 import stat
 import subprocess
@@ -108,6 +109,64 @@ class SchedulerDoctorTests(unittest.TestCase):
                 base_repo=base_repo,
                 owner=owner,
             )
+
+    def write_pending_systemd_pair(
+        self,
+        user_home: Path,
+        home: Path,
+    ) -> MODULE.SchedulerPaths:
+        runner = home / "bin" / "codex-personal-sync"
+        runner.parent.mkdir(parents=True)
+        runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        runner.chmod(0o755)
+        with mock.patch.object(MODULE.Path, "home", return_value=user_home):
+            with contextlib.redirect_stdout(io.StringIO()):
+                MODULE.install_scheduler(
+                    home,
+                    "owner/old",
+                    17,
+                    "linux",
+                    None,
+                    dry_run=False,
+                    enable=False,
+                )
+            paths = MODULE._scheduler_paths("linux", home)
+            assert paths.systemd_service is not None
+            assert paths.systemd_timer is not None
+            service_before = MODULE._scheduler_config_snapshot(paths.systemd_service)
+            timer_before = MODULE._scheduler_config_snapshot(paths.systemd_timer)
+            service_after = MODULE._systemd_service(
+                home,
+                "owner/new",
+                runner,
+            ).encode("utf-8")
+            timer_after = MODULE._systemd_timer(29).encode("utf-8")
+            marker = MODULE._scheduler_pair_transaction_path(paths)
+            marker_before = MODULE._scheduler_config_snapshot(
+                marker,
+                MODULE.MAX_SCHEDULER_PAIR_TRANSACTION_BYTES,
+            )
+            MODULE._atomic_write_scheduler_config(
+                marker,
+                MODULE._scheduler_pair_transaction_payload(
+                    service_before=service_before,
+                    timer_before=timer_before,
+                    service_after=service_after,
+                    timer_after=timer_after,
+                ),
+                expected_snapshot=marker_before,
+            )
+            MODULE._atomic_write_scheduler_config(
+                paths.systemd_service,
+                service_after,
+                expected_snapshot=service_before,
+            )
+            MODULE._atomic_write_scheduler_config(
+                paths.systemd_timer,
+                timer_after,
+                expected_snapshot=timer_before,
+            )
+        return paths
 
     def write_skill(self, name: str, frontmatter_name: str) -> Path:
         skill_root = self.home / "skills" / name
@@ -2496,6 +2555,281 @@ class SchedulerDoctorTests(unittest.TestCase):
             "user edit\n",
         )
 
+    def test_systemd_pair_recovery_retains_marker_on_member_replacement(
+        self,
+    ) -> None:
+        real_parse = MODULE._parse_scheduler_pair_transaction
+        for target_kind in ("service", "timer"):
+            with self.subTest(target=target_kind):
+                case_user_home = self.root / f"pair-replacement-{target_kind}" / "home"
+                case_home = case_user_home / ".codex"
+                paths = self.write_pending_systemd_pair(
+                    case_user_home,
+                    case_home,
+                )
+                target = (
+                    paths.systemd_service
+                    if target_kind == "service"
+                    else paths.systemd_timer
+                )
+                assert target is not None
+                marker = MODULE._scheduler_pair_transaction_path(paths)
+                replaced = False
+
+                def parse_then_replace(
+                    payload: bytes,
+                    path: Path,
+                ) -> tuple[
+                    MODULE.ManagedStateFileSnapshot,
+                    MODULE.ManagedStateFileSnapshot,
+                    bytes,
+                    bytes,
+                ]:
+                    nonlocal replaced
+                    parsed = real_parse(payload, path)
+                    replacement = target.with_name(target.name + ".replacement")
+                    replacement.write_bytes(target.read_bytes())
+                    replacement.chmod(stat.S_IMODE(target.stat().st_mode))
+                    os.replace(replacement, target)
+                    replaced = True
+                    return parsed
+
+                with (
+                    mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_parse_scheduler_pair_transaction",
+                        side_effect=parse_then_replace,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "recovery object group changed",
+                    ),
+                ):
+                    MODULE._recover_scheduler_pair_transaction(
+                        paths,
+                        dry_run=False,
+                    )
+
+                self.assertTrue(replaced)
+                self.assertTrue(marker.is_file())
+
+    def test_systemd_pair_recovery_rechecks_earlier_member_after_later_member(
+        self,
+    ) -> None:
+        case_user_home = self.root / "pair-later-member-race" / "home"
+        case_home = case_user_home / ".codex"
+        paths = self.write_pending_systemd_pair(case_user_home, case_home)
+        assert paths.systemd_service is not None
+        assert paths.systemd_timer is not None
+        marker = MODULE._scheduler_pair_transaction_path(paths)
+        real_parse = MODULE._parse_scheduler_pair_transaction
+        real_matches = MODULE._scheduler_recovery_binding_matches
+        armed = False
+        replaced = False
+
+        def parse_and_arm(
+            payload: bytes,
+            path: Path,
+        ) -> tuple[
+            MODULE.ManagedStateFileSnapshot,
+            MODULE.ManagedStateFileSnapshot,
+            bytes,
+            bytes,
+        ]:
+            nonlocal armed
+            parsed = real_parse(payload, path)
+            armed = True
+            return parsed
+
+        def replace_service_while_timer_is_checked(
+            home: Path,
+            file_fd: int,
+            path: Path,
+            parent_fd: int,
+            expected: MODULE.ManagedStateFileSnapshot,
+        ) -> bool:
+            nonlocal replaced
+            if armed and not replaced and path == paths.systemd_timer:
+                replacement = paths.systemd_service.with_name(
+                    paths.systemd_service.name + ".replacement"
+                )
+                replacement.write_bytes(paths.systemd_service.read_bytes())
+                replacement.chmod(
+                    stat.S_IMODE(paths.systemd_service.stat().st_mode)
+                )
+                os.replace(replacement, paths.systemd_service)
+                replaced = True
+            return real_matches(
+                home,
+                file_fd,
+                path,
+                parent_fd,
+                expected,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE.Path,
+                "home",
+                return_value=case_user_home,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_parse_scheduler_pair_transaction",
+                side_effect=parse_and_arm,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_scheduler_recovery_binding_matches",
+                side_effect=replace_service_while_timer_is_checked,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "recovery object group changed",
+            ),
+        ):
+            MODULE._recover_scheduler_pair_transaction(
+                paths,
+                dry_run=False,
+            )
+
+        self.assertTrue(replaced)
+        self.assertTrue(marker.is_file())
+
+    def test_systemd_pair_recovery_closes_partial_bindings(self) -> None:
+        case_user_home = self.root / "pair-partial-bind" / "home"
+        case_home = case_user_home / ".codex"
+        paths = self.write_pending_systemd_pair(case_user_home, case_home)
+        assert paths.systemd_service is not None
+        real_bind = MODULE._bind_systemd_pair_recovery_member
+        bound_fds: list[int] = []
+
+        def bind_marker_then_fail(
+            home: Path,
+            path: Path,
+            parent_fd: int,
+            *,
+            maximum_bytes: int = 1024 * 1024,
+        ) -> MODULE.SystemdPairRecoveryMember:
+            if path == paths.systemd_service:
+                raise MODULE.SyncError("simulated service binding failure")
+            member = real_bind(
+                home,
+                path,
+                parent_fd,
+                maximum_bytes=maximum_bytes,
+            )
+            if member.file_fd >= 0:
+                bound_fds.append(member.file_fd)
+            return member
+
+        with (
+            mock.patch.object(
+                MODULE.Path,
+                "home",
+                return_value=case_user_home,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_bind_systemd_pair_recovery_member",
+                side_effect=bind_marker_then_fail,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "simulated service binding failure",
+            ),
+        ):
+            with MODULE._retain_systemd_pair_recovery_group(paths):
+                self.fail("partial recovery binding unexpectedly succeeded")
+
+        self.assertTrue(bound_fds)
+        for file_fd in bound_fds:
+            with self.assertRaises(OSError):
+                os.fstat(file_fd)
+
+    def test_systemd_pair_recovery_retains_marker_across_parent_aba(
+        self,
+    ) -> None:
+        case_user_home = self.root / "pair-parent-aba" / "home"
+        case_home = case_user_home / ".codex"
+        paths = self.write_pending_systemd_pair(case_user_home, case_home)
+        assert paths.systemd_service is not None
+        unit_parent = paths.systemd_service.parent
+        displaced_parent = unit_parent.with_name(unit_parent.name + ".displaced")
+        transient_parent = unit_parent.with_name(unit_parent.name + ".transient")
+        marker = MODULE._scheduler_pair_transaction_path(paths)
+        real_parse = MODULE._parse_scheduler_pair_transaction
+        rotated = False
+
+        def parse_then_rotate_parent(
+            payload: bytes,
+            path: Path,
+        ) -> tuple[
+            MODULE.ManagedStateFileSnapshot,
+            MODULE.ManagedStateFileSnapshot,
+            bytes,
+            bytes,
+        ]:
+            nonlocal rotated
+            parsed = real_parse(payload, path)
+            unit_parent.rename(displaced_parent)
+            unit_parent.mkdir()
+            for source in displaced_parent.iterdir():
+                if not source.is_file():
+                    continue
+                destination = unit_parent / source.name
+                destination.write_bytes(source.read_bytes())
+                destination.chmod(stat.S_IMODE(source.stat().st_mode))
+            rotated = True
+            return parsed
+
+        with (
+            mock.patch.object(
+                MODULE.Path,
+                "home",
+                return_value=case_user_home,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_parse_scheduler_pair_transaction",
+                side_effect=parse_then_rotate_parent,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "recovery object group changed",
+            ),
+        ):
+            MODULE._recover_scheduler_pair_transaction(
+                paths,
+                dry_run=False,
+            )
+
+        self.assertTrue(rotated)
+        self.assertTrue((displaced_parent / marker.name).is_file())
+        unit_parent.rename(transient_parent)
+        displaced_parent.rename(unit_parent)
+        self.assertTrue(marker.is_file())
+        with (
+            mock.patch.object(
+                MODULE.Path,
+                "home",
+                return_value=case_user_home,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertTrue(
+                MODULE._recover_scheduler_pair_transaction(
+                    paths,
+                    dry_run=False,
+                )
+            )
+        self.assertFalse(marker.exists())
+
     def test_macos_install_binds_semantically_audited_snapshot(self) -> None:
         self.write_runner()
         self.install_scheduler_quietly("owner/old", 17, "macos")
@@ -4067,6 +4401,396 @@ class SchedulerDoctorTests(unittest.TestCase):
                     self.assertFalse(other.exists())
                     self.assertNotIn("removed ", output.getvalue())
 
+    def test_uninstall_native_failures_retain_transaction_and_configs(
+        self,
+    ) -> None:
+        success = subprocess.CompletedProcess(
+            ["scheduler-action"],
+            0,
+            "",
+            "",
+        )
+        failures: tuple[
+            tuple[str, str, int, BaseException | subprocess.CompletedProcess[str]],
+            ...,
+        ] = (
+            (
+                "macos",
+                "timeout",
+                0,
+                subprocess.TimeoutExpired(["launchctl", "bootout"], 30),
+            ),
+            (
+                "macos",
+                "permission",
+                0,
+                subprocess.CompletedProcess(
+                    ["launchctl", "bootout"],
+                    1,
+                    "",
+                    "Operation not permitted",
+                ),
+            ),
+            (
+                "macos",
+                "unknown",
+                1,
+                subprocess.CompletedProcess(
+                    ["launchctl", "disable"],
+                    1,
+                    "",
+                    "Input/output error",
+                ),
+            ),
+            (
+                "linux",
+                "timeout",
+                0,
+                subprocess.TimeoutExpired(["systemctl", "disable"], 30),
+            ),
+            (
+                "linux",
+                "permission",
+                0,
+                subprocess.CompletedProcess(
+                    ["systemctl", "disable"],
+                    1,
+                    "",
+                    "Permission denied",
+                ),
+            ),
+            (
+                "linux",
+                "unknown",
+                0,
+                subprocess.CompletedProcess(
+                    ["systemctl", "disable"],
+                    1,
+                    "",
+                    "Unit operation failed",
+                ),
+            ),
+        )
+        for platform_name, failure_kind, failure_call, failure in failures:
+            with self.subTest(
+                platform=platform_name,
+                failure=failure_kind,
+            ):
+                case_user_home = (
+                    self.root / f"native-{platform_name}-{failure_kind}" / "home"
+                )
+                case_home = case_user_home / ".codex"
+                runner = case_home / "bin" / "codex-personal-sync"
+                runner.parent.mkdir(parents=True)
+                runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                runner.chmod(0o755)
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        MODULE.install_scheduler(
+                            case_home,
+                            "owner/public-sync",
+                            17,
+                            platform_name,
+                            None,
+                            dry_run=False,
+                            enable=False,
+                        )
+                    paths = MODULE._scheduler_paths(
+                        platform_name,
+                        case_home,
+                    )
+                    native_results: list[
+                        BaseException | subprocess.CompletedProcess[str]
+                    ] = [success] * failure_call + [failure]
+                    output = io.StringIO()
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_native_scheduler_argv",
+                            side_effect=lambda args: args,
+                        ),
+                        mock.patch.object(
+                            MODULE.subprocess,
+                            "run",
+                            side_effect=native_results,
+                        ),
+                        contextlib.redirect_stdout(output),
+                        self.assertRaises(MODULE.SyncError),
+                    ):
+                        MODULE.uninstall_scheduler(
+                            case_home,
+                            platform_name,
+                            dry_run=False,
+                            disable=True,
+                        )
+
+                config_paths = (
+                    (paths.launchd_plist,)
+                    if platform_name == "macos"
+                    else (paths.systemd_service, paths.systemd_timer)
+                )
+                self.assertTrue(
+                    all(path is not None and path.is_file() for path in config_paths)
+                )
+                self.assertTrue(
+                    MODULE._scheduler_uninstall_transaction_path(paths).is_file()
+                )
+                self.assertNotIn("removed ", output.getvalue())
+
+    def test_uninstall_accepts_only_precise_absence_evidence(self) -> None:
+        accepted = (
+            (
+                [
+                    "launchctl",
+                    "bootout",
+                    "gui/501",
+                    "/tmp/scheduler.plist",
+                ],
+                "Boot-out failed: 3: No such process",
+            ),
+            (
+                ["launchctl", "disable", "gui/501/example"],
+                "Could not find specified service",
+            ),
+            (
+                [
+                    "systemctl",
+                    "--user",
+                    "disable",
+                    "--now",
+                    f"{MODULE.SYSTEMD_UNIT}.timer",
+                ],
+                (
+                    "Failed to disable unit: Unit "
+                    f"{MODULE.SYSTEMD_UNIT}.timer not loaded."
+                ),
+            ),
+        )
+        for args, stderr in accepted:
+            with self.subTest(args=args):
+                completed = subprocess.CompletedProcess(
+                    args,
+                    1,
+                    "",
+                    stderr,
+                )
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_native_scheduler_argv",
+                        side_effect=lambda selected: selected,
+                    ),
+                    mock.patch.object(
+                        MODULE.subprocess,
+                        "run",
+                        return_value=completed,
+                    ),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    MODULE._run_native_command(
+                        args,
+                        dry_run=False,
+                        allow_fail=MODULE.NATIVE_FAILURE_ALREADY_ABSENT,
+                    )
+
+        rejected = (
+            (
+                [
+                    "systemctl",
+                    "--user",
+                    "disable",
+                    "--now",
+                    f"{MODULE.SYSTEMD_UNIT}.timer",
+                ],
+                (
+                    "Failed to disable unit: Unit file "
+                    f"{MODULE.SYSTEMD_UNIT}.timer does not exist."
+                ),
+            ),
+            (
+                ["launchctl", "disable", "gui/501/example"],
+                "Permission denied: Could not find specified service",
+            ),
+            (
+                [
+                    "systemctl",
+                    "--user",
+                    "disable",
+                    "--now",
+                    f"{MODULE.SYSTEMD_UNIT}.timer",
+                ],
+                (
+                    "Permission denied: Unit "
+                    f"{MODULE.SYSTEMD_UNIT}.timer not loaded."
+                ),
+            ),
+        )
+        for args, stderr in rejected:
+            with self.subTest(stderr=stderr):
+                completed = subprocess.CompletedProcess(
+                    args,
+                    1,
+                    "",
+                    stderr,
+                )
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_native_scheduler_argv",
+                        side_effect=lambda selected: selected,
+                    ),
+                    mock.patch.object(
+                        MODULE.subprocess,
+                        "run",
+                        return_value=completed,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        re.escape(stderr),
+                    ),
+                ):
+                    MODULE._run_native_command(
+                        args,
+                        dry_run=False,
+                        allow_fail=MODULE.NATIVE_FAILURE_ALREADY_ABSENT,
+                    )
+
+    def test_linux_uninstall_reload_failure_is_reported_and_recoverable(
+        self,
+    ) -> None:
+        self.write_runner()
+        self.install_scheduler_quietly(
+            "owner/public-sync",
+            17,
+            "linux",
+        )
+        paths = MODULE._scheduler_paths("linux", self.home)
+        assert paths.systemd_service is not None
+        assert paths.systemd_timer is not None
+        marker = MODULE._scheduler_uninstall_transaction_path(paths)
+        failed_results = (
+            subprocess.CompletedProcess(
+                ["systemctl", "disable"],
+                0,
+                "",
+                "",
+            ),
+            subprocess.CompletedProcess(
+                ["systemctl", "daemon-reload"],
+                1,
+                "",
+                "Permission denied",
+            ),
+        )
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                MODULE,
+                "_native_scheduler_argv",
+                side_effect=lambda args: args,
+            ),
+            mock.patch.object(
+                MODULE.subprocess,
+                "run",
+                side_effect=failed_results,
+            ),
+            contextlib.redirect_stdout(output),
+            self.assertRaisesRegex(MODULE.SyncError, "Permission denied"),
+        ):
+            MODULE.uninstall_scheduler(
+                self.home,
+                "linux",
+                dry_run=False,
+                disable=True,
+            )
+
+        self.assertFalse(paths.systemd_service.exists())
+        self.assertFalse(paths.systemd_timer.exists())
+        self.assertTrue(marker.is_file())
+        self.assertNotIn("removed ", output.getvalue())
+        with (
+            mock.patch.object(
+                MODULE,
+                "_quarantine_batch_count",
+                return_value=0,
+            ),
+            mock.patch.object(
+                MODULE,
+                "audit_active_skills",
+                return_value=[],
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            report, issues = MODULE.doctor(
+                self.home,
+                "linux",
+                json_output=False,
+            )
+        self.assertEqual(
+            report.failure_code,
+            "scheduler-uninstall-incomplete",
+        )
+        uninstall_issues = [
+            issue for issue in issues if issue.code == "scheduler-uninstall-incomplete"
+        ]
+        self.assertEqual(len(uninstall_issues), 1)
+        self.assertEqual(uninstall_issues[0].path, marker)
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "incomplete uninstall transaction",
+        ):
+            MODULE.install_scheduler(
+                self.home,
+                "owner/public-sync",
+                17,
+                "linux",
+                None,
+                dry_run=False,
+                enable=False,
+            )
+
+        recovered_results = (
+            subprocess.CompletedProcess(
+                ["systemctl", "disable"],
+                1,
+                "",
+                (
+                    "Failed to disable unit: Unit "
+                    f"{MODULE.SYSTEMD_UNIT}.timer not loaded."
+                ),
+            ),
+            subprocess.CompletedProcess(
+                ["systemctl", "daemon-reload"],
+                0,
+                "",
+                "",
+            ),
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_native_scheduler_argv",
+                side_effect=lambda args: args,
+            ),
+            mock.patch.object(
+                MODULE.subprocess,
+                "run",
+                side_effect=recovered_results,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            MODULE.uninstall_scheduler(
+                self.home,
+                "linux",
+                dry_run=False,
+                disable=True,
+            )
+        self.assertFalse(marker.exists())
+
     def test_scheduler_daemon_query_classifies_only_explicit_state_evidence(
         self,
     ) -> None:
@@ -4134,6 +4858,16 @@ class SchedulerDoctorTests(unittest.TestCase):
                     stdout,
                     stderr,
                 )
+                results = [completed]
+                if platform_name == "linux":
+                    results.append(
+                        subprocess.CompletedProcess(
+                            ["scheduler-activity-query"],
+                            0,
+                            "active\n",
+                            "",
+                        )
+                    )
                 with (
                     mock.patch.object(
                         MODULE,
@@ -4143,7 +4877,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                     mock.patch.object(
                         MODULE.subprocess,
                         "run",
-                        return_value=completed,
+                        side_effect=results,
                     ),
                 ):
                     query = MODULE._scheduler_daemon_enabled(
@@ -4162,6 +4896,77 @@ class SchedulerDoctorTests(unittest.TestCase):
                 )
                 if reason is not None:
                     self.assertIn(reason, query.reason or "")
+
+    def test_linux_status_requires_enabled_and_active_timer(self) -> None:
+        self.write_runner()
+        self.install_scheduler_quietly(
+            "owner/public-sync",
+            17,
+            "linux",
+        )
+        query_results = (
+            subprocess.CompletedProcess(
+                ["systemctl", "is-enabled"],
+                0,
+                "enabled\n",
+                "",
+            ),
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                3,
+                "failed\n",
+                "",
+            ),
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_native_scheduler_argv",
+                side_effect=lambda args: args,
+            ),
+            mock.patch.object(
+                MODULE.subprocess,
+                "run",
+                side_effect=query_results,
+            ) as run,
+            mock.patch.object(
+                MODULE,
+                "_stable_scheduler_runner_matches",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_current_releases_for_scheduler",
+                return_value=(),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_scheduler_release_integrity_issues",
+                return_value=(),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_quarantine_batch_count",
+                return_value=0,
+            ),
+        ):
+            report = MODULE.scheduler_report(self.home, "linux")
+
+        self.assertEqual(
+            [call.args[0][2] for call in run.call_args_list],
+            ["is-enabled", "is-active"],
+        )
+        self.assertFalse(report.enabled)
+        self.assertEqual(
+            report.failure_code,
+            "scheduler-daemon-disabled",
+        )
+        assert report.daemon_query is not None
+        self.assertEqual(report.daemon_query.classification, "disabled")
+        self.assertIn(
+            "enabled but not active (state failed)",
+            report.daemon_query.reason or "",
+        )
 
     def test_scheduler_report_and_doctor_preserve_runtime_and_daemon_failures(
         self,
@@ -4386,7 +5191,11 @@ class SchedulerDoctorTests(unittest.TestCase):
                     return subprocess.CompletedProcess(
                         args,
                         0,
-                        "enabled\n",
+                        (
+                            "active\n"
+                            if len(args) > 2 and args[2] == "is-active"
+                            else "enabled\n"
+                        ),
                         "",
                     )
 
