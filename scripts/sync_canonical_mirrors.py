@@ -56,6 +56,9 @@ MAX_GIT_STDOUT_BYTES = MAX_SOURCE_BYTES
 MAX_GIT_STDERR_BYTES = 1024 * 1024
 GIT_TIMEOUT_SECONDS = 30
 GIT_CLEANUP_TIMEOUT_SECONDS = 5
+MINIMUM_GIT_VERSION = (2, 45, 0)
+MAX_GIT_VERSION_STDOUT_BYTES = 1024
+MAX_GIT_VERSION_STDERR_BYTES = 4096
 MAX_GIT_SNAPSHOT_ENTRIES = 100_000
 MAX_GIT_SNAPSHOT_BYTES = 512 * 1024 * 1024
 MAX_ROOT_ANCESTOR_DEPTH = 256
@@ -71,6 +74,11 @@ REPOSITORY_RE = re.compile(
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+GIT_VERSION_RE = re.compile(
+    rb"git version "
+    rb"([0-9]{1,6})\.([0-9]{1,6})\.([0-9]{1,6})"
+    rb"(?:[ .+()A-Za-z0-9_-]*)\n"
+)
 MODE_RE = re.compile(r"^0[0-7]{3}$")
 PRIVATE_SNAPSHOT_RE = re.compile(r"^sync-canonical-git-control\.[0-9]+\.[0-9a-f]{32}$")
 QUARANTINE_FILE_RE = re.compile(
@@ -150,6 +158,7 @@ class BoundRoot:
     git_executable: ControlObjectBinding
     launcher_executable: ControlObjectBinding
     git_control: GitControlBinding | None = None
+    git_capability_verified: bool = False
     operation: OperationBudget | None = None
     managed_ancestor_paths: set[PurePosixPath] = field(default_factory=set)
     managed_ancestors: dict[
@@ -196,6 +205,7 @@ class GitControlBinding:
     owner_record: ControlObjectBinding
     owner_record_name: str
     owner_nonce: str
+    static_profile_verified: bool
 
 
 @dataclass(frozen=True)
@@ -5121,9 +5131,14 @@ def _terminate_git_process(process: subprocess.Popen[bytes]) -> None:
         ) from error
 
 
-def _collect_bounded_git_output(
+def _collect_bounded_process_output(
     process: subprocess.Popen[bytes],
-    operation: OperationBudget | None = None,
+    operation: OperationBudget | None,
+    *,
+    stdout_limit: int,
+    stderr_limit: int,
+    timeout_seconds: float,
+    label: str,
 ) -> tuple[int, bytes, bytes]:
     if process.stdout is None or process.stderr is None:
         _terminate_git_process(process)
@@ -5136,10 +5151,10 @@ def _collect_bounded_git_output(
         "stderr": bytearray(),
     }
     limits = {
-        "stdout": MAX_GIT_STDOUT_BYTES,
-        "stderr": MAX_GIT_STDERR_BYTES,
+        "stdout": stdout_limit,
+        "stderr": stderr_limit,
     }
-    deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout_seconds
     if operation is not None:
         deadline = min(deadline, operation.deadline)
     try:
@@ -5148,7 +5163,7 @@ def _collect_bounded_git_output(
             if remaining <= 0:
                 _terminate_git_process(process)
                 raise MirrorSyncError(
-                    f"bounded Git verification exceeded {GIT_TIMEOUT_SECONDS} seconds"
+                    f"bounded {label} exceeded {timeout_seconds} seconds"
                 )
             events = selector.select(remaining)
             if not events:
@@ -5165,7 +5180,7 @@ def _collect_bounded_git_output(
                 except OSError as error:
                     _terminate_git_process(process)
                     raise MirrorSyncError(
-                        f"cannot read bounded Git {stream_name}: {error}"
+                        f"cannot read bounded {label} {stream_name}: {error}"
                     ) from error
                 if not chunk:
                     selector.unregister(key.fileobj)
@@ -5179,7 +5194,8 @@ def _collect_bounded_git_output(
                 if len(current) > maximum:
                     _terminate_git_process(process)
                     raise MirrorSyncError(
-                        f"bounded Git {stream_name} exceeds the {maximum}-byte limit"
+                        f"bounded {label} {stream_name} exceeds the "
+                        f"{maximum}-byte limit"
                     )
         remaining = max(0.0, deadline - time.monotonic())
         try:
@@ -5187,7 +5203,7 @@ def _collect_bounded_git_output(
         except subprocess.TimeoutExpired as error:
             _terminate_git_process(process)
             raise MirrorSyncError(
-                f"bounded Git verification exceeded {GIT_TIMEOUT_SECONDS} seconds"
+                f"bounded {label} exceeded {timeout_seconds} seconds"
             ) from error
         return return_code, bytes(buffers["stdout"]), bytes(buffers["stderr"])
     except BaseException:
@@ -5199,6 +5215,225 @@ def _collect_bounded_git_output(
         process.stderr.close()
 
 
+def _collect_bounded_git_output(
+    process: subprocess.Popen[bytes],
+    operation: OperationBudget | None = None,
+) -> tuple[int, bytes, bytes]:
+    return _collect_bounded_process_output(
+        process,
+        operation,
+        stdout_limit=MAX_GIT_STDOUT_BYTES,
+        stderr_limit=MAX_GIT_STDERR_BYTES,
+        timeout_seconds=GIT_TIMEOUT_SECONDS,
+        label="Git verification",
+    )
+
+
+def _parse_git_version_output(payload: bytes) -> tuple[int, int, int]:
+    match = GIT_VERSION_RE.fullmatch(payload)
+    if match is None:
+        raise MirrorSyncError("Git capability probe returned malformed version output")
+    return (
+        int(match.group(1)),
+        int(match.group(2)),
+        int(match.group(3)),
+    )
+
+
+def _verify_git_capability(bound_root: BoundRoot) -> None:
+    if bound_root.git_capability_verified:
+        _revalidate_bound_root(bound_root)
+        return
+    command = [
+        LAUNCHER_EXECUTABLE.as_posix(),
+        "-I",
+        "-B",
+        "-S",
+        "-c",
+        LAUNCHER_PROGRAM,
+        str(bound_root.fd),
+        GIT_EXECUTABLE.as_posix(),
+        "--no-lazy-fetch",
+        "--version",
+    ]
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        _revalidate_bound_root(bound_root)
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_git_environment(),
+            pass_fds=(bound_root.fd,),
+            start_new_session=True,
+        )
+        return_code, stdout, stderr = _collect_bounded_process_output(
+            process,
+            bound_root.operation,
+            stdout_limit=MAX_GIT_VERSION_STDOUT_BYTES,
+            stderr_limit=MAX_GIT_VERSION_STDERR_BYTES,
+            timeout_seconds=GIT_TIMEOUT_SECONDS,
+            label="Git capability probe",
+        )
+    except OSError as error:
+        if process is not None:
+            _terminate_git_process(process)
+        raise MirrorSyncError(
+            f"cannot run bounded Git capability probe: {error}"
+        ) from error
+    finally:
+        _revalidate_bound_root(bound_root)
+    if return_code != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        if len(detail) > 500:
+            detail = detail[:500] + "..."
+        raise MirrorSyncError(
+            "Git 2.45.0 or newer with --no-lazy-fetch is required"
+            + (f": {detail}" if detail else f" (exit {return_code})")
+        )
+    version = _parse_git_version_output(stdout)
+    if version < MINIMUM_GIT_VERSION:
+        rendered = ".".join(str(component) for component in version)
+        raise MirrorSyncError(
+            f"Git 2.45.0 or newer with --no-lazy-fetch is required; observed {rendered}"
+        )
+    bound_root.git_capability_verified = True
+
+
+def _run_private_git_config_process(
+    bound_root: BoundRoot,
+    config_name: str,
+) -> bytes:
+    if bound_root.git_control is None:
+        raise MirrorSyncError(
+            "Git control plane must be bound before static config inspection"
+        )
+    if not bound_root.git_capability_verified:
+        raise MirrorSyncError("Git capability gate has not completed")
+    command = [
+        LAUNCHER_EXECUTABLE.as_posix(),
+        "-I",
+        "-B",
+        "-S",
+        "-c",
+        LAUNCHER_PROGRAM,
+        str(bound_root.git_control.private.fd),
+        GIT_EXECUTABLE.as_posix(),
+        "--no-lazy-fetch",
+        "--no-optional-locks",
+        "--no-replace-objects",
+        "config",
+        f"--file={config_name}",
+        "--no-includes",
+        "--null",
+        "--list",
+    ]
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        _revalidate_bound_root(bound_root)
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_git_environment(),
+            pass_fds=(
+                bound_root.fd,
+                bound_root.git_control.private.fd,
+            ),
+            start_new_session=True,
+        )
+        return_code, stdout, stderr = _collect_bounded_git_output(
+            process,
+            bound_root.operation,
+        )
+    except OSError as error:
+        if process is not None:
+            _terminate_git_process(process)
+        raise MirrorSyncError(
+            f"cannot inspect private Git config snapshot: {error}"
+        ) from error
+    finally:
+        _revalidate_bound_root(bound_root)
+    if return_code == 0:
+        return stdout
+    detail = stderr.decode("utf-8", errors="replace").strip()
+    if len(detail) > 1000:
+        detail = detail[:1000] + "..."
+    raise MirrorSyncError(
+        "private Git config snapshot inspection failed"
+        + (f": {detail}" if detail else f" (exit {return_code})")
+    )
+
+
+def _verify_static_git_profile(bound_root: BoundRoot) -> None:
+    binding = bound_root.git_control
+    if binding is None:
+        raise MirrorSyncError(
+            "Git control plane must be bound before static profile inspection"
+        )
+    if binding.static_profile_verified:
+        _revalidate_bound_root(bound_root)
+        return
+
+    for record in binding.private_objects_manifest:
+        if len(record) < 2 or not isinstance(record[1], str):
+            raise MirrorSyncError(
+                "private Git object snapshot has an invalid manifest record"
+            )
+        relative_path = PurePosixPath(record[1])
+        if relative_path.name.casefold().endswith(".promisor"):
+            raise MirrorSyncError(
+                f"partial/promisor Git object state is not allowed: {relative_path}"
+            )
+        if relative_path.as_posix() in {
+            "info/alternates",
+            "info/http-alternates",
+        }:
+            raise MirrorSyncError(
+                f"Git object alternates are not allowed: {relative_path}"
+            )
+
+    control_files = {
+        record[1]
+        for record in binding.private_manifest
+        if (len(record) >= 2 and record[0] == "file" and isinstance(record[1], str))
+    }
+    for config_name in ("config", "config.worktree"):
+        if config_name not in control_files:
+            continue
+        raw_config = _run_private_git_config_process(
+            bound_root,
+            config_name,
+        )
+        for record in raw_config.split(b"\0"):
+            if not record:
+                continue
+            raw_key = record.split(b"\n", 1)[0]
+            try:
+                key = raw_key.decode("utf-8", errors="strict").casefold()
+            except UnicodeDecodeError as error:
+                raise MirrorSyncError(
+                    "private Git config key is not valid UTF-8"
+                ) from error
+            if key == "include.path" or (
+                key.startswith("includeif.") and key.endswith(".path")
+            ):
+                raise MirrorSyncError(
+                    "repository-local Git include paths are not allowed"
+                )
+            if key == "extensions.partialclone" or (
+                key.startswith("remote.")
+                and (key.endswith(".promisor") or key.endswith(".partialclonefilter"))
+            ):
+                raise MirrorSyncError(
+                    f"partial/promisor Git config state is not allowed: {key}"
+                )
+    binding.static_profile_verified = True
+    _revalidate_bound_root(bound_root)
+
+
 def _run_git_process(
     bound_root: BoundRoot,
     *arguments: str,
@@ -5207,8 +5442,13 @@ def _run_git_process(
         raise MirrorSyncError(
             "Git control plane must be bound before repository verification"
         )
+    if not bound_root.git_capability_verified:
+        raise MirrorSyncError("Git capability gate has not completed")
+    if not bound_root.git_control.static_profile_verified:
+        raise MirrorSyncError("Git static repository profile has not completed")
     git_command = [
         GIT_EXECUTABLE.as_posix(),
+        "--no-lazy-fetch",
         "--git-dir=.",
         f"--work-tree={bound_root.path}",
         "--no-optional-locks",
@@ -5270,6 +5510,10 @@ def _run_git_process(
 
 def _ensure_git_control_binding(root: BoundRoot) -> None:
     if root.git_control is not None:
+        if not root.git_capability_verified:
+            raise MirrorSyncError("Git capability gate has not completed")
+        if not root.git_control.static_profile_verified:
+            raise MirrorSyncError("Git static repository profile has not completed")
         _revalidate_bound_root(root)
         return
     marker = _bind_git_marker(root)
@@ -5343,6 +5587,11 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
             require_directory=True,
         )
         controls.append(objects)
+        for binding in (marker, admin, common, objects):
+            _revalidate_control_object(root, binding)
+        _verify_git_capability(root)
+        for binding in (marker, admin, common, objects):
+            _revalidate_control_object(root, binding)
         (
             private_parent,
             private_name,
@@ -5408,7 +5657,9 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
             owner_record=owner_record,
             owner_record_name=owner_record_name,
             owner_nonce=owner_nonce,
+            static_profile_verified=False,
         )
+        _verify_static_git_profile(root)
         _revalidate_bound_root(root)
     except BaseException:
         root.git_control = None
@@ -5519,6 +5770,7 @@ def _verify_git_safety(repository_root: Root) -> None:
 
 
 def _verify_git_root(repository_root: Root) -> None:
+    _verify_git_safety(repository_root)
     raw_top_level = _run_git(
         repository_root,
         "rev-parse",
@@ -5548,7 +5800,6 @@ def _verify_git_root(repository_root: Root) -> None:
         raise MirrorSyncError(
             f"target root is not the exact Git top-level: {_root_path(repository_root)}"
         )
-    _verify_git_safety(repository_root)
 
 
 def _current_commit(repository_root: Root) -> str:

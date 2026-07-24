@@ -17,8 +17,9 @@
   wholly absent bootstrap paths may be created. Never overwrite consumer edits.
 - Preserve bidirectional root-overlap rejection, root-bound transaction
   locking, FD-relative IO, fixed/bound Git executable and control-plane
-  identities, parent-frozen private Git control snapshots, bounded Git
-  subprocesses, and Git lazy-fetch, replace/alternate/include rejection.
+  identities, the pre-snapshot Git 2.45+ `--no-lazy-fetch` capability gate,
+  parent-frozen private Git control snapshots, bounded Git subprocesses, and
+  pre-object partial/promisor, alternate, include, and replace rejection.
 - Preserve the bounded stage-0 consumer index snapshot before every write,
   no-clobber conditional publication, durable per-file and whole-generation
   crash recovery, terminal whole-target-group validation, and final

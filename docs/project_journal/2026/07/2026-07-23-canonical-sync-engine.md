@@ -49,6 +49,13 @@ superseded_by:
   materialization. Per-command revalidation now binds the complete
   pack/idx/loose manifest and rejects any invalidated content-stability signal
   before or after Git without repeatedly rereading stable pack bytes.
+- Fresh-review Git control-plane findings are closed locally. After binding the
+  fixed executable and source marker/admin/common/object directories, mirror
+  generation requires one bounded Git 2.45+ `--no-lazy-fetch` capability
+  probe. Before any repository/object Git command, the parent-private snapshot
+  rejects `.promisor`/alternate markers and parses only its own config files
+  with `--file --no-includes`, rejecting include, partial-clone, and promisor
+  keys by presence. Every later Git argv carries `--no-lazy-fetch`.
 - A prior generated receipt can authorize only exact, clean retired paths:
   receipt digests plus target `HEAD`, stage-0 index, worktree bytes/mode, and
   recovery state must agree. Rename/removal uses desired-absent group
@@ -64,6 +71,14 @@ superseded_by:
   exists and none was invented or installed. Generated files are staged with
   filter-free Git plumbing, deletion is explicit, and mirror parity is checked
   again after the generated commit.
+- Toolbox automation now binds the exact prepared remote branch record and
+  fetched tracking SHA, revalidates base/branch state immediately before an
+  ordinary push, and treats an exact already-published desired SHA as an
+  idempotent no-op. `pr_has_changes` is independent from
+  `branch_needs_update`, so stale-to-clean reconciliation still advances the
+  branch; an exact owned open PR is then revalidated against its lifecycle,
+  base/head, head OID, owner, repository shape, and marker before it is closed
+  without deleting the branch.
 - Scheduler runtime timestamps use a bounded canonical UTC representation,
   reject impossible or far-future values, and recover only timestamp
   corruption under the state lock without accepting unsafe structure or mode.
@@ -89,6 +104,22 @@ superseded_by:
 
 ## Validation Evidence
 
+- `python3 -B -m unittest tests.test_sync_toolbox_automation
+  tests.test_source_lock`: 119 tests passed in 956.398 seconds after the
+  fresh-review fixes. The added matrix covers unsupported/old/malformed Git
+  capability output, bounded probe failures, all partial/promisor config
+  values by key presence, case-insensitive promisor and alternate markers,
+  helper non-execution, failed-snapshot cleanup/retry, strict remote-ref
+  parsing, fetch mismatch, push drift/idempotence/creation, stale-to-clean
+  branch advancement, and exact clean-PR closure.
+- `python3 scripts/sync_canonical_mirrors.py refresh-lock` and
+  `refresh-lock --check` both completed for all six locked sources. The
+  generator/workflow follow-up does not change a declared consumer source, so
+  `sync-source-lock.json` remains
+  `678b5eaeef2a12280c062f657dda9d23b04bcc77bc11608b5a8edacea96ab131`.
+- `actionlint .github/workflows/sync-toolbox.yml`, Ruff lint and format check
+  for the three changed Python files, and `git diff --check` all passed after
+  the final edits.
 - `PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -q -b
   tests/test_source_lock.py`: 99 tests passed in 1057.621 seconds after the
   final format-only test update.
@@ -105,8 +136,8 @@ superseded_by:
   canonical sources after the final source changes. The final
   `sync-source-lock.json` SHA-256 is
   `678b5eaeef2a12280c062f657dda9d23b04bcc77bc11608b5a8edacea96ab131`.
-  This follow-up changes only the generator, its focused tests, and
-  documentation, so no locked canonical source digest changed.
+  This follow-up changes the generator, toolbox workflow, their focused tests,
+  and documentation, so no locked canonical source digest changed.
 - `PYTHONPYCACHEPREFIX=<task-scoped-temp> python3 -B -m compileall -q scripts tests`
   passed. The temporary compile root was removed; the repository contains no
   `__pycache__`, `.pyc`, or `.pyo`.

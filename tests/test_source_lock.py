@@ -1461,7 +1461,238 @@ class MirrorGeneratorTests(unittest.TestCase):
         ):
             self._generate()
 
-    def test_run_git_disables_promisor_lazy_fetch(self) -> None:
+    def test_git_capability_probe_fails_before_private_materialization(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "unsupported option",
+                (129, b"", b"unknown option: no-lazy-fetch\n"),
+                "Git 2.45.0 or newer",
+            ),
+            (
+                "old version",
+                (0, b"git version 2.44.0\n", b""),
+                "observed 2.44.0",
+            ),
+            (
+                "malformed version",
+                (0, b"git 2.45.0\n", b""),
+                "malformed version output",
+            ),
+            (
+                "multiple version lines",
+                (0, b"git version 2.45.0\ngit version 2.45.0\n", b""),
+                "malformed version output",
+            ),
+        )
+        for name, result, expected_error in cases:
+            with self.subTest(name=name):
+                bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
+                try:
+                    with (
+                        mock.patch.object(
+                            MIRROR_MODULE.subprocess,
+                            "Popen",
+                            return_value=mock.Mock(),
+                        ) as popen,
+                        mock.patch.object(
+                            MIRROR_MODULE,
+                            "_collect_bounded_process_output",
+                            return_value=result,
+                        ),
+                        mock.patch.object(
+                            MIRROR_MODULE,
+                            "_materialize_private_git_control",
+                        ) as materialize,
+                        self.assertRaisesRegex(
+                            MIRROR_MODULE.MirrorSyncError,
+                            expected_error,
+                        ),
+                    ):
+                        MIRROR_MODULE._ensure_git_control_binding(bound_root)
+                    materialize.assert_not_called()
+                    self.assertFalse(bound_root.git_capability_verified)
+                    self.assertIsNone(bound_root.git_control)
+                    command = popen.call_args.args[0]
+                    self.assertIn("--no-lazy-fetch", command)
+                    self.assertEqual(command[-1], "--version")
+                finally:
+                    MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_git_capability_probe_bounds_output_and_runtime_before_snapshot(
+        self,
+    ) -> None:
+        for error_text in (
+            "bounded Git capability probe stdout exceeds the 1024-byte limit",
+            "bounded Git capability probe exceeded 30 seconds",
+        ):
+            with self.subTest(error=error_text):
+                bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
+                try:
+                    with (
+                        mock.patch.object(
+                            MIRROR_MODULE.subprocess,
+                            "Popen",
+                            return_value=mock.Mock(),
+                        ),
+                        mock.patch.object(
+                            MIRROR_MODULE,
+                            "_collect_bounded_process_output",
+                            side_effect=MIRROR_MODULE.MirrorSyncError(error_text),
+                        ),
+                        mock.patch.object(
+                            MIRROR_MODULE,
+                            "_materialize_private_git_control",
+                        ) as materialize,
+                        self.assertRaisesRegex(
+                            MIRROR_MODULE.MirrorSyncError,
+                            re.escape(error_text),
+                        ),
+                    ):
+                        MIRROR_MODULE._ensure_git_control_binding(bound_root)
+                    materialize.assert_not_called()
+                    self.assertFalse(bound_root.git_capability_verified)
+                    self.assertIsNone(bound_root.git_control)
+                finally:
+                    MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_static_git_profile_rejects_partial_clone_config_before_object_git(
+        self,
+    ) -> None:
+        cases = (
+            ("extensions.partialClone", "origin"),
+            ("remote.origin.promisor", "true"),
+            ("remote.origin.promisor", "false"),
+            ("remote.origin.promisor", ""),
+            ("remote.origin.partialCloneFilter", "blob:none"),
+        )
+        for key, value in cases:
+            with self.subTest(key=key, value=value):
+                self._git(self.canonical_root, "config", key, value)
+                try:
+                    with (
+                        mock.patch.object(
+                            MIRROR_MODULE,
+                            "_run_git_process",
+                        ) as run_git_process,
+                        self.assertRaisesRegex(
+                            MIRROR_MODULE.MirrorSyncError,
+                            "partial/promisor Git config state",
+                        ),
+                    ):
+                        self._generate()
+                    run_git_process.assert_not_called()
+                finally:
+                    self._git(
+                        self.canonical_root,
+                        "config",
+                        "--unset-all",
+                        key,
+                    )
+
+    def test_static_git_profile_rejects_promisor_and_alternate_markers(
+        self,
+    ) -> None:
+        cases = (
+            Path("pack") / "fixture.PrOmIsOr",
+            Path("info") / "alternates",
+            Path("info") / "http-alternates",
+        )
+        for relative_path in cases:
+            with self.subTest(path=relative_path.as_posix()):
+                marker = self.canonical_root / ".git" / "objects" / relative_path
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text("fixture\n", encoding="utf-8")
+                try:
+                    with (
+                        mock.patch.object(
+                            MIRROR_MODULE,
+                            "_run_private_git_config_process",
+                        ) as inspect_config,
+                        mock.patch.object(
+                            MIRROR_MODULE,
+                            "_run_git_process",
+                        ) as run_git_process,
+                        self.assertRaisesRegex(
+                            MIRROR_MODULE.MirrorSyncError,
+                            "partial/promisor|object alternates",
+                        ),
+                    ):
+                        self._generate()
+                    inspect_config.assert_not_called()
+                    run_git_process.assert_not_called()
+                finally:
+                    marker.unlink()
+
+    def test_static_git_profile_does_not_invoke_configured_helpers(self) -> None:
+        marker = self.root / "credential-helper-invoked"
+        helper = self.root / "credential-helper"
+        helper.write_text(
+            f"#!/bin/sh\nprintf invoked > {marker}\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        self._git(
+            self.canonical_root,
+            "config",
+            "credential.helper",
+            helper.as_posix(),
+        )
+        self._git(
+            self.canonical_root,
+            "config",
+            "remote.origin.promisor",
+            "false",
+        )
+
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "partial/promisor Git config state",
+        ):
+            self._generate()
+
+        self.assertFalse(marker.exists())
+
+    def test_static_git_profile_failure_cleans_snapshot_and_can_retry(
+        self,
+    ) -> None:
+        self._git(
+            self.canonical_root,
+            "config",
+            "remote.origin.promisor",
+            "false",
+        )
+        bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_cleanup_private_git_control",
+                    wraps=MIRROR_MODULE._cleanup_private_git_control,
+                ) as cleanup,
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "partial/promisor Git config state",
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            cleanup.assert_called_once()
+            self.assertTrue(bound_root.git_capability_verified)
+            self.assertIsNone(bound_root.git_control)
+
+            self._git(
+                self.canonical_root,
+                "config",
+                "--unset-all",
+                "remote.origin.promisor",
+            )
+            MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            self.assertTrue(bound_root.git_control.static_profile_verified)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_run_git_rejects_promisor_state_before_lazy_fetch(self) -> None:
         donor = self.root / "donor"
         donor.mkdir()
         self._init_git_repository(donor, "Joey-Tools/donor-fixture")
@@ -1511,9 +1742,15 @@ class MirrorGeneratorTests(unittest.TestCase):
         )
         self.assertFalse(local_object.exists())
 
-        with self.assertRaisesRegex(
-            MIRROR_MODULE.MirrorSyncError,
-            "Git verification failed",
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_run_git_process",
+            ) as run_git_process,
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "partial/promisor Git config state",
+            ),
         ):
             MIRROR_MODULE._run_git(
                 self.canonical_root,
@@ -1522,6 +1759,7 @@ class MirrorGeneratorTests(unittest.TestCase):
                 promised_object,
             )
 
+        run_git_process.assert_not_called()
         self.assertFalse(local_object.exists())
 
     def test_run_git_sanitizes_ambient_git_environment(self) -> None:
@@ -1602,6 +1840,7 @@ class MirrorGeneratorTests(unittest.TestCase):
         )
         self.assertIn(MIRROR_MODULE.LAUNCHER_PROGRAM, captured["command"])
         self.assertIn(MIRROR_MODULE.GIT_EXECUTABLE.as_posix(), captured["command"])
+        self.assertIn("--no-lazy-fetch", captured["command"])
         self.assertIn("--git-dir=.", captured["command"])
         self.assertNotIn("cwd", captured)
         self.assertNotIn("preexec_fn", captured)

@@ -71,19 +71,24 @@ The generator binds canonical and consumer roots by directory file descriptor
 for the complete transaction, uses cooperative root-bound locks, and rejects
 symlink ancestors or targets. It also binds the fixed Git executable and each
 repository's `.git` marker, admin/common directories, and object directory;
-then it double-reads those bound control files into a parent-private frozen
-snapshot before launching Git. The copied content-addressed object store is
-fully hashed once into a path/identity/access/size/content manifest. Every Git
-call revalidates that complete pack/idx/loose manifest before and after the
-child; stable file change signals avoid rereading pack bytes while still
-failing closed if content stability can no longer be proved. Git calls use only
-that snapshot, are deadline/output bounded, and reject unsafe config includes,
-replace refs, alternates, and lazy object fetching. Canonical and consumer
-origins must match the lock, roots must not overlap in either ancestry
-direction, and managed paths may never enter the Git control plane. Target
-validation also rejects case-insensitive/NFC collisions and overlap in either
-ancestry direction with the receipt, transaction markers, or per-target
-exchange journals.
+proves that fixed executable is Git 2.45 or newer and accepts the explicit
+`--no-lazy-fetch` option, then double-reads those bound control files into a
+parent-private frozen snapshot before any repository/object Git command. The
+copied content-addressed object store is fully hashed once into a
+path/identity/access/size/content manifest. Before repository Git runs, a
+bounded `--file`/`--no-includes` parse of only the private `config` and optional
+`config.worktree` snapshot rejects include directives and every partial-clone
+or promisor key by presence, while direct object inventory rejects promisor and
+alternate markers. Every later Git argv also carries `--no-lazy-fetch` and
+revalidates the complete pack/idx/loose manifest before and after the child;
+stable file change signals avoid rereading pack bytes while still failing
+closed if content stability can no longer be proved. Git calls use only that
+snapshot, are deadline/output bounded, and retain defense-in-depth rejection
+of replace refs and alternates. Canonical and consumer origins must match the
+lock, roots must not overlap in either ancestry direction, and managed paths
+may never enter the Git control plane. Target validation also rejects
+case-insensitive/NFC collisions and overlap in either ancestry direction with
+the receipt, transaction markers, or per-target exchange journals.
 
 The live Git binding includes `HEAD`, its resolved loose ref when present,
 `packed-refs`, common/worktree config, the index, and explicit absence records
