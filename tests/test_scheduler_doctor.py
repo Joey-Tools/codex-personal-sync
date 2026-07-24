@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 import plistlib
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -2690,6 +2691,383 @@ class SchedulerDoctorTests(unittest.TestCase):
         )
         self.assertIsNotNone(MODULE._load_macos_scheduler_config(paths))
 
+    def test_legacy_launchd_cleanup_binds_file_across_native_actions(
+        self,
+    ) -> None:
+        mutations = (
+            ("replacement", "object identity changed"),
+            ("content", "content changed"),
+            ("mode", "access policy changed"),
+            ("parent", "parent chain changed"),
+            ("missing", "is missing"),
+            ("unreadable", "is unreadable"),
+        )
+        label = MODULE.LEGACY_LAUNCHD_LABELS[0]
+        for mutation, expected_error in mutations:
+            with self.subTest(mutation=mutation):
+                case_user_home = self.root / f"legacy-{mutation}" / "home"
+                case_home = case_user_home / ".codex"
+                runner = case_home / "bin" / "codex-personal-sync"
+                runner.parent.mkdir(parents=True)
+                runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                runner.chmod(0o755)
+                paths = MODULE.SchedulerPaths(
+                    platform="macos",
+                    launchd_plist=(
+                        case_user_home
+                        / "Library"
+                        / "LaunchAgents"
+                        / f"{MODULE.LAUNCHD_LABEL}.plist"
+                    ),
+                )
+                legacy = MODULE._legacy_launchd_plist(paths, label)
+                legacy.parent.mkdir(parents=True)
+                original = b"legacy launchd config\n"
+                replacement = b"user replacement config\n"
+                legacy.write_bytes(original)
+                legacy.chmod(0o600)
+                force_unreadable = False
+                real_read = MODULE._read_managed_state_bytes
+
+                def mutate_legacy(
+                    _args: list[str],
+                    *,
+                    dry_run: bool,
+                    allow_fail: bool = False,
+                ) -> None:
+                    del dry_run, allow_fail
+                    nonlocal force_unreadable
+                    if mutation == "replacement":
+                        candidate = legacy.with_name(legacy.name + ".replacement")
+                        candidate.write_bytes(replacement)
+                        candidate.chmod(0o600)
+                        os.replace(candidate, legacy)
+                    elif mutation == "content":
+                        legacy.write_bytes(replacement)
+                        legacy.chmod(0o600)
+                    elif mutation == "mode":
+                        legacy.chmod(0o644)
+                    elif mutation == "parent":
+                        displaced_parent = legacy.parent.with_name(
+                            legacy.parent.name + ".displaced"
+                        )
+                        legacy.parent.rename(displaced_parent)
+                        legacy.parent.mkdir()
+                        candidate = legacy.parent / legacy.name
+                        candidate.write_bytes(replacement)
+                        candidate.chmod(0o600)
+                    elif mutation == "missing":
+                        legacy.unlink()
+                    else:
+                        force_unreadable = True
+
+                def fail_legacy_read(
+                    file_fd: int,
+                    path: Path,
+                    maximum_bytes: int = MODULE.MAX_MANAGED_STATE_BYTES,
+                ) -> bytes:
+                    if force_unreadable and path == legacy:
+                        raise MODULE.SyncError("injected legacy read failure")
+                    return real_read(file_fd, path, maximum_bytes)
+
+                with (
+                    mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_run_native_command",
+                        side_effect=mutate_legacy,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_read_managed_state_bytes",
+                        side_effect=fail_legacy_read,
+                    ),
+                    contextlib.redirect_stdout(io.StringIO()),
+                    self.assertRaisesRegex(MODULE.SyncError, expected_error),
+                ):
+                    MODULE.install_scheduler(
+                        case_home,
+                        "owner/public-sync",
+                        17,
+                        "macos",
+                        None,
+                        dry_run=False,
+                        enable=True,
+                    )
+
+                if mutation in {"replacement", "content"}:
+                    self.assertEqual(legacy.read_bytes(), replacement)
+                elif mutation == "mode":
+                    self.assertEqual(stat.S_IMODE(legacy.stat().st_mode), 0o644)
+                elif mutation == "parent":
+                    displaced = legacy.parent.with_name(
+                        legacy.parent.name + ".displaced"
+                    )
+                    self.assertEqual(
+                        (displaced / legacy.name).read_bytes(),
+                        original,
+                    )
+                    self.assertEqual(legacy.read_bytes(), replacement)
+                elif mutation == "missing":
+                    self.assertFalse(legacy.exists())
+                else:
+                    self.assertEqual(legacy.read_bytes(), original)
+    def test_legacy_launchd_cleanup_allows_mtime_only_churn(self) -> None:
+        self.write_runner()
+        paths = MODULE._scheduler_paths("macos", self.home)
+        label = MODULE.LEGACY_LAUNCHD_LABELS[0]
+        legacy = MODULE._legacy_launchd_plist(paths, label)
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes(b"legacy launchd config\n")
+        legacy.chmod(0o600)
+
+        def touch_legacy(
+            _args: list[str],
+            *,
+            dry_run: bool,
+            allow_fail: bool = False,
+        ) -> None:
+            del dry_run, allow_fail
+            if legacy.exists():
+                metadata = legacy.stat()
+                os.utime(
+                    legacy,
+                    ns=(
+                        metadata.st_atime_ns,
+                        metadata.st_mtime_ns + 1_000_000,
+                    ),
+                )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_run_native_command",
+                side_effect=touch_legacy,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            MODULE.install_scheduler(
+                self.home,
+                "owner/public-sync",
+                17,
+                "macos",
+                None,
+                dry_run=False,
+                enable=True,
+            )
+
+        self.assertFalse(legacy.exists())
+    def test_scheduler_status_binds_config_across_native_query(self) -> None:
+        for platform_name in ("macos", "linux"):
+            with self.subTest(platform=platform_name):
+                case_user_home = self.root / f"status-{platform_name}" / "home"
+                case_home = case_user_home / ".codex"
+                runner = case_home / "bin" / "codex-personal-sync"
+                runner.parent.mkdir(parents=True)
+                runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                runner.chmod(0o755)
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        MODULE.install_scheduler(
+                            case_home,
+                            "owner/public-sync",
+                            17,
+                            platform_name,
+                            None,
+                            dry_run=False,
+                            enable=False,
+                        )
+                    paths = MODULE._scheduler_paths(platform_name, case_home)
+                    target = (
+                        paths.launchd_plist
+                        if platform_name == "macos"
+                        else paths.systemd_service
+                    )
+                    assert target is not None
+                    original = target.read_text(encoding="utf-8")
+
+                    def mutate_during_status(
+                        args: list[str],
+                        **_kwargs: object,
+                    ) -> subprocess.CompletedProcess[str]:
+                        target.write_text(
+                            original.replace(
+                                "owner/public-sync",
+                                "owner/changed-sync",
+                            ),
+                            encoding="utf-8",
+                        )
+                        target.chmod(0o600)
+                        return subprocess.CompletedProcess(
+                            args,
+                            0,
+                            "enabled\n",
+                            "",
+                        )
+
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_native_scheduler_argv",
+                            side_effect=lambda args: args,
+                        ),
+                        mock.patch.object(
+                            MODULE.subprocess,
+                            "run",
+                            side_effect=mutate_during_status,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_stable_scheduler_runner_matches",
+                            return_value=True,
+                        ),
+                    ):
+                        report = MODULE.scheduler_report(
+                            case_home,
+                            platform_name,
+                        )
+
+                self.assertEqual(report.failure_code, "scheduler-config-drift")
+                self.assertIsNone(report.enabled)
+                self.assertIn("content changed", report.failure_reason or "")
+    def test_scheduler_status_allows_mtime_churn_and_reports_unavailable(
+        self,
+    ) -> None:
+        self.write_runner()
+        for platform_name in ("macos", "linux"):
+            with self.subTest(platform=platform_name):
+                self.install_scheduler_quietly(
+                    "owner/public-sync",
+                    17,
+                    platform_name,
+                )
+                paths = MODULE._scheduler_paths(platform_name, self.home)
+                target = (
+                    paths.launchd_plist
+                    if platform_name == "macos"
+                    else paths.systemd_timer
+                )
+                assert target is not None
+
+                def touch_during_status(
+                    args: list[str],
+                    **_kwargs: object,
+                ) -> subprocess.CompletedProcess[str]:
+                    metadata = target.stat()
+                    os.utime(
+                        target,
+                        ns=(
+                            metadata.st_atime_ns,
+                            metadata.st_mtime_ns + 1_000_000,
+                        ),
+                    )
+                    return subprocess.CompletedProcess(
+                        args,
+                        0,
+                        "enabled\n",
+                        "",
+                    )
+
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(
+                        mock.patch.object(
+                            MODULE,
+                            "_native_scheduler_argv",
+                            side_effect=lambda args: args,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            MODULE,
+                            "_stable_scheduler_runner_matches",
+                            return_value=True,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            MODULE,
+                            "_current_releases_for_scheduler",
+                            return_value=(),
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            MODULE,
+                            "_scheduler_release_integrity_issues",
+                            return_value=(),
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            MODULE,
+                            "_quarantine_batch_count",
+                            return_value=0,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            MODULE.subprocess,
+                            "run",
+                            side_effect=touch_during_status,
+                        )
+                    )
+                    healthy = MODULE.scheduler_report(
+                        self.home,
+                        platform_name,
+                    )
+                self.assertTrue(healthy.enabled)
+                self.assertIsNone(healthy.failure_code)
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_native_scheduler_argv",
+                        side_effect=lambda args: args,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_stable_scheduler_runner_matches",
+                        return_value=True,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_current_releases_for_scheduler",
+                        return_value=(),
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_scheduler_release_integrity_issues",
+                        return_value=(),
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_quarantine_batch_count",
+                        return_value=0,
+                    ),
+                    mock.patch.object(
+                        MODULE.subprocess,
+                        "run",
+                        side_effect=OSError("status unavailable"),
+                    ),
+                ):
+                    unavailable = MODULE.scheduler_report(
+                        self.home,
+                        platform_name,
+                    )
+                self.assertIsNone(unavailable.enabled)
+                self.assertEqual(
+                    unavailable.failure_code,
+                    "scheduler-daemon-unavailable",
+                )
+
     def test_linux_install_binds_semantically_audited_pair(self) -> None:
         self.write_runner()
         self.install_scheduler_quietly("owner/old", 17, "linux")
@@ -3188,8 +3566,16 @@ class SchedulerDoctorTests(unittest.TestCase):
                 self.subTest(label=label),
                 mock.patch.object(
                     MODULE,
-                    "_load_scheduler_config",
-                    return_value=config,
+                    "_audit_scheduler_config",
+                    return_value=MODULE.SchedulerConfigAudit(
+                        config=config,
+                        snapshots=(),
+                    ),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_retain_scheduler_config_audit_bindings",
+                    return_value=contextlib.nullcontext(()),
                 ),
                 mock.patch.object(
                     MODULE,
@@ -3249,8 +3635,16 @@ class SchedulerDoctorTests(unittest.TestCase):
         with (
             mock.patch.object(
                 MODULE,
-                "_load_scheduler_config",
-                return_value=config,
+                "_audit_scheduler_config",
+                return_value=MODULE.SchedulerConfigAudit(
+                    config=config,
+                    snapshots=(),
+                ),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_retain_scheduler_config_audit_bindings",
+                return_value=contextlib.nullcontext(()),
             ),
             mock.patch.object(
                 MODULE,

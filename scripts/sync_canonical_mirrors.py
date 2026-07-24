@@ -16,6 +16,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 import unicodedata
@@ -62,6 +63,22 @@ MAX_GIT_VERSION_STDERR_BYTES = 4096
 MAX_GIT_SNAPSHOT_ENTRIES = 100_000
 MAX_GIT_SNAPSHOT_BYTES = 512 * 1024 * 1024
 MAX_CONSUMER_TRACKED_ENTRIES = 100_000
+MAX_SYNC_HISTORY_ALLOWED_PATH_BYTES = 1024 * 1024
+MAX_SYNC_HISTORY_COMMITS = 256
+MAX_SYNC_HISTORY_PARENTS_PER_COMMIT = 16
+MAX_SYNC_HISTORY_PARENT_EDGES = 1024
+MAX_SYNC_HISTORY_PATH_EVENTS = 100_000
+MAX_SYNC_HISTORY_PATH_BYTES = 8 * 1024 * 1024
+MAX_SYNC_HISTORY_BLOBS = 100_000
+MAX_SYNC_HISTORY_BLOB_BYTES = 512 * 1024 * 1024
+SYNC_HISTORY_SECRET_PATTERNS = (
+    re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    re.compile(rb"\bgh[pousr]_[A-Za-z0-9]{36,255}\b"),
+    re.compile(rb"\bgithub_pat_[A-Za-z0-9_]{40,255}\b"),
+    re.compile(rb"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(rb"\bsk-ant-(?:api\d{2}-)?[A-Za-z0-9_-]{32,255}\b"),
+    re.compile(rb"\bxox[baprs]-[A-Za-z0-9-]{20,255}\b"),
+)
 MAX_ROOT_ANCESTOR_DEPTH = 256
 MAX_TOOL_ROOT_ENTRIES = 256
 MAX_STALE_SNAPSHOTS_PER_OPERATION = 8
@@ -147,6 +164,73 @@ class OperationBudget:
     deadline: float
     remaining_bytes: int
     remaining_entries: int
+
+
+@dataclass(frozen=True)
+class SyncHistoryLimits:
+    max_commits: int = MAX_SYNC_HISTORY_COMMITS
+    max_parents_per_commit: int = MAX_SYNC_HISTORY_PARENTS_PER_COMMIT
+    max_parent_edges: int = MAX_SYNC_HISTORY_PARENT_EDGES
+    max_path_events: int = MAX_SYNC_HISTORY_PATH_EVENTS
+    max_path_bytes: int = MAX_SYNC_HISTORY_PATH_BYTES
+    max_blobs: int = MAX_SYNC_HISTORY_BLOBS
+    max_blob_bytes: int = MAX_SYNC_HISTORY_BLOB_BYTES
+
+
+def _bounded_sync_history_limit(
+    value: int,
+    *,
+    name: str,
+    compiled_maximum: int,
+) -> int:
+    if value <= 0:
+        raise MirrorSyncError(f"sync history {name} limit must be positive")
+    if value > compiled_maximum:
+        raise MirrorSyncError(
+            f"sync history {name} limit cannot exceed the compiled "
+            f"maximum {compiled_maximum}"
+        )
+    return value
+
+
+def _sync_history_limits_from_args(args: argparse.Namespace) -> SyncHistoryLimits:
+    return SyncHistoryLimits(
+        max_commits=_bounded_sync_history_limit(
+            args.max_commits,
+            name="commit",
+            compiled_maximum=MAX_SYNC_HISTORY_COMMITS,
+        ),
+        max_parents_per_commit=_bounded_sync_history_limit(
+            args.max_parents_per_commit,
+            name="parents-per-commit",
+            compiled_maximum=MAX_SYNC_HISTORY_PARENTS_PER_COMMIT,
+        ),
+        max_parent_edges=_bounded_sync_history_limit(
+            args.max_parent_edges,
+            name="parent-edge",
+            compiled_maximum=MAX_SYNC_HISTORY_PARENT_EDGES,
+        ),
+        max_path_events=_bounded_sync_history_limit(
+            args.max_path_events,
+            name="path-event",
+            compiled_maximum=MAX_SYNC_HISTORY_PATH_EVENTS,
+        ),
+        max_path_bytes=_bounded_sync_history_limit(
+            args.max_path_bytes,
+            name="path-byte",
+            compiled_maximum=MAX_SYNC_HISTORY_PATH_BYTES,
+        ),
+        max_blobs=_bounded_sync_history_limit(
+            args.max_blobs,
+            name="blob",
+            compiled_maximum=MAX_SYNC_HISTORY_BLOBS,
+        ),
+        max_blob_bytes=_bounded_sync_history_limit(
+            args.max_blob_bytes,
+            name="blob-byte",
+            compiled_maximum=MAX_SYNC_HISTORY_BLOB_BYTES,
+        ),
+    )
 
 
 @dataclass
@@ -5568,6 +5652,7 @@ def _verify_static_git_profile(bound_root: BoundRoot) -> None:
 def _run_git_process(
     bound_root: BoundRoot,
     *arguments: str,
+    stdin_payload: bytes | None = None,
 ) -> bytes:
     if bound_root.git_control is None:
         raise MirrorSyncError(
@@ -5602,11 +5687,22 @@ def _run_git_process(
     ]
 
     process: subprocess.Popen[bytes] | None = None
+    stdin_file: Any | None = None
     try:
         _revalidate_bound_root(bound_root)
+        if stdin_payload is not None:
+            _consume_operation_budget(
+                bound_root.operation,
+                byte_count=len(stdin_payload),
+                label="preparing bounded Git stdin",
+            )
+            stdin_file = tempfile.TemporaryFile()
+            stdin_file.write(stdin_payload)
+            stdin_file.flush()
+            stdin_file.seek(0)
         process = subprocess.Popen(
             command,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL if stdin_file is None else stdin_file,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=_git_environment(),
@@ -5627,6 +5723,8 @@ def _run_git_process(
             f"cannot run bounded Git verification: {error}"
         ) from error
     finally:
+        if stdin_file is not None:
+            stdin_file.close()
         _revalidate_bound_root(bound_root)
     if return_code == 0:
         return stdout
@@ -5886,6 +5984,594 @@ def _run_git(repository_root: Root, *arguments: str) -> bytes:
     finally:
         if close_root:
             _finish_bound_roots(bound_root)
+
+
+def _read_sync_history_allowed_paths(
+    path: Path,
+) -> tuple[frozenset[bytes], bytes]:
+    path = Path(os.path.abspath(path))
+    file_fd = -1
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        file_fd = os.open(path, flags)
+        before = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_size > MAX_SYNC_HISTORY_ALLOWED_PATH_BYTES
+        ):
+            raise MirrorSyncError(
+                "sync history allowed-path input must be a bounded "
+                "current-user-owned regular file"
+            )
+
+        def read_payload() -> bytes:
+            payload = bytearray()
+            while len(payload) <= MAX_SYNC_HISTORY_ALLOWED_PATH_BYTES:
+                chunk = os.read(
+                    file_fd,
+                    min(
+                        64 * 1024,
+                        MAX_SYNC_HISTORY_ALLOWED_PATH_BYTES + 1 - len(payload),
+                    ),
+                )
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            if len(payload) > MAX_SYNC_HISTORY_ALLOWED_PATH_BYTES:
+                raise MirrorSyncError(
+                    "sync history allowed-path input exceeds its byte limit"
+                )
+            return bytes(payload)
+
+        payload = read_payload()
+        os.lseek(file_fd, 0, os.SEEK_SET)
+        confirmed_payload = read_payload()
+        after = os.fstat(file_fd)
+        named = os.lstat(path)
+        expected_metadata = (
+            before.st_dev,
+            before.st_ino,
+            stat.S_IFMT(before.st_mode),
+            stat.S_IMODE(before.st_mode),
+            before.st_uid,
+            before.st_gid,
+            before.st_size,
+        )
+        if (
+            payload != confirmed_payload
+            or (
+                after.st_dev,
+                after.st_ino,
+                stat.S_IFMT(after.st_mode),
+                stat.S_IMODE(after.st_mode),
+                after.st_uid,
+                after.st_gid,
+                after.st_size,
+            )
+            != expected_metadata
+            or (
+                named.st_dev,
+                named.st_ino,
+                stat.S_IFMT(named.st_mode),
+                stat.S_IMODE(named.st_mode),
+                named.st_uid,
+                named.st_gid,
+                named.st_size,
+            )
+            != expected_metadata
+        ):
+            raise MirrorSyncError("sync history allowed-path input changed during read")
+    except OSError as error:
+        raise MirrorSyncError(
+            f"cannot read sync history allowed-path input: {error}"
+        ) from error
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+
+    try:
+        raw = json.loads(
+            payload.decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except MirrorSyncError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        raise MirrorSyncError(
+            "sync history allowed-path input is not valid JSON"
+        ) from error
+    if (
+        not isinstance(raw, list)
+        or not raw
+        or not all(isinstance(item, str) for item in raw)
+        or raw != sorted(set(raw))
+    ):
+        raise MirrorSyncError(
+            "sync history allowed-path input must be one nonempty sorted "
+            "unique string array"
+        )
+    encoded_paths: set[bytes] = set()
+    for raw_path in raw:
+        normalized = _validate_relative_path(
+            raw_path,
+            "sync history allowed path",
+        )
+        if normalized.as_posix() != raw_path:
+            raise MirrorSyncError(
+                f"sync history allowed path is not canonical: {raw_path!r}"
+            )
+        encoded = raw_path.encode("utf-8", errors="strict")
+        if encoded in encoded_paths:
+            raise MirrorSyncError("sync history allowed-path input is ambiguous")
+        encoded_paths.add(encoded)
+    canonical_payload = _canonical_json(raw, pretty=False)
+    return frozenset(encoded_paths), hashlib.sha256(canonical_payload).digest()
+
+
+def _sync_history_digest_record(
+    digest: Any,
+    label: bytes,
+    *fields: bytes,
+) -> None:
+    digest.update(len(label).to_bytes(4, "big"))
+    digest.update(label)
+    digest.update(len(fields).to_bytes(4, "big"))
+    for field_payload in fields:
+        digest.update(len(field_payload).to_bytes(8, "big"))
+        digest.update(field_payload)
+
+
+def _parse_sync_history_topology(
+    payload: bytes,
+    *,
+    head_sha: str,
+    base_sha: str,
+    limits: SyncHistoryLimits,
+) -> list[tuple[str, tuple[str, ...]]]:
+    try:
+        text = payload.decode("ascii", errors="strict")
+    except UnicodeDecodeError as error:
+        raise MirrorSyncError(
+            "sync branch topology output is not canonical ASCII"
+        ) from error
+    lines = text.splitlines()
+    if len(lines) > limits.max_commits:
+        raise MirrorSyncError(
+            f"sync branch history exceeds the {limits.max_commits}-commit limit"
+        )
+    records: list[tuple[str, tuple[str, ...]]] = []
+    seen: set[str] = set()
+    parent_edges = 0
+    for line in lines:
+        fields = line.split(" ")
+        if not fields or any(GIT_SHA_RE.fullmatch(field) is None for field in fields):
+            raise MirrorSyncError("sync branch topology output is malformed")
+        commit_sha, *raw_parents = fields
+        if commit_sha in seen:
+            raise MirrorSyncError("sync branch topology repeats a commit")
+        if not raw_parents:
+            raise MirrorSyncError(
+                "sync branch exclusive history contains an unrelated root commit"
+            )
+        if len(raw_parents) > limits.max_parents_per_commit:
+            raise MirrorSyncError(
+                "sync branch commit exceeds the "
+                f"{limits.max_parents_per_commit}-parent limit"
+            )
+        parent_edges += len(raw_parents)
+        if parent_edges > limits.max_parent_edges:
+            raise MirrorSyncError(
+                "sync branch history exceeds the "
+                f"{limits.max_parent_edges}-parent-edge limit"
+            )
+        seen.add(commit_sha)
+        records.append((commit_sha, tuple(raw_parents)))
+    if head_sha == base_sha:
+        if records:
+            raise MirrorSyncError(
+                "sync branch topology is nonempty for an identical base/head"
+            )
+    elif not records or records[-1][0] != head_sha or head_sha not in seen:
+        raise MirrorSyncError(
+            "sync branch topology does not terminate at the exact head"
+        )
+    return records
+
+
+def _parse_sync_history_edge(
+    payload: bytes,
+    *,
+    allowed_paths: frozenset[bytes],
+    limits: SyncHistoryLimits,
+    counters: dict[str, int],
+    blobs: set[str],
+    digest: Any,
+    parent_sha: str,
+    commit_sha: str,
+) -> None:
+    if payload and not payload.endswith(b"\0"):
+        raise MirrorSyncError("sync branch edge output is not NUL terminated")
+    records = payload.split(b"\0")
+    if records and records[-1] == b"":
+        records.pop()
+    if len(records) % 2:
+        raise MirrorSyncError("sync branch edge output is malformed")
+    zero_object = b"0" * 40
+    supported_modes = {b"000000", b"100644", b"100755"}
+    for index in range(0, len(records), 2):
+        metadata = records[index]
+        raw_path = records[index + 1]
+        try:
+            raw_old_mode, raw_new_mode, raw_old_oid, raw_new_oid, raw_status = (
+                metadata.split(b" ", 4)
+            )
+        except ValueError as error:
+            raise MirrorSyncError("sync branch edge metadata is malformed") from error
+        if not raw_old_mode.startswith(b":"):
+            raise MirrorSyncError("sync branch edge metadata is malformed")
+        raw_old_mode = raw_old_mode[1:]
+        if (
+            raw_old_mode not in supported_modes
+            or raw_new_mode not in supported_modes
+            or len(raw_old_oid) != 40
+            or len(raw_new_oid) != 40
+            or (
+                raw_old_oid != zero_object
+                and re.fullmatch(rb"[0-9a-f]{40}", raw_old_oid) is None
+            )
+            or (
+                raw_new_oid != zero_object
+                and re.fullmatch(rb"[0-9a-f]{40}", raw_new_oid) is None
+            )
+            or raw_status not in {b"A", b"D", b"M"}
+            or not raw_path
+        ):
+            raise MirrorSyncError("sync branch edge metadata is unsupported")
+        if (
+            (
+                raw_status == b"A"
+                and (
+                    raw_old_mode != b"000000"
+                    or raw_old_oid != zero_object
+                    or raw_new_mode == b"000000"
+                    or raw_new_oid == zero_object
+                )
+            )
+            or (
+                raw_status == b"D"
+                and (
+                    raw_old_mode == b"000000"
+                    or raw_old_oid == zero_object
+                    or raw_new_mode != b"000000"
+                    or raw_new_oid != zero_object
+                )
+            )
+            or (
+                raw_status == b"M"
+                and (
+                    raw_old_mode == b"000000"
+                    or raw_old_oid == zero_object
+                    or raw_new_mode == b"000000"
+                    or raw_new_oid == zero_object
+                )
+            )
+        ):
+            raise MirrorSyncError(
+                "sync branch edge status is inconsistent with its object record"
+            )
+        if raw_path not in allowed_paths:
+            preview = repr(raw_path[:256])
+            raise MirrorSyncError(
+                "sync branch history changes a path outside the generated "
+                f"allowed set: {preview}"
+            )
+        counters["path_events"] += 1
+        counters["path_bytes"] += len(raw_path)
+        if counters["path_events"] > limits.max_path_events:
+            raise MirrorSyncError(
+                "sync branch history exceeds the "
+                f"{limits.max_path_events}-path-event limit"
+            )
+        if counters["path_bytes"] > limits.max_path_bytes:
+            raise MirrorSyncError(
+                "sync branch history exceeds the "
+                f"{limits.max_path_bytes}-path-byte limit"
+            )
+        _sync_history_digest_record(
+            digest,
+            b"edge-change",
+            parent_sha.encode("ascii"),
+            commit_sha.encode("ascii"),
+            raw_old_mode,
+            raw_new_mode,
+            raw_old_oid,
+            raw_new_oid,
+            raw_status,
+            raw_path,
+        )
+        if raw_new_mode != b"000000":
+            blobs.add(raw_new_oid.decode("ascii"))
+            if len(blobs) > limits.max_blobs:
+                raise MirrorSyncError(
+                    f"sync branch history exceeds the {limits.max_blobs}-blob limit"
+                )
+
+
+def _sync_history_blob_sizes(
+    target_root: BoundRoot,
+    blobs: set[str],
+    *,
+    limits: SyncHistoryLimits,
+    digest: Any,
+) -> int:
+    if not blobs:
+        return 0
+    ordered = sorted(blobs)
+    input_payload = b"".join(object_id.encode("ascii") + b"\n" for object_id in ordered)
+    output = _run_git_process(
+        target_root,
+        "cat-file",
+        "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+        stdin_payload=input_payload,
+    )
+    try:
+        lines = output.decode("ascii", errors="strict").splitlines()
+    except UnicodeDecodeError as error:
+        raise MirrorSyncError(
+            "sync branch blob inventory is not canonical ASCII"
+        ) from error
+    if len(lines) != len(ordered):
+        raise MirrorSyncError("sync branch blob inventory is incomplete")
+    total_bytes = 0
+    for expected_oid, line in zip(ordered, lines):
+        fields = line.split(" ")
+        if (
+            len(fields) != 3
+            or fields[0] != expected_oid
+            or fields[1] != "blob"
+            or not fields[2].isdecimal()
+        ):
+            raise MirrorSyncError("sync branch blob inventory is malformed")
+        size = int(fields[2])
+        total_bytes += size
+        if total_bytes > limits.max_blob_bytes:
+            raise MirrorSyncError(
+                "sync branch history exceeds the "
+                f"{limits.max_blob_bytes}-logical-blob-byte limit"
+            )
+        _sync_history_digest_record(
+            digest,
+            b"blob",
+            expected_oid.encode("ascii"),
+            str(size).encode("ascii"),
+        )
+        payload = _run_git(
+            target_root,
+            "cat-file",
+            "blob",
+            expected_oid,
+        )
+        if len(payload) != size:
+            raise MirrorSyncError(
+                "sync branch blob content does not match its declared size"
+            )
+        if any(pattern.search(payload) for pattern in SYNC_HISTORY_SECRET_PATTERNS):
+            raise MirrorSyncError(
+                "sync branch history contains a high-confidence secret marker "
+                f"in introduced blob {expected_oid}"
+            )
+    return total_bytes
+
+
+def _validate_sync_branch_history_bound(
+    target_root: BoundRoot,
+    base_sha: str,
+    head_sha: str,
+    allowed_paths: frozenset[bytes],
+    allowed_paths_sha256: bytes,
+    *,
+    limits: SyncHistoryLimits,
+    require_fresh_head: bool,
+) -> dict[str, object]:
+    history_mirror = MirrorSpec(
+        name="sync-history",
+        repository="history-only",
+        files={},
+    )
+    initial_index = _target_index_snapshot(
+        target_root,
+        history_mirror,
+    )
+    if _current_commit(target_root) != head_sha:
+        raise MirrorSyncError(
+            "sync branch worktree HEAD does not match the exact history head"
+        )
+    for label, value in (("base", base_sha), ("head", head_sha)):
+        if GIT_SHA_RE.fullmatch(value) is None:
+            raise MirrorSyncError(
+                f"sync branch {label} must be one exact lowercase SHA-1"
+            )
+        resolved = _run_git(
+            target_root,
+            "rev-parse",
+            "--verify",
+            f"{value}^{{commit}}",
+        )
+        if resolved != value.encode("ascii") + b"\n":
+            raise MirrorSyncError(
+                f"sync branch {label} does not resolve to its exact commit"
+            )
+    merge_base_output = _run_git(
+        target_root,
+        "merge-base",
+        "--all",
+        base_sha,
+        head_sha,
+    )
+    try:
+        merge_bases = merge_base_output.decode(
+            "ascii",
+            errors="strict",
+        ).splitlines()
+    except UnicodeDecodeError as error:
+        raise MirrorSyncError("sync branch merge-base output is malformed") from error
+    if len(merge_bases) != 1 or GIT_SHA_RE.fullmatch(merge_bases[0]) is None:
+        raise MirrorSyncError(
+            "sync branch base/head must have one unambiguous merge base"
+        )
+    merge_base_sha = merge_bases[0]
+    topology_payload = _run_git(
+        target_root,
+        "rev-list",
+        "--reverse",
+        "--topo-order",
+        "--parents",
+        f"{base_sha}..{head_sha}",
+        "--",
+    )
+    topology = _parse_sync_history_topology(
+        topology_payload,
+        head_sha=head_sha,
+        base_sha=base_sha,
+        limits=limits,
+    )
+    if require_fresh_head:
+        if merge_base_sha != base_sha:
+            raise MirrorSyncError(
+                "fresh generated sync head is not based on the exact target base"
+            )
+        if head_sha == base_sha:
+            if topology:
+                raise MirrorSyncError(
+                    "fresh generated sync history is unexpectedly nonempty"
+                )
+        elif (
+            len(topology) != 1
+            or topology[0][0] != head_sha
+            or topology[0][1] != (base_sha,)
+        ):
+            raise MirrorSyncError(
+                "fresh generated sync history must contain exactly one "
+                "single-parent commit from the exact target base"
+            )
+
+    digest = hashlib.sha256()
+    _sync_history_digest_record(
+        digest,
+        b"sync-history-v1",
+        base_sha.encode("ascii"),
+        head_sha.encode("ascii"),
+        merge_base_sha.encode("ascii"),
+        allowed_paths_sha256,
+    )
+    for commit_sha, parents in topology:
+        _sync_history_digest_record(
+            digest,
+            b"commit",
+            commit_sha.encode("ascii"),
+            *(parent.encode("ascii") for parent in parents),
+        )
+
+    counters = {
+        "path_events": 0,
+        "path_bytes": 0,
+    }
+    blobs: set[str] = set()
+    parent_edges = 0
+    for commit_sha, parents in topology:
+        for parent_sha in parents:
+            parent_edges += 1
+            edge_payload = _run_git(
+                target_root,
+                "diff-tree",
+                "-r",
+                "-z",
+                "--raw",
+                "--no-abbrev",
+                "--no-commit-id",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                parent_sha,
+                commit_sha,
+                "--",
+            )
+            _parse_sync_history_edge(
+                edge_payload,
+                allowed_paths=allowed_paths,
+                limits=limits,
+                counters=counters,
+                blobs=blobs,
+                digest=digest,
+                parent_sha=parent_sha,
+                commit_sha=commit_sha,
+            )
+    blob_bytes = _sync_history_blob_sizes(
+        target_root,
+        blobs,
+        limits=limits,
+        digest=digest,
+    )
+    _require_same_target_index(
+        target_root,
+        history_mirror,
+        initial_index,
+    )
+    return {
+        "schema_version": 1,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "merge_base_sha": merge_base_sha,
+        "commit_count": len(topology),
+        "parent_edge_count": parent_edges,
+        "path_event_count": counters["path_events"],
+        "path_bytes": counters["path_bytes"],
+        "blob_count": len(blobs),
+        "blob_bytes": blob_bytes,
+        "allowed_paths_sha256": allowed_paths_sha256.hex(),
+        "history_sha256": digest.hexdigest(),
+        "profile": "fresh-single-commit" if require_fresh_head else "branch-exclusive",
+    }
+
+
+def validate_sync_branch_history(
+    target_root: Path,
+    base_sha: str,
+    head_sha: str,
+    allowed_paths_file: Path,
+    *,
+    limits: SyncHistoryLimits | None = None,
+    require_fresh_head: bool = False,
+) -> dict[str, object]:
+    selected_limits = limits or SyncHistoryLimits()
+    allowed_paths, allowed_paths_sha256 = _read_sync_history_allowed_paths(
+        allowed_paths_file
+    )
+    operation = _new_operation_budget()
+    target = _bind_root(target_root)
+    target.operation = operation
+    try:
+        _ensure_git_control_binding(target)
+        initial_head = _current_commit(target)
+        receipt = _validate_sync_branch_history_bound(
+            target,
+            base_sha,
+            head_sha,
+            allowed_paths,
+            allowed_paths_sha256,
+            limits=selected_limits,
+            require_fresh_head=require_fresh_head,
+        )
+        if _current_commit(target) != initial_head:
+            raise MirrorSyncError(
+                "sync branch worktree HEAD changed during history validation"
+            )
+        return receipt
+    finally:
+        _finish_bound_roots(target)
 
 
 def _top_literal_pathspec(path: PurePosixPath) -> str:
@@ -8509,6 +9195,87 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Fail if the lock needs a refresh instead of writing it",
     )
+    history_parser = subparsers.add_parser(
+        "validate-branch-history",
+        help=(
+            "Validate every commit-parent edge in one exact generated "
+            "branch-exclusive history"
+        ),
+    )
+    history_parser.add_argument(
+        "--target-root",
+        type=Path,
+        required=True,
+        help="Existing generated-mirror repository checkout",
+    )
+    history_parser.add_argument(
+        "--base-ref",
+        required=True,
+        help="Exact lowercase SHA-1 target-base commit",
+    )
+    history_parser.add_argument(
+        "--head-ref",
+        required=True,
+        help="Exact lowercase SHA-1 generated-branch head commit",
+    )
+    history_parser.add_argument(
+        "--allowed-paths-file",
+        type=Path,
+        required=True,
+        help="Current-user-owned canonical JSON array of generated paths",
+    )
+    history_parser.add_argument(
+        "--require-fresh-head",
+        action="store_true",
+        help=(
+            "Require either the exact base or one single-parent generated "
+            "commit directly on that base"
+        ),
+    )
+    history_limits = (
+        (
+            "--max-commits",
+            MAX_SYNC_HISTORY_COMMITS,
+            "Maximum branch-exclusive commits",
+        ),
+        (
+            "--max-parents-per-commit",
+            MAX_SYNC_HISTORY_PARENTS_PER_COMMIT,
+            "Maximum parents on one commit",
+        ),
+        (
+            "--max-parent-edges",
+            MAX_SYNC_HISTORY_PARENT_EDGES,
+            "Maximum validated commit-parent edges",
+        ),
+        (
+            "--max-path-events",
+            MAX_SYNC_HISTORY_PATH_EVENTS,
+            "Maximum changed-path events across all edges",
+        ),
+        (
+            "--max-path-bytes",
+            MAX_SYNC_HISTORY_PATH_BYTES,
+            "Maximum aggregate raw changed-path bytes",
+        ),
+        (
+            "--max-blobs",
+            MAX_SYNC_HISTORY_BLOBS,
+            "Maximum distinct introduced blobs",
+        ),
+        (
+            "--max-blob-bytes",
+            MAX_SYNC_HISTORY_BLOB_BYTES,
+            "Maximum aggregate logical introduced-blob bytes",
+        ),
+    )
+    for option, default, help_text in history_limits:
+        history_parser.add_argument(
+            option,
+            type=int,
+            default=default,
+            help=help_text,
+        )
     return parser
 
 
@@ -8540,6 +9307,16 @@ def _run(args: argparse.Namespace) -> int:
         count = refresh_source_lock(REPOSITORY_ROOT, check=args.check)
         action = "verified" if args.check else "refreshed"
         print(f"{action} source lock ({count} sources)")
+    elif args.command == "validate-branch-history":
+        receipt = validate_sync_branch_history(
+            args.target_root,
+            args.base_ref,
+            args.head_ref,
+            args.allowed_paths_file,
+            limits=_sync_history_limits_from_args(args),
+            require_fresh_head=args.require_fresh_head,
+        )
+        sys.stdout.buffer.write(_canonical_json(receipt, pretty=True))
     else:
         raise AssertionError(f"unhandled command: {args.command}")
     return 0

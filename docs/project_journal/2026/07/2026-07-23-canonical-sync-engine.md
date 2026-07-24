@@ -326,6 +326,28 @@ superseded_by:
   in 390.258 seconds plus 119 source-lock tests in 1427.115 seconds, for 714
   disjoint repository tests. The refreshed source-lock SHA-256 is
   `4dd4ab9e9fa6751f3a83388e791937a10a8478e92a9913086a4ff4c9347463ba`.
+- The closing review follow-up adds complete branch-exclusive validation for
+  the generated toolbox branch. Every commit-parent edge, including merge and
+  octopus side history, is checked without rename collapsing against the
+  independently proven managed-path union. The receipt binds topology,
+  introduced blobs, budgets, base/head, and the allowlist; transient
+  out-of-scope paths and high-confidence secret blobs fail closed. Each run
+  then republishes only an exact-base fresh single commit through an exact old
+  branch lease. Legacy launchd cleanup now retains and revalidates each legacy
+  plist through every native boundary and uses no-replace isolation before
+  deleting only the proved original. `status-scheduler` and `doctor` retain the
+  audited macOS plist or Linux service/timer pair through the native daemon
+  query and preserve distinct config-drift, daemon-unavailable,
+  daemon-disabled, and stable-runner diagnostics.
+- The aggregate personal-sync, reconciliation, retention, scheduler, and
+  automation gate passed 604 tests in 539.402 seconds; the toolbox automation
+  module independently passed 22 tests in 360.568 seconds. After a final
+  formatting-only blank-line correction and source-lock refresh, the exact
+  final source bytes passed all 119 source-lock tests in 1355.707 seconds and
+  all 63 scheduler tests in 2.922 seconds. Python compilation, Ruff lint,
+  `actionlint`, source-lock verification, and `git diff --check` also passed.
+  The refreshed source-lock SHA-256 is
+  `a068a413a0f083fe3a3ab572d5b62fb3e05392aa7c87f25bdf6011a3219f3d38`.
 
 ## Installed Host Baseline
 

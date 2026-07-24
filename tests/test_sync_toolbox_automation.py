@@ -289,6 +289,19 @@ class SyncToolboxAutomationTests(unittest.TestCase):
             '"${fetched_remote_branch_sha}" != "${remote_branch_sha}"',
             prepare,
         )
+        self.assertIn("validate-branch-history", prepare)
+        self.assertIn(
+            'git -C "${TARGET_ROOT}" switch --force-create "${SYNC_BRANCH}"',
+            prepare,
+        )
+        self.assertNotIn(
+            'git -C "${TARGET_ROOT}" merge --no-edit',
+            prepare,
+        )
+        history = self._step_run("Validate fresh generated branch history")
+        self.assertIn("validate-branch-history", history)
+        self.assertIn("--require-fresh-head", history)
+        self.assertIn(".merge_base_sha == $base", history)
         push = self._step_run("Push scoped sync branch")
         self.assertNotIn("awk ", push)
         self.assertIn(
@@ -299,10 +312,9 @@ class SyncToolboxAutomationTests(unittest.TestCase):
             '"${REMOTE_REF_SHA}" == "${DESIRED_HEAD_SHA}"',
             push,
         )
-        self.assertIn(
-            'git -C "${TARGET_ROOT}" merge-base --is-ancestor',
-            push,
-        )
+        self.assertNotIn("merge-base --is-ancestor", push)
+        self.assertIn("DESIRED_HISTORY_SHA256", push)
+        self.assertIn("PREPARED_REMOTE_HISTORY_SHA256", push)
         self.assertIn(
             'git -C "${TARGET_ROOT}" rev-parse --verify',
             push,
@@ -1242,7 +1254,20 @@ class SyncToolboxAutomationTests(unittest.TestCase):
             fake_git.chmod(0o755)
             fake_python = fake_bin / "python3"
             fake_python.write_text(
-                "#!/bin/sh\nprintf '[]\\n'\n",
+                "#!/usr/bin/python3\n"
+                "import json\n"
+                "import os\n"
+                "import sys\n"
+                "if 'validate-branch-history' in sys.argv:\n"
+                "    print(json.dumps({\n"
+                "        'schema_version': 1,\n"
+                "        'base_sha': os.environ['BASE_SHA'],\n"
+                "        'head_sha': os.environ['FETCHED_BRANCH_SHA'],\n"
+                "        'profile': 'branch-exclusive',\n"
+                "        'history_sha256': 'd' * 64,\n"
+                "    }))\n"
+                "else:\n"
+                "    print('[]')\n",
                 encoding="utf-8",
             )
             fake_python.chmod(0o755)
@@ -1540,7 +1565,7 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                 "canonical two",
             )
             generate(seed_root, second_canonical)
-            commit_all(seed_root, "generated two")
+            second_branch_sha = commit_all(seed_root, "generated two")
             run_git(
                 seed_root,
                 "push",
@@ -1677,10 +1702,15 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                 ],
             )
             generate(rename_runner, third_canonical)
-            commit_all(rename_runner, "generated three")
+            third_branch_sha = commit_all(rename_runner, "generated three")
             run_git(
                 rename_runner,
                 "push",
+                (
+                    "--force-with-lease=refs/heads/"
+                    "automation/canonical-personal-sync:"
+                    f"{second_branch_sha}"
+                ),
                 str(remote_root),
                 "HEAD:refs/heads/automation/canonical-personal-sync",
             )
@@ -1713,6 +1743,11 @@ class SyncToolboxAutomationTests(unittest.TestCase):
             run_git(
                 removal_runner,
                 "push",
+                (
+                    "--force-with-lease=refs/heads/"
+                    "automation/canonical-personal-sync:"
+                    f"{third_branch_sha}"
+                ),
                 str(remote_root),
                 "HEAD:refs/heads/automation/canonical-personal-sync",
             )
@@ -1775,9 +1810,6 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                 "            print(f'{value}\\t{reference}')\n"
                 "elif 'rev-parse' in args and '--verify' in args:\n"
                 "    print(os.environ['DESIRED_HEAD_SHA'])\n"
-                "elif 'merge-base' in args and '--is-ancestor' in args:\n"
-                "    if os.environ.get('DESIRED_IS_DESCENDANT') != '1':\n"
-                "        raise SystemExit(1)\n"
                 "elif 'push' in args:\n"
                 "    race = os.environ.get('RACE_BEFORE_PUSH', 'none')\n"
                 "    race_marker = Path(os.environ['RACE_MARKER'])\n"
@@ -1879,16 +1911,6 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                     "message": "Ambiguous remote ref",
                 },
                 {
-                    "name": "non-descendant generated head",
-                    "live_sha": prepared_sha,
-                    "prepared_present": "true",
-                    "prepared_value": prepared_sha,
-                    "descendant": "0",
-                    "expected_failure": True,
-                    "expected_final": prepared_sha,
-                    "message": "Non-descendant sync update",
-                },
-                {
                     "name": "branch deleted after preflight",
                     "live_sha": prepared_sha,
                     "prepared_present": "true",
@@ -1941,12 +1963,13 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                         "BASE_SHA": base_sha,
                         "CODEX_TOOLBOX_SYNC_TOKEN": SYNTHETIC_ACCESS_TOKEN,
                         "DESIRED_HEAD_SHA": desired_sha,
-                        "DESIRED_IS_DESCENDANT": case.get("descendant", "1"),
+                        "DESIRED_HISTORY_SHA256": "5" * 64,
                         "DUPLICATE_BRANCH": case.get("duplicate", "0"),
                         "FAKE_GIT_LOG": str(git_log),
                         "PATH": f"{fake_bin}:/usr/bin:/bin",
                         "PREPARED_REMOTE_BRANCH_PRESENT": case["prepared_present"],
                         "PREPARED_REMOTE_BRANCH_SHA": case["prepared_value"],
+                        "PREPARED_REMOTE_HISTORY_SHA256": "6" * 64,
                         "PREPARED_TARGET_BASE_SHA": base_sha,
                         "RACE_BEFORE_PUSH": case.get("race", "none"),
                         "RACE_MARKER": str(race_marker),
@@ -2241,6 +2264,285 @@ class SyncToolboxAutomationTests(unittest.TestCase):
             documentation,
         )
         self.assertIn("does not run for pull-request events", documentation)
+
+
+class SyncBranchHistoryValidationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory(
+            prefix="sync-branch-history."
+        )
+        self.root = Path(self.temporary_directory.name)
+        self.repository = self.root / "repository"
+        self.repository.mkdir()
+        self.allowed_paths_file = self.root / "allowed-paths.json"
+        self._git("init", "-q", "-b", "master")
+        self._git("config", "user.name", "History Fixture")
+        self._git(
+            "config",
+            "user.email",
+            "history-fixture@example.invalid",
+        )
+        self._git("config", "commit.gpgsign", "false")
+        self._write("seed.txt", "seed\n")
+        self.base_sha = self._commit("base")
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def _git(self, *arguments: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(self.repository), *arguments],
+            cwd=REPOSITORY_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stdout + completed.stderr,
+        )
+        return completed.stdout.strip()
+
+    def _write(self, path: str, payload: str) -> None:
+        target = self.repository / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(payload, encoding="utf-8")
+
+    def _commit(self, message: str) -> str:
+        self._git("add", "-A")
+        self._git("commit", "--no-gpg-sign", "-q", "-m", message)
+        return self._git("rev-parse", "HEAD")
+
+    def _validate(
+        self,
+        base_sha: str,
+        head_sha: str,
+        allowed_paths: list[str],
+        *extra_arguments: str,
+    ) -> subprocess.CompletedProcess[str]:
+        self.allowed_paths_file.write_text(
+            json.dumps(sorted(set(allowed_paths))) + "\n",
+            encoding="utf-8",
+        )
+        return subprocess.run(
+            [
+                "python3",
+                str(REPOSITORY_ROOT / "scripts" / "sync_canonical_mirrors.py"),
+                "validate-branch-history",
+                "--target-root",
+                str(self.repository),
+                "--base-ref",
+                base_sha,
+                "--head-ref",
+                head_sha,
+                "--allowed-paths-file",
+                str(self.allowed_paths_file),
+                *extra_arguments,
+            ],
+            cwd=REPOSITORY_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+
+    def test_rejects_transient_add_delete_rename_and_secret_blobs(self) -> None:
+        cases = ("add-delete", "rename-back", "secret-delete")
+        for case in cases:
+            with self.subTest(case=case):
+                self._git("reset", "--hard", self.base_sha)
+                if case == "add-delete":
+                    self._write("outside.txt", "transient\n")
+                    self._commit("add outside")
+                    (self.repository / "outside.txt").unlink()
+                    head_sha = self._commit("delete outside")
+                    allowed = ["seed.txt"]
+                    expected = "outside the generated allowed set"
+                elif case == "rename-back":
+                    self._git("mv", "seed.txt", "outside.txt")
+                    self._commit("rename outside")
+                    self._git("mv", "outside.txt", "seed.txt")
+                    head_sha = self._commit("rename back")
+                    allowed = ["seed.txt"]
+                    expected = "outside the generated allowed set"
+                else:
+                    self._write(
+                        "generated.txt",
+                        "github_pat_" + "A" * 48 + "\n",
+                    )
+                    self._commit("add transient secret")
+                    (self.repository / "generated.txt").unlink()
+                    head_sha = self._commit("delete transient secret")
+                    allowed = ["generated.txt", "seed.txt"]
+                    expected = "high-confidence secret marker"
+
+                rejected = self._validate(
+                    self.base_sha,
+                    head_sha,
+                    allowed,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertIn(
+                    expected,
+                    rejected.stdout + rejected.stderr,
+                )
+
+    def test_rejects_out_of_scope_merge_side_history(self) -> None:
+        self._git("switch", "-q", "-c", "side", self.base_sha)
+        self._write("outside.txt", "side branch\n")
+        self._commit("side outside")
+        self._git("switch", "-q", "-c", "generated", self.base_sha)
+        self._write("seed.txt", "generated\n")
+        self._commit("generated change")
+        self._git("merge", "--no-ff", "-q", "-m", "merge side", "side")
+        head_sha = self._git("rev-parse", "HEAD")
+
+        rejected = self._validate(
+            self.base_sha,
+            head_sha,
+            ["seed.txt"],
+        )
+
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn(
+            "outside the generated allowed set",
+            rejected.stdout + rejected.stderr,
+        )
+
+    def test_octopus_topology_passes_and_parent_cap_tightens(self) -> None:
+        branches: list[str] = []
+        allowed = ["seed.txt"]
+        for index in range(3):
+            branch = f"side-{index}"
+            path = f"generated-{index}.txt"
+            branches.append(branch)
+            allowed.append(path)
+            self._git("switch", "-q", "-c", branch, self.base_sha)
+            self._write(path, f"{index}\n")
+            self._commit(branch)
+        self._git("switch", "-q", "master")
+        self._git(
+            "merge",
+            "--no-ff",
+            "-q",
+            "-m",
+            "octopus",
+            *branches,
+        )
+        head_sha = self._git("rev-parse", "HEAD")
+
+        accepted = self._validate(self.base_sha, head_sha, allowed)
+        self.assertEqual(
+            accepted.returncode,
+            0,
+            accepted.stdout + accepted.stderr,
+        )
+        receipt = json.loads(accepted.stdout)
+        self.assertEqual(receipt["head_sha"], head_sha)
+        self.assertGreaterEqual(receipt["parent_edge_count"], 6)
+
+        rejected = self._validate(
+            self.base_sha,
+            head_sha,
+            allowed,
+            "--max-parents-per-commit",
+            "3",
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("3-parent limit", rejected.stdout + rejected.stderr)
+
+    def test_commit_blob_and_base_retarget_caps_fail_closed(self) -> None:
+        self._write("generated.txt", "one\n")
+        first = self._commit("generated one")
+        self._write("generated.txt", "two\n")
+        self._commit("generated two")
+        self._write("generated.txt", "three\n")
+        head_sha = self._commit("generated three")
+        allowed = ["generated.txt", "seed.txt"]
+
+        commit_cap = self._validate(
+            self.base_sha,
+            head_sha,
+            allowed,
+            "--max-commits",
+            "2",
+        )
+        self.assertNotEqual(commit_cap.returncode, 0)
+        self.assertIn("2-commit limit", commit_cap.stdout + commit_cap.stderr)
+
+        self._git("switch", "--detach", "-q", first)
+        blob_cap = self._validate(
+            self.base_sha,
+            first,
+            allowed,
+            "--max-blob-bytes",
+            "1",
+        )
+        self.assertNotEqual(blob_cap.returncode, 0)
+        self.assertIn(
+            "logical-blob-byte limit",
+            blob_cap.stdout + blob_cap.stderr,
+        )
+
+        fresh = self._validate(
+            self.base_sha,
+            first,
+            allowed,
+            "--require-fresh-head",
+        )
+        self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
+        first_receipt = json.loads(fresh.stdout)
+
+        self._git("switch", "-q", "-c", "retarget", self.base_sha)
+        self._write("retarget.txt", "retarget\n")
+        retarget_sha = self._commit("retarget base")
+        self._git("switch", "--detach", "-q", first)
+        retargeted = self._validate(
+            retarget_sha,
+            first,
+            [*allowed, "retarget.txt"],
+        )
+        self.assertEqual(
+            retargeted.returncode,
+            0,
+            retargeted.stdout + retargeted.stderr,
+        )
+        retargeted_receipt = json.loads(retargeted.stdout)
+        self.assertNotEqual(
+            first_receipt["history_sha256"],
+            retargeted_receipt["history_sha256"],
+        )
+        self.assertEqual(retargeted_receipt["base_sha"], retarget_sha)
+
+        stale_fresh = self._validate(
+            retarget_sha,
+            first,
+            [*allowed, "retarget.txt"],
+            "--require-fresh-head",
+        )
+        self.assertNotEqual(stale_fresh.returncode, 0)
+        self.assertIn(
+            "not based on the exact target base",
+            stale_fresh.stdout + stale_fresh.stderr,
+        )
+
+    def test_limit_overrides_cannot_expand_compiled_caps(self) -> None:
+        self._write("generated.txt", "generated\n")
+        head_sha = self._commit("generated")
+        rejected = self._validate(
+            self.base_sha,
+            head_sha,
+            ["generated.txt", "seed.txt"],
+            "--max-commits",
+            "257",
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn(
+            "cannot exceed the compiled maximum",
+            rejected.stdout + rejected.stderr,
+        )
 
 
 if __name__ == "__main__":

@@ -630,6 +630,9 @@ class SchedulerActivationBinding:
     parent_fd: int
     file_fd: int
     expected: ManagedStateFileSnapshot
+    description: str = "launchd scheduler config"
+    failure_code: str | None = None
+    removed: bool = False
 
 
 @dataclass(frozen=True)
@@ -20402,20 +20405,56 @@ def _cleanup_legacy_launchd_schedulers(
     domain = f"gui/{os.getuid()}"
     for label in LEGACY_LAUNCHD_LABELS:
         legacy_plist = _legacy_launchd_plist(paths, label)
-        if disable:
-            _run_native_scheduler_action(
-                ["launchctl", "bootout", domain, str(legacy_plist)],
-                dry_run=dry_run,
-                allow_fail=True,
-                activation_binding=activation_binding,
+        legacy_snapshot = _scheduler_config_snapshot(legacy_plist)
+
+        def cleanup_one(
+            legacy_binding: SchedulerActivationBinding | None,
+        ) -> None:
+            bindings = tuple(
+                binding
+                for binding in (activation_binding, legacy_binding)
+                if binding is not None
             )
-            _run_native_scheduler_action(
-                ["launchctl", "disable", f"{domain}/{label}"],
-                dry_run=dry_run,
-                allow_fail=True,
-                activation_binding=activation_binding,
+            if disable:
+                _run_native_scheduler_action(
+                    ["launchctl", "bootout", domain, str(legacy_plist)],
+                    dry_run=dry_run,
+                    allow_fail=True,
+                    activation_bindings=bindings,
+                )
+                _run_native_scheduler_action(
+                    ["launchctl", "disable", f"{domain}/{label}"],
+                    dry_run=dry_run,
+                    allow_fail=True,
+                    activation_bindings=bindings,
+                )
+            if dry_run:
+                _unlink_file(legacy_plist, dry_run=True)
+                return
+            if legacy_binding is None:
+                return
+            _revalidate_launchd_activation_binding(
+                legacy_binding,
+                boundary="before conditional legacy removal",
             )
-        _unlink_file(legacy_plist, dry_run=dry_run)
+            _isolate_and_delete_pending_cleanup_file(
+                legacy_binding.home,
+                legacy_plist,
+                legacy_binding.parent_fd,
+                legacy_snapshot,
+                label=f"legacy launchd scheduler {label}",
+            )
+            legacy_binding.removed = True
+
+        if dry_run or not legacy_snapshot.exists:
+            cleanup_one(None)
+            continue
+        with _retain_launchd_activation_binding(
+            legacy_plist,
+            legacy_snapshot,
+            description=f"legacy launchd scheduler {label}",
+        ) as legacy_binding:
+            cleanup_one(legacy_binding)
 
 
 def _scheduler_log_dir(home: Path) -> Path:
@@ -20623,7 +20662,10 @@ def _launchd_activation_failure(
     boundary: str,
     failure: str,
 ) -> SyncError:
-    return SyncError(f"launchd scheduler config {failure} {boundary}: {binding.path}")
+    return SyncError(
+        f"{binding.description} {failure} {boundary}: {binding.path}",
+        code=binding.failure_code,
+    )
 
 
 def _revalidate_launchd_activation_binding(
@@ -20806,13 +20848,17 @@ def _revalidate_launchd_activation_binding(
 def _retain_launchd_activation_binding(
     path: Path,
     expected: ManagedStateFileSnapshot,
+    *,
+    description: str = "launchd scheduler config",
+    failure_code: str | None = None,
 ) -> Iterator[SchedulerActivationBinding]:
     user_home = Path.home().expanduser()
     try:
         path.relative_to(user_home)
     except ValueError as error:
         raise SyncError(
-            f"launchd scheduler config must remain beneath the user home: {path}"
+            f"{description} must remain beneath the user home: {path}",
+            code=failure_code,
         ) from error
     parent_fd = -1
     file_fd = -1
@@ -20821,11 +20867,13 @@ def _retain_launchd_activation_binding(
             parent_fd = _open_directory_beneath(user_home, path.parent)
         except FileNotFoundError as error:
             raise SyncError(
-                f"launchd scheduler config parent chain is missing: {path.parent}"
+                f"{description} parent chain is missing: {path.parent}",
+                code=failure_code,
             ) from error
         except (OSError, SyncError) as error:
             raise SyncError(
-                f"launchd scheduler config parent chain is unreadable: {path.parent}"
+                f"{description} parent chain is unreadable: {path.parent}",
+                code=failure_code,
             ) from error
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -20834,11 +20882,13 @@ def _retain_launchd_activation_binding(
             file_fd = os.open(path.name, flags, dir_fd=parent_fd)
         except FileNotFoundError as error:
             raise SyncError(
-                f"launchd scheduler config is missing before activation: {path}"
+                f"{description} is missing before activation: {path}",
+                code=failure_code,
             ) from error
         except OSError as error:
             raise SyncError(
-                f"launchd scheduler config is unreadable before activation: {path}"
+                f"{description} is unreadable before activation: {path}",
+                code=failure_code,
             ) from error
         binding = SchedulerActivationBinding(
             home=user_home,
@@ -20846,21 +20896,78 @@ def _retain_launchd_activation_binding(
             parent_fd=parent_fd,
             file_fd=file_fd,
             expected=expected,
+            description=description,
+            failure_code=failure_code,
         )
         _revalidate_launchd_activation_binding(
             binding,
             boundary="before activation",
         )
         yield binding
-        _revalidate_launchd_activation_binding(
-            binding,
-            boundary="after activation",
-        )
+        if not binding.removed:
+            _revalidate_launchd_activation_binding(
+                binding,
+                boundary="after activation",
+            )
     finally:
         if file_fd >= 0:
             _close_fd_quietly(file_fd)
         if parent_fd >= 0:
             _close_fd_quietly(parent_fd)
+
+
+@contextlib.contextmanager
+def _retain_scheduler_config_audit_bindings(
+    paths: SchedulerPaths,
+    audit: SchedulerConfigAudit,
+) -> Iterator[tuple[SchedulerActivationBinding, ...]]:
+    if audit.config is None:
+        yield ()
+        return
+    if len(audit.config.config_paths) != len(audit.snapshots):
+        raise SyncError(
+            "scheduler audit path/snapshot cardinality changed before status",
+            code="scheduler-config-drift",
+        )
+    with contextlib.ExitStack() as stack:
+        bindings: list[SchedulerActivationBinding] = []
+        for path, snapshot in zip(audit.config.config_paths, audit.snapshots):
+            if not snapshot.exists:
+                raise SyncError(
+                    f"audited scheduler config disappeared before status: {path}",
+                    code="scheduler-config-drift",
+                )
+            bindings.append(
+                stack.enter_context(
+                    _retain_launchd_activation_binding(
+                        path,
+                        snapshot,
+                        description="audited scheduler config",
+                        failure_code="scheduler-config-drift",
+                    )
+                )
+            )
+        _revalidate_scheduler_status_audit(paths, audit)
+        yield tuple(bindings)
+        for binding in bindings:
+            _revalidate_launchd_activation_binding(
+                binding,
+                boundary="after scheduler status audit",
+            )
+        _revalidate_scheduler_status_audit(paths, audit)
+
+
+def _revalidate_scheduler_status_audit(
+    paths: SchedulerPaths,
+    audit: SchedulerConfigAudit,
+) -> None:
+    try:
+        _revalidate_scheduler_config_audit(paths, audit)
+    except SyncError as error:
+        raise SyncError(
+            f"scheduler configuration drifted during status: {error}",
+            code="scheduler-config-drift",
+        ) from error
 
 
 def _run_native_scheduler_action(
@@ -20869,11 +20976,19 @@ def _run_native_scheduler_action(
     dry_run: bool,
     allow_fail: bool = False,
     activation_binding: SchedulerActivationBinding | None = None,
+    activation_bindings: tuple[SchedulerActivationBinding, ...] = (),
 ) -> None:
     action = " ".join(args[:3])
-    if activation_binding is not None:
+    bindings = (
+        (activation_binding,) + activation_bindings
+        if activation_binding is not None
+        else activation_bindings
+    )
+    if len({id(binding) for binding in bindings}) != len(bindings):
+        raise SyncError("native scheduler action received duplicate file bindings")
+    for binding in bindings:
         _revalidate_launchd_activation_binding(
-            activation_binding,
+            binding,
             boundary=f"before native action {action}",
         )
     try:
@@ -20883,14 +20998,19 @@ def _run_native_scheduler_action(
             allow_fail=allow_fail,
         )
     finally:
-        if activation_binding is not None:
+        for binding in bindings:
             _revalidate_launchd_activation_binding(
-                activation_binding,
+                binding,
                 boundary=f"after native action {action}",
             )
 
 
-def _scheduler_daemon_enabled(paths: SchedulerPaths) -> bool | None:
+def _scheduler_daemon_enabled(
+    paths: SchedulerPaths,
+    *,
+    config_audit: SchedulerConfigAudit | None = None,
+    activation_bindings: tuple[SchedulerActivationBinding, ...] = (),
+) -> bool | None:
     if paths.platform == "macos":
         args = [
             "launchctl",
@@ -20906,18 +21026,34 @@ def _scheduler_daemon_enabled(paths: SchedulerPaths) -> bool | None:
         ]
     else:
         return None
-    try:
-        native_args = _native_scheduler_argv(args)
-        completed = subprocess.run(
-            native_args,
-            check=False,
-            text=True,
-            capture_output=True,
-            timeout=10,
-            env=_scheduler_native_environment(),
+    for binding in activation_bindings:
+        _revalidate_launchd_activation_binding(
+            binding,
+            boundary="before native scheduler status",
         )
-    except (OSError, subprocess.TimeoutExpired, SyncError):
-        return None
+    if config_audit is not None:
+        _revalidate_scheduler_status_audit(paths, config_audit)
+    try:
+        try:
+            native_args = _native_scheduler_argv(args)
+            completed = subprocess.run(
+                native_args,
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=10,
+                env=_scheduler_native_environment(),
+            )
+        except (OSError, subprocess.TimeoutExpired, SyncError):
+            return None
+    finally:
+        for binding in activation_bindings:
+            _revalidate_launchd_activation_binding(
+                binding,
+                boundary="after native scheduler status",
+            )
+        if config_audit is not None:
+            _revalidate_scheduler_status_audit(paths, config_audit)
     if len(completed.stdout) > 64 * 1024 or len(completed.stderr) > 64 * 1024:
         return None
     return completed.returncode == 0
@@ -23504,6 +23640,7 @@ def doctor(
     home = home.expanduser()
     report = scheduler_report(home, platform_name)
     issues = audit_active_skills(home)
+    classified: set[tuple[str, str]] = set()
     if not report.installed:
         issues.append(
             DoctorIssue(
@@ -23513,14 +23650,15 @@ def doctor(
             )
         )
     if report.installed and not report.stable_runner:
+        detail = "scheduler does not use the stable installed runner path"
         issues.append(
             DoctorIssue(
                 "scheduler-runner-drift",
                 report.runner or home.expanduser(),
-                "scheduler does not use the stable installed runner path",
+                detail,
             )
         )
-    classified: set[tuple[str, str]] = set()
+        classified.add(("scheduler-runner-drift", detail))
     for code, owner, sha, detail in report.release_integrity:
         issues.append(
             DoctorIssue(
@@ -23554,6 +23692,10 @@ def doctor(
                 "immutable-release-drift",
                 "quarantine-saturated",
                 "quarantine-audit-inconclusive",
+                "scheduler-config-drift",
+                "scheduler-daemon-unavailable",
+                "scheduler-daemon-disabled",
+                "scheduler-runner-drift",
             }
             else "scheduler-failure"
         )
@@ -24424,11 +24566,27 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
     selected_platform = _scheduler_platform(platform_name)
     paths = _scheduler_paths(selected_platform, home)
     config: SchedulerConfig | None = None
+    config_audit: SchedulerConfigAudit | None = None
+    config_bindings: tuple[SchedulerActivationBinding, ...] = ()
+    config_binding_stack = contextlib.ExitStack()
     failure_reason: str | None = None
     failure_code: str | None = None
     try:
-        config = _load_scheduler_config(paths)
+        config_audit = _audit_scheduler_config(paths)
+        config = config_audit.config
+        if config is not None:
+            config_bindings = config_binding_stack.enter_context(
+                _retain_scheduler_config_audit_bindings(
+                    paths,
+                    config_audit,
+                )
+            )
     except SyncError as error:
+        config_binding_stack.close()
+        config_binding_stack = contextlib.ExitStack()
+        config = None
+        config_audit = None
+        config_bindings = ()
         failure_reason = str(error)
         failure_code = error.code or "scheduler-config-invalid"
     runtime_state: dict[str, Any] | None = None
@@ -24497,7 +24655,21 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
             failure_code = "quarantine-audit-inconclusive"
             failure_reason = f"quarantine capacity audit failed: {error}"
     installed = config is not None
-    enabled = _scheduler_daemon_enabled(paths) if installed else None
+    stable_runner = _stable_scheduler_runner_matches(home, config)
+    if failure_reason is None and installed and not stable_runner:
+        failure_reason = "scheduler does not use the stable installed runner path"
+        failure_code = "scheduler-runner-drift"
+    enabled: bool | None = None
+    if installed:
+        try:
+            enabled = _scheduler_daemon_enabled(
+                paths,
+                config_audit=config_audit,
+                activation_bindings=config_bindings,
+            )
+        except SyncError as error:
+            failure_reason = str(error)
+            failure_code = error.code or "scheduler-config-drift"
     if failure_reason is None and installed and enabled is not True:
         failure_reason = (
             "scheduler daemon state is unavailable"
@@ -24509,6 +24681,12 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
             if enabled is None
             else "scheduler-daemon-disabled"
         )
+    try:
+        config_binding_stack.close()
+    except SyncError as error:
+        failure_reason = str(error)
+        failure_code = error.code or "scheduler-config-drift"
+        enabled = None
     config_paths = (
         config.config_paths
         if config is not None
@@ -24529,13 +24707,11 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
         config_paths=config_paths,
         interval_minutes=config.interval_minutes if config is not None else None,
         runner=config.runner if config is not None else None,
-        stable_runner=_stable_scheduler_runner_matches(home, config),
+        stable_runner=stable_runner,
         mode=config.mode if config is not None else None,
         base_repo=config.base_repo if config is not None else None,
         private_repo=(
-            config.repo
-            if config is not None and config.mode == "private"
-            else None
+            config.repo if config is not None and config.mode == "private" else None
         ),
         last_attempt=(
             runtime_state.get("last_attempt")

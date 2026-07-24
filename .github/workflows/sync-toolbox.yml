@@ -90,6 +90,9 @@ jobs:
           combined_allowed_paths_file="$(
             mktemp "${RUNNER_TEMP}/toolbox-sync-combined-paths.XXXXXX"
           )"
+          history_receipt_file="$(
+            mktemp "${RUNNER_TEMP}/toolbox-sync-history.XXXXXX"
+          )"
           git_with_token() {
             local basic_token
             basic_token="$(
@@ -174,6 +177,10 @@ jobs:
             "refs/remotes/origin/${TARGET_BASE}"
           require_managed_paths \
             "The target base" "${base_allowed_paths_file}"
+          target_base_sha="$(
+            git -C "${TARGET_ROOT}" rev-parse --verify \
+              "refs/remotes/origin/${TARGET_BASE}"
+          )"
 
           remote_branch="$(
             git_with_token -C "${TARGET_ROOT}" ls-remote --heads origin \
@@ -227,25 +234,53 @@ jobs:
               "The existing generated branch" \
               git -C "${TARGET_ROOT}" diff --no-renames --name-only -z \
                 "origin/${TARGET_BASE}...HEAD"
+            if ! python3 \
+              "${CANONICAL_ROOT}/scripts/sync_canonical_mirrors.py" \
+              validate-branch-history \
+              --target-root "${TARGET_ROOT}" \
+              --base-ref "${target_base_sha}" \
+              --head-ref "${remote_branch_sha}" \
+              --allowed-paths-file "${allowed_paths_file}" \
+              >"${history_receipt_file}"; then
+              echo "::error title=Unsafe sync branch history::The complete branch-exclusive commit history did not pass canonical edge, path, topology, and blob validation."
+              exit 1
+            fi
+            if ! jq -e \
+              --arg base "${target_base_sha}" \
+              --arg head "${remote_branch_sha}" \
+              '
+                .schema_version == 1 and
+                .base_sha == $base and
+                .head_sha == $head and
+                .profile == "branch-exclusive" and
+                (.history_sha256 | test("^[0-9a-f]{64}$"))
+              ' "${history_receipt_file}" >/dev/null; then
+              echo "::error title=Invalid sync history receipt::The branch history validator did not bind the exact prepared base and head."
+              exit 1
+            fi
+            remote_branch_history_sha256="$(
+              jq -r '.history_sha256' "${history_receipt_file}"
+            )"
+            git -C "${TARGET_ROOT}" switch --force-create "${SYNC_BRANCH}" \
+              "origin/${TARGET_BASE}"
           else
             git -C "${TARGET_ROOT}" switch --create "${SYNC_BRANCH}" \
               "origin/${TARGET_BASE}"
             mv "${base_allowed_paths_file}" "${allowed_paths_file}"
+            remote_branch_history_sha256="$(
+              printf '%064d' 0
+            )"
           fi
 
-          target_base_sha="$(
-            git -C "${TARGET_ROOT}" rev-parse --verify \
-              "refs/remotes/origin/${TARGET_BASE}"
-          )"
-          git -C "${TARGET_ROOT}" merge --no-edit "origin/${TARGET_BASE}"
           assert_allowed_paths \
-            "The merged generated branch" \
+            "The fresh generated branch" \
             git -C "${TARGET_ROOT}" diff --no-renames --name-only -z \
               "origin/${TARGET_BASE}...HEAD"
           {
             echo "target_base_sha=${target_base_sha}"
             echo "remote_branch_present=${remote_branch_present}"
             echo "remote_branch_sha=${remote_branch_sha}"
+            echo "remote_branch_history_sha256=${remote_branch_history_sha256}"
           } >>"${GITHUB_OUTPUT}"
 
       - name: Validate existing sync PR ownership
@@ -459,14 +494,61 @@ jobs:
             echo "head_sha=${head_sha}"
           } >>"${GITHUB_OUTPUT}"
 
+      - name: Validate fresh generated branch history
+        id: history
+        shell: bash
+        env:
+          GENERATED_HEAD_SHA: ${{ steps.commit.outputs.head_sha }}
+          PREPARED_TARGET_BASE_SHA: ${{ steps.prepare.outputs.target_base_sha }}
+        run: |
+          set -euo pipefail
+          allowed_paths_file="${RUNNER_TEMP}/toolbox-sync-allowed-paths.json"
+          history_receipt_file="$(
+            mktemp "${RUNNER_TEMP}/toolbox-sync-fresh-history.XXXXXX"
+          )"
+          if [[ ! "${PREPARED_TARGET_BASE_SHA}" =~ ^[0-9a-f]{40}$ || \
+            ! "${GENERATED_HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Invalid generated history::The prepared base or generated head is malformed."
+            exit 1
+          fi
+          python3 \
+            "${CANONICAL_ROOT}/scripts/sync_canonical_mirrors.py" \
+            validate-branch-history \
+            --target-root "${TARGET_ROOT}" \
+            --base-ref "${PREPARED_TARGET_BASE_SHA}" \
+            --head-ref "${GENERATED_HEAD_SHA}" \
+            --allowed-paths-file "${allowed_paths_file}" \
+            --require-fresh-head \
+            >"${history_receipt_file}"
+          if ! jq -e \
+            --arg base "${PREPARED_TARGET_BASE_SHA}" \
+            --arg head "${GENERATED_HEAD_SHA}" \
+            '
+              .schema_version == 1 and
+              .base_sha == $base and
+              .head_sha == $head and
+              .merge_base_sha == $base and
+              .profile == "fresh-single-commit" and
+              (.history_sha256 | test("^[0-9a-f]{64}$"))
+            ' "${history_receipt_file}" >/dev/null; then
+            echo "::error title=Invalid generated history receipt::The fresh-history validator did not bind the exact prepared base and generated head."
+            exit 1
+          fi
+          {
+            echo "head_sha=${GENERATED_HEAD_SHA}"
+            echo "history_sha256=$(jq -r '.history_sha256' "${history_receipt_file}")"
+          } >>"${GITHUB_OUTPUT}"
+
       - name: Push scoped sync branch
         if: steps.commit.outputs.branch_needs_update == 'true'
         shell: bash
         env:
           CODEX_TOOLBOX_SYNC_TOKEN: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
-          DESIRED_HEAD_SHA: ${{ steps.commit.outputs.head_sha }}
+          DESIRED_HEAD_SHA: ${{ steps.history.outputs.head_sha }}
+          DESIRED_HISTORY_SHA256: ${{ steps.history.outputs.history_sha256 }}
           PREPARED_REMOTE_BRANCH_PRESENT: ${{ steps.prepare.outputs.remote_branch_present }}
           PREPARED_REMOTE_BRANCH_SHA: ${{ steps.prepare.outputs.remote_branch_sha }}
+          PREPARED_REMOTE_HISTORY_SHA256: ${{ steps.prepare.outputs.remote_branch_history_sha256 }}
           PREPARED_TARGET_BASE_SHA: ${{ steps.prepare.outputs.target_base_sha }}
         run: |
           set -euo pipefail
@@ -507,8 +589,10 @@ jobs:
           }
 
           if [[ ! "${DESIRED_HEAD_SHA}" =~ ^[0-9a-f]{40}$ || \
-            ! "${PREPARED_TARGET_BASE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error title=Invalid prepared commit::The desired head or prepared base SHA is malformed."
+            ! "${PREPARED_TARGET_BASE_SHA}" =~ ^[0-9a-f]{40}$ || \
+            ! "${DESIRED_HISTORY_SHA256}" =~ ^[0-9a-f]{64}$ || \
+            ! "${PREPARED_REMOTE_HISTORY_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error title=Invalid prepared commit::The desired head, prepared base, or bound history digest is malformed."
             exit 1
           fi
           local_desired_sha="$(
@@ -537,11 +621,6 @@ jobs:
                   "${REMOTE_REF_PRESENT}" != "true" || \
                   "${REMOTE_REF_SHA}" != "${PREPARED_REMOTE_BRANCH_SHA}" ]]; then
                   echo "::error title=Sync branch advanced::The remote sync branch changed after preparation; refusing to overwrite it."
-                  exit 1
-                fi
-                if ! git -C "${TARGET_ROOT}" merge-base --is-ancestor \
-                  "${PREPARED_REMOTE_BRANCH_SHA}" "${DESIRED_HEAD_SHA}"; then
-                  echo "::error title=Non-descendant sync update::The generated commit is not descended from the exact prepared sync branch."
                   exit 1
                 fi
                 push_lease="--force-with-lease=refs/heads/${SYNC_BRANCH}:${PREPARED_REMOTE_BRANCH_SHA}"
@@ -575,7 +654,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
-          DESIRED_HEAD_SHA: ${{ steps.commit.outputs.head_sha }}
+          DESIRED_HEAD_SHA: ${{ steps.history.outputs.head_sha }}
           EXISTING_PR: ${{ steps.existing-pr.outputs.number }}
           PREPARED_TARGET_BASE_SHA: ${{ steps.prepare.outputs.target_base_sha }}
         run: |
@@ -850,7 +929,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
-          DESIRED_HEAD_SHA: ${{ steps.commit.outputs.head_sha }}
+          DESIRED_HEAD_SHA: ${{ steps.history.outputs.head_sha }}
           EXISTING_PR: ${{ steps.existing-pr.outputs.number }}
           PREPARED_TARGET_BASE_SHA: ${{ steps.prepare.outputs.target_base_sha }}
         run: |
