@@ -305,6 +305,8 @@ class SyncToolboxAutomationTests(unittest.TestCase):
         self.assertIn("gh pr create", publish)
         self.assertIn("query_sync_prs", publish)
         self.assertIn("require_target_base_sha", publish)
+        self.assertIn("require_sync_branch_sha", publish)
+        self.assertIn('published_pr_number="${created_pr_url#', publish)
         self.assertIn('.state == "OPEN"', publish)
         self.assertIn(".baseRefOid == $base_oid", publish)
         self.assertIn(".headRefOid == $head_oid", publish)
@@ -314,6 +316,199 @@ class SyncToolboxAutomationTests(unittest.TestCase):
         self.assertNotIn("--delete-branch", close)
         self.assertIn(".baseRefOid == $base_oid", close)
         self.assertIn(".headRefOid == $head_oid", close)
+
+    def test_pr_create_binds_live_head_and_returned_number(self) -> None:
+        jq = shutil.which("jq")
+        if jq is None:
+            self.skipTest("jq is unavailable")
+        with tempfile.TemporaryDirectory(
+            prefix="sync-toolbox-create-pr."
+        ) as temporary_directory:
+            root = Path(temporary_directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_gh = fake_bin / "gh"
+            fake_gh.write_text(
+                "#!/usr/bin/python3\n"
+                "import json\n"
+                "import os\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "args = sys.argv[1:]\n"
+                "log = Path(os.environ['FAKE_GH_LOG'])\n"
+                "with log.open('a', encoding='utf-8') as stream:\n"
+                "    stream.write(' '.join(args) + '\\n')\n"
+                "if args[:1] == ['api']:\n"
+                "    if '/heads/master' in args[1]:\n"
+                "        print(os.environ['LIVE_BASE_SHA'])\n"
+                "    elif Path(os.environ['CREATED_STATE']).exists():\n"
+                "        print(os.environ['LIVE_HEAD_AFTER_CREATE'])\n"
+                "    else:\n"
+                "        print(os.environ['LIVE_HEAD_SHA'])\n"
+                "elif args[:2] == ['pr', 'list']:\n"
+                "    if Path(os.environ['CREATED_STATE']).exists():\n"
+                "        print(os.environ['AFTER_PR_PAYLOAD'])\n"
+                "    else:\n"
+                "        print('[]')\n"
+                "elif args[:2] == ['pr', 'create']:\n"
+                "    Path(os.environ['CREATED_STATE']).write_text('created', encoding='ascii')\n"
+                "    print(os.environ['CREATED_PR_URL'])\n"
+                "elif args[:2] == ['pr', 'view']:\n"
+                "    if args[2] != os.environ['ACTUAL_CREATED_NUMBER']:\n"
+                "        raise SystemExit(1)\n"
+                "    payload = json.loads(os.environ['RECOVERY_PR_PAYLOAD'])\n"
+                "    if Path(os.environ['CLOSED_STATE']).exists():\n"
+                "        payload['state'] = 'CLOSED'\n"
+                "    print(json.dumps(payload))\n"
+                "elif args[:2] == ['pr', 'close']:\n"
+                "    if args[2] != os.environ['ACTUAL_CREATED_NUMBER']:\n"
+                "        raise SystemExit(1)\n"
+                "    Path(os.environ['CLOSED_STATE']).write_text('closed', encoding='ascii')\n",
+                encoding="utf-8",
+            )
+            fake_gh.chmod(0o755)
+            desired_sha = "5" * 40
+            prepared_base_sha = "4" * 40
+            exact_payload = [
+                {
+                    "number": 29,
+                    "body": ("<!-- codex-personal-sync-toolbox-automation -->\n"),
+                    "state": "OPEN",
+                    "baseRefName": "master",
+                    "baseRefOid": prepared_base_sha,
+                    "headRefName": "automation/canonical-personal-sync",
+                    "headRefOid": desired_sha,
+                    "headRepositoryOwner": {"login": "Joey-Tools"},
+                    "isCrossRepository": False,
+                }
+            ]
+            drifted_payload = [{**exact_payload[0], "headRefOid": "6" * 40}]
+            recovery_payload = {
+                key: value
+                for key, value in exact_payload[0].items()
+                if key not in {"baseRefOid", "headRefOid"}
+            }
+            cases = (
+                (
+                    "exact",
+                    desired_sha,
+                    desired_sha,
+                    "https://github.com/Joey-Tools/codex-toolbox/pull/29",
+                    exact_payload,
+                    0,
+                    True,
+                    False,
+                ),
+                (
+                    "head drift before create",
+                    "6" * 40,
+                    "6" * 40,
+                    "https://github.com/Joey-Tools/codex-toolbox/pull/29",
+                    drifted_payload,
+                    1,
+                    False,
+                    False,
+                ),
+                (
+                    "head drift after create",
+                    desired_sha,
+                    "6" * 40,
+                    "https://github.com/Joey-Tools/codex-toolbox/pull/29",
+                    drifted_payload,
+                    1,
+                    True,
+                    True,
+                ),
+                (
+                    "returned number mismatch",
+                    desired_sha,
+                    desired_sha,
+                    "https://github.com/Joey-Tools/codex-toolbox/pull/30",
+                    exact_payload,
+                    1,
+                    True,
+                    False,
+                ),
+            )
+            for (
+                name,
+                live_head_sha,
+                live_head_after_create,
+                created_pr_url,
+                after_pr_payload,
+                expected_failure,
+                should_create,
+                should_close,
+            ) in cases:
+                with self.subTest(name=name):
+                    gh_log = root / f"gh-log-{name.replace(' ', '-')}"
+                    created_state = root / f"created-{name.replace(' ', '-')}"
+                    closed_state = root / f"closed-{name.replace(' ', '-')}"
+                    environment = {
+                        **os.environ,
+                        "ACTUAL_CREATED_NUMBER": "29",
+                        "AFTER_PR_PAYLOAD": json.dumps(after_pr_payload),
+                        "CANONICAL_SHA": "3" * 40,
+                        "CLOSED_STATE": str(closed_state),
+                        "CREATED_PR_URL": created_pr_url,
+                        "CREATED_STATE": str(created_state),
+                        "DESIRED_HEAD_SHA": desired_sha,
+                        "EXISTING_PR": "",
+                        "FAKE_GH_LOG": str(gh_log),
+                        "GH_TOKEN": SYNTHETIC_ACCESS_TOKEN,
+                        "GITHUB_REPOSITORY": "Joey-Tools/codex-personal-sync",
+                        "GITHUB_RUN_ID": "123",
+                        "GITHUB_WORKFLOW": "Sync toolbox mirror",
+                        "LIVE_BASE_SHA": prepared_base_sha,
+                        "LIVE_HEAD_AFTER_CREATE": live_head_after_create,
+                        "LIVE_HEAD_SHA": live_head_sha,
+                        "MIRROR_NAME": "toolbox",
+                        "PATH": (f"{fake_bin}:{Path(jq).parent}:/usr/bin:/bin"),
+                        "PREPARED_TARGET_BASE_SHA": prepared_base_sha,
+                        "RECOVERY_PR_PAYLOAD": json.dumps(recovery_payload),
+                        "RUNNER_TEMP": str(root),
+                        "SYNC_BRANCH": "automation/canonical-personal-sync",
+                        "TARGET_BASE": "master",
+                        "TARGET_OWNER": "Joey-Tools",
+                        "TARGET_REPOSITORY": "Joey-Tools/codex-toolbox",
+                    }
+                    completed = subprocess.run(
+                        [
+                            "/bin/bash",
+                            "-euo",
+                            "pipefail",
+                            "-c",
+                            self._step_run("Publish or update toolbox sync PR"),
+                        ],
+                        cwd=REPOSITORY_ROOT,
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=30,
+                    )
+                    if expected_failure:
+                        self.assertNotEqual(
+                            completed.returncode,
+                            0,
+                            completed.stdout + completed.stderr,
+                        )
+                    else:
+                        self.assertEqual(
+                            completed.returncode,
+                            0,
+                            completed.stdout + completed.stderr,
+                        )
+                    commands = gh_log.read_text(encoding="utf-8")
+                    self.assertEqual("pr create" in commands, should_create)
+                    self.assertEqual("pr close" in commands, should_close)
+                    self.assertEqual(closed_state.exists(), should_close)
+                    if name == "head drift before create":
+                        self.assertIn("Sync branch advanced", completed.stdout)
+                    if name == "head drift after create":
+                        self.assertIn("Rejected created sync PR", completed.stdout)
+                    if name == "returned number mismatch":
+                        self.assertIn("Sync PR recovery required", completed.stdout)
 
     def test_allowed_path_stream_is_nul_delimited(self) -> None:
         jq = shutil.which("jq")
@@ -973,7 +1168,10 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                 "if args[:2] == ['pr', 'view']:\n"
                 "    print(os.environ['PR_PAYLOAD'])\n"
                 "elif args[:1] == ['api']:\n"
-                "    print(os.environ['LIVE_BASE_SHA'])\n",
+                "    if '/heads/master' in args[1]:\n"
+                "        print(os.environ['LIVE_BASE_SHA'])\n"
+                "    else:\n"
+                "        print(os.environ['LIVE_HEAD_SHA'])\n",
                 encoding="utf-8",
             )
             fake_gh.chmod(0o755)
@@ -991,11 +1189,19 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                 "isCrossRepository": False,
             }
             cases = (
-                ("exact", exact_payload, prepared_base_sha, 0, True),
+                (
+                    "exact",
+                    exact_payload,
+                    prepared_base_sha,
+                    desired_sha,
+                    0,
+                    True,
+                ),
                 (
                     "head drift",
                     {**exact_payload, "headRefOid": "6" * 40},
                     prepared_base_sha,
+                    desired_sha,
                     1,
                     False,
                 ),
@@ -1006,6 +1212,7 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                         "headRepositoryOwner": {"login": "someone-else"},
                     },
                     prepared_base_sha,
+                    desired_sha,
                     1,
                     False,
                 ),
@@ -1013,6 +1220,7 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                     "pr base drift",
                     {**exact_payload, "baseRefOid": "7" * 40},
                     prepared_base_sha,
+                    desired_sha,
                     1,
                     False,
                 ),
@@ -1020,6 +1228,15 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                     "live base drift",
                     exact_payload,
                     "8" * 40,
+                    desired_sha,
+                    1,
+                    False,
+                ),
+                (
+                    "live head drift",
+                    exact_payload,
+                    prepared_base_sha,
+                    "9" * 40,
                     1,
                     False,
                 ),
@@ -1028,6 +1245,7 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                 name,
                 payload,
                 live_base_sha,
+                live_head_sha,
                 expected_failure,
                 should_close,
             ) in cases:
@@ -1040,6 +1258,7 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                         "FAKE_GH_LOG": str(gh_log),
                         "GH_TOKEN": SYNTHETIC_ACCESS_TOKEN,
                         "LIVE_BASE_SHA": live_base_sha,
+                        "LIVE_HEAD_SHA": live_head_sha,
                         "PATH": (f"{fake_bin}:{Path(jq).parent}:/usr/bin:/bin"),
                         "PREPARED_TARGET_BASE_SHA": prepared_base_sha,
                         "PR_PAYLOAD": json.dumps(payload),

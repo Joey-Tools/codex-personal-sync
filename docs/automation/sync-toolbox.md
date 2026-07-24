@@ -61,9 +61,16 @@ administrators must provision and rotate the secret outside this workflow.
   owner, base name and exact base OID, head branch and exact head OID,
   same-repository status, and automation marker all match the prepared branch
   evidence. The workflow also queries the live target-base ref immediately
-  before every create, edit, or close mutation and verifies both the ref and
-  PR evidence again after create/edit. It does not trust an earlier PR listing
-  or assume that an unchanged branch name implies an unchanged base.
+  before every create, edit, or close mutation, requires the live sync branch
+  to equal the generated head, and verifies both refs plus PR evidence again
+  after create/edit. A newly created PR is also rebound to the exact positive
+  PR number returned by `gh pr create`; a different open PR cannot satisfy the
+  postcondition. If a post-create ref or ownership check fails, the workflow
+  closes only that returned-number PR after revalidating its repository,
+  lifecycle, branch names, owner, and automation marker, then verifies the
+  closed state. Ambiguous cleanup preserves the exact PR locator as recovery
+  evidence. The workflow does not trust an earlier PR listing or assume that
+  an unchanged branch name implies unchanged base/head object identity.
 - `pr_has_changes` and `branch_needs_update` are independent. A stale generated
   branch can become tree-equal to `master` after reconciliation while still
   requiring an ordinary fast-forward push. After that push, an exact owned

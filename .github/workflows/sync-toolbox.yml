@@ -564,7 +564,21 @@ jobs:
               ! "${observed_base_sha}" =~ ^[0-9a-f]{40}$ || \
               "${observed_base_sha}" != "${PREPARED_TARGET_BASE_SHA}" ]]; then
               echo "::error title=Toolbox master advanced::The target base changed after generation; refusing to mutate a sync PR."
-              exit 1
+              return 1
+            fi
+          }
+          require_sync_branch_sha() {
+            local observed_head_sha
+            observed_head_sha="$(
+              gh api \
+                "repos/${TARGET_REPOSITORY}/git/ref/heads/${SYNC_BRANCH}" \
+                --jq '.object.sha'
+            )"
+            if [[ ! "${DESIRED_HEAD_SHA}" =~ ^[0-9a-f]{40}$ || \
+              ! "${observed_head_sha}" =~ ^[0-9a-f]{40}$ || \
+              "${observed_head_sha}" != "${DESIRED_HEAD_SHA}" ]]; then
+              echo "::error title=Sync branch advanced::The generated branch changed after publication; refusing to mutate a sync PR."
+              return 1
             fi
           }
           require_owned_sync_pr() {
@@ -574,7 +588,7 @@ jobs:
             count="$(jq 'length' <<<"${pull_requests}")"
             if ((count != 1)); then
               echo "::error title=Sync PR changed::Expected exactly one open scoped sync PR after publication."
-              exit 1
+              return 1
             fi
             if ! jq -e \
               --arg owner "${TARGET_OWNER}" \
@@ -598,14 +612,77 @@ jobs:
                 )
               ' <<<"${pull_requests}" >/dev/null; then
               echo "::error title=Sync PR changed::The live PR does not exactly match the owned repository, lifecycle, base, branch, generated head, owner, and automation marker."
-              exit 1
+              return 1
             fi
+          }
+          close_created_pr_after_failed_postcondition() {
+            local created_number="$1"
+            local created_pr
+            local closed_pr
+            if [[ ! "${created_number}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error title=Sync PR recovery required::A created PR may need manual inspection, but its returned number is invalid."
+              return 1
+            fi
+            if ! created_pr="$(
+              gh pr view "${created_number}" \
+                --repo "${TARGET_REPOSITORY}" \
+                --json number,body,state,baseRefName,headRefName,headRepositoryOwner,isCrossRepository
+            )"; then
+              echo "::error title=Sync PR recovery required::Could not inspect created PR ${TARGET_REPOSITORY}#${created_number}; preserve it for manual recovery."
+              return 1
+            fi
+            if ! jq -e \
+              --arg number "${created_number}" \
+              --arg owner "${TARGET_OWNER}" \
+              --arg base "${TARGET_BASE}" \
+              --arg head "${SYNC_BRANCH}" \
+              '
+                (.number | tostring) == $number and
+                .state == "OPEN" and
+                .baseRefName == $base and
+                .headRefName == $head and
+                .isCrossRepository == false and
+                .headRepositoryOwner.login == $owner and
+                (.body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
+              ' <<<"${created_pr}" >/dev/null; then
+              echo "::error title=Sync PR recovery required::Created PR ${TARGET_REPOSITORY}#${created_number} no longer matches the exact automation identity; preserve it for manual recovery."
+              return 1
+            fi
+            if ! gh pr close "${created_number}" \
+              --repo "${TARGET_REPOSITORY}"; then
+              echo "::error title=Sync PR recovery required::Failed to close created PR ${TARGET_REPOSITORY}#${created_number} after its postcondition failed."
+              return 1
+            fi
+            if ! closed_pr="$(
+              gh pr view "${created_number}" \
+                --repo "${TARGET_REPOSITORY}" \
+                --json number,body,state,baseRefName,headRefName,headRepositoryOwner,isCrossRepository
+            )" || ! jq -e \
+              --arg number "${created_number}" \
+              --arg owner "${TARGET_OWNER}" \
+              --arg base "${TARGET_BASE}" \
+              --arg head "${SYNC_BRANCH}" \
+              '
+                (.number | tostring) == $number and
+                .state == "CLOSED" and
+                .baseRefName == $base and
+                .headRefName == $head and
+                .isCrossRepository == false and
+                .headRepositoryOwner.login == $owner and
+                (.body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
+              ' <<<"${closed_pr}" >/dev/null; then
+              echo "::error title=Sync PR recovery required::Closure of created PR ${TARGET_REPOSITORY}#${created_number} is unverified; preserve the exact locator for manual recovery."
+              return 1
+            fi
+            echo "::warning title=Rejected created sync PR::Closed ${TARGET_REPOSITORY}#${created_number} because its exact post-publication evidence did not match."
           }
 
           before_publish="$(query_sync_prs)"
+          published_pr_number="${EXISTING_PR}"
           if [[ -n "${EXISTING_PR}" ]]; then
             require_owned_sync_pr "${before_publish}" "${EXISTING_PR}"
             require_target_base_sha
+            require_sync_branch_sha
             gh pr edit "${EXISTING_PR}" \
               --repo "${TARGET_REPOSITORY}" \
               --title "${title}" \
@@ -616,15 +693,37 @@ jobs:
               exit 1
             fi
             require_target_base_sha
-            gh pr create \
-              --repo "${TARGET_REPOSITORY}" \
-              --base "${TARGET_BASE}" \
-              --head "${SYNC_BRANCH}" \
-              --title "${title}" \
-              --body-file "${pr_body_file}"
+            require_sync_branch_sha
+            created_pr_url="$(
+              gh pr create \
+                --repo "${TARGET_REPOSITORY}" \
+                --base "${TARGET_BASE}" \
+                --head "${SYNC_BRANCH}" \
+                --title "${title}" \
+                --body-file "${pr_body_file}"
+            )"
+            expected_pr_url_prefix="https://github.com/${TARGET_REPOSITORY}/pull/"
+            if [[ "${created_pr_url}" != "${expected_pr_url_prefix}"* ]]; then
+              echo "::error title=Unexpected sync PR response::The created PR URL does not identify the exact target repository."
+              exit 1
+            fi
+            published_pr_number="${created_pr_url#"${expected_pr_url_prefix}"}"
+            if [[ ! "${published_pr_number}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error title=Unexpected sync PR response::The created PR URL does not end in one canonical positive PR number."
+              exit 1
+            fi
           fi
-          require_target_base_sha
-          require_owned_sync_pr "$(query_sync_prs)" "${EXISTING_PR}"
+          post_publish_pr="$(query_sync_prs || true)"
+          if ! require_target_base_sha || \
+            ! require_sync_branch_sha || \
+            ! require_owned_sync_pr \
+              "${post_publish_pr}" "${published_pr_number}"; then
+            if [[ -z "${EXISTING_PR}" ]]; then
+              close_created_pr_after_failed_postcondition \
+                "${published_pr_number}" || true
+            fi
+            exit 1
+          fi
 
       - name: Close clean owned toolbox sync PR
         if: steps.commit.outputs.pr_has_changes != 'true' && steps.existing-pr.outputs.number != ''
@@ -671,6 +770,17 @@ jobs:
             ! "${observed_base_sha}" =~ ^[0-9a-f]{40}$ || \
             "${observed_base_sha}" != "${PREPARED_TARGET_BASE_SHA}" ]]; then
             echo "::error title=Toolbox master advanced::The target base changed after generation; refusing to close the sync PR."
+            exit 1
+          fi
+          observed_head_sha="$(
+            gh api \
+              "repos/${TARGET_REPOSITORY}/git/ref/heads/${SYNC_BRANCH}" \
+              --jq '.object.sha'
+          )"
+          if [[ ! "${DESIRED_HEAD_SHA}" =~ ^[0-9a-f]{40}$ || \
+            ! "${observed_head_sha}" =~ ^[0-9a-f]{40}$ || \
+            "${observed_head_sha}" != "${DESIRED_HEAD_SHA}" ]]; then
+            echo "::error title=Sync branch advanced::The generated branch changed after publication; refusing to close the sync PR."
             exit 1
           fi
           gh pr close "${EXISTING_PR}" \

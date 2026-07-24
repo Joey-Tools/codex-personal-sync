@@ -111,6 +111,16 @@ superseded_by:
   PR after create/edit. Focused toolbox workflow tests add PR-base and live-ref
   drift cases; `python3 -m unittest tests.test_sync_toolbox_automation` passed
   14 tests, and actionlint plus Ruff passed for the follow-up.
+- Fresh named-single review then found that the no-existing-PR path could
+  create from a sync branch moved after the push step and only reject it after
+  the wrong PR already existed. Publication now revalidates the exact live
+  sync-branch OID immediately before every PR mutation and after create/edit,
+  and binds a newly created PR to the exact number returned by `gh pr create`.
+  A failed post-create condition closes and verifies only that exact,
+  identity-revalidated automation PR; ambiguous cleanup retains its exact
+  locator. The execution-level matrix covers pre-create and post-create head
+  drift, successful compensating closure, and a mismatched returned PR number;
+  the focused suite now passes 15 tests.
 - `python3 -B -m unittest tests.test_sync_toolbox_automation
   tests.test_source_lock`: 119 tests passed in 956.398 seconds after the
   fresh-review fixes. The added matrix covers unsupported/old/malformed Git
