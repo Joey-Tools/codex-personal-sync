@@ -2389,6 +2389,80 @@ class SyncBranchHistoryValidationTests(unittest.TestCase):
                     rejected.stdout + rejected.stderr,
                 )
 
+    def test_rejects_private_key_headers_across_transient_history_shapes(
+        self,
+    ) -> None:
+        private_key_kinds = (
+            "ENCRYPTED PRIVATE KEY",
+            "DSA PRIVATE KEY",
+            "PGP PRIVATE KEY BLOCK",
+        )
+        history_shapes = ("add-delete", "rename-back", "merge")
+        for kind_index, private_key_kind in enumerate(private_key_kinds):
+            marker = f"{'-' * 5}BEGIN {private_key_kind}{'-' * 5}\n"
+            for shape in history_shapes:
+                with self.subTest(kind=private_key_kind, shape=shape):
+                    self._git("switch", "--detach", "-q", self.base_sha)
+                    generated = "generated.txt"
+                    transient = "transient.txt"
+                    allowed = [generated, transient]
+                    if shape == "add-delete":
+                        self._write(generated, marker)
+                        self._commit(f"add {private_key_kind}")
+                        (self.repository / generated).unlink()
+                        head_sha = self._commit(f"delete {private_key_kind}")
+                    elif shape == "rename-back":
+                        self._write(generated, marker)
+                        self._commit(f"add {private_key_kind}")
+                        self._git("mv", generated, transient)
+                        self._commit(f"rename {private_key_kind} out")
+                        self._git("mv", transient, generated)
+                        self._write(generated, "safe generated content\n")
+                        head_sha = self._commit(f"rename {private_key_kind} back")
+                    else:
+                        side = f"secret-side-{kind_index}"
+                        generated_branch = f"secret-generated-{kind_index}"
+                        self._git(
+                            "switch",
+                            "-q",
+                            "-c",
+                            side,
+                            self.base_sha,
+                        )
+                        self._write(generated, marker)
+                        self._commit(f"side add {private_key_kind}")
+                        (self.repository / generated).unlink()
+                        self._commit(f"side delete {private_key_kind}")
+                        self._git(
+                            "switch",
+                            "-q",
+                            "-c",
+                            generated_branch,
+                            self.base_sha,
+                        )
+                        self._write(generated, "safe generated content\n")
+                        self._commit("generated branch change")
+                        self._git(
+                            "merge",
+                            "--no-ff",
+                            "-q",
+                            "-m",
+                            f"merge {private_key_kind} history",
+                            side,
+                        )
+                        head_sha = self._git("rev-parse", "HEAD")
+
+                    rejected = self._validate(
+                        self.base_sha,
+                        head_sha,
+                        allowed,
+                    )
+                    self.assertNotEqual(rejected.returncode, 0)
+                    self.assertIn(
+                        "high-confidence secret marker",
+                        rejected.stdout + rejected.stderr,
+                    )
+
     def test_rejects_out_of_scope_merge_side_history(self) -> None:
         self._git("switch", "-q", "-c", "side", self.base_sha)
         self._write("outside.txt", "side branch\n")

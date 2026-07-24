@@ -72,7 +72,10 @@ MAX_SYNC_HISTORY_PATH_BYTES = 8 * 1024 * 1024
 MAX_SYNC_HISTORY_BLOBS = 100_000
 MAX_SYNC_HISTORY_BLOB_BYTES = 512 * 1024 * 1024
 SYNC_HISTORY_SECRET_PATTERNS = (
-    re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    re.compile(
+        rb"-----BEGIN (?:(?:ENCRYPTED|RSA|DSA|EC|OPENSSH) PRIVATE KEY|"
+        rb"PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----"
+    ),
     re.compile(rb"\bgh[pousr]_[A-Za-z0-9]{36,255}\b"),
     re.compile(rb"\bgithub_pat_[A-Za-z0-9_]{40,255}\b"),
     re.compile(rb"\bAKIA[0-9A-Z]{16}\b"),

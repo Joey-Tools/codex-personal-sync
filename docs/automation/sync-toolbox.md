@@ -68,8 +68,11 @@ administrators must provision and rotate the secret outside this workflow.
   republishing a bounded fresh branch instead of retaining arbitrary history.
 - Existing branch history is checked edge-by-edge without rename collapsing;
   add-then-delete, rename-out-and-back, side-merge, and transient-secret
-  sequences cannot hide behind a clean net diff. Working-tree changes, staged
-  changes, and the final PR diff remain restricted to the generated allowlist.
+  sequences cannot hide behind a clean net diff. High-confidence private-key
+  headers include generic, encrypted, RSA, DSA, EC, OpenSSH, and PGP private
+  key block forms; the scanner deliberately does not widen this gate to vague
+  key-related prose. Working-tree changes, staged changes, and the final PR
+  diff remain restricted to the generated allowlist.
 - Generated regular files are staged from their exact worktree bytes with
   `git hash-object --no-filters` and `git update-index --cacheinfo`; missing
   allowed paths use an explicit index removal. The commit is assembled from

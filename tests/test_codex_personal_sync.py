@@ -6942,6 +6942,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
     def test_uninstall_scheduler_runs_macos_disable_commands(self) -> None:
         home = self.root / "home" / ".codex"
+        (self.root / "home" / "Library" / "LaunchAgents").mkdir(parents=True)
         completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
 
         with mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:

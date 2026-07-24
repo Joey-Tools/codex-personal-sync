@@ -348,6 +348,25 @@ superseded_by:
   `actionlint`, source-lock verification, and `git diff --check` also passed.
   The refreshed source-lock SHA-256 is
   `a068a413a0f083fe3a3ab572d5b62fb3e05392aa7c87f25bdf6011a3219f3d38`.
+- The second fresh-review follow-up binds the installed macOS plist or Linux
+  service/timer pair before the first uninstall native action, revalidates
+  exact identity, bytes, ownership, mode, and parent access through every
+  boundary, and conditionally removes only the proved original. Initially
+  absent legacy plists retain parent-and-absence evidence, so later appearance,
+  parent replacement, or unreadable evidence fails closed without deleting a
+  new object. Daemon queries now return explicit `enabled`, `disabled`, or
+  `unavailable` classifications; status and doctor retain daemon evidence
+  alongside earlier runtime or config failures. Branch-exclusive secret
+  admission now also rejects transient ENCRYPTED, DSA, and PGP private-key
+  headers across add/delete, rename/back, and merge-side history.
+- The exact final source bytes passed 609 personal-sync, reconciliation,
+  retention, scheduler, and automation tests in 587.219 seconds plus all 119
+  source-lock tests in 1545.549 seconds, for 728 disjoint repository tests.
+  The engine module independently passed 188 tests in 42.448 seconds, the
+  scheduler module passed 67 tests in 5.832 seconds, and the nine new
+  transient-history subcases passed in 60.471 seconds. The refreshed
+  source-lock SHA-256 is
+  `10b8caee52a83c71087b6be971812523feab00358688640e6da8334e3c9de15b`.
 
 ## Installed Host Baseline
 

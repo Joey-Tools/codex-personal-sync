@@ -541,6 +541,22 @@ class SchedulerDoctorTests(unittest.TestCase):
                 "quarantine_limit": MODULE.MAX_RETAINED_QUARANTINE_BATCHES,
                 "failure_code": None,
                 "failure_reason": "network unavailable",
+                "daemon_query": {
+                    "classification": "enabled",
+                    "reason": None,
+                },
+                "failures": [
+                    {
+                        "code": None,
+                        "reason": "network unavailable",
+                    },
+                    {
+                        "code": "scheduler-runner-drift",
+                        "reason": (
+                            "scheduler does not use the stable installed runner path"
+                        ),
+                    },
+                ],
             },
         )
 
@@ -2861,6 +2877,495 @@ class SchedulerDoctorTests(unittest.TestCase):
             )
 
         self.assertFalse(legacy.exists())
+
+    def test_absent_legacy_launchd_cleanup_retains_parent_and_absence(self) -> None:
+        mutations = (
+            ("appearance", "appeared after initial absence"),
+            ("parent", "parent chain changed"),
+            ("unreadable", "parent descriptor became unreadable"),
+        )
+        label = MODULE.LEGACY_LAUNCHD_LABELS[0]
+        for action_index in range(2):
+            for mutation, expected_error in mutations:
+                with self.subTest(action=action_index, mutation=mutation):
+                    case_user_home = (
+                        self.root / f"legacy-absent-{action_index}-{mutation}" / "home"
+                    )
+                    paths = MODULE.SchedulerPaths(
+                        platform="macos",
+                        launchd_plist=(
+                            case_user_home
+                            / "Library"
+                            / "LaunchAgents"
+                            / f"{MODULE.LAUNCHD_LABEL}.plist"
+                        ),
+                    )
+                    legacy = MODULE._legacy_launchd_plist(paths, label)
+                    legacy.parent.mkdir(parents=True)
+                    parent_identity = (
+                        legacy.parent.stat().st_dev,
+                        legacy.parent.stat().st_ino,
+                    )
+                    real_directory_identity = MODULE._directory_identity
+                    native_calls = 0
+                    force_unreadable = False
+
+                    def mutate_absence(
+                        _args: list[str],
+                        *,
+                        dry_run: bool,
+                        allow_fail: bool = False,
+                    ) -> None:
+                        del dry_run, allow_fail
+                        nonlocal force_unreadable, native_calls
+                        current_call = native_calls
+                        native_calls += 1
+                        if current_call != action_index:
+                            return
+                        if mutation == "appearance":
+                            legacy.write_bytes(b"new user scheduler config\n")
+                            legacy.chmod(0o600)
+                        elif mutation == "parent":
+                            displaced = legacy.parent.with_name(
+                                legacy.parent.name + ".displaced"
+                            )
+                            legacy.parent.rename(displaced)
+                            legacy.parent.mkdir()
+                        else:
+                            force_unreadable = True
+
+                    def directory_identity(
+                        directory_fd: int,
+                    ) -> tuple[int, int]:
+                        identity = real_directory_identity(directory_fd)
+                        if force_unreadable and identity == parent_identity:
+                            raise OSError("injected parent read failure")
+                        return identity
+
+                    with (
+                        mock.patch.object(
+                            MODULE.Path,
+                            "home",
+                            return_value=case_user_home,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_run_native_command",
+                            side_effect=mutate_absence,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_directory_identity",
+                            side_effect=directory_identity,
+                        ),
+                        contextlib.redirect_stdout(io.StringIO()),
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            expected_error,
+                        ),
+                    ):
+                        MODULE._cleanup_legacy_launchd_schedulers(
+                            paths,
+                            dry_run=False,
+                            disable=True,
+                            remove=True,
+                        )
+
+                    self.assertEqual(native_calls, action_index + 1)
+                    if mutation == "appearance":
+                        self.assertEqual(
+                            legacy.read_bytes(),
+                            b"new user scheduler config\n",
+                        )
+
+    def test_uninstall_binds_original_scheduler_configs_across_native_calls(
+        self,
+    ) -> None:
+        mutations = (
+            ("replacement", "object identity changed"),
+            ("content", "content changed"),
+            ("mode", "access policy changed"),
+            ("owner", "access policy changed"),
+            ("parent", "parent chain changed"),
+            ("missing", "is missing"),
+            ("unreadable", "is unreadable"),
+        )
+        case_index = 0
+        for platform_name in ("macos", "linux"):
+            targets = ("plist",) if platform_name == "macos" else ("service", "timer")
+            action_indexes = range(2) if platform_name == "macos" else range(1)
+            for target_kind in targets:
+                for action_index in action_indexes:
+                    for mutation, expected_error in mutations:
+                        case_index += 1
+                        with self.subTest(
+                            platform=platform_name,
+                            target=target_kind,
+                            action=action_index,
+                            mutation=mutation,
+                        ):
+                            case_user_home = (
+                                self.root / f"uninstall-{case_index}" / "home"
+                            )
+                            case_home = case_user_home / ".codex"
+                            runner = case_home / "bin" / "codex-personal-sync"
+                            runner.parent.mkdir(parents=True)
+                            runner.write_text(
+                                "#!/bin/sh\nexit 0\n",
+                                encoding="utf-8",
+                            )
+                            runner.chmod(0o755)
+                            with mock.patch.object(
+                                MODULE.Path,
+                                "home",
+                                return_value=case_user_home,
+                            ):
+                                with contextlib.redirect_stdout(io.StringIO()):
+                                    MODULE.install_scheduler(
+                                        case_home,
+                                        "owner/public-sync",
+                                        17,
+                                        platform_name,
+                                        None,
+                                        dry_run=False,
+                                        enable=False,
+                                    )
+                                paths = MODULE._scheduler_paths(
+                                    platform_name,
+                                    case_home,
+                                )
+                            if target_kind == "plist":
+                                target = paths.launchd_plist
+                            elif target_kind == "service":
+                                target = paths.systemd_service
+                            else:
+                                target = paths.systemd_timer
+                            assert target is not None
+                            original = target.read_bytes()
+                            original_metadata = target.stat()
+                            original_identity = (
+                                original_metadata.st_dev,
+                                original_metadata.st_ino,
+                            )
+                            original_mode = stat.S_IMODE(original_metadata.st_mode)
+                            real_read = MODULE._read_managed_state_bytes
+                            real_fstat = MODULE.os.fstat
+                            native_calls = 0
+                            force_owner = False
+                            force_unreadable = False
+
+                            def mutate_during_uninstall(
+                                _args: list[str],
+                                *,
+                                dry_run: bool,
+                                allow_fail: bool = False,
+                            ) -> None:
+                                del dry_run, allow_fail
+                                nonlocal force_owner
+                                nonlocal force_unreadable
+                                nonlocal native_calls
+                                current_call = native_calls
+                                native_calls += 1
+                                if current_call != action_index:
+                                    return
+                                if mutation == "replacement":
+                                    candidate = target.with_name(
+                                        target.name + ".replacement"
+                                    )
+                                    candidate.write_bytes(original)
+                                    candidate.chmod(original_mode)
+                                    os.replace(candidate, target)
+                                elif mutation == "content":
+                                    payload = bytearray(original)
+                                    payload[len(payload) // 2] ^= 1
+                                    target.write_bytes(payload)
+                                    target.chmod(original_mode)
+                                elif mutation == "mode":
+                                    target.chmod(
+                                        0o644 if original_mode != 0o644 else 0o600
+                                    )
+                                elif mutation == "owner":
+                                    force_owner = True
+                                elif mutation == "parent":
+                                    displaced = target.parent.with_name(
+                                        target.parent.name + ".displaced"
+                                    )
+                                    target.parent.rename(displaced)
+                                    target.parent.mkdir()
+                                elif mutation == "missing":
+                                    target.unlink()
+                                else:
+                                    force_unreadable = True
+
+                            def fstat_with_owner(
+                                file_fd: int,
+                            ) -> os.stat_result:
+                                metadata = real_fstat(file_fd)
+                                if (
+                                    force_owner
+                                    and (metadata.st_dev, metadata.st_ino)
+                                    == original_identity
+                                ):
+                                    fields = list(metadata)
+                                    fields[4] = metadata.st_uid + 1
+                                    return os.stat_result(fields)
+                                return metadata
+
+                            def fail_bound_read(
+                                file_fd: int,
+                                path: Path,
+                                maximum_bytes: int = (MODULE.MAX_MANAGED_STATE_BYTES),
+                            ) -> bytes:
+                                if force_unreadable and path == target:
+                                    raise MODULE.SyncError(
+                                        "injected bound read failure"
+                                    )
+                                return real_read(
+                                    file_fd,
+                                    path,
+                                    maximum_bytes,
+                                )
+
+                            output = io.StringIO()
+                            with (
+                                mock.patch.object(
+                                    MODULE.Path,
+                                    "home",
+                                    return_value=case_user_home,
+                                ),
+                                mock.patch.object(
+                                    MODULE,
+                                    "_run_native_command",
+                                    side_effect=mutate_during_uninstall,
+                                ),
+                                mock.patch.object(
+                                    MODULE.os,
+                                    "fstat",
+                                    side_effect=fstat_with_owner,
+                                ),
+                                mock.patch.object(
+                                    MODULE,
+                                    "_read_managed_state_bytes",
+                                    side_effect=fail_bound_read,
+                                ),
+                                contextlib.redirect_stdout(output),
+                                self.assertRaisesRegex(
+                                    MODULE.SyncError,
+                                    expected_error,
+                                ),
+                            ):
+                                MODULE.uninstall_scheduler(
+                                    case_home,
+                                    platform_name,
+                                    dry_run=False,
+                                    disable=True,
+                                )
+
+                            self.assertEqual(
+                                native_calls,
+                                action_index + 1,
+                            )
+                            self.assertNotIn(
+                                "removed ",
+                                output.getvalue(),
+                            )
+                            if mutation == "replacement":
+                                self.assertEqual(target.read_bytes(), original)
+
+    def test_scheduler_daemon_query_classifies_only_explicit_state_evidence(
+        self,
+    ) -> None:
+        cases = (
+            ("macos", 0, "", "", "enabled", None),
+            (
+                "macos",
+                113,
+                "",
+                "Could not find service in domain",
+                "disabled",
+                "not loaded",
+            ),
+            (
+                "macos",
+                1,
+                "",
+                "Operation not permitted",
+                "unavailable",
+                "denied",
+            ),
+            ("linux", 0, "enabled\n", "", "enabled", None),
+            (
+                "linux",
+                1,
+                "disabled\n",
+                "",
+                "disabled",
+                "state disabled",
+            ),
+            (
+                "linux",
+                1,
+                "",
+                "Failed to connect to bus",
+                "unavailable",
+                "user bus",
+            ),
+            (
+                "linux",
+                1,
+                "unexpected\n",
+                "",
+                "unavailable",
+                "no recognized",
+            ),
+        )
+        for (
+            platform_name,
+            returncode,
+            stdout,
+            stderr,
+            classification,
+            reason,
+        ) in cases:
+            with self.subTest(
+                platform=platform_name,
+                returncode=returncode,
+                stdout=stdout,
+                stderr=stderr,
+            ):
+                completed = subprocess.CompletedProcess(
+                    ["scheduler-query"],
+                    returncode,
+                    stdout,
+                    stderr,
+                )
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_native_scheduler_argv",
+                        side_effect=lambda args: args,
+                    ),
+                    mock.patch.object(
+                        MODULE.subprocess,
+                        "run",
+                        return_value=completed,
+                    ),
+                ):
+                    query = MODULE._scheduler_daemon_enabled(
+                        MODULE.SchedulerPaths(platform=platform_name)
+                    )
+                self.assertEqual(query.classification, classification)
+                self.assertEqual(
+                    query.enabled,
+                    (
+                        True
+                        if classification == "enabled"
+                        else False
+                        if classification == "disabled"
+                        else None
+                    ),
+                )
+                if reason is not None:
+                    self.assertIn(reason, query.reason or "")
+
+    def test_scheduler_report_and_doctor_preserve_runtime_and_daemon_failures(
+        self,
+    ) -> None:
+        self.write_runner()
+        self.install_scheduler_quietly(
+            "owner/public-sync",
+            17,
+            "linux",
+        )
+        runtime_state = {
+            "version": 2,
+            "last_attempt": "2026-07-24T12:00:00+00:00",
+            "last_success": None,
+            "success": False,
+            "failure_reason": "scheduled sync failed",
+            "failure_code": None,
+            "release_trees": {},
+            "mode": "public",
+            "repo": "owner/public-sync",
+            "base_repo": "owner/public-sync",
+            "owner": MODULE.PUBLIC_OWNER,
+        }
+        completed = subprocess.CompletedProcess(
+            ["systemctl"],
+            1,
+            "disabled\n",
+            "",
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_read_scheduler_runtime_state",
+                return_value=runtime_state,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_current_releases_for_scheduler",
+                return_value=(),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_scheduler_release_integrity_issues",
+                return_value=(),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_quarantine_batch_count",
+                return_value=0,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_stable_scheduler_runner_matches",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_native_scheduler_argv",
+                side_effect=lambda args: args,
+            ),
+            mock.patch.object(
+                MODULE.subprocess,
+                "run",
+                return_value=completed,
+            ),
+            mock.patch.object(
+                MODULE,
+                "audit_active_skills",
+                return_value=[],
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            report = MODULE.scheduler_report(self.home, "linux")
+            _doctor_report, issues = MODULE.doctor(
+                self.home,
+                "linux",
+                json_output=False,
+            )
+
+        self.assertEqual(report.failure_reason, "scheduled sync failed")
+        self.assertIsNone(report.failure_code)
+        self.assertFalse(report.enabled)
+        assert report.daemon_query is not None
+        self.assertEqual(report.daemon_query.classification, "disabled")
+        self.assertIn(
+            (None, "scheduled sync failed"),
+            report.failures,
+        )
+        self.assertIn(
+            (
+                "scheduler-daemon-disabled",
+                "systemd reports scheduler unit state disabled",
+            ),
+            report.failures,
+        )
+        issue_codes = {issue.code for issue in issues}
+        self.assertIn("scheduler-failure", issue_codes)
+        self.assertIn("scheduler-daemon-disabled", issue_codes)
+
     def test_scheduler_status_binds_config_across_native_query(self) -> None:
         for platform_name in ("macos", "linux"):
             with self.subTest(platform=platform_name):
@@ -2938,6 +3443,20 @@ class SchedulerDoctorTests(unittest.TestCase):
                 self.assertEqual(report.failure_code, "scheduler-config-drift")
                 self.assertIsNone(report.enabled)
                 self.assertIn("content changed", report.failure_reason or "")
+                assert report.daemon_query is not None
+                self.assertEqual(
+                    report.daemon_query.classification,
+                    "unavailable",
+                )
+                self.assertIn(
+                    "scheduler-config-drift",
+                    {code for code, _reason in report.failures},
+                )
+                self.assertIn(
+                    "scheduler-daemon-unavailable",
+                    {code for code, _reason in report.failures},
+                )
+
     def test_scheduler_status_allows_mtime_churn_and_reports_unavailable(
         self,
     ) -> None:
@@ -3066,6 +3585,11 @@ class SchedulerDoctorTests(unittest.TestCase):
                 self.assertEqual(
                     unavailable.failure_code,
                     "scheduler-daemon-unavailable",
+                )
+                assert unavailable.daemon_query is not None
+                self.assertEqual(
+                    unavailable.daemon_query.classification,
+                    "unavailable",
                 )
 
     def test_linux_install_binds_semantically_audited_pair(self) -> None:
