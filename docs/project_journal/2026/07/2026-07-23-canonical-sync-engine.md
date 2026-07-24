@@ -121,6 +121,13 @@ superseded_by:
   locator. The execution-level matrix covers pre-create and post-create head
   drift, successful compensating closure, and a mismatched returned PR number;
   the focused suite now passes 15 tests.
+- The next fresh named-single pass found no implementation defect and requested
+  stronger executable coverage. The harness now covers existing-PR edit
+  success plus ownership/head/base drift before and after edit; create base
+  drift before and after publication; and compensating-close refusal for
+  identity drift, close failure, an unclosed result, and post-close identity
+  drift. The focused workflow suite now passes 16 tests, with actionlint and
+  Ruff still clean.
 - `python3 -B -m unittest tests.test_sync_toolbox_automation
   tests.test_source_lock`: 119 tests passed in 956.398 seconds after the
   fresh-review fixes. The added matrix covers unsupported/old/malformed Git
