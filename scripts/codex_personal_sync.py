@@ -19806,23 +19806,119 @@ def _scheduler_config_parent(paths: SchedulerPaths) -> Path:
 def _scheduler_config_parent_is_missing(paths: SchedulerPaths) -> bool:
     parent = _scheduler_config_parent(paths)
     user_home = Path.home().expanduser()
+    parts = _directory_parts_beneath(user_home, parent)
+    directory_fds: list[int] = []
+
+    def revalidate_open_chain() -> None:
+        if not directory_fds or not _sync_home_matches_fd(
+            user_home,
+            directory_fds[0],
+        ):
+            raise SyncError(f"scheduler user home identity is uncertain: {user_home}")
+        for index, part in enumerate(parts[: len(directory_fds) - 1]):
+            child_fd = directory_fds[index + 1]
+            try:
+                child_identity = _directory_identity(child_fd)
+            except (OSError, SyncError) as error:
+                raise SyncError(
+                    f"scheduler config parent component is unreadable: {parent}"
+                ) from error
+            try:
+                named = os.stat(
+                    part,
+                    dir_fd=directory_fds[index],
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError as error:
+                raise SyncError(
+                    "scheduler config parent component disappeared during "
+                    f"validation: {parent}"
+                ) from error
+            except OSError as error:
+                raise SyncError(
+                    f"scheduler config parent component is unreadable: {parent}"
+                ) from error
+            if (
+                not stat.S_ISDIR(named.st_mode)
+                or (named.st_dev, named.st_ino) != child_identity
+            ):
+                raise SyncError(
+                    f"scheduler config parent component identity changed: {parent}"
+                )
+        if not _sync_home_matches_fd(user_home, directory_fds[0]):
+            raise SyncError(f"scheduler user home identity changed: {user_home}")
+
     try:
-        parent.relative_to(user_home)
-    except ValueError as error:
-        raise SyncError(
-            f"scheduler config parent must remain beneath the user home: {parent}"
-        ) from error
-    try:
-        metadata = os.stat(parent, follow_symlinks=False)
-    except FileNotFoundError:
-        return True
-    except OSError as error:
-        raise SyncError(
-            f"scheduler config parent is unreadable: {parent}"
-        ) from error
-    if not stat.S_ISDIR(metadata.st_mode):
-        raise SyncError(f"scheduler config parent is not a directory: {parent}")
-    return False
+        try:
+            directory_fds.append(_open_sync_home(user_home))
+        except FileNotFoundError as error:
+            raise SyncError(f"scheduler user home is missing: {user_home}") from error
+        except (OSError, SyncError) as error:
+            raise SyncError(
+                f"scheduler user home is unreadable: {user_home}"
+            ) from error
+
+        child_flags = _directory_open_flags(nofollow=True)
+        for part in parts:
+            current_fd = directory_fds[-1]
+            try:
+                child_fd = os.open(
+                    part,
+                    child_flags,
+                    dir_fd=current_fd,
+                )
+            except FileNotFoundError:
+                revalidate_open_chain()
+                try:
+                    os.stat(
+                        part,
+                        dir_fd=current_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    revalidate_open_chain()
+                    return True
+                except OSError as error:
+                    raise SyncError(
+                        "scheduler config parent component absence is "
+                        f"unreadable: {parent}"
+                    ) from error
+                raise SyncError(
+                    "scheduler config parent component appeared after "
+                    f"a missing observation: {parent}"
+                )
+            except OSError as error:
+                try:
+                    metadata = os.stat(
+                        part,
+                        dir_fd=current_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError as stat_error:
+                    raise SyncError(
+                        "scheduler config parent component identity is "
+                        f"uncertain: {parent}"
+                    ) from stat_error
+                except OSError as stat_error:
+                    raise SyncError(
+                        f"scheduler config parent component is unreadable: {parent}"
+                    ) from stat_error
+                if stat.S_ISLNK(metadata.st_mode):
+                    reason = "is a symlink"
+                elif not stat.S_ISDIR(metadata.st_mode):
+                    reason = "is not a directory"
+                else:
+                    reason = "could not be opened safely"
+                raise SyncError(
+                    f"scheduler config parent component {reason}: {parent}"
+                ) from error
+            directory_fds.append(child_fd)
+            revalidate_open_chain()
+        revalidate_open_chain()
+        return False
+    finally:
+        for directory_fd in reversed(directory_fds):
+            _close_fd_quietly(directory_fd)
 
 
 def _read_scheduler_regular_file(path: Path, maximum_bytes: int) -> bytes:
@@ -22893,16 +22989,16 @@ def _install_scheduler_transaction(
             published_launchd_snapshot = None if dry_run else config_audit.snapshots[0]
 
         def activate(
-            binding: SchedulerActivationBinding | None,
+            bindings: tuple[SchedulerActivationBinding, ...],
+            legacy_bindings: tuple[SchedulerActivationBinding, ...] | None,
         ) -> None:
             _cleanup_legacy_launchd_schedulers(
                 paths,
                 dry_run=dry_run,
                 disable=enable,
                 remove=enable,
-                activation_bindings=(
-                    (binding,) if binding is not None else ()
-                ),
+                activation_bindings=bindings,
+                retained_legacy_bindings=legacy_bindings,
             )
             if enable:
                 domain = f"gui/{os.getuid()}"
@@ -22910,28 +23006,60 @@ def _install_scheduler_transaction(
                     ["launchctl", "bootout", domain, str(paths.launchd_plist)],
                     dry_run=dry_run,
                     allow_fail=True,
-                    activation_binding=binding,
+                    activation_bindings=bindings,
                 )
                 _run_native_scheduler_action(
                     ["launchctl", "bootstrap", domain, str(paths.launchd_plist)],
                     dry_run=dry_run,
-                    activation_binding=binding,
+                    activation_bindings=bindings,
                 )
                 _run_native_scheduler_action(
                     ["launchctl", "enable", f"{domain}/{LAUNCHD_LABEL}"],
                     dry_run=dry_run,
-                    activation_binding=binding,
+                    activation_bindings=bindings,
                 )
 
         if dry_run:
-            activate(None)
+            activate((), None)
         else:
             assert published_launchd_snapshot is not None
-            with _retain_launchd_activation_binding(
-                paths.launchd_plist,
-                published_launchd_snapshot,
-            ) as activation_binding:
-                activate(activation_binding)
+            legacy_binding_specs = (
+                tuple(
+                    (
+                        _legacy_launchd_plist(paths, label),
+                        _scheduler_config_snapshot(
+                            _legacy_launchd_plist(paths, label),
+                        ),
+                        f"legacy launchd scheduler {label}",
+                    )
+                    for label in LEGACY_LAUNCHD_LABELS
+                )
+                if enable
+                else ()
+            )
+            binding_specs = (
+                (
+                    paths.launchd_plist,
+                    published_launchd_snapshot,
+                    "macOS launchd scheduler config",
+                ),
+                *legacy_binding_specs,
+            )
+            with contextlib.ExitStack() as stack:
+                bindings = tuple(
+                    stack.enter_context(
+                        _retain_launchd_activation_binding(
+                            path,
+                            snapshot,
+                            description=description,
+                        )
+                    )
+                    for path, snapshot, description in binding_specs
+                )
+                activate(
+                    bindings,
+                    bindings[1:],
+                )
         print(f"installed macOS launchd scheduler: {paths.launchd_plist}")
         return
 
@@ -23308,10 +23436,11 @@ def _uninstall_scheduler_transaction(
                 )
             _report_preserved_systemd_drop_ins(paths)
             if disable:
-                _run_native_command(
+                _run_native_scheduler_action(
                     ["systemctl", "--user", "daemon-reload"],
                     dry_run=dry_run,
                     allow_fail=True,
+                    activation_bindings=bindings,
                 )
 
         if dry_run:

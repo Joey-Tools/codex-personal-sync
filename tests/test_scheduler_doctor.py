@@ -2657,6 +2657,187 @@ class SchedulerDoctorTests(unittest.TestCase):
                         output.getvalue(),
                     )
 
+    def test_macos_install_prebinds_every_legacy_before_cleanup(self) -> None:
+        case_user_home = self.root / "install-all-legacy-bindings" / "home"
+        case_home = case_user_home / ".codex"
+        runner = case_home / "bin" / "codex-personal-sync"
+        runner.parent.mkdir(parents=True)
+        runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        runner.chmod(0o755)
+        labels = (
+            "com.joeyteng.codex-personal-sync.one",
+            "com.joeyteng.codex-personal-sync.two",
+        )
+        with (
+            mock.patch.object(
+                MODULE.Path,
+                "home",
+                return_value=case_user_home,
+            ),
+            mock.patch.object(
+                MODULE,
+                "LEGACY_LAUNCHD_LABELS",
+                labels,
+            ),
+        ):
+            paths = MODULE._scheduler_paths("macos", case_home)
+            second_legacy = MODULE._legacy_launchd_plist(paths, labels[1])
+        second_legacy.parent.mkdir(parents=True)
+        second_legacy.write_bytes(b"original second legacy\n")
+        second_legacy.chmod(0o600)
+        replacement = b"replacement second legacy\n"
+        native_calls = 0
+
+        def replace_second_legacy_during_first_cleanup_action(
+            _args: list[str],
+            *,
+            dry_run: bool,
+            allow_fail: bool = False,
+        ) -> None:
+            del dry_run, allow_fail
+            nonlocal native_calls
+            native_calls += 1
+            candidate = second_legacy.with_name(second_legacy.name + ".replacement")
+            candidate.write_bytes(replacement)
+            candidate.chmod(0o600)
+            os.replace(candidate, second_legacy)
+
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                MODULE.Path,
+                "home",
+                return_value=case_user_home,
+            ),
+            mock.patch.object(
+                MODULE,
+                "LEGACY_LAUNCHD_LABELS",
+                labels,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_run_native_command",
+                side_effect=replace_second_legacy_during_first_cleanup_action,
+            ),
+            contextlib.redirect_stdout(output),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "object identity changed",
+            ),
+        ):
+            MODULE.install_scheduler(
+                case_home,
+                "owner/public-sync",
+                17,
+                "macos",
+                None,
+                dry_run=False,
+                enable=True,
+            )
+
+        self.assertEqual(native_calls, 1)
+        self.assertEqual(second_legacy.read_bytes(), replacement)
+        assert paths.launchd_plist is not None
+        self.assertTrue(paths.launchd_plist.exists())
+        self.assertNotIn(
+            "installed macOS launchd scheduler",
+            output.getvalue(),
+        )
+
+    def test_macos_install_retains_legacy_absence_through_current_actions(
+        self,
+    ) -> None:
+        legacy_action_count = len(MODULE.LEGACY_LAUNCHD_LABELS) * 2
+        label = MODULE.LEGACY_LAUNCHD_LABELS[0]
+        case_index = 0
+        for initial_legacy_exists in (False, True):
+            for current_action_offset in range(3):
+                case_index += 1
+                with self.subTest(
+                    initial_legacy_exists=initial_legacy_exists,
+                    current_action=current_action_offset,
+                ):
+                    case_user_home = (
+                        self.root / f"install-legacy-retained-{case_index}" / "home"
+                    )
+                    case_home = case_user_home / ".codex"
+                    runner = case_home / "bin" / "codex-personal-sync"
+                    runner.parent.mkdir(parents=True)
+                    runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                    runner.chmod(0o755)
+                    with mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ):
+                        paths = MODULE._scheduler_paths("macos", case_home)
+                    assert paths.launchd_plist is not None
+                    legacy = MODULE._legacy_launchd_plist(paths, label)
+                    legacy.parent.mkdir(parents=True)
+                    if initial_legacy_exists:
+                        legacy.write_bytes(b"original legacy scheduler\n")
+                        legacy.chmod(0o600)
+                    payload = (
+                        f"new legacy {initial_legacy_exists} {current_action_offset}\n"
+                    ).encode("utf-8")
+                    mutation_action = legacy_action_count + current_action_offset
+                    native_calls = 0
+
+                    def reappear_during_current_action(
+                        _args: list[str],
+                        *,
+                        dry_run: bool,
+                        allow_fail: bool = False,
+                    ) -> None:
+                        del dry_run, allow_fail
+                        nonlocal native_calls
+                        current_call = native_calls
+                        native_calls += 1
+                        if current_call != mutation_action:
+                            return
+                        legacy.write_bytes(payload)
+                        legacy.chmod(0o600)
+
+                    output = io.StringIO()
+                    with (
+                        mock.patch.object(
+                            MODULE.Path,
+                            "home",
+                            return_value=case_user_home,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_run_native_command",
+                            side_effect=reappear_during_current_action,
+                        ),
+                        contextlib.redirect_stdout(output),
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            (
+                                "reappeared after conditional removal"
+                                if initial_legacy_exists
+                                else "appeared after initial absence"
+                            ),
+                        ),
+                    ):
+                        MODULE.install_scheduler(
+                            case_home,
+                            "owner/public-sync",
+                            17,
+                            "macos",
+                            None,
+                            dry_run=False,
+                            enable=True,
+                        )
+
+                    self.assertEqual(native_calls, mutation_action + 1)
+                    self.assertEqual(legacy.read_bytes(), payload)
+                    self.assertTrue(paths.launchd_plist.exists())
+                    self.assertNotIn(
+                        "installed macOS launchd scheduler",
+                        output.getvalue(),
+                    )
+
     def test_macos_install_allows_mtime_only_churn_at_native_boundaries(
         self,
     ) -> None:
@@ -3179,6 +3360,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                         / f"missing-parent-{platform_name}-{disable}"
                         / "home"
                     )
+                    case_user_home.mkdir(parents=True)
                     case_home = case_user_home / ".codex"
                     output = io.StringIO()
                     with (
@@ -3222,7 +3404,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                     native_command.assert_not_called()
                     self.assertIn("scheduler already absent", output.getvalue())
 
-    def test_uninstall_missing_parent_noop_preserves_concurrent_appearance(
+    def test_uninstall_missing_parent_race_fails_closed_and_preserves_appearance(
         self,
     ) -> None:
         for platform_name in ("macos", "linux"):
@@ -3230,6 +3412,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                 case_user_home = (
                     self.root / f"missing-parent-race-{platform_name}" / "home"
                 )
+                case_user_home.mkdir(parents=True)
                 case_home = case_user_home / ".codex"
                 with mock.patch.object(
                     MODULE.Path,
@@ -3245,22 +3428,34 @@ class SchedulerDoctorTests(unittest.TestCase):
                 )
                 assert target is not None
                 payload = f"concurrent {platform_name} config\n".encode("utf-8")
-                real_stat = MODULE.os.stat
+                first_component = "Library" if platform_name == "macos" else ".config"
+                real_open = MODULE.os.open
                 injected = False
 
                 def observe_missing_then_appear(
                     path: os.PathLike[str] | str,
-                    *args: object,
-                    **kwargs: object,
-                ) -> os.stat_result:
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
                     nonlocal injected
-                    if not injected and Path(path) == parent:
+                    if (
+                        not injected
+                        and os.fspath(path) == first_component
+                        and dir_fd is not None
+                    ):
                         injected = True
                         parent.mkdir(parents=True)
                         target.write_bytes(payload)
                         target.chmod(0o600)
-                        raise FileNotFoundError(str(parent))
-                    return real_stat(path, *args, **kwargs)
+                        raise FileNotFoundError(first_component)
+                    return real_open(
+                        path,
+                        flags,
+                        mode,
+                        dir_fd=dir_fd,
+                    )
 
                 with (
                     mock.patch.object(
@@ -3270,7 +3465,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                     ),
                     mock.patch.object(
                         MODULE.os,
-                        "stat",
+                        "open",
                         side_effect=observe_missing_then_appear,
                     ),
                     mock.patch.object(
@@ -3288,6 +3483,10 @@ class SchedulerDoctorTests(unittest.TestCase):
                         ),
                     ),
                     contextlib.redirect_stdout(io.StringIO()),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "appeared after a missing observation",
+                    ),
                 ):
                     MODULE.uninstall_scheduler(
                         case_home,
@@ -3303,7 +3502,7 @@ class SchedulerDoctorTests(unittest.TestCase):
         for platform_name in ("macos", "linux"):
             for mutation, expected_error in (
                 ("file", "is not a directory"),
-                ("symlink", "is not a directory"),
+                ("symlink", "is a symlink"),
                 ("unreadable", "is unreadable"),
             ):
                 with self.subTest(platform=platform_name, mutation=mutation):
@@ -3327,16 +3526,43 @@ class SchedulerDoctorTests(unittest.TestCase):
                         target = parent.with_name(parent.name + ".target")
                         target.mkdir()
                         parent.symlink_to(target, target_is_directory=True)
+                    else:
+                        parent.mkdir()
 
+                    real_open = MODULE.os.open
                     real_stat = MODULE.os.stat
+
+                    def reject_parent_open(
+                        path: os.PathLike[str] | str,
+                        flags: int,
+                        mode: int = 0o777,
+                        *,
+                        dir_fd: int | None = None,
+                    ) -> int:
+                        if (
+                            mutation == "unreadable"
+                            and os.fspath(path) == parent.name
+                            and dir_fd is not None
+                        ):
+                            raise PermissionError(parent.name)
+                        return real_open(
+                            path,
+                            flags,
+                            mode,
+                            dir_fd=dir_fd,
+                        )
 
                     def reject_parent_read(
                         path: os.PathLike[str] | str,
                         *args: object,
                         **kwargs: object,
                     ) -> os.stat_result:
-                        if mutation == "unreadable" and Path(path) == parent:
-                            raise PermissionError(str(parent))
+                        if (
+                            mutation == "unreadable"
+                            and os.fspath(path) == parent.name
+                            and kwargs.get("dir_fd") is not None
+                        ):
+                            raise PermissionError(parent.name)
                         return real_stat(path, *args, **kwargs)
 
                     with (
@@ -3344,6 +3570,11 @@ class SchedulerDoctorTests(unittest.TestCase):
                             MODULE.Path,
                             "home",
                             return_value=case_user_home,
+                        ),
+                        mock.patch.object(
+                            MODULE.os,
+                            "open",
+                            side_effect=reject_parent_open,
                         ),
                         mock.patch.object(
                             MODULE.os,
@@ -3375,6 +3606,162 @@ class SchedulerDoctorTests(unittest.TestCase):
 
                     install_lock.assert_not_called()
                     native_command.assert_not_called()
+
+    def test_uninstall_intermediate_config_parent_symlink_fails_closed(
+        self,
+    ) -> None:
+        for platform_name in ("macos", "linux"):
+            with self.subTest(platform=platform_name):
+                case_user_home = (
+                    self.root / f"intermediate-symlink-{platform_name}" / "home"
+                )
+                case_user_home.mkdir(parents=True)
+                case_home = case_user_home / ".codex"
+                if platform_name == "macos":
+                    link = case_user_home / "Library"
+                    link_target = case_user_home / "foreign-library"
+                    config_parent = link_target / "LaunchAgents"
+                    config_name = f"{MODULE.LAUNCHD_LABEL}.plist"
+                else:
+                    config_root = case_user_home / ".config"
+                    config_root.mkdir()
+                    link = config_root / "systemd"
+                    link_target = case_user_home / "foreign-systemd"
+                    config_parent = link_target / "user"
+                    config_name = f"{MODULE.SYSTEMD_UNIT}.service"
+                config_parent.mkdir(parents=True)
+                link.symlink_to(link_target, target_is_directory=True)
+                foreign_config = config_parent / config_name
+                payload = f"foreign {platform_name} scheduler\n".encode("utf-8")
+                foreign_config.write_bytes(payload)
+                foreign_config.chmod(0o600)
+
+                with (
+                    mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "installation_lock",
+                        side_effect=AssertionError(
+                            "intermediate symlink acquired the install lock"
+                        ),
+                    ) as install_lock,
+                    mock.patch.object(
+                        MODULE,
+                        "_run_native_command",
+                        side_effect=AssertionError(
+                            "intermediate symlink ran a native command"
+                        ),
+                    ) as native_command,
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "component is a symlink",
+                    ),
+                ):
+                    MODULE.uninstall_scheduler(
+                        case_home,
+                        platform_name,
+                        dry_run=False,
+                        disable=True,
+                    )
+
+                install_lock.assert_not_called()
+                native_command.assert_not_called()
+                self.assertEqual(foreign_config.read_bytes(), payload)
+
+    def test_uninstall_config_parent_component_replacement_fails_closed(
+        self,
+    ) -> None:
+        for platform_name in ("macos", "linux"):
+            with self.subTest(platform=platform_name):
+                case_user_home = (
+                    self.root / f"component-replacement-{platform_name}" / "home"
+                )
+                case_home = case_user_home / ".codex"
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    paths = MODULE._scheduler_paths(platform_name, case_home)
+                parent = MODULE._scheduler_config_parent(paths)
+                parent.mkdir(parents=True)
+                first_component = "Library" if platform_name == "macos" else ".config"
+                original_component = case_user_home / first_component
+                displaced_component = original_component.with_name(
+                    original_component.name + ".displaced"
+                )
+                real_open = MODULE.os.open
+                injected = False
+
+                def replace_opened_component(
+                    path: os.PathLike[str] | str,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal injected
+                    file_descriptor = real_open(
+                        path,
+                        flags,
+                        mode,
+                        dir_fd=dir_fd,
+                    )
+                    if (
+                        not injected
+                        and os.fspath(path) == first_component
+                        and dir_fd is not None
+                    ):
+                        injected = True
+                        original_component.rename(displaced_component)
+                        original_component.mkdir()
+                    return file_descriptor
+
+                with (
+                    mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ),
+                    mock.patch.object(
+                        MODULE.os,
+                        "open",
+                        side_effect=replace_opened_component,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "installation_lock",
+                        side_effect=AssertionError(
+                            "component replacement acquired the install lock"
+                        ),
+                    ) as install_lock,
+                    mock.patch.object(
+                        MODULE,
+                        "_run_native_command",
+                        side_effect=AssertionError(
+                            "component replacement ran a native command"
+                        ),
+                    ) as native_command,
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "component identity changed",
+                    ),
+                ):
+                    MODULE.uninstall_scheduler(
+                        case_home,
+                        platform_name,
+                        dry_run=False,
+                        disable=True,
+                    )
+
+                self.assertTrue(injected)
+                install_lock.assert_not_called()
+                native_command.assert_not_called()
+                self.assertTrue(displaced_component.exists())
 
     def test_uninstall_binds_original_scheduler_configs_across_native_calls(
         self,
@@ -3569,6 +3956,116 @@ class SchedulerDoctorTests(unittest.TestCase):
                             )
                             if mutation == "replacement":
                                 self.assertEqual(target.read_bytes(), original)
+
+    def test_linux_uninstall_revalidates_unit_absence_around_daemon_reload(
+        self,
+    ) -> None:
+        case_index = 0
+        for target_kind in ("service", "timer"):
+            for appearance_phase in ("before", "during"):
+                case_index += 1
+                with self.subTest(
+                    target=target_kind,
+                    phase=appearance_phase,
+                ):
+                    case_user_home = self.root / f"reload-absence-{case_index}" / "home"
+                    case_home = case_user_home / ".codex"
+                    runner = case_home / "bin" / "codex-personal-sync"
+                    runner.parent.mkdir(parents=True)
+                    runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                    runner.chmod(0o755)
+                    with mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            MODULE.install_scheduler(
+                                case_home,
+                                "owner/public-sync",
+                                17,
+                                "linux",
+                                None,
+                                dry_run=False,
+                                enable=False,
+                            )
+                        paths = MODULE._scheduler_paths("linux", case_home)
+                    target = (
+                        paths.systemd_service
+                        if target_kind == "service"
+                        else paths.systemd_timer
+                    )
+                    other = (
+                        paths.systemd_timer
+                        if target_kind == "service"
+                        else paths.systemd_service
+                    )
+                    assert target is not None
+                    assert other is not None
+                    payload = (f"reappeared {target_kind} {appearance_phase}\n").encode(
+                        "utf-8"
+                    )
+                    native_calls = 0
+                    real_report = MODULE._report_preserved_systemd_drop_ins
+
+                    def appear_before_reload(
+                        selected_paths: MODULE.SchedulerPaths,
+                    ) -> None:
+                        real_report(selected_paths)
+                        if appearance_phase == "before":
+                            target.write_bytes(payload)
+                            target.chmod(0o600)
+
+                    def appear_during_reload(
+                        args: list[str],
+                        *,
+                        dry_run: bool,
+                        allow_fail: bool = False,
+                    ) -> None:
+                        del dry_run, allow_fail
+                        nonlocal native_calls
+                        native_calls += 1
+                        if appearance_phase == "during" and args[-1] == "daemon-reload":
+                            target.write_bytes(payload)
+                            target.chmod(0o600)
+
+                    output = io.StringIO()
+                    with (
+                        mock.patch.object(
+                            MODULE.Path,
+                            "home",
+                            return_value=case_user_home,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_report_preserved_systemd_drop_ins",
+                            side_effect=appear_before_reload,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_run_native_command",
+                            side_effect=appear_during_reload,
+                        ),
+                        contextlib.redirect_stdout(output),
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            "reappeared after conditional removal",
+                        ),
+                    ):
+                        MODULE.uninstall_scheduler(
+                            case_home,
+                            "linux",
+                            dry_run=False,
+                            disable=True,
+                        )
+
+                    self.assertEqual(
+                        native_calls,
+                        1 if appearance_phase == "before" else 2,
+                    )
+                    self.assertEqual(target.read_bytes(), payload)
+                    self.assertFalse(other.exists())
+                    self.assertNotIn("removed ", output.getvalue())
 
     def test_scheduler_daemon_query_classifies_only_explicit_state_evidence(
         self,

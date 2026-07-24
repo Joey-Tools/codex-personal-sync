@@ -121,6 +121,14 @@ superseded_by:
   retained and reported. A definitively missing macOS/Linux scheduler config
   parent is now a pre-lock idempotent no-op, including `--no-disable`, while
   unreadable, symlink, and non-directory states remain fail-closed.
+- The third scheduler follow-up extends that same binding set across macOS
+  install: current and every legacy plist are prebound before cleanup and
+  retained through current bootout/bootstrap/enable. Linux uninstall now
+  brackets post-removal daemon reload with both unit absence bindings.
+  Missing-parent classification walks from a bound user-home descriptor with
+  no-follow component opens, so intermediate symlinks and uncertain identity
+  fail closed while only a confirmed missing component remains an idempotent
+  no-op.
 
 ## Validation Evidence
 
@@ -385,6 +393,22 @@ superseded_by:
   disjoint repository tests. The scheduler module independently passed 72
   tests in 18.833 seconds; the final source-lock SHA-256 is
   `95e4541724e56b239cea923815ef2c5ccc605ac6f86fb2cf2c0625662fddb505`.
+- The third scheduler findings follow-up adds five focused test methods. A
+  two-legacy fixture proves every legacy plist is prebound before the first
+  install cleanup action; current-action fixtures prove deleted or initially
+  absent legacy paths stay bound through current activation. Linux fixtures
+  exercise unit reappearance immediately before and during daemon reload.
+  Missing-parent fixtures cover confirmed absence, concurrent appearance,
+  final and intermediate symlinks (`~/Library` and `~/.config/systemd`),
+  unreadable/non-directory components, and opened-component identity
+  replacement. The exact final bytes passed 619 personal-sync,
+  reconciliation, retention, scheduler, and automation tests in 906.120
+  seconds plus all 119 source-lock tests in 1934.155 seconds, for 738 disjoint
+  repository tests. The scheduler module independently passed 77 tests in
+  8.744 seconds. Compileall, Ruff, actionlint, project-journal validation,
+  source-lock verification, and `git diff --check` passed. The final
+  source-lock SHA-256 is
+  `4a47eb34ea208dc841b19d6ebcb46a490d8c84b0531c982fb87ef8a0603e7688`.
 
 ## Installed Host Baseline
 
