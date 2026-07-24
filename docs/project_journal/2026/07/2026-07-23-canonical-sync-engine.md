@@ -426,13 +426,17 @@ superseded_by:
   Scheduler/doctor passed 85 tests in 6.095 seconds. The exact final bytes then
   passed 627 personal-sync, reconciliation, retention, scheduler, and
   automation tests in 810.036 seconds plus all 119 source-lock tests in
-  2388.623 seconds, for 746 disjoint repository tests. The first aggregate run
+  2067.999 seconds, for 746 disjoint repository tests. The first aggregate run
   exposed one older temporary-home fixture that did not bind `Path.home()` to
   its simulated user home; that test contract was corrected, its focused test
-  passed, and the complete 627-test partition passed on rerun. Compileall,
-  Ruff, actionlint, project-journal validation, source-lock verification, and
-  `git diff --check` passed. The final source-lock SHA-256 is
-  `cf666337879638a7f12b353d9b9a14538e249644840d0e5502452d5c31596005`.
+  passed, and the complete 627-test partition passed on rerun. Initial commit
+  output then exposed an unintended executable-mode loss from earlier
+  formatting recovery; the script was restored from `100644` to canonical
+  `100755`, the source lock was refreshed, and the full 119-test source-lock
+  suite above passed again on that final mode. Compileall, Ruff, actionlint,
+  project-journal validation, source-lock verification, and `git diff
+  --check` passed. The final source-lock SHA-256 is
+  `a3155369a24a391740f6cbff1e1d1306b6ab3c31239192b426c924a10cd38c59`.
 
 ## Installed Host Baseline
 

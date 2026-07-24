@@ -26,7 +26,7 @@
   },
   "sources": {
     "engine": {
-      "mode": "0644",
+      "mode": "0755",
       "path": "scripts/codex_personal_sync.py",
       "sha256": "495e2961c3ea5f091ce1bdd83264a52e024b5457434b3e578b80b05409895170"
     },
