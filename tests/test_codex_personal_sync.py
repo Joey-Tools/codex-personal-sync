@@ -6546,6 +6546,118 @@ class CodexPersonalSyncTests(unittest.TestCase):
             [["systemctl", "--user", "daemon-reload"]],
         )
 
+    def test_linux_enable_rejects_main_unit_drift_during_daemon_reload(
+        self,
+    ) -> None:
+        home = self.root / "home" / ".codex"
+        write_scheduler_runner(home)
+        paths = MODULE._scheduler_paths("linux", home)
+        assert paths.systemd_service is not None
+        calls: list[list[str]] = []
+
+        def mutate_during_reload(
+            args: list[str],
+            *,
+            dry_run: bool,
+            allow_fail: bool = False,
+        ) -> None:
+            del dry_run, allow_fail
+            calls.append(args)
+            if args == ["systemctl", "--user", "daemon-reload"]:
+                paths.systemd_service.write_text(
+                    "[Unit]\nDescription=foreign replacement\n",
+                    encoding="utf-8",
+                )
+                paths.systemd_service.chmod(0o600)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_run_native_command",
+                side_effect=mutate_during_reload,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "published systemd scheduler service/timer pair changed",
+            ),
+        ):
+            MODULE.install_scheduler(
+                home,
+                "owner/repo",
+                60,
+                "linux",
+                None,
+                dry_run=False,
+                enable=True,
+            )
+
+        self.assertEqual(
+            calls,
+            [["systemctl", "--user", "daemon-reload"]],
+        )
+
+    def test_linux_enable_rejects_main_unit_drift_before_start(self) -> None:
+        home = self.root / "home" / ".codex"
+        write_scheduler_runner(home)
+        paths = MODULE._scheduler_paths("linux", home)
+        assert paths.systemd_service is not None
+        calls: list[list[str]] = []
+
+        def replace_after_enable(
+            args: list[str],
+            *,
+            dry_run: bool,
+            allow_fail: bool = False,
+        ) -> None:
+            del dry_run, allow_fail
+            calls.append(args)
+            if args == [
+                "systemctl",
+                "--user",
+                "enable",
+                f"{MODULE.SYSTEMD_UNIT}.timer",
+            ]:
+                paths.systemd_service.unlink()
+                paths.systemd_service.write_text(
+                    "[Unit]\nDescription=foreign replacement\n",
+                    encoding="utf-8",
+                )
+                paths.systemd_service.chmod(0o600)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_run_native_command",
+                side_effect=replace_after_enable,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "published systemd scheduler service/timer pair changed",
+            ),
+        ):
+            MODULE.install_scheduler(
+                home,
+                "owner/repo",
+                60,
+                "linux",
+                None,
+                dry_run=False,
+                enable=True,
+            )
+
+        self.assertEqual(
+            calls,
+            [
+                ["systemctl", "--user", "daemon-reload"],
+                [
+                    "systemctl",
+                    "--user",
+                    "enable",
+                    f"{MODULE.SYSTEMD_UNIT}.timer",
+                ],
+            ],
+        )
+
     def test_linux_uninstall_preserves_foreign_drop_in_and_blocks_reinstall(
         self,
     ) -> None:

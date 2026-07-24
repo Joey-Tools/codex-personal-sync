@@ -187,10 +187,19 @@ class ControlAbsenceBinding:
 
 
 @dataclass
+class ControlNameSetBinding:
+    label: str
+    parent: ControlObjectBinding
+    name: str
+    expected_names: tuple[str, ...]
+
+
+@dataclass
 class GitControlBinding:
     marker: ControlObjectBinding
     admin: ControlObjectBinding
     commondir_file: ControlObjectBinding | None
+    commondir_name_set: ControlNameSetBinding
     common: ControlObjectBinding
     objects: ControlObjectBinding
     source_files: tuple[ControlObjectBinding, ...]
@@ -626,7 +635,7 @@ def _bind_unique_relative_control_file(
     parent: ControlObjectBinding,
     name: str,
     label: str,
-) -> ControlObjectBinding | None:
+) -> tuple[ControlObjectBinding | None, ControlNameSetBinding]:
     collisions = _control_marker_collision_names(parent, name, label)
     if collisions and collisions != (name,):
         raise MirrorSyncError(
@@ -640,7 +649,15 @@ def _bind_unique_relative_control_file(
         if binding is not None:
             os.close(binding.fd)
         raise MirrorSyncError(f"{label} changed while binding its unique name")
-    return binding
+    return (
+        binding,
+        ControlNameSetBinding(
+            label=label,
+            parent=parent,
+            name=name,
+            expected_names=expected,
+        ),
+    )
 
 
 def _bind_collision_aware_control_absence(
@@ -1560,6 +1577,7 @@ def _materialize_private_git_control(
     root: BoundRoot,
     admin: ControlObjectBinding,
     common: ControlObjectBinding,
+    commondir_name_set: ControlNameSetBinding,
     common_commondir_absence: ControlAbsenceBinding,
 ) -> tuple[
     ControlObjectBinding,
@@ -1630,6 +1648,7 @@ def _materialize_private_git_control(
     source_files: list[ControlObjectBinding] = []
     final_manifest: tuple[tuple[object, ...], ...] = ()
     try:
+        _revalidate_control_name_set(root, commondir_name_set)
         _revalidate_control_absence(root, common_commondir_absence)
         first_budget = {"entries": 0, "bytes": 0}
         first_manifest = _snapshot_git_directory_tree(
@@ -1651,6 +1670,7 @@ def _materialize_private_git_control(
             raise MirrorSyncError(
                 "Git common control tree changed during private snapshot"
             )
+        _revalidate_control_name_set(root, commondir_name_set)
         _revalidate_control_absence(root, common_commondir_absence)
         source_manifest = _logical_git_snapshot_manifest(first_manifest)
         copied_manifest = _scan_private_git_tree(
@@ -1712,6 +1732,7 @@ def _materialize_private_git_control(
             raise MirrorSyncError(
                 "private Git control plane differs from bound source bytes"
             )
+        _revalidate_control_name_set(root, commondir_name_set)
         _revalidate_control_absence(root, common_commondir_absence)
         _set_owner_record_phase(
             owner_record,
@@ -2028,6 +2049,25 @@ def _revalidate_control_object(
             raise MirrorSyncError(
                 f"{binding.label} content changed before transaction completion"
             )
+
+
+def _revalidate_control_name_set(
+    root: BoundRoot,
+    binding: ControlNameSetBinding,
+) -> None:
+    _revalidate_control_object(root, binding.parent)
+    observed = _control_marker_collision_names(
+        binding.parent,
+        binding.name,
+        binding.label,
+    )
+    if observed != binding.expected_names:
+        raise MirrorSyncError(
+            f"{binding.label} portable collision set changed before "
+            "transaction completion: expected "
+            f"{binding.expected_names!r}, observed {observed!r}"
+        )
+    _revalidate_control_object(root, binding.parent)
 
 
 def _revalidate_control_absence(
@@ -2807,6 +2847,10 @@ def _revalidate_bound_root(root: BoundRoot) -> None:
     if root.git_control is not None:
         _revalidate_control_object(root, root.git_control.marker)
         _revalidate_control_object(root, root.git_control.admin)
+        _revalidate_control_name_set(
+            root,
+            root.git_control.commondir_name_set,
+        )
         if root.git_control.commondir_file is not None:
             _revalidate_control_object(
                 root,
@@ -5605,6 +5649,7 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
     marker = _bind_git_marker(root)
     controls: list[ControlObjectBinding] = []
     commondir_file: ControlObjectBinding | None = None
+    commondir_name_set: ControlNameSetBinding | None = None
     private_path: Path | None = None
     private: ControlObjectBinding | None = None
     private_objects: ControlObjectBinding | None = None
@@ -5642,11 +5687,12 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
                 require_directory=True,
             )
         controls.append(admin)
-        commondir_file = _bind_unique_relative_control_file(
+        commondir_file, commondir_name_set = _bind_unique_relative_control_file(
             admin,
             "commondir",
             "Git commondir control file",
         )
+        _revalidate_control_name_set(root, commondir_name_set)
         if commondir_file is None:
             common_path = admin_path
             common = _duplicate_directory_control(
@@ -5680,9 +5726,11 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
         controls.append(objects)
         for binding in (marker, admin, common, objects):
             _revalidate_control_object(root, binding)
+        _revalidate_control_name_set(root, commondir_name_set)
         _verify_git_capability(root)
         for binding in (marker, admin, common, objects):
             _revalidate_control_object(root, binding)
+        _revalidate_control_name_set(root, commondir_name_set)
         (
             private_parent,
             private_name,
@@ -5697,8 +5745,10 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
             root,
             admin,
             common,
+            commondir_name_set,
             common_commondir_absence,
         )
+        _revalidate_control_name_set(root, commondir_name_set)
         private_commondir_absence = _bind_collision_aware_control_absence(
             private,
             "commondir",
@@ -5744,6 +5794,7 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
             marker=marker,
             admin=admin,
             commondir_file=commondir_file,
+            commondir_name_set=commondir_name_set,
             common=common,
             objects=objects,
             source_files=source_files,

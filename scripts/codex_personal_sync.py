@@ -20688,7 +20688,30 @@ def _scheduler_file_snapshots_match(
                 or actual.parent_identity == expected.parent_identity
             )
         )
-    return _managed_state_snapshot_matches_file_evidence(actual, expected)
+    return (
+        actual.parent_identity == expected.parent_identity
+        and _managed_state_snapshot_matches_file_evidence(actual, expected)
+    )
+
+
+def _revalidate_published_systemd_pair(
+    paths: SchedulerPaths,
+    expected: tuple[ManagedStateFileSnapshot, ManagedStateFileSnapshot],
+) -> None:
+    assert paths.systemd_service is not None
+    assert paths.systemd_timer is not None
+    current = (
+        _scheduler_config_snapshot(paths.systemd_service, 1024 * 1024),
+        _scheduler_config_snapshot(paths.systemd_timer, 1024 * 1024),
+    )
+    if any(
+        not _scheduler_file_snapshots_match(actual, bound)
+        for actual, bound in zip(current, expected)
+    ):
+        raise SyncError(
+            "published systemd scheduler service/timer pair changed "
+            "before daemon activation"
+        )
 
 
 def _scheduler_file_logical_state_matches(
@@ -20706,6 +20729,103 @@ def _scheduler_file_logical_state_matches(
         and actual.uid == expected.uid
         and actual.gid == expected.gid
     )
+
+
+def _open_scheduler_recovery_binding(
+    path: Path,
+    parent_fd: int,
+    expected: ManagedStateFileSnapshot,
+) -> int:
+    if not _managed_state_snapshot_has_complete_file_evidence(expected):
+        raise SyncError(f"scheduler recovery evidence is incomplete: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    file_fd = -1
+    try:
+        named = os.stat(
+            path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        file_fd = os.open(path.name, flags, dir_fd=parent_fd)
+        opened = os.fstat(file_fd)
+        expected_metadata = (
+            expected.file_identity[0],
+            expected.file_identity[1],
+            expected.file_type,
+            expected.mode,
+            expected.uid,
+            expected.gid,
+            expected.size,
+        )
+        if (
+            _managed_state_metadata_snapshot(named) != expected_metadata
+            or _managed_state_metadata_snapshot(opened) != expected_metadata
+        ):
+            raise SyncError(f"scheduler recovery evidence changed: {path}")
+        payload = _read_managed_state_bytes(
+            file_fd,
+            path,
+            max(expected.size or 0, 1),
+        )
+        os.lseek(file_fd, 0, os.SEEK_SET)
+        confirmed_payload = _read_managed_state_bytes(
+            file_fd,
+            path,
+            max(expected.size or 0, 1),
+        )
+        if (
+            payload != expected.payload
+            or confirmed_payload != expected.payload
+            or _managed_state_metadata_snapshot(os.fstat(file_fd)) != expected_metadata
+        ):
+            raise SyncError(f"scheduler recovery evidence changed: {path}")
+        return file_fd
+    except BaseException:
+        if file_fd >= 0:
+            _close_fd_quietly(file_fd)
+        raise
+
+
+def _scheduler_recovery_binding_matches(
+    file_fd: int,
+    path: Path,
+    expected: ManagedStateFileSnapshot,
+) -> bool:
+    if file_fd < 0 or not _managed_state_snapshot_has_complete_file_evidence(expected):
+        return False
+    expected_metadata = (
+        expected.file_identity[0],
+        expected.file_identity[1],
+        expected.file_type,
+        expected.mode,
+        expected.uid,
+        expected.gid,
+        expected.size,
+    )
+    try:
+        if _managed_state_metadata_snapshot(os.fstat(file_fd)) != expected_metadata:
+            return False
+        os.lseek(file_fd, 0, os.SEEK_SET)
+        payload = _read_managed_state_bytes(
+            file_fd,
+            path,
+            max(expected.size or 0, 1),
+        )
+        os.lseek(file_fd, 0, os.SEEK_SET)
+        confirmed_payload = _read_managed_state_bytes(
+            file_fd,
+            path,
+            max(expected.size or 0, 1),
+        )
+        return (
+            payload == expected.payload
+            and confirmed_payload == expected.payload
+            and _managed_state_metadata_snapshot(os.fstat(file_fd)) == expected_metadata
+        )
+    except (OSError, SyncError):
+        return False
 
 
 def _atomic_write_scheduler_config(
@@ -20741,6 +20861,7 @@ def _atomic_write_scheduler_config(
     published = False
     retained_old = False
     recovery_name: str | None = None
+    recovery_fd = -1
     preserve_recovery = False
     exchanged = False
     try:
@@ -20749,12 +20870,9 @@ def _atomic_write_scheduler_config(
             path,
             parent_fd,
         )
-        if (
-            expected_snapshot is not None
-            and not _scheduler_file_snapshots_match(
-                before,
-                expected_snapshot,
-            )
+        if expected_snapshot is not None and not _scheduler_file_snapshots_match(
+            before,
+            expected_snapshot,
         ):
             raise SyncError(
                 f"scheduler config changed before conditional publication: {path}"
@@ -20828,11 +20946,19 @@ def _atomic_write_scheduler_config(
                 ) from error
             os.fsync(parent_fd)
             recovery_path = path.with_name(recovery_name)
+            # From this point onward, the hard link is the durable locator for
+            # the descriptor-bound preimage. Any uncertainty preserves it.
+            preserve_recovery = True
             recovery = _read_managed_state_file_snapshot(
                 user_home,
                 recovery_path,
                 parent_fd,
                 expected_identity=before.file_identity,
+            )
+            recovery_fd = _open_scheduler_recovery_binding(
+                recovery_path,
+                parent_fd,
+                before,
             )
             current_before = _read_managed_state_file_snapshot(
                 user_home,
@@ -20847,6 +20973,11 @@ def _atomic_write_scheduler_config(
                 )
                 or not _managed_state_snapshot_matches_file_evidence(
                     current_before,
+                    before,
+                )
+                or not _scheduler_recovery_binding_matches(
+                    recovery_fd,
+                    recovery_path,
                     before,
                 )
             ):
@@ -20872,12 +21003,9 @@ def _atomic_write_scheduler_config(
                 )
             except SyncError:
                 displaced = None
-            if (
-                displaced is None
-                or not _managed_state_snapshot_matches_file_evidence(
-                    displaced,
-                    before,
-                )
+            if displaced is None or not _managed_state_snapshot_matches_file_evidence(
+                displaced,
+                before,
             ):
                 preserve_recovery = True
                 installed_after_mismatch = _read_managed_state_file_snapshot(
@@ -20901,6 +21029,11 @@ def _atomic_write_scheduler_config(
                         recovery,
                         before,
                     )
+                    or not _scheduler_recovery_binding_matches(
+                        recovery_fd,
+                        recovery_path,
+                        before,
+                    )
                     or not _bound_directory_matches(
                         user_home,
                         path.parent,
@@ -20912,101 +21045,17 @@ def _atomic_write_scheduler_config(
                         f"scheduler config and recovery evidence changed during "
                         f"publication: {path}"
                     )
-                if rollback_displaced_conflict and displaced is not None:
-                    try:
-                        _rename_exchange_at(
-                            parent_fd,
-                            temporary_name,
-                            parent_fd,
-                            path.name,
-                        )
-                        os.fsync(parent_fd)
-                    except (OSError, SyncError) as error:
-                        published = True
-                        retained_old = False
-                        raise SyncError(
-                            "conditional scheduler publication could not restore "
-                            f"the displaced state; recovery evidence is retained "
-                            f"as {recovery_path} and the displaced state as "
-                            f"{temporary_path}"
-                        ) from error
-                    try:
-                        restored = _read_managed_state_file_snapshot(
-                            user_home,
-                            path,
-                            parent_fd,
-                            expected_identity=displaced.file_identity,
-                        )
-                        rolled_back_staged = _read_managed_state_file_snapshot(
-                            user_home,
-                            temporary_path,
-                            parent_fd,
-                            expected_identity=staged.file_identity,
-                        )
-                    except SyncError as error:
-                        published = True
-                        retained_old = False
-                        raise SyncError(
-                            "conditional scheduler publication rollback is "
-                            f"uncertain; recovery evidence is retained as "
-                            f"{recovery_path} and exchange evidence as "
-                            f"{temporary_path}"
-                        ) from error
-                    if (
-                        not _managed_state_snapshot_matches_file_evidence(
-                            restored,
-                            displaced,
-                        )
-                        or not _managed_state_snapshot_matches_file_evidence(
-                            rolled_back_staged,
-                            staged,
-                        )
-                        or not _bound_directory_matches(
-                            user_home,
-                            path.parent,
-                            parent_fd,
-                        )
-                    ):
-                        published = True
-                        retained_old = False
-                        raise SyncError(
-                            "conditional scheduler publication rollback is "
-                            f"uncertain; recovery evidence is retained as "
-                            f"{recovery_path} and exchange evidence as "
-                            f"{temporary_path}"
-                        )
-                    try:
-                        _isolate_and_delete_pending_cleanup_file(
-                            user_home,
-                            temporary_path,
-                            parent_fd,
-                            rolled_back_staged,
-                            label=f"scheduler config rejected staging file {path}",
-                        )
-                        retained_old = False
-                        _isolate_and_delete_pending_cleanup_file(
-                            user_home,
-                            recovery_path,
-                            parent_fd,
-                            recovery,
-                            label=(
-                                "scheduler config rejected-publication recovery "
-                                f"evidence {path}"
-                            ),
-                        )
-                        recovery_name = None
-                    except (OSError, SyncError) as error:
-                        raise SyncError(
-                            "conditional scheduler publication restored the "
-                            f"displaced state, but cleanup is uncertain; recovery "
-                            f"evidence may remain as {recovery_path}"
-                        ) from error
-                    raise SyncError(
-                        "scheduler config changed during conditional publication; "
-                        f"restored the displaced state without overwriting it: {path}"
-                    )
                 published = True
                 retained_old = False
+                if rollback_displaced_conflict:
+                    raise SyncError(
+                        "conditional scheduler publication could not prove that "
+                        "the temporary object is the exact state displaced from "
+                        f"the live path; it was not exchanged back into {path}. "
+                        f"The descriptor-bound recovery evidence is retained as "
+                        f"{recovery_path} and the untrusted displaced locator as "
+                        f"{temporary_path}"
+                    )
                 raise SyncError(
                     f"scheduler config displaced path changed during "
                     f"publication; the trusted staged config remains live and "
@@ -21036,9 +21085,7 @@ def _atomic_write_scheduler_config(
             )
             or not _bound_directory_matches(user_home, path.parent, parent_fd)
         ):
-            raise SyncError(
-                f"scheduler config changed during publication: {path}"
-            )
+            raise SyncError(f"scheduler config changed during publication: {path}")
         if retained_old:
             old_snapshot = _read_managed_state_file_snapshot(
                 user_home,
@@ -21071,6 +21118,10 @@ def _atomic_write_scheduler_config(
             if not _managed_state_snapshot_matches_file_evidence(
                 recovery,
                 before,
+            ) or not _scheduler_recovery_binding_matches(
+                recovery_fd,
+                recovery_path,
+                before,
             ):
                 preserve_recovery = True
                 raise SyncError(
@@ -21086,10 +21137,14 @@ def _atomic_write_scheduler_config(
             )
             recovery_name = None
     except OSError as error:
-        raise SyncError(f"failed to publish scheduler config {path}: {error}") from error
+        raise SyncError(
+            f"failed to publish scheduler config {path}: {error}"
+        ) from error
     finally:
         if file_fd >= 0:
             _close_fd_quietly(file_fd)
+        if recovery_fd >= 0:
+            _close_fd_quietly(recovery_fd)
         if not published and not retained_old:
             try:
                 staged_cleanup = _read_managed_state_file_snapshot(
@@ -21540,9 +21595,7 @@ def install_scheduler(
     if REPOSITORY_RE.fullmatch(repo) is None:
         raise SyncError("scheduler repository must be an owner/repo string")
     if REPOSITORY_RE.fullmatch(base_repo) is None:
-        raise SyncError(
-            "scheduler base repository must be an owner/repo string"
-        )
+        raise SyncError("scheduler base repository must be an owner/repo string")
     owner = _validate_owner(owner)
     if mode == "private" and owner == PUBLIC_OWNER:
         raise SyncError("private scheduler owner must not be public")
@@ -21694,6 +21747,9 @@ def _install_scheduler_transaction(
     if selected_platform == "linux":
         assert paths.systemd_service is not None
         assert paths.systemd_timer is not None
+        published_systemd_snapshots: (
+            tuple[ManagedStateFileSnapshot, ManagedStateFileSnapshot] | None
+        ) = None
         if not config_matches:
             desired_service = _systemd_service(
                 home,
@@ -21751,27 +21807,20 @@ def _install_scheduler_transaction(
                 config_audit.systemd_drop_ins,
             )
             if not dry_run:
-                if (
-                    _optional_scheduler_config_payload(
-                        paths.systemd_service
-                    )
-                    != desired_service.encode("utf-8")
-                    or _optional_scheduler_config_payload(
-                        paths.systemd_timer
-                    )
-                    != desired_timer.encode("utf-8")
-                ):
-                    raise SyncError(
-                        "scheduler pair publication could not be verified"
-                    )
+                if _optional_scheduler_config_payload(
+                    paths.systemd_service
+                ) != desired_service.encode(
+                    "utf-8"
+                ) or _optional_scheduler_config_payload(
+                    paths.systemd_timer
+                ) != desired_timer.encode("utf-8"):
+                    raise SyncError("scheduler pair publication could not be verified")
                 marker_snapshot = _scheduler_config_snapshot(
                     _scheduler_pair_transaction_path(paths),
                     MAX_SCHEDULER_PAIR_TRANSACTION_BYTES,
                 )
                 if marker_snapshot.payload != marker_payload:
-                    raise SyncError(
-                        "scheduler pair transaction changed before commit"
-                    )
+                    raise SyncError("scheduler pair transaction changed before commit")
                 _remove_scheduler_config_if_snapshot(
                     _scheduler_pair_transaction_path(paths),
                     marker_snapshot,
@@ -21780,13 +21829,42 @@ def _install_scheduler_transaction(
                     paths,
                     config_audit.systemd_drop_ins,
                 )
+                published_systemd_snapshots = (
+                    _scheduler_config_snapshot(
+                        paths.systemd_service,
+                        1024 * 1024,
+                    ),
+                    _scheduler_config_snapshot(
+                        paths.systemd_timer,
+                        1024 * 1024,
+                    ),
+                )
+                if published_systemd_snapshots[0].payload != desired_service.encode(
+                    "utf-8"
+                ) or published_systemd_snapshots[1].payload != desired_timer.encode(
+                    "utf-8"
+                ):
+                    raise SyncError(
+                        "published systemd scheduler pair differs from "
+                        "the committed transaction"
+                    )
         else:
             _revalidate_scheduler_config_audit(paths, config_audit)
+            service_snapshot, timer_snapshot = config_audit.snapshots
+            published_systemd_snapshots = (
+                service_snapshot,
+                timer_snapshot,
+            )
         if enable:
             _revalidate_systemd_drop_ins(
                 paths,
                 config_audit.systemd_drop_ins,
             )
+            if published_systemd_snapshots is not None:
+                _revalidate_published_systemd_pair(
+                    paths,
+                    published_systemd_snapshots,
+                )
             _run_native_command(
                 ["systemctl", "--user", "daemon-reload"], dry_run=dry_run
             )
@@ -21794,6 +21872,11 @@ def _install_scheduler_transaction(
                 paths,
                 config_audit.systemd_drop_ins,
             )
+            if published_systemd_snapshots is not None:
+                _revalidate_published_systemd_pair(
+                    paths,
+                    published_systemd_snapshots,
+                )
             _run_native_command(
                 ["systemctl", "--user", "enable", f"{SYSTEMD_UNIT}.timer"],
                 dry_run=dry_run,
@@ -21802,10 +21885,20 @@ def _install_scheduler_transaction(
                 paths,
                 config_audit.systemd_drop_ins,
             )
+            if published_systemd_snapshots is not None:
+                _revalidate_published_systemd_pair(
+                    paths,
+                    published_systemd_snapshots,
+                )
             _run_native_command(
                 ["systemctl", "--user", "start", f"{SYSTEMD_UNIT}.timer"],
                 dry_run=dry_run,
             )
+            if published_systemd_snapshots is not None:
+                _revalidate_published_systemd_pair(
+                    paths,
+                    published_systemd_snapshots,
+                )
         _revalidate_systemd_drop_ins(
             paths,
             config_audit.systemd_drop_ins,

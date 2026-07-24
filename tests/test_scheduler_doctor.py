@@ -903,7 +903,7 @@ class SchedulerDoctorTests(unittest.TestCase):
 
         self.assertEqual(status_path.read_bytes(), replacement)
 
-    def test_scheduler_runtime_cas_rolls_back_a_late_identity_replacement(
+    def test_scheduler_runtime_cas_does_not_restore_unproven_late_replacement(
         self,
     ) -> None:
         attempt = MODULE._begin_scheduler_attempt(
@@ -945,7 +945,8 @@ class SchedulerDoctorTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
-                "restored the displaced state without overwriting it",
+                "could not prove that the temporary object is the exact state "
+                "displaced",
             ),
         ):
             MODULE._complete_scheduler_attempt(
@@ -960,14 +961,23 @@ class SchedulerDoctorTests(unittest.TestCase):
                 owner=MODULE.PUBLIC_OWNER,
             )
 
-        self.assertEqual(exchange_count, 2)
-        self.assertEqual(status_path.read_bytes(), newer)
+        self.assertEqual(exchange_count, 1)
+        self.assertNotEqual(status_path.read_bytes(), newer)
         self.assertEqual(
-            list(status_path.parent.glob(f".{status_path.name}.personal-sync-write-*")),
-            [],
+            json.loads(status_path.read_text(encoding="utf-8"))["last_attempt"],
+            attempt,
         )
+        displaced_paths = [
+            candidate
+            for candidate in status_path.parent.glob(
+                f".{status_path.name}.personal-sync-write-*"
+            )
+            if not candidate.name.endswith(".original")
+        ]
+        self.assertEqual(len(displaced_paths), 1)
+        self.assertEqual(displaced_paths[0].read_bytes(), newer)
 
-    def test_scheduler_runtime_cas_retains_recovery_on_rollback_uncertainty(
+    def test_scheduler_runtime_cas_never_swaps_unproven_temp_back_to_live(
         self,
     ) -> None:
         attempt = MODULE._begin_scheduler_attempt(
@@ -979,11 +989,12 @@ class SchedulerDoctorTests(unittest.TestCase):
         )
         status_path = MODULE._scheduler_status_path(self.home)
         original = status_path.read_bytes()
-        newer = b"foreign state that won the late race\n"
+        attacker = b"attacker-controlled temporary replacement\n"
+        saved_displaced = status_path.parent / "saved-displaced-status"
         real_exchange = MODULE._rename_exchange_at
         exchange_count = 0
 
-        def fail_rollback_exchange(
+        def swap_displaced_temp(
             first_parent_fd: int,
             first_name: str,
             second_parent_fd: int,
@@ -991,28 +1002,33 @@ class SchedulerDoctorTests(unittest.TestCase):
         ) -> None:
             nonlocal exchange_count
             exchange_count += 1
-            if exchange_count == 1:
-                status_path.unlink()
-                status_path.write_bytes(newer)
-                status_path.chmod(0o600)
-                real_exchange(
-                    first_parent_fd,
-                    first_name,
-                    second_parent_fd,
-                    second_name,
-                )
+            real_exchange(
+                first_parent_fd,
+                first_name,
+                second_parent_fd,
+                second_name,
+            )
+            if exchange_count != 1:
                 return
-            raise OSError("injected rollback uncertainty")
+            saved_displaced.write_bytes(attacker)
+            saved_displaced.chmod(0o600)
+            real_exchange(
+                first_parent_fd,
+                first_name,
+                first_parent_fd,
+                saved_displaced.name,
+            )
 
         with (
             mock.patch.object(
                 MODULE,
                 "_rename_exchange_at",
-                side_effect=fail_rollback_exchange,
+                side_effect=swap_displaced_temp,
             ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
-                "recovery evidence is retained",
+                "could not prove that the temporary object is the exact state "
+                "displaced",
             ),
         ):
             MODULE._complete_scheduler_attempt(
@@ -1027,7 +1043,12 @@ class SchedulerDoctorTests(unittest.TestCase):
                 owner=MODULE.PUBLIC_OWNER,
             )
 
-        self.assertEqual(exchange_count, 2)
+        self.assertEqual(exchange_count, 1)
+        self.assertNotEqual(status_path.read_bytes(), attacker)
+        self.assertEqual(
+            json.loads(status_path.read_text(encoding="utf-8"))["last_attempt"],
+            attempt,
+        )
         recovery_paths = list(
             status_path.parent.glob(
                 f".{status_path.name}.personal-sync-write-*.original"
@@ -1043,7 +1064,8 @@ class SchedulerDoctorTests(unittest.TestCase):
             if not candidate.name.endswith(".original")
         ]
         self.assertEqual(len(displaced_paths), 1)
-        self.assertEqual(displaced_paths[0].read_bytes(), newer)
+        self.assertEqual(displaced_paths[0].read_bytes(), attacker)
+        self.assertEqual(saved_displaced.read_bytes(), original)
 
     def test_scheduler_runtime_cas_rejects_same_inode_content_and_access_drift(
         self,
@@ -1241,6 +1263,92 @@ class SchedulerDoctorTests(unittest.TestCase):
         assert state is not None
         self.assertTrue(state["success"])
         self.assertEqual(state["last_attempt"], attempt)
+
+    def test_scheduler_runtime_cas_rejects_parent_rotation_with_same_file_inode(
+        self,
+    ) -> None:
+        attempt = MODULE._begin_scheduler_attempt(
+            self.home,
+            mode="public",
+            repo="owner/public-sync",
+            base_repo="owner/public-sync",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+        status_path = MODULE._scheduler_status_path(self.home)
+        original_payload = status_path.read_bytes()
+        original_identity = (
+            status_path.stat().st_dev,
+            status_path.stat().st_ino,
+        )
+        rotated_parent = status_path.parent.with_name(
+            status_path.parent.name + "-rotated"
+        )
+        real_publish = MODULE._atomic_write_scheduler_config
+
+        def rotate_parent_before_publish(
+            path: Path,
+            payload: bytes,
+            *,
+            expected_snapshot: MODULE.ManagedStateFileSnapshot | None = None,
+            mode: int = 0o600,
+            gid: int | None = None,
+            rollback_displaced_conflict: bool = False,
+        ) -> None:
+            status_path.parent.rename(rotated_parent)
+            status_path.parent.mkdir(mode=0o700)
+            os.link(
+                rotated_parent / status_path.name,
+                status_path,
+                follow_symlinks=False,
+            )
+            real_publish(
+                path,
+                payload,
+                expected_snapshot=expected_snapshot,
+                mode=mode,
+                gid=gid,
+                rollback_displaced_conflict=rollback_displaced_conflict,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_atomic_write_scheduler_config",
+                side_effect=rotate_parent_before_publish,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "changed before conditional publication",
+            ),
+        ):
+            MODULE._complete_scheduler_attempt(
+                self.home,
+                attempt=attempt,
+                success=True,
+                failure_reason=None,
+                failure_code=None,
+                mode="public",
+                repo="owner/public-sync",
+                base_repo="owner/public-sync",
+                owner=MODULE.PUBLIC_OWNER,
+            )
+
+        self.assertEqual(status_path.read_bytes(), original_payload)
+        self.assertEqual(
+            (status_path.stat().st_dev, status_path.stat().st_ino),
+            original_identity,
+        )
+        self.assertEqual(
+            (
+                (rotated_parent / status_path.name).stat().st_dev,
+                (rotated_parent / status_path.name).stat().st_ino,
+            ),
+            original_identity,
+        )
+        self.assertEqual(
+            list(status_path.parent.glob(f".{status_path.name}.personal-sync-write-*")),
+            [],
+        )
 
     def test_timestamp_recovery_does_not_accept_unsafe_runtime_file(self) -> None:
         status_path = MODULE._scheduler_status_path(self.home)

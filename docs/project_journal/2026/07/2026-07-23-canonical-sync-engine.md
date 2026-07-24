@@ -246,20 +246,33 @@ superseded_by:
   the user-owned residue is resolved.
 - Scheduler runtime state now carries the complete
   `ManagedStateFileSnapshot` from read through conditional publication.
-  Existing-file publication uses exchange verification and restores a
-  displaced newer object; rollback uncertainty retains explicit recovery and
-  exchange locators. Tests cover identity replacement, same-inode content and
-  access drift, absent-to-appeared races, late exchange races, rollback
-  uncertainty, and benign mtime-only transitions while retaining monotonic
-  attempt behavior.
-- The superseding final validation passed 107 source-lock tests in 898.299
-  seconds, 17 toolbox workflow tests in 237.220 seconds, and 560 complete
-  personal-sync/scheduler/reconciliation/retention tests in 148.959 seconds.
-  `actionlint` passed all workflows; Ruff lint passed `scripts` and `tests`;
-  the generator, source-lock, and workflow tests passed Ruff format check;
-  isolated compileall and `git diff --check` passed; and no bytecode, formatter
+  Existing-file CAS includes parent-directory identity while ignoring
+  timestamp-only churn. Publication never exchanges an unproved displaced
+  temporary object back into the live status path; it leaves trusted staged
+  bytes live and retains descriptor-bound original recovery evidence plus the
+  untrusted displaced locator. Tests cover identity replacement, same-inode
+  content/access drift, whole-parent rotation with the same hard-linked file,
+  absent-to-appeared races, late exchange replacement/swap, and benign
+  mtime-only transitions while retaining monotonic attempt behavior.
+- The next fresh named-single pass found four remaining binding gaps. Linux
+  activation now binds the published service/timer objects, bytes, access
+  policy, and parent identity, then revalidates the pair after daemon reload,
+  before enable, before start, and after start; injected main-unit drift stops
+  before the next native action. Linked-worktree `commondir` binding now
+  retains the entire NFC+casefold collision set from initial bind through
+  private materialization, every Git boundary, and terminal validation.
+  Case-sensitive alias/add-and-rename fixtures plus simulated
+  case-insensitive/NFC inventories exercise the retained set.
+- The superseding final validation passed 108 source-lock tests in 1163.809
+  seconds and 563 complete
+  personal-sync/scheduler/reconciliation/retention tests in 147.848 seconds,
+  for 671 disjoint repository tests. Focused scheduler activation and
+  recovery tests passed before the full partitions, and an independent
+  read-only property audit found no remaining defect in the four reviewed
+  bindings. Ruff lint, isolated compileall, project-journal validation,
+  source-lock check, and `git diff --check` passed; no bytecode, formatter
   backup, or reject artifact remains. The refreshed source-lock SHA-256 is
-  `d750f2b83c3de0340e4ed1c9e1a7696e639d01b9ce60f9aec984dcbc25c60ab5`.
+  `a52fffe15f750abff47f1e84eef84610e0873b8010038a9ad43accf26e304adf`.
 
 ## Installed Host Baseline
 

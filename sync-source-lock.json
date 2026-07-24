@@ -28,12 +28,12 @@
     "engine": {
       "mode": "0755",
       "path": "scripts/codex_personal_sync.py",
-      "sha256": "644a96df62ff6a5652e0e9017dfda740fd35602c30d1ee8b1e466eb16a4ed5dc"
+      "sha256": "cf6c7e8a140a536800611312e75ba51f8c5839c31e2c0ed7e7b09315215f7dba"
     },
     "engine_tests": {
       "mode": "0644",
       "path": "tests/test_codex_personal_sync.py",
-      "sha256": "3b08d28a9954c4c75df78c4d786915925ec335bdada4b8abca6092aad34c912a"
+      "sha256": "0cc31b397af352986afeba4193f4174b69f3b34d5c95321a1496fa64d4118bb2"
     },
     "manifest_schema": {
       "mode": "0644",
@@ -53,7 +53,7 @@
     "scheduler_doctor_tests": {
       "mode": "0644",
       "path": "tests/test_scheduler_doctor.py",
-      "sha256": "63abc26caff9a2c30a92aa1a6c0a9ad730b9046f13e8d753f48740099f0e8f9c"
+      "sha256": "39b8117eaa8fb06335879b1df321cc5dfccd2a39b894c2ef39b4a55aeb565d04"
     }
   },
   "version": 1

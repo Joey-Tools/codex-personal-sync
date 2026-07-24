@@ -6,7 +6,7 @@ import importlib.util
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
@@ -2129,7 +2129,7 @@ class MirrorGeneratorTests(unittest.TestCase):
             commondir_path.write_bytes(b".\n")
             with self.assertRaisesRegex(
                 MIRROR_MODULE.MirrorSyncError,
-                "commondir control file appeared",
+                "commondir control file portable collision set changed",
             ):
                 MIRROR_MODULE._run_git(bound_root, "rev-parse", "HEAD")
             commondir_path.unlink()
@@ -2247,6 +2247,97 @@ class MirrorGeneratorTests(unittest.TestCase):
             common_marker.unlink(missing_ok=True)
             if private_marker is not None:
                 private_marker.unlink(missing_ok=True)
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+            self._git(
+                self.canonical_root,
+                "worktree",
+                "remove",
+                "--force",
+                str(linked_root),
+            )
+
+    def test_linked_worktree_revalidates_commondir_collision_set_after_bind(
+        self,
+    ) -> None:
+        linked_root = self.root / "linked-canonical"
+        self._git(
+            self.canonical_root,
+            "worktree",
+            "add",
+            "--detach",
+            str(linked_root),
+            self.source_commit,
+        )
+        bound_root = MIRROR_MODULE._bind_root(linked_root)
+        alias_marker: Path | None = None
+        original_marker: Path | None = None
+        try:
+            MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            assert bound_root.git_control is not None
+            assert bound_root.git_control.admin.path is not None
+            admin = bound_root.git_control.admin
+            original_marker = admin.path / "commondir"
+            alias_marker = admin.path / "CoMmOnDiR"
+
+            if not alias_marker.exists():
+                alias_marker.write_text("../escape.git\n", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "portable collision set changed",
+                ):
+                    MIRROR_MODULE._run_git(bound_root, "rev-parse", "HEAD")
+                alias_marker.unlink()
+
+                original_marker.rename(alias_marker)
+                with self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "portable collision set changed",
+                ):
+                    MIRROR_MODULE._run_git(bound_root, "rev-parse", "HEAD")
+                alias_marker.rename(original_marker)
+
+            self.assertEqual(
+                MIRROR_MODULE._path_collision_key(PurePosixPath("Café")),
+                MIRROR_MODULE._path_collision_key(
+                    PurePosixPath("CAFE\u0301"),
+                ),
+            )
+            real_inventory = MIRROR_MODULE._control_marker_collision_names
+            for observed in (
+                ("CoMmOnDiR", "commondir"),
+                ("CoMmOnDiR",),
+            ):
+                with self.subTest(simulated_collision_set=observed):
+
+                    def simulated_inventory(parent, name, label):
+                        if parent.fd == admin.fd and name == "commondir":
+                            return observed
+                        return real_inventory(parent, name, label)
+
+                    with (
+                        mock.patch.object(
+                            MIRROR_MODULE,
+                            "_control_marker_collision_names",
+                            side_effect=simulated_inventory,
+                        ),
+                        self.assertRaisesRegex(
+                            MIRROR_MODULE.MirrorSyncError,
+                            "portable collision set changed",
+                        ),
+                    ):
+                        MIRROR_MODULE._run_git(
+                            bound_root,
+                            "rev-parse",
+                            "HEAD",
+                        )
+        finally:
+            if (
+                alias_marker is not None
+                and original_marker is not None
+                and alias_marker.exists()
+                and not original_marker.exists()
+            ):
+                alias_marker.rename(original_marker)
             MIRROR_MODULE._finish_bound_roots(bound_root)
             self._git(
                 self.canonical_root,
