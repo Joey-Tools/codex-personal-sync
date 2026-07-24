@@ -230,6 +230,36 @@ superseded_by:
   seconds. One additional full-suite run under concurrent source-lock load hit
   only the fixture's former 30-second subprocess timeout, so the fixture now
   retains explicit 90-second generator and 120-second prepare ceilings.
+- A subsequent fresh single review found three remaining publication-boundary
+  gaps. Linked-worktree setup now rejects any root-level `commondir`
+  case/canonical collision in the shared common directory before copying,
+  binds the same absence in the private Git snapshot before its first Git
+  process, and revalidates both descriptors through completion. Real linked
+  worktree fixtures cover exact and case-aliased escape markers plus later
+  common/private marker appearance.
+- Linux scheduler audits now bind service/timer drop-in absence or an exact
+  empty-directory identity before the no-unit early return, through pair
+  publication, daemon reload, separate enable, and start phases. Foreign
+  drop-in residue is never inferred to be tool-owned or deleted without an
+  ownership receipt; uninstall preserves and reports it, status/doctor reports
+  it even when both unit files are absent, and reinstall remains blocked until
+  the user-owned residue is resolved.
+- Scheduler runtime state now carries the complete
+  `ManagedStateFileSnapshot` from read through conditional publication.
+  Existing-file publication uses exchange verification and restores a
+  displaced newer object; rollback uncertainty retains explicit recovery and
+  exchange locators. Tests cover identity replacement, same-inode content and
+  access drift, absent-to-appeared races, late exchange races, rollback
+  uncertainty, and benign mtime-only transitions while retaining monotonic
+  attempt behavior.
+- The superseding final validation passed 107 source-lock tests in 898.299
+  seconds, 17 toolbox workflow tests in 237.220 seconds, and 560 complete
+  personal-sync/scheduler/reconciliation/retention tests in 148.959 seconds.
+  `actionlint` passed all workflows; Ruff lint passed `scripts` and `tests`;
+  the generator, source-lock, and workflow tests passed Ruff format check;
+  isolated compileall and `git diff --check` passed; and no bytecode, formatter
+  backup, or reject artifact remains. The refreshed source-lock SHA-256 is
+  `d750f2b83c3de0340e4ed1c9e1a7696e639d01b9ce60f9aec984dcbc25c60ab5`.
 
 ## Installed Host Baseline
 

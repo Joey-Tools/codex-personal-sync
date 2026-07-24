@@ -183,6 +183,7 @@ class ControlAbsenceBinding:
     label: str
     parent: ControlObjectBinding
     name: str
+    collision_key: tuple[str, ...] | None = None
 
 
 @dataclass
@@ -594,6 +595,72 @@ def _bind_relative_control_file(
         access_policy=_access_policy(opened_metadata),
         content_digest=content_digest,
     )
+
+
+def _control_marker_collision_names(
+    parent: ControlObjectBinding,
+    name: str,
+    label: str,
+) -> tuple[str, ...]:
+    marker_key = _path_collision_key(PurePosixPath(name))
+    try:
+        names = os.listdir(parent.fd)
+    except OSError as error:
+        raise MirrorSyncError(f"cannot inventory {label} parent: {error}") from error
+    collisions: list[str] = []
+    for candidate in names:
+        if (
+            not isinstance(candidate, str)
+            or candidate in {"", ".", ".."}
+            or "/" in candidate
+        ):
+            raise MirrorSyncError(
+                f"{label} parent contains an unsafe entry: {candidate!r}"
+            )
+        if _path_collision_key(PurePosixPath(candidate)) == marker_key:
+            collisions.append(candidate)
+    return tuple(sorted(collisions))
+
+
+def _bind_unique_relative_control_file(
+    parent: ControlObjectBinding,
+    name: str,
+    label: str,
+) -> ControlObjectBinding | None:
+    collisions = _control_marker_collision_names(parent, name, label)
+    if collisions and collisions != (name,):
+        raise MirrorSyncError(
+            f"{label} has a case/canonical collision alias: "
+            + ", ".join(repr(candidate) for candidate in collisions)
+        )
+    binding = _bind_relative_control_file(parent, name, label)
+    confirmed = _control_marker_collision_names(parent, name, label)
+    expected = (name,) if binding is not None else ()
+    if confirmed != expected:
+        if binding is not None:
+            os.close(binding.fd)
+        raise MirrorSyncError(f"{label} changed while binding its unique name")
+    return binding
+
+
+def _bind_collision_aware_control_absence(
+    parent: ControlObjectBinding,
+    name: str,
+    label: str,
+) -> ControlAbsenceBinding:
+    binding = ControlAbsenceBinding(
+        label=label,
+        parent=parent,
+        name=name,
+        collision_key=_path_collision_key(PurePosixPath(name)),
+    )
+    collisions = _control_marker_collision_names(parent, name, label)
+    if collisions:
+        raise MirrorSyncError(
+            f"{label} appeared before private Git materialization: "
+            + ", ".join(repr(candidate) for candidate in collisions)
+        )
+    return binding
 
 
 def _bind_relative_control_directory(
@@ -1493,6 +1560,7 @@ def _materialize_private_git_control(
     root: BoundRoot,
     admin: ControlObjectBinding,
     common: ControlObjectBinding,
+    common_commondir_absence: ControlAbsenceBinding,
 ) -> tuple[
     ControlObjectBinding,
     str,
@@ -1562,6 +1630,7 @@ def _materialize_private_git_control(
     source_files: list[ControlObjectBinding] = []
     final_manifest: tuple[tuple[object, ...], ...] = ()
     try:
+        _revalidate_control_absence(root, common_commondir_absence)
         first_budget = {"entries": 0, "bytes": 0}
         first_manifest = _snapshot_git_directory_tree(
             common.fd,
@@ -1582,6 +1651,7 @@ def _materialize_private_git_control(
             raise MirrorSyncError(
                 "Git common control tree changed during private snapshot"
             )
+        _revalidate_control_absence(root, common_commondir_absence)
         source_manifest = _logical_git_snapshot_manifest(first_manifest)
         copied_manifest = _scan_private_git_tree(
             private.fd,
@@ -1642,6 +1712,7 @@ def _materialize_private_git_control(
             raise MirrorSyncError(
                 "private Git control plane differs from bound source bytes"
             )
+        _revalidate_control_absence(root, common_commondir_absence)
         _set_owner_record_phase(
             owner_record,
             private_name,
@@ -1765,8 +1836,8 @@ def _require_private_source_controls(
 def _bind_git_source_controls(
     admin: ControlObjectBinding,
     common: ControlObjectBinding,
-    commondir_file: ControlObjectBinding | None,
     initial_files: tuple[ControlObjectBinding, ...],
+    initial_absences: tuple[ControlAbsenceBinding, ...],
     private_manifest: tuple[tuple[object, ...], ...],
     acquired: list[ControlObjectBinding],
 ) -> tuple[
@@ -1776,7 +1847,7 @@ def _bind_git_source_controls(
 ]:
     files = list(initial_files)
     directories: list[ControlObjectBinding] = []
-    absences: list[ControlAbsenceBinding] = []
+    absences = list(initial_absences)
     private_files: dict[PurePosixPath, ControlObjectBinding] = {}
     private_directories: dict[PurePosixPath, ControlObjectBinding] = {}
     private_absences: set[PurePosixPath] = set()
@@ -1821,15 +1892,11 @@ def _bind_git_source_controls(
         private_files[private_path] = binding
         return binding
 
-    if commondir_file is None:
-        absences.append(
-            ControlAbsenceBinding(
-                label="Git commondir control file",
-                parent=admin,
-                name="commondir",
-            )
-        )
-        private_absences.add(PurePosixPath("commondir"))
+    # A private Git control plane must never inherit a commondir marker. The
+    # source-side collision-aware absence bindings are carried separately for
+    # descriptor-relative revalidation; this logical manifest check additionally
+    # proves the exact spelling is absent from the copied snapshot.
+    private_absences.add(PurePosixPath("commondir"))
 
     head = bind_file(
         admin,
@@ -1968,6 +2035,24 @@ def _revalidate_control_absence(
     binding: ControlAbsenceBinding,
 ) -> None:
     _revalidate_control_object(root, binding.parent)
+    if binding.collision_key is not None:
+        try:
+            names = os.listdir(binding.parent.fd)
+        except OSError as error:
+            raise MirrorSyncError(
+                f"{binding.label} absence became unreadable: {error}"
+            ) from error
+        for name in names:
+            if not isinstance(name, str) or name in {"", ".", ".."} or "/" in name:
+                raise MirrorSyncError(
+                    f"{binding.label} parent contains an unsafe entry: {name!r}"
+                )
+            if _path_collision_key(PurePosixPath(name)) == binding.collision_key:
+                raise MirrorSyncError(
+                    f"{binding.label} appeared before transaction completion"
+                )
+        _revalidate_control_object(root, binding.parent)
+        return
     try:
         os.stat(
             binding.name,
@@ -5557,7 +5642,7 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
                 require_directory=True,
             )
         controls.append(admin)
-        commondir_file = _bind_relative_control_file(
+        commondir_file = _bind_unique_relative_control_file(
             admin,
             "commondir",
             "Git commondir control file",
@@ -5582,6 +5667,11 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
                 require_directory=True,
             )
         controls.append(common)
+        common_commondir_absence = _bind_collision_aware_control_absence(
+            common,
+            "commondir",
+            "Git common-directory commondir control file",
+        )
         objects = _bind_absolute_control_object(
             common_path / "objects",
             "Git object directory",
@@ -5607,7 +5697,15 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
             root,
             admin,
             common,
+            common_commondir_absence,
         )
+        private_commondir_absence = _bind_collision_aware_control_absence(
+            private,
+            "commondir",
+            "private Git commondir control file",
+        )
+        _revalidate_control_absence(root, common_commondir_absence)
+        _revalidate_control_absence(root, private_commondir_absence)
         private_objects = _bind_relative_control_directory(
             private,
             PRIVATE_OBJECTS_PATH.as_posix(),
@@ -5626,8 +5724,11 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
         ) = _bind_git_source_controls(
             admin,
             common,
-            commondir_file,
             source_files,
+            (
+                common_commondir_absence,
+                private_commondir_absence,
+            ),
             private_manifest,
             acquired_source_controls,
         )

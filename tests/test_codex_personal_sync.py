@@ -6447,11 +6447,176 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 "/usr/bin/systemctl",
                 "--user",
                 "enable",
-                "--now",
                 "codex-personal-sync.timer",
             ],
             calls,
         )
+        self.assertIn(
+            [
+                "/usr/bin/systemctl",
+                "--user",
+                "start",
+                "codex-personal-sync.timer",
+            ],
+            calls,
+        )
+
+    def test_install_scheduler_rejects_drop_in_when_linux_units_are_absent(
+        self,
+    ) -> None:
+        home = self.root / "home" / ".codex"
+        write_scheduler_runner(home)
+        unit_root = self.root / "home" / ".config" / "systemd" / "user"
+        drop_in = unit_root / "codex-personal-sync.service.d"
+        drop_in.mkdir(parents=True)
+        override = drop_in / "override.conf"
+        override.write_text(
+            "[Service]\nExecStartPre=/tmp/attacker\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "drop-ins are unsupported",
+        ):
+            MODULE.install_scheduler(
+                home,
+                "owner/repo",
+                60,
+                "linux",
+                None,
+                dry_run=False,
+                enable=False,
+            )
+
+        self.assertFalse((unit_root / "codex-personal-sync.service").exists())
+        self.assertFalse((unit_root / "codex-personal-sync.timer").exists())
+        self.assertEqual(
+            override.read_text(encoding="utf-8"),
+            "[Service]\nExecStartPre=/tmp/attacker\n",
+        )
+
+    def test_linux_enable_rejects_drop_in_appearing_after_daemon_reload(
+        self,
+    ) -> None:
+        home = self.root / "home" / ".codex"
+        write_scheduler_runner(home)
+        unit_root = self.root / "home" / ".config" / "systemd" / "user"
+        calls: list[list[str]] = []
+
+        def inject_after_reload(
+            args: list[str],
+            *,
+            dry_run: bool,
+            allow_fail: bool = False,
+        ) -> None:
+            del dry_run, allow_fail
+            calls.append(args)
+            if args == ["systemctl", "--user", "daemon-reload"]:
+                drop_in = unit_root / "codex-personal-sync.service.d"
+                drop_in.mkdir()
+                (drop_in / "override.conf").write_text(
+                    "[Service]\nExecStartPre=/tmp/attacker\n",
+                    encoding="utf-8",
+                )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_run_native_command",
+                side_effect=inject_after_reload,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "drop-ins are unsupported",
+            ),
+        ):
+            MODULE.install_scheduler(
+                home,
+                "owner/repo",
+                60,
+                "linux",
+                None,
+                dry_run=False,
+                enable=True,
+            )
+
+        self.assertEqual(
+            calls,
+            [["systemctl", "--user", "daemon-reload"]],
+        )
+
+    def test_linux_uninstall_preserves_foreign_drop_in_and_blocks_reinstall(
+        self,
+    ) -> None:
+        home = self.root / "home" / ".codex"
+        write_scheduler_runner(home)
+        self.run_quietly(
+            MODULE.install_scheduler,
+            home,
+            "owner/repo",
+            60,
+            "linux",
+            None,
+            dry_run=False,
+            enable=False,
+        )
+        unit_root = self.root / "home" / ".config" / "systemd" / "user"
+        drop_in = unit_root / "codex-personal-sync.timer.d"
+        drop_in.mkdir()
+        override = drop_in / "override.conf"
+        override.write_text(
+            "[Timer]\nOnUnitActiveSec=1min\n",
+            encoding="utf-8",
+        )
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            MODULE.uninstall_scheduler(
+                home,
+                "linux",
+                dry_run=False,
+                disable=False,
+            )
+
+        self.assertIn(
+            "preserved foreign systemd drop-in residue",
+            output.getvalue(),
+        )
+        self.assertTrue(override.is_file())
+        self.assertFalse((unit_root / "codex-personal-sync.service").exists())
+        self.assertFalse((unit_root / "codex-personal-sync.timer").exists())
+        report = MODULE.scheduler_report(home, "linux")
+        self.assertIn("drop-ins are unsupported", report.failure_reason or "")
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "drop-ins are unsupported",
+        ):
+            MODULE.install_scheduler(
+                home,
+                "owner/repo",
+                60,
+                "linux",
+                None,
+                dry_run=False,
+                enable=False,
+            )
+
+        override.unlink()
+        drop_in.rmdir()
+        self.run_quietly(
+            MODULE.install_scheduler,
+            home,
+            "owner/repo",
+            60,
+            "linux",
+            None,
+            dry_run=False,
+            enable=False,
+        )
+        self.assertTrue((unit_root / "codex-personal-sync.service").is_file())
+        self.assertTrue((unit_root / "codex-personal-sync.timer").is_file())
 
     def test_uninstall_scheduler_removes_linux_units(self) -> None:
         home = self.root / "home" / ".codex"

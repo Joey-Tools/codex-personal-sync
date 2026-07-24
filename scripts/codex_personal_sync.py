@@ -603,9 +603,21 @@ class SchedulerConfig:
 
 
 @dataclass(frozen=True)
+class SystemdDropInSnapshot:
+    exists: bool
+    parent_identity: tuple[int, int] | None = None
+    directory_identity: tuple[int, int] | None = None
+    file_type: int | None = None
+    mode: int | None = None
+    uid: int | None = None
+    gid: int | None = None
+
+
+@dataclass(frozen=True)
 class SchedulerConfigAudit:
     config: SchedulerConfig | None
     snapshots: tuple[ManagedStateFileSnapshot, ...]
+    systemd_drop_ins: tuple[SystemdDropInSnapshot, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -20007,24 +20019,153 @@ def _load_macos_scheduler_config(
     return config
 
 
-def _reject_systemd_drop_ins(unit_path: Path) -> None:
+def _systemd_drop_in_metadata(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+
+def _systemd_drop_in_snapshot(unit_path: Path) -> SystemdDropInSnapshot:
     drop_in = unit_path.with_name(unit_path.name + ".d")
+    user_home = Path.home().expanduser()
     try:
-        metadata = drop_in.lstat()
+        drop_in.relative_to(user_home)
+    except ValueError as error:
+        raise SyncError(
+            f"systemd drop-in path must remain beneath the user home: {drop_in}"
+        ) from error
+    try:
+        parent_fd = _open_directory_beneath(user_home, drop_in.parent)
     except FileNotFoundError:
-        return
+        return SystemdDropInSnapshot(exists=False)
     except OSError as error:
-        raise SyncError(f"failed to inspect systemd drop-in path: {drop_in}") from error
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise SyncError(f"refusing unsafe systemd drop-in path: {drop_in}")
+        raise SyncError(
+            f"failed to inspect systemd drop-in parent: {drop_in}"
+        ) from error
+    directory_fd = -1
     try:
-        with os.scandir(drop_in) as entries:
-            if next(entries, None) is not None:
+        parent_identity = _directory_identity(parent_fd)
+        try:
+            named_metadata = os.stat(
+                drop_in.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            if not _bound_directory_matches(
+                user_home,
+                drop_in.parent,
+                parent_fd,
+            ):
                 raise SyncError(
-                    f"systemd scheduler drop-ins are unsupported: {drop_in}"
+                    f"systemd drop-in parent changed during audit: {drop_in}"
                 )
-    except OSError as error:
-        raise SyncError(f"failed to inspect systemd drop-ins: {drop_in}") from error
+            return SystemdDropInSnapshot(
+                exists=False,
+                parent_identity=parent_identity,
+            )
+        except OSError as error:
+            raise SyncError(
+                f"failed to inspect systemd drop-in path: {drop_in}"
+            ) from error
+        if not stat.S_ISDIR(named_metadata.st_mode):
+            raise SyncError(f"refusing unsafe systemd drop-in path: {drop_in}")
+        if (
+            named_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(named_metadata.st_mode) & 0o022
+        ):
+            raise SyncError(
+                f"systemd drop-in directory has unsafe access policy: {drop_in}"
+            )
+        try:
+            directory_fd = os.open(
+                drop_in.name,
+                _directory_open_flags(nofollow=True),
+                dir_fd=parent_fd,
+            )
+        except OSError as error:
+            raise SyncError(
+                f"failed to safely open systemd drop-in path: {drop_in}"
+            ) from error
+        opened_metadata = os.fstat(directory_fd)
+        expected_metadata = _systemd_drop_in_metadata(named_metadata)
+        if _systemd_drop_in_metadata(opened_metadata) != expected_metadata:
+            raise SyncError(
+                f"systemd drop-in directory changed during audit: {drop_in}"
+            )
+        try:
+            entries = os.listdir(directory_fd)
+        except OSError as error:
+            raise SyncError(f"failed to inspect systemd drop-ins: {drop_in}") from error
+        if entries:
+            raise SyncError(f"systemd scheduler drop-ins are unsupported: {drop_in}")
+        try:
+            current_metadata = os.stat(
+                drop_in.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise SyncError(
+                f"systemd drop-in directory changed during audit: {drop_in}"
+            ) from error
+        if (
+            _systemd_drop_in_metadata(os.fstat(directory_fd)) != expected_metadata
+            or _systemd_drop_in_metadata(current_metadata) != expected_metadata
+            or not _bound_directory_matches(
+                user_home,
+                drop_in.parent,
+                parent_fd,
+            )
+        ):
+            raise SyncError(
+                f"systemd drop-in directory changed during audit: {drop_in}"
+            )
+        return SystemdDropInSnapshot(
+            exists=True,
+            parent_identity=parent_identity,
+            directory_identity=(
+                opened_metadata.st_dev,
+                opened_metadata.st_ino,
+            ),
+            file_type=stat.S_IFMT(opened_metadata.st_mode),
+            mode=stat.S_IMODE(opened_metadata.st_mode),
+            uid=opened_metadata.st_uid,
+            gid=opened_metadata.st_gid,
+        )
+    finally:
+        if directory_fd >= 0:
+            _close_fd_quietly(directory_fd)
+        _close_fd_quietly(parent_fd)
+
+
+def _audit_systemd_drop_ins(
+    paths: SchedulerPaths,
+) -> tuple[SystemdDropInSnapshot, SystemdDropInSnapshot]:
+    assert paths.systemd_service is not None
+    assert paths.systemd_timer is not None
+    return (
+        _systemd_drop_in_snapshot(paths.systemd_service),
+        _systemd_drop_in_snapshot(paths.systemd_timer),
+    )
+
+
+def _revalidate_systemd_drop_ins(
+    paths: SchedulerPaths,
+    expected: tuple[SystemdDropInSnapshot, ...],
+) -> None:
+    current = _audit_systemd_drop_ins(paths)
+    if len(current) != len(expected) or any(
+        actual != bound for actual, bound in zip(current, expected)
+    ):
+        raise SyncError("systemd scheduler drop-ins changed after semantic audit")
 
 
 def _load_linux_scheduler_config(
@@ -20033,9 +20174,17 @@ def _load_linux_scheduler_config(
     audited_snapshots: (
         tuple[ManagedStateFileSnapshot, ManagedStateFileSnapshot] | None
     ) = None,
+    audited_drop_ins: (
+        tuple[SystemdDropInSnapshot, SystemdDropInSnapshot] | None
+    ) = None,
 ) -> SchedulerConfig | None:
     assert paths.systemd_service is not None
     assert paths.systemd_timer is not None
+    if audited_drop_ins is None:
+        drop_in_snapshots = _audit_systemd_drop_ins(paths)
+    else:
+        drop_in_snapshots = audited_drop_ins
+        _revalidate_systemd_drop_ins(paths, drop_in_snapshots)
     pair_transaction = _scheduler_pair_transaction_path(paths)
     if _path_exists_or_is_link(pair_transaction):
         raise SyncError(
@@ -20056,11 +20205,10 @@ def _load_linux_scheduler_config(
     service_exists = service_snapshot.exists
     timer_exists = timer_snapshot.exists
     if not service_exists and not timer_exists:
+        _revalidate_systemd_drop_ins(paths, drop_in_snapshots)
         return None
     if service_exists != timer_exists:
         raise SyncError("systemd scheduler service/timer pair is incomplete")
-    _reject_systemd_drop_ins(paths.systemd_service)
-    _reject_systemd_drop_ins(paths.systemd_timer)
     assert service_snapshot.payload is not None
     assert timer_snapshot.payload is not None
     service_payload = service_snapshot.payload
@@ -20131,6 +20279,7 @@ def _load_linux_scheduler_config(
         timer_snapshot,
     ):
         raise SyncError("systemd scheduler service/timer pair changed during read")
+    _revalidate_systemd_drop_ins(paths, drop_in_snapshots)
     return config
 
 
@@ -20159,6 +20308,7 @@ def _audit_scheduler_config(paths: SchedulerPaths) -> SchedulerConfigAudit:
     if paths.platform == "linux":
         assert paths.systemd_service is not None
         assert paths.systemd_timer is not None
+        drop_in_snapshots = _audit_systemd_drop_ins(paths)
         snapshots = (
             _scheduler_config_snapshot(
                 paths.systemd_service,
@@ -20173,8 +20323,10 @@ def _audit_scheduler_config(paths: SchedulerPaths) -> SchedulerConfigAudit:
             config=_load_linux_scheduler_config(
                 paths,
                 audited_snapshots=snapshots,
+                audited_drop_ins=drop_in_snapshots,
             ),
             snapshots=snapshots,
+            systemd_drop_ins=drop_in_snapshots,
         )
     raise SyncError(f"unsupported scheduler platform: {paths.platform}")
 
@@ -20204,6 +20356,7 @@ def _revalidate_scheduler_config_audit(
                 1024 * 1024,
             ),
         )
+        _revalidate_systemd_drop_ins(paths, audit.systemd_drop_ins)
     else:
         raise SyncError(f"unsupported scheduler platform: {paths.platform}")
     if len(current) != len(audit.snapshots) or any(
@@ -20527,7 +20680,14 @@ def _scheduler_file_snapshots_match(
     expected: ManagedStateFileSnapshot,
 ) -> bool:
     if not actual.exists or not expected.exists:
-        return not actual.exists and not expected.exists
+        return (
+            not actual.exists
+            and not expected.exists
+            and (
+                expected.parent_identity is None
+                or actual.parent_identity == expected.parent_identity
+            )
+        )
     return _managed_state_snapshot_matches_file_evidence(actual, expected)
 
 
@@ -20555,6 +20715,7 @@ def _atomic_write_scheduler_config(
     expected_snapshot: ManagedStateFileSnapshot | None = None,
     mode: int = 0o600,
     gid: int | None = None,
+    rollback_displaced_conflict: bool = False,
 ) -> None:
     if mode & 0o022 or mode < 0 or mode > 0o7777:
         raise SyncError(f"scheduler config mode is unsafe: {mode:#o}")
@@ -20750,6 +20911,99 @@ def _atomic_write_scheduler_config(
                     raise SyncError(
                         f"scheduler config and recovery evidence changed during "
                         f"publication: {path}"
+                    )
+                if rollback_displaced_conflict and displaced is not None:
+                    try:
+                        _rename_exchange_at(
+                            parent_fd,
+                            temporary_name,
+                            parent_fd,
+                            path.name,
+                        )
+                        os.fsync(parent_fd)
+                    except (OSError, SyncError) as error:
+                        published = True
+                        retained_old = False
+                        raise SyncError(
+                            "conditional scheduler publication could not restore "
+                            f"the displaced state; recovery evidence is retained "
+                            f"as {recovery_path} and the displaced state as "
+                            f"{temporary_path}"
+                        ) from error
+                    try:
+                        restored = _read_managed_state_file_snapshot(
+                            user_home,
+                            path,
+                            parent_fd,
+                            expected_identity=displaced.file_identity,
+                        )
+                        rolled_back_staged = _read_managed_state_file_snapshot(
+                            user_home,
+                            temporary_path,
+                            parent_fd,
+                            expected_identity=staged.file_identity,
+                        )
+                    except SyncError as error:
+                        published = True
+                        retained_old = False
+                        raise SyncError(
+                            "conditional scheduler publication rollback is "
+                            f"uncertain; recovery evidence is retained as "
+                            f"{recovery_path} and exchange evidence as "
+                            f"{temporary_path}"
+                        ) from error
+                    if (
+                        not _managed_state_snapshot_matches_file_evidence(
+                            restored,
+                            displaced,
+                        )
+                        or not _managed_state_snapshot_matches_file_evidence(
+                            rolled_back_staged,
+                            staged,
+                        )
+                        or not _bound_directory_matches(
+                            user_home,
+                            path.parent,
+                            parent_fd,
+                        )
+                    ):
+                        published = True
+                        retained_old = False
+                        raise SyncError(
+                            "conditional scheduler publication rollback is "
+                            f"uncertain; recovery evidence is retained as "
+                            f"{recovery_path} and exchange evidence as "
+                            f"{temporary_path}"
+                        )
+                    try:
+                        _isolate_and_delete_pending_cleanup_file(
+                            user_home,
+                            temporary_path,
+                            parent_fd,
+                            rolled_back_staged,
+                            label=f"scheduler config rejected staging file {path}",
+                        )
+                        retained_old = False
+                        _isolate_and_delete_pending_cleanup_file(
+                            user_home,
+                            recovery_path,
+                            parent_fd,
+                            recovery,
+                            label=(
+                                "scheduler config rejected-publication recovery "
+                                f"evidence {path}"
+                            ),
+                        )
+                        recovery_name = None
+                    except (OSError, SyncError) as error:
+                        raise SyncError(
+                            "conditional scheduler publication restored the "
+                            f"displaced state, but cleanup is uncertain; recovery "
+                            f"evidence may remain as {recovery_path}"
+                        ) from error
+                    raise SyncError(
+                        "scheduler config changed during conditional publication; "
+                        f"restored the displaced state without overwriting it: {path}"
                     )
                 published = True
                 retained_old = False
@@ -21344,7 +21598,20 @@ def _install_scheduler_transaction(
     base_repo: str,
     owner: str,
 ) -> None:
+    initial_systemd_drop_ins: tuple[SystemdDropInSnapshot, ...] = ()
+    if selected_platform == "linux":
+        assert paths.systemd_service is not None
+        if not dry_run:
+            unit_root_fd = _open_or_create_directory_beneath(
+                Path.home().expanduser(),
+                paths.systemd_service.parent,
+                mode=0o755,
+            )
+            _close_fd_quietly(unit_root_fd)
+        initial_systemd_drop_ins = _audit_systemd_drop_ins(paths)
     _recover_scheduler_pair_transaction(paths, dry_run=dry_run)
+    if initial_systemd_drop_ins:
+        _revalidate_systemd_drop_ins(paths, initial_systemd_drop_ins)
     _validate_scheduler_runner(runner_path, dry_run=dry_run)
     config_audit = _audit_scheduler_config(paths)
     existing = config_audit.config
@@ -21459,17 +21726,29 @@ def _install_scheduler_transaction(
                     marker_payload,
                     expected_snapshot=marker_before,
                 )
+                _revalidate_systemd_drop_ins(
+                    paths,
+                    config_audit.systemd_drop_ins,
+                )
             _write_text(
                 paths.systemd_service,
                 desired_service,
                 dry_run=dry_run,
                 expected_snapshot=service_before,
             )
+            _revalidate_systemd_drop_ins(
+                paths,
+                config_audit.systemd_drop_ins,
+            )
             _write_text(
                 paths.systemd_timer,
                 desired_timer,
                 dry_run=dry_run,
                 expected_snapshot=timer_before,
+            )
+            _revalidate_systemd_drop_ins(
+                paths,
+                config_audit.systemd_drop_ins,
             )
             if not dry_run:
                 if (
@@ -21497,14 +21776,40 @@ def _install_scheduler_transaction(
                     _scheduler_pair_transaction_path(paths),
                     marker_snapshot,
                 )
+                _revalidate_systemd_drop_ins(
+                    paths,
+                    config_audit.systemd_drop_ins,
+                )
         else:
             _revalidate_scheduler_config_audit(paths, config_audit)
         if enable:
-            _run_native_command(["systemctl", "--user", "daemon-reload"], dry_run=dry_run)
+            _revalidate_systemd_drop_ins(
+                paths,
+                config_audit.systemd_drop_ins,
+            )
             _run_native_command(
-                ["systemctl", "--user", "enable", "--now", f"{SYSTEMD_UNIT}.timer"],
+                ["systemctl", "--user", "daemon-reload"], dry_run=dry_run
+            )
+            _revalidate_systemd_drop_ins(
+                paths,
+                config_audit.systemd_drop_ins,
+            )
+            _run_native_command(
+                ["systemctl", "--user", "enable", f"{SYSTEMD_UNIT}.timer"],
                 dry_run=dry_run,
             )
+            _revalidate_systemd_drop_ins(
+                paths,
+                config_audit.systemd_drop_ins,
+            )
+            _run_native_command(
+                ["systemctl", "--user", "start", f"{SYSTEMD_UNIT}.timer"],
+                dry_run=dry_run,
+            )
+        _revalidate_systemd_drop_ins(
+            paths,
+            config_audit.systemd_drop_ins,
+        )
         print(f"installed Linux systemd user scheduler: {paths.systemd_timer}")
         return
 
@@ -21542,6 +21847,21 @@ def _unlink_file(path: Path, *, dry_run: bool) -> None:
         )
     finally:
         _close_fd_quietly(parent_fd)
+
+
+def _report_preserved_systemd_drop_ins(paths: SchedulerPaths) -> None:
+    assert paths.systemd_service is not None
+    assert paths.systemd_timer is not None
+    # This scheduler does not create drop-ins or an ownership receipt. Any
+    # residue is therefore foreign user content: report it for doctor/status
+    # follow-up, but never infer ownership from its name and never delete it.
+    for unit_path in (paths.systemd_service, paths.systemd_timer):
+        drop_in = unit_path.with_name(unit_path.name + ".d")
+        if _path_exists_or_is_link(drop_in):
+            print(
+                "preserved foreign systemd drop-in residue without an "
+                f"ownership receipt: {drop_in}"
+            )
 
 
 def uninstall_scheduler(
@@ -21617,6 +21937,7 @@ def _uninstall_scheduler_transaction(
             )
         _unlink_file(paths.systemd_timer, dry_run=dry_run)
         _unlink_file(paths.systemd_service, dry_run=dry_run)
+        _report_preserved_systemd_drop_ins(paths)
         if disable:
             _run_native_command(
                 ["systemctl", "--user", "daemon-reload"],
@@ -22477,11 +22798,11 @@ def _parse_scheduler_utc_timestamp(
     return parsed
 
 
-def _read_scheduler_runtime_state(
+def _read_scheduler_runtime_state_with_snapshot(
     home: Path,
     *,
     recover_timestamps: bool = False,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, ManagedStateFileSnapshot]:
     path = _scheduler_status_path(home)
     if not _ensure_safe_internal_parent(
         home,
@@ -22489,14 +22810,14 @@ def _read_scheduler_runtime_state(
         create=False,
         allow_missing=True,
     ):
-        return None
+        return None, ManagedStateFileSnapshot(exists=False)
     parent_fd = _open_directory_beneath(home, path.parent)
     try:
         snapshot = _read_managed_state_file_snapshot(home, path, parent_fd)
     finally:
         _close_fd_quietly(parent_fd)
     if not snapshot.exists:
-        return None
+        return None, snapshot
     if (
         snapshot.payload is None
         or len(snapshot.payload) > MAX_SCHEDULER_STATUS_BYTES
@@ -22616,10 +22937,27 @@ def _read_scheduler_runtime_state(
         data["failure_reason"] = "invalid scheduler timestamp was recovered"
         data["failure_code"] = "scheduler-state-timestamp-recovered"
         data["release_trees"] = {}
-    return data
+    return data, snapshot
 
 
-def _write_scheduler_runtime_state(home: Path, data: dict[str, Any]) -> None:
+def _read_scheduler_runtime_state(
+    home: Path,
+    *,
+    recover_timestamps: bool = False,
+) -> dict[str, Any] | None:
+    state, _snapshot = _read_scheduler_runtime_state_with_snapshot(
+        home,
+        recover_timestamps=recover_timestamps,
+    )
+    return state
+
+
+def _write_scheduler_runtime_state(
+    home: Path,
+    data: dict[str, Any],
+    *,
+    expected_snapshot: ManagedStateFileSnapshot | None = None,
+) -> None:
     path = _scheduler_status_path(home)
     payload = _bounded_json_document(
         data,
@@ -22627,56 +22965,24 @@ def _write_scheduler_runtime_state(home: Path, data: dict[str, Any]) -> None:
         overflow_error="scheduler runtime state exceeds the size limit",
     )
     _ensure_safe_internal_directory(home, path.parent, create=True)
-    parent_fd = _open_directory_beneath(home, path.parent)
-    temporary_name = (
-        f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}-{os.urandom(4).hex()}"
-    )
-    file_fd = -1
-    published = False
-    try:
+    if expected_snapshot is None:
+        parent_fd = _open_directory_beneath(home, path.parent)
         try:
-            current = os.stat(
-                path.name,
-                dir_fd=parent_fd,
-                follow_symlinks=False,
+            expected_snapshot = _read_managed_state_file_snapshot(
+                home,
+                path,
+                parent_fd,
+                maximum_bytes=MAX_SCHEDULER_STATUS_BYTES,
             )
-        except FileNotFoundError:
-            current = None
-        if current is not None and not stat.S_ISREG(current.st_mode):
-            raise SyncError(f"refusing non-file scheduler runtime state: {path}")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        flags |= getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        file_fd = os.open(temporary_name, flags, 0o600, dir_fd=parent_fd)
-        with os.fdopen(file_fd, "wb", closefd=True) as file:
-            file_fd = -1
-            file.write(payload)
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(
-            temporary_name,
-            path.name,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=parent_fd,
-        )
-        published = True
-        os.fsync(parent_fd)
-        snapshot = _read_managed_state_file_snapshot(home, path, parent_fd)
-        if snapshot.payload != payload or snapshot.mode != 0o600:
-            raise SyncError("scheduler runtime state changed during publication")
-    except OSError as error:
-        raise SyncError(f"failed to write scheduler runtime state: {error}") from error
-    finally:
-        if file_fd >= 0:
-            _close_fd_quietly(file_fd)
-        if not published:
-            try:
-                os.unlink(temporary_name, dir_fd=parent_fd)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
-        _close_fd_quietly(parent_fd)
+        finally:
+            _close_fd_quietly(parent_fd)
+    _atomic_write_scheduler_config(
+        path,
+        payload,
+        expected_snapshot=expected_snapshot,
+        mode=0o600,
+        rollback_displaced_conflict=True,
+    )
 
 
 def _scheduler_runtime_payload(
@@ -22827,7 +23133,7 @@ def _begin_scheduler_attempt(
     # and swap boundary. It makes attempt allocation monotonic across processes
     # without holding a global lock during network or installation work.
     with installation_lock(home):
-        previous = _read_scheduler_runtime_state(
+        previous, state_snapshot = _read_scheduler_runtime_state_with_snapshot(
             home,
             recover_timestamps=True,
         )
@@ -22845,6 +23151,7 @@ def _begin_scheduler_attempt(
                 base_repo=base_repo,
                 owner=owner,
             ),
+            expected_snapshot=state_snapshot,
         )
     return attempt
 
@@ -22866,7 +23173,7 @@ def _complete_scheduler_attempt(
     # attempts. A completion from an older overlapping run never replaces the
     # state of the currently recorded attempt.
     with installation_lock(home):
-        current = _read_scheduler_runtime_state(home)
+        current, state_snapshot = _read_scheduler_runtime_state_with_snapshot(home)
         if (
             current is None
             or current.get("last_attempt") != attempt
@@ -22897,6 +23204,7 @@ def _complete_scheduler_attempt(
                 base_repo=base_repo,
                 owner=owner,
             ),
+            expected_snapshot=state_snapshot,
         )
     return True
 

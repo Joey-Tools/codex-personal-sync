@@ -417,7 +417,15 @@ class SchedulerDoctorTests(unittest.TestCase):
                         "systemctl",
                         "--user",
                         "enable",
-                        "--now",
+                        f"{MODULE.SYSTEMD_UNIT}.timer",
+                    ],
+                    dry_run=False,
+                ),
+                mock.call(
+                    [
+                        "systemctl",
+                        "--user",
+                        "start",
                         f"{MODULE.SYSTEMD_UNIT}.timer",
                     ],
                     dry_run=False,
@@ -836,6 +844,403 @@ class SchedulerDoctorTests(unittest.TestCase):
         self.assertEqual(state["last_attempt"], replacement_attempt)
         self.assertIsNone(state["last_success"])
         self.assertEqual(state["release_trees"], {})
+
+    def test_scheduler_runtime_cas_preserves_identity_replacement(self) -> None:
+        attempt = MODULE._begin_scheduler_attempt(
+            self.home,
+            mode="public",
+            repo="owner/public-sync",
+            base_repo="owner/public-sync",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+        status_path = MODULE._scheduler_status_path(self.home)
+        replacement = b"foreign newer scheduler state\n"
+        real_publish = MODULE._atomic_write_scheduler_config
+
+        def replace_before_publish(
+            path: Path,
+            payload: bytes,
+            *,
+            expected_snapshot: MODULE.ManagedStateFileSnapshot | None = None,
+            mode: int = 0o600,
+            gid: int | None = None,
+            rollback_displaced_conflict: bool = False,
+        ) -> None:
+            status_path.unlink()
+            status_path.write_bytes(replacement)
+            status_path.chmod(0o600)
+            real_publish(
+                path,
+                payload,
+                expected_snapshot=expected_snapshot,
+                mode=mode,
+                gid=gid,
+                rollback_displaced_conflict=rollback_displaced_conflict,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_atomic_write_scheduler_config",
+                side_effect=replace_before_publish,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "changed before conditional publication",
+            ),
+        ):
+            MODULE._complete_scheduler_attempt(
+                self.home,
+                attempt=attempt,
+                success=True,
+                failure_reason=None,
+                failure_code=None,
+                mode="public",
+                repo="owner/public-sync",
+                base_repo="owner/public-sync",
+                owner=MODULE.PUBLIC_OWNER,
+            )
+
+        self.assertEqual(status_path.read_bytes(), replacement)
+
+    def test_scheduler_runtime_cas_rolls_back_a_late_identity_replacement(
+        self,
+    ) -> None:
+        attempt = MODULE._begin_scheduler_attempt(
+            self.home,
+            mode="public",
+            repo="owner/public-sync",
+            base_repo="owner/public-sync",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+        status_path = MODULE._scheduler_status_path(self.home)
+        newer = b"foreign state that won the late race\n"
+        real_exchange = MODULE._rename_exchange_at
+        exchange_count = 0
+
+        def replace_live_then_exchange(
+            first_parent_fd: int,
+            first_name: str,
+            second_parent_fd: int,
+            second_name: str,
+        ) -> None:
+            nonlocal exchange_count
+            exchange_count += 1
+            if exchange_count == 1:
+                status_path.unlink()
+                status_path.write_bytes(newer)
+                status_path.chmod(0o600)
+            real_exchange(
+                first_parent_fd,
+                first_name,
+                second_parent_fd,
+                second_name,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_exchange_at",
+                side_effect=replace_live_then_exchange,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "restored the displaced state without overwriting it",
+            ),
+        ):
+            MODULE._complete_scheduler_attempt(
+                self.home,
+                attempt=attempt,
+                success=True,
+                failure_reason=None,
+                failure_code=None,
+                mode="public",
+                repo="owner/public-sync",
+                base_repo="owner/public-sync",
+                owner=MODULE.PUBLIC_OWNER,
+            )
+
+        self.assertEqual(exchange_count, 2)
+        self.assertEqual(status_path.read_bytes(), newer)
+        self.assertEqual(
+            list(status_path.parent.glob(f".{status_path.name}.personal-sync-write-*")),
+            [],
+        )
+
+    def test_scheduler_runtime_cas_retains_recovery_on_rollback_uncertainty(
+        self,
+    ) -> None:
+        attempt = MODULE._begin_scheduler_attempt(
+            self.home,
+            mode="public",
+            repo="owner/public-sync",
+            base_repo="owner/public-sync",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+        status_path = MODULE._scheduler_status_path(self.home)
+        original = status_path.read_bytes()
+        newer = b"foreign state that won the late race\n"
+        real_exchange = MODULE._rename_exchange_at
+        exchange_count = 0
+
+        def fail_rollback_exchange(
+            first_parent_fd: int,
+            first_name: str,
+            second_parent_fd: int,
+            second_name: str,
+        ) -> None:
+            nonlocal exchange_count
+            exchange_count += 1
+            if exchange_count == 1:
+                status_path.unlink()
+                status_path.write_bytes(newer)
+                status_path.chmod(0o600)
+                real_exchange(
+                    first_parent_fd,
+                    first_name,
+                    second_parent_fd,
+                    second_name,
+                )
+                return
+            raise OSError("injected rollback uncertainty")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_exchange_at",
+                side_effect=fail_rollback_exchange,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "recovery evidence is retained",
+            ),
+        ):
+            MODULE._complete_scheduler_attempt(
+                self.home,
+                attempt=attempt,
+                success=True,
+                failure_reason=None,
+                failure_code=None,
+                mode="public",
+                repo="owner/public-sync",
+                base_repo="owner/public-sync",
+                owner=MODULE.PUBLIC_OWNER,
+            )
+
+        self.assertEqual(exchange_count, 2)
+        recovery_paths = list(
+            status_path.parent.glob(
+                f".{status_path.name}.personal-sync-write-*.original"
+            )
+        )
+        self.assertEqual(len(recovery_paths), 1)
+        self.assertEqual(recovery_paths[0].read_bytes(), original)
+        displaced_paths = [
+            candidate
+            for candidate in status_path.parent.glob(
+                f".{status_path.name}.personal-sync-write-*"
+            )
+            if not candidate.name.endswith(".original")
+        ]
+        self.assertEqual(len(displaced_paths), 1)
+        self.assertEqual(displaced_paths[0].read_bytes(), newer)
+
+    def test_scheduler_runtime_cas_rejects_same_inode_content_and_access_drift(
+        self,
+    ) -> None:
+        for drift in ("content", "access"):
+            with self.subTest(drift=drift):
+                case_home = self.home / f"runtime-{drift}"
+                case_home.mkdir()
+                attempt = MODULE._begin_scheduler_attempt(
+                    case_home,
+                    mode="public",
+                    repo="owner/public-sync",
+                    base_repo="owner/public-sync",
+                    owner=MODULE.PUBLIC_OWNER,
+                )
+                status_path = MODULE._scheduler_status_path(case_home)
+                original_identity = (
+                    status_path.stat().st_dev,
+                    status_path.stat().st_ino,
+                )
+                real_publish = MODULE._atomic_write_scheduler_config
+
+                def drift_before_publish(
+                    path: Path,
+                    payload: bytes,
+                    *,
+                    expected_snapshot: (MODULE.ManagedStateFileSnapshot | None) = None,
+                    mode: int = 0o600,
+                    gid: int | None = None,
+                    rollback_displaced_conflict: bool = False,
+                ) -> None:
+                    if drift == "content":
+                        with status_path.open("r+b") as stream:
+                            stream.seek(0)
+                            stream.write(b"foreign same-inode state\n")
+                            stream.truncate()
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                    else:
+                        status_path.chmod(0o640)
+                    real_publish(
+                        path,
+                        payload,
+                        expected_snapshot=expected_snapshot,
+                        mode=mode,
+                        gid=gid,
+                        rollback_displaced_conflict=rollback_displaced_conflict,
+                    )
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_atomic_write_scheduler_config",
+                        side_effect=drift_before_publish,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "changed before conditional publication",
+                    ),
+                ):
+                    MODULE._complete_scheduler_attempt(
+                        case_home,
+                        attempt=attempt,
+                        success=True,
+                        failure_reason=None,
+                        failure_code=None,
+                        mode="public",
+                        repo="owner/public-sync",
+                        base_repo="owner/public-sync",
+                        owner=MODULE.PUBLIC_OWNER,
+                    )
+
+                self.assertEqual(
+                    (
+                        status_path.stat().st_dev,
+                        status_path.stat().st_ino,
+                    ),
+                    original_identity,
+                )
+                if drift == "content":
+                    self.assertEqual(
+                        status_path.read_bytes(),
+                        b"foreign same-inode state\n",
+                    )
+                else:
+                    self.assertEqual(
+                        stat.S_IMODE(status_path.stat().st_mode),
+                        0o640,
+                    )
+
+    def test_scheduler_runtime_cas_preserves_absent_to_appeared_state(
+        self,
+    ) -> None:
+        status_path = MODULE._scheduler_status_path(self.home)
+        appeared = b"foreign concurrently-created scheduler state\n"
+        real_publish = MODULE._atomic_write_scheduler_config
+
+        def appear_before_publish(
+            path: Path,
+            payload: bytes,
+            *,
+            expected_snapshot: MODULE.ManagedStateFileSnapshot | None = None,
+            mode: int = 0o600,
+            gid: int | None = None,
+            rollback_displaced_conflict: bool = False,
+        ) -> None:
+            status_path.write_bytes(appeared)
+            status_path.chmod(0o600)
+            real_publish(
+                path,
+                payload,
+                expected_snapshot=expected_snapshot,
+                mode=mode,
+                gid=gid,
+                rollback_displaced_conflict=rollback_displaced_conflict,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_atomic_write_scheduler_config",
+                side_effect=appear_before_publish,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "changed before conditional publication",
+            ),
+        ):
+            MODULE._begin_scheduler_attempt(
+                self.home,
+                mode="public",
+                repo="owner/public-sync",
+                base_repo="owner/public-sync",
+                owner=MODULE.PUBLIC_OWNER,
+            )
+
+        self.assertEqual(status_path.read_bytes(), appeared)
+
+    def test_scheduler_runtime_cas_allows_mtime_only_transition(self) -> None:
+        attempt = MODULE._begin_scheduler_attempt(
+            self.home,
+            mode="public",
+            repo="owner/public-sync",
+            base_repo="owner/public-sync",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+        status_path = MODULE._scheduler_status_path(self.home)
+        real_publish = MODULE._atomic_write_scheduler_config
+
+        def touch_before_publish(
+            path: Path,
+            payload: bytes,
+            *,
+            expected_snapshot: MODULE.ManagedStateFileSnapshot | None = None,
+            mode: int = 0o600,
+            gid: int | None = None,
+            rollback_displaced_conflict: bool = False,
+        ) -> None:
+            metadata = status_path.stat()
+            os.utime(
+                status_path,
+                ns=(
+                    metadata.st_atime_ns,
+                    metadata.st_mtime_ns + 1_000_000,
+                ),
+            )
+            real_publish(
+                path,
+                payload,
+                expected_snapshot=expected_snapshot,
+                mode=mode,
+                gid=gid,
+                rollback_displaced_conflict=rollback_displaced_conflict,
+            )
+
+        with mock.patch.object(
+            MODULE,
+            "_atomic_write_scheduler_config",
+            side_effect=touch_before_publish,
+        ):
+            completed = MODULE._complete_scheduler_attempt(
+                self.home,
+                attempt=attempt,
+                success=True,
+                failure_reason=None,
+                failure_code=None,
+                mode="public",
+                repo="owner/public-sync",
+                base_repo="owner/public-sync",
+                owner=MODULE.PUBLIC_OWNER,
+            )
+
+        self.assertTrue(completed)
+        state = MODULE._read_scheduler_runtime_state(self.home)
+        assert state is not None
+        self.assertTrue(state["success"])
+        self.assertEqual(state["last_attempt"], attempt)
 
     def test_timestamp_recovery_does_not_accept_unsafe_runtime_file(self) -> None:
         status_path = MODULE._scheduler_status_path(self.home)

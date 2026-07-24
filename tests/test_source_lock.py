@@ -2161,6 +2161,101 @@ class MirrorGeneratorTests(unittest.TestCase):
                     pass
             MIRROR_MODULE._finish_bound_roots(bound_root)
 
+    def test_linked_worktree_rejects_common_commondir_escape_aliases_before_copy(
+        self,
+    ) -> None:
+        linked_root = self.root / "linked-canonical"
+        self._git(
+            self.canonical_root,
+            "worktree",
+            "add",
+            "--detach",
+            str(linked_root),
+            self.source_commit,
+        )
+        common_git = self.canonical_root / ".git"
+        try:
+            for marker_name in ("commondir", "CoMmOnDiR"):
+                with self.subTest(marker_name=marker_name):
+                    marker = common_git / marker_name
+                    marker.write_text("../../escape.git\n", encoding="utf-8")
+                    bound_root = MIRROR_MODULE._bind_root(linked_root)
+                    try:
+                        with (
+                            mock.patch.object(
+                                MIRROR_MODULE,
+                                "_materialize_private_git_control",
+                            ) as materialize,
+                            self.assertRaisesRegex(
+                                MIRROR_MODULE.MirrorSyncError,
+                                "common-directory commondir control file "
+                                "appeared before private Git materialization",
+                            ),
+                        ):
+                            MIRROR_MODULE._ensure_git_control_binding(bound_root)
+                        materialize.assert_not_called()
+                    finally:
+                        marker.unlink(missing_ok=True)
+                        MIRROR_MODULE._finish_bound_roots(bound_root)
+        finally:
+            for marker_name in ("commondir", "CoMmOnDiR"):
+                (common_git / marker_name).unlink(missing_ok=True)
+            self._git(
+                self.canonical_root,
+                "worktree",
+                "remove",
+                "--force",
+                str(linked_root),
+            )
+
+    def test_linked_worktree_revalidates_common_and_private_commondir_aliases(
+        self,
+    ) -> None:
+        linked_root = self.root / "linked-canonical"
+        self._git(
+            self.canonical_root,
+            "worktree",
+            "add",
+            "--detach",
+            str(linked_root),
+            self.source_commit,
+        )
+        common_marker = self.canonical_root / ".git" / "COMMOnDir"
+        bound_root = MIRROR_MODULE._bind_root(linked_root)
+        private_marker: Path | None = None
+        try:
+            MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            assert bound_root.git_control is not None
+
+            common_marker.write_text("../../escape.git\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "common-directory commondir control file appeared",
+            ):
+                MIRROR_MODULE._run_git(bound_root, "rev-parse", "HEAD")
+            common_marker.unlink()
+
+            private_marker = bound_root.git_control.private_path / "COMMOnDir"
+            private_marker.write_text("../../escape.git\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "private Git commondir control file appeared",
+            ):
+                MIRROR_MODULE._run_git(bound_root, "rev-parse", "HEAD")
+            private_marker.unlink()
+        finally:
+            common_marker.unlink(missing_ok=True)
+            if private_marker is not None:
+                private_marker.unlink(missing_ok=True)
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+            self._git(
+                self.canonical_root,
+                "worktree",
+                "remove",
+                "--force",
+                str(linked_root),
+            )
+
     def test_private_tool_root_lock_covers_owner_publication(self) -> None:
         real_create_owner = MIRROR_MODULE._create_owner_record
         observed_lock = False
