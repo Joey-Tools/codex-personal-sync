@@ -114,6 +114,13 @@ superseded_by:
   generation does not create quarantine churn, and exact-capacity recovery
   keeps the active journal as the authoritative blocker instead of moving it
   into an already-full recovery namespace.
+- The final scheduler-uninstall follow-up prebinds the current macOS plist and
+  every legacy plist before the first current `launchctl` action. Native
+  actions and conditional removals revalidate every live binding before and
+  after their mutation boundary, so a legacy appearance or replacement is
+  retained and reported. A definitively missing macOS/Linux scheduler config
+  parent is now a pre-lock idempotent no-op, including `--no-disable`, while
+  unreadable, symlink, and non-directory states remain fail-closed.
 
 ## Validation Evidence
 
@@ -367,6 +374,17 @@ superseded_by:
   transient-history subcases passed in 60.471 seconds. The refreshed
   source-lock SHA-256 is
   `10b8caee52a83c71087b6be971812523feab00358688640e6da8334e3c9de15b`.
+- The final scheduler-uninstall findings follow-up adds five adversarial test
+  methods covering current-action legacy appearance/replacement, removal-time
+  reappearance from both initially absent and removed-present states, explicit
+  missing-parent no-op for macOS/Linux with and without daemon disable,
+  concurrent appearance after the absence observation, and fail-closed
+  unreadable/symlink/non-directory parents. The exact final bytes passed 614
+  personal-sync, reconciliation, retention, scheduler, and automation tests in
+  1196.462 seconds plus all 119 source-lock tests in 2557.828 seconds, for 733
+  disjoint repository tests. The scheduler module independently passed 72
+  tests in 18.833 seconds; the final source-lock SHA-256 is
+  `95e4541724e56b239cea923815ef2c5ccc605ac6f86fb2cf2c0625662fddb505`.
 
 ## Installed Host Baseline
 

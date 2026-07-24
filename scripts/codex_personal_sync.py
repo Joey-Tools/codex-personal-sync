@@ -19790,6 +19790,41 @@ def _scheduler_paths(platform_name: str, home: Path) -> SchedulerPaths:
     raise SyncError(f"unsupported scheduler platform: {platform_name}")
 
 
+def _scheduler_config_parent(paths: SchedulerPaths) -> Path:
+    if paths.platform == "macos":
+        assert paths.launchd_plist is not None
+        return paths.launchd_plist.parent
+    if paths.platform == "linux":
+        assert paths.systemd_service is not None
+        assert paths.systemd_timer is not None
+        if paths.systemd_service.parent != paths.systemd_timer.parent:
+            raise SyncError("systemd scheduler config parents disagree")
+        return paths.systemd_service.parent
+    raise SyncError(f"unsupported scheduler platform: {paths.platform}")
+
+
+def _scheduler_config_parent_is_missing(paths: SchedulerPaths) -> bool:
+    parent = _scheduler_config_parent(paths)
+    user_home = Path.home().expanduser()
+    try:
+        parent.relative_to(user_home)
+    except ValueError as error:
+        raise SyncError(
+            f"scheduler config parent must remain beneath the user home: {parent}"
+        ) from error
+    try:
+        metadata = os.stat(parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    except OSError as error:
+        raise SyncError(
+            f"scheduler config parent is unreadable: {parent}"
+        ) from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise SyncError(f"scheduler config parent is not a directory: {parent}")
+    return False
+
+
 def _read_scheduler_regular_file(path: Path, maximum_bytes: int) -> bytes:
     parent_fd = -1
     file_fd = -1
@@ -20410,11 +20445,26 @@ def _conditionally_remove_bound_scheduler_config(
     binding: SchedulerActivationBinding,
     *,
     boundary: str,
+    related_bindings: tuple[SchedulerActivationBinding, ...] = (),
 ) -> None:
-    _revalidate_launchd_activation_binding(
-        binding,
-        boundary=boundary,
-    )
+    if binding.removed:
+        raise SyncError(
+            f"{binding.description} was already conditionally removed: "
+            f"{binding.path}"
+        )
+    bindings: list[SchedulerActivationBinding] = []
+    seen: set[int] = set()
+    for candidate in (binding, *related_bindings):
+        identity = id(candidate)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        bindings.append(candidate)
+    for candidate in bindings:
+        _revalidate_launchd_activation_binding(
+            candidate,
+            boundary=boundary,
+        )
     if not binding.expected.exists:
         return
     _isolate_and_delete_pending_cleanup_file(
@@ -20424,7 +20474,21 @@ def _conditionally_remove_bound_scheduler_config(
         binding.expected,
         label=binding.description,
     )
+    binding.expected = ManagedStateFileSnapshot(
+        exists=False,
+        parent_identity=binding.expected.parent_identity,
+    )
     binding.removed = True
+    after_boundary = (
+        f"after {boundary.removeprefix('before ')}"
+        if boundary.startswith("before ")
+        else f"after {boundary}"
+    )
+    for candidate in bindings:
+        _revalidate_launchd_activation_binding(
+            candidate,
+            boundary=after_boundary,
+        )
 
 
 def _cleanup_legacy_launchd_schedulers(
@@ -20433,57 +20497,102 @@ def _cleanup_legacy_launchd_schedulers(
     dry_run: bool,
     disable: bool,
     remove: bool,
-    activation_binding: SchedulerActivationBinding | None = None,
+    activation_bindings: tuple[SchedulerActivationBinding, ...] = (),
+    retained_legacy_bindings: tuple[SchedulerActivationBinding, ...] | None = None,
 ) -> None:
     if paths.launchd_plist is None:
         return
     if not remove:
         return
     domain = f"gui/{os.getuid()}"
-    for label in LEGACY_LAUNCHD_LABELS:
+    labels = tuple(LEGACY_LAUNCHD_LABELS)
+
+    def live_bindings(
+        bindings: tuple[SchedulerActivationBinding, ...],
+    ) -> tuple[SchedulerActivationBinding, ...]:
+        live: list[SchedulerActivationBinding] = []
+        seen: set[int] = set()
+        for binding in bindings:
+            identity = id(binding)
+            if identity in seen:
+                raise SyncError(
+                    "legacy scheduler cleanup received duplicate file bindings"
+                )
+            seen.add(identity)
+            live.append(binding)
+        return tuple(live)
+
+    def cleanup_one(
+        label: str,
+        legacy_plist: Path,
+        legacy_binding: SchedulerActivationBinding | None,
+        complete_bindings: tuple[SchedulerActivationBinding, ...],
+    ) -> None:
+        if disable:
+            _run_native_scheduler_action(
+                ["launchctl", "bootout", domain, str(legacy_plist)],
+                dry_run=dry_run,
+                allow_fail=True,
+                activation_bindings=live_bindings(complete_bindings),
+            )
+            _run_native_scheduler_action(
+                ["launchctl", "disable", f"{domain}/{label}"],
+                dry_run=dry_run,
+                allow_fail=True,
+                activation_bindings=live_bindings(complete_bindings),
+            )
+        if dry_run:
+            _unlink_file(legacy_plist, dry_run=True)
+            return
+        if legacy_binding is None:
+            return
+        _conditionally_remove_bound_scheduler_config(
+            legacy_binding,
+            boundary="before conditional legacy removal",
+            related_bindings=complete_bindings,
+        )
+
+    if retained_legacy_bindings is not None:
+        if dry_run:
+            raise SyncError("dry-run cannot consume retained legacy bindings")
+        if len(retained_legacy_bindings) != len(labels):
+            raise SyncError("retained legacy scheduler binding count changed")
+        activation_ids = {id(binding) for binding in activation_bindings}
+        for label, legacy_binding in zip(labels, retained_legacy_bindings):
+            legacy_plist = _legacy_launchd_plist(paths, label)
+            if (
+                legacy_binding.path != legacy_plist
+                or id(legacy_binding) not in activation_ids
+            ):
+                raise SyncError(
+                    f"retained legacy scheduler binding changed: {legacy_plist}"
+                )
+            cleanup_one(
+                label,
+                legacy_plist,
+                legacy_binding,
+                activation_bindings,
+            )
+        return
+
+    for label in labels:
         legacy_plist = _legacy_launchd_plist(paths, label)
         legacy_snapshot = _scheduler_config_snapshot(legacy_plist)
 
-        def cleanup_one(
-            legacy_binding: SchedulerActivationBinding | None,
-        ) -> None:
-            bindings = tuple(
-                binding
-                for binding in (activation_binding, legacy_binding)
-                if binding is not None
-            )
-            if disable:
-                _run_native_scheduler_action(
-                    ["launchctl", "bootout", domain, str(legacy_plist)],
-                    dry_run=dry_run,
-                    allow_fail=True,
-                    activation_bindings=bindings,
-                )
-                _run_native_scheduler_action(
-                    ["launchctl", "disable", f"{domain}/{label}"],
-                    dry_run=dry_run,
-                    allow_fail=True,
-                    activation_bindings=bindings,
-                )
-            if dry_run:
-                _unlink_file(legacy_plist, dry_run=True)
-                return
-            if legacy_binding is None:
-                return
-            _conditionally_remove_bound_scheduler_config(
-                legacy_binding,
-                boundary="before conditional legacy removal",
-            )
-
         if dry_run:
-            cleanup_one(None)
+            cleanup_one(label, legacy_plist, None, ())
             continue
         with _retain_launchd_activation_binding(
             legacy_plist,
             legacy_snapshot,
             description=f"legacy launchd scheduler {label}",
         ) as legacy_binding:
-            cleanup_one(legacy_binding)
+            cleanup_one(
+                label,
+                legacy_plist,
+                legacy_binding,
+                (*activation_bindings, legacy_binding),
+            )
 
 
 def _scheduler_log_dir(home: Path) -> Path:
@@ -20763,7 +20872,11 @@ def _revalidate_launchd_activation_binding(
             raise _launchd_activation_failure(
                 binding,
                 boundary,
-                "appeared after initial absence",
+                (
+                    "reappeared after conditional removal"
+                    if binding.removed
+                    else "appeared after initial absence"
+                ),
             )
         try:
             final_parent_identity = _directory_identity(binding.parent_fd)
@@ -21000,11 +21113,10 @@ def _retain_launchd_activation_binding(
             boundary="before activation",
         )
         yield binding
-        if not binding.removed:
-            _revalidate_launchd_activation_binding(
-                binding,
-                boundary="after activation",
-            )
+        _revalidate_launchd_activation_binding(
+            binding,
+            boundary="after activation",
+        )
     finally:
         if file_fd >= 0:
             _close_fd_quietly(file_fd)
@@ -22788,7 +22900,9 @@ def _install_scheduler_transaction(
                 dry_run=dry_run,
                 disable=enable,
                 remove=enable,
-                activation_binding=binding,
+                activation_bindings=(
+                    (binding,) if binding is not None else ()
+                ),
             )
             if enable:
                 domain = f"gui/{os.getuid()}"
@@ -23040,6 +23154,12 @@ def uninstall_scheduler(
             disable=disable,
         )
         return
+    if _scheduler_config_parent_is_missing(paths):
+        print(
+            f"{selected_platform} scheduler already absent; "
+            f"config parent is missing: {_scheduler_config_parent(paths)}"
+        )
+        return
     with installation_lock(home):
         _uninstall_scheduler_transaction(
             home,
@@ -23059,12 +23179,36 @@ def _uninstall_scheduler_transaction(
     disable: bool,
 ) -> None:
     _recover_scheduler_pair_transaction(paths, dry_run=dry_run)
+    if not dry_run and _scheduler_config_parent_is_missing(paths):
+        print(
+            f"{selected_platform} scheduler already absent; "
+            f"config parent is missing: {_scheduler_config_parent(paths)}"
+        )
+        return
     if selected_platform == "macos":
         assert paths.launchd_plist is not None
-        snapshot = _scheduler_config_snapshot(paths.launchd_plist)
+        binding_specs = (
+            (
+                paths.launchd_plist,
+                "macOS launchd scheduler config",
+            ),
+            *(
+                (
+                    _legacy_launchd_plist(paths, label),
+                    f"legacy launchd scheduler {label}",
+                )
+                for label in LEGACY_LAUNCHD_LABELS
+            ),
+        )
+        snapshots = tuple(
+            _scheduler_config_snapshot(path)
+            for path, _description in binding_specs
+        )
 
         def uninstall_macos(
             binding: SchedulerActivationBinding | None,
+            bindings: tuple[SchedulerActivationBinding, ...],
+            legacy_bindings: tuple[SchedulerActivationBinding, ...] | None,
         ) -> None:
             if disable:
                 domain = f"gui/{os.getuid()}"
@@ -23072,20 +23216,21 @@ def _uninstall_scheduler_transaction(
                     ["launchctl", "bootout", domain, str(paths.launchd_plist)],
                     dry_run=dry_run,
                     allow_fail=True,
-                    activation_binding=binding,
+                    activation_bindings=bindings,
                 )
                 _run_native_scheduler_action(
                     ["launchctl", "disable", f"{domain}/{LAUNCHD_LABEL}"],
                     dry_run=dry_run,
                     allow_fail=True,
-                    activation_binding=binding,
+                    activation_bindings=bindings,
                 )
             _cleanup_legacy_launchd_schedulers(
                 paths,
                 dry_run=dry_run,
                 disable=disable,
                 remove=True,
-                activation_binding=binding,
+                activation_bindings=bindings,
+                retained_legacy_bindings=legacy_bindings,
             )
             if dry_run:
                 _unlink_file(paths.launchd_plist, dry_run=True)
@@ -23094,17 +23239,31 @@ def _uninstall_scheduler_transaction(
                 _conditionally_remove_bound_scheduler_config(
                     binding,
                     boundary="before conditional scheduler removal",
+                    related_bindings=bindings,
                 )
 
         if dry_run:
-            uninstall_macos(None)
+            uninstall_macos(None, (), None)
         else:
-            with _retain_launchd_activation_binding(
-                paths.launchd_plist,
-                snapshot,
-                description="macOS launchd scheduler config",
-            ) as binding:
-                uninstall_macos(binding)
+            with contextlib.ExitStack() as stack:
+                bindings = tuple(
+                    stack.enter_context(
+                        _retain_launchd_activation_binding(
+                            path,
+                            snapshot,
+                            description=description,
+                        )
+                    )
+                    for (path, description), snapshot in zip(
+                        binding_specs,
+                        snapshots,
+                    )
+                )
+                uninstall_macos(
+                    bindings[0],
+                    bindings,
+                    bindings[1:],
+                )
         print(f"removed macOS launchd scheduler: {paths.launchd_plist}")
         return
 
@@ -23140,10 +23299,12 @@ def _uninstall_scheduler_transaction(
                 _conditionally_remove_bound_scheduler_config(
                     timer_binding,
                     boundary="before conditional scheduler timer removal",
+                    related_bindings=bindings,
                 )
                 _conditionally_remove_bound_scheduler_config(
                     service_binding,
                     boundary="before conditional scheduler service removal",
+                    related_bindings=bindings,
                 )
             _report_preserved_systemd_drop_ins(paths)
             if disable:
