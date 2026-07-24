@@ -207,6 +207,29 @@ superseded_by:
   and subsequent recovery-evidence races; the current candidate closes those
   findings. This is pre-commit design evidence, not the required post-commit
   named review.
+- A later named-single pass found that toolbox automation derived its complete
+  managed-path allowlist only from `master`, so a second unmerged canonical
+  rename/removal could reject the prior generated branch path. Preparation now
+  validates `managed-paths` independently on the exact target base and exact
+  fetched branch receipt, then admits only their sorted union. A real
+  bare-remote fixture exercises `one -> two -> three -> removed` without
+  merging `master` and still rejects an unrelated committed branch path.
+- The same follow-up replaces the final unguarded sync-branch push with an
+  exact ref lease. Existing branches require proof that the desired commit
+  descends from the prepared SHA and use
+  `--force-with-lease=<ref>:<prepared-sha>`; first publication uses the exact
+  absent-ref lease, and the refspec binds the exact desired OID rather than
+  moving `HEAD`. Focused race fixtures cover deletion, rollback,
+  appearance, movement to the desired SHA, malformed duplicate ref evidence,
+  and non-descendant heads.
+- The final source-lock suite passed 105 tests in 966.119 seconds. The complete
+  workflow suite passed 17 tests in 235.479 seconds before the final
+  exact-desired-OID refspec tightening; after that tightening, the static and
+  lease-race tests passed 2 tests in 5.164 seconds, while the unchanged
+  rename/removal fixture had already passed after formatting in 210.925
+  seconds. One additional full-suite run under concurrent source-lock load hit
+  only the fixture's former 30-second subprocess timeout, so the fixture now
+  retains explicit 90-second generator and 120-second prepare ceilings.
 
 ## Installed Host Baseline
 

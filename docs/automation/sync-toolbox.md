@@ -35,18 +35,27 @@ administrators must provision and rotate the secret outside this workflow.
   supplies `--target-root`, `--mirror toolbox`, and the exact
   `--source-commit`, then runs `check` against the same target.
 - The fixed target branch is `automation/canonical-personal-sync`. Updates use
-  ordinary merge/fast-forward history and a normal push; there is no force
-  push. Branch discovery accepts only zero records or one exact lowercase
-  40-hex SHA plus the requested full ref. A fetched tracking ref must equal
-  that prepared SHA before the branch is used.
+  ordinary merge/fast-forward history. Publication uses an exact
+  `--force-with-lease=<ref>:<prepared-sha>` compare-and-swap after proving the
+  desired commit descends from that prepared SHA. The refspec names the exact
+  desired commit OID instead of a moving local `HEAD`. First publication uses
+  the exact absent-ref lease `<ref>:`. Branch discovery accepts only zero
+  records or one exact lowercase 40-hex SHA plus the requested full ref. A
+  fetched tracking ref must equal that prepared SHA before the branch is used.
 - Before switching to the automation branch, the target is detached at the
-  freshly fetched target-base SHA. The canonical `managed-paths` command then
-  validates the prior committed receipt and returns the exact allowlist:
-  current toolbox targets, the receipt, and any clean receipt-bound paths that
-  the new mapping retires. The prior receipt must byte-match a deterministic
-  reconstruction from its reachable canonical source-lock commit. Receipt
-  digests plus target `HEAD`/stage-0 index/worktree parity must all agree; a
-  consumer edit or forged/inconsistent receipt fails before generation.
+  freshly fetched target-base SHA. The canonical `managed-paths` command first
+  validates that base's prior committed receipt. When an automation branch
+  exists, the workflow fetches its exact prepared SHA, switches to it, and runs
+  `managed-paths` again before inspecting its diff. Only the sorted union of
+  those two independently proven lists becomes the allowlist: current toolbox
+  targets, the receipt, and clean receipt-bound paths from the base or unmerged
+  generated branch that the new mapping retires. Each prior receipt must
+  byte-match a deterministic reconstruction from its reachable canonical
+  source-lock commit. Receipt digests plus target `HEAD`/stage-0
+  index/worktree parity must all agree; a consumer edit, arbitrary branch path,
+  or forged/inconsistent receipt fails before generation. This preserves
+  consecutive rename/removal runs on one not-yet-merged sync PR without
+  trusting arbitrary branch history.
 - Existing branch history, working-tree changes, staged changes, and final PR
   diff are restricted to that generated allowlist. This permits an exact
   canonical rename/removal while preventing the workflow from staging an
@@ -79,7 +88,10 @@ administrators must provision and rotate the secret outside this workflow.
 - The target `master` SHA and live sync-branch SHA are checked again before
   push. The push is skipped safely if another actor already published the
   exact desired SHA; every other base or branch drift fails without an
-  overwrite. The post-push remote SHA must equal the generated commit.
+  overwrite. The exact lease makes a deletion, rollback, appearance, or drift
+  between the final `ls-remote` and push fail at the server even when the
+  racing ref happens to land on the desired SHA. The post-push remote SHA must
+  equal the generated commit.
 
 ## Limitations
 

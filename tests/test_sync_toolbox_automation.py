@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -191,7 +192,7 @@ class SyncToolboxAutomationTests(unittest.TestCase):
             self._step_run("Verify canonical master and source lock"),
         )
 
-    def test_branch_push_and_pr_are_scoped_without_force_or_master_write(
+    def test_branch_push_and_pr_use_exact_lease_without_master_write(
         self,
     ) -> None:
         self.assertIn(
@@ -199,7 +200,7 @@ class SyncToolboxAutomationTests(unittest.TestCase):
             self.workflow,
         )
         self.assertIn(
-            '"HEAD:refs/heads/${SYNC_BRANCH}"',
+            '"${DESIRED_HEAD_SHA}:refs/heads/${SYNC_BRANCH}"',
             self.workflow,
         )
         self.assertIn(
@@ -210,7 +211,16 @@ class SyncToolboxAutomationTests(unittest.TestCase):
             'GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${basic_token}"',
             self.workflow,
         )
-        self.assertNotRegex(self.workflow, r"(?m)^\s+.*git .*push .*--force")
+        self.assertIn(
+            '"--force-with-lease=refs/heads/${SYNC_BRANCH}:'
+            '${PREPARED_REMOTE_BRANCH_SHA}"',
+            self.workflow,
+        )
+        self.assertIn(
+            '"--force-with-lease=refs/heads/${SYNC_BRANCH}:"',
+            self.workflow,
+        )
+        self.assertNotIn("--force-if-includes", self.workflow)
         self.assertNotRegex(
             self.workflow,
             r"(?m)^\s+.*git .*push .*refs/heads/master",
@@ -233,15 +243,24 @@ class SyncToolboxAutomationTests(unittest.TestCase):
             '  "refs/remotes/origin/${TARGET_BASE}"'
         )
         managed_paths = (
-            'sync_canonical_mirrors.py" \\\n'
-            "  managed-paths \\\n"
-            '  --target-root "${TARGET_ROOT}" \\\n'
-            '  --mirror "${MIRROR_NAME}" >"${allowed_paths_file}"'
+            'require_managed_paths \\\n  "The target base" "${base_allowed_paths_file}"'
         )
         self.assertIn(detached_base, prepare)
         self.assertIn(managed_paths, prepare)
         self.assertLess(prepare.index(detached_base), prepare.index(managed_paths))
         self.assertLess(prepare.index(managed_paths), prepare.index("remote_branch="))
+        self.assertGreaterEqual(prepare.count("require_managed_paths"), 3)
+        self.assertIn('"${base_allowed_paths_file}"', prepare)
+        self.assertIn('"${branch_allowed_paths_file}"', prepare)
+        self.assertIn("add | unique | sort", prepare)
+        self.assertLess(
+            prepare.index(
+                'require_managed_paths \\\n    "The existing generated branch"'
+            ),
+            prepare.index(
+                'assert_allowed_paths \\\n    "The existing generated branch"'
+            ),
+        )
         self.assertIn(
             "jq -j '.[] | ., \"\\u0000\"'",
             self.workflow,
@@ -278,6 +297,14 @@ class SyncToolboxAutomationTests(unittest.TestCase):
         )
         self.assertIn(
             '"${REMOTE_REF_SHA}" == "${DESIRED_HEAD_SHA}"',
+            push,
+        )
+        self.assertIn(
+            'git -C "${TARGET_ROOT}" merge-base --is-ancestor',
+            push,
+        )
+        self.assertIn(
+            'git -C "${TARGET_ROOT}" rev-parse --verify',
             push,
         )
 
@@ -1311,7 +1338,413 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                             outputs,
                         )
 
-    def test_push_revalidates_remote_state_without_force(self) -> None:
+    def test_prepare_recovers_consecutive_unmerged_rename_and_removal_scope(
+        self,
+    ) -> None:
+        jq = shutil.which("jq")
+        python = shutil.which("python3")
+        if jq is None or python is None:
+            self.skipTest("jq and python3 are required")
+
+        with tempfile.TemporaryDirectory(
+            prefix="sync-toolbox-branch-receipt."
+        ) as temporary_directory:
+            root = Path(temporary_directory)
+            canonical_root = root / "canonical"
+            seed_root = root / "seed"
+            remote_root = root / "toolbox.git"
+            fake_bin = root / "bin"
+            fixture_home = root / "home"
+            canonical_root.mkdir()
+            seed_root.mkdir()
+            fake_bin.mkdir()
+            fixture_home.mkdir()
+
+            def run_git(
+                repository: Path,
+                *arguments: str,
+                environment: dict[str, str] | None = None,
+            ) -> str:
+                completed = subprocess.run(
+                    ["git", "-C", str(repository), *arguments],
+                    cwd=REPOSITORY_ROOT,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=90,
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    completed.stdout + completed.stderr,
+                )
+                return completed.stdout.strip()
+
+            def initialize_repository(repository: Path) -> None:
+                run_git(repository, "init", "-q", "-b", "master")
+                run_git(repository, "config", "user.name", "Sync Fixture")
+                run_git(
+                    repository,
+                    "config",
+                    "user.email",
+                    "sync-fixture@example.invalid",
+                )
+                run_git(repository, "config", "commit.gpgsign", "false")
+
+            def commit_all(repository: Path, message: str) -> str:
+                run_git(repository, "add", "-A")
+                run_git(
+                    repository,
+                    "commit",
+                    "--no-gpg-sign",
+                    "-q",
+                    "-m",
+                    message,
+                )
+                return run_git(repository, "rev-parse", "HEAD")
+
+            initialize_repository(canonical_root)
+            initialize_repository(seed_root)
+            subprocess.run(
+                ["git", "init", "--bare", "-q", str(remote_root)],
+                cwd=REPOSITORY_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            canonical_scripts = canonical_root / "scripts"
+            canonical_scripts.mkdir()
+            shutil.copy2(
+                REPOSITORY_ROOT / "scripts" / "sync_canonical_mirrors.py",
+                canonical_scripts / "sync_canonical_mirrors.py",
+            )
+            (canonical_scripts / "sync_canonical_mirrors.py").chmod(0o755)
+            (canonical_root / "AGENTS.md").write_text(
+                "# Fixture rules\n",
+                encoding="utf-8",
+            )
+            anchor_source = canonical_scripts / "anchor.py"
+            engine_source = canonical_scripts / "engine.py"
+            anchor_source.write_text("anchor = True\n", encoding="utf-8")
+            engine_source.write_text("engine = True\n", encoding="utf-8")
+
+            lock_path = canonical_root / "sync-source-lock.json"
+
+            def write_lock(engine_target: str | None) -> None:
+                files = {"anchor": "mirror/anchor.py"}
+                if engine_target is not None:
+                    files["engine"] = engine_target
+                payload = {
+                    "version": 1,
+                    "hash_algorithm": "sha256",
+                    "canonical_repository": ("Joey-Tools/codex-personal-sync"),
+                    "sources": {
+                        "anchor": {
+                            "path": "scripts/anchor.py",
+                            "sha256": hashlib.sha256(
+                                anchor_source.read_bytes()
+                            ).hexdigest(),
+                            "mode": "0644",
+                        },
+                        "engine": {
+                            "path": "scripts/engine.py",
+                            "sha256": hashlib.sha256(
+                                engine_source.read_bytes()
+                            ).hexdigest(),
+                            "mode": "0644",
+                        },
+                    },
+                    "mirrors": {
+                        "toolbox": {
+                            "repository": "Joey-Tools/codex-toolbox",
+                            "files": files,
+                        }
+                    },
+                }
+                lock_path.write_text(
+                    json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+
+            def generate(target_root: Path, source_commit: str) -> None:
+                completed = subprocess.run(
+                    [
+                        python,
+                        str(canonical_scripts / "sync_canonical_mirrors.py"),
+                        "generate",
+                        "--target-root",
+                        str(target_root),
+                        "--mirror",
+                        "toolbox",
+                        "--source-commit",
+                        source_commit,
+                    ],
+                    cwd=REPOSITORY_ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=90,
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    completed.stdout + completed.stderr,
+                )
+
+            write_lock("mirror/one.py")
+            first_canonical = commit_all(
+                canonical_root,
+                "canonical one",
+            )
+            run_git(
+                canonical_root,
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Joey-Tools/codex-personal-sync.git",
+            )
+            (seed_root / "README.md").write_text(
+                "# Toolbox fixture\n",
+                encoding="utf-8",
+            )
+            commit_all(seed_root, "toolbox seed")
+            run_git(
+                seed_root,
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Joey-Tools/codex-toolbox.git",
+            )
+            generate(seed_root, first_canonical)
+            commit_all(seed_root, "generated one")
+            run_git(
+                seed_root,
+                "push",
+                str(remote_root),
+                "HEAD:refs/heads/master",
+            )
+
+            run_git(
+                seed_root,
+                "switch",
+                "-q",
+                "-c",
+                "automation/canonical-personal-sync",
+            )
+            write_lock("mirror/two.py")
+            second_canonical = commit_all(
+                canonical_root,
+                "canonical two",
+            )
+            generate(seed_root, second_canonical)
+            commit_all(seed_root, "generated two")
+            run_git(
+                seed_root,
+                "push",
+                str(remote_root),
+                "HEAD:refs/heads/automation/canonical-personal-sync",
+            )
+
+            base64 = fake_bin / "base64"
+            base64.write_text("#!/bin/sh\ncat\n", encoding="utf-8")
+            base64.chmod(0o755)
+            fixture_config = fixture_home / ".gitconfig"
+            fixture_config.write_text(
+                (
+                    '[url "file://'
+                    f'{remote_root.as_posix()}"]\n'
+                    "  insteadOf = "
+                    "https://github.com/Joey-Tools/codex-toolbox.git\n"
+                    '[protocol "file"]\n'
+                    "  allow = always\n"
+                ),
+                encoding="utf-8",
+            )
+            workflow_path = os.pathsep.join(
+                [
+                    str(fake_bin),
+                    str(Path(jq).parent),
+                    str(Path(python).parent),
+                    os.environ.get("PATH", ""),
+                ]
+            )
+
+            def run_prepare(
+                target_root: Path,
+                runner_temp: Path,
+                *,
+                expect_success: bool,
+            ) -> subprocess.CompletedProcess[str]:
+                runner_temp.mkdir()
+                github_output = runner_temp / "github-output"
+                environment = {
+                    **os.environ,
+                    "CANONICAL_ROOT": str(canonical_root),
+                    "CODEX_TOOLBOX_SYNC_TOKEN": SYNTHETIC_ACCESS_TOKEN,
+                    "GITHUB_OUTPUT": str(github_output),
+                    "HOME": str(fixture_home),
+                    "MIRROR_NAME": "toolbox",
+                    "PATH": workflow_path,
+                    "RUNNER_TEMP": str(runner_temp),
+                    "SYNC_BRANCH": "automation/canonical-personal-sync",
+                    "TARGET_BASE": "master",
+                    "TARGET_OWNER": "Joey-Tools",
+                    "TARGET_REPOSITORY": "Joey-Tools/codex-toolbox",
+                    "TARGET_ROOT": str(target_root),
+                }
+                completed = subprocess.run(
+                    [
+                        "/bin/bash",
+                        "-euo",
+                        "pipefail",
+                        "-c",
+                        self._step_run("Prepare scoped sync branch"),
+                    ],
+                    cwd=REPOSITORY_ROOT,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=120,
+                )
+                if expect_success:
+                    self.assertEqual(
+                        completed.returncode,
+                        0,
+                        completed.stdout + completed.stderr,
+                    )
+                else:
+                    self.assertNotEqual(completed.returncode, 0)
+                return completed
+
+            def clone_master(destination: Path) -> None:
+                subprocess.run(
+                    [
+                        "git",
+                        "clone",
+                        "-q",
+                        "--branch",
+                        "master",
+                        str(remote_root),
+                        str(destination),
+                    ],
+                    cwd=REPOSITORY_ROOT,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                run_git(
+                    destination,
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://github.com/Joey-Tools/codex-toolbox.git",
+                )
+                run_git(destination, "config", "user.name", "Sync Fixture")
+                run_git(
+                    destination,
+                    "config",
+                    "user.email",
+                    "sync-fixture@example.invalid",
+                )
+                run_git(destination, "config", "commit.gpgsign", "false")
+
+            write_lock("mirror/three.py")
+            third_canonical = commit_all(
+                canonical_root,
+                "canonical three",
+            )
+            rename_runner = root / "rename-runner"
+            clone_master(rename_runner)
+            rename_temp = root / "rename-temp"
+            run_prepare(rename_runner, rename_temp, expect_success=True)
+            self.assertEqual(
+                json.loads(
+                    (rename_temp / "toolbox-sync-allowed-paths.json").read_text(
+                        encoding="utf-8"
+                    )
+                ),
+                [
+                    "generated-sync-source-lock.json",
+                    "mirror/anchor.py",
+                    "mirror/one.py",
+                    "mirror/three.py",
+                    "mirror/two.py",
+                ],
+            )
+            generate(rename_runner, third_canonical)
+            commit_all(rename_runner, "generated three")
+            run_git(
+                rename_runner,
+                "push",
+                str(remote_root),
+                "HEAD:refs/heads/automation/canonical-personal-sync",
+            )
+
+            write_lock(None)
+            fourth_canonical = commit_all(
+                canonical_root,
+                "canonical removal",
+            )
+            removal_runner = root / "removal-runner"
+            clone_master(removal_runner)
+            removal_temp = root / "removal-temp"
+            run_prepare(removal_runner, removal_temp, expect_success=True)
+            self.assertEqual(
+                json.loads(
+                    (removal_temp / "toolbox-sync-allowed-paths.json").read_text(
+                        encoding="utf-8"
+                    )
+                ),
+                [
+                    "generated-sync-source-lock.json",
+                    "mirror/anchor.py",
+                    "mirror/one.py",
+                    "mirror/three.py",
+                ],
+            )
+            generate(removal_runner, fourth_canonical)
+            commit_all(removal_runner, "remove generated engine")
+            self.assertFalse((removal_runner / "mirror" / "three.py").exists())
+            run_git(
+                removal_runner,
+                "push",
+                str(remote_root),
+                "HEAD:refs/heads/automation/canonical-personal-sync",
+            )
+
+            (removal_runner / "unrelated.txt").write_text(
+                "unowned branch drift\n",
+                encoding="utf-8",
+            )
+            commit_all(removal_runner, "inject unrelated branch drift")
+            run_git(
+                removal_runner,
+                "push",
+                str(remote_root),
+                "HEAD:refs/heads/automation/canonical-personal-sync",
+            )
+            drift_runner = root / "drift-runner"
+            clone_master(drift_runner)
+            drift = run_prepare(
+                drift_runner,
+                root / "drift-temp",
+                expect_success=False,
+            )
+            self.assertIn(
+                "Out-of-scope toolbox branch",
+                drift.stdout + drift.stderr,
+            )
+            self.assertIn(
+                "unrelated.txt",
+                drift.stdout + drift.stderr,
+            )
+
+    def test_push_uses_exact_lease_and_rejects_pre_push_ref_races(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="sync-toolbox-push-remote."
         ) as temporary_directory:
@@ -1329,17 +1762,50 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                 "with log.open('a', encoding='utf-8') as stream:\n"
                 "    stream.write(' '.join(args) + '\\n')\n"
                 "state = Path(os.environ['REMOTE_BRANCH_STATE'])\n"
+                "absent = 'absent'\n"
                 "if 'ls-remote' in args:\n"
                 "    reference = args[-1]\n"
                 "    if reference.endswith('/master'):\n"
                 "        print(f\"{os.environ['BASE_SHA']}\\t{reference}\")\n"
                 "    else:\n"
                 "        value = state.read_text(encoding='ascii')\n"
-                "        if value != 'absent':\n"
+                "        if value != absent:\n"
                 "            if os.environ.get('DUPLICATE_BRANCH') == '1':\n"
                 "                print(f'{value}\\t{reference}')\n"
                 "            print(f'{value}\\t{reference}')\n"
+                "elif 'rev-parse' in args and '--verify' in args:\n"
+                "    print(os.environ['DESIRED_HEAD_SHA'])\n"
+                "elif 'merge-base' in args and '--is-ancestor' in args:\n"
+                "    if os.environ.get('DESIRED_IS_DESCENDANT') != '1':\n"
+                "        raise SystemExit(1)\n"
                 "elif 'push' in args:\n"
+                "    race = os.environ.get('RACE_BEFORE_PUSH', 'none')\n"
+                "    race_marker = Path(os.environ['RACE_MARKER'])\n"
+                "    if race != 'none' and not race_marker.exists():\n"
+                "        if race == 'delete':\n"
+                "            state.write_text(absent, encoding='ascii')\n"
+                "        elif race in {'rollback', 'appear'}:\n"
+                "            state.write_text(os.environ['RACE_SHA'], encoding='ascii')\n"
+                "        elif race == 'desired':\n"
+                "            state.write_text(os.environ['DESIRED_HEAD_SHA'], encoding='ascii')\n"
+                "        else:\n"
+                "            raise SystemExit(f'unknown race: {race}')\n"
+                "        race_marker.write_text('applied', encoding='ascii')\n"
+                "    leases = [\n"
+                "        item for item in args\n"
+                "        if item.startswith('--force-with-lease=')\n"
+                "    ]\n"
+                "    if len(leases) != 1:\n"
+                "        raise SystemExit('missing exact lease')\n"
+                "    lease = leases[0].split('=', 1)[1]\n"
+                "    reference, expected = lease.rsplit(':', 1)\n"
+                "    if reference != f\"refs/heads/{os.environ['SYNC_BRANCH']}\":\n"
+                "        raise SystemExit('wrong leased ref')\n"
+                "    observed = state.read_text(encoding='ascii')\n"
+                "    if (expected == '' and observed != absent) or (\n"
+                "        expected != '' and observed != expected\n"
+                "    ):\n"
+                "        raise SystemExit('stale lease')\n"
                 "    state.write_text(os.environ['DESIRED_HEAD_SHA'], encoding='ascii')\n",
                 encoding="utf-8",
             )
@@ -1351,93 +1817,140 @@ class SyncToolboxAutomationTests(unittest.TestCase):
             base_sha = "1" * 40
             prepared_sha = "2" * 40
             desired_sha = "3" * 40
-            cases = (
-                (
-                    "matching prepared state",
-                    prepared_sha,
-                    "true",
-                    prepared_sha,
-                    "0",
-                    0,
-                    True,
-                    "",
-                ),
-                (
-                    "same desired no-op",
-                    desired_sha,
-                    "true",
-                    prepared_sha,
-                    "0",
-                    0,
-                    False,
-                    "already points",
-                ),
-                (
-                    "absent branch creation",
-                    "absent",
-                    "false",
-                    "",
-                    "0",
-                    0,
-                    True,
-                    "",
-                ),
-                (
-                    "remote drift",
-                    "4" * 40,
-                    "true",
-                    prepared_sha,
-                    "0",
-                    1,
-                    False,
-                    "Sync branch advanced",
-                ),
-                (
-                    "branch appeared",
-                    "4" * 40,
-                    "false",
-                    "",
-                    "0",
-                    1,
-                    False,
-                    "Sync branch appeared",
-                ),
-                (
-                    "duplicate branch records",
-                    prepared_sha,
-                    "true",
-                    prepared_sha,
-                    "1",
-                    1,
-                    False,
-                    "Ambiguous remote ref",
-                ),
+            drift_sha = "4" * 40
+            existing_lease = (
+                "--force-with-lease=refs/heads/"
+                f"automation/canonical-personal-sync:{prepared_sha}"
             )
-            for (
-                name,
-                live_sha,
-                prepared_present,
-                prepared_value,
-                duplicate,
-                expected_failure,
-                should_push,
-                expected_message,
-            ) in cases:
+            absent_lease = (
+                "--force-with-lease=refs/heads/automation/canonical-personal-sync:"
+            )
+            cases = (
+                {
+                    "name": "matching prepared state",
+                    "live_sha": prepared_sha,
+                    "prepared_present": "true",
+                    "prepared_value": prepared_sha,
+                    "expected_final": desired_sha,
+                    "expected_lease": existing_lease,
+                },
+                {
+                    "name": "same desired no-op",
+                    "live_sha": desired_sha,
+                    "prepared_present": "true",
+                    "prepared_value": prepared_sha,
+                    "expected_final": desired_sha,
+                    "message": "already points",
+                },
+                {
+                    "name": "absent branch creation",
+                    "live_sha": "absent",
+                    "prepared_present": "false",
+                    "prepared_value": "",
+                    "expected_final": desired_sha,
+                    "expected_lease": absent_lease,
+                },
+                {
+                    "name": "remote drift before push preflight",
+                    "live_sha": drift_sha,
+                    "prepared_present": "true",
+                    "prepared_value": prepared_sha,
+                    "expected_failure": True,
+                    "expected_final": drift_sha,
+                    "message": "Sync branch advanced",
+                },
+                {
+                    "name": "branch appeared before push preflight",
+                    "live_sha": drift_sha,
+                    "prepared_present": "false",
+                    "prepared_value": "",
+                    "expected_failure": True,
+                    "expected_final": drift_sha,
+                    "message": "Sync branch appeared",
+                },
+                {
+                    "name": "duplicate branch records",
+                    "live_sha": prepared_sha,
+                    "prepared_present": "true",
+                    "prepared_value": prepared_sha,
+                    "duplicate": "1",
+                    "expected_failure": True,
+                    "expected_final": prepared_sha,
+                    "message": "Ambiguous remote ref",
+                },
+                {
+                    "name": "non-descendant generated head",
+                    "live_sha": prepared_sha,
+                    "prepared_present": "true",
+                    "prepared_value": prepared_sha,
+                    "descendant": "0",
+                    "expected_failure": True,
+                    "expected_final": prepared_sha,
+                    "message": "Non-descendant sync update",
+                },
+                {
+                    "name": "branch deleted after preflight",
+                    "live_sha": prepared_sha,
+                    "prepared_present": "true",
+                    "prepared_value": prepared_sha,
+                    "race": "delete",
+                    "expected_failure": True,
+                    "expected_final": "absent",
+                    "expected_lease": existing_lease,
+                },
+                {
+                    "name": "branch rolled back after preflight",
+                    "live_sha": prepared_sha,
+                    "prepared_present": "true",
+                    "prepared_value": prepared_sha,
+                    "race": "rollback",
+                    "expected_failure": True,
+                    "expected_final": drift_sha,
+                    "expected_lease": existing_lease,
+                },
+                {
+                    "name": "branch moved to desired after preflight",
+                    "live_sha": prepared_sha,
+                    "prepared_present": "true",
+                    "prepared_value": prepared_sha,
+                    "race": "desired",
+                    "expected_failure": True,
+                    "expected_final": desired_sha,
+                    "expected_lease": existing_lease,
+                },
+                {
+                    "name": "branch appeared after absent preflight",
+                    "live_sha": "absent",
+                    "prepared_present": "false",
+                    "prepared_value": "",
+                    "race": "appear",
+                    "expected_failure": True,
+                    "expected_final": drift_sha,
+                    "expected_lease": absent_lease,
+                },
+            )
+            for case in cases:
+                name = case["name"]
                 with self.subTest(name=name):
                     state = root / f"state-{name.replace(' ', '-')}"
-                    state.write_text(live_sha, encoding="ascii")
+                    state.write_text(case["live_sha"], encoding="ascii")
                     git_log = root / f"log-{name.replace(' ', '-')}"
+                    race_marker = root / f"race-{name.replace(' ', '-')}"
                     environment = {
                         **os.environ,
                         "BASE_SHA": base_sha,
                         "CODEX_TOOLBOX_SYNC_TOKEN": SYNTHETIC_ACCESS_TOKEN,
                         "DESIRED_HEAD_SHA": desired_sha,
-                        "DUPLICATE_BRANCH": duplicate,
+                        "DESIRED_IS_DESCENDANT": case.get("descendant", "1"),
+                        "DUPLICATE_BRANCH": case.get("duplicate", "0"),
                         "FAKE_GIT_LOG": str(git_log),
                         "PATH": f"{fake_bin}:/usr/bin:/bin",
-                        "PREPARED_REMOTE_BRANCH_PRESENT": prepared_present,
-                        "PREPARED_REMOTE_BRANCH_SHA": prepared_value,
+                        "PREPARED_REMOTE_BRANCH_PRESENT": case["prepared_present"],
+                        "PREPARED_REMOTE_BRANCH_SHA": case["prepared_value"],
                         "PREPARED_TARGET_BASE_SHA": base_sha,
+                        "RACE_BEFORE_PUSH": case.get("race", "none"),
+                        "RACE_MARKER": str(race_marker),
+                        "RACE_SHA": drift_sha,
                         "REMOTE_BRANCH_STATE": str(state),
                         "SYNC_BRANCH": "automation/canonical-personal-sync",
                         "TARGET_BASE": "master",
@@ -1458,7 +1971,7 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                         check=False,
                         timeout=30,
                     )
-                    if expected_failure:
+                    if case.get("expected_failure", False):
                         self.assertNotEqual(completed.returncode, 0)
                     else:
                         self.assertEqual(
@@ -1466,28 +1979,37 @@ class SyncToolboxAutomationTests(unittest.TestCase):
                             0,
                             completed.stdout + completed.stderr,
                         )
-                        self.assertEqual(
-                            state.read_text(encoding="ascii"),
-                            desired_sha,
-                        )
-                    if expected_message:
+                    self.assertEqual(
+                        state.read_text(encoding="ascii"),
+                        case["expected_final"],
+                    )
+                    if message := case.get("message"):
                         self.assertIn(
-                            expected_message,
+                            message,
                             completed.stdout + completed.stderr,
                         )
                     commands = git_log.read_text(encoding="utf-8")
-                    push_line = (
-                        "push origin HEAD:refs/heads/automation/canonical-personal-sync"
+                    push_lines = [
+                        line
+                        for line in commands.splitlines()
+                        if " push " in f" {line} "
+                    ]
+                    expected_lease = case.get("expected_lease")
+                    self.assertEqual(
+                        len(push_lines),
+                        1 if expected_lease is not None else 0,
                     )
-                    self.assertEqual(push_line in commands, should_push)
-                    self.assertNotIn("--force", commands)
+                    if expected_lease is not None:
+                        self.assertIn(expected_lease, push_lines[0])
+                        self.assertIn(
+                            f"{desired_sha}:refs/heads/"
+                            "automation/canonical-personal-sync",
+                            push_lines[0],
+                        )
+                    self.assertNotIn("--force-if-includes", commands)
                     self.assertNotIn(
                         "refs/heads/master",
-                        "\n".join(
-                            line
-                            for line in commands.splitlines()
-                            if " push " in f" {line} "
-                        ),
+                        "\n".join(push_lines),
                     )
 
     def test_clean_pr_close_requires_exact_live_ownership_and_head(

@@ -25,7 +25,10 @@ request through `.github/workflows/sync-toolbox.yml`. The workflow requires the
 explicit least-privilege `CODEX_TOOLBOX_SYNC_TOKEN` interface documented in
 [`docs/automation/sync-toolbox.md`](docs/automation/sync-toolbox.md); it fails
 before target checkout when the secret is absent and never creates a
-credential.
+credential. Repeated runs against one unmerged sync branch reconstruct
+managed-path authority from both the target base and the branch's exact
+historical receipt, and branch publication uses an exact compare-and-swap
+lease rather than an unguarded ref update.
 
 After a canonical source change, refresh and verify the lock:
 
