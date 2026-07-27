@@ -26,6 +26,11 @@ administrators must provision and rotate the secret outside this workflow.
 - Triggers are restricted to canonical `master` pushes and trusted manual
   dispatches on canonical `master`; the workflow does not run for pull-request
   events.
+- Every third-party action in this token-bearing workflow is pinned to a full
+  40-hex commit SHA. Both canonical and target checkout steps use the
+  GitHub-verified `actions/checkout` `v4.4.0` commit
+  `11d5960a326750d5838078e36cf38b85af677262`; a structure test rejects movable
+  tags or other non-commit action references.
 - The canonical checkout is detached at the exact triggering SHA with full
   local history. The generator never fetches implicitly: it reconstructs a
   prior receipt from the exact reachable canonical commit named by that

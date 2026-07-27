@@ -147,6 +147,12 @@ superseded_by:
   interleavings retain the marker. Linux status treats only exact persistent
   `enabled` plus exact `active` as healthy; `enabled-runtime` is explicit
   runtime-only drift even while active.
+- The final workflow-trust follow-up pins both canonical and target checkout
+  steps to GitHub-verified `actions/checkout` `v4.4.0` commit
+  `11d5960a326750d5838078e36cf38b85af677262`. The token-bearing workflow has no
+  other third-party action use, and its structure test now rejects every
+  non-full-SHA action reference before a movable tag can regain privileged
+  execution.
 
 ## Validation Evidence
 
@@ -456,6 +462,17 @@ superseded_by:
   engine remains mode `0755`; its SHA-256 is
   `57eb9e9015c460ee073cfb68067ca66f3abeb4c8ef19861770cef8a3fbc431f5`,
   and the refreshed source-lock SHA-256 is
+  `e249c583d6f9f43c7447375b550d842615e8ffb42166f5135fa6ce06f54dc578`.
+- The final workflow-trust fix passed all 24 toolbox automation tests in
+  369.541 seconds, all 87 scheduler/doctor tests in 5.715 seconds, the complete
+  749-test repository suite in 1232.265 seconds, and the independent
+  119-test source-lock suite in 957.763 seconds. Compileall, Ruff lint and
+  changed-range format check, actionlint, project-journal validation,
+  source-lock verification, and `git diff --check` passed. Official upstream
+  refs `actions/checkout` `v4` and `v4.4.0` both resolved to
+  `11d5960a326750d5838078e36cf38b85af677262`, whose GitHub commit verification
+  was valid. No declared canonical source changed, so the source-lock SHA-256
+  remains
   `e249c583d6f9f43c7447375b550d842615e8ffb42166f5135fa6ce06f54dc578`.
 
 ## Installed Host Baseline

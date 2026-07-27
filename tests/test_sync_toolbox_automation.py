@@ -14,6 +14,7 @@ import unittest
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = REPOSITORY_ROOT / ".github" / "workflows" / "sync-toolbox.yml"
 DOCUMENTATION_PATH = REPOSITORY_ROOT / "docs" / "automation" / "sync-toolbox.md"
+CHECKOUT_COMMIT = "11d5960a326750d5838078e36cf38b85af677262"
 SYNTHETIC_ACCESS_TOKEN_ID = "access-a"
 SYNTHETIC_ACCESS_TOKEN = "codex_synth_v1_access_a"
 
@@ -76,6 +77,26 @@ class SyncToolboxAutomationTests(unittest.TestCase):
         self.assertNotRegex(
             permissions,
             r"\b(?:actions|checks|issues|pull-requests|statuses):\s*write\b",
+        )
+
+    def test_privileged_action_uses_are_pinned_to_full_commit_shas(self) -> None:
+        action_uses = re.findall(
+            r"(?m)^\s+uses:\s+([^\s#]+)(?:\s+#\s+([^\r\n]+))?\s*$",
+            self.workflow,
+        )
+        self.assertTrue(action_uses)
+        for action_ref, _version_comment in action_uses:
+            with self.subTest(action_ref=action_ref):
+                self.assertRegex(action_ref, r"^[^@\s]+@[0-9a-f]{40}$")
+        checkout_ref = f"actions/checkout@{CHECKOUT_COMMIT}"
+        checkout_uses = [
+            (action_ref, version_comment)
+            for action_ref, version_comment in action_uses
+            if action_ref.startswith("actions/checkout@")
+        ]
+        self.assertEqual(
+            checkout_uses,
+            [(checkout_ref, "v4.4.0"), (checkout_ref, "v4.4.0")],
         )
 
     def test_canonical_checkout_retains_history_for_receipt_validation(self) -> None:

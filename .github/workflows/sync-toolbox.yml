@@ -41,7 +41,7 @@ jobs:
           fi
 
       - name: Check out exact canonical commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: canonical
           ref: ${{ github.sha }}
@@ -64,7 +64,7 @@ jobs:
           python3 "${CANONICAL_ROOT}/scripts/sync_canonical_mirrors.py" refresh-lock --check
 
       - name: Check out toolbox master
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: Joey-Tools/codex-toolbox
           token: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
