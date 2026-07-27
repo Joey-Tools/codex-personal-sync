@@ -21565,14 +21565,12 @@ def _scheduler_daemon_enabled(
             "scheduler daemon query output exceeded its byte limit",
         )
     enabled_state = enabled_result.stdout.strip().casefold()
-    if not (
-        enabled_result.returncode == 0
-        and enabled_state in {"enabled", "enabled-runtime"}
-    ):
+    if not (enabled_result.returncode == 0 and enabled_state == "enabled"):
         if enabled_state in {
             "alias",
             "disabled",
             "disabled-runtime",
+            "enabled-runtime",
             "generated",
             "indirect",
             "linked",
@@ -21585,7 +21583,12 @@ def _scheduler_daemon_enabled(
         }:
             return SchedulerDaemonQuery(
                 "disabled",
-                f"systemd reports scheduler unit state {enabled_state}",
+                (
+                    "systemd reports scheduler runtime-only enablement "
+                    f"state {enabled_state}"
+                    if enabled_state == "enabled-runtime"
+                    else f"systemd reports scheduler unit state {enabled_state}"
+                ),
             )
         return SchedulerDaemonQuery(
             "unavailable",
@@ -23035,6 +23038,50 @@ def _systemd_pair_recovery_members(
 ]:
     return group.marker, group.service, group.timer
 
+
+def _revalidate_systemd_pair_recovery_member(
+    group: SystemdPairRecoveryGroup,
+    member: SystemdPairRecoveryMember,
+) -> None:
+    expected = member.expected
+    if expected.parent_identity != group.parent_identity:
+        raise SyncError(f"incomplete parent evidence for {member.path}")
+    if expected.exists:
+        if not _scheduler_recovery_binding_matches(
+            group.home,
+            member.file_fd,
+            member.path,
+            group.parent_fd,
+            expected,
+        ):
+            raise SyncError(f"object binding changed for {member.path}")
+        return
+    if any(
+        value is not None
+        for value in (
+            expected.payload,
+            expected.mode,
+            expected.file_identity,
+            expected.file_type,
+            expected.size,
+            expected.uid,
+            expected.gid,
+        )
+    ):
+        raise SyncError(f"incomplete absence evidence for {member.path}")
+    try:
+        os.stat(
+            member.path.name,
+            dir_fd=group.parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise SyncError(f"absence is unreadable for {member.path}") from error
+    raise SyncError(f"absent object appeared at {member.path}")
+
+
 def _revalidate_systemd_pair_recovery_group(
     group: SystemdPairRecoveryGroup,
     *,
@@ -23049,83 +23096,15 @@ def _revalidate_systemd_pair_recovery_group(
             group.parent_fd,
         ):
             raise SyncError("unit parent identity changed")
-        # A member-level check double-reads one descriptor. Run two complete
-        # group passes so drift of an earlier object while a later object is
-        # checked is observed before the marker commit.
+        # Object identity, exact bytes, and access policy are protected for
+        # present members; exact name absence is protected for absent members.
+        # Run two stabilization passes and one final complete pass so a change
+        # to an earlier member while a later member is checked is observed.
         for _verification_round in range(2):
             for member in _systemd_pair_recovery_members(group):
-                expected = member.expected
-                if expected.parent_identity != group.parent_identity:
-                    raise SyncError(f"incomplete parent evidence for {member.path}")
-                if expected.exists:
-                    if not _scheduler_recovery_binding_matches(
-                        group.home,
-                        member.file_fd,
-                        member.path,
-                        group.parent_fd,
-                        expected,
-                    ):
-                        raise SyncError(f"object binding changed for {member.path}")
-                    continue
-                if any(
-                    value is not None
-                    for value in (
-                        expected.payload,
-                        expected.mode,
-                        expected.file_identity,
-                        expected.file_type,
-                        expected.size,
-                        expected.uid,
-                        expected.gid,
-                    )
-                ):
-                    raise SyncError(f"incomplete absence evidence for {member.path}")
-                try:
-                    os.stat(
-                        member.path.name,
-                        dir_fd=group.parent_fd,
-                        follow_symlinks=False,
-                    )
-                except FileNotFoundError:
-                    pass
-                except OSError as error:
-                    raise SyncError(
-                        f"absence is unreadable for {member.path}"
-                    ) from error
-                else:
-                    raise SyncError(f"absent object appeared at {member.path}")
-        # Bind the last full-pass results to canonical names immediately before
-        # returning to the marker commit.
+                _revalidate_systemd_pair_recovery_member(group, member)
         for member in _systemd_pair_recovery_members(group):
-            expected = member.expected
-            if not expected.exists:
-                continue
-            assert expected.file_identity is not None
-            assert expected.file_type is not None
-            assert expected.mode is not None
-            assert expected.uid is not None
-            assert expected.gid is not None
-            assert expected.size is not None
-            expected_metadata = (
-                expected.file_identity[0],
-                expected.file_identity[1],
-                expected.file_type,
-                expected.mode,
-                expected.uid,
-                expected.gid,
-                expected.size,
-            )
-            named = os.stat(
-                member.path.name,
-                dir_fd=group.parent_fd,
-                follow_symlinks=False,
-            )
-            opened = os.fstat(member.file_fd)
-            if (
-                _managed_state_metadata_snapshot(named) != expected_metadata
-                or _managed_state_metadata_snapshot(opened) != expected_metadata
-            ):
-                raise SyncError(f"object binding changed for {member.path}")
+            _revalidate_systemd_pair_recovery_member(group, member)
         if _directory_identity(
             group.parent_fd
         ) != group.parent_identity or not _bound_directory_matches(
@@ -23136,8 +23115,9 @@ def _revalidate_systemd_pair_recovery_group(
             raise SyncError("unit parent identity changed")
     except (OSError, SyncError) as error:
         raise SyncError(
-            f"systemd scheduler pair recovery object group changed {boundary}"
+            f"systemd scheduler pair recovery object group changed {boundary}: {error}"
         ) from error
+
 
 def _bind_systemd_pair_recovery_member(
     home: Path,
@@ -23272,14 +23252,20 @@ def _refresh_systemd_pair_recovery_member(
         boundary=f"after rollback of {member.path.name}",
     )
 
+
 def _commit_systemd_pair_recovery_marker(
     group: SystemdPairRecoveryGroup,
 ) -> None:
+    try:
+        os.fsync(group.parent_fd)
+    except OSError as error:
+        raise SyncError(
+            "failed to sync recovered systemd scheduler pair transaction"
+        ) from error
     _revalidate_systemd_pair_recovery_group(
         group,
-        boundary="before transaction marker commit",
+        boundary="after parent sync before transaction marker commit",
     )
-    os.fsync(group.parent_fd)
     try:
         os.unlink(
             group.marker.path.name,
@@ -23289,6 +23275,7 @@ def _commit_systemd_pair_recovery_marker(
         raise SyncError(
             "failed to commit recovered systemd scheduler pair transaction"
         ) from error
+
 
 def _recover_scheduler_pair_transaction(
     paths: SchedulerPaths,
@@ -23816,21 +23803,117 @@ def _report_preserved_systemd_drop_ins(paths: SchedulerPaths) -> None:
             )
 
 
+def _scheduler_uninstall_commit_group(
+    marker_binding: SchedulerActivationBinding,
+    related_bindings: tuple[SchedulerActivationBinding, ...],
+) -> tuple[SchedulerActivationBinding, ...]:
+    bindings = (*related_bindings, marker_binding)
+    if len({id(binding) for binding in bindings}) != len(bindings):
+        raise SyncError("scheduler uninstall commit received duplicate file bindings")
+    parent_path = marker_binding.path.parent
+    parent_identity = marker_binding.expected.parent_identity
+    if parent_identity is None:
+        raise SyncError(
+            "scheduler uninstall commit has incomplete parent evidence",
+            code=marker_binding.failure_code,
+        )
+    shared_parent_fd = marker_binding.parent_fd
+    for binding in bindings:
+        if (
+            binding.home != marker_binding.home
+            or binding.path.parent != parent_path
+            or binding.expected.parent_identity != parent_identity
+        ):
+            raise SyncError(
+                "scheduler uninstall commit object group disagrees on its parent",
+                code=marker_binding.failure_code,
+            )
+    try:
+        if _directory_identity(
+            shared_parent_fd
+        ) != parent_identity or not _bound_directory_matches(
+            marker_binding.home,
+            parent_path,
+            shared_parent_fd,
+        ):
+            raise SyncError("scheduler uninstall commit parent identity changed")
+    except (OSError, SyncError) as error:
+        raise SyncError(
+            "scheduler uninstall commit object group parent is unreadable",
+            code=marker_binding.failure_code,
+        ) from error
+    # Every canonical-name lookup in the commit pass uses the one retained
+    # marker-parent descriptor. File descriptors remain bound to their exact
+    # original objects for present-member content and access revalidation.
+    return tuple(replace(binding, parent_fd=shared_parent_fd) for binding in bindings)
+
+
+def _revalidate_scheduler_uninstall_commit_group(
+    bindings: tuple[SchedulerActivationBinding, ...],
+) -> None:
+    if not bindings:
+        raise SyncError("scheduler uninstall commit object group is empty")
+    shared_parent_fd = bindings[0].parent_fd
+    parent_identity = bindings[0].expected.parent_identity
+    home = bindings[0].home
+    parent_path = bindings[0].path.parent
+    if (
+        parent_identity is None
+        or any(binding.parent_fd != shared_parent_fd for binding in bindings)
+        or any(binding.home != home for binding in bindings)
+        or any(binding.path.parent != parent_path for binding in bindings)
+        or any(
+            binding.expected.parent_identity != parent_identity for binding in bindings
+        )
+    ):
+        raise SyncError("scheduler uninstall commit object group is inconsistent")
+    # Present members protect identity, bytes, and access policy; removed or
+    # initially absent members protect exact canonical-name absence. As with
+    # pair recovery, two stabilization passes plus a final complete pass catch
+    # an earlier member changing while a later member is being checked.
+    for _verification_round in range(2):
+        for binding in bindings:
+            _revalidate_launchd_activation_binding(
+                binding,
+                boundary="after parent sync before uninstall transaction commit",
+            )
+    for binding in bindings:
+        _revalidate_launchd_activation_binding(
+            binding,
+            boundary="after parent sync before uninstall transaction commit",
+        )
+    try:
+        if _directory_identity(
+            shared_parent_fd
+        ) != parent_identity or not _bound_directory_matches(
+            home,
+            parent_path,
+            shared_parent_fd,
+        ):
+            raise SyncError("scheduler uninstall commit parent identity changed")
+    except (OSError, SyncError) as error:
+        raise SyncError(
+            "scheduler uninstall commit object group parent is unreadable"
+        ) from error
+
+
 def _commit_scheduler_uninstall_transaction(
     marker_binding: SchedulerActivationBinding,
     *,
     related_bindings: tuple[SchedulerActivationBinding, ...],
 ) -> None:
-    bindings = (*related_bindings, marker_binding)
-    if len({id(binding) for binding in bindings}) != len(bindings):
-        raise SyncError("scheduler uninstall commit received duplicate file bindings")
-    for binding in bindings:
-        _revalidate_launchd_activation_binding(
-            binding,
-            boundary="before uninstall transaction commit",
-        )
+    bindings = _scheduler_uninstall_commit_group(
+        marker_binding,
+        related_bindings,
+    )
     try:
         os.fsync(marker_binding.parent_fd)
+    except OSError as error:
+        raise SyncError(
+            f"failed to sync scheduler uninstall transaction: {marker_binding.path}"
+        ) from error
+    _revalidate_scheduler_uninstall_commit_group(bindings)
+    try:
         os.unlink(
             marker_binding.path.name,
             dir_fd=marker_binding.parent_fd,
@@ -23846,6 +23929,7 @@ def _commit_scheduler_uninstall_transaction(
         parent_identity=marker_binding.expected.parent_identity,
     )
     marker_binding.removed = True
+
 
 def _retain_scheduler_uninstall_transaction(
     stack: contextlib.ExitStack,

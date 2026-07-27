@@ -2618,6 +2618,114 @@ class SchedulerDoctorTests(unittest.TestCase):
                 self.assertTrue(replaced)
                 self.assertTrue(marker.is_file())
 
+    def test_systemd_pair_recovery_revalidates_absent_group_after_parent_sync(
+        self,
+    ) -> None:
+        for mutation in ("during-fsync", "during-second-pass"):
+            with self.subTest(mutation=mutation):
+                case_user_home = self.root / f"pair-absent-{mutation}" / "home"
+                case_home = case_user_home / ".codex"
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    paths = MODULE._scheduler_paths("linux", case_home)
+                assert paths.systemd_service is not None
+                assert paths.systemd_timer is not None
+                paths.systemd_service.parent.mkdir(parents=True)
+                marker = MODULE._scheduler_pair_transaction_path(paths)
+                absent = MODULE.ManagedStateFileSnapshot(exists=False)
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    marker_before = MODULE._scheduler_config_snapshot(
+                        marker,
+                        MODULE.MAX_SCHEDULER_PAIR_TRANSACTION_BYTES,
+                    )
+                    MODULE._atomic_write_scheduler_config(
+                        marker,
+                        MODULE._scheduler_pair_transaction_payload(
+                            service_before=absent,
+                            timer_before=absent,
+                            service_after=b"future service\n",
+                            timer_after=b"future timer\n",
+                        ),
+                        expected_snapshot=marker_before,
+                    )
+
+                real_fsync = MODULE.os.fsync
+                real_member_check = MODULE._revalidate_systemd_pair_recovery_member
+                armed = False
+                injected = False
+                timer_checks = 0
+
+                def reappear_service() -> None:
+                    nonlocal injected
+                    paths.systemd_service.write_bytes(b"concurrent service\n")
+                    paths.systemd_service.chmod(0o600)
+                    injected = True
+
+                def sync_then_arm_or_reappear(file_fd: int) -> None:
+                    nonlocal armed
+                    real_fsync(file_fd)
+                    if mutation == "during-fsync":
+                        reappear_service()
+                    else:
+                        armed = True
+
+                def reappear_after_earlier_absence_check(
+                    group: MODULE.SystemdPairRecoveryGroup,
+                    member: MODULE.SystemdPairRecoveryMember,
+                ) -> None:
+                    nonlocal timer_checks
+                    if (
+                        mutation == "during-second-pass"
+                        and armed
+                        and member.path == paths.systemd_timer
+                    ):
+                        timer_checks += 1
+                        if timer_checks == 2:
+                            reappear_service()
+                    real_member_check(group, member)
+
+                with (
+                    mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ),
+                    mock.patch.object(
+                        MODULE.os,
+                        "fsync",
+                        side_effect=sync_then_arm_or_reappear,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_revalidate_systemd_pair_recovery_member",
+                        side_effect=reappear_after_earlier_absence_check,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "recovery object group changed",
+                    ) as raised,
+                ):
+                    MODULE._recover_scheduler_pair_transaction(
+                        paths,
+                        dry_run=False,
+                    )
+
+                self.assertTrue(injected)
+                self.assertIn(str(paths.systemd_service), str(raised.exception))
+                self.assertIn(
+                    "after parent sync before transaction marker commit",
+                    str(raised.exception),
+                )
+                self.assertTrue(paths.systemd_service.is_file())
+                self.assertTrue(marker.is_file())
+
     def test_systemd_pair_recovery_rechecks_earlier_member_after_later_member(
         self,
     ) -> None:
@@ -4401,6 +4509,150 @@ class SchedulerDoctorTests(unittest.TestCase):
                     self.assertFalse(other.exists())
                     self.assertNotIn("removed ", output.getvalue())
 
+    def test_uninstall_commit_revalidates_shared_parent_group(self) -> None:
+        for platform_name in ("macos", "linux"):
+            for mutation in ("during-fsync", "during-second-pass"):
+                with self.subTest(
+                    platform=platform_name,
+                    mutation=mutation,
+                ):
+                    case_user_home = (
+                        self.root / f"commit-group-{platform_name}-{mutation}" / "home"
+                    )
+                    case_home = case_user_home / ".codex"
+                    runner = case_home / "bin" / "codex-personal-sync"
+                    runner.parent.mkdir(parents=True)
+                    runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                    runner.chmod(0o755)
+                    with mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            MODULE.install_scheduler(
+                                case_home,
+                                "owner/public-sync",
+                                17,
+                                platform_name,
+                                None,
+                                dry_run=False,
+                                enable=False,
+                            )
+                    with mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ):
+                        paths = MODULE._scheduler_paths(
+                            platform_name,
+                            case_home,
+                        )
+                    target = (
+                        paths.launchd_plist
+                        if platform_name == "macos"
+                        else paths.systemd_service
+                    )
+                    assert target is not None
+                    marker = MODULE._scheduler_uninstall_transaction_path(paths)
+                    original = target.read_bytes()
+                    real_commit = MODULE._commit_scheduler_uninstall_transaction
+                    real_fsync = MODULE.os.fsync
+                    real_revalidate = MODULE._revalidate_launchd_activation_binding
+                    commit_active = False
+                    injected = False
+                    marker_checks = 0
+                    commit_parent_fds: list[int] = []
+
+                    def reappear_target() -> None:
+                        nonlocal injected
+                        target.write_bytes(original)
+                        target.chmod(0o600)
+                        injected = True
+
+                    def commit_and_arm(
+                        marker_binding: MODULE.SchedulerActivationBinding,
+                        *,
+                        related_bindings: tuple[
+                            MODULE.SchedulerActivationBinding,
+                            ...,
+                        ],
+                    ) -> None:
+                        nonlocal commit_active
+                        commit_active = True
+                        real_commit(
+                            marker_binding,
+                            related_bindings=related_bindings,
+                        )
+
+                    def sync_then_reappear(file_fd: int) -> None:
+                        real_fsync(file_fd)
+                        if (
+                            commit_active
+                            and mutation == "during-fsync"
+                            and not injected
+                        ):
+                            reappear_target()
+
+                    def revalidate_and_interleave(
+                        binding: MODULE.SchedulerActivationBinding,
+                        *,
+                        boundary: str,
+                    ) -> None:
+                        nonlocal marker_checks
+                        if commit_active and boundary == (
+                            "after parent sync before uninstall transaction commit"
+                        ):
+                            commit_parent_fds.append(binding.parent_fd)
+                            if (
+                                mutation == "during-second-pass"
+                                and binding.path == marker
+                            ):
+                                marker_checks += 1
+                                if marker_checks == 2:
+                                    reappear_target()
+                        real_revalidate(binding, boundary=boundary)
+
+                    with (
+                        mock.patch.object(
+                            MODULE.Path,
+                            "home",
+                            return_value=case_user_home,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_commit_scheduler_uninstall_transaction",
+                            side_effect=commit_and_arm,
+                        ),
+                        mock.patch.object(
+                            MODULE.os,
+                            "fsync",
+                            side_effect=sync_then_reappear,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_revalidate_launchd_activation_binding",
+                            side_effect=revalidate_and_interleave,
+                        ),
+                        contextlib.redirect_stdout(io.StringIO()),
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            "reappeared after conditional removal",
+                        ),
+                    ):
+                        MODULE.uninstall_scheduler(
+                            case_home,
+                            platform_name,
+                            dry_run=False,
+                            disable=False,
+                        )
+
+                    self.assertTrue(injected)
+                    self.assertTrue(marker.is_file())
+                    self.assertTrue(target.is_file())
+                    self.assertTrue(commit_parent_fds)
+                    self.assertEqual(len(set(commit_parent_fds)), 1)
+
     def test_uninstall_native_failures_retain_transaction_and_configs(
         self,
     ) -> None:
@@ -4813,6 +5065,14 @@ class SchedulerDoctorTests(unittest.TestCase):
                 "denied",
             ),
             ("linux", 0, "enabled\n", "", "enabled", None),
+            (
+                "linux",
+                0,
+                "enabled-runtime\n",
+                "",
+                "disabled",
+                "runtime-only enablement",
+            ),
             (
                 "linux",
                 1,

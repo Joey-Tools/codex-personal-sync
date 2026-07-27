@@ -138,6 +138,15 @@ superseded_by:
   descriptor and treats marker/service/timer as one object group, including
   two complete byte/access/name passes plus final identity and parent
   revalidation before the marker commit.
+- The fifth scheduler follow-up moves pair-recovery and uninstall parent fsync
+  before their terminal validation boundary. Pair recovery revalidates present
+  and absent marker/service/timer members as one group; uninstall routes every
+  marker/config canonical-name lookup through one retained config-parent FD.
+  Both paths run repeated complete group passes plus a final parent check
+  immediately before exact marker unlink, so fsync-time and later-member
+  interleavings retain the marker. Linux status treats only exact persistent
+  `enabled` plus exact `active` as healthy; `enabled-runtime` is explicit
+  runtime-only drift even while active.
 
 ## Validation Evidence
 
@@ -437,6 +446,17 @@ superseded_by:
   project-journal validation, source-lock verification, and `git diff
   --check` passed. The final source-lock SHA-256 is
   `a3155369a24a391740f6cbff1e1d1306b6ab3c31239192b426c924a10cd38c59`.
+- The fifth scheduler findings follow-up adds post-fsync whole-group
+  revalidation for pair recovery and uninstall, including earlier absent-member
+  reappearance during later-member checks, plus explicit runtime-only systemd
+  enablement drift. The exact final bytes passed 87 scheduler/doctor tests,
+  the complete 748-test repository suite, and the independent 119-test
+  source-lock suite. Compileall, Ruff, actionlint, project-journal validation,
+  source-lock verification, and `git diff --check` passed. The canonical
+  engine remains mode `0755`; its SHA-256 is
+  `57eb9e9015c460ee073cfb68067ca66f3abeb4c8ef19861770cef8a3fbc431f5`,
+  and the refreshed source-lock SHA-256 is
+  `e249c583d6f9f43c7447375b550d842615e8ffb42166f5135fa6ce06f54dc578`.
 
 ## Installed Host Baseline
 
@@ -478,9 +498,6 @@ configuration.
 ## Next Steps
 
 - Generate and validate the declared downstream mirrors.
-- Create a signed append checkpoint after the final repository gate; the fixed
-  workstream review base remains
-  `ca66cca229fdf92713d1b1d2c6477d9927670b53`.
 - Push/open the canonical PR and continue downstream mirror/PR delivery only
   when the parent workstream authorizes those remote mutations.
 - Provision `CODEX_TOOLBOX_SYNC_TOKEN` separately only if the repository owner
