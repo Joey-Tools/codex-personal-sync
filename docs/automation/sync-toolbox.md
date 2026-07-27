@@ -29,8 +29,11 @@ administrators must provision and rotate the secret outside this workflow.
 - Every third-party action in this token-bearing workflow is pinned to a full
   40-hex commit SHA. Both canonical and target checkout steps use the
   GitHub-verified `actions/checkout` `v4.4.0` commit
-  `11d5960a326750d5838078e36cf38b85af677262`; a structure test rejects movable
-  tags or other non-commit action references.
+  `11d5960a326750d5838078e36cf38b85af677262`. A strict structural YAML loader
+  traverses every job-level reusable workflow and step-level action `uses`
+  mapping, including block, flow, and quoted-key forms, and rejects unsupported
+  aliases, anchors, merge keys, duplicate keys, or malformed structures before
+  enforcing full-SHA external references.
 - The canonical checkout is detached at the exact triggering SHA with full
   local history. The generator never fetches implicitly: it reconstructs a
   prior receipt from the exact reachable canonical commit named by that

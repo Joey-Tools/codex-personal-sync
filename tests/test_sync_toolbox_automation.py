@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from typing import NoReturn
 import unittest
 
 
@@ -17,6 +18,470 @@ DOCUMENTATION_PATH = REPOSITORY_ROOT / "docs" / "automation" / "sync-toolbox.md"
 CHECKOUT_COMMIT = "11d5960a326750d5838078e36cf38b85af677262"
 SYNTHETIC_ACCESS_TOKEN_ID = "access-a"
 SYNTHETIC_ACCESS_TOKEN = "codex_synth_v1_access_a"
+FULL_COMMIT_ACTION_RE = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
+
+
+class StrictWorkflowYamlError(ValueError):
+    pass
+
+
+# This loader accepts only the workflow's deliberately small YAML subset.
+# Unsupported YAML features fail closed so they cannot hide executable `uses`
+# mappings from the pin audit.
+class _StrictWorkflowFlowParser:
+    def __init__(self, payload: str) -> None:
+        self.payload = payload
+        self.offset = 0
+
+    def parse(self) -> object:
+        value = self._parse_value()
+        self._skip_spaces()
+        if self.offset != len(self.payload):
+            self._fail("unexpected trailing flow content")
+        return value
+
+    def _fail(self, message: str) -> NoReturn:
+        raise StrictWorkflowYamlError(f"{message} at flow offset {self.offset}")
+
+    def _skip_spaces(self) -> None:
+        while self.offset < len(self.payload) and self.payload[self.offset] == " ":
+            self.offset += 1
+
+    def _parse_value(self) -> object:
+        self._skip_spaces()
+        if self.offset >= len(self.payload):
+            self._fail("missing flow value")
+        current = self.payload[self.offset]
+        if current == "{":
+            return self._parse_mapping()
+        if current == "[":
+            return self._parse_sequence()
+        if current in {"'", '"'}:
+            return self._parse_quoted()
+        return self._parse_plain_value()
+
+    def _parse_mapping(self) -> dict[str, object]:
+        self.offset += 1
+        result: dict[str, object] = {}
+        self._skip_spaces()
+        if self._consume("}"):
+            return result
+        while True:
+            key = self._parse_key()
+            self._skip_spaces()
+            if not self._consume(":"):
+                self._fail("flow mapping key is missing ':'")
+            value = self._parse_value()
+            if key in result:
+                self._fail(f"duplicate mapping key {key!r}")
+            result[key] = value
+            self._skip_spaces()
+            if self._consume("}"):
+                return result
+            if not self._consume(","):
+                self._fail("flow mapping entries must be comma-separated")
+            self._skip_spaces()
+            if self.offset >= len(self.payload):
+                self._fail("unterminated flow mapping")
+
+    def _parse_sequence(self) -> list[object]:
+        self.offset += 1
+        result: list[object] = []
+        self._skip_spaces()
+        if self._consume("]"):
+            return result
+        while True:
+            result.append(self._parse_value())
+            self._skip_spaces()
+            if self._consume("]"):
+                return result
+            if not self._consume(","):
+                self._fail("flow sequence items must be comma-separated")
+            self._skip_spaces()
+            if self.offset >= len(self.payload):
+                self._fail("unterminated flow sequence")
+
+    def _parse_key(self) -> str:
+        self._skip_spaces()
+        if self.offset >= len(self.payload):
+            self._fail("missing flow mapping key")
+        if self.payload[self.offset] in {"'", '"'}:
+            key = self._parse_quoted()
+        else:
+            start = self.offset
+            while self.offset < len(self.payload) and self.payload[self.offset] != ":":
+                if self.payload[self.offset] in "{[}],":
+                    self._fail("unsupported flow mapping key")
+                self.offset += 1
+            key = self.payload[start : self.offset].strip()
+        return _strict_workflow_yaml_key(key)
+
+    def _parse_plain_value(self) -> str:
+        start = self.offset
+        while (
+            self.offset < len(self.payload) and self.payload[self.offset] not in ",]}"
+        ):
+            if self.payload[self.offset] in "{[":
+                self._fail("nested flow collections must start a value")
+            self.offset += 1
+        value = self.payload[start : self.offset].strip()
+        return _strict_workflow_yaml_scalar(value)
+
+    def _parse_quoted(self) -> str:
+        quote = self.payload[self.offset]
+        self.offset += 1
+        result: list[str] = []
+        while self.offset < len(self.payload):
+            current = self.payload[self.offset]
+            self.offset += 1
+            if current == quote:
+                if (
+                    quote == "'"
+                    and self.offset < len(self.payload)
+                    and self.payload[self.offset] == "'"
+                ):
+                    result.append("'")
+                    self.offset += 1
+                    continue
+                return "".join(result)
+            if current == "\\" and quote == '"':
+                if self.offset >= len(self.payload):
+                    self._fail("unterminated double-quoted escape")
+                escaped = self.payload[self.offset]
+                self.offset += 1
+                replacements = {
+                    '"': '"',
+                    "\\": "\\",
+                    "/": "/",
+                    "b": "\b",
+                    "f": "\f",
+                    "n": "\n",
+                    "r": "\r",
+                    "t": "\t",
+                }
+                if escaped not in replacements:
+                    self._fail("unsupported double-quoted escape")
+                result.append(replacements[escaped])
+                continue
+            result.append(current)
+        self._fail("unterminated quoted scalar")
+
+    def _consume(self, expected: str) -> bool:
+        if self.offset < len(self.payload) and self.payload[self.offset] == expected:
+            self.offset += 1
+            return True
+        return False
+
+
+class _StrictWorkflowYamlLoader:
+    _BLOCK_SCALAR_RE = re.compile(r"^[>|](?:[1-9][+-]?|[+-][1-9]?)?$")
+
+    def __init__(self, payload: str) -> None:
+        if "\r" in payload:
+            raise StrictWorkflowYamlError("workflow YAML must use LF newlines")
+        self.lines = payload.split("\n")
+        self.index = 0
+        for line_number, line in enumerate(self.lines, start=1):
+            if "\t" in line:
+                raise StrictWorkflowYamlError(
+                    f"tabs are unsupported at line {line_number}"
+                )
+            if any(ord(character) < 0x20 and character != "\n" for character in line):
+                raise StrictWorkflowYamlError(
+                    f"control character at line {line_number}"
+                )
+
+    def load(self) -> dict[str, object]:
+        self._skip_ignored()
+        if self.index >= len(self.lines):
+            raise StrictWorkflowYamlError("workflow YAML is empty")
+        if self._line_indent(self.index) != 0:
+            self._fail("root mapping must start at indentation zero")
+        document = self._parse_node(0)
+        self._skip_ignored()
+        if self.index != len(self.lines):
+            self._fail("unexpected trailing YAML content")
+        if not isinstance(document, dict):
+            raise StrictWorkflowYamlError("workflow YAML root must be a mapping")
+        return document
+
+    def _fail(self, message: str) -> NoReturn:
+        raise StrictWorkflowYamlError(f"{message} at line {self.index + 1}")
+
+    def _skip_ignored(self) -> None:
+        while self.index < len(self.lines):
+            content = self.lines[self.index].lstrip(" ")
+            if not content or content.startswith("#"):
+                self.index += 1
+                continue
+            if content in {"---", "..."} or content.startswith("%YAML"):
+                self._fail("YAML directives and document markers are unsupported")
+            return
+
+    def _line_indent(self, index: int) -> int:
+        line = self.lines[index]
+        return len(line) - len(line.lstrip(" "))
+
+    def _line_content(self, index: int) -> str:
+        return self.lines[index][self._line_indent(index) :].rstrip(" ")
+
+    def _parse_node(self, indent: int) -> object:
+        self._skip_ignored()
+        if self.index >= len(self.lines):
+            self._fail("missing nested YAML value")
+        if self._line_indent(self.index) != indent:
+            self._fail("unexpected YAML indentation")
+        content = self._line_content(self.index)
+        if content == "-" or content.startswith("- "):
+            return self._parse_sequence(indent)
+        return self._parse_mapping(indent)
+
+    def _parse_mapping(
+        self,
+        indent: int,
+        initial: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        result = {} if initial is None else initial
+        while True:
+            self._skip_ignored()
+            if self.index >= len(self.lines):
+                return result
+            current_indent = self._line_indent(self.index)
+            if current_indent < indent:
+                return result
+            if current_indent > indent:
+                self._fail("unexpected mapping indentation")
+            content = self._line_content(self.index)
+            if content == "-" or content.startswith("- "):
+                self._fail("mapping and sequence entries cannot be mixed")
+            key, raw_value = self._parse_mapping_entry(content)
+            self.index += 1
+            self._store_mapping_value(result, key, raw_value, indent)
+
+    def _parse_sequence(self, indent: int) -> list[object]:
+        result: list[object] = []
+        while True:
+            self._skip_ignored()
+            if self.index >= len(self.lines):
+                return result
+            current_indent = self._line_indent(self.index)
+            if current_indent < indent:
+                return result
+            if current_indent > indent:
+                self._fail("unexpected sequence indentation")
+            content = self._line_content(self.index)
+            if not (content == "-" or content.startswith("- ")):
+                return result
+            raw_item = content[1:].lstrip(" ")
+            self.index += 1
+            if not raw_item:
+                result.append(self._parse_nested_value(indent))
+                continue
+            if raw_item.startswith(("{", "[")):
+                result.append(self._parse_inline_value(raw_item))
+                continue
+            if _strict_workflow_yaml_mapping_colon(raw_item) is None:
+                result.append(self._parse_inline_value(raw_item))
+                continue
+            key, raw_value = self._parse_mapping_entry(raw_item)
+            mapping_indent = indent + 2
+            mapping: dict[str, object] = {}
+            self._store_mapping_value(
+                mapping,
+                key,
+                raw_value,
+                mapping_indent,
+            )
+            result.append(self._parse_mapping(mapping_indent, mapping))
+
+    def _parse_nested_value(self, parent_indent: int) -> object:
+        self._skip_ignored()
+        if self.index >= len(self.lines):
+            return None
+        child_indent = self._line_indent(self.index)
+        if child_indent <= parent_indent:
+            return None
+        return self._parse_node(child_indent)
+
+    def _store_mapping_value(
+        self,
+        mapping: dict[str, object],
+        key: str,
+        raw_value: str,
+        indent: int,
+    ) -> None:
+        if key in mapping:
+            self._fail(f"duplicate mapping key {key!r}")
+        value_without_comment = _strict_workflow_yaml_strip_comment(raw_value)
+        if not value_without_comment:
+            value = self._parse_nested_value(indent)
+        elif self._BLOCK_SCALAR_RE.fullmatch(value_without_comment):
+            value = self._consume_block_scalar(indent)
+        else:
+            value = self._parse_inline_value(value_without_comment)
+        mapping[key] = value
+
+    def _consume_block_scalar(self, parent_indent: int) -> str:
+        payload: list[str] = []
+        while self.index < len(self.lines):
+            line = self.lines[self.index]
+            if line and self._line_indent(self.index) <= parent_indent:
+                break
+            payload.append(line)
+            self.index += 1
+        return "\n".join(payload)
+
+    def _parse_mapping_entry(self, content: str) -> tuple[str, str]:
+        colon = _strict_workflow_yaml_mapping_colon(content)
+        if colon is None:
+            raise StrictWorkflowYamlError(
+                f"mapping entry is missing ':' at line {self.index + 1}"
+            )
+        key = _strict_workflow_yaml_key(content[:colon].strip())
+        return key, content[colon + 1 :].lstrip(" ")
+
+    def _parse_inline_value(self, raw_value: str) -> object:
+        value = _strict_workflow_yaml_strip_comment(raw_value)
+        if not value:
+            return None
+        if value.startswith(("{", "[")):
+            return _StrictWorkflowFlowParser(value).parse()
+        return _strict_workflow_yaml_scalar(value)
+
+
+def _strict_workflow_yaml_mapping_colon(value: str) -> int | None:
+    quote: str | None = None
+    escaped = False
+    for index, character in enumerate(value):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif quote == '"' and character == "\\":
+                escaped = True
+            elif character == quote:
+                if quote == "'" and index + 1 < len(value) and value[index + 1] == "'":
+                    continue
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            continue
+        if character == ":" and (index + 1 == len(value) or value[index + 1].isspace()):
+            return index
+    if quote is not None:
+        raise StrictWorkflowYamlError("unterminated quoted mapping key")
+    return None
+
+
+def _strict_workflow_yaml_strip_comment(value: str) -> str:
+    quote: str | None = None
+    escaped = False
+    depth = 0
+    for index, character in enumerate(value):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif quote == '"' and character == "\\":
+                escaped = True
+            elif character == quote:
+                if quote == "'" and index + 1 < len(value) and value[index + 1] == "'":
+                    continue
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            continue
+        if character in "[{":
+            depth += 1
+            continue
+        if character in "]}":
+            depth -= 1
+            if depth < 0:
+                raise StrictWorkflowYamlError("unbalanced flow collection")
+            continue
+        if (
+            character == "#"
+            and depth == 0
+            and (index == 0 or value[index - 1].isspace())
+        ):
+            value = value[:index]
+            break
+    if quote is not None or depth != 0:
+        raise StrictWorkflowYamlError("unterminated quoted or flow value")
+    return value.rstrip(" ")
+
+
+def _strict_workflow_yaml_key(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise StrictWorkflowYamlError("mapping keys must be non-empty strings")
+    key = _strict_workflow_yaml_scalar(value)
+    if key == "<<":
+        raise StrictWorkflowYamlError("YAML merge keys are unsupported")
+    return key
+
+
+def _strict_workflow_yaml_scalar(value: str) -> str:
+    if not value:
+        raise StrictWorkflowYamlError("empty scalar is unsupported")
+    if value[0] in {"&", "*", "!"}:
+        raise StrictWorkflowYamlError("YAML anchors, aliases, and tags are unsupported")
+    if value[0] in {"'", '"'}:
+        parser = _StrictWorkflowFlowParser(value)
+        decoded = parser._parse_quoted()
+        parser._skip_spaces()
+        if parser.offset != len(value):
+            raise StrictWorkflowYamlError(
+                "quoted scalar has unexpected trailing content"
+            )
+        return decoded
+    if any(character in "\n\r\0" for character in value):
+        raise StrictWorkflowYamlError("scalar contains a control character")
+    return value
+
+
+def _load_strict_workflow_yaml(payload: str) -> dict[str, object]:
+    return _StrictWorkflowYamlLoader(payload).load()
+
+
+def _workflow_external_action_uses(
+    document: dict[str, object],
+) -> list[str]:
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict) or not jobs:
+        raise StrictWorkflowYamlError("workflow jobs must be a non-empty mapping")
+    action_uses: list[str] = []
+    for job_name, job in jobs.items():
+        if not isinstance(job_name, str) or not isinstance(job, dict):
+            raise StrictWorkflowYamlError("each workflow job must be a mapping")
+        job_uses = job.get("uses")
+        if job_uses is not None:
+            if not isinstance(job_uses, str) or not job_uses:
+                raise StrictWorkflowYamlError(
+                    f"job {job_name!r} uses must be a non-empty string"
+                )
+            if not job_uses.startswith("./"):
+                action_uses.append(job_uses)
+        steps = job.get("steps")
+        if steps is None:
+            continue
+        if not isinstance(steps, list):
+            raise StrictWorkflowYamlError(f"job {job_name!r} steps must be a sequence")
+        for step_index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                raise StrictWorkflowYamlError(
+                    f"job {job_name!r} step {step_index} must be a mapping"
+                )
+            step_uses = step.get("uses")
+            if step_uses is None:
+                continue
+            if not isinstance(step_uses, str) or not step_uses:
+                raise StrictWorkflowYamlError(
+                    f"job {job_name!r} step {step_index} uses must be "
+                    "a non-empty string"
+                )
+            if not step_uses.startswith("./"):
+                action_uses.append(step_uses)
+    return action_uses
 
 
 class SyncToolboxAutomationTests(unittest.TestCase):
@@ -80,24 +545,94 @@ class SyncToolboxAutomationTests(unittest.TestCase):
         )
 
     def test_privileged_action_uses_are_pinned_to_full_commit_shas(self) -> None:
-        action_uses = re.findall(
-            r"(?m)^\s+uses:\s+([^\s#]+)(?:\s+#\s+([^\r\n]+))?\s*$",
-            self.workflow,
-        )
+        workflow = _load_strict_workflow_yaml(self.workflow)
+        action_uses = _workflow_external_action_uses(workflow)
         self.assertTrue(action_uses)
-        for action_ref, _version_comment in action_uses:
+        for action_ref in action_uses:
             with self.subTest(action_ref=action_ref):
-                self.assertRegex(action_ref, r"^[^@\s]+@[0-9a-f]{40}$")
+                self.assertRegex(action_ref, FULL_COMMIT_ACTION_RE)
         checkout_ref = f"actions/checkout@{CHECKOUT_COMMIT}"
         checkout_uses = [
-            (action_ref, version_comment)
-            for action_ref, version_comment in action_uses
+            action_ref
+            for action_ref in action_uses
             if action_ref.startswith("actions/checkout@")
         ]
         self.assertEqual(
             checkout_uses,
-            [(checkout_ref, "v4.4.0"), (checkout_ref, "v4.4.0")],
+            [checkout_ref, checkout_ref],
         )
+        self.assertEqual(
+            self.workflow.count(f"uses: {checkout_ref} # v4.4.0"),
+            2,
+        )
+
+    def test_privileged_action_pin_parser_covers_yaml_structures(self) -> None:
+        pinned = "owner/action@" + "a" * 40
+        fixture = f"""
+jobs:
+  block:
+    steps:
+      - uses: owner/block@main
+  flow:
+    steps:
+      - {{ uses: owner/flow@main }}
+  quoted:
+    steps:
+      - "uses" : owner/quoted@main
+  reusable:
+    'uses' : owner/repository/.github/workflows/reuse.yml@main
+  safe:
+    steps:
+      - {{ "uses": {pinned} }}
+      - uses: ./local-action
+"""
+        action_uses = _workflow_external_action_uses(
+            _load_strict_workflow_yaml(fixture)
+        )
+        self.assertEqual(
+            action_uses,
+            [
+                "owner/block@main",
+                "owner/flow@main",
+                "owner/quoted@main",
+                "owner/repository/.github/workflows/reuse.yml@main",
+                pinned,
+            ],
+        )
+        self.assertRegex(action_uses[-1], FULL_COMMIT_ACTION_RE)
+        for action_ref in action_uses[:-1]:
+            with self.subTest(action_ref=action_ref):
+                self.assertNotRegex(action_ref, FULL_COMMIT_ACTION_RE)
+
+    def test_privileged_action_pin_parser_rejects_ambiguous_yaml(self) -> None:
+        fixtures = {
+            "alias": """
+shared: &shared
+  uses: owner/action@main
+jobs:
+  unsafe: *shared
+""",
+            "merge-key": """
+jobs:
+  unsafe:
+    <<: { uses: owner/action@main }
+""",
+            "duplicate-key": """
+jobs:
+  unsafe:
+    steps:
+      - uses: owner/first@main
+        uses: owner/second@main
+""",
+            "malformed-flow": """
+jobs:
+  unsafe:
+    steps: [{ uses: owner/action@main ]
+""",
+        }
+        for name, fixture in fixtures.items():
+            with self.subTest(name=name), self.assertRaises(StrictWorkflowYamlError):
+                _load_strict_workflow_yaml(fixture)
 
     def test_canonical_checkout_retains_history_for_receipt_validation(self) -> None:
         canonical_checkout = re.search(

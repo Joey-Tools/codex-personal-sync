@@ -21,7 +21,6 @@ from pathlib import Path, PurePosixPath
 import plistlib
 import posixpath
 import re
-import shlex
 import stat
 import subprocess
 import sys
@@ -20418,10 +20417,7 @@ def _load_linux_scheduler_config(
     interval_match = re.fullmatch(r"([1-9][0-9]{0,8})min", interval_lines[0])
     if interval_match is None:
         raise SyncError("systemd scheduler interval must use whole minutes")
-    try:
-        arguments = shlex.split(exec_lines[0], posix=True)
-    except ValueError as error:
-        raise SyncError("systemd scheduler command quoting is invalid") from error
+    arguments = _parse_systemd_exec_arguments(exec_lines[0])
     try:
         interval_minutes = int(interval_match.group(1))
     except ValueError as error:
@@ -20787,8 +20783,76 @@ def _launchd_plist(
     }
 
 
+def _validate_systemd_argument(value: str) -> None:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise SyncError("systemd scheduler arguments must be valid UTF-8") from error
+    if any(unicodedata.category(character) == "Cc" for character in value):
+        raise SyncError(
+            "systemd scheduler arguments must not contain control characters"
+        )
+
+
 def _systemd_quote(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    _validate_systemd_argument(value)
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("$", "$$")
+        .replace("%", "%%")
+    )
+    return f'"{escaped}"'
+
+
+def _parse_systemd_exec_arguments(command: str) -> list[str]:
+    arguments: list[str] = []
+    offset = 0
+    while offset < len(command):
+        if command[offset] != '"':
+            raise SyncError("systemd scheduler command quoting is invalid")
+        offset += 1
+        argument: list[str] = []
+        while offset < len(command):
+            current = command[offset]
+            if current == '"':
+                offset += 1
+                break
+            if current == "\\":
+                offset += 1
+                if offset >= len(command) or command[offset] not in {'"', "\\"}:
+                    raise SyncError("systemd scheduler command quoting is invalid")
+                argument.append(command[offset])
+                offset += 1
+                continue
+            if current in {"$", "%"}:
+                if offset + 1 >= len(command) or command[offset + 1] != current:
+                    raise SyncError(
+                        "systemd scheduler command contains unsupported "
+                        "expansion semantics"
+                    )
+                argument.append(current)
+                offset += 2
+                continue
+            _validate_systemd_argument(current)
+            argument.append(current)
+            offset += 1
+        else:
+            raise SyncError("systemd scheduler command quoting is invalid")
+        arguments.append("".join(argument))
+        if offset == len(command):
+            break
+        if command[offset] != " ":
+            raise SyncError("systemd scheduler command quoting is invalid")
+        offset += 1
+        if offset == len(command) or command[offset] == " ":
+            raise SyncError("systemd scheduler command quoting is invalid")
+    if not arguments:
+        raise SyncError("systemd scheduler command quoting is invalid")
+    canonical = " ".join(_systemd_quote(argument) for argument in arguments)
+    if command != canonical:
+        raise SyncError("systemd scheduler command quoting is invalid")
+    return arguments
 
 
 def _systemd_service(
@@ -23407,6 +23471,15 @@ def install_scheduler(
     selected_platform = _scheduler_platform(platform_name)
     runner_path = _scheduler_runner(home, runner)
     paths = _scheduler_paths(selected_platform, home)
+    if selected_platform == "linux":
+        _systemd_service(
+            home,
+            repo,
+            runner_path,
+            mode=mode,
+            base_repo=base_repo,
+            owner=owner,
+        )
     if dry_run:
         _install_scheduler_transaction(
             home,

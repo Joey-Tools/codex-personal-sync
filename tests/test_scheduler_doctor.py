@@ -2112,6 +2112,115 @@ class SchedulerDoctorTests(unittest.TestCase):
         ):
             MODULE._load_linux_scheduler_config(paths)
 
+    def test_systemd_exec_arguments_preserve_literal_special_paths(self) -> None:
+        runner = (
+            self.home / "bin with spaces" / 'runner %h $RUNNER "quoted" \\ backslash'
+        )
+        expected = MODULE._scheduler_install_args(
+            runner,
+            "owner/public-sync",
+            self.home,
+        )
+        service = MODULE._systemd_service(
+            self.home,
+            "owner/public-sync",
+            runner,
+        )
+        exec_start = next(
+            line.partition("=")[2]
+            for line in service.splitlines()
+            if line.startswith("ExecStart=")
+        )
+
+        self.assertIn("%%h", exec_start)
+        self.assertIn("$$RUNNER", exec_start)
+        self.assertIn('\\"quoted\\"', exec_start)
+        self.assertIn("\\\\ backslash", exec_start)
+        self.assertEqual(
+            MODULE._parse_systemd_exec_arguments(exec_start),
+            expected,
+        )
+
+    def test_linux_loader_decodes_exact_systemd_runtime_arguments(self) -> None:
+        runner = (
+            self.home / "bin with spaces" / 'runner %h $RUNNER "quoted" \\ backslash'
+        )
+        runner.parent.mkdir(parents=True)
+        runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        runner.chmod(0o755)
+        paths = MODULE._scheduler_paths("linux", self.home)
+        assert paths.systemd_service is not None
+        assert paths.systemd_timer is not None
+        paths.systemd_service.parent.mkdir(parents=True)
+        service = MODULE._systemd_service(
+            self.home,
+            "owner/public-sync",
+            runner,
+        )
+        paths.systemd_service.write_text(service, encoding="utf-8")
+        paths.systemd_timer.write_text(
+            MODULE._systemd_timer(23),
+            encoding="utf-8",
+        )
+
+        config = MODULE._load_linux_scheduler_config(paths)
+
+        self.assertIsNotNone(config)
+        assert config is not None
+        self.assertEqual(config.runner, runner)
+        self.assertEqual(config.home, self.home)
+        self.assertEqual(config.repo, "owner/public-sync")
+
+    def test_systemd_exec_parser_rejects_expansion_and_shell_forms(self) -> None:
+        commands = {
+            "specifier": '"/absolute/runner%h" "run-scheduled"',
+            "variable": '"/absolute/$RUNNER" "run-scheduled"',
+            "single-quote": "'/absolute/runner' 'run-scheduled'",
+            "backslash-escape": '"/absolute/runner\\sname" "run-scheduled"',
+        }
+        for name, command in commands.items():
+            with self.subTest(name=name), self.assertRaises(MODULE.SyncError):
+                MODULE._parse_systemd_exec_arguments(command)
+
+    def test_systemd_arguments_reject_controls_and_invalid_utf8(self) -> None:
+        rejected = {
+            "newline": "\n",
+            "nul": "\0",
+            "tab": "\t",
+            "delete": "\x7f",
+            "c1-control": "\x85",
+            "surrogate": "\udcff",
+        }
+        for name, character in rejected.items():
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "valid UTF-8|control characters",
+                ),
+            ):
+                MODULE._systemd_quote(f"/absolute/runner{character}unsafe")
+
+    def test_linux_install_rejects_control_path_before_transaction(self) -> None:
+        runner = self.home / "bin" / "runner\nunsafe"
+        runner.parent.mkdir(parents=True)
+        runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        runner.chmod(0o755)
+        with (
+            mock.patch.object(MODULE, "_install_scheduler_transaction") as install,
+            self.assertRaisesRegex(MODULE.SyncError, "control characters"),
+        ):
+            MODULE.install_scheduler(
+                self.home,
+                "owner/public-sync",
+                23,
+                "linux",
+                str(runner),
+                dry_run=False,
+                enable=False,
+            )
+        install.assert_not_called()
+
     def test_linux_interval_parser_is_bounded(self) -> None:
         runner = self.home / "bin" / "runner"
         paths = MODULE._scheduler_paths("linux", self.home)

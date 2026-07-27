@@ -150,9 +150,18 @@ superseded_by:
 - The final workflow-trust follow-up pins both canonical and target checkout
   steps to GitHub-verified `actions/checkout` `v4.4.0` commit
   `11d5960a326750d5838078e36cf38b85af677262`. The token-bearing workflow has no
-  other third-party action use, and its structure test now rejects every
-  non-full-SHA action reference before a movable tag can regain privileged
-  execution.
+  other third-party action use. Its security test now parses a strict YAML
+  structure, traverses every job-level and step-level `uses`, handles flow
+  mappings and quoted-key alternatives, and rejects aliases, merge keys,
+  duplicates, or malformed structures that could otherwise hide a movable
+  external ref.
+- Linux scheduler `ExecStart=` serialization now preserves exact runtime argv
+  rather than borrowing shell syntax. Literal `$` and `%` are emitted as
+  `$$` and `%%`; spaces, quotes, and backslashes use canonical systemd
+  double-quoted escapes. The semantic reader decodes only that representation
+  before comparing runner/home/repository arguments, while raw expansion
+  syntax, control characters, and non-UTF-8 paths fail closed before an install
+  transaction starts.
 
 ## Validation Evidence
 
@@ -474,6 +483,24 @@ superseded_by:
   was valid. No declared canonical source changed, so the source-lock SHA-256
   remains
   `e249c583d6f9f43c7447375b550d842615e8ffb42166f5135fa6ce06f54dc578`.
+
+- The final two P2 follow-ups replace the privileged-workflow line regex with a
+  strict structural YAML loader and replace Linux scheduler shell parsing with
+  canonical systemd argv serialization/decoding. Eight final focused tests
+  passed in 0.021 seconds, all 26 toolbox automation tests passed in 365.414
+  seconds, and all 92 scheduler/doctor tests passed in 7.189 seconds. The exact
+  final bytes passed the complete 756-test repository suite in 1799.892
+  seconds and the independent 119-test source-lock suite in 1289.901 seconds.
+  Compileall, Ruff lint and changed-range format checks, actionlint,
+  source-lock verification, and `git diff --check` passed. The audited
+  `actions/checkout` `v4.4.0` pin remains
+  `11d5960a326750d5838078e36cf38b85af677262`. The canonical engine remains mode
+  `0755` with SHA-256
+  `d0b51c4f2ef65876c1c5675f39038a4c016aa48bacd11d72db8e8c1b88df3d30`;
+  scheduler tests have SHA-256
+  `1b31f5e3da0bf59cec944762e490aed409ed72882044e27fef54f94bd9f56a0b`,
+  and the refreshed source-lock SHA-256 is
+  `b1f87a037fb38428db572cbbec2fa756c1e8c84cb66f194e0563f5d5305839d6`.
 
 ## Installed Host Baseline
 
