@@ -3,7 +3,7 @@ id: 20260723-canonical-sync-engine
 title: Canonical Sync Engine
 status: active
 created: 2026-07-23
-updated: 2026-07-25
+updated: 2026-07-29
 branch: codex/canonical-sync-engine
 pr:
 supersedes: []
@@ -501,6 +501,29 @@ superseded_by:
   `1b31f5e3da0bf59cec944762e490aed409ed72882044e27fef54f94bd9f56a0b`,
   and the refreshed source-lock SHA-256 is
   `b1f87a037fb38428db572cbbec2fa756c1e8c84cb66f194e0563f5d5305839d6`.
+- The next P2 follow-up reserves every home-root release-retention control
+  target, its NFC+casefold portable aliases, and all descendants across active,
+  removed, and replacement manifest routes. Internal retention transaction
+  paths remain covered by the existing reserved `personal-sync/` namespace.
+  Legacy macOS scheduler cleanup now accepts a nonzero `bootout` or `disable`
+  only when the action-specific parser proves the service is already absent.
+  Timeout, permission, and unknown failures abort before conditional removal or
+  current-job activation while the current and legacy config bindings remain
+  live.
+- The final bytes passed the three focused regressions in 0.083 seconds, all
+  119 source-lock tests in 832.095 seconds, and the complete 759-test repository
+  suite in 1329.938 seconds. Independent module gates passed 189 engine tests
+  in 27.121 seconds, 94 scheduler/doctor tests in 4.889 seconds, and 26 toolbox
+  automation tests in 249.926 seconds. Compileall, Ruff lint and changed-range
+  format checks, actionlint, source-lock verification, and `git diff --check`
+  passed. The canonical engine remains mode `0755`; its SHA-256 is
+  `c16f3720ad7845971929f54212f47e8b580ee91614f57049e8b2588b536be2b4`.
+  Manifest and scheduler tests have SHA-256
+  `6485b3c3e320f5a213bb1eb03c45e0a993a9f779f4029c3435624a67ca5d5ace`
+  and
+  `523ca00bf23cb103dfcbf698837e230c8dd79b7fd06efaa2a05ceac8ca82aa43`;
+  the refreshed source-lock SHA-256 is
+  `803a51e187204338e055c1f29801aaee5201c1ab6a675619afb714cee6b7e3a1`.
 
 ## Installed Host Baseline
 

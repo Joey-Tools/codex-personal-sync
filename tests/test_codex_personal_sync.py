@@ -4640,6 +4640,60 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 MODULE._validate_target_path(target, "target")
             portable_key.assert_not_called()
 
+    def test_manifest_rejects_release_retention_control_targets(self) -> None:
+        def payload(route: str, target: str) -> dict[str, object]:
+            active_link: dict[str, object] = {
+                "source": "personal_codex/AGENTS.md",
+                "target": "AGENTS.md",
+                "kind": "file",
+            }
+            data: dict[str, object] = {
+                "version": 1,
+                "links": [active_link],
+            }
+            if route == "active":
+                active_link["target"] = target
+                return data
+            removed_link: dict[str, object] = {
+                "id": "retired",
+                "source": "personal_codex/retired",
+                "target": "skills/retired",
+                "kind": "file",
+            }
+            if route == "removed":
+                removed_link["target"] = target
+            else:
+                removed_link["replacement_target"] = target
+            data["removed_links"] = [removed_link]
+            return data
+
+        for reserved_target in MODULE.RELEASE_RETENTION_CONTROL_TARGETS:
+            exact = reserved_target.as_posix()
+            portable_alias = exact.upper()
+            variants = (
+                ("exact", exact),
+                ("portable-alias", portable_alias),
+                ("descendant", f"{exact}/child"),
+                ("portable-alias-descendant", f"{portable_alias}/child"),
+            )
+            for route in ("active", "removed", "replacement"):
+                for variant, target in variants:
+                    with (
+                        self.subTest(
+                            reserved=exact,
+                            route=route,
+                            variant=variant,
+                        ),
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            "release retention transaction/control path",
+                        ),
+                    ):
+                        MODULE._parse_manifest_data(
+                            payload(route, target),
+                            lambda _path: "file",
+                        )
+
     def test_base_release_repo_requires_owner_repository_form(self) -> None:
         data = {
             "version": 1,

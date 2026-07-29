@@ -206,6 +206,22 @@ RELEASE_RETENTION_BATCH_PREFIX = "release-retention-"
 RELEASE_RETENTION_QUARANTINE_RELATIVE_PATH = (
     QUARANTINE_RELATIVE_PATH / "releases"
 )
+RELEASE_RETENTION_CONTROL_TARGETS = (
+    PurePosixPath(RELEASE_RETENTION_POINTER_NAME),
+    PurePosixPath(RELEASE_RETENTION_CLEAR_MARKER_NAME),
+    PurePosixPath(RELEASE_RETENTION_DELETED_CLEAR_MARKER_NAME),
+)
+MANIFEST_RESERVED_TARGETS = (
+    (SYNC_INTERNAL_TARGET, "sync internal path"),
+    (
+        PurePosixPath(PENDING_LINK_POINTER_NAME),
+        "pending transaction pointer path",
+    ),
+    *(
+        (target, "release retention transaction/control path")
+        for target in RELEASE_RETENTION_CONTROL_TARGETS
+    ),
+)
 RETAINED_RELEASE_PIN_RE = re.compile(
     rf"^{re.escape(PENDING_CLEANUP_RETAINED_PREFIX)}"
     r"([0-9a-f]{40})\.json-[0-9]+-[0-9a-f]{16}$"
@@ -797,14 +813,7 @@ def _validate_target_path(raw: object, field_name: str) -> PurePosixPath:
                 f"{MAX_MANIFEST_TARGET_COMPONENT_BYTES} UTF-8 bytes"
             )
     path_key = _portable_target_key(path)
-    reserved_targets = (
-        (SYNC_INTERNAL_TARGET, "sync internal path"),
-        (
-            PurePosixPath(PENDING_LINK_POINTER_NAME),
-            "pending transaction pointer path",
-        ),
-    )
-    for reserved_target, label in reserved_targets:
+    for reserved_target, label in MANIFEST_RESERVED_TARGETS:
         reserved_key = _portable_target_key(reserved_target)
         if path_key[: len(reserved_key)] == reserved_key:
             raise SyncError(f"{field_name} must not use {label}: {path}")
@@ -20610,7 +20619,6 @@ def _cleanup_legacy_launchd_schedulers(
     dry_run: bool,
     disable: bool,
     remove: bool,
-    native_failure_policy: bool | str = True,
     activation_bindings: tuple[SchedulerActivationBinding, ...] = (),
     retained_legacy_bindings: tuple[SchedulerActivationBinding, ...] | None = None,
 ) -> None:
@@ -20646,13 +20654,13 @@ def _cleanup_legacy_launchd_schedulers(
             _run_native_scheduler_action(
                 ["launchctl", "bootout", domain, str(legacy_plist)],
                 dry_run=dry_run,
-                allow_fail=native_failure_policy,
+                allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
                 activation_bindings=live_bindings(complete_bindings),
             )
             _run_native_scheduler_action(
                 ["launchctl", "disable", f"{domain}/{label}"],
                 dry_run=dry_run,
-                allow_fail=native_failure_policy,
+                allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
                 activation_bindings=live_bindings(complete_bindings),
             )
         if dry_run:
@@ -24147,7 +24155,6 @@ def _uninstall_scheduler_transaction(
                 dry_run=dry_run,
                 disable=disable,
                 remove=True,
-                native_failure_policy=NATIVE_FAILURE_ALREADY_ABSENT,
                 activation_bindings=complete_bindings,
                 retained_legacy_bindings=legacy_bindings,
             )

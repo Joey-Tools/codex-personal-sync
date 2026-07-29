@@ -3295,6 +3295,242 @@ class SchedulerDoctorTests(unittest.TestCase):
             output.getvalue(),
         )
 
+    def test_macos_install_legacy_cleanup_native_failures_stop_migration(
+        self,
+    ) -> None:
+        success = subprocess.CompletedProcess(
+            ["scheduler-action"],
+            0,
+            "",
+            "",
+        )
+        failures: tuple[
+            tuple[str, int, BaseException | subprocess.CompletedProcess[str], str],
+            ...,
+        ] = (
+            (
+                "timeout",
+                0,
+                subprocess.TimeoutExpired(["launchctl", "bootout"], 30),
+                "failed to run launchctl bootout",
+            ),
+            (
+                "permission",
+                0,
+                subprocess.CompletedProcess(
+                    ["launchctl", "bootout"],
+                    1,
+                    "",
+                    "Operation not permitted",
+                ),
+                "Operation not permitted",
+            ),
+            (
+                "unknown",
+                1,
+                subprocess.CompletedProcess(
+                    ["launchctl", "disable"],
+                    1,
+                    "",
+                    "Input/output error",
+                ),
+                "Input/output error",
+            ),
+        )
+        label = MODULE.LEGACY_LAUNCHD_LABELS[0]
+        for failure_kind, failure_call, failure, expected_error in failures:
+            with self.subTest(failure=failure_kind):
+                case_user_home = self.root / f"install-legacy-{failure_kind}" / "home"
+                case_home = case_user_home / ".codex"
+                runner = case_home / "bin" / "codex-personal-sync"
+                runner.parent.mkdir(parents=True)
+                runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                runner.chmod(0o755)
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    paths = MODULE._scheduler_paths("macos", case_home)
+                assert paths.launchd_plist is not None
+                legacy = MODULE._legacy_launchd_plist(paths, label)
+                legacy.parent.mkdir(parents=True)
+                legacy_payload = b"legacy scheduler config\n"
+                legacy.write_bytes(legacy_payload)
+                legacy.chmod(0o600)
+                results: list[BaseException | subprocess.CompletedProcess[str]] = [
+                    success
+                ] * failure_call + [failure]
+                native_calls: list[list[str]] = []
+
+                def run_native(
+                    args: list[str],
+                    **_kwargs: object,
+                ) -> subprocess.CompletedProcess[str]:
+                    native_calls.append(args)
+                    result = results.pop(0)
+                    if isinstance(result, BaseException):
+                        raise result
+                    return result
+
+                output = io.StringIO()
+                with (
+                    mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_native_scheduler_argv",
+                        side_effect=lambda args: args,
+                    ),
+                    mock.patch.object(
+                        MODULE.subprocess,
+                        "run",
+                        side_effect=run_native,
+                    ),
+                    contextlib.redirect_stdout(output),
+                    self.assertRaisesRegex(MODULE.SyncError, expected_error),
+                ):
+                    MODULE.install_scheduler(
+                        case_home,
+                        "owner/public-sync",
+                        17,
+                        "macos",
+                        None,
+                        dry_run=False,
+                        enable=True,
+                    )
+
+                self.assertEqual(results, [])
+                self.assertEqual(len(native_calls), failure_call + 1)
+                self.assertEqual(native_calls[0][1], "bootout")
+                if failure_call:
+                    self.assertEqual(native_calls[1][1], "disable")
+                self.assertFalse(
+                    any(
+                        len(args) > 1 and args[1] in {"bootstrap", "enable"}
+                        for args in native_calls
+                    )
+                )
+                self.assertEqual(legacy.read_bytes(), legacy_payload)
+                self.assertEqual(stat.S_IMODE(legacy.stat().st_mode), 0o600)
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    config = MODULE._load_macos_scheduler_config(paths)
+                self.assertIsNotNone(config)
+                assert config is not None
+                self.assertEqual(config.repo, "owner/public-sync")
+                self.assertNotIn(
+                    "installed macOS launchd scheduler",
+                    output.getvalue(),
+                )
+
+    def test_macos_install_legacy_cleanup_accepts_precise_absence(
+        self,
+    ) -> None:
+        case_user_home = self.root / "install-legacy-already-absent" / "home"
+        case_home = case_user_home / ".codex"
+        runner = case_home / "bin" / "codex-personal-sync"
+        runner.parent.mkdir(parents=True)
+        runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        runner.chmod(0o755)
+        with mock.patch.object(
+            MODULE.Path,
+            "home",
+            return_value=case_user_home,
+        ):
+            paths = MODULE._scheduler_paths("macos", case_home)
+        assert paths.launchd_plist is not None
+        label = MODULE.LEGACY_LAUNCHD_LABELS[0]
+        legacy = MODULE._legacy_launchd_plist(paths, label)
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes(b"legacy scheduler config\n")
+        legacy.chmod(0o600)
+        results = [
+            subprocess.CompletedProcess(
+                ["launchctl", "bootout"],
+                1,
+                "",
+                "Boot-out failed: 3: No such process",
+            ),
+            subprocess.CompletedProcess(
+                ["launchctl", "disable"],
+                1,
+                "",
+                "Could not find specified service",
+            ),
+            *(
+                subprocess.CompletedProcess(
+                    ["scheduler-action"],
+                    0,
+                    "",
+                    "",
+                )
+                for _ in range(3)
+            ),
+        ]
+        native_calls: list[list[str]] = []
+
+        def run_native(
+            args: list[str],
+            **_kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            native_calls.append(args)
+            return results.pop(0)
+
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                MODULE.Path,
+                "home",
+                return_value=case_user_home,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_native_scheduler_argv",
+                side_effect=lambda args: args,
+            ),
+            mock.patch.object(
+                MODULE.subprocess,
+                "run",
+                side_effect=run_native,
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            MODULE.install_scheduler(
+                case_home,
+                "owner/public-sync",
+                17,
+                "macos",
+                None,
+                dry_run=False,
+                enable=True,
+            )
+
+        self.assertEqual(results, [])
+        self.assertEqual(
+            [args[1] for args in native_calls],
+            ["bootout", "disable", "bootout", "bootstrap", "enable"],
+        )
+        self.assertFalse(legacy.exists())
+        with mock.patch.object(
+            MODULE.Path,
+            "home",
+            return_value=case_user_home,
+        ):
+            config = MODULE._load_macos_scheduler_config(paths)
+        self.assertIsNotNone(config)
+        self.assertEqual(
+            output.getvalue().count("ignored already-absent scheduler command"),
+            2,
+        )
+        self.assertIn("installed macOS launchd scheduler", output.getvalue())
+
     def test_macos_install_retains_legacy_absence_through_current_actions(
         self,
     ) -> None:
