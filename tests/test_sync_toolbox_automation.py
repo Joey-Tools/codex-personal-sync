@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -19,6 +20,51 @@ CHECKOUT_COMMIT = "11d5960a326750d5838078e36cf38b85af677262"
 SYNTHETIC_ACCESS_TOKEN_ID = "access-a"
 SYNTHETIC_ACCESS_TOKEN = "codex_synth_v1_access_a"
 FULL_COMMIT_ACTION_RE = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
+ISOLATED_GENERATOR_RUNNER_SOURCE = """\
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+import sys
+
+
+sys.dont_write_bytecode = True
+generator_path = Path(sys.argv[1])
+private_control_parent = Path(sys.argv[2])
+spec = importlib.util.spec_from_file_location(
+    "sync_canonical_mirrors_isolated_test_runner",
+    generator_path,
+)
+if spec is None or spec.loader is None:
+    raise RuntimeError(f"cannot load generator from {generator_path}")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module.PRIVATE_GIT_CONTROL_PARENT = private_control_parent
+raise SystemExit(module.main(sys.argv[3:]))
+"""
+
+
+def _isolated_generator_command(
+    root: Path,
+    generator_path: Path,
+    interpreter: str,
+    *arguments: str,
+) -> list[str]:
+    runner = root / "run-sync-canonical-mirrors.py"
+    private_control_parent = root / "mirror-private-control"
+    private_control_parent.mkdir(mode=0o700, exist_ok=True)
+    runner.write_text(
+        ISOLATED_GENERATOR_RUNNER_SOURCE,
+        encoding="utf-8",
+    )
+    return [
+        interpreter,
+        str(runner),
+        str(generator_path),
+        str(private_control_parent),
+        *arguments,
+    ]
 
 
 class StrictWorkflowYamlError(ValueError):
@@ -2052,9 +2098,10 @@ jobs:
 
             def generate(target_root: Path, source_commit: str) -> None:
                 completed = subprocess.run(
-                    [
+                    _isolated_generator_command(
+                        root,
+                        canonical_scripts / "sync_canonical_mirrors.py",
                         python,
-                        str(canonical_scripts / "sync_canonical_mirrors.py"),
                         "generate",
                         "--target-root",
                         str(target_root),
@@ -2062,7 +2109,7 @@ jobs:
                         "toolbox",
                         "--source-commit",
                         source_commit,
-                    ],
+                    ),
                     cwd=REPOSITORY_ROOT,
                     capture_output=True,
                     text=True,
@@ -2132,6 +2179,34 @@ jobs:
             base64 = fake_bin / "base64"
             base64.write_text("#!/bin/sh\ncat\n", encoding="utf-8")
             base64.chmod(0o755)
+            isolated_generator_command = _isolated_generator_command(
+                root,
+                canonical_scripts / "sync_canonical_mirrors.py",
+                python,
+            )
+            python_shim = fake_bin / "python3"
+            python_shim.write_text(
+                (
+                    "#!/bin/sh\n"
+                    'case "$1" in\n'
+                    "  */sync_canonical_mirrors.py)\n"
+                    '    generator_path="$1"\n'
+                    "    shift\n"
+                    f"    exec {shlex.quote(python)} "
+                    f"{shlex.quote(isolated_generator_command[1])} "
+                    '"${generator_path}" '
+                    f"{shlex.quote(isolated_generator_command[3])} "
+                    '"$@"\n'
+                    "    ;;\n"
+                    "  *)\n"
+                    f"    exec {shlex.quote(python)} "
+                    '"$@"\n'
+                    "    ;;\n"
+                    "esac\n"
+                ),
+                encoding="utf-8",
+            )
+            python_shim.chmod(0o755)
             fixture_config = fixture_home / ".gitconfig"
             fixture_config.write_text(
                 (
@@ -2883,9 +2958,10 @@ class SyncBranchHistoryValidationTests(unittest.TestCase):
             encoding="utf-8",
         )
         return subprocess.run(
-            [
+            _isolated_generator_command(
+                self.root,
+                REPOSITORY_ROOT / "scripts" / "sync_canonical_mirrors.py",
                 "python3",
-                str(REPOSITORY_ROOT / "scripts" / "sync_canonical_mirrors.py"),
                 "validate-branch-history",
                 "--target-root",
                 str(self.repository),
@@ -2896,7 +2972,7 @@ class SyncBranchHistoryValidationTests(unittest.TestCase):
                 "--allowed-paths-file",
                 str(self.allowed_paths_file),
                 *extra_arguments,
-            ],
+            ),
             cwd=REPOSITORY_ROOT,
             capture_output=True,
             text=True,

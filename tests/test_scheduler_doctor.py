@@ -73,8 +73,18 @@ class SchedulerDoctorTests(unittest.TestCase):
             return_value=self.user_home,
         )
         self.path_home_patch.start()
+        self.host_mirror_private_control_parent = MODULE.MIRROR_PRIVATE_CONTROL_PARENT
+        self.mirror_private_control_parent = self.root / "mirror-private-control"
+        self.mirror_private_control_parent.mkdir()
+        self.mirror_private_control_parent_patch = mock.patch.object(
+            MODULE,
+            "MIRROR_PRIVATE_CONTROL_PARENT",
+            self.mirror_private_control_parent,
+        )
+        self.mirror_private_control_parent_patch.start()
 
     def tearDown(self) -> None:
+        self.mirror_private_control_parent_patch.stop()
         self.path_home_patch.stop()
         self.tmpdir.cleanup()
 
@@ -922,6 +932,25 @@ class SchedulerDoctorTests(unittest.TestCase):
                 "release_integrity": [],
                 "quarantine_batches": 0,
                 "quarantine_limit": MODULE.MAX_RETAINED_QUARANTINE_BATCHES,
+                "mirror_quarantine": {
+                    "classification": "absent",
+                    "path": str(
+                        self.mirror_private_control_parent
+                        / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+                    ),
+                    "entry_count": 0,
+                    "entry_limit": (MODULE.MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT),
+                    "segment_name": (MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME),
+                    "segment_entry_count": 0,
+                    "segment_entry_limit": (
+                        MODULE.MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT
+                    ),
+                    "count_is_lower_bound": False,
+                    "segment_identity": None,
+                    "segment_access_policy": None,
+                    "owner_records": [],
+                    "detail": None,
+                },
                 "failure_code": None,
                 "failure_reason": "network unavailable",
                 "daemon_query": {
@@ -8115,6 +8144,471 @@ class SchedulerDoctorTests(unittest.TestCase):
             saturated[0].detail,
         )
         self.assertEqual(snapshot_tree(quarantine), before)
+
+    def test_doctor_reports_mirror_quarantine_recovery_without_mutation(
+        self,
+    ) -> None:
+        quarantine = (
+            self.mirror_private_control_parent
+            / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+        )
+        quarantine.mkdir(mode=0o700)
+        for index in range(2):
+            evidence = quarantine / f"transient-evidence-{index}"
+            evidence.write_bytes(f"evidence {index}\n".encode())
+            evidence.chmod(0o600)
+
+        tool_root = (
+            self.mirror_private_control_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        )
+        tool_root.mkdir(mode=0o700)
+        private_name = (
+            f"sync-canonical-git-control.{os.getpid()}.0123456789abcdef0123456789abcdef"
+        )
+        owner_name = f"{private_name}.owner.json"
+        owner_nonce = "fedcba9876543210fedcba9876543210"
+        expected_private_identity = [123, 456, stat.S_IFDIR]
+        owner_path = tool_root / owner_name
+        owner_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "owner_pid": os.getpid(),
+                    "owner_uid": os.geteuid(),
+                    "owner_gid": os.getegid(),
+                    "owner_nonce": owner_nonce,
+                    "phase": "cleanup",
+                    "private_name": private_name,
+                    "private_identity": expected_private_identity,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        owner_path.chmod(0o600)
+        before = snapshot_tree(self.mirror_private_control_parent)
+        real_bind = MODULE._bind_mirror_audit_directory
+        observed_bind_paths = []
+
+        def reject_default_host_parent(path, label):
+            candidate = Path(os.path.abspath(path))
+            self.assertNotEqual(
+                candidate,
+                self.host_mirror_private_control_parent,
+            )
+            observed_bind_paths.append(candidate)
+            return real_bind(path, label)
+
+        doctor_output = io.StringIO()
+        strict_output = io.StringIO()
+        with (
+            mock.patch.object(
+                MODULE,
+                "MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT",
+                2,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_bind_mirror_audit_directory",
+                side_effect=reject_default_host_parent,
+            ),
+        ):
+            with contextlib.redirect_stdout(doctor_output):
+                report, issues = MODULE.doctor(
+                    self.home,
+                    "linux",
+                    json_output=True,
+                )
+            with contextlib.redirect_stdout(strict_output):
+                strict_status = MODULE.main(
+                    [
+                        "status-scheduler",
+                        "--home",
+                        str(self.home),
+                        "--platform",
+                        "linux",
+                        "--json",
+                        "--strict",
+                    ]
+                )
+
+        self.assertEqual(strict_status, 1)
+        audit = report.mirror_quarantine
+        assert audit is not None
+        self.assertEqual(audit.classification, "saturated")
+        self.assertEqual(audit.entry_count, 2)
+        self.assertEqual(audit.entry_limit, 2)
+        self.assertFalse(audit.count_is_lower_bound)
+        self.assertEqual(
+            audit.segment_identity,
+            MODULE._mirror_object_identity(quarantine.stat()),
+        )
+        self.assertEqual(len(audit.owner_records), 1)
+        owner_record = audit.owner_records[0]
+        self.assertEqual(owner_record.name, owner_name)
+        self.assertEqual(owner_record.state, "stale")
+        self.assertEqual(owner_record.owner_nonce, owner_nonce)
+        self.assertEqual(owner_record.phase, "cleanup")
+        self.assertEqual(owner_record.private_name, private_name)
+        self.assertEqual(
+            owner_record.expected_private_identity,
+            tuple(expected_private_identity),
+        )
+        self.assertEqual(owner_record.private_state, "missing")
+        self.assertIsNotNone(owner_record.sha256)
+        self.assertIn(
+            "mirror-quarantine-saturated",
+            {issue.code for issue in issues},
+        )
+        payload = json.loads(doctor_output.getvalue())
+        self.assertEqual(
+            payload["scheduler"]["mirror_quarantine"]["classification"],
+            "saturated",
+        )
+        self.assertEqual(
+            payload["scheduler"]["mirror_quarantine"]["owner_records"][0][
+                "owner_nonce"
+            ],
+            owner_nonce,
+        )
+        self.assertEqual(
+            observed_bind_paths,
+            [
+                self.mirror_private_control_parent,
+                self.mirror_private_control_parent,
+            ],
+        )
+        self.assertEqual(
+            snapshot_tree(self.mirror_private_control_parent),
+            before,
+        )
+
+    def test_scheduler_status_reports_mirror_quarantine_audit_inconclusive(
+        self,
+    ) -> None:
+        (
+            self.mirror_private_control_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        ).mkdir(mode=0o700)
+        quarantine = (
+            self.mirror_private_control_parent
+            / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+        )
+        quarantine.mkdir(mode=0o700)
+        quarantine.chmod(0o755)
+        before = snapshot_tree(self.mirror_private_control_parent)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            report = MODULE.status_scheduler(
+                self.home,
+                "linux",
+                json_output=True,
+            )
+
+        audit = report.mirror_quarantine
+        assert audit is not None
+        self.assertEqual(audit.classification, "inconclusive")
+        self.assertIn(
+            "must be mode 0700",
+            audit.detail,
+        )
+        self.assertIn(
+            "mirror-quarantine-audit-inconclusive",
+            {code for code, _detail in report.failures},
+        )
+        self.assertEqual(
+            snapshot_tree(self.mirror_private_control_parent),
+            before,
+        )
+
+    def test_mirror_quarantine_audit_holds_directory_leases_without_mutation(
+        self,
+    ) -> None:
+        tool_root = (
+            self.mirror_private_control_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        )
+        quarantine = (
+            self.mirror_private_control_parent
+            / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+        )
+        tool_root.mkdir(mode=0o700)
+        quarantine.mkdir(mode=0o700)
+        private_name = (
+            f"sync-canonical-git-control.{os.getpid()}.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        )
+        owner_path = tool_root / f"{private_name}.owner.json"
+        owner_path.write_text(
+            json.dumps(
+                {
+                    "version": MODULE.MIRROR_PRIVATE_OWNER_RECORD_VERSION,
+                    "owner_pid": os.getpid(),
+                    "owner_uid": os.geteuid(),
+                    "owner_gid": os.getegid(),
+                    "owner_nonce": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "phase": "cleanup",
+                    "private_name": private_name,
+                    "private_identity": [123, 456, stat.S_IFDIR],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        owner_path.chmod(0o600)
+        before = snapshot_tree(self.mirror_private_control_parent)
+        real_inventory = MODULE._bounded_mirror_directory_names
+        observed_lock_order: list[str] = []
+
+        def assert_shared_lease(directory_fd, *, limit, label):
+            path = tool_root if label == "mirror private tool root" else quarantine
+            contender_fd = os.open(path, MODULE._source_directory_flags())
+            try:
+                with self.assertRaises(BlockingIOError):
+                    MODULE.fcntl.flock(
+                        contender_fd,
+                        MODULE.fcntl.LOCK_EX | MODULE.fcntl.LOCK_NB,
+                    )
+            finally:
+                os.close(contender_fd)
+            observed_lock_order.append(label)
+            return real_inventory(
+                directory_fd,
+                limit=limit,
+                label=label,
+            )
+
+        with mock.patch.object(
+            MODULE,
+            "_bounded_mirror_directory_names",
+            side_effect=assert_shared_lease,
+        ):
+            audit = MODULE._mirror_quarantine_audit()
+
+        self.assertEqual(audit.classification, "available")
+        self.assertEqual(audit.entry_count, 0)
+        self.assertEqual(
+            observed_lock_order,
+            [
+                "mirror private tool root",
+                "mirror durable quarantine segment",
+            ],
+        )
+        self.assertEqual(len(audit.owner_records), 1)
+        self.assertEqual(audit.owner_records[0].state, "stale")
+        self.assertEqual(
+            snapshot_tree(self.mirror_private_control_parent),
+            before,
+        )
+
+    def test_mirror_quarantine_audit_reports_busy_tool_root_without_scanning(
+        self,
+    ) -> None:
+        tool_root = (
+            self.mirror_private_control_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        )
+        quarantine = (
+            self.mirror_private_control_parent
+            / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+        )
+        tool_root.mkdir(mode=0o700)
+        quarantine.mkdir(mode=0o700)
+        before = snapshot_tree(self.mirror_private_control_parent)
+        tool_fd = os.open(tool_root, MODULE._source_directory_flags())
+        try:
+            MODULE.fcntl.flock(tool_fd, MODULE.fcntl.LOCK_EX)
+            audit = MODULE._mirror_quarantine_audit()
+        finally:
+            MODULE.fcntl.flock(tool_fd, MODULE.fcntl.LOCK_UN)
+            os.close(tool_fd)
+
+        self.assertEqual(audit.classification, "inconclusive")
+        self.assertIsNone(audit.entry_count)
+        self.assertIn("busy with an active writer", audit.detail)
+        self.assertEqual(
+            snapshot_tree(self.mirror_private_control_parent),
+            before,
+        )
+
+    def test_mirror_quarantine_audit_does_not_lock_without_coordination_root(
+        self,
+    ) -> None:
+        quarantine = (
+            self.mirror_private_control_parent
+            / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+        )
+        quarantine.mkdir(mode=0o700)
+        before = snapshot_tree(self.mirror_private_control_parent)
+
+        with mock.patch.object(
+            MODULE,
+            "_acquire_mirror_audit_shared_lock",
+        ) as acquire:
+            audit = MODULE._mirror_quarantine_audit()
+
+        acquire.assert_not_called()
+        self.assertEqual(audit.classification, "inconclusive")
+        self.assertIsNone(audit.entry_count)
+        self.assertIn(
+            "exists without its coordination tool root",
+            audit.detail,
+        )
+        self.assertEqual(
+            snapshot_tree(self.mirror_private_control_parent),
+            before,
+        )
+
+    def test_mirror_quarantine_audit_classifies_deep_owner_json_as_invalid(
+        self,
+    ) -> None:
+        tool_root = (
+            self.mirror_private_control_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        )
+        quarantine = (
+            self.mirror_private_control_parent
+            / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+        )
+        tool_root.mkdir(mode=0o700)
+        quarantine.mkdir(mode=0o700)
+        private_name = (
+            f"sync-canonical-git-control.{os.getpid()}.cccccccccccccccccccccccccccccccc"
+        )
+        owner_path = tool_root / f"{private_name}.owner.json"
+        owner_path.write_bytes(b"[" * 1_200 + b"0" + b"]" * 1_200)
+        owner_path.chmod(0o600)
+        before = snapshot_tree(self.mirror_private_control_parent)
+
+        audit = MODULE._mirror_quarantine_audit()
+
+        self.assertEqual(audit.classification, "available")
+        self.assertEqual(len(audit.owner_records), 1)
+        self.assertEqual(audit.owner_records[0].state, "invalid")
+        self.assertIn("schema", audit.owner_records[0].detail)
+        self.assertEqual(
+            snapshot_tree(self.mirror_private_control_parent),
+            before,
+        )
+
+    def test_mirror_quarantine_audit_detects_final_access_policy_drift(
+        self,
+    ) -> None:
+        (
+            self.mirror_private_control_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        ).mkdir(mode=0o700)
+        quarantine = (
+            self.mirror_private_control_parent
+            / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+        )
+        quarantine.mkdir(mode=0o700)
+        before = snapshot_tree(self.mirror_private_control_parent)
+        real_revalidate = MODULE._revalidate_mirror_audit_directory
+        quarantine_revalidations = 0
+
+        def mutate_after_first_quarantine_revalidation(
+            path,
+            directory_fd,
+            identity,
+            access_policy,
+            label,
+        ):
+            nonlocal quarantine_revalidations
+            real_revalidate(
+                path,
+                directory_fd,
+                identity,
+                access_policy,
+                label,
+            )
+            if (
+                label == "mirror durable quarantine segment"
+                and quarantine_revalidations == 0
+            ):
+                quarantine.chmod(0o755)
+                quarantine_revalidations += 1
+
+        try:
+            with mock.patch.object(
+                MODULE,
+                "_revalidate_mirror_audit_directory",
+                side_effect=mutate_after_first_quarantine_revalidation,
+            ):
+                audit = MODULE._mirror_quarantine_audit()
+        finally:
+            quarantine.chmod(0o700)
+
+        self.assertEqual(audit.classification, "inconclusive")
+        self.assertIn("access policy changed during audit", audit.detail)
+        self.assertEqual(
+            snapshot_tree(self.mirror_private_control_parent),
+            before,
+        )
+
+    def test_mirror_quarantine_handoff_lists_only_durable_recovery_records(
+        self,
+    ) -> None:
+        def owner(
+            name: str,
+            *,
+            state: str,
+            private_state: str | None,
+        ) -> MODULE.MirrorQuarantineOwnerRecord:
+            return MODULE.MirrorQuarantineOwnerRecord(
+                name=name,
+                identity=(1, 2, stat.S_IFREG),
+                access_policy=(0o600, os.geteuid(), os.getegid()),
+                sha256="a" * 64,
+                state=state,
+                owner_pid=123,
+                owner_nonce="b" * 32,
+                phase="cleanup",
+                private_name=f"{name}.private",
+                expected_private_identity=(3, 4, stat.S_IFDIR),
+                observed_private_identity=(
+                    (3, 4, stat.S_IFDIR)
+                    if private_state in {"matching", "mismatched"}
+                    else None
+                ),
+                private_state=private_state,
+            )
+
+        audit = MODULE.MirrorQuarantineAudit(
+            classification="saturated",
+            path=(
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+            ),
+            entry_count=10,
+            entry_limit=10,
+            count_is_lower_bound=False,
+            segment_identity=(5, 6, stat.S_IFDIR),
+            segment_access_policy=(0o700, os.geteuid(), os.getegid()),
+            owner_records=(
+                owner("missing.owner.json", state="stale", private_state="missing"),
+                owner(
+                    "matching.owner.json",
+                    state="stale",
+                    private_state="matching",
+                ),
+                owner(
+                    "mismatched.owner.json",
+                    state="stale",
+                    private_state="mismatched",
+                ),
+                owner("invalid.owner.json", state="invalid", private_state=None),
+                owner("active.owner.json", state="active", private_state=None),
+            ),
+        )
+
+        detail = MODULE._mirror_quarantine_failure_detail(audit)
+
+        self.assertIn("missing.owner.json", detail)
+        self.assertIn("matching.owner.json", detail)
+        self.assertIn("sha256=" + "a" * 64, detail)
+        self.assertIn("nonce=" + "b" * 32, detail)
+        self.assertNotIn("mismatched.owner.json", detail)
+        self.assertNotIn("invalid.owner.json", detail)
+        self.assertNotIn("active.owner.json", detail)
 
     def test_native_scheduler_commands_use_closed_environment(self) -> None:
         completed = MODULE.subprocess.CompletedProcess(

@@ -97,12 +97,22 @@ the receipt, transaction markers, or per-target exchange journals.
 
 The live Git binding includes `HEAD`, its resolved loose ref when present,
 `packed-refs`, common/worktree config, the index, and explicit absence records
-for optional controls. A fixed isolated Python launcher changes directory by
-the private Git directory descriptor before `execve`; no Python `preexec_fn`
-or pathname cwd is used. Private snapshots live below a durable mode-0700,
-current-owner tool root outside both repositories. Locked owner/phase records
-make active snapshots distinguishable from bounded stale cleanup; invalid or
-identity-ambiguous leftovers are quarantined rather than deleted by pathname.
+for optional controls. The source Git executable is identity/access-bound and
+double-read into a SHA-256 content binding, then copied with exclusive creation
+and rebound as a mode-0500 executable inside the private snapshot. Git launches
+use that verified snapshot as `Popen(executable=...)` while the single-threaded
+parent changes directory through the retained repository/private-snapshot
+descriptor; no Python re-exec, `preexec_fn`, or pathname cwd is used. On macOS,
+the sealed-system `/usr/bin/xcrun` locator selects the ordinary developer-tool
+Git binary because the `/usr/bin/git` platform shim cannot execute from a byte
+copy. The protected launch property is the exact snapshot byte sequence, not
+macOS descriptor execution. Snapshot identity, bytes, and access policy are
+revalidated immediately around each spawn. Private snapshots live below a
+durable mode-0700, current-owner tool root outside both repositories; that
+namespace excludes unauthorized other users but is not claimed to stop a
+hostile same-UID process. Locked owner/phase records make active snapshots
+distinguishable from bounded stale cleanup; invalid or identity-ambiguous
+leftovers are quarantined rather than deleted by pathname.
 Expected owner-record cleanup moves the exact file into a separate durable
 quarantine beside the private-control parent, on the same verified filesystem;
 stale-owner recovery uses that same explicit placement even when the consumer
@@ -117,8 +127,31 @@ before a source pathname moves. At exactly 10,000 entries, the quarantine can
 still be opened to validate and diagnose journal-bound recovery, but cleanup
 that would retain another journal is blocked before that journal moves and the
 active journal remains in place until identity-aware maintenance frees
-capacity. The no-op path below prevents unchanged scheduled runs from creating
-additional retained artifacts.
+capacity. Every operation that reaches private Git binding retains the exact
+owner-cleanup evidence, including `refresh-lock --check` and a target-level
+`generate` no-op. The no-op path below prevents only target transaction and
+target-sibling quarantine churn; it does not suppress private-control evidence
+growth.
+
+`status-scheduler` and `doctor` audit this private quarantine without modifying
+it. They bind the current-owner tool root first, take a nonblocking shared
+lease, then bind and lease the durable quarantine in the generator's
+tool-root-to-quarantine order. If a quarantine exists without that
+coordination root, the audit reports inconclusive without taking a quarantine
+lease. A concurrent writer, unstable namespace,
+replacement, access-policy change, or unreadable evidence reports
+`mirror-quarantine-audit-inconclusive`; an exact-capacity segment reports
+`mirror-quarantine-saturated`. JSON includes the exact segment path, name,
+identity, access policy, count/cap, and bounded owner recovery records. Strict
+status and doctor exit unhealthy for either classification.
+
+The current flat quarantine has no automatic rollover. Existing version-2
+exchange journals store only a quarantine basename, so searching that name
+across new segments would make recovery ambiguous. Safe segmented retention
+requires a separately reviewed journal-locator migration plus global
+entry/logical/allocated-byte ceilings. Until that work lands, a saturated
+production quarantine remains a blocking maintenance condition; status
+reporting does not claim to repair it.
 All source reads and Git stdout use the same 32 MiB per-file/per-command
 contract, while one shared operation deadline and aggregate byte/entry budget
 cover snapshotting, Git execution, recovery, generation, and cleanup.

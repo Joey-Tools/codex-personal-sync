@@ -36,6 +36,7 @@ GENERATOR_CONTRACT_VERSION = 2
 RULES_CONTRACT_VERSION = 1
 HASH_ALGORITHM = "sha256"
 GIT_EXECUTABLE = Path("/usr/bin/git")
+MACOS_GIT_LOCATOR_EXECUTABLE = Path("/usr/bin/xcrun")
 GIT_DERIVED_CACHE_DISABLE_ARGUMENTS = (
     "-c",
     "core.commitGraph=false",
@@ -46,6 +47,23 @@ PRIVATE_GIT_CONTROL_PARENT = Path(
     "/private/tmp" if sys.platform == "darwin" else "/var/tmp"
 )
 PRIVATE_TOOL_ROOT_NAME = "codex-sync-canonical-mirrors"
+PRIVATE_OWNER_RECORD_VERSION = 1
+PRIVATE_OWNER_RECORD_FIELDS = frozenset(
+    {
+        "version",
+        "owner_pid",
+        "owner_uid",
+        "owner_gid",
+        "owner_nonce",
+        "phase",
+        "private_name",
+        "private_identity",
+    }
+)
+PRIVATE_OWNER_RECORD_PHASES = frozenset({"building", "ready", "cleanup"})
+MAX_PRIVATE_OWNER_RECORD_BYTES = 4096
+PRIVATE_GIT_EXECUTABLE_PREFIX = ".bound-git-executable."
+MAX_PRIVATE_GIT_EXECUTABLE_ATTEMPTS = 32
 DURABLE_QUARANTINE_ROOT_NAME = ".codex-sync-canonical-mirror-quarantine"
 MAX_DURABLE_QUARANTINE_ENTRIES = 10_000
 QUARANTINE_RECOVERY_KIND = "recovery"
@@ -60,6 +78,7 @@ GIT_CLEANUP_TIMEOUT_SECONDS = 5
 MINIMUM_GIT_VERSION = (2, 45, 0)
 MAX_GIT_VERSION_STDOUT_BYTES = 1024
 MAX_GIT_VERSION_STDERR_BYTES = 4096
+MAX_GIT_LOCATOR_STDOUT_BYTES = 4096
 MAX_GIT_SNAPSHOT_ENTRIES = 100_000
 MAX_GIT_SNAPSHOT_BYTES = 512 * 1024 * 1024
 MAX_CONSUMER_TRACKED_ENTRIES = 100_000
@@ -244,6 +263,7 @@ class BoundRoot:
     access_policy: tuple[int, int, int]
     exclusive: bool
     git_executable: ControlObjectBinding
+    private_git_executable: PrivateGitExecutableBinding | None = None
     git_control: GitControlBinding | None = None
     git_capability_verified: bool = False
     operation: OperationBudget | None = None
@@ -274,6 +294,20 @@ class ControlAbsenceBinding:
 
 
 @dataclass
+class PrivateGitExecutableBinding:
+    private_parent: ControlObjectBinding
+    private: ControlObjectBinding
+    private_name: str
+    private_path: Path
+    executable_name: str
+    executable: ControlObjectBinding
+    private_manifest: tuple[tuple[object, ...], ...]
+    owner_record: ControlObjectBinding
+    owner_record_name: str
+    owner_nonce: str
+
+
+@dataclass
 class ControlNameSetBinding:
     label: str
     parent: ControlObjectBinding
@@ -295,9 +329,12 @@ class GitControlBinding:
     private_parent: ControlObjectBinding
     private: ControlObjectBinding
     private_objects: ControlObjectBinding
+    private_git_executable: ControlObjectBinding
+    private_git_executable_name: str
     private_name: str
     private_path: Path
     private_manifest: tuple[tuple[object, ...], ...]
+    private_cleanup_manifest: tuple[tuple[object, ...], ...]
     private_objects_manifest: tuple[tuple[object, ...], ...]
     owner_record: ControlObjectBinding
     owner_record_name: str
@@ -882,6 +919,7 @@ def _snapshot_git_directory_tree(
     budget: dict[str, int],
     operation: OperationBudget | None = None,
     skip_descendants: frozenset[PurePosixPath] = frozenset(),
+    skip_entries: frozenset[PurePosixPath] = frozenset(),
 ) -> list[tuple[object, ...]]:
     _operation_checkpoint(operation, f"snapshotting Git control tree {prefix}")
     try:
@@ -897,6 +935,8 @@ def _snapshot_git_directory_tree(
                 f"Git control directory has an unsafe entry: {name!r}"
             )
         relative_path = prefix / name
+        if relative_path in skip_entries:
+            continue
         budget["entries"] += 1
         _consume_operation_budget(
             operation,
@@ -970,6 +1010,7 @@ def _snapshot_git_directory_tree(
                             budget=budget,
                             operation=operation,
                             skip_descendants=skip_descendants,
+                            skip_entries=skip_entries,
                         )
                     )
             finally:
@@ -1086,6 +1127,7 @@ def _scan_private_git_tree(
     operation: OperationBudget | None = None,
     *,
     skip_descendants: frozenset[PurePosixPath] = frozenset(),
+    skip_entries: frozenset[PurePosixPath] = frozenset(),
 ) -> tuple[tuple[object, ...], ...]:
     first_budget = {"entries": 0, "bytes": 0}
     first = _snapshot_git_directory_tree(
@@ -1095,6 +1137,7 @@ def _scan_private_git_tree(
         budget=first_budget,
         operation=operation,
         skip_descendants=skip_descendants,
+        skip_entries=skip_entries,
     )
     second_budget = {"entries": 0, "bytes": 0}
     second = _snapshot_git_directory_tree(
@@ -1104,6 +1147,7 @@ def _scan_private_git_tree(
         budget=second_budget,
         operation=operation,
         skip_descendants=skip_descendants,
+        skip_entries=skip_entries,
     )
     first_logical = _logical_git_snapshot_manifest(first)
     second_logical = _logical_git_snapshot_manifest(second)
@@ -1117,11 +1161,14 @@ def _scan_private_git_tree(
 def _scan_private_git_control(
     private_fd: int,
     operation: OperationBudget | None = None,
+    *,
+    skip_entries: frozenset[PurePosixPath] = frozenset(),
 ) -> tuple[tuple[object, ...], ...]:
     return _scan_private_git_tree(
         private_fd,
         operation,
         skip_descendants=frozenset({PRIVATE_OBJECTS_PATH}),
+        skip_entries=skip_entries,
     )
 
 
@@ -1472,7 +1519,7 @@ def _owner_record_payload(
     return (
         json.dumps(
             {
-                "version": 1,
+                "version": PRIVATE_OWNER_RECORD_VERSION,
                 "owner_pid": os.getpid(),
                 "owner_uid": os.geteuid(),
                 "owner_gid": os.getegid(),
@@ -1640,6 +1687,290 @@ def _create_private_git_directory(
     )
 
 
+def _create_owned_private_directory(
+    root: BoundRoot,
+    admin: ControlObjectBinding,
+    common: ControlObjectBinding,
+) -> tuple[
+    ControlObjectBinding,
+    str,
+    Path,
+    ControlObjectBinding,
+    ControlObjectBinding,
+    str,
+    str,
+]:
+    private_parent = _bind_private_tool_root(
+        root,
+        admin,
+        common,
+    )
+    private_name: str | None = None
+    private: ControlObjectBinding | None = None
+    root_locked = False
+    try:
+        fcntl.flock(
+            private_parent.fd,
+            fcntl.LOCK_EX | fcntl.LOCK_NB,
+        )
+        root_locked = True
+    except BlockingIOError as error:
+        os.close(private_parent.fd)
+        raise MirrorSyncError(
+            "private Git tool root is busy with another bounded "
+            "snapshot/recovery publication"
+        ) from error
+    try:
+        _recover_stale_private_snapshots(root, private_parent)
+        private_name, private_path, private = _create_private_git_directory(
+            private_parent
+        )
+        owner_name, owner_nonce, owner_record = _create_owner_record(
+            root,
+            private_parent,
+            private_name,
+            private,
+        )
+        return (
+            private_parent,
+            private_name,
+            private_path,
+            private,
+            owner_record,
+            owner_name,
+            owner_nonce,
+        )
+    except BaseException:
+        if private is not None and private_name is not None:
+            try:
+                _remove_bound_private_directory(
+                    root,
+                    private_parent,
+                    private,
+                    private_name,
+                    None,
+                )
+            finally:
+                os.close(private.fd)
+        if root_locked:
+            fcntl.flock(private_parent.fd, fcntl.LOCK_UN)
+            root_locked = False
+        os.close(private_parent.fd)
+        raise
+    finally:
+        if root_locked:
+            fcntl.flock(private_parent.fd, fcntl.LOCK_UN)
+
+
+def _snapshot_bound_git_executable(
+    root: BoundRoot,
+    private: ControlObjectBinding,
+) -> tuple[str, ControlObjectBinding]:
+    if private.path is None:
+        raise MirrorSyncError("private Git control snapshot must have an absolute path")
+    source = root.git_executable
+    if source.content_digest is None:
+        raise MirrorSyncError("Git executable source bytes are not bound")
+
+    _revalidate_control_object(root, source)
+    payload = _bound_control_payload(source)
+    _consume_operation_budget(
+        root.operation,
+        byte_count=len(payload),
+        label="snapshotting the bound Git executable",
+    )
+
+    for _attempt in range(MAX_PRIVATE_GIT_EXECUTABLE_ATTEMPTS):
+        name = f"{PRIVATE_GIT_EXECUTABLE_PREFIX}{secrets.token_hex(16)}"
+        destination_fd = -1
+        snapshot_fd = -1
+        try:
+            destination_fd = os.open(
+                name,
+                _FILE_WRITE_FLAGS,
+                0o500,
+                dir_fd=private.fd,
+            )
+            os.fchmod(destination_fd, 0o500)
+            os.fchown(destination_fd, os.geteuid(), os.getegid())
+            _write_all(
+                destination_fd,
+                payload,
+                PurePosixPath(name),
+            )
+            os.fsync(destination_fd)
+            written_metadata = os.fstat(destination_fd)
+            if (
+                not stat.S_ISREG(written_metadata.st_mode)
+                or _access_policy(written_metadata)
+                != (0o500, os.geteuid(), os.getegid())
+                or written_metadata.st_size != len(payload)
+            ):
+                raise MirrorSyncError(
+                    "private Git executable snapshot has invalid written state"
+                )
+            os.close(destination_fd)
+            destination_fd = -1
+
+            path_metadata = os.stat(
+                name,
+                dir_fd=private.fd,
+                follow_symlinks=False,
+            )
+            snapshot_fd = os.open(
+                name,
+                _FILE_READ_FLAGS,
+                dir_fd=private.fd,
+            )
+            opened_metadata = os.fstat(snapshot_fd)
+            if (
+                not stat.S_ISREG(path_metadata.st_mode)
+                or _object_identity(path_metadata) != _object_identity(opened_metadata)
+                or _access_policy(path_metadata) != _access_policy(opened_metadata)
+                or _object_identity(opened_metadata)
+                != _object_identity(written_metadata)
+                or _access_policy(opened_metadata)
+                != (0o500, os.geteuid(), os.getegid())
+            ):
+                raise MirrorSyncError(
+                    "private Git executable snapshot changed while reopening it"
+                )
+            content_digest = _control_content_digest(
+                snapshot_fd,
+                "private Git executable snapshot",
+            )
+            if content_digest != source.content_digest:
+                raise MirrorSyncError(
+                    "private Git executable snapshot differs from bound source bytes"
+                )
+            binding = ControlObjectBinding(
+                label="private Git executable snapshot",
+                path=private.path / name,
+                relative_path=None,
+                fd=snapshot_fd,
+                identity=_object_identity(opened_metadata),
+                access_policy=_access_policy(opened_metadata),
+                content_digest=content_digest,
+            )
+            os.fsync(private.fd)
+            _revalidate_control_object(root, source)
+            _revalidate_control_object(root, binding)
+            snapshot_fd = -1
+            return name, binding
+        except FileExistsError:
+            continue
+        except BaseException:
+            if snapshot_fd >= 0:
+                os.close(snapshot_fd)
+            raise
+        finally:
+            if destination_fd >= 0:
+                os.close(destination_fd)
+    raise MirrorSyncError("cannot allocate a unique private Git executable snapshot")
+
+
+def _prepare_private_git_executable(
+    root: BoundRoot,
+    admin: ControlObjectBinding,
+    common: ControlObjectBinding,
+) -> PrivateGitExecutableBinding:
+    (
+        private_parent,
+        private_name,
+        private_path,
+        private,
+        owner_record,
+        owner_record_name,
+        owner_nonce,
+    ) = _create_owned_private_directory(root, admin, common)
+    executable: ControlObjectBinding | None = None
+    private_manifest: tuple[tuple[object, ...], ...] = ()
+    try:
+        executable_name, executable = _snapshot_bound_git_executable(
+            root,
+            private,
+        )
+        metadata = os.fstat(executable.fd)
+        assert executable.content_digest is not None
+        private_manifest = (
+            (
+                "file",
+                executable_name,
+                stat.S_IMODE(metadata.st_mode),
+                metadata.st_size,
+                executable.content_digest,
+            ),
+        )
+        names = sorted(os.listdir(private.fd))
+        if names != [executable_name]:
+            raise MirrorSyncError(
+                "private Git executable directory contains unexpected entries"
+            )
+        _set_owner_record_phase(
+            owner_record,
+            private_name,
+            private.identity,
+            owner_nonce,
+            "ready",
+        )
+        os.fsync(private.fd)
+        os.fsync(private_parent.fd)
+        return PrivateGitExecutableBinding(
+            private_parent=private_parent,
+            private=private,
+            private_name=private_name,
+            private_path=private_path,
+            executable_name=executable_name,
+            executable=executable,
+            private_manifest=private_manifest,
+            owner_record=owner_record,
+            owner_record_name=owner_record_name,
+            owner_nonce=owner_nonce,
+        )
+    except BaseException:
+        try:
+            _cleanup_private_git_control(
+                root,
+                private_parent,
+                private,
+                private_name,
+                private_manifest or None,
+                owner_record,
+                owner_record_name,
+                owner_nonce,
+            )
+        finally:
+            if executable is not None:
+                os.close(executable.fd)
+            os.close(owner_record.fd)
+            os.close(private.fd)
+            os.close(private_parent.fd)
+        raise
+
+
+def _revalidate_private_git_executable(
+    root: BoundRoot,
+    binding: PrivateGitExecutableBinding,
+) -> None:
+    _revalidate_control_object(root, binding.private_parent)
+    _revalidate_control_object(root, binding.private)
+    _revalidate_control_object(root, binding.owner_record)
+    _revalidate_control_object(root, binding.executable)
+    try:
+        names = sorted(os.listdir(binding.private.fd))
+    except OSError as error:
+        raise MirrorSyncError(
+            f"private Git executable directory became unreadable: {error}"
+        ) from error
+    if names != [binding.executable_name]:
+        raise MirrorSyncError(
+            "private Git executable directory namespace changed before "
+            "transaction completion"
+        )
+    _revalidate_control_object(root, binding.private)
+    _revalidate_control_object(root, binding.private_parent)
+
+
 def _expected_private_manifest(
     source_manifest: tuple[tuple[object, ...], ...],
     overrides: dict[str, ControlObjectBinding | None],
@@ -1667,6 +1998,7 @@ def _materialize_private_git_control(
     common: ControlObjectBinding,
     commondir_name_set: ControlNameSetBinding,
     common_commondir_absence: ControlAbsenceBinding,
+    prepared: PrivateGitExecutableBinding,
 ) -> tuple[
     ControlObjectBinding,
     str,
@@ -1678,64 +2010,28 @@ def _materialize_private_git_control(
     str,
     str,
 ]:
-    private_parent = _bind_private_tool_root(
-        root,
-        admin,
-        common,
-    )
-    private_name: str | None = None
-    private: ControlObjectBinding | None = None
-    owner_record: ControlObjectBinding | None = None
-    root_locked = False
-    try:
-        fcntl.flock(
-            private_parent.fd,
-            fcntl.LOCK_EX | fcntl.LOCK_NB,
-        )
-        root_locked = True
-    except BlockingIOError as error:
-        os.close(private_parent.fd)
+    if root.private_git_executable is not prepared:
         raise MirrorSyncError(
-            "private Git tool root is busy with another bounded "
-            "snapshot/recovery publication"
-        ) from error
-    try:
-        _recover_stale_private_snapshots(root, private_parent)
-        private_name, private_path, private = _create_private_git_directory(
-            private_parent
+            "private Git executable snapshot ownership changed before "
+            "repository materialization"
         )
-        owner_name, owner_nonce, owner_record = _create_owner_record(
-            root,
-            private_parent,
-            private_name,
-            private,
-        )
-    except BaseException:
-        if private is not None and private_name is not None:
-            try:
-                _remove_bound_private_directory(
-                    root,
-                    private_parent,
-                    private,
-                    private_name,
-                    None,
-                )
-            finally:
-                os.close(private.fd)
-        if root_locked:
-            fcntl.flock(private_parent.fd, fcntl.LOCK_UN)
-            root_locked = False
-        os.close(private_parent.fd)
-        raise
-    finally:
-        if root_locked and private_parent.fd >= 0:
-            fcntl.flock(private_parent.fd, fcntl.LOCK_UN)
-    assert private is not None
-    assert private_name is not None
-    assert owner_record is not None
+    private_parent = prepared.private_parent
+    private_name = prepared.private_name
+    private_path = prepared.private_path
+    private = prepared.private
+    owner_record = prepared.owner_record
+    owner_name = prepared.owner_record_name
+    owner_nonce = prepared.owner_nonce
     source_files: list[ControlObjectBinding] = []
     final_manifest: tuple[tuple[object, ...], ...] = ()
     try:
+        _set_owner_record_phase(
+            owner_record,
+            private_name,
+            private.identity,
+            owner_nonce,
+            "building",
+        )
         _revalidate_control_name_set(root, commondir_name_set)
         _revalidate_control_absence(root, common_commondir_absence)
         first_budget = {"entries": 0, "bytes": 0}
@@ -1764,6 +2060,7 @@ def _materialize_private_git_control(
         copied_manifest = _scan_private_git_tree(
             private.fd,
             root.operation,
+            skip_entries=frozenset({PurePosixPath(prepared.executable_name)}),
         )
         if copied_manifest != source_manifest:
             raise MirrorSyncError(
@@ -1803,6 +2100,7 @@ def _materialize_private_git_control(
         final_tree_manifest = _scan_private_git_tree(
             private.fd,
             root.operation,
+            skip_entries=frozenset({PurePosixPath(prepared.executable_name)}),
         )
         expected_manifest = _expected_private_manifest(
             source_manifest,
@@ -1815,6 +2113,7 @@ def _materialize_private_git_control(
         final_manifest = _scan_private_git_control(
             private.fd,
             root.operation,
+            skip_entries=frozenset({PurePosixPath(prepared.executable_name)}),
         )
         if final_manifest != _git_control_plane_manifest(expected_manifest):
             raise MirrorSyncError(
@@ -1845,9 +2144,11 @@ def _materialize_private_git_control(
                 owner_nonce,
             )
         finally:
+            os.close(prepared.executable.fd)
             os.close(owner_record.fd)
             os.close(private.fd)
             os.close(private_parent.fd)
+            root.private_git_executable = None
         raise
     return (
         private_parent,
@@ -2088,20 +2389,63 @@ def _bind_git_source_controls(
     return tuple(files), tuple(directories), tuple(absences)
 
 
+def _revalidate_absolute_control_object(
+    binding: ControlObjectBinding,
+) -> None:
+    if binding.path is None or binding.relative_path is not None:
+        raise MirrorSyncError(f"{binding.label} is not an absolute control object")
+    try:
+        path_metadata = os.stat(binding.path, follow_symlinks=False)
+    except FileNotFoundError as error:
+        raise MirrorSyncError(
+            f"{binding.label} went missing before transaction completion"
+        ) from error
+    except OSError as error:
+        raise MirrorSyncError(
+            f"{binding.label} became unreadable before transaction completion: {error}"
+        ) from error
+    try:
+        descriptor_metadata = os.fstat(binding.fd)
+    except OSError as error:
+        raise MirrorSyncError(
+            f"{binding.label} descriptor revalidation failed before "
+            f"transaction completion: {error}"
+        ) from error
+    if (
+        _object_identity(path_metadata) != binding.identity
+        or _object_identity(descriptor_metadata) != binding.identity
+    ):
+        raise MirrorSyncError(
+            f"{binding.label} was replaced before transaction completion"
+        )
+    if (
+        _access_policy(path_metadata) != binding.access_policy
+        or _access_policy(descriptor_metadata) != binding.access_policy
+    ):
+        raise MirrorSyncError(
+            f"{binding.label} access policy changed before transaction completion"
+        )
+    if binding.content_digest is not None:
+        observed_digest = _control_content_digest(binding.fd, binding.label)
+        if observed_digest != binding.content_digest:
+            raise MirrorSyncError(
+                f"{binding.label} content changed before transaction completion"
+            )
+
+
 def _revalidate_control_object(
     root: BoundRoot,
     binding: ControlObjectBinding,
 ) -> None:
+    if binding.relative_path is None:
+        _revalidate_absolute_control_object(binding)
+        return
     try:
-        if binding.relative_path is not None:
-            path_metadata = os.stat(
-                binding.relative_path.as_posix(),
-                dir_fd=root.fd,
-                follow_symlinks=False,
-            )
-        else:
-            assert binding.path is not None
-            path_metadata = os.stat(binding.path, follow_symlinks=False)
+        path_metadata = os.stat(
+            binding.relative_path.as_posix(),
+            dir_fd=root.fd,
+            follow_symlinks=False,
+        )
     except FileNotFoundError as error:
         raise MirrorSyncError(
             f"{binding.label} went missing before transaction completion"
@@ -2203,6 +2547,7 @@ def _revalidate_private_git_control(
     _revalidate_control_object(root, binding.private_parent)
     _revalidate_control_object(root, binding.private)
     _revalidate_control_object(root, binding.private_objects)
+    _revalidate_control_object(root, binding.private_git_executable)
     _revalidate_private_git_objects(
         binding.private_objects.fd,
         binding.private_objects_manifest,
@@ -2211,6 +2556,7 @@ def _revalidate_private_git_control(
     observed = _scan_private_git_control(
         binding.private.fd,
         root.operation,
+        skip_entries=frozenset({PurePosixPath(binding.private_git_executable_name)}),
     )
     if observed != binding.private_manifest:
         raise MirrorSyncError(
@@ -2512,34 +2858,33 @@ def _recover_stale_private_snapshots(
                     )
                 cleaned += 1
                 continue
-            expected_fields = {
-                "version",
-                "owner_pid",
-                "owner_uid",
-                "owner_gid",
-                "owner_nonce",
-                "phase",
-                "private_name",
-                "private_identity",
-            }
             valid_record = (
                 isinstance(record, dict)
-                and set(record) == expected_fields
-                and record["version"] == 1
+                and len(owner_snapshot.payload) <= MAX_PRIVATE_OWNER_RECORD_BYTES
+                and set(record) == PRIVATE_OWNER_RECORD_FIELDS
+                and type(record["version"]) is int
+                and record["version"] == PRIVATE_OWNER_RECORD_VERSION
+                and type(record["owner_uid"]) is int
                 and record["owner_uid"] == os.geteuid()
+                and type(record["owner_gid"]) is int
                 and record["owner_gid"] == os.getegid()
-                and isinstance(record["owner_pid"], int)
+                and type(record["owner_pid"]) is int
+                and record["owner_pid"] > 0
                 and isinstance(record["owner_nonce"], str)
                 and re.fullmatch(
                     r"[0-9a-f]{32}",
                     record["owner_nonce"],
                 )
                 is not None
-                and record["phase"] in {"building", "ready", "cleanup"}
+                and isinstance(record["phase"], str)
+                and record["phase"] in PRIVATE_OWNER_RECORD_PHASES
                 and record["private_name"] == private_name
                 and isinstance(record["private_identity"], list)
                 and len(record["private_identity"]) == 3
-                and all(isinstance(item, int) for item in record["private_identity"])
+                and all(
+                    type(item) is int and item >= 0
+                    for item in record["private_identity"]
+                )
                 and owner_snapshot.mode == 0o600
                 and owner_snapshot.access_policy[1:]
                 == (
@@ -2862,7 +3207,6 @@ def _bind_root(root: Path, *, exclusive: bool = False) -> BoundRoot:
             GIT_EXECUTABLE,
             "Git executable",
             require_directory=False,
-            bind_content=False,
         )
     except BaseException:
         fcntl.flock(root_fd, fcntl.LOCK_UN)
@@ -2915,9 +3259,18 @@ def _revalidate_bound_root_directory(root: BoundRoot) -> None:
 
 def _revalidate_bound_root(root: BoundRoot) -> None:
     git_control = root.git_control
+    private_git_executable = root.private_git_executable
     try:
         _revalidate_bound_root_directory(root)
-        _revalidate_control_object(root, root.git_executable)
+        if private_git_executable is None and git_control is None:
+            # The source executable is an input only until its exact bytes
+            # have been copied and rebound inside the private snapshot.
+            _revalidate_control_object(root, root.git_executable)
+        elif private_git_executable is not None:
+            _revalidate_private_git_executable(
+                root,
+                private_git_executable,
+            )
         for managed_ancestor in root.managed_ancestors.values():
             _revalidate_control_object(root, managed_ancestor)
         if git_control is not None:
@@ -2960,7 +3313,7 @@ def _close_bound_root(root: BoundRoot) -> None:
                 root.git_control.private_parent,
                 root.git_control.private,
                 root.git_control.private_name,
-                root.git_control.private_manifest,
+                root.git_control.private_cleanup_manifest,
                 root.git_control.owner_record,
                 root.git_control.owner_record_name,
                 root.git_control.owner_nonce,
@@ -2976,6 +3329,7 @@ def _close_bound_root(root: BoundRoot) -> None:
             *root.git_control.source_files,
             *root.git_control.source_directories,
             root.git_control.private_objects,
+            root.git_control.private_git_executable,
             root.git_control.private,
             root.git_control.private_parent,
             root.git_control.owner_record,
@@ -2983,6 +3337,30 @@ def _close_bound_root(root: BoundRoot) -> None:
             if binding is not None:
                 os.close(binding.fd)
         root.git_control = None
+    if root.private_git_executable is not None:
+        binding = root.private_git_executable
+        try:
+            _cleanup_private_git_control(
+                root,
+                binding.private_parent,
+                binding.private,
+                binding.private_name,
+                binding.private_manifest,
+                binding.owner_record,
+                binding.owner_record_name,
+                binding.owner_nonce,
+            )
+        except MirrorSyncError as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        for control in (
+            binding.executable,
+            binding.private,
+            binding.private_parent,
+            binding.owner_record,
+        ):
+            os.close(control.fd)
+        root.private_git_executable = None
     for binding in root.managed_ancestors.values():
         os.close(binding.fd)
     root.managed_ancestors.clear()
@@ -5439,6 +5817,78 @@ def _collect_bounded_git_output(
     )
 
 
+def _resolve_macos_git_executable() -> Path:
+    # `/usr/bin/git` is an Apple platform shim whose copied bytes are not
+    # executable outside the sealed system volume. Treat the fixed system
+    # `xcrun` locator as a platform trust root, then content-bind and snapshot
+    # the ordinary developer-tool Git binary that it selects.
+    locator = _bind_absolute_control_object(
+        MACOS_GIT_LOCATOR_EXECUTABLE,
+        "macOS Git locator executable",
+        require_directory=False,
+    )
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        _revalidate_absolute_control_object(locator)
+        process = subprocess.Popen(
+            [
+                MACOS_GIT_LOCATOR_EXECUTABLE.as_posix(),
+                "--find",
+                "git",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_git_environment(),
+            start_new_session=True,
+        )
+        return_code, stdout, stderr = _collect_bounded_process_output(
+            process,
+            None,
+            stdout_limit=MAX_GIT_LOCATOR_STDOUT_BYTES,
+            stderr_limit=MAX_GIT_VERSION_STDERR_BYTES,
+            timeout_seconds=GIT_TIMEOUT_SECONDS,
+            label="macOS Git locator",
+        )
+    except OSError as error:
+        if process is not None:
+            _terminate_git_process(process)
+        raise MirrorSyncError(
+            f"cannot run bounded macOS Git locator: {error}"
+        ) from error
+    finally:
+        try:
+            _revalidate_absolute_control_object(locator)
+        finally:
+            os.close(locator.fd)
+    if return_code != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        if len(detail) > 500:
+            detail = detail[:500] + "..."
+        raise MirrorSyncError(
+            "macOS Git locator failed"
+            + (f": {detail}" if detail else f" (exit {return_code})")
+        )
+    if stderr:
+        raise MirrorSyncError("macOS Git locator returned unexpected stderr")
+    try:
+        rendered = stdout.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise MirrorSyncError("macOS Git locator returned a non-UTF-8 path") from error
+    if not rendered.endswith("\n") or "\n" in rendered[:-1] or "\0" in rendered:
+        raise MirrorSyncError("macOS Git locator returned a malformed path")
+    path = Path(rendered[:-1])
+    if not path.is_absolute() or Path(os.path.abspath(path)) != path:
+        raise MirrorSyncError(
+            f"macOS Git locator returned a non-canonical path: {path}"
+        )
+    if path == Path("/usr/bin/git"):
+        raise MirrorSyncError(
+            "macOS Git locator returned the non-snapshot-capable system shim"
+        )
+    return path
+
+
 def _parse_git_version_output(payload: bytes) -> tuple[int, int, int]:
     match = GIT_VERSION_RE.fullmatch(payload)
     if match is None:
@@ -5450,6 +5900,33 @@ def _parse_git_version_output(payload: bytes) -> tuple[int, int, int]:
     )
 
 
+def _bound_private_git_executable(
+    root: BoundRoot,
+) -> ControlObjectBinding:
+    if root.private_git_executable is not None:
+        binding = root.private_git_executable.executable
+    elif root.git_control is not None:
+        binding = root.git_control.private_git_executable
+    else:
+        raise MirrorSyncError(
+            "private Git executable snapshot must exist before Git process launch"
+        )
+    if binding.path is None or binding.content_digest is None:
+        raise MirrorSyncError(
+            "private Git executable snapshot must be an absolute content-bound file"
+        )
+    return binding
+
+
+def _bound_git_argv0(root: BoundRoot) -> str:
+    binding = root.git_executable
+    if binding.path is None or binding.content_digest is None:
+        raise MirrorSyncError(
+            "Git executable source must be an absolute content-bound file"
+        )
+    return binding.path.as_posix()
+
+
 def _popen_from_bound_directory(
     command: list[str],
     *,
@@ -5457,11 +5934,18 @@ def _popen_from_bound_directory(
     directory_identity: tuple[int, int, int],
     directory_access_policy: tuple[int, int, int],
     directory_label: str,
+    control_root: BoundRoot | None = None,
+    executable_binding: ControlObjectBinding | None = None,
     **kwargs: Any,
 ) -> subprocess.Popen[bytes]:
-    if "cwd" in kwargs or "preexec_fn" in kwargs:
+    if "cwd" in kwargs or "preexec_fn" in kwargs or "executable" in kwargs:
         raise MirrorSyncError(
-            "bound-directory process launch does not accept cwd or preexec_fn"
+            "bound-directory process launch does not accept cwd, preexec_fn, "
+            "or executable overrides"
+        )
+    if (control_root is None) != (executable_binding is None):
+        raise MirrorSyncError(
+            "bound executable process launch requires its control root"
         )
 
     # The CLI is single-threaded. Change its current directory through the
@@ -5471,6 +5955,18 @@ def _popen_from_bound_directory(
     saved_directory_fd = os.open(".", _DIRECTORY_FLAGS)
     process: subprocess.Popen[bytes] | None = None
     try:
+        executable_path: str | None = None
+        if executable_binding is not None:
+            assert control_root is not None
+            if (
+                executable_binding.path is None
+                or executable_binding.content_digest is None
+            ):
+                raise MirrorSyncError(
+                    "bound process executable must be an absolute content-bound file"
+                )
+            _revalidate_control_object(control_root, executable_binding)
+            executable_path = executable_binding.path.as_posix()
         descriptor_metadata = os.fstat(directory_fd)
         if _object_identity(descriptor_metadata) != directory_identity:
             raise MirrorSyncError(
@@ -5493,7 +5989,18 @@ def _popen_from_bound_directory(
                 f"{directory_label} current-directory access policy changed "
                 "before process launch"
             )
-        process = subprocess.Popen(command, **kwargs)
+        process = subprocess.Popen(
+            command,
+            executable=executable_path,
+            **kwargs,
+        )
+        if executable_binding is not None:
+            assert control_root is not None
+            try:
+                _revalidate_control_object(control_root, executable_binding)
+            except BaseException:
+                _terminate_git_process(process)
+                raise
     finally:
         try:
             os.fchdir(saved_directory_fd)
@@ -5516,7 +6023,7 @@ def _verify_git_capability(bound_root: BoundRoot) -> None:
         _revalidate_bound_root(bound_root)
         return
     command = [
-        GIT_EXECUTABLE.as_posix(),
+        _bound_git_argv0(bound_root),
         "--no-lazy-fetch",
         "--version",
     ]
@@ -5529,6 +6036,8 @@ def _verify_git_capability(bound_root: BoundRoot) -> None:
             directory_identity=bound_root.identity,
             directory_access_policy=bound_root.access_policy,
             directory_label="repository root",
+            control_root=bound_root,
+            executable_binding=_bound_private_git_executable(bound_root),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -5579,7 +6088,7 @@ def _run_private_git_config_process(
     if not bound_root.git_capability_verified:
         raise MirrorSyncError("Git capability gate has not completed")
     command = [
-        GIT_EXECUTABLE.as_posix(),
+        _bound_git_argv0(bound_root),
         "--no-lazy-fetch",
         "--no-optional-locks",
         "--no-replace-objects",
@@ -5599,6 +6108,8 @@ def _run_private_git_config_process(
             directory_identity=bound_root.git_control.private.identity,
             directory_access_policy=bound_root.git_control.private.access_policy,
             directory_label="private Git control snapshot",
+            control_root=bound_root,
+            executable_binding=_bound_private_git_executable(bound_root),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -5710,7 +6221,7 @@ def _run_private_git_process(
     if not bound_root.git_control.static_profile_verified:
         raise MirrorSyncError("Git static repository profile has not completed")
     git_command = [
-        GIT_EXECUTABLE.as_posix(),
+        _bound_git_argv0(bound_root),
         "--no-lazy-fetch",
         "--git-dir=.",
         f"--work-tree={bound_root.path}",
@@ -5743,6 +6254,8 @@ def _run_private_git_process(
             directory_identity=bound_root.git_control.private.identity,
             directory_access_policy=bound_root.git_control.private.access_policy,
             directory_label="private Git control snapshot",
+            control_root=bound_root,
+            executable_binding=_bound_private_git_executable(bound_root),
             stdin=subprocess.DEVNULL if stdin_file is None else stdin_file,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -5847,11 +6360,13 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
     private_parent: ControlObjectBinding | None = None
     private_name: str | None = None
     private_manifest: tuple[tuple[object, ...], ...] = ()
+    private_cleanup_manifest: tuple[tuple[object, ...], ...] = ()
     private_objects_manifest: tuple[tuple[object, ...], ...] = ()
     source_files: tuple[ControlObjectBinding, ...] = ()
     source_directories: tuple[ControlObjectBinding, ...] = ()
     source_absences: tuple[ControlAbsenceBinding, ...] = ()
     acquired_source_controls: list[ControlObjectBinding] = []
+    prepared_private_git_executable: PrivateGitExecutableBinding | None = None
     owner_record: ControlObjectBinding | None = None
     owner_record_name: str | None = None
     owner_nonce: str | None = None
@@ -5918,10 +6433,19 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
         for binding in (marker, admin, common, objects):
             _revalidate_control_object(root, binding)
         _revalidate_control_name_set(root, commondir_name_set)
+        _revalidate_control_absence(root, common_commondir_absence)
+        if root.private_git_executable is None:
+            root.private_git_executable = _prepare_private_git_executable(
+                root,
+                admin,
+                common,
+            )
         _verify_git_capability(root)
         for binding in (marker, admin, common, objects):
             _revalidate_control_object(root, binding)
         _revalidate_control_name_set(root, commondir_name_set)
+        prepared_private_git_executable = root.private_git_executable
+        assert prepared_private_git_executable is not None
         (
             private_parent,
             private_name,
@@ -5938,6 +6462,16 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
             common,
             commondir_name_set,
             common_commondir_absence,
+            prepared_private_git_executable,
+        )
+        private_cleanup_manifest = tuple(
+            sorted(
+                (
+                    *private_manifest,
+                    *prepared_private_git_executable.private_manifest,
+                ),
+                key=lambda record: str(record[1]),
+            )
         )
         _revalidate_control_name_set(root, commondir_name_set)
         private_commondir_absence = _bind_collision_aware_control_absence(
@@ -5994,9 +6528,14 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
             private_parent=private_parent,
             private=private,
             private_objects=private_objects,
+            private_git_executable=prepared_private_git_executable.executable,
+            private_git_executable_name=(
+                prepared_private_git_executable.executable_name
+            ),
             private_name=private_name,
             private_path=private_path,
             private_manifest=private_manifest,
+            private_cleanup_manifest=private_cleanup_manifest,
             private_objects_manifest=private_objects_manifest,
             owner_record=owner_record,
             owner_record_name=owner_record_name,
@@ -6004,6 +6543,7 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
             static_profile_verified=False,
             object_integrity_verified=False,
         )
+        root.private_git_executable = None
         _verify_static_git_profile(root)
         _verify_private_git_object_integrity(root)
         _revalidate_bound_root(root)
@@ -6037,7 +6577,7 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
                         private_parent,
                         private,
                         private_name,
-                        private_manifest or None,
+                        private_cleanup_manifest or None,
                         owner_record,
                         owner_record_name,
                         owner_nonce,
@@ -6048,13 +6588,17 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
                         private_parent,
                         private,
                         private_name,
-                        private_manifest or None,
+                        private_cleanup_manifest or None,
                     )
             finally:
                 if owner_record is not None:
                     os.close(owner_record.fd)
+                if prepared_private_git_executable is not None:
+                    os.close(prepared_private_git_executable.executable.fd)
                 os.close(private.fd)
                 os.close(private_parent.fd)
+                if root.private_git_executable is prepared_private_git_executable:
+                    root.private_git_executable = None
         if private_objects is not None:
             os.close(private_objects.fd)
         for binding in controls:
@@ -9423,6 +9967,10 @@ def main(argv: list[str] | None = None) -> int:
     except MirrorSyncError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+
+
+if sys.platform == "darwin":
+    GIT_EXECUTABLE = _resolve_macos_git_executable()
 
 
 if __name__ == "__main__":

@@ -47,6 +47,16 @@ class MirrorGeneratorTests(unittest.TestCase):
             prefix="canonical-mirror-tests."
         )
         self.root = Path(self.temporary_directory.name)
+        self.host_private_git_control_parent = MIRROR_MODULE.PRIVATE_GIT_CONTROL_PARENT
+        self.private_git_control_parent = self.root / "private-control-parent"
+        self.private_git_control_parent.mkdir()
+        self.private_control_parent_patch = mock.patch.object(
+            MIRROR_MODULE,
+            "PRIVATE_GIT_CONTROL_PARENT",
+            self.private_git_control_parent,
+        )
+        self.private_control_parent_patch.start()
+        self.addCleanup(self.private_control_parent_patch.stop)
         self.canonical_root = self.root / "canonical"
         self.target_root = self.root / "consumer"
         self.canonical_root.mkdir()
@@ -311,7 +321,9 @@ class MirrorGeneratorTests(unittest.TestCase):
             )
         self.assertEqual(self.source_path.read_bytes(), original_source)
 
-    def test_repeated_exact_generate_is_a_quarantine_stable_no_op(self) -> None:
+    def test_repeated_exact_generate_only_stabilizes_target_quarantine(
+        self,
+    ) -> None:
         self.assertEqual(self._generate(), 1)
         self._commit(self.target_root, "track generated mirror")
         target = self.target_root / "scripts" / "engine.py"
@@ -326,6 +338,10 @@ class MirrorGeneratorTests(unittest.TestCase):
             if quarantine.exists()
             else []
         )
+        private_quarantine = (
+            self.private_git_control_parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        )
+        private_quarantine_names = {path.name for path in private_quarantine.iterdir()}
 
         for _index in range(5):
             self.assertEqual(self._generate(), 1)
@@ -342,6 +358,16 @@ class MirrorGeneratorTests(unittest.TestCase):
                 else []
             ),
             quarantine_names,
+        )
+        final_private_quarantine_names = {
+            path.name for path in private_quarantine.iterdir()
+        }
+        self.assertLess(
+            len(private_quarantine_names),
+            len(final_private_quarantine_names),
+        )
+        self.assertTrue(
+            private_quarantine_names.issubset(final_private_quarantine_names)
         )
         self.assertEqual(
             self._git(self.target_root, "status", "--porcelain"),
@@ -2484,7 +2510,7 @@ class MirrorGeneratorTests(unittest.TestCase):
         finally:
             os.close(binding.fd)
 
-    def test_run_git_executes_git_directly_without_python_launcher(self) -> None:
+    def test_run_git_uses_private_snapshot_without_python_launcher(self) -> None:
         captured: dict[str, object] = {}
 
         def capture_popen(command, **kwargs):
@@ -2516,10 +2542,173 @@ class MirrorGeneratorTests(unittest.TestCase):
                 captured["command"][0],
                 MIRROR_MODULE.GIT_EXECUTABLE.as_posix(),
             )
+            self.assertEqual(
+                captured["executable"],
+                bound_root.git_control.private_git_executable.path.as_posix(),
+            )
             self.assertEqual(captured["launch_cwd_identity"], private_identity)
             self.assertNotIn("preexec_fn", captured)
             self.assertNotIn("cwd", captured)
             self.assertNotIn("pass_fds", captured)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_private_git_snapshot_survives_source_replace_restore_at_popen(
+        self,
+    ) -> None:
+        source_git_parent = self.root / "git-source"
+        source_git_parent.mkdir()
+        source_git = source_git_parent / "git"
+        shutil.copyfile(MIRROR_MODULE.GIT_EXECUTABLE, source_git)
+        source_git.chmod(0o755)
+        preserved_git = source_git_parent / "git-preserved"
+        replacement_git = self.root / "git-replacement"
+        shutil.copyfile("/usr/bin/false", replacement_git)
+        replacement_git.chmod(0o755)
+        real_popen = subprocess.Popen
+        captured: dict[str, object] = {}
+
+        with mock.patch.object(MIRROR_MODULE, "GIT_EXECUTABLE", source_git):
+            bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
+            try:
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+                snapshot_path = (
+                    bound_root.git_control.private_git_executable.path.as_posix()
+                )
+
+                def replace_restore_source(command, **kwargs):
+                    source_git.rename(preserved_git)
+                    shutil.copyfile(replacement_git, source_git)
+                    source_git.chmod(0o755)
+                    captured["executable"] = kwargs.get("executable")
+                    try:
+                        return real_popen(command, **kwargs)
+                    finally:
+                        source_git.unlink()
+                        preserved_git.rename(source_git)
+
+                with mock.patch.object(
+                    MIRROR_MODULE.subprocess,
+                    "Popen",
+                    side_effect=replace_restore_source,
+                ):
+                    observed = (
+                        MIRROR_MODULE._run_git_process(
+                            bound_root,
+                            "rev-parse",
+                            "HEAD",
+                        )
+                        .decode("ascii")
+                        .strip()
+                    )
+                self.assertEqual(observed, self.source_commit)
+                self.assertEqual(captured["executable"], snapshot_path)
+            finally:
+                MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_private_git_snapshot_access_policy_drift_fails_before_popen(
+        self,
+    ) -> None:
+        bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        try:
+            MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            snapshot = bound_root.git_control.private_git_executable
+            assert snapshot.path is not None
+            snapshot.path.chmod(0o400)
+            try:
+                with (
+                    mock.patch.object(
+                        MIRROR_MODULE.subprocess,
+                        "Popen",
+                    ) as popen,
+                    self.assertRaisesRegex(
+                        MIRROR_MODULE.MirrorSyncError,
+                        "private Git executable snapshot access policy changed",
+                    ),
+                ):
+                    MIRROR_MODULE._run_git_process(
+                        bound_root,
+                        "rev-parse",
+                        "HEAD",
+                    )
+                popen.assert_not_called()
+            finally:
+                snapshot.path.chmod(0o500)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_private_git_snapshot_rejects_source_mutation_during_copy(
+        self,
+    ) -> None:
+        source_git = self.root / "git-source"
+        shutil.copyfile(MIRROR_MODULE.GIT_EXECUTABLE, source_git)
+        source_git.chmod(0o755)
+        private_path = self.root / "private-executable-snapshot"
+        private_path.mkdir(mode=0o700)
+        private = MIRROR_MODULE._bind_absolute_control_object(
+            private_path,
+            "test private executable snapshot",
+            require_directory=True,
+        )
+        with mock.patch.object(MIRROR_MODULE, "GIT_EXECUTABLE", source_git):
+            bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        real_bound_control_payload = MIRROR_MODULE._bound_control_payload
+
+        def mutate_source_after_read(binding):
+            payload = real_bound_control_payload(binding)
+            if binding is bound_root.git_executable:
+                mutated = bytearray(payload)
+                mutated[0] ^= 0x01
+                source_git.write_bytes(mutated)
+                source_git.chmod(0o755)
+            return payload
+
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_bound_control_payload",
+                    side_effect=mutate_source_after_read,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "Git executable content changed",
+                ),
+            ):
+                MIRROR_MODULE._snapshot_bound_git_executable(
+                    bound_root,
+                    private,
+                )
+        finally:
+            os.close(private.fd)
+            MIRROR_MODULE._close_bound_root(bound_root)
+
+    def test_private_git_snapshot_runs_real_version_and_rev_parse(self) -> None:
+        bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        try:
+            MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            snapshot = bound_root.git_control.private_git_executable
+            self.assertNotEqual(snapshot.path, bound_root.git_executable.path)
+            self.assertEqual(
+                snapshot.content_digest,
+                bound_root.git_executable.content_digest,
+            )
+            self.assertEqual(snapshot.access_policy[0], 0o500)
+            version = MIRROR_MODULE._run_private_git_process(
+                bound_root,
+                "--version",
+            )
+            self.assertIsNotNone(MIRROR_MODULE.GIT_VERSION_RE.fullmatch(version))
+            observed = (
+                MIRROR_MODULE._run_git_process(
+                    bound_root,
+                    "rev-parse",
+                    "HEAD",
+                )
+                .decode("ascii")
+                .strip()
+            )
+            self.assertEqual(observed, self.source_commit)
         finally:
             MIRROR_MODULE._finish_bound_roots(bound_root)
 
@@ -3102,6 +3291,69 @@ class MirrorGeneratorTests(unittest.TestCase):
         self.assertTrue(observed_private_parent)
         self.assertFalse(owner_path.exists())
 
+    def test_stale_owner_recovery_quarantines_unhashable_phase_schema(
+        self,
+    ) -> None:
+        tool_root_path = (
+            MIRROR_MODULE.PRIVATE_GIT_CONTROL_PARENT
+            / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        )
+        tool_root_path.mkdir(mode=0o700)
+        private_name = (
+            f"sync-canonical-git-control.{os.getpid()}.abcdefabcdefabcdefabcdefabcdefab"
+        )
+        owner_name = f"{private_name}.owner.json"
+        owner_path = tool_root_path / owner_name
+        owner_path.write_text(
+            json.dumps(
+                {
+                    "version": MIRROR_MODULE.PRIVATE_OWNER_RECORD_VERSION,
+                    "owner_pid": os.getpid(),
+                    "owner_uid": os.geteuid(),
+                    "owner_gid": os.getegid(),
+                    "owner_nonce": "abcdef0123456789abcdef0123456789",
+                    "phase": [],
+                    "private_name": private_name,
+                    "private_identity": [123, 456, stat.S_IFDIR],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        owner_path.chmod(0o600)
+        os.chown(owner_path, os.geteuid(), os.getegid())
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        tool_root = MIRROR_MODULE._bind_absolute_control_object(
+            tool_root_path,
+            "test private Git tool root",
+            require_directory=True,
+        )
+        try:
+            MIRROR_MODULE.fcntl.flock(tool_root.fd, MIRROR_MODULE.fcntl.LOCK_EX)
+            MIRROR_MODULE._recover_stale_private_snapshots(
+                bound_root,
+                tool_root,
+            )
+        finally:
+            MIRROR_MODULE.fcntl.flock(tool_root.fd, MIRROR_MODULE.fcntl.LOCK_UN)
+            os.close(tool_root.fd)
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        self.assertFalse(owner_path.exists())
+        self.assertEqual(
+            len(
+                [
+                    path
+                    for path in tool_root_path.iterdir()
+                    if path.name.startswith(".quarantine-")
+                ]
+            ),
+            1,
+        )
+
     def test_stale_owner_recovery_binds_quarantine_before_private_removal(
         self,
     ) -> None:
@@ -3558,9 +3810,15 @@ class MirrorGeneratorTests(unittest.TestCase):
         def corrupt_after_initial_destination_scan(
             private_fd,
             operation=None,
+            *,
+            skip_entries=frozenset(),
         ):
             nonlocal scan_count
-            observed = real_scan(private_fd, operation)
+            observed = real_scan(
+                private_fd,
+                operation,
+                skip_entries=skip_entries,
+            )
             scan_count += 1
             if scan_count == 1:
                 index_fd = os.open(
@@ -3767,6 +4025,33 @@ class MirrorGeneratorTests(unittest.TestCase):
                 MIRROR_MODULE._ensure_git_control_binding(overlapping_root)
         finally:
             MIRROR_MODULE._finish_bound_roots(overlapping_root)
+
+    def test_private_git_snapshot_never_binds_the_default_host_parent(self) -> None:
+        observed_paths = []
+        real_bind = MIRROR_MODULE._bind_absolute_control_object
+
+        def reject_default_host_parent(path, *args, **kwargs):
+            candidate = Path(os.path.abspath(path))
+            self.assertFalse(
+                candidate == self.host_private_git_control_parent
+                or self.host_private_git_control_parent in candidate.parents,
+                f"default host private-control path was accessed: {candidate}",
+            )
+            observed_paths.append(candidate)
+            return real_bind(path, *args, **kwargs)
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with mock.patch.object(
+                MIRROR_MODULE,
+                "_bind_absolute_control_object",
+                side_effect=reject_default_host_parent,
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        self.assertIn(self.private_git_control_parent, observed_paths)
 
     def test_private_git_cleanup_preserves_a_replaced_top_directory(
         self,
@@ -5666,6 +5951,50 @@ class RepositorySourceLockTests(unittest.TestCase):
         actual = (REPOSITORY_ROOT / "sync-source-lock.json").read_bytes()
 
         self.assertEqual(actual, MIRROR_MODULE._source_lock_payload(source_lock))
+
+
+class MirrorQuarantineContractParityTests(unittest.TestCase):
+    def test_scheduler_probe_matches_generator_recovery_contract(self) -> None:
+        self.assertEqual(
+            ENGINE_MODULE.MIRROR_PRIVATE_CONTROL_PARENT,
+            MIRROR_MODULE.PRIVATE_GIT_CONTROL_PARENT,
+        )
+        self.assertEqual(
+            ENGINE_MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME,
+            MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME,
+        )
+        self.assertEqual(
+            ENGINE_MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+            MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME,
+        )
+        self.assertEqual(
+            ENGINE_MODULE.MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT,
+            MIRROR_MODULE.MAX_DURABLE_QUARANTINE_ENTRIES,
+        )
+        self.assertEqual(
+            ENGINE_MODULE.MIRROR_PRIVATE_TOOL_ROOT_ENTRY_LIMIT,
+            MIRROR_MODULE.MAX_TOOL_ROOT_ENTRIES,
+        )
+        self.assertEqual(
+            ENGINE_MODULE.MIRROR_PRIVATE_OWNER_RECORD_VERSION,
+            MIRROR_MODULE.PRIVATE_OWNER_RECORD_VERSION,
+        )
+        self.assertEqual(
+            ENGINE_MODULE.MIRROR_PRIVATE_OWNER_RECORD_FIELDS,
+            MIRROR_MODULE.PRIVATE_OWNER_RECORD_FIELDS,
+        )
+        self.assertEqual(
+            ENGINE_MODULE.MIRROR_PRIVATE_OWNER_RECORD_PHASES,
+            MIRROR_MODULE.PRIVATE_OWNER_RECORD_PHASES,
+        )
+        self.assertEqual(
+            ENGINE_MODULE.MAX_MIRROR_PRIVATE_OWNER_RECORD_BYTES,
+            MIRROR_MODULE.MAX_PRIVATE_OWNER_RECORD_BYTES,
+        )
+        self.assertEqual(
+            ENGINE_MODULE.MIRROR_PRIVATE_SNAPSHOT_RE.pattern,
+            MIRROR_MODULE.PRIVATE_SNAPSHOT_RE.pattern,
+        )
 
 
 class ManifestSchemaParityTests(unittest.TestCase):

@@ -14,11 +14,13 @@ superseded_by:
 
 ## Summary
 
-- Delivery status: `delivery_gate_complete`.
+- Delivery status: `delivery_gate_blocked`.
 - The workstream is consolidating personal sync ownership in `Joey-Tools/codex-personal-sync` and hardening mirror generation, scheduler observability, active-skill auditing, reconciliation, and release retention.
-- Signed commit `39050ba7629ae0ee896f1df5e9e9c9dd75421825` is the fixed
-  parent of the current recovery-hardening candidate. The candidate is fully
-  locally gated; no push, consumer generation, PR mutation, or external
+- Signed commit `30ff8cfd36c7aee7b1b5f2e3fa6de14816f7bfaa` is the
+  formal-review head and fixed parent of the current follow-up. The code
+  candidate is locally gated in an isolated private-control root, while
+  production admission remains blocked by the retained host quarantine at its
+  exact capacity. No push, consumer generation, PR mutation, or external
   deployment was performed.
 
 ## Scope
@@ -32,8 +34,8 @@ superseded_by:
 
 ## Current State
 
-- The signed `39050ba7629ae0ee896f1df5e9e9c9dd75421825` candidate has
-  been superseded by the follow-up candidate containing this journal.
+- The signed `30ff8cfd36c7aee7b1b5f2e3fa6de14816f7bfaa` candidate has
+  been superseded locally by the follow-up candidate containing this journal.
 - Scheduler installation now binds the exact semantically audited macOS/Linux
   config snapshots through conditional writes and matching-config
   revalidation. Required `current` releases are strict, code-less runtime
@@ -111,9 +113,11 @@ superseded_by:
   recovery holds the exact quarantine lock while it revalidates evidence
   immediately before and after the active-journal move, so concurrent evidence
   replacement cannot be misclassified as a completed cleanup. A no-op
-  generation does not create quarantine churn, and exact-capacity recovery
-  keeps the active journal as the authoritative blocker instead of moving it
-  into an already-full recovery namespace.
+  generation does not create target transaction or target-sibling quarantine
+  churn, and exact-capacity recovery keeps the active journal as the
+  authoritative blocker instead of moving it into an already-full recovery
+  namespace. Private Git owner cleanup still retains one transient evidence
+  record for every operation that reaches Git binding.
 - The final scheduler-uninstall follow-up prebinds the current macOS plist and
   every legacy plist before the first current `launchctl` action. Native
   actions and conditional removals revalidate every live binding before and
@@ -589,6 +593,66 @@ superseded_by:
   default arm64 kernel configured; host kernel configuration was intentionally
   left unchanged. The refreshed six-source lock verifies with SHA-256
   `30bf5743a368ac2d189caf9825edb1d13f69924639dc0713d30f33dc9ffb6d17`.
+- The formal fresh-context Codex single review of
+  `6c4878f33f5c82714e988b0470ccc5f4f33c0b70..30ff8cfd36c7aee7b1b5f2e3fa6de14816f7bfaa`
+  returned one P1: binding the source Git object did not bind the executable
+  image selected by `Popen(pathname)` at the final spawn boundary. Direct
+  Claude Code review is temporarily waived by Joey through
+  `2026-08-01 00:00 Asia/Shanghai`; that waiver is not counted as a completed
+  double or triple review, and no Claude lane was started or awaited.
+- The follow-up protects the bytes actually executed. The source Git
+  descriptor is identity/access-bound and double-read into a stable SHA-256
+  digest, then copied with exclusive creation into the parent-private snapshot,
+  fsynced, reopened read-only, and rebound by identity, owner/type/mode,
+  access policy, and exact content. Every Git child uses that mode-0500 file as
+  `Popen(executable=...)`, with pre/post-spawn revalidation and the existing
+  descriptor-bound cwd. A replace/consume/restore race against the original
+  source pathname therefore still executes the frozen snapshot. Snapshot
+  access-policy drift fails before `Popen`, and an in-place source mutation
+  during copy invalidates publication.
+- macOS does not provide the required Python fd-exec path, and a byte copy of
+  the sealed-system `/usr/bin/git` platform shim is killed by AMFI even though
+  its embedded signature verifies. The implementation therefore treats fixed
+  `/usr/bin/xcrun` as the platform locator trust root, binds the ordinary
+  developer-tool Git it selects, and snapshots that executable instead. The
+  real copied Mach-O passed both `--version` and repository `rev-parse`; the
+  contract does not claim fd-exec or hostile same-UID namespace exclusion.
+- Independent follow-up evidence found the local durable private-control
+  quarantine at its exact 10,000-entry cap. Both native Python and
+  `/usr/bin/python3` production `refresh-lock --check` attempts stopped before
+  moving their active owner records and reported the bounded-capacity blocker;
+  the retained evidence was not deleted, moved, or rewritten. The new
+  `status-scheduler` / `doctor` mirror-quarantine audit is descriptor-bound,
+  read-only, and ordered tool-root → quarantine under nonblocking shared
+  leases. It reports exact segment path/name, identity/access policy,
+  count/cap, and schema-valid stale recovery owner identities; saturation and
+  inconclusive audit states fail strict status. Invalid or private-identity
+  mismatched owner records are not mislabeled as durable-capacity recovery.
+  Safe segment rollover is explicitly deferred because version-2 exchange
+  journals store only a basename; a separate high-risk workstream must add
+  receipt-bound version-3 segment locators, legacy migration, and global
+  entry/logical/allocated-byte ceilings. Production admission therefore
+  remains blocked even when isolated-root verification passes.
+- The exact follow-up bytes passed all 806 repository tests under native
+  Python in 911.205 seconds and `/usr/bin/python3` in 977.546 seconds; each
+  run skipped only the Linux read-lease integration fixture. The final
+  scheduler/doctor partition passed all 116 tests in 8.479 and 10.032 seconds,
+  and the five lock-order/revalidation regressions passed in 0.020 and 0.044
+  seconds. Ruff lint and changed-file format checks, dual-Python compileall,
+  actionlint, project-journal validation, isolated-root six-source lock
+  verification, and `git diff --check` passed. The source-lock, engine,
+  scheduler-test, and generator SHA-256 values are respectively
+  `b759cbadb48e016d0864b7e38e67a307dc1d41f5d4402999bada14bb1a811405`,
+  `a8dd98e16da8dffb6894aa366fcd6d61f79f4f4ec973d59accadf0dd30336dae`,
+  `29e9be4cb6e659e24ed97ab63a52aba4299d0df07a4e90500938f4607dee4dd5`,
+  and
+  `b9830769d53f3e7ea8b6d3069a24437359309021b119cd5158610f0f2efd1aca`.
+  A final read-only host check confirmed the retained durable quarantine is
+  still device `16777231`, inode `1362674446`, mode `0700`, uid `501`, gid
+  `0`, mtime `1785353196`, with exactly 10,000 direct entries. No production
+  refresh was retried and no retained host evidence was deleted, moved, or
+  rewritten; the isolated gate is green while production admission remains
+  blocked.
 
 ## Installed Host Baseline
 

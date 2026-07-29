@@ -179,6 +179,31 @@ SCHEDULER_STATUS_PUBLICATION_MARKER_NAME = (
 MAX_SCHEDULER_STATUS_BYTES = 64 * 1024
 MAX_SCHEDULER_ATTEMPT_FUTURE_SKEW = timedelta(minutes=5)
 MAX_SCHEDULER_RUNNER_BYTES = 16 * 1024 * 1024
+MIRROR_PRIVATE_CONTROL_PARENT = Path(
+    "/private/tmp" if sys.platform == "darwin" else "/var/tmp"
+)
+MIRROR_PRIVATE_TOOL_ROOT_NAME = "codex-sync-canonical-mirrors"
+MIRROR_DURABLE_QUARANTINE_ROOT_NAME = ".codex-sync-canonical-mirror-quarantine"
+MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT = 10_000
+MIRROR_PRIVATE_TOOL_ROOT_ENTRY_LIMIT = 256
+MIRROR_PRIVATE_OWNER_RECORD_VERSION = 1
+MIRROR_PRIVATE_OWNER_RECORD_FIELDS = frozenset(
+    {
+        "version",
+        "owner_pid",
+        "owner_uid",
+        "owner_gid",
+        "owner_nonce",
+        "phase",
+        "private_name",
+        "private_identity",
+    }
+)
+MIRROR_PRIVATE_OWNER_RECORD_PHASES = frozenset({"building", "ready", "cleanup"})
+MAX_MIRROR_PRIVATE_OWNER_RECORD_BYTES = 4096
+MIRROR_PRIVATE_SNAPSHOT_RE = re.compile(
+    r"^sync-canonical-git-control\.[0-9]+\.[0-9a-f]{32}$"
+)
 SCHEDULER_PAIR_TRANSACTION_NAME = ".codex-personal-sync-scheduler-transaction.json"
 MAX_SCHEDULER_PAIR_TRANSACTION_BYTES = 4 * 1024 * 1024
 SCHEDULER_ACTIVATION_TRANSACTION_NAME = (
@@ -732,6 +757,36 @@ class SchedulerDaemonQuery:
 
 
 @dataclass(frozen=True)
+class MirrorQuarantineOwnerRecord:
+    name: str
+    identity: tuple[int, int, int]
+    access_policy: tuple[int, int, int]
+    sha256: str | None
+    state: str
+    detail: str | None = None
+    owner_pid: int | None = None
+    owner_nonce: str | None = None
+    phase: str | None = None
+    private_name: str | None = None
+    expected_private_identity: tuple[int, int, int] | None = None
+    observed_private_identity: tuple[int, int, int] | None = None
+    private_state: str | None = None
+
+
+@dataclass(frozen=True)
+class MirrorQuarantineAudit:
+    classification: str
+    path: Path
+    entry_count: int | None
+    entry_limit: int
+    count_is_lower_bound: bool
+    segment_identity: tuple[int, int, int] | None
+    segment_access_policy: tuple[int, int, int] | None
+    owner_records: tuple[MirrorQuarantineOwnerRecord, ...] = ()
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
 class SchedulerReport:
     platform: str
     installed: bool
@@ -750,6 +805,7 @@ class SchedulerReport:
     failure_code: str | None = None
     quarantine_batches: int | None = None
     quarantine_limit: int = MAX_RETAINED_QUARANTINE_BATCHES
+    mirror_quarantine: MirrorQuarantineAudit | None = None
     release_integrity: tuple[tuple[str, str, str, str], ...] = ()
     daemon_query: SchedulerDaemonQuery | None = None
     failures: tuple[tuple[str | None, str], ...] = ()
@@ -26618,12 +26674,32 @@ def doctor(
             )
         )
         classified.add(("quarantine-saturated", detail))
+    if (
+        report.mirror_quarantine is not None
+        and report.mirror_quarantine.classification in {"saturated", "inconclusive"}
+    ):
+        issue_code = (
+            "mirror-quarantine-saturated"
+            if report.mirror_quarantine.classification == "saturated"
+            else "mirror-quarantine-audit-inconclusive"
+        )
+        detail = _mirror_quarantine_failure_detail(report.mirror_quarantine)
+        issues.append(
+            DoctorIssue(
+                issue_code,
+                report.mirror_quarantine.path,
+                detail,
+            )
+        )
+        classified.add((issue_code, detail))
     for failure_code, failure_reason in _scheduler_report_failures(report):
         issue_code = (
             failure_code
             if failure_code
             in {
                 "immutable-release-drift",
+                "mirror-quarantine-saturated",
+                "mirror-quarantine-audit-inconclusive",
                 "quarantine-saturated",
                 "quarantine-audit-inconclusive",
                 "scheduler-config-drift",
@@ -26643,7 +26719,14 @@ def doctor(
                 DoctorIssue(
                     issue_code,
                     (
-                        _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
+                        (
+                            report.mirror_quarantine.path
+                            if report.mirror_quarantine is not None
+                            else Path(os.path.abspath(MIRROR_PRIVATE_CONTROL_PARENT))
+                            / MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+                        )
+                        if issue_code.startswith("mirror-quarantine-")
+                        else (_personal_sync_root(home) / QUARANTINE_RELATIVE_PATH)
                         if issue_code.startswith("quarantine-")
                         else (
                             _scheduler_activation_transaction_path(
@@ -27548,6 +27631,787 @@ def _scheduler_release_integrity_issues(
     return tuple(issues)
 
 
+def _mirror_object_identity(metadata: os.stat_result) -> tuple[int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+    )
+
+
+def _mirror_access_policy(metadata: os.stat_result) -> tuple[int, int, int]:
+    return (
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+
+def _bind_mirror_audit_directory(
+    path: Path,
+    label: str,
+) -> tuple[int, tuple[int, int, int], tuple[int, int, int]]:
+    path = Path(os.path.abspath(path))
+    try:
+        path_metadata = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise SyncError(f"cannot inspect {label}: {path}: {error}") from error
+    if stat.S_ISLNK(path_metadata.st_mode) or not stat.S_ISDIR(path_metadata.st_mode):
+        raise SyncError(f"{label} must be a non-symlink directory: {path}")
+    try:
+        directory_fd = os.open(path, _source_directory_flags())
+    except OSError as error:
+        raise SyncError(f"cannot safely open {label}: {path}: {error}") from error
+    try:
+        descriptor_metadata = os.fstat(directory_fd)
+    except OSError as error:
+        os.close(directory_fd)
+        raise SyncError(f"cannot inspect the bound {label}: {path}: {error}") from error
+    if _mirror_object_identity(path_metadata) != _mirror_object_identity(
+        descriptor_metadata
+    ) or _mirror_access_policy(path_metadata) != _mirror_access_policy(
+        descriptor_metadata
+    ):
+        os.close(directory_fd)
+        raise SyncError(f"{label} changed while binding it: {path}")
+    return (
+        directory_fd,
+        _mirror_object_identity(descriptor_metadata),
+        _mirror_access_policy(descriptor_metadata),
+    )
+
+
+def _bind_mirror_audit_child_directory(
+    parent_fd: int,
+    parent_path: Path,
+    name: str,
+    label: str,
+) -> tuple[int, tuple[int, int, int], tuple[int, int, int]]:
+    try:
+        path_metadata = os.stat(
+            name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise SyncError(
+            f"cannot inspect {label}: {parent_path / name}: {error}"
+        ) from error
+    if stat.S_ISLNK(path_metadata.st_mode) or not stat.S_ISDIR(path_metadata.st_mode):
+        raise SyncError(
+            f"{label} must be a non-symlink directory: {parent_path / name}"
+        )
+    try:
+        directory_fd = os.open(
+            name,
+            _source_directory_flags(),
+            dir_fd=parent_fd,
+        )
+    except OSError as error:
+        raise SyncError(
+            f"cannot safely open {label}: {parent_path / name}: {error}"
+        ) from error
+    try:
+        descriptor_metadata = os.fstat(directory_fd)
+    except OSError as error:
+        os.close(directory_fd)
+        raise SyncError(
+            f"cannot inspect the bound {label}: {parent_path / name}: {error}"
+        ) from error
+    if _mirror_object_identity(path_metadata) != _mirror_object_identity(
+        descriptor_metadata
+    ) or _mirror_access_policy(path_metadata) != _mirror_access_policy(
+        descriptor_metadata
+    ):
+        os.close(directory_fd)
+        raise SyncError(f"{label} changed while binding it: {parent_path / name}")
+    return (
+        directory_fd,
+        _mirror_object_identity(descriptor_metadata),
+        _mirror_access_policy(descriptor_metadata),
+    )
+
+
+def _revalidate_mirror_audit_directory(
+    path: Path,
+    directory_fd: int,
+    identity: tuple[int, int, int],
+    access_policy: tuple[int, int, int],
+    label: str,
+) -> None:
+    try:
+        path_metadata = os.stat(path, follow_symlinks=False)
+        descriptor_metadata = os.fstat(directory_fd)
+    except OSError as error:
+        raise SyncError(f"{label} became unavailable: {path}: {error}") from error
+    if (
+        _mirror_object_identity(path_metadata) != identity
+        or _mirror_object_identity(descriptor_metadata) != identity
+    ):
+        raise SyncError(f"{label} was replaced during audit: {path}")
+    if (
+        _mirror_access_policy(path_metadata) != access_policy
+        or _mirror_access_policy(descriptor_metadata) != access_policy
+    ):
+        raise SyncError(f"{label} access policy changed during audit: {path}")
+
+
+def _acquire_mirror_audit_shared_lock(
+    directory_fd: int,
+    label: str,
+) -> None:
+    try:
+        fcntl.flock(directory_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        raise SyncError(f"{label} is busy with an active writer") from error
+    except OSError as error:
+        raise SyncError(f"cannot acquire the {label} audit lease: {error}") from error
+
+
+def _bounded_mirror_directory_names(
+    directory_fd: int,
+    *,
+    limit: int,
+    label: str,
+) -> tuple[tuple[str, ...], bool]:
+    def scan() -> tuple[tuple[str, ...], bool]:
+        names: list[str] = []
+        try:
+            with os.scandir(directory_fd) as entries:
+                for entry in entries:
+                    name = entry.name
+                    if (
+                        not isinstance(name, str)
+                        or name in {"", ".", ".."}
+                        or "/" in name
+                    ):
+                        raise SyncError(
+                            f"{label} contains an unsafe entry name: {name!r}"
+                        )
+                    names.append(name)
+                    if len(names) > limit:
+                        return tuple(sorted(names)), True
+        except OSError as error:
+            raise SyncError(f"cannot inventory {label}: {error}") from error
+        return tuple(sorted(names)), False
+
+    first, first_overflow = scan()
+    if first_overflow:
+        return first, True
+    second, second_overflow = scan()
+    if second_overflow or second != first:
+        raise SyncError(f"{label} namespace changed during audit")
+    return first, False
+
+
+def _read_bounded_mirror_owner_payload(
+    file_fd: int,
+    label: str,
+) -> bytes:
+    try:
+        before = os.fstat(file_fd)
+    except OSError as error:
+        raise SyncError(f"cannot inspect {label} before reading: {error}") from error
+
+    def read_once() -> bytes:
+        try:
+            os.lseek(file_fd, 0, os.SEEK_SET)
+            payload = bytearray()
+            while len(payload) <= MAX_MIRROR_PRIVATE_OWNER_RECORD_BYTES:
+                chunk = os.read(
+                    file_fd,
+                    min(
+                        4096,
+                        MAX_MIRROR_PRIVATE_OWNER_RECORD_BYTES + 1 - len(payload),
+                    ),
+                )
+                if not chunk:
+                    break
+                payload.extend(chunk)
+        except OSError as error:
+            raise SyncError(f"cannot read {label}: {error}") from error
+        if len(payload) > MAX_MIRROR_PRIVATE_OWNER_RECORD_BYTES:
+            raise SyncError(
+                f"{label} exceeds {MAX_MIRROR_PRIVATE_OWNER_RECORD_BYTES} bytes"
+            )
+        return bytes(payload)
+
+    first = read_once()
+    second = read_once()
+    try:
+        after = os.fstat(file_fd)
+    except OSError as error:
+        raise SyncError(f"cannot inspect {label} after reading: {error}") from error
+    if (
+        _mirror_object_identity(before) != _mirror_object_identity(after)
+        or _mirror_access_policy(before) != _mirror_access_policy(after)
+        or before.st_size != after.st_size
+        or first != second
+    ):
+        raise SyncError(f"{label} changed while reading it")
+    return first
+
+
+def _mirror_owner_record_from_pairs(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    record: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in record:
+            raise ValueError(f"duplicate key: {key}")
+        record[key] = value
+    return record
+
+
+def _is_strict_json_integer(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _audit_mirror_owner_record(
+    tool_fd: int,
+    owner_name: str,
+) -> MirrorQuarantineOwnerRecord:
+    label = f"mirror private owner record {owner_name}"
+    try:
+        path_metadata = os.stat(
+            owner_name,
+            dir_fd=tool_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISREG(path_metadata.st_mode):
+            raise SyncError(f"{label} must be a regular file")
+        owner_fd = os.open(
+            owner_name,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=tool_fd,
+        )
+    except OSError as error:
+        raise SyncError(f"cannot bind {label}: {error}") from error
+    try:
+        try:
+            descriptor_metadata = os.fstat(owner_fd)
+        except OSError as error:
+            raise SyncError(f"cannot inspect the bound {label}: {error}") from error
+        identity = _mirror_object_identity(descriptor_metadata)
+        access_policy = _mirror_access_policy(descriptor_metadata)
+        if (
+            _mirror_object_identity(path_metadata) != identity
+            or _mirror_access_policy(path_metadata) != access_policy
+        ):
+            raise SyncError(f"{label} changed while opening it")
+        try:
+            fcntl.flock(owner_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            try:
+                final_path_metadata = os.stat(
+                    owner_name,
+                    dir_fd=tool_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise SyncError(f"cannot revalidate active {label}: {error}") from error
+            if (
+                _mirror_object_identity(final_path_metadata) != identity
+                or _mirror_access_policy(final_path_metadata) != access_policy
+            ):
+                raise SyncError(f"{label} changed after its active lease was observed")
+            return MirrorQuarantineOwnerRecord(
+                name=owner_name,
+                identity=identity,
+                access_policy=access_policy,
+                sha256=None,
+                state="active",
+                detail="owner record is held by an active exclusive lease",
+            )
+        except OSError as error:
+            raise SyncError(
+                f"cannot acquire the {label} audit lease: {error}"
+            ) from error
+        try:
+            payload = _read_bounded_mirror_owner_payload(owner_fd, label)
+            digest = hashlib.sha256(payload).hexdigest()
+            try:
+                final_path_metadata = os.stat(
+                    owner_name,
+                    dir_fd=tool_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise SyncError(f"cannot revalidate {label}: {error}") from error
+            if (
+                _mirror_object_identity(final_path_metadata) != identity
+                or _mirror_access_policy(final_path_metadata) != access_policy
+            ):
+                raise SyncError(f"{label} changed after it was read")
+            try:
+                record = json.loads(
+                    payload.decode("utf-8"),
+                    object_pairs_hook=_mirror_owner_record_from_pairs,
+                )
+            except (
+                UnicodeDecodeError,
+                ValueError,
+                json.JSONDecodeError,
+                RecursionError,
+            ) as error:
+                return MirrorQuarantineOwnerRecord(
+                    name=owner_name,
+                    identity=identity,
+                    access_policy=access_policy,
+                    sha256=digest,
+                    state="invalid",
+                    detail=f"owner record schema is invalid: {error}",
+                )
+            private_name = (
+                record.get("private_name") if isinstance(record, dict) else None
+            )
+            private_identity = (
+                record.get("private_identity") if isinstance(record, dict) else None
+            )
+            valid = (
+                isinstance(record, dict)
+                and set(record) == MIRROR_PRIVATE_OWNER_RECORD_FIELDS
+                and type(record["version"]) is int
+                and record["version"] == MIRROR_PRIVATE_OWNER_RECORD_VERSION
+                and _is_strict_json_integer(record["owner_pid"])
+                and record["owner_pid"] > 0
+                and type(record["owner_uid"]) is int
+                and record["owner_uid"] == os.geteuid()
+                and type(record["owner_gid"]) is int
+                and record["owner_gid"] == os.getegid()
+                and isinstance(record["owner_nonce"], str)
+                and re.fullmatch(r"[0-9a-f]{32}", record["owner_nonce"]) is not None
+                and isinstance(record["phase"], str)
+                and record["phase"] in MIRROR_PRIVATE_OWNER_RECORD_PHASES
+                and isinstance(private_name, str)
+                and MIRROR_PRIVATE_SNAPSHOT_RE.fullmatch(private_name) is not None
+                and owner_name == f"{private_name}.owner.json"
+                and isinstance(private_identity, list)
+                and len(private_identity) == 3
+                and all(
+                    _is_strict_json_integer(item) and item >= 0
+                    for item in private_identity
+                )
+                and access_policy == (0o600, os.geteuid(), os.getegid())
+            )
+            if not valid:
+                return MirrorQuarantineOwnerRecord(
+                    name=owner_name,
+                    identity=identity,
+                    access_policy=access_policy,
+                    sha256=digest,
+                    state="invalid",
+                    detail="owner record fields do not match the recovery schema",
+                )
+            expected_private_identity = tuple(private_identity)
+            assert private_name is not None
+            try:
+                private_metadata = os.stat(
+                    private_name,
+                    dir_fd=tool_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                observed_private_identity = None
+                private_state = "missing"
+            except OSError as error:
+                raise SyncError(
+                    f"cannot inspect mirror private snapshot {private_name}: {error}"
+                ) from error
+            else:
+                observed_private_identity = _mirror_object_identity(private_metadata)
+                private_state = (
+                    "matching"
+                    if stat.S_ISDIR(private_metadata.st_mode)
+                    and observed_private_identity == expected_private_identity
+                    else "mismatched"
+                )
+            return MirrorQuarantineOwnerRecord(
+                name=owner_name,
+                identity=identity,
+                access_policy=access_policy,
+                sha256=digest,
+                state="stale",
+                owner_pid=record["owner_pid"],
+                owner_nonce=record["owner_nonce"],
+                phase=record["phase"],
+                private_name=private_name,
+                expected_private_identity=expected_private_identity,
+                observed_private_identity=observed_private_identity,
+                private_state=private_state,
+            )
+        finally:
+            try:
+                fcntl.flock(owner_fd, fcntl.LOCK_UN)
+            except OSError as error:
+                raise SyncError(
+                    f"cannot release the {label} audit lease: {error}"
+                ) from error
+    finally:
+        os.close(owner_fd)
+
+
+def _mirror_quarantine_audit() -> MirrorQuarantineAudit:
+    parent_path = Path(os.path.abspath(MIRROR_PRIVATE_CONTROL_PARENT))
+    tool_path = parent_path / MIRROR_PRIVATE_TOOL_ROOT_NAME
+    quarantine_path = parent_path / MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+    parent_fd = -1
+    tool_fd = -1
+    quarantine_fd = -1
+    tool_was_present = False
+    quarantine_inspection_attempted = False
+    quarantine_was_present = False
+    entry_count: int | None = None
+    count_is_lower_bound = False
+    tool_identity: tuple[int, int, int] | None = None
+    tool_access_policy: tuple[int, int, int] | None = None
+    segment_identity: tuple[int, int, int] | None = None
+    segment_access_policy: tuple[int, int, int] | None = None
+    owner_records: list[MirrorQuarantineOwnerRecord] = []
+    audit_errors: list[str] = []
+    try:
+        parent_fd, parent_identity, parent_access_policy = _bind_mirror_audit_directory(
+            parent_path,
+            "mirror private-control parent",
+        )
+        tool_coordination_ready = True
+        try:
+            os.stat(
+                MIRROR_PRIVATE_TOOL_ROOT_NAME,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            tool_coordination_ready = False
+            audit_errors.append(f"cannot inspect mirror private tool root: {error}")
+        else:
+            tool_was_present = True
+            try:
+                (
+                    tool_fd,
+                    tool_identity,
+                    tool_access_policy,
+                ) = _bind_mirror_audit_child_directory(
+                    parent_fd,
+                    parent_path,
+                    MIRROR_PRIVATE_TOOL_ROOT_NAME,
+                    "mirror private tool root",
+                )
+                if (
+                    tool_access_policy[0] != 0o700
+                    or tool_access_policy[1] != os.geteuid()
+                ):
+                    raise SyncError(
+                        "mirror private tool root must be mode 0700 and "
+                        "owned by the current uid"
+                    )
+                _acquire_mirror_audit_shared_lock(
+                    tool_fd,
+                    "mirror private tool root",
+                )
+            except SyncError as error:
+                tool_coordination_ready = False
+                audit_errors.append(str(error))
+            else:
+                try:
+                    tool_names, tool_overflow = _bounded_mirror_directory_names(
+                        tool_fd,
+                        limit=MIRROR_PRIVATE_TOOL_ROOT_ENTRY_LIMIT,
+                        label="mirror private tool root",
+                    )
+                    if tool_overflow:
+                        raise SyncError(
+                            "mirror private tool root exceeds its bounded "
+                            f"{MIRROR_PRIVATE_TOOL_ROOT_ENTRY_LIMIT}-entry audit"
+                        )
+                    for owner_name in tool_names:
+                        if not owner_name.endswith(".owner.json"):
+                            continue
+                        private_name = owner_name[: -len(".owner.json")]
+                        if MIRROR_PRIVATE_SNAPSHOT_RE.fullmatch(private_name) is None:
+                            continue
+                        try:
+                            owner_records.append(
+                                _audit_mirror_owner_record(
+                                    tool_fd,
+                                    owner_name,
+                                )
+                            )
+                        except SyncError as error:
+                            audit_errors.append(str(error))
+                except SyncError as error:
+                    audit_errors.append(str(error))
+                _revalidate_mirror_audit_directory(
+                    tool_path,
+                    tool_fd,
+                    tool_identity,
+                    tool_access_policy,
+                    "mirror private tool root",
+                )
+
+        if tool_coordination_ready and not tool_was_present:
+            quarantine_inspection_attempted = True
+            try:
+                os.stat(
+                    MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                entry_count = 0
+            except OSError as error:
+                audit_errors.append(
+                    f"cannot inspect mirror quarantine segment presence: {error}"
+                )
+            else:
+                quarantine_was_present = True
+                audit_errors.append(
+                    "mirror durable quarantine segment exists without its "
+                    "coordination tool root"
+                )
+        elif tool_coordination_ready:
+            quarantine_inspection_attempted = True
+            try:
+                os.stat(
+                    MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                entry_count = 0
+            except OSError as error:
+                audit_errors.append(
+                    f"cannot inspect mirror quarantine segment: {error}"
+                )
+            else:
+                quarantine_was_present = True
+                try:
+                    (
+                        quarantine_fd,
+                        segment_identity,
+                        segment_access_policy,
+                    ) = _bind_mirror_audit_child_directory(
+                        parent_fd,
+                        parent_path,
+                        MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+                        "mirror durable quarantine segment",
+                    )
+                    if (
+                        segment_access_policy[0] != 0o700
+                        or segment_access_policy[1] != os.geteuid()
+                    ):
+                        raise SyncError(
+                            "mirror durable quarantine segment must be mode 0700 "
+                            "and owned by the current uid"
+                        )
+                    _acquire_mirror_audit_shared_lock(
+                        quarantine_fd,
+                        "mirror durable quarantine segment",
+                    )
+                    quarantine_names, count_is_lower_bound = (
+                        _bounded_mirror_directory_names(
+                            quarantine_fd,
+                            limit=MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT,
+                            label="mirror durable quarantine segment",
+                        )
+                    )
+                    entry_count = len(quarantine_names)
+                    _revalidate_mirror_audit_directory(
+                        quarantine_path,
+                        quarantine_fd,
+                        segment_identity,
+                        segment_access_policy,
+                        "mirror durable quarantine segment",
+                    )
+                except SyncError as error:
+                    audit_errors.append(str(error))
+
+        if not tool_was_present:
+            try:
+                os.stat(
+                    MIRROR_PRIVATE_TOOL_ROOT_NAME,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                audit_errors.append(
+                    f"cannot revalidate mirror private tool root presence: {error}"
+                )
+            else:
+                audit_errors.append("mirror private tool root appeared during audit")
+        elif (
+            tool_identity is not None
+            and tool_fd >= 0
+            and tool_access_policy is not None
+        ):
+            try:
+                _revalidate_mirror_audit_directory(
+                    tool_path,
+                    tool_fd,
+                    tool_identity,
+                    tool_access_policy,
+                    "mirror private tool root",
+                )
+            except SyncError as error:
+                audit_errors.append(str(error))
+
+        if quarantine_inspection_attempted and not quarantine_was_present:
+            try:
+                os.stat(
+                    MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                audit_errors.append(
+                    f"cannot revalidate mirror quarantine segment presence: {error}"
+                )
+            else:
+                audit_errors.append(
+                    "mirror durable quarantine segment appeared during audit"
+                )
+        elif (
+            quarantine_inspection_attempted
+            and quarantine_was_present
+            and segment_identity is not None
+            and quarantine_fd >= 0
+            and segment_access_policy is not None
+        ):
+            try:
+                _revalidate_mirror_audit_directory(
+                    quarantine_path,
+                    quarantine_fd,
+                    segment_identity,
+                    segment_access_policy,
+                    "mirror durable quarantine segment",
+                )
+            except SyncError as error:
+                audit_errors.append(str(error))
+
+        _revalidate_mirror_audit_directory(
+            parent_path,
+            parent_fd,
+            parent_identity,
+            parent_access_policy,
+            "mirror private-control parent",
+        )
+    except SyncError as error:
+        audit_errors.append(str(error))
+    finally:
+        for descriptor in (quarantine_fd, tool_fd, parent_fd):
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    if audit_errors:
+        classification = "inconclusive"
+    elif (
+        entry_count is not None and entry_count >= MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT
+    ):
+        classification = "saturated"
+    elif segment_identity is None:
+        classification = "absent"
+    else:
+        classification = "available"
+    return MirrorQuarantineAudit(
+        classification=classification,
+        path=quarantine_path,
+        entry_count=entry_count,
+        entry_limit=MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT,
+        count_is_lower_bound=count_is_lower_bound,
+        segment_identity=segment_identity,
+        segment_access_policy=segment_access_policy,
+        owner_records=tuple(owner_records),
+        detail="; ".join(audit_errors) if audit_errors else None,
+    )
+
+
+def _mirror_quarantine_failure_detail(
+    audit: MirrorQuarantineAudit,
+) -> str:
+    rendered_count = (
+        "unknown"
+        if audit.entry_count is None
+        else (
+            f">={audit.entry_count}"
+            if audit.count_is_lower_bound
+            else str(audit.entry_count)
+        )
+    )
+    identity = (
+        "unknown"
+        if audit.segment_identity is None
+        else ":".join(f"{component:x}" for component in audit.segment_identity)
+    )
+    access_policy = (
+        "unknown"
+        if audit.segment_access_policy is None
+        else (
+            f"{audit.segment_access_policy[0]:04o}:"
+            f"{audit.segment_access_policy[1]}:"
+            f"{audit.segment_access_policy[2]}"
+        )
+    )
+    blocked_recovery_records = [
+        record
+        for record in audit.owner_records
+        if record.state == "stale" and record.private_state in {"missing", "matching"}
+    ]
+
+    def render_owner(record: MirrorQuarantineOwnerRecord) -> str:
+        owner_identity = ":".join(f"{component:x}" for component in record.identity)
+        owner_access_policy = (
+            f"{record.access_policy[0]:04o}:"
+            f"{record.access_policy[1]}:"
+            f"{record.access_policy[2]}"
+        )
+        expected_private_identity = (
+            "none"
+            if record.expected_private_identity is None
+            else ":".join(
+                f"{component:x}" for component in record.expected_private_identity
+            )
+        )
+        observed_private_identity = (
+            "none"
+            if record.observed_private_identity is None
+            else ":".join(
+                f"{component:x}" for component in record.observed_private_identity
+            )
+        )
+        return (
+            f"{record.name}"
+            f"[identity={owner_identity},access={owner_access_policy},"
+            f"sha256={record.sha256 or 'unavailable'},"
+            f"pid={record.owner_pid},nonce={record.owner_nonce},"
+            f"phase={record.phase},private={record.private_name},"
+            f"expected-private-identity={expected_private_identity},"
+            f"observed-private-identity={observed_private_identity},"
+            f"private-state={record.private_state}]"
+        )
+
+    recovery_preview = (
+        ", ".join(render_owner(record) for record in blocked_recovery_records[:8])
+        or "none"
+    )
+    if len(blocked_recovery_records) > 8:
+        recovery_preview += f", ... ({len(blocked_recovery_records) - 8} more)"
+    detail = (
+        f"mirror durable quarantine segment {audit.path} is "
+        f"{audit.classification}: count={rendered_count}, "
+        f"cap={audit.entry_limit}, identity={identity}, access={access_policy}, "
+        f"blocked-recovery-owner-records={recovery_preview}"
+    )
+    if audit.detail:
+        detail += f"; audit-error={audit.detail}"
+    return detail
+
+
 def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
     home = home.expanduser()
     selected_platform = _scheduler_platform(platform_name)
@@ -27756,6 +28620,32 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
     ]
     for code, _owner, _sha, detail in actionable_release_integrity:
         record_failure(code, detail)
+    try:
+        mirror_quarantine = _mirror_quarantine_audit()
+    except (OSError, SyncError) as error:
+        mirror_quarantine = MirrorQuarantineAudit(
+            classification="inconclusive",
+            path=(
+                Path(os.path.abspath(MIRROR_PRIVATE_CONTROL_PARENT))
+                / MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+            ),
+            entry_count=None,
+            entry_limit=MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT,
+            count_is_lower_bound=False,
+            segment_identity=None,
+            segment_access_policy=None,
+            detail=f"mirror quarantine audit failed unexpectedly: {error}",
+        )
+    if mirror_quarantine.classification == "saturated":
+        record_failure(
+            "mirror-quarantine-saturated",
+            _mirror_quarantine_failure_detail(mirror_quarantine),
+        )
+    elif mirror_quarantine.classification == "inconclusive":
+        record_failure(
+            "mirror-quarantine-audit-inconclusive",
+            _mirror_quarantine_failure_detail(mirror_quarantine),
+        )
     try:
         quarantine_batches = _quarantine_batch_count(home)
     except (OSError, SyncError) as error:
@@ -27968,6 +28858,7 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
         failure_reason=failure_reason,
         failure_code=failure_code,
         quarantine_batches=quarantine_batches,
+        mirror_quarantine=mirror_quarantine,
         release_integrity=release_integrity,
         daemon_query=daemon_query,
         failures=tuple(failures),
@@ -27982,6 +28873,74 @@ def _scheduler_report_failures(
     if report.failure_reason is None:
         return ()
     return ((report.failure_code, report.failure_reason),)
+
+
+def _mirror_identity_payload(
+    identity: tuple[int, int, int] | None,
+) -> dict[str, int] | None:
+    if identity is None:
+        return None
+    return {
+        "device": identity[0],
+        "inode": identity[1],
+        "file_type": identity[2],
+    }
+
+
+def _mirror_access_policy_payload(
+    access_policy: tuple[int, int, int] | None,
+) -> dict[str, int] | None:
+    if access_policy is None:
+        return None
+    return {
+        "mode": access_policy[0],
+        "uid": access_policy[1],
+        "gid": access_policy[2],
+    }
+
+
+def _mirror_quarantine_payload(
+    audit: MirrorQuarantineAudit | None,
+) -> dict[str, Any] | None:
+    if audit is None:
+        return None
+    return {
+        "classification": audit.classification,
+        "path": str(audit.path),
+        "entry_count": audit.entry_count,
+        "entry_limit": audit.entry_limit,
+        "segment_name": MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+        "segment_entry_count": audit.entry_count,
+        "segment_entry_limit": audit.entry_limit,
+        "count_is_lower_bound": audit.count_is_lower_bound,
+        "segment_identity": _mirror_identity_payload(audit.segment_identity),
+        "segment_access_policy": _mirror_access_policy_payload(
+            audit.segment_access_policy
+        ),
+        "owner_records": [
+            {
+                "name": record.name,
+                "identity": _mirror_identity_payload(record.identity),
+                "access_policy": _mirror_access_policy_payload(record.access_policy),
+                "sha256": record.sha256,
+                "state": record.state,
+                "detail": record.detail,
+                "owner_pid": record.owner_pid,
+                "owner_nonce": record.owner_nonce,
+                "phase": record.phase,
+                "private_name": record.private_name,
+                "expected_private_identity": _mirror_identity_payload(
+                    record.expected_private_identity
+                ),
+                "observed_private_identity": _mirror_identity_payload(
+                    record.observed_private_identity
+                ),
+                "private_state": record.private_state,
+            }
+            for record in audit.owner_records
+        ],
+        "detail": audit.detail,
+    }
 
 
 def _scheduler_report_payload(report: SchedulerReport) -> dict[str, Any]:
@@ -28010,6 +28969,7 @@ def _scheduler_report_payload(report: SchedulerReport) -> dict[str, Any]:
         ],
         "quarantine_batches": report.quarantine_batches,
         "quarantine_limit": report.quarantine_limit,
+        "mirror_quarantine": _mirror_quarantine_payload(report.mirror_quarantine),
         "failure_code": report.failure_code,
         "failure_reason": report.failure_reason,
         "daemon_query": (
@@ -28096,6 +29056,67 @@ def _print_scheduler_report(report: SchedulerReport) -> None:
             else (f"{report.quarantine_batches}/{report.quarantine_limit}")
         )
     )
+    if report.mirror_quarantine is None:
+        print("scheduler mirror quarantine: unknown")
+    else:
+        mirror_count = (
+            "unknown"
+            if report.mirror_quarantine.entry_count is None
+            else (
+                f">={report.mirror_quarantine.entry_count}"
+                if report.mirror_quarantine.count_is_lower_bound
+                else str(report.mirror_quarantine.entry_count)
+            )
+        )
+        mirror_identity = (
+            "unknown"
+            if report.mirror_quarantine.segment_identity is None
+            else ":".join(
+                f"{component:x}"
+                for component in report.mirror_quarantine.segment_identity
+            )
+        )
+        mirror_access_policy = (
+            "unknown"
+            if report.mirror_quarantine.segment_access_policy is None
+            else (
+                f"{report.mirror_quarantine.segment_access_policy[0]:04o}:"
+                f"{report.mirror_quarantine.segment_access_policy[1]}:"
+                f"{report.mirror_quarantine.segment_access_policy[2]}"
+            )
+        )
+        blocked_recovery_records = [
+            record
+            for record in report.mirror_quarantine.owner_records
+            if record.state == "stale"
+            and record.private_state in {"missing", "matching"}
+        ]
+        print(
+            "scheduler mirror quarantine: "
+            f"{report.mirror_quarantine.classification} "
+            f"{mirror_count}/{report.mirror_quarantine.entry_limit} "
+            f"segment={MIRROR_DURABLE_QUARANTINE_ROOT_NAME} "
+            f"path={report.mirror_quarantine.path} "
+            f"identity={mirror_identity} "
+            f"access={mirror_access_policy} "
+            "blocked-recovery-owner-records="
+            + (
+                ", ".join(
+                    (
+                        f"{record.name}"
+                        f"[identity={':'.join(f'{item:x}' for item in record.identity)},"
+                        f"access={record.access_policy[0]:04o}:"
+                        f"{record.access_policy[1]}:{record.access_policy[2]},"
+                        f"sha256={record.sha256 or 'unavailable'},"
+                        f"phase={record.phase},nonce={record.owner_nonce},"
+                        f"private={record.private_name},"
+                        f"private-state={record.private_state}]"
+                    )
+                    for record in blocked_recovery_records
+                )
+                or "none"
+            )
+        )
     print(f"scheduler failure code: {report.failure_code or 'none'}")
     print(f"scheduler failure reason: {report.failure_reason or 'none'}")
     print(
