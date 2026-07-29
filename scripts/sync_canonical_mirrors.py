@@ -42,13 +42,6 @@ GIT_DERIVED_CACHE_DISABLE_ARGUMENTS = (
     "-c",
     "core.multiPackIndex=false",
 )
-LAUNCHER_PROGRAM = (
-    "import os,sys;"
-    "os.fchdir(int(sys.argv[1]));"
-    "os.execve(sys.argv[2],sys.argv[2:],os.environ)"
-)
-MAX_LAUNCHER_SYMLINKS = 40
-MAX_LAUNCHER_PATH_COMPONENTS = 256
 PRIVATE_GIT_CONTROL_PARENT = Path(
     "/private/tmp" if sys.platform == "darwin" else "/var/tmp"
 )
@@ -145,85 +138,6 @@ class MirrorSyncError(RuntimeError):
 
 class MissingPathError(MirrorSyncError):
     pass
-
-
-def _resolve_launcher_executable(raw_executable: str) -> Path:
-    if not raw_executable:
-        raise MirrorSyncError("current Python executable path is empty")
-    unresolved = Path(raw_executable)
-    if not unresolved.is_absolute():
-        raise MirrorSyncError(
-            f"current Python executable must be absolute: {raw_executable!r}"
-        )
-
-    resolved = Path(unresolved.anchor)
-    pending = list(unresolved.parts[1:])
-    symlink_count = 0
-    component_count = 0
-    while pending:
-        component = pending.pop(0)
-        component_count += 1
-        if component_count > MAX_LAUNCHER_PATH_COMPONENTS:
-            raise MirrorSyncError(
-                "current Python executable resolution exceeds the "
-                f"{MAX_LAUNCHER_PATH_COMPONENTS}-component limit"
-            )
-        if component in {"", "."}:
-            continue
-        if component == "..":
-            resolved = resolved.parent
-            continue
-
-        candidate = resolved / component
-        try:
-            metadata = os.stat(candidate, follow_symlinks=False)
-        except OSError as error:
-            raise MirrorSyncError(
-                f"cannot resolve current Python executable {raw_executable!r}: "
-                f"{error}"
-            ) from error
-        if not stat.S_ISLNK(metadata.st_mode):
-            resolved = candidate
-            continue
-
-        symlink_count += 1
-        if symlink_count > MAX_LAUNCHER_SYMLINKS:
-            raise MirrorSyncError(
-                "current Python executable resolution exceeds the "
-                f"{MAX_LAUNCHER_SYMLINKS}-symlink limit"
-            )
-        try:
-            target = Path(os.readlink(candidate))
-        except OSError as error:
-            raise MirrorSyncError(
-                f"cannot read current Python executable symlink {candidate}: {error}"
-            ) from error
-        if target.is_absolute():
-            resolved = Path(target.anchor)
-            target_parts = list(target.parts[1:])
-        else:
-            target_parts = list(target.parts)
-        pending = target_parts + pending
-
-    resolved = Path(os.path.abspath(resolved))
-    try:
-        metadata = os.stat(resolved, follow_symlinks=False)
-    except OSError as error:
-        raise MirrorSyncError(
-            f"cannot inspect resolved Python executable {resolved}: {error}"
-        ) from error
-    if stat.S_ISLNK(metadata.st_mode):
-        raise MirrorSyncError(
-            f"resolved Python executable must not be a symlink: {resolved}"
-        )
-    if not stat.S_ISREG(metadata.st_mode):
-        raise MirrorSyncError(
-            f"resolved Python executable must be a regular file: {resolved}"
-        )
-    return resolved
-
-
-LAUNCHER_EXECUTABLE = _resolve_launcher_executable(sys.executable)
 
 
 @dataclass(frozen=True)
@@ -330,7 +244,6 @@ class BoundRoot:
     access_policy: tuple[int, int, int]
     exclusive: bool
     git_executable: ControlObjectBinding
-    launcher_executable: ControlObjectBinding
     git_control: GitControlBinding | None = None
     git_capability_verified: bool = False
     operation: OperationBudget | None = None
@@ -2955,17 +2868,6 @@ def _bind_root(root: Path, *, exclusive: bool = False) -> BoundRoot:
         fcntl.flock(root_fd, fcntl.LOCK_UN)
         os.close(root_fd)
         raise
-    try:
-        launcher_executable = _bind_absolute_control_object(
-            LAUNCHER_EXECUTABLE,
-            "Git launcher executable",
-            require_directory=False,
-        )
-    except BaseException:
-        os.close(git_executable.fd)
-        fcntl.flock(root_fd, fcntl.LOCK_UN)
-        os.close(root_fd)
-        raise
     root_metadata = os.fstat(root_fd)
     return BoundRoot(
         path=path,
@@ -2974,17 +2876,7 @@ def _bind_root(root: Path, *, exclusive: bool = False) -> BoundRoot:
         access_policy=_access_policy(root_metadata),
         exclusive=exclusive,
         git_executable=git_executable,
-        launcher_executable=launcher_executable,
     )
-
-
-def _bound_launcher_path(root: BoundRoot) -> str:
-    binding = root.launcher_executable
-    if binding.path is None or binding.content_digest is None:
-        raise MirrorSyncError(
-            "Git launcher executable must be an absolute content-bound file"
-        )
-    return binding.path.as_posix()
 
 
 def _revalidate_bound_root_directory(root: BoundRoot) -> None:
@@ -3026,7 +2918,6 @@ def _revalidate_bound_root(root: BoundRoot) -> None:
     try:
         _revalidate_bound_root_directory(root)
         _revalidate_control_object(root, root.git_executable)
-        _revalidate_control_object(root, root.launcher_executable)
         for managed_ancestor in root.managed_ancestors.values():
             _revalidate_control_object(root, managed_ancestor)
         if git_control is not None:
@@ -3098,8 +2989,6 @@ def _close_bound_root(root: BoundRoot) -> None:
     root.managed_ancestor_paths.clear()
     os.close(root.git_executable.fd)
     root.git_executable.fd = -1
-    os.close(root.launcher_executable.fd)
-    root.launcher_executable.fd = -1
     fcntl.flock(root.fd, fcntl.LOCK_UN)
     os.close(root.fd)
     root.fd = -1
@@ -5561,18 +5450,72 @@ def _parse_git_version_output(payload: bytes) -> tuple[int, int, int]:
     )
 
 
+def _popen_from_bound_directory(
+    command: list[str],
+    *,
+    directory_fd: int,
+    directory_identity: tuple[int, int, int],
+    directory_access_policy: tuple[int, int, int],
+    directory_label: str,
+    **kwargs: Any,
+) -> subprocess.Popen[bytes]:
+    if "cwd" in kwargs or "preexec_fn" in kwargs:
+        raise MirrorSyncError(
+            "bound-directory process launch does not accept cwd or preexec_fn"
+        )
+
+    # The CLI is single-threaded. Change its current directory through the
+    # already-bound descriptor before Popen so the child inherits that exact
+    # directory object. A pathname replacement at the launch boundary cannot
+    # redirect the child, and no Python executable has to be re-executed.
+    saved_directory_fd = os.open(".", _DIRECTORY_FLAGS)
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        descriptor_metadata = os.fstat(directory_fd)
+        if _object_identity(descriptor_metadata) != directory_identity:
+            raise MirrorSyncError(
+                f"{directory_label} descriptor was replaced before process launch"
+            )
+        if _access_policy(descriptor_metadata) != directory_access_policy:
+            raise MirrorSyncError(
+                f"{directory_label} descriptor access policy changed before "
+                "process launch"
+            )
+        os.fchdir(directory_fd)
+        inherited_metadata = os.stat(".", follow_symlinks=False)
+        if _object_identity(inherited_metadata) != directory_identity:
+            raise MirrorSyncError(
+                f"{directory_label} current-directory identity changed before "
+                "process launch"
+            )
+        if _access_policy(inherited_metadata) != directory_access_policy:
+            raise MirrorSyncError(
+                f"{directory_label} current-directory access policy changed "
+                "before process launch"
+            )
+        process = subprocess.Popen(command, **kwargs)
+    finally:
+        try:
+            os.fchdir(saved_directory_fd)
+        except OSError as error:
+            if process is not None:
+                _terminate_git_process(process)
+            raise MirrorSyncError(
+                "cannot restore the parent working directory after bounded "
+                f"{directory_label} process launch: {error}"
+            ) from error
+        finally:
+            os.close(saved_directory_fd)
+    if process is None:
+        raise MirrorSyncError(f"cannot start bounded {directory_label} process")
+    return process
+
+
 def _verify_git_capability(bound_root: BoundRoot) -> None:
     if bound_root.git_capability_verified:
         _revalidate_bound_root(bound_root)
         return
     command = [
-        _bound_launcher_path(bound_root),
-        "-I",
-        "-B",
-        "-S",
-        "-c",
-        LAUNCHER_PROGRAM,
-        str(bound_root.fd),
         GIT_EXECUTABLE.as_posix(),
         "--no-lazy-fetch",
         "--version",
@@ -5580,13 +5523,16 @@ def _verify_git_capability(bound_root: BoundRoot) -> None:
     process: subprocess.Popen[bytes] | None = None
     try:
         _revalidate_bound_root(bound_root)
-        process = subprocess.Popen(
+        process = _popen_from_bound_directory(
             command,
+            directory_fd=bound_root.fd,
+            directory_identity=bound_root.identity,
+            directory_access_policy=bound_root.access_policy,
+            directory_label="repository root",
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=_git_environment(),
-            pass_fds=(bound_root.fd,),
             start_new_session=True,
         )
         return_code, stdout, stderr = _collect_bounded_process_output(
@@ -5633,13 +5579,6 @@ def _run_private_git_config_process(
     if not bound_root.git_capability_verified:
         raise MirrorSyncError("Git capability gate has not completed")
     command = [
-        _bound_launcher_path(bound_root),
-        "-I",
-        "-B",
-        "-S",
-        "-c",
-        LAUNCHER_PROGRAM,
-        str(bound_root.git_control.private.fd),
         GIT_EXECUTABLE.as_posix(),
         "--no-lazy-fetch",
         "--no-optional-locks",
@@ -5654,16 +5593,16 @@ def _run_private_git_config_process(
     process: subprocess.Popen[bytes] | None = None
     try:
         _revalidate_bound_root(bound_root)
-        process = subprocess.Popen(
+        process = _popen_from_bound_directory(
             command,
+            directory_fd=bound_root.git_control.private.fd,
+            directory_identity=bound_root.git_control.private.identity,
+            directory_access_policy=bound_root.git_control.private.access_policy,
+            directory_label="private Git control snapshot",
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=_git_environment(),
-            pass_fds=(
-                bound_root.fd,
-                bound_root.git_control.private.fd,
-            ),
             start_new_session=True,
         )
         return_code, stdout, stderr = _collect_bounded_git_output(
@@ -5784,17 +5723,6 @@ def _run_private_git_process(
         f"core.hooksPath={os.devnull}",
         *arguments,
     ]
-    command = [
-        _bound_launcher_path(bound_root),
-        "-I",
-        "-B",
-        "-S",
-        "-c",
-        LAUNCHER_PROGRAM,
-        str(bound_root.git_control.private.fd),
-        *git_command,
-    ]
-
     process: subprocess.Popen[bytes] | None = None
     stdin_file: Any | None = None
     try:
@@ -5809,16 +5737,16 @@ def _run_private_git_process(
             stdin_file.write(stdin_payload)
             stdin_file.flush()
             stdin_file.seek(0)
-        process = subprocess.Popen(
-            command,
+        process = _popen_from_bound_directory(
+            git_command,
+            directory_fd=bound_root.git_control.private.fd,
+            directory_identity=bound_root.git_control.private.identity,
+            directory_access_policy=bound_root.git_control.private.access_policy,
+            directory_label="private Git control snapshot",
             stdin=subprocess.DEVNULL if stdin_file is None else stdin_file,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=_git_environment(),
-            pass_fds=(
-                bound_root.fd,
-                bound_root.git_control.private.fd,
-            ),
             start_new_session=True,
         )
         return_code, stdout, stderr = _collect_bounded_git_output(

@@ -404,9 +404,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             "--home",
             str(self.home),
         ]
-        paths.launchd_plist.write_bytes(
-            plistlib.dumps(legacy_payload, sort_keys=True)
-        )
+        paths.launchd_plist.write_bytes(plistlib.dumps(legacy_payload, sort_keys=True))
 
         self.install_scheduler_quietly(
             "owner/new-sync",
@@ -477,16 +475,6 @@ class SchedulerDoctorTests(unittest.TestCase):
                     [
                         "systemctl",
                         "--user",
-                        "enable",
-                        f"{MODULE.SYSTEMD_UNIT}.timer",
-                    ],
-                    dry_run=False,
-                    allow_fail=False,
-                ),
-                mock.call(
-                    [
-                        "systemctl",
-                        "--user",
                         "start",
                         f"{MODULE.SYSTEMD_UNIT}.timer",
                     ],
@@ -495,6 +483,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                 ),
             ],
         )
+        enablement = MODULE._systemd_timer_enablement_path(paths)
+        self.assertEqual(os.readlink(enablement), str(paths.systemd_timer))
         self.assertIn("already matches audited configuration", output.getvalue())
         self.assertIn("preserved 29-minute interval", output.getvalue())
         self.assertEqual(
@@ -2384,17 +2374,10 @@ class SchedulerDoctorTests(unittest.TestCase):
         managed_drift = self.write_skill("managed-drift", "managed-name")
         cache_entry = self.home / "skills" / ".cache"
         cache_entry.mkdir()
-        backup_entry = (
-            self.home
-            / "skills"
-            / "bug-triage-playbook.bak-20260312-145916"
-        )
+        backup_entry = self.home / "skills" / "bug-triage-playbook.bak-20260312-145916"
         backup_entry.mkdir()
         system_backup_entry = (
-            self.home
-            / "skills"
-            / ".system"
-            / "legacy-system-skill.bak-20260723"
+            self.home / "skills" / ".system" / "legacy-system-skill.bak-20260723"
         )
         system_backup_entry.mkdir(parents=True)
         broken_link = self.home / "skills" / "broken-link"
@@ -2446,11 +2429,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             }.issubset(audit_codes)
         )
         self.assertEqual(
-            {
-                issue.path
-                for issue in audit_issues
-                if issue.code == "unmanaged-skill"
-            },
+            {issue.path for issue in audit_issues if issue.code == "unmanaged-skill"},
             {duplicate_one, duplicate_two},
         )
         self.assertEqual(
@@ -2462,11 +2441,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             {duplicate_one, duplicate_two},
         )
         self.assertEqual(
-            {
-                issue.path
-                for issue in audit_issues
-                if issue.code == "cache-or-backup"
-            },
+            {issue.path for issue in audit_issues if issue.code == "cache-or-backup"},
             {cache_entry, backup_entry, system_backup_entry},
         )
         self.assertIn(
@@ -2550,7 +2525,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             runner,
         ).replace(
             "ExecStart=",
-            "ExecStartPre=\"/tmp/attacker\"\nExecStart=",
+            'ExecStartPre="/tmp/attacker"\nExecStart=',
         )
         paths.systemd_service.write_text(service, encoding="utf-8")
         paths.systemd_timer.write_text(
@@ -2571,9 +2546,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        drop_in = paths.systemd_service.with_name(
-            paths.systemd_service.name + ".d"
-        )
+        drop_in = paths.systemd_service.with_name(paths.systemd_service.name + ".d")
         drop_in.mkdir()
         (drop_in / "override.conf").write_text(
             "[Service]\nExecStartPre=/tmp/attacker\n",
@@ -2785,9 +2758,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             base_repo="owner/public-sync",
             owner=MODULE.PUBLIC_OWNER,
         )
-        self.assertFalse(
-            MODULE._stable_scheduler_runner_matches(self.home, config)
-        )
+        self.assertFalse(MODULE._stable_scheduler_runner_matches(self.home, config))
 
         plain_runner.unlink()
         managed_runner = (
@@ -2820,9 +2791,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             "_load_managed_state",
             return_value=state,
         ):
-            self.assertTrue(
-                MODULE._stable_scheduler_runner_matches(self.home, config)
-            )
+            self.assertTrue(MODULE._stable_scheduler_runner_matches(self.home, config))
 
         alternate = self.home / "alternate-runner"
         alternate.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -2832,9 +2801,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             _home: Path,
         ) -> MODULE.ManagedState:
             plain_runner.unlink()
-            plain_runner.symlink_to(
-                os.path.relpath(alternate, plain_runner.parent)
-            )
+            plain_runner.symlink_to(os.path.relpath(alternate, plain_runner.parent))
             return state
 
         with mock.patch.object(
@@ -2842,9 +2809,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             "_load_managed_state",
             side_effect=replace_link_then_return_state,
         ):
-            self.assertFalse(
-                MODULE._stable_scheduler_runner_matches(self.home, config)
-            )
+            self.assertFalse(MODULE._stable_scheduler_runner_matches(self.home, config))
 
     def test_runtime_target_mismatch_is_unhealthy_and_not_carried_forward(
         self,
@@ -2914,16 +2879,19 @@ class SchedulerDoctorTests(unittest.TestCase):
         paths = MODULE._scheduler_paths("linux", self.home)
         assert paths.systemd_service is not None
         assert paths.systemd_timer is not None
-        real_write = MODULE._write_text
+        real_write = MODULE._write_text_with_activation_binding
         injected = False
 
         def fail_before_timer(
             path: Path,
             content: str,
             *,
-            dry_run: bool,
-            expected_snapshot: MODULE.ManagedStateFileSnapshot | None = None,
-        ) -> MODULE.ManagedStateFileSnapshot | None:
+            expected_snapshot: MODULE.ManagedStateFileSnapshot,
+            description: str,
+        ) -> tuple[
+            MODULE.ManagedStateFileSnapshot,
+            MODULE.SchedulerActivationBinding,
+        ]:
             nonlocal injected
             if path == paths.systemd_timer and not injected:
                 injected = True
@@ -2931,14 +2899,14 @@ class SchedulerDoctorTests(unittest.TestCase):
             return real_write(
                 path,
                 content,
-                dry_run=dry_run,
                 expected_snapshot=expected_snapshot,
+                description=description,
             )
 
         with (
             mock.patch.object(
                 MODULE,
-                "_write_text",
+                "_write_text_with_activation_binding",
                 side_effect=fail_before_timer,
             ),
             self.assertRaisesRegex(MODULE.SyncError, "pair crash"),
@@ -2973,16 +2941,19 @@ class SchedulerDoctorTests(unittest.TestCase):
         second_install_started = threading.Event()
         second_recovery_entered = threading.Event()
         errors: dict[str, BaseException] = {}
-        real_write = MODULE._write_text
+        real_write = MODULE._write_text_with_activation_binding
         real_recover = MODULE._recover_scheduler_pair_transaction
 
         def pause_first_publication(
             path: Path,
             content: str,
             *,
-            dry_run: bool,
-            expected_snapshot: MODULE.ManagedStateFileSnapshot | None = None,
-        ) -> MODULE.ManagedStateFileSnapshot | None:
+            expected_snapshot: MODULE.ManagedStateFileSnapshot,
+            description: str,
+        ) -> tuple[
+            MODULE.ManagedStateFileSnapshot,
+            MODULE.SchedulerActivationBinding,
+        ]:
             if (
                 threading.current_thread().name == "first-scheduler-install"
                 and path == paths.systemd_service
@@ -2993,8 +2964,8 @@ class SchedulerDoctorTests(unittest.TestCase):
             return real_write(
                 path,
                 content,
-                dry_run=dry_run,
                 expected_snapshot=expected_snapshot,
+                description=description,
             )
 
         def observe_recovery(
@@ -3037,7 +3008,7 @@ class SchedulerDoctorTests(unittest.TestCase):
         with (
             mock.patch.object(
                 MODULE,
-                "_write_text",
+                "_write_text_with_activation_binding",
                 side_effect=pause_first_publication,
             ),
             mock.patch.object(
@@ -3086,16 +3057,19 @@ class SchedulerDoctorTests(unittest.TestCase):
         assert paths.systemd_service is not None
         assert paths.systemd_timer is not None
         original_timer = paths.systemd_timer.read_bytes()
-        real_write = MODULE._write_text
+        real_write = MODULE._write_text_with_activation_binding
         injected = False
 
         def edit_before_conditional_write(
             path: Path,
             content: str,
             *,
-            dry_run: bool,
-            expected_snapshot: MODULE.ManagedStateFileSnapshot | None = None,
-        ) -> MODULE.ManagedStateFileSnapshot | None:
+            expected_snapshot: MODULE.ManagedStateFileSnapshot,
+            description: str,
+        ) -> tuple[
+            MODULE.ManagedStateFileSnapshot,
+            MODULE.SchedulerActivationBinding,
+        ]:
             nonlocal injected
             if path == paths.systemd_service and not injected:
                 injected = True
@@ -3104,14 +3078,14 @@ class SchedulerDoctorTests(unittest.TestCase):
             return real_write(
                 path,
                 content,
-                dry_run=dry_run,
                 expected_snapshot=expected_snapshot,
+                description=description,
             )
 
         with (
             mock.patch.object(
                 MODULE,
-                "_write_text",
+                "_write_text_with_activation_binding",
                 side_effect=edit_before_conditional_write,
             ),
             self.assertRaisesRegex(
@@ -3349,9 +3323,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                     paths.systemd_service.name + ".replacement"
                 )
                 replacement.write_bytes(paths.systemd_service.read_bytes())
-                replacement.chmod(
-                    stat.S_IMODE(paths.systemd_service.stat().st_mode)
-                )
+                replacement.chmod(stat.S_IMODE(paths.systemd_service.stat().st_mode))
                 os.replace(replacement, paths.systemd_service)
                 replaced = True
             return real_matches(
@@ -4273,6 +4245,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                     self.assertFalse(legacy.exists())
                 else:
                     self.assertEqual(legacy.read_bytes(), original)
+
     def test_legacy_launchd_cleanup_allows_mtime_only_churn(self) -> None:
         self.write_runner()
         paths = MODULE._scheduler_paths("macos", self.home)
@@ -4519,9 +4492,7 @@ class SchedulerDoctorTests(unittest.TestCase):
         for initial_legacy_exists in (False, True):
             with self.subTest(initial_legacy_exists=initial_legacy_exists):
                 suffix = "present" if initial_legacy_exists else "absent"
-                case_user_home = (
-                    self.root / f"legacy-current-removal-{suffix}" / "home"
-                )
+                case_user_home = self.root / f"legacy-current-removal-{suffix}" / "home"
                 case_home = case_user_home / ".codex"
                 runner = case_home / "bin" / "codex-personal-sync"
                 runner.parent.mkdir(parents=True)
@@ -4552,8 +4523,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                     legacy.write_bytes(b"original legacy config\n")
                     legacy.chmod(0o600)
                 payload = (
-                    f"concurrent {suffix} legacy config during "
-                    "current removal\n"
+                    f"concurrent {suffix} legacy config during current removal\n"
                 ).encode("utf-8")
                 isolate = MODULE._isolate_and_delete_pending_cleanup_file
 
@@ -4929,9 +4899,7 @@ class SchedulerDoctorTests(unittest.TestCase):
     def test_uninstall_orphan_retries_from_durable_marker(self) -> None:
         for platform_name in ("macos", "linux"):
             with self.subTest(platform=platform_name):
-                case_user_home = (
-                    self.root / f"orphan-retry-{platform_name}" / "home"
-                )
+                case_user_home = self.root / f"orphan-retry-{platform_name}" / "home"
                 case_user_home.mkdir(parents=True)
                 case_home = case_user_home / ".codex"
                 with mock.patch.object(
@@ -6075,6 +6043,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                 self.assertNotIn("removed ", output.getvalue())
 
     def test_uninstall_accepts_only_precise_absence_evidence(self) -> None:
+        uid = os.getuid()
+        legacy_label = MODULE.LEGACY_LAUNCHD_LABELS[0]
         accepted = (
             (
                 [
@@ -6088,6 +6058,39 @@ class SchedulerDoctorTests(unittest.TestCase):
             (
                 ["launchctl", "disable", "gui/501/example"],
                 "Could not find specified service",
+            ),
+            (
+                [
+                    "launchctl",
+                    "disable",
+                    f"gui/{uid}/{MODULE.LAUNCHD_LABEL}",
+                ],
+                (
+                    "Bad request.\n"
+                    f'Could not find service "{MODULE.LAUNCHD_LABEL}" '
+                    f"in domain for user gui: {uid}"
+                ),
+            ),
+            (
+                ["launchctl", "bootout", f"gui/{uid}/{legacy_label}"],
+                (
+                    "Bad request.\n"
+                    f'Could not find service "{legacy_label}" '
+                    f"in domain for user gui: {uid}"
+                ),
+            ),
+            (
+                [
+                    "launchctl",
+                    "bootout",
+                    f"gui/{uid}",
+                    f"/tmp/{legacy_label}.plist",
+                ],
+                (
+                    "Bad request.\n"
+                    f'Could not find service "{legacy_label}" '
+                    f"in domain for user gui: {uid}"
+                ),
             ),
             (
                 [
@@ -6150,16 +6153,74 @@ class SchedulerDoctorTests(unittest.TestCase):
             ),
             (
                 [
+                    "launchctl",
+                    "disable",
+                    f"gui/{uid}/{MODULE.LAUNCHD_LABEL}",
+                ],
+                (
+                    "Bad request.\n"
+                    'Could not find service "mismatched.label" '
+                    f"in domain for user gui: {uid}"
+                ),
+            ),
+            (
+                [
+                    "launchctl",
+                    "disable",
+                    f"gui/{uid}/{MODULE.LAUNCHD_LABEL}",
+                ],
+                (
+                    "Bad request.\n"
+                    f'Could not find service "{MODULE.LAUNCHD_LABEL.upper()}" '
+                    f"in domain for user gui: {uid}"
+                ),
+            ),
+            (
+                [
+                    "launchctl",
+                    "disable",
+                    f"gui/{uid}/{MODULE.LAUNCHD_LABEL}",
+                ],
+                (
+                    "Bad request.\n"
+                    f'Could not find service "{MODULE.LAUNCHD_LABEL}" '
+                    f"in domain for user gui: {uid + 1}"
+                ),
+            ),
+            (
+                [
+                    "launchctl",
+                    "disable",
+                    f"gui/{uid + 1}/{MODULE.LAUNCHD_LABEL}",
+                ],
+                (
+                    "Bad request.\n"
+                    f'Could not find service "{MODULE.LAUNCHD_LABEL}" '
+                    f"in domain for user gui: {uid}"
+                ),
+            ),
+            (
+                [
+                    "launchctl",
+                    "disable",
+                    f"gui/{uid}/{MODULE.LAUNCHD_LABEL}",
+                ],
+                (
+                    "Bad request.\n"
+                    f'Could not find service "{MODULE.LAUNCHD_LABEL}" '
+                    f"in domain for user gui: {uid}\n"
+                    "additional diagnostic"
+                ),
+            ),
+            (
+                [
                     "systemctl",
                     "--user",
                     "disable",
                     "--now",
                     f"{MODULE.SYSTEMD_UNIT}.timer",
                 ],
-                (
-                    "Permission denied: Unit "
-                    f"{MODULE.SYSTEMD_UNIT}.timer not loaded."
-                ),
+                (f"Permission denied: Unit {MODULE.SYSTEMD_UNIT}.timer not loaded."),
             ),
         )
         for args, stderr in rejected:
@@ -6580,6 +6641,35 @@ class SchedulerDoctorTests(unittest.TestCase):
                 f"in domain for user gui: {os.getuid()}",
                 "disabled",
                 "not loaded",
+            ),
+            (
+                "Bad request.\n"
+                'Could not find service "mismatched.label" '
+                f"in domain for user gui: {os.getuid()}",
+                "unavailable",
+                "without explicit",
+            ),
+            (
+                "Bad request.\n"
+                f'Could not find service "{MODULE.LAUNCHD_LABEL.upper()}" '
+                f"in domain for user gui: {os.getuid()}",
+                "unavailable",
+                "without explicit",
+            ),
+            (
+                "Bad request.\n"
+                f'Could not find service "{MODULE.LAUNCHD_LABEL}" '
+                f"in domain for user gui: {os.getuid() + 1}",
+                "unavailable",
+                "without explicit",
+            ),
+            (
+                "Bad request.\n"
+                f'Could not find service "{MODULE.LAUNCHD_LABEL}" '
+                f"in domain for user gui: {os.getuid()}\n"
+                "additional diagnostic",
+                "unavailable",
+                "without explicit",
             ),
         ):
             with self.subTest(evidence=evidence):
@@ -7777,9 +7867,7 @@ class SchedulerDoctorTests(unittest.TestCase):
         )
 
         restored = MODULE._scheduler_config_snapshot(config)
-        self.assertTrue(
-            MODULE._scheduler_file_logical_state_matches(restored, desired)
-        )
+        self.assertTrue(MODULE._scheduler_file_logical_state_matches(restored, desired))
 
     def test_scheduler_report_requires_every_configured_current(self) -> None:
         public_config = MODULE.SchedulerConfig(
@@ -8002,22 +8090,11 @@ class SchedulerDoctorTests(unittest.TestCase):
         self.assertEqual(failed["last_success"], previous_success)
 
     def test_doctor_reports_quarantine_saturation_without_mutation(self) -> None:
-        quarantine = (
-            self.home
-            / "personal-sync"
-            / MODULE.QUARANTINE_RELATIVE_PATH
-        )
+        quarantine = self.home / "personal-sync" / MODULE.QUARANTINE_RELATIVE_PATH
         quarantine.mkdir(parents=True)
         for index in range(MODULE.MAX_RETAINED_QUARANTINE_BATCHES):
-            prefix = (
-                MODULE.PENDING_CLEANUP_ISOLATED_BATCH_PREFIX
-                if index % 2
-                else ""
-            )
-            (
-                quarantine
-                / f"{prefix}20260723T000000Z-{index + 1}-{index + 1}"
-            ).mkdir()
+            prefix = MODULE.PENDING_CLEANUP_ISOLATED_BATCH_PREFIX if index % 2 else ""
+            (quarantine / f"{prefix}20260723T000000Z-{index + 1}-{index + 1}").mkdir()
         before = snapshot_tree(quarantine)
 
         with contextlib.redirect_stdout(io.StringIO()):
@@ -8031,9 +8108,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             report.quarantine_batches,
             MODULE.MAX_RETAINED_QUARANTINE_BATCHES,
         )
-        saturated = [
-            issue for issue in issues if issue.code == "quarantine-saturated"
-        ]
+        saturated = [issue for issue in issues if issue.code == "quarantine-saturated"]
         self.assertEqual(len(saturated), 1)
         self.assertIn(
             f">= {MODULE.MAX_RETAINED_QUARANTINE_BATCHES}",
@@ -8119,9 +8194,7 @@ class SchedulerDoctorTests(unittest.TestCase):
 
         self.assertTrue(swapped)
         self.assertIn("skills-root-unsafe", {issue.code for issue in issues})
-        self.assertFalse(
-            any("injected" in issue.detail for issue in issues)
-        )
+        self.assertFalse(any("injected" in issue.detail for issue in issues))
 
     def test_uninstall_refuses_scheduler_symlink_without_deleting_target(
         self,

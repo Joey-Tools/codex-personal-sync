@@ -173,13 +173,48 @@ superseded_by:
   `git diff --check` passed; the refreshed source-lock SHA-256 is
   `cb876ccf5a761b09eebaf77559cf0a01c6bcffa8183a81b2b7537bd1bd8f8d6c`.
 - The PR #5 Ubuntu source-lock follow-up removes the fixed
-  `/usr/bin/python3` launcher assumption. Mirror verification now resolves the
-  current interpreter once through bounded absolute symlink traversal, binds
-  the resulting ordinary target by object identity, complete content, and
-  access policy, and executes only that bound path. Retargeting the original
-  symlink cannot redirect a later launch. Seven focused launcher tests, both
-  129-test native/Python 3.9.6 source-lock suites, both 26-test workflow
-  suites, and a symlink-invoked `refresh-lock --check` pass.
+  `/usr/bin/python3` launcher assumption and does not re-execute the current
+  interpreter. Immediately before each direct `/usr/bin/git` spawn, the
+  single-threaded CLI enters the already-bound repository or private-snapshot
+  directory through its retained descriptor; the child inherits that exact
+  directory object, and the parent restores its prior descriptor-bound
+  working directory. The protected launch properties are directory object
+  identity and access policy. Replacing the directory pathname at the
+  `Popen` boundary cannot redirect the child, while later path revalidation
+  still rejects the transaction.
+- The combined provider-review follow-up resolves all four reported findings.
+  Git is spawned directly from the exact descriptor-bound repository or
+  private-snapshot directory without re-executing a Python pathname. Quoted
+  launchctl not-loaded output is accepted only when its current/legacy label
+  preserves exact case and its `gui/<uid>` target exactly matches the command.
+  macOS scheduler tests mock the fixed native-argv resolver before any host
+  `/bin/launchctl` inspection, so the same harness remains runnable on Ubuntu.
+- Linux activation retains the writer-returned service/timer objects and
+  parents, reopens the exact objects read-only, and holds read leases through
+  activation. The protected properties are canonical-name object identity,
+  exact bytes, access policy, and audited drop-in state. Full
+  user-home-to-unit ancestry plus existing empty drop-in directories remain
+  descriptor-bound. Their ctime values are command-interval generation
+  evidence only: a delta is not classified as mutation, but makes that reload
+  interval inconclusive and requires a corrective `daemon-reload`; exact
+  missing, mismatch, unreadable, access-policy, or lease-break evidence fails
+  closed. Activation proceeds only after one stable interval, with three
+  bounded attempts.
+- `systemctl enable` no longer reparses a replaceable unit. The installer
+  conditionally publishes the one exact `timers.target.wants` symlink, retains
+  its identity evidence through `start`, and revalidates it immediately before
+  the incomplete-state marker is committed. New-publish and already-matching
+  tests deterministically replace a unit, let the first reload consume foreign
+  bytes, restore the original, and prove a second stable reload occurs before
+  start. Persistent interval instability exhausts the bounded retries and
+  retains the marker. The scheduler writer also closes its duplicated stream
+  descriptor when `fdopen()` construction fails.
+- This Linux interval proof assumes a local ctime-coherent filesystem and
+  cooperative same-UID access. It does not claim protection from mount-capable
+  actors, remote filesystems with weaker metadata semantics, or a malicious
+  same-UID writer that controls the parent namespace outside the observed
+  interval. Exact state mismatch remains distinct from an inconclusive
+  generation interval.
 
 ## Validation Evidence
 
@@ -542,6 +577,18 @@ superseded_by:
   `523ca00bf23cb103dfcbf698837e230c8dd79b7fd06efaa2a05ceac8ca82aa43`;
   the refreshed source-lock SHA-256 is
   `803a51e187204338e055c1f29801aaee5201c1ab6a675619afb714cee6b7e3a1`.
+- The provider-review follow-up's exact final bytes passed the complete
+  791-test repository gate under native Python in 591.745 seconds and Python
+  3.9.6 in 672.796 seconds. The focused personal-sync plus scheduler/doctor
+  partition passed 308 tests in 40.617 and 47.817 seconds; the source-lock
+  partition passed its exact final formatted bytes with 126 tests in 332.804
+  and 366.116 seconds; and toolbox
+  workflow automation passed 26 tests in 140.471 and 146.277 seconds. Each
+  macOS run skipped only the Linux read-lease integration fixture. A local
+  Linux container attempt could not start because Apple Container has no
+  default arm64 kernel configured; host kernel configuration was intentionally
+  left unchanged. The refreshed six-source lock verifies with SHA-256
+  `30bf5743a368ac2d189caf9825edb1d13f69924639dc0713d30f33dc9ffb6d17`.
 
 ## Installed Host Baseline
 

@@ -1865,13 +1865,16 @@ class MirrorGeneratorTests(unittest.TestCase):
 
         def capture_popen(command, **kwargs):
             captured["command"] = command
+            captured["launch_cwd_identity"] = MIRROR_MODULE._object_identity(
+                os.stat(".", follow_symlinks=False)
+            )
             captured.update(kwargs)
             return mock.Mock()
 
         bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
         try:
             MIRROR_MODULE._ensure_git_control_binding(bound_root)
-            private_control_fd = bound_root.git_control.private.fd
+            private_control_identity = bound_root.git_control.private.identity
             with (
                 mock.patch.dict(
                     os.environ,
@@ -1934,20 +1937,19 @@ class MirrorGeneratorTests(unittest.TestCase):
         self.assertEqual(environment["PATH"], "/usr/bin:/bin")
         self.assertEqual(
             captured["command"][0],
-            MIRROR_MODULE.LAUNCHER_EXECUTABLE.as_posix(),
+            MIRROR_MODULE.GIT_EXECUTABLE.as_posix(),
         )
-        self.assertIn(MIRROR_MODULE.LAUNCHER_PROGRAM, captured["command"])
-        self.assertIn(MIRROR_MODULE.GIT_EXECUTABLE.as_posix(), captured["command"])
         self.assertIn("--no-lazy-fetch", captured["command"])
         self.assertIn("--git-dir=.", captured["command"])
         self.assertIn("core.commitGraph=false", captured["command"])
         self.assertIn("core.multiPackIndex=false", captured["command"])
+        self.assertEqual(
+            captured["launch_cwd_identity"],
+            private_control_identity,
+        )
         self.assertNotIn("cwd", captured)
         self.assertNotIn("preexec_fn", captured)
-        self.assertIn(
-            private_control_fd,
-            captured["pass_fds"],
-        )
+        self.assertNotIn("pass_fds", captured)
 
     def test_private_config_git_disables_derived_object_caches(self) -> None:
         captured: dict[str, object] = {}
@@ -2014,9 +2016,7 @@ class MirrorGeneratorTests(unittest.TestCase):
             "--reachable",
             "--no-changed-paths",
         )
-        graph_path = (
-            self.canonical_root / ".git" / "objects" / "info" / "commit-graph"
-        )
+        graph_path = self.canonical_root / ".git" / "objects" / "info" / "commit-graph"
         graph_payload = bytearray(graph_path.read_bytes())
         chunks = self._git_cache_chunks(
             graph_payload,
@@ -2133,11 +2133,7 @@ class MirrorGeneratorTests(unittest.TestCase):
             "write",
         )
         midx_path = (
-            self.canonical_root
-            / ".git"
-            / "objects"
-            / "pack"
-            / "multi-pack-index"
+            self.canonical_root / ".git" / "objects" / "pack" / "multi-pack-index"
         )
         midx_payload = bytearray(midx_path.read_bytes())
         chunks = self._git_cache_chunks(
@@ -2338,7 +2334,10 @@ class MirrorGeneratorTests(unittest.TestCase):
         ]
         self.assertEqual(len(fsck_commands), 1)
         fsck_command = fsck_commands[0]
-        self.assertIn(MIRROR_MODULE.LAUNCHER_PROGRAM, fsck_command)
+        self.assertEqual(
+            fsck_command[0],
+            MIRROR_MODULE.GIT_EXECUTABLE.as_posix(),
+        )
         self.assertIn("--full", fsck_command)
         self.assertIn("--strict", fsck_command)
         self.assertIn("--no-dangling", fsck_command)
@@ -2378,37 +2377,13 @@ class MirrorGeneratorTests(unittest.TestCase):
 
         self.assertEqual(observed_head, self.source_commit)
 
-    def test_launcher_resolution_follows_symlinked_current_executable(self) -> None:
-        runtime = self.root / "runtime"
-        runtime.mkdir()
-        executable = runtime / "python-real"
-        executable.write_bytes(b"resolved launcher\n")
-        executable.chmod(0o755)
-        intermediate = self.root / "python-intermediate"
-        intermediate.symlink_to(Path("runtime") / executable.name)
-        launcher = self.root / "python"
-        launcher.symlink_to(intermediate.name)
-
-        self.assertEqual(
-            MIRROR_MODULE._resolve_launcher_executable(launcher.as_posix()),
-            executable.resolve(strict=True),
-        )
-        with (
-            mock.patch.object(MIRROR_MODULE, "MAX_LAUNCHER_SYMLINKS", 1),
-            self.assertRaisesRegex(
-                MIRROR_MODULE.MirrorSyncError,
-                "1-symlink limit",
-            ),
-        ):
-            MIRROR_MODULE._resolve_launcher_executable(launcher.as_posix())
-
-    def test_module_invocation_resolves_symlinked_python_argv(self) -> None:
+    def test_module_import_accepts_symlinked_python_argv(self) -> None:
         launcher = self.root / "python-symlink"
         launcher.symlink_to(Path(sys.executable))
         program = (
             "import runpy,sys;"
-            "scope=runpy.run_path(sys.argv[1]);"
-            "print(scope['LAUNCHER_EXECUTABLE'])"
+            "runpy.run_path(sys.argv[1]);"
+            "print('loaded sync generator')"
         )
         completed = subprocess.run(
             [
@@ -2426,100 +2401,105 @@ class MirrorGeneratorTests(unittest.TestCase):
             timeout=30,
         )
 
-        self.assertEqual(
-            Path(completed.stdout.strip()),
-            Path(sys.executable).resolve(strict=True),
+        self.assertEqual(completed.stdout, "loaded sync generator\n")
+
+    def test_bound_directory_launch_uses_descriptor_across_path_replacement(
+        self,
+    ) -> None:
+        launch_directory = self.root / "launch-directory"
+        launch_directory.mkdir(mode=0o700)
+        preserved_directory = self.root / "launch-preserved"
+        binding = MIRROR_MODULE._bind_absolute_control_object(
+            launch_directory,
+            "test launch directory",
+            require_directory=True,
+        )
+        real_popen = subprocess.Popen
+        captured: dict[str, object] = {}
+        parent_identity = MIRROR_MODULE._object_identity(
+            os.stat(".", follow_symlinks=False)
         )
 
-    def test_launcher_binding_does_not_revisit_resolved_symlink(self) -> None:
-        first = self.root / "python-first"
-        first.write_bytes(b"first launcher\n")
-        first.chmod(0o755)
-        second = self.root / "python-second"
-        second.write_bytes(b"second launcher\n")
-        second.chmod(0o755)
-        launcher = self.root / "python"
-        launcher.symlink_to(first.name)
-        resolved = MIRROR_MODULE._resolve_launcher_executable(launcher.as_posix())
-        launcher.unlink()
-        launcher.symlink_to(second.name)
+        def replace_path_at_popen(command, **kwargs):
+            launch_directory.rename(preserved_directory)
+            launch_directory.mkdir(mode=0o700)
+            captured.update(kwargs)
+            return real_popen(command, **kwargs)
 
-        with mock.patch.object(MIRROR_MODULE, "LAUNCHER_EXECUTABLE", resolved):
-            bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
         try:
-            self.assertEqual(bound_root.launcher_executable.path, first.resolve())
-            MIRROR_MODULE._revalidate_bound_root(bound_root)
-        finally:
-            MIRROR_MODULE._close_bound_root(bound_root)
+            with mock.patch.object(
+                MIRROR_MODULE.subprocess,
+                "Popen",
+                side_effect=replace_path_at_popen,
+            ):
+                process = MIRROR_MODULE._popen_from_bound_directory(
+                    ["/bin/pwd"],
+                    directory_fd=binding.fd,
+                    directory_identity=binding.identity,
+                    directory_access_policy=binding.access_policy,
+                    directory_label=binding.label,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env={"PATH": "/usr/bin:/bin"},
+                    start_new_session=True,
+                )
+                stdout, stderr = process.communicate(timeout=30)
 
-    def test_launcher_binding_rejects_real_target_replacement(self) -> None:
-        launcher = self.root / "python-real"
-        launcher.write_bytes(b"original launcher\n")
-        launcher.chmod(0o755)
-        with mock.patch.object(MIRROR_MODULE, "LAUNCHER_EXECUTABLE", launcher):
-            bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
-        preserved = self.root / "python-preserved"
-        launcher.rename(preserved)
-        launcher.write_bytes(b"replacement launcher\n")
-        launcher.chmod(0o755)
+            self.assertEqual(process.returncode, 0, stderr.decode())
+            self.assertEqual(
+                Path(stdout.decode().strip()).resolve(),
+                preserved_directory.resolve(),
+            )
+            self.assertEqual(
+                MIRROR_MODULE._object_identity(os.stat(".", follow_symlinks=False)),
+                parent_identity,
+            )
+            self.assertNotIn("cwd", captured)
+            self.assertNotIn("preexec_fn", captured)
+        finally:
+            os.close(binding.fd)
+
+    def test_bound_directory_launch_rejects_access_policy_change(self) -> None:
+        launch_directory = self.root / "launch-directory"
+        launch_directory.mkdir(mode=0o700)
+        binding = MIRROR_MODULE._bind_absolute_control_object(
+            launch_directory,
+            "test launch directory",
+            require_directory=True,
+        )
+        launch_directory.chmod(0o755)
         try:
             with self.assertRaisesRegex(
                 MIRROR_MODULE.MirrorSyncError,
-                "Git launcher executable was replaced",
+                "descriptor access policy changed",
             ):
-                MIRROR_MODULE._revalidate_bound_root(bound_root)
+                MIRROR_MODULE._popen_from_bound_directory(
+                    [MIRROR_MODULE.GIT_EXECUTABLE.as_posix(), "--version"],
+                    directory_fd=binding.fd,
+                    directory_identity=binding.identity,
+                    directory_access_policy=binding.access_policy,
+                    directory_label=binding.label,
+                )
         finally:
-            MIRROR_MODULE._close_bound_root(bound_root)
+            os.close(binding.fd)
 
-    def test_launcher_binding_rejects_real_target_content_change(self) -> None:
-        launcher = self.root / "python-real"
-        launcher.write_bytes(b"launcher-a\n")
-        launcher.chmod(0o755)
-        with mock.patch.object(MIRROR_MODULE, "LAUNCHER_EXECUTABLE", launcher):
-            bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
-        launcher.write_bytes(b"launcher-b\n")
-        try:
-            with self.assertRaisesRegex(
-                MIRROR_MODULE.MirrorSyncError,
-                "Git launcher executable content changed",
-            ):
-                MIRROR_MODULE._revalidate_bound_root(bound_root)
-        finally:
-            MIRROR_MODULE._close_bound_root(bound_root)
-
-    def test_launcher_binding_rejects_real_target_access_policy_change(self) -> None:
-        launcher = self.root / "python-real"
-        launcher.write_bytes(b"launcher\n")
-        launcher.chmod(0o755)
-        with mock.patch.object(MIRROR_MODULE, "LAUNCHER_EXECUTABLE", launcher):
-            bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
-        launcher.chmod(0o700)
-        try:
-            with self.assertRaisesRegex(
-                MIRROR_MODULE.MirrorSyncError,
-                "Git launcher executable access policy changed",
-            ):
-                MIRROR_MODULE._revalidate_bound_root(bound_root)
-        finally:
-            MIRROR_MODULE._close_bound_root(bound_root)
-
-    def test_run_git_uses_a_fixed_launcher_without_preexec_fn(self) -> None:
+    def test_run_git_executes_git_directly_without_python_launcher(self) -> None:
         captured: dict[str, object] = {}
 
         def capture_popen(command, **kwargs):
             captured["command"] = command
+            captured["launch_cwd_identity"] = MIRROR_MODULE._object_identity(
+                os.stat(".", follow_symlinks=False)
+            )
             captured.update(kwargs)
             return mock.Mock()
 
         bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
         try:
             MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            private_identity = bound_root.git_control.private.identity
             with (
-                mock.patch.object(
-                    MIRROR_MODULE,
-                    "LAUNCHER_EXECUTABLE",
-                    Path("/unused-after-binding"),
-                ),
                 mock.patch.object(
                     MIRROR_MODULE.subprocess,
                     "Popen",
@@ -2534,14 +2514,12 @@ class MirrorGeneratorTests(unittest.TestCase):
                 MIRROR_MODULE._run_git(bound_root, "rev-parse", "HEAD")
             self.assertEqual(
                 captured["command"][0],
-                bound_root.launcher_executable.path.as_posix(),
+                MIRROR_MODULE.GIT_EXECUTABLE.as_posix(),
             )
-            self.assertIn(
-                MIRROR_MODULE.LAUNCHER_PROGRAM,
-                captured["command"],
-            )
+            self.assertEqual(captured["launch_cwd_identity"], private_identity)
             self.assertNotIn("preexec_fn", captured)
             self.assertNotIn("cwd", captured)
+            self.assertNotIn("pass_fds", captured)
         finally:
             MIRROR_MODULE._finish_bound_roots(bound_root)
 
