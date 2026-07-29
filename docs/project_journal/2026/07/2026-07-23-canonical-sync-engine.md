@@ -162,6 +162,16 @@ superseded_by:
   before comparing runner/home/repository arguments, while raw expansion
   syntax, control characters, and non-UTF-8 paths fail closed before an install
   transaction starts.
+- Fresh-review follow-up hardening now runs one bounded strict full Git `fsck`
+  against the parent-private snapshot before any ordinary object query, makes
+  scheduled installs revalidate their attempt CAS under the installation lock
+  before mutation, and supervises every GitHub metadata/download child under
+  one shared monotonic deadline with bounded streams and verified process-group
+  cleanup. The final bytes passed the independent 123-test source-lock suite,
+  the complete 780-test native suite, and the complete 780-test Python 3.9.6
+  suite. Native and Python 3.9 compileall, Ruff, source-lock verification, and
+  `git diff --check` passed; the refreshed source-lock SHA-256 is
+  `cb876ccf5a761b09eebaf77559cf0a01c6bcffa8183a81b2b7537bd1bd8f8d6c`.
 
 ## Validation Evidence
 

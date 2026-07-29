@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any
+from typing import Any, Union
 import unicodedata
 
 
@@ -310,6 +310,7 @@ class GitControlBinding:
     owner_record_name: str
     owner_nonce: str
     static_profile_verified: bool
+    object_integrity_verified: bool
 
 
 @dataclass(frozen=True)
@@ -328,7 +329,7 @@ class GitEntry:
     object_id: str
 
 
-Root = Path | BoundRoot
+Root = Union[Path, BoundRoot]
 
 
 def _new_operation_budget() -> OperationBudget:
@@ -2933,33 +2934,42 @@ def _revalidate_bound_root_directory(root: BoundRoot) -> None:
 
 
 def _revalidate_bound_root(root: BoundRoot) -> None:
-    _revalidate_bound_root_directory(root)
-    _revalidate_control_object(root, root.git_executable)
-    _revalidate_control_object(root, root.launcher_executable)
-    for binding in root.managed_ancestors.values():
-        _revalidate_control_object(root, binding)
-    if root.git_control is not None:
-        _revalidate_control_object(root, root.git_control.marker)
-        _revalidate_control_object(root, root.git_control.admin)
-        _revalidate_control_name_set(
-            root,
-            root.git_control.commondir_name_set,
-        )
-        if root.git_control.commondir_file is not None:
-            _revalidate_control_object(
+    git_control = root.git_control
+    try:
+        _revalidate_bound_root_directory(root)
+        _revalidate_control_object(root, root.git_executable)
+        _revalidate_control_object(root, root.launcher_executable)
+        for managed_ancestor in root.managed_ancestors.values():
+            _revalidate_control_object(root, managed_ancestor)
+        if git_control is not None:
+            _revalidate_control_object(root, git_control.marker)
+            _revalidate_control_object(root, git_control.admin)
+            _revalidate_control_name_set(
                 root,
-                root.git_control.commondir_file,
+                git_control.commondir_name_set,
             )
-        _revalidate_control_object(root, root.git_control.common)
-        _revalidate_control_object(root, root.git_control.objects)
-        for binding in root.git_control.source_directories:
-            _revalidate_control_object(root, binding)
-        for binding in root.git_control.source_files:
-            _revalidate_control_object(root, binding)
-        for binding in root.git_control.source_absences:
-            _revalidate_control_absence(root, binding)
-        _revalidate_control_object(root, root.git_control.owner_record)
-        _revalidate_private_git_control(root, root.git_control)
+            if git_control.commondir_file is not None:
+                _revalidate_control_object(
+                    root,
+                    git_control.commondir_file,
+                )
+            _revalidate_control_object(root, git_control.common)
+            _revalidate_control_object(root, git_control.objects)
+            for binding in git_control.source_directories:
+                _revalidate_control_object(root, binding)
+            for binding in git_control.source_files:
+                _revalidate_control_object(root, binding)
+            for binding in git_control.source_absences:
+                _revalidate_control_absence(root, binding)
+            _revalidate_control_object(root, git_control.owner_record)
+            _revalidate_private_git_control(root, git_control)
+    except BaseException:
+        if git_control is not None:
+            # The full fsck result belongs only to this exact, still-bound
+            # private snapshot. Any failed source/private/root revalidation
+            # invalidates that result even if a later observation looks stable.
+            git_control.object_integrity_verified = False
+        raise
 
 
 def _close_bound_root(root: BoundRoot) -> None:
@@ -5659,7 +5669,7 @@ def _verify_static_git_profile(bound_root: BoundRoot) -> None:
     _revalidate_bound_root(bound_root)
 
 
-def _run_git_process(
+def _run_private_git_process(
     bound_root: BoundRoot,
     *arguments: str,
     stdin_payload: bytes | None = None,
@@ -5748,12 +5758,67 @@ def _run_git_process(
     )
 
 
+def _verify_private_git_object_integrity(bound_root: BoundRoot) -> None:
+    binding = bound_root.git_control
+    if binding is None:
+        raise MirrorSyncError(
+            "Git control plane must be bound before object integrity inspection"
+        )
+    if binding.object_integrity_verified:
+        _revalidate_bound_root(bound_root)
+        return
+    if not binding.static_profile_verified:
+        raise MirrorSyncError(
+            "Git static repository profile must complete before object integrity "
+            "inspection"
+        )
+    try:
+        _run_private_git_process(
+            bound_root,
+            "fsck",
+            "--full",
+            "--strict",
+            "--no-dangling",
+            "--no-progress",
+            "--no-reflogs",
+        )
+    except MirrorSyncError as error:
+        raise MirrorSyncError(
+            f"private Git full object integrity check failed: {error}"
+        ) from error
+    _revalidate_bound_root(bound_root)
+    binding.object_integrity_verified = True
+
+
+def _run_git_process(
+    bound_root: BoundRoot,
+    *arguments: str,
+    stdin_payload: bytes | None = None,
+) -> bytes:
+    binding = bound_root.git_control
+    if binding is None:
+        raise MirrorSyncError(
+            "Git control plane must be bound before repository verification"
+        )
+    if not binding.object_integrity_verified:
+        raise MirrorSyncError(
+            "private Git full object integrity check has not completed"
+        )
+    return _run_private_git_process(
+        bound_root,
+        *arguments,
+        stdin_payload=stdin_payload,
+    )
+
+
 def _ensure_git_control_binding(root: BoundRoot) -> None:
     if root.git_control is not None:
         if not root.git_capability_verified:
             raise MirrorSyncError("Git capability gate has not completed")
         if not root.git_control.static_profile_verified:
             raise MirrorSyncError("Git static repository profile has not completed")
+        if not root.git_control.object_integrity_verified:
+            _verify_private_git_object_integrity(root)
         _revalidate_bound_root(root)
         return
     marker = _bind_git_marker(root)
@@ -5921,8 +5986,10 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
             owner_record_name=owner_record_name,
             owner_nonce=owner_nonce,
             static_profile_verified=False,
+            object_integrity_verified=False,
         )
         _verify_static_git_profile(root)
+        _verify_private_git_object_integrity(root)
         _revalidate_bound_root(root)
     except BaseException:
         root.git_control = None

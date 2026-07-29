@@ -21,6 +21,8 @@ from pathlib import Path, PurePosixPath
 import plistlib
 import posixpath
 import re
+import selectors
+import signal
 import stat
 import subprocess
 import sys
@@ -49,6 +51,11 @@ MAX_ARCHIVE_EXPANDED_BYTES = 256 * 1024 * 1024
 MAX_ARCHIVE_MEMBER_PATH_BYTES = 4096
 MAX_ARCHIVE_MEMBER_COMPONENT_BYTES = 255
 MAX_ARCHIVE_MEMBER_PATH_DEPTH = 64
+GH_OPERATION_TIMEOUT_SECONDS = 300.0
+GH_TERMINATE_GRACE_SECONDS = 1.0
+GH_CLEANUP_TIMEOUT_SECONDS = 5.0
+MAX_GH_METADATA_STDOUT_BYTES = 16 * 1024 * 1024
+MAX_GH_STDERR_BYTES = 1024 * 1024
 MAX_TEMP_ARCHIVE_CLEANUP_DEPTH = MAX_ARCHIVE_MEMBER_PATH_DEPTH + 4
 MAX_TEMP_ARCHIVE_CLEANUP_ENTRIES = (
     MAX_ARCHIVE_MEMBERS * (MAX_ARCHIVE_MEMBER_PATH_DEPTH + 2) + 128
@@ -310,6 +317,33 @@ class DownloadedRelease:
     assets: ReleaseAssets
     release_root: Path
     release_expectation: ReleaseTreeExpectation | None = None
+
+
+@dataclass(frozen=True)
+class _GhProcessResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+
+@dataclass(frozen=True)
+class _GhCleanupReceipt:
+    term_sent: bool
+    kill_sent: bool
+    child_reaped: bool
+    stdout_drained: bool
+    stderr_drained: bool
+    process_group_gone: bool
+    errors: tuple[str, ...]
+
+    @property
+    def complete(self) -> bool:
+        return (
+            self.child_reaped
+            and self.stdout_drained
+            and self.stderr_drained
+            and self.process_group_gone
+        )
 
 
 @dataclass(frozen=True)
@@ -715,6 +749,16 @@ class SchedulerReport:
     release_integrity: tuple[tuple[str, str, str, str], ...] = ()
     daemon_query: SchedulerDaemonQuery | None = None
     failures: tuple[tuple[str | None, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class SchedulerAttemptGuard:
+    home_key: str
+    attempt: str
+    mode: str
+    repo: str
+    base_repo: str | None
+    owner: str | None
 
 
 @dataclass(frozen=True)
@@ -3752,6 +3796,14 @@ _LOCKED_SYNC_HOME_BINDINGS: ContextVar[tuple[tuple[str, int], ...]] = ContextVar
     "locked_sync_home_bindings",
     default=(),
 )
+_ACTIVE_SCHEDULER_ATTEMPT: ContextVar[SchedulerAttemptGuard | None] = ContextVar(
+    "active_scheduler_attempt",
+    default=None,
+)
+_GH_OPERATION_DEADLINE: ContextVar[float | None] = ContextVar(
+    "gh_operation_deadline",
+    default=None,
+)
 
 
 def _sync_home_binding_key(home: Path) -> str:
@@ -6562,6 +6614,7 @@ def installation_lock(home: Path):
             + ((_sync_home_binding_key(home), home_fd),)
         )
         try:
+            _revalidate_active_scheduler_attempt_unlocked(home)
             yield
         finally:
             if (
@@ -16306,18 +16359,366 @@ def _stage_release_tree_for_install(
     )
 
 
-def _run_gh_process(args: list[str]) -> subprocess.CompletedProcess[str]:
+@contextlib.contextmanager
+def _gh_operation_deadline():
+    existing = _GH_OPERATION_DEADLINE.get()
+    if existing is not None:
+        if time.monotonic() >= existing:
+            raise SyncError(
+                "gh operation exceeded its monotonic deadline",
+                code="gh-timeout",
+            )
+        yield existing
+        return
+    deadline = time.monotonic() + GH_OPERATION_TIMEOUT_SECONDS
+    token = _GH_OPERATION_DEADLINE.set(deadline)
     try:
-        return subprocess.run(
-            ["gh", *args],
-            check=False,
-            text=True,
-            capture_output=True,
+        yield deadline
+    finally:
+        _GH_OPERATION_DEADLINE.reset(token)
+
+
+def _gh_process_group_exists(process: subprocess.Popen[bytes]) -> bool | None:
+    process_id = getattr(process, "pid", None)
+    if isinstance(process_id, bool) or not isinstance(process_id, int):
+        return None
+    try:
+        os.killpg(process_id, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return None
+    return True
+
+
+def _signal_gh_process_group(
+    process: subprocess.Popen[bytes],
+    signal_number: int,
+) -> tuple[bool, str | None]:
+    process_id = getattr(process, "pid", None)
+    group_error: OSError | None = None
+    if isinstance(process_id, int) and not isinstance(process_id, bool):
+        try:
+            os.killpg(process_id, signal_number)
+            return True, None
+        except ProcessLookupError:
+            pass
+        except OSError as error:
+            group_error = error
+    try:
+        if process.poll() is not None:
+            return False, None
+        if signal_number == signal.SIGTERM:
+            process.terminate()
+        else:
+            process.kill()
+        return True, (
+            f"process-group signal failed; used direct-child fallback: {group_error}"
+            if group_error is not None
+            else None
+        )
+    except OSError as error:
+        detail = f"cannot signal gh process: {error}"
+        if group_error is not None:
+            detail = (
+                f"cannot signal gh process group ({group_error}) or child ({error})"
+            )
+        return False, detail
+
+
+def _close_gh_process_streams(process: subprocess.Popen[bytes]) -> None:
+    for stream in (process.stdout, process.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+
+
+def _cleanup_gh_process_group(
+    process: subprocess.Popen[bytes],
+) -> _GhCleanupReceipt:
+    cleanup_deadline = time.monotonic() + GH_CLEANUP_TIMEOUT_SECONDS
+    terminate_deadline = min(
+        cleanup_deadline,
+        time.monotonic() + GH_TERMINATE_GRACE_SECONDS,
+    )
+    errors: list[str] = []
+    drained = {"stdout": False, "stderr": False}
+    selector = selectors.DefaultSelector()
+    streams = {
+        "stdout": process.stdout,
+        "stderr": process.stderr,
+    }
+    for name, stream in streams.items():
+        if stream is None:
+            errors.append(f"{name} pipe is missing")
+            continue
+        try:
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, name)
+        except (OSError, ValueError) as error:
+            errors.append(f"cannot register {name} cleanup drain: {error}")
+
+    term_sent, term_error = _signal_gh_process_group(process, signal.SIGTERM)
+    if term_error is not None:
+        errors.append(term_error)
+    kill_sent = False
+    child_reaped = False
+    process_group_gone = False
+    try:
+        while time.monotonic() < cleanup_deadline:
+            now = time.monotonic()
+            if now >= terminate_deadline and not kill_sent:
+                kill_sent, kill_error = _signal_gh_process_group(
+                    process,
+                    signal.SIGKILL,
+                )
+                if kill_error is not None:
+                    errors.append(kill_error)
+            timeout = min(0.05, max(0.0, cleanup_deadline - now))
+            if selector.get_map():
+                try:
+                    events = selector.select(timeout)
+                except OSError as error:
+                    errors.append(f"cannot drain gh process pipes: {error}")
+                    events = []
+                for key, _mask in events:
+                    name = key.data
+                    try:
+                        chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+                    except BlockingIOError:
+                        continue
+                    except OSError as error:
+                        errors.append(f"cannot drain gh {name}: {error}")
+                        try:
+                            selector.unregister(key.fileobj)
+                        except (KeyError, OSError, ValueError):
+                            pass
+                        continue
+                    if chunk:
+                        continue
+                    drained[name] = True
+                    try:
+                        selector.unregister(key.fileobj)
+                    except (KeyError, OSError, ValueError):
+                        pass
+            else:
+                time.sleep(timeout)
+            try:
+                child_reaped = process.poll() is not None
+            except OSError as error:
+                errors.append(f"cannot reap gh process: {error}")
+                child_reaped = False
+            group_state = _gh_process_group_exists(process)
+            if child_reaped and not selector.get_map() and group_state is False:
+                break
+        try:
+            child_reaped = process.poll() is not None
+        except OSError as error:
+            errors.append(f"cannot confirm gh child reaping: {error}")
+            child_reaped = False
+        process_group_gone = _gh_process_group_exists(process) is False
+    finally:
+        selector.close()
+        _close_gh_process_streams(process)
+    return _GhCleanupReceipt(
+        term_sent=term_sent,
+        kill_sent=kill_sent,
+        child_reaped=child_reaped,
+        stdout_drained=drained["stdout"],
+        stderr_drained=drained["stderr"],
+        process_group_gone=process_group_gone,
+        errors=tuple(errors),
+    )
+
+
+def _gh_cleanup_detail(receipt: _GhCleanupReceipt) -> str:
+    incomplete: list[str] = []
+    if not receipt.child_reaped:
+        incomplete.append("child-not-reaped")
+    if not receipt.stdout_drained:
+        incomplete.append("stdout-not-drained")
+    if not receipt.stderr_drained:
+        incomplete.append("stderr-not-drained")
+    if not receipt.process_group_gone:
+        incomplete.append("process-group-not-gone")
+    incomplete.extend(receipt.errors)
+    return "; ".join(incomplete) or "unknown cleanup failure"
+
+
+def _raise_gh_failure_after_cleanup(
+    process: subprocess.Popen[bytes],
+    primary: BaseException,
+) -> NoReturn:
+    try:
+        receipt = _cleanup_gh_process_group(process)
+    except Exception as cleanup_error:
+        raise SyncError(
+            f"{primary}; gh process cleanup raised an exception: {cleanup_error}",
+            code="gh-cleanup-inconclusive",
+        ) from primary
+    if not receipt.complete:
+        raise SyncError(
+            f"{primary}; gh process cleanup was inconclusive: "
+            f"{_gh_cleanup_detail(receipt)}",
+            code="gh-cleanup-inconclusive",
+        ) from primary
+    raise primary
+
+
+def _run_bounded_gh_process(
+    args: list[str],
+    *,
+    deadline: float,
+    stdout_limit: int,
+    stderr_limit: int,
+    label: str,
+    stdout_sink: Callable[[bytes], None] | None = None,
+    stdout_overflow_message: str | None = None,
+) -> _GhProcessResult:
+    if stdout_limit < 0 or stderr_limit < 0:
+        raise SyncError("gh process output limits must be nonnegative")
+    if time.monotonic() >= deadline:
+        raise SyncError(
+            f"{label} exceeded its monotonic deadline",
+            code="gh-timeout",
+        )
+    command = ["gh", *args]
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
         )
     except OSError as error:
         raise SyncError(
             "GitHub CLI `gh` is not available; install it or make sure it is on PATH"
         ) from error
+    if process.stdout is None or process.stderr is None:
+        _raise_gh_failure_after_cleanup(
+            process,
+            SyncError(
+                f"{label} did not provide bounded stdout/stderr pipes",
+                code="gh-process-io",
+            ),
+        )
+
+    selector = selectors.DefaultSelector()
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    totals = {"stdout": 0, "stderr": 0}
+    limits = {"stdout": stdout_limit, "stderr": stderr_limit}
+    try:
+        for name, stream in (
+            ("stdout", process.stdout),
+            ("stderr", process.stderr),
+        ):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, name)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SyncError(
+                    f"{label} exceeded its monotonic deadline",
+                    code="gh-timeout",
+                )
+            events = selector.select(remaining)
+            if not events:
+                continue
+            for key, _mask in events:
+                name = key.data
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+                except BlockingIOError:
+                    continue
+                except OSError as error:
+                    raise SyncError(
+                        f"cannot read {label} {name}: {error}",
+                        code="gh-process-io",
+                    ) from error
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                totals[name] += len(chunk)
+                if totals[name] > limits[name]:
+                    if name == "stdout" and stdout_overflow_message is not None:
+                        message = stdout_overflow_message
+                    else:
+                        message = (
+                            f"{label} {name} exceeds the {limits[name]}-byte limit"
+                        )
+                    raise SyncError(message, code=f"gh-{name}-limit")
+                if name == "stdout" and stdout_sink is not None:
+                    stdout_sink(chunk)
+                else:
+                    buffers[name].extend(chunk)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SyncError(
+                f"{label} exceeded its monotonic deadline",
+                code="gh-timeout",
+            )
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as error:
+            raise SyncError(
+                f"{label} exceeded its monotonic deadline",
+                code="gh-timeout",
+            ) from error
+        group_state = _gh_process_group_exists(process)
+        if group_state is not False:
+            raise SyncError(
+                f"{label} left an unverified process group after child exit",
+                code="gh-process-group-residual",
+            )
+        return _GhProcessResult(
+            returncode=returncode,
+            stdout=bytes(buffers["stdout"]),
+            stderr=bytes(buffers["stderr"]),
+        )
+    except SyncError as primary:
+        _raise_gh_failure_after_cleanup(process, primary)
+    except (OSError, ValueError) as error:
+        _raise_gh_failure_after_cleanup(
+            process,
+            SyncError(
+                f"{label} bounded process supervision failed: {error}",
+                code="gh-process-io",
+            ),
+        )
+    except BaseException as primary:
+        _raise_gh_failure_after_cleanup(process, primary)
+    finally:
+        selector.close()
+        _close_gh_process_streams(process)
+
+
+def _run_gh_process(args: list[str]) -> subprocess.CompletedProcess[str]:
+    with _gh_operation_deadline() as deadline:
+        result = _run_bounded_gh_process(
+            args,
+            deadline=deadline,
+            stdout_limit=MAX_GH_METADATA_STDOUT_BYTES,
+            stderr_limit=MAX_GH_STDERR_BYTES,
+            label="gh metadata command",
+        )
+    try:
+        stdout = result.stdout.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise SyncError(
+            "gh metadata stdout is not valid UTF-8",
+            code="gh-output-invalid",
+        ) from error
+    stderr = result.stderr.decode("utf-8", errors="replace")
+    return subprocess.CompletedProcess(
+        args=["gh", *args],
+        returncode=result.returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
 
 
 def _run_gh_json(args: list[str]) -> Any:
@@ -16461,31 +16862,6 @@ def find_release_by_asset_sha(
     raise SyncError(f"no {TAG_PREFIX} release with asset SHA {sha} found in {repo}")
 
 
-def _terminate_gh_download_process(process: subprocess.Popen[bytes]) -> None:
-    try:
-        if process.poll() is not None:
-            return
-        process.terminate()
-        try:
-            process.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-    except OSError:
-        return
-
-
-def _gh_download_error(stderr_file: Any) -> str:
-    stderr_file.flush()
-    stderr_file.seek(0)
-    payload = stderr_file.read(64 * 1024 + 1)
-    truncated = len(payload) > 64 * 1024
-    message = payload[: 64 * 1024].decode("utf-8", errors="replace").strip()
-    if truncated:
-        message = f"{message}\n[stderr truncated]" if message else "[stderr truncated]"
-    return message
-
-
 def _isolate_download_entry_for_cleanup(
     directory_fd: int,
     name: str,
@@ -16570,8 +16946,6 @@ def _download_release_asset(
         raise SyncError(
             f"release download directory is no longer bound {destination}: {error}"
         ) from error
-    process: subprocess.Popen[bytes] | None = None
-    stdout: Any | None = None
     try:
         if not _archive_path_matches_fd(destination, destination_fd):
             raise SyncError(f"release download directory changed: {destination}")
@@ -16605,69 +16979,65 @@ def _download_release_asset(
                 f"failed to create partial download for release asset {asset_name}"
             )
 
-        with tempfile.TemporaryFile(mode="w+b") as stderr_file:
-            try:
-                process = subprocess.Popen(
-                    [
-                        "gh",
-                        "api",
-                        f"repos/{repo}/releases/assets/{asset_id}",
-                        "-H",
-                        "Accept: application/octet-stream",
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=stderr_file,
-                )
-            except OSError as error:
-                raise SyncError(
-                    "GitHub CLI `gh` is not available; install it or make sure it is on PATH"
-                ) from error
-            stdout = process.stdout
-            if stdout is None:
-                raise SyncError(f"gh did not provide a download stream for {asset_name}")
+        received = 0
+        downloaded_digest = hashlib.sha256()
 
-            received = 0
-            downloaded_digest = hashlib.sha256()
-            while True:
-                read_size = min(64 * 1024, expected_size - received + 1)
-                chunk = stdout.read(read_size)
-                if not chunk:
-                    break
-                received += len(chunk)
-                if received > expected_size or received > maximum_bytes:
-                    _terminate_gh_download_process(process)
-                    raise SyncError(
-                        f"downloaded release asset {asset_name} exceeds its "
-                        f"advertised {expected_size} byte size"
-                    )
-                downloaded_digest.update(chunk)
-                view = memoryview(chunk)
-                while view:
+        def consume_download(chunk: bytes) -> None:
+            nonlocal received
+            downloaded_digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                try:
                     written = os.write(partial_fd, view)
-                    if written <= 0:
-                        raise SyncError(
-                            f"failed to write downloaded release asset: {asset_name}"
-                        )
-                    view = view[written:]
+                except OSError as error:
+                    raise SyncError(
+                        f"failed to write downloaded release asset "
+                        f"{asset_name}: {error}"
+                    ) from error
+                if written <= 0:
+                    raise SyncError(
+                        f"failed to write downloaded release asset: {asset_name}"
+                    )
+                view = view[written:]
+            received += len(chunk)
 
-            stdout.close()
-            stdout = None
-            returncode = process.wait()
-            if returncode != 0:
-                message = _gh_download_error(stderr_file)
-                raise SyncError(message or f"gh failed to download release asset {asset_name}")
-            if received != expected_size:
-                raise SyncError(
-                    f"downloaded release asset {asset_name} size mismatch: "
-                    f"expected {expected_size}, got {received}"
-                )
-            actual_digest = f"sha256:{downloaded_digest.hexdigest()}"
-            if actual_digest != expected_digest:
-                raise SyncError(
-                    f"GitHub API digest mismatch for {asset_name}: "
-                    f"expected {expected_digest}, got {actual_digest}"
-                )
+        with _gh_operation_deadline() as deadline:
+            result = _run_bounded_gh_process(
+                [
+                    "api",
+                    f"repos/{repo}/releases/assets/{asset_id}",
+                    "-H",
+                    "Accept: application/octet-stream",
+                ],
+                deadline=deadline,
+                stdout_limit=expected_size,
+                stderr_limit=MAX_GH_STDERR_BYTES,
+                label=f"gh release asset download {asset_name}",
+                stdout_sink=consume_download,
+                stdout_overflow_message=(
+                    f"downloaded release asset {asset_name} exceeds its "
+                    f"advertised {expected_size} byte size"
+                ),
+            )
+        if result.returncode != 0:
+            message = result.stderr.decode(
+                "utf-8",
+                errors="replace",
+            ).strip()
+            raise SyncError(
+                message or f"gh failed to download release asset {asset_name}"
+            )
+        if received != expected_size:
+            raise SyncError(
+                f"downloaded release asset {asset_name} size mismatch: "
+                f"expected {expected_size}, got {received}"
+            )
+        actual_digest = f"sha256:{downloaded_digest.hexdigest()}"
+        if actual_digest != expected_digest:
+            raise SyncError(
+                f"GitHub API digest mismatch for {asset_name}: "
+                f"expected {expected_digest}, got {actual_digest}"
+            )
 
         actual_size = os.fstat(partial_fd).st_size
         if actual_size != expected_size:
@@ -16730,13 +17100,6 @@ def _download_release_asset(
     finally:
         active_error = sys.exc_info()[0] is not None
         cleanup_errors: list[SyncError] = []
-        if process is not None:
-            _terminate_gh_download_process(process)
-        if stdout is not None:
-            try:
-                stdout.close()
-            except (OSError, ValueError):
-                pass
         try:
             if destination_fd is not None:
                 if partial_fd >= 0 and not completed and destination_linked:
@@ -16824,18 +17187,19 @@ def download_release_assets(
         create=True,
     )
     try:
-        for asset_name, asset_id, asset_size, maximum_bytes, asset_digest in downloads:
-            assert asset_digest is not None
-            _download_release_asset(
-                repo,
-                asset_name,
-                asset_id,
-                asset_size,
-                maximum_bytes,
-                destination,
-                bound_destination_fd=destination_fd,
-                expected_digest=asset_digest,
-            )
+        with _gh_operation_deadline():
+            for asset_name, asset_id, asset_size, maximum_bytes, asset_digest in downloads:
+                assert asset_digest is not None
+                _download_release_asset(
+                    repo,
+                    asset_name,
+                    asset_id,
+                    asset_size,
+                    maximum_bytes,
+                    destination,
+                    bound_destination_fd=destination_fd,
+                    expected_digest=asset_digest,
+                )
         if not _archive_path_matches_fd(destination, destination_fd):
             raise SyncError(f"release download directory changed: {destination}")
         workspace_check_fd = _duplicate_bound_archive_workspace(workspace)
@@ -16845,6 +17209,22 @@ def download_release_assets(
 
 
 def download_and_extract_release(
+    repo: str,
+    destination: Path,
+    *,
+    workspace: BoundArchiveWorkspace,
+    sha: str | None = None,
+) -> DownloadedRelease:
+    with _gh_operation_deadline():
+        return _download_and_extract_release_with_deadline(
+            repo,
+            destination,
+            workspace=workspace,
+            sha=sha,
+        )
+
+
+def _download_and_extract_release_with_deadline(
     repo: str,
     destination: Path,
     *,
@@ -16958,23 +17338,24 @@ def install_private_from_github(
         prefix="codex-personal-sync-private."
     ) as workspace:
         temp_dir = workspace.path
-        overlay_release = download_and_extract_release(
-            repo,
-            temp_dir / "overlay",
-            workspace=workspace,
-        )
-        overlay_manifest = _validate_release_manifest_owner(
-            overlay_release.release_root,
-            owner,
-            overlay_release.release_expectation,
-        )
-        base_spec = _load_base_release_spec(overlay_manifest, base_repo)
-        base_release = download_and_extract_release(
-            base_spec.repo,
-            temp_dir / "base",
-            workspace=workspace,
-            sha=base_spec.sha,
-        )
+        with _gh_operation_deadline():
+            overlay_release = download_and_extract_release(
+                repo,
+                temp_dir / "overlay",
+                workspace=workspace,
+            )
+            overlay_manifest = _validate_release_manifest_owner(
+                overlay_release.release_root,
+                owner,
+                overlay_release.release_expectation,
+            )
+            base_spec = _load_base_release_spec(overlay_manifest, base_repo)
+            base_release = download_and_extract_release(
+                base_spec.repo,
+                temp_dir / "base",
+                workspace=workspace,
+                sha=base_spec.sha,
+            )
         base_manifest = _validate_release_manifest_owner(
             base_release.release_root,
             PUBLIC_OWNER,
@@ -26242,6 +26623,33 @@ def _scheduler_runtime_target_matches(
     )
 
 
+def _revalidate_active_scheduler_attempt_unlocked(home: Path) -> None:
+    guard = _ACTIVE_SCHEDULER_ATTEMPT.get()
+    if guard is None:
+        return
+    if _sync_home_binding_key(home) != guard.home_key:
+        raise SyncError(
+            "scheduled sync attempted to mutate a different installation home",
+            code="scheduled-sync-attempt-home-mismatch",
+        )
+    current, _state_snapshot = _read_scheduler_runtime_state_with_snapshot(home)
+    if (
+        current is None
+        or current.get("last_attempt") != guard.attempt
+        or not _scheduler_runtime_target_matches(
+            current,
+            mode=guard.mode,
+            repo=guard.repo,
+            base_repo=guard.base_repo,
+            owner=guard.owner,
+        )
+    ):
+        raise SyncError(
+            "scheduled sync attempt was superseded before installation",
+            code="scheduled-sync-superseded",
+        )
+
+
 def _begin_scheduler_attempt(
     home: Path,
     *,
@@ -26390,17 +26798,29 @@ def run_scheduled(
         base_repo=effective_base_repo,
         owner=effective_owner,
     )
+    guard = SchedulerAttemptGuard(
+        home_key=_sync_home_binding_key(home),
+        attempt=attempt,
+        mode=mode,
+        repo=repo,
+        base_repo=effective_base_repo,
+        owner=effective_owner,
+    )
     try:
-        if mode == "public":
-            install_from_github(repo, home, dry_run=False)
-        else:
-            install_private_from_github(
-                repo,
-                home,
-                base_repo=base_repo,
-                owner=owner,
-                dry_run=False,
-            )
+        guard_token = _ACTIVE_SCHEDULER_ATTEMPT.set(guard)
+        try:
+            if mode == "public":
+                install_from_github(repo, home, dry_run=False)
+            else:
+                install_private_from_github(
+                    repo,
+                    home,
+                    base_repo=base_repo,
+                    owner=owner,
+                    dry_run=False,
+                )
+        finally:
+            _ACTIVE_SCHEDULER_ATTEMPT.reset(guard_token)
         release_trees = _capture_scheduler_release_trees(
             home,
             mode=mode,

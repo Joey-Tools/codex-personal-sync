@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -59,7 +60,14 @@ def github_release_asset(
 
 class FakeDownloadProcess:
     def __init__(self, payload: bytes, *, returncode: int = 0) -> None:
-        self.stdout = io.BytesIO(payload)
+        stdout_read_fd, stdout_write_fd = os.pipe()
+        stderr_read_fd, stderr_write_fd = os.pipe()
+        os.write(stdout_write_fd, payload)
+        os.close(stdout_write_fd)
+        os.close(stderr_write_fd)
+        self.stdout = os.fdopen(stdout_read_fd, "rb", buffering=0)
+        self.stderr = os.fdopen(stderr_read_fd, "rb", buffering=0)
+        self.pid = 2_000_000_000
         self.final_returncode = returncode
         self.returncode: int | None = None
         self.terminated = False
@@ -2238,7 +2246,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
     def test_run_gh_json_wraps_missing_gh(self) -> None:
         with mock.patch.object(
             MODULE.subprocess,
-            "run",
+            "Popen",
             side_effect=FileNotFoundError("No such file or directory"),
         ):
             with self.assertRaisesRegex(MODULE.SyncError, "GitHub CLI `gh` is not available"):
@@ -2247,7 +2255,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
     def test_run_gh_wraps_missing_gh(self) -> None:
         with mock.patch.object(
             MODULE.subprocess,
-            "run",
+            "Popen",
             side_effect=FileNotFoundError("No such file or directory"),
         ):
             with self.assertRaisesRegex(MODULE.SyncError, "GitHub CLI `gh` is not available"):
@@ -2265,6 +2273,125 @@ class CodexPersonalSyncTests(unittest.TestCase):
             pages = MODULE._run_gh_json_stream(["api", "repos/owner/repo/releases"])
 
         self.assertEqual(pages, [[{"tag_name": "one"}], [{"tag_name": "two"}]])
+
+    def test_run_gh_metadata_enforces_output_cap_and_reaps_group(self) -> None:
+        real_popen = subprocess.Popen
+        processes: list[subprocess.Popen[bytes]] = []
+
+        def overflowing_popen(_args, **kwargs):
+            process = real_popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os,time;os.write(1,b'123456789');time.sleep(30)",
+                ],
+                **kwargs,
+            )
+            processes.append(process)
+            return process
+
+        with (
+            mock.patch.object(
+                MODULE.subprocess,
+                "Popen",
+                side_effect=overflowing_popen,
+            ),
+            mock.patch.object(MODULE, "MAX_GH_METADATA_STDOUT_BYTES", 8),
+            mock.patch.object(MODULE, "GH_OPERATION_TIMEOUT_SECONDS", 1.0),
+            mock.patch.object(MODULE, "GH_TERMINATE_GRACE_SECONDS", 0.05),
+            mock.patch.object(MODULE, "GH_CLEANUP_TIMEOUT_SECONDS", 1.0),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "stdout exceeds the 8-byte limit",
+            ) as raised,
+        ):
+            MODULE._run_gh_process(["api", "repos/owner/repo/releases"])
+
+        self.assertEqual(raised.exception.code, "gh-stdout-limit")
+        self.assertEqual(len(processes), 1)
+        self.assertIsNotNone(processes[0].poll())
+
+    def test_download_release_asset_times_out_and_reaps_stalled_group(self) -> None:
+        real_popen = subprocess.Popen
+        processes: list[subprocess.Popen[bytes]] = []
+
+        def stalled_popen(_args, **kwargs):
+            process = real_popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                **kwargs,
+            )
+            processes.append(process)
+            return process
+
+        payload = b"x"
+        assets = MODULE.ReleaseAssets(
+            tag_name="personal-codex-20260511-120000-1111111",
+            sha=SHA1,
+            archive_name=f"personal-codex-{SHA1}.tar.gz",
+            checksum_name=f"personal-codex-{SHA1}.sha256",
+            archive_id=101,
+            archive_size=len(payload),
+            checksum_id=102,
+            checksum_size=len(payload),
+            archive_digest=github_sha256(payload),
+            checksum_digest=github_sha256(payload),
+        )
+        destination = self.root / "stalled-download"
+        with (
+            mock.patch.object(
+                MODULE.subprocess,
+                "Popen",
+                side_effect=stalled_popen,
+            ),
+            mock.patch.object(MODULE, "GH_OPERATION_TIMEOUT_SECONDS", 0.05),
+            mock.patch.object(MODULE, "GH_TERMINATE_GRACE_SECONDS", 0.05),
+            mock.patch.object(MODULE, "GH_CLEANUP_TIMEOUT_SECONDS", 1.0),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "exceeded its monotonic deadline",
+            ) as raised,
+        ):
+            self.download_release_assets("owner/repo", assets, destination)
+
+        self.assertEqual(raised.exception.code, "gh-timeout")
+        self.assertEqual(len(processes), 1)
+        self.assertIsNotNone(processes[0].poll())
+        self.assertFalse((destination / assets.archive_name).exists())
+        self.assertEqual(list(destination.glob(".*.partial.*")), [])
+
+    def test_gh_cleanup_inconclusive_preserves_primary_classification(self) -> None:
+        process = FakeDownloadProcess(b"123456789")
+        incomplete = MODULE._GhCleanupReceipt(
+            term_sent=True,
+            kill_sent=True,
+            child_reaped=False,
+            stdout_drained=False,
+            stderr_drained=True,
+            process_group_gone=False,
+            errors=("injected cleanup failure",),
+        )
+        with (
+            mock.patch.object(MODULE.subprocess, "Popen", return_value=process),
+            mock.patch.object(
+                MODULE,
+                "_cleanup_gh_process_group",
+                return_value=incomplete,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "cleanup was inconclusive.*stdout-not-drained",
+            ) as raised,
+        ):
+            MODULE._run_bounded_gh_process(
+                ["api", "repos/owner/repo/releases"],
+                deadline=time.monotonic() + 1,
+                stdout_limit=8,
+                stderr_limit=8,
+                label="gh metadata command",
+            )
+
+        self.assertEqual(raised.exception.code, "gh-cleanup-inconclusive")
+        self.assertIn("stdout exceeds", str(raised.exception.__cause__))
 
     def test_download_release_assets_streams_api_assets_by_id(self) -> None:
         archive_payload = b"archive-payload"

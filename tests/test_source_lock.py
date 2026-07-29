@@ -208,6 +208,30 @@ class MirrorGeneratorTests(unittest.TestCase):
         ]
         return object_ids.index(raw_object_id)
 
+    def _pack_index_v2_layout(
+        self,
+        payload: bytes | bytearray,
+    ) -> tuple[list[bytes], int, int]:
+        self.assertEqual(payload[:4], b"\xfftOc")
+        self.assertEqual(int.from_bytes(payload[4:8], "big"), 2)
+        fanout_start = 8
+        fanout_end = fanout_start + 256 * 4
+        object_count = int.from_bytes(
+            payload[fanout_end - 4 : fanout_end],
+            "big",
+        )
+        object_ids_start = fanout_end
+        object_ids_end = object_ids_start + object_count * 20
+        object_ids = [
+            bytes(payload[offset : offset + 20])
+            for offset in range(object_ids_start, object_ids_end, 20)
+        ]
+        crc_start = object_ids_end
+        offsets_start = crc_start + object_count * 4
+        offsets_end = offsets_start + object_count * 4
+        self.assertLessEqual(offsets_end + 40, len(payload))
+        return object_ids, crc_start, offsets_start
+
     def _generate(self, mirror: str = "toolbox") -> int:
         return MIRROR_MODULE.generate_mirror(
             self.canonical_root,
@@ -2199,6 +2223,131 @@ class MirrorGeneratorTests(unittest.TestCase):
         finally:
             MIRROR_MODULE._finish_bound_roots(bound_root)
 
+    def test_private_git_full_fsck_rejects_forged_pack_index_offsets(
+        self,
+    ) -> None:
+        object_format = (
+            self._git(
+                self.canonical_root,
+                "rev-parse",
+                "--show-object-format",
+            )
+            .decode("ascii")
+            .strip()
+        )
+        if object_format != "sha1":
+            self.skipTest("forged pack-index fixture currently covers SHA-1")
+        root_commit, first_commit, head_commit, side_commit = (
+            self._build_forgeable_history()
+        )
+        self._git(
+            self.canonical_root,
+            "-c",
+            "gc.writeCommitGraph=false",
+            "repack",
+            "-a",
+            "-d",
+            "-f",
+            "--window=0",
+            "--no-write-bitmap-index",
+        )
+        pack_directory = self.canonical_root / ".git" / "objects" / "pack"
+        index_paths = sorted(pack_directory.glob("*.idx"))
+        self.assertEqual(len(index_paths), 1)
+        index_path = index_paths[0]
+        index_payload = bytearray(index_path.read_bytes())
+        object_ids, crc_start, offsets_start = self._pack_index_v2_layout(index_payload)
+        head_index = object_ids.index(bytes.fromhex(head_commit))
+        side_index = object_ids.index(bytes.fromhex(side_commit))
+        head_crc = crc_start + head_index * 4
+        side_crc = crc_start + side_index * 4
+        head_offset = offsets_start + head_index * 4
+        side_offset = offsets_start + side_index * 4
+        self.assertEqual(
+            int.from_bytes(index_payload[head_offset : head_offset + 4], "big") >> 31,
+            0,
+        )
+        self.assertEqual(
+            int.from_bytes(index_payload[side_offset : side_offset + 4], "big") >> 31,
+            0,
+        )
+        index_payload[head_crc : head_crc + 4] = index_payload[side_crc : side_crc + 4]
+        index_payload[head_offset : head_offset + 4] = index_payload[
+            side_offset : side_offset + 4
+        ]
+        index_payload[-20:] = hashlib.sha1(
+            index_payload[:-20],
+            usedforsecurity=False,
+        ).digest()
+        index_path.chmod(0o600)
+        index_path.write_bytes(index_payload)
+
+        forged = self._git(
+            self.canonical_root,
+            "-c",
+            "core.commitGraph=false",
+            "-c",
+            "core.multiPackIndex=false",
+            "rev-list",
+            "--parents",
+            "--max-count=1",
+            head_commit,
+        )
+        self.assertEqual(
+            forged,
+            f"{head_commit} {root_commit}\n".encode("ascii"),
+        )
+        self.assertNotEqual(
+            forged,
+            f"{head_commit} {first_commit}\n".encode("ascii"),
+        )
+
+        commands: list[list[str]] = []
+        real_popen = subprocess.Popen
+
+        def capture_popen(command, **kwargs):
+            commands.append(command)
+            return real_popen(command, **kwargs)
+
+        bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE.subprocess,
+                    "Popen",
+                    side_effect=capture_popen,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "private Git full object integrity check failed",
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            self.assertIsNone(bound_root.git_control)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        private_git_commands = [
+            command
+            for command in commands
+            if MIRROR_MODULE.GIT_EXECUTABLE.as_posix() in command
+            and "--git-dir=." in command
+        ]
+        fsck_commands = [
+            command for command in private_git_commands if "fsck" in command
+        ]
+        self.assertEqual(len(fsck_commands), 1)
+        fsck_command = fsck_commands[0]
+        self.assertIn(MIRROR_MODULE.LAUNCHER_PROGRAM, fsck_command)
+        self.assertIn("--full", fsck_command)
+        self.assertIn("--strict", fsck_command)
+        self.assertIn("--no-dangling", fsck_command)
+        self.assertIn("--no-progress", fsck_command)
+        self.assertIn("--no-reflogs", fsck_command)
+        for command in private_git_commands:
+            self.assertNotIn("cat-file", command)
+            self.assertNotIn("rev-list", command)
+
     def test_run_git_uses_bound_root_during_swap_and_restore(self) -> None:
         real_popen = subprocess.Popen
         moved_root = self.root / "canonical-during-git"
@@ -3366,6 +3515,7 @@ class MirrorGeneratorTests(unittest.TestCase):
                     "--verify",
                     "HEAD^{commit}",
                 )
+            self.assertFalse(bound_root.git_control.object_integrity_verified)
             private_index.write_bytes(original_index)
         finally:
             MIRROR_MODULE._finish_bound_roots(bound_root)
@@ -3418,6 +3568,7 @@ class MirrorGeneratorTests(unittest.TestCase):
                     "--verify",
                     "HEAD^{commit}",
                 )
+            self.assertFalse(bound_root.git_control.object_integrity_verified)
         finally:
             # The deliberately invalidated binding must not be reaccepted merely
             # because the bytes were restored after the child. Close directly so
@@ -3468,6 +3619,7 @@ class MirrorGeneratorTests(unittest.TestCase):
                     "--verify",
                     "HEAD^{commit}",
                 )
+            self.assertFalse(bound_root.git_control.object_integrity_verified)
         finally:
             MIRROR_MODULE._close_bound_root(bound_root)
 

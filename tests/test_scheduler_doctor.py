@@ -1163,6 +1163,145 @@ class SchedulerDoctorTests(unittest.TestCase):
             newer_failure,
         )
 
+    def test_superseded_scheduled_install_cannot_roll_back_newer_release(
+        self,
+    ) -> None:
+        older_sha = "3" * 40
+        newer_sha = "4" * 40
+        older_release = self.root / "older-release"
+        newer_release = self.root / "newer-release"
+
+        def write_release(root: Path, payload: str) -> None:
+            skill_root = root / "personal_codex" / "skills" / "scheduler-race"
+            skill_root.mkdir(parents=True)
+            (skill_root / "SKILL.md").write_text(payload, encoding="utf-8")
+            (root / "personal_codex" / "sync-manifest.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "links": [
+                            {
+                                "source": "personal_codex/skills/scheduler-race",
+                                "target": "skills/scheduler-race",
+                                "kind": "skill",
+                            }
+                        ],
+                        "reference_only": [],
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+        write_release(older_release, "---\nname: scheduler-race\nold: true\n---\n")
+        write_release(newer_release, "---\nname: scheduler-race\nnew: true\n---\n")
+        older_download_entered = threading.Event()
+        release_older_download = threading.Event()
+        errors: dict[str, BaseException] = {}
+
+        def downloaded_release(root: Path, sha: str) -> MODULE.DownloadedRelease:
+            return MODULE.DownloadedRelease(
+                repo="owner/public-sync",
+                assets=MODULE.ReleaseAssets(
+                    tag_name=f"personal-codex-20260723-120000-{sha[:7]}",
+                    sha=sha,
+                    archive_name=f"personal-codex-{sha}.tar.gz",
+                    archive_id=1,
+                    archive_size=1,
+                    checksum_name=f"personal-codex-{sha}.sha256",
+                    checksum_id=2,
+                    checksum_size=1,
+                ),
+                release_root=root,
+            )
+
+        def interleaved_download(
+            repo: str,
+            destination: Path,
+            *,
+            workspace,
+            sha: str | None = None,
+        ) -> MODULE.DownloadedRelease:
+            del destination, workspace, sha
+            self.assertEqual(repo, "owner/public-sync")
+            if threading.current_thread().name == "older-release-run":
+                older_download_entered.set()
+                if not release_older_download.wait(5):
+                    raise AssertionError("older release download was not resumed")
+                return downloaded_release(older_release, older_sha)
+            return downloaded_release(newer_release, newer_sha)
+
+        def run(name: str) -> None:
+            try:
+                MODULE.run_scheduled(
+                    self.home,
+                    "owner/public-sync",
+                    mode="public",
+                    base_repo="owner/ignored",
+                    owner="private",
+                )
+            except BaseException as error:
+                errors[name] = error
+
+        older = threading.Thread(
+            target=run,
+            args=("older",),
+            name="older-release-run",
+            daemon=True,
+        )
+        newer = threading.Thread(
+            target=run,
+            args=("newer",),
+            name="newer-release-run",
+            daemon=True,
+        )
+        with mock.patch.object(
+            MODULE,
+            "download_and_extract_release",
+            side_effect=interleaved_download,
+        ):
+            try:
+                older.start()
+                self.assertTrue(older_download_entered.wait(5))
+                newer.start()
+                newer.join(10)
+                self.assertFalse(newer.is_alive())
+                self.assertNotIn("newer", errors)
+                self.assertEqual(
+                    MODULE._current_sha(self.home, MODULE.PUBLIC_OWNER),
+                    newer_sha,
+                )
+                newer_state = MODULE._read_scheduler_runtime_state(self.home)
+                assert newer_state is not None
+                self.assertTrue(newer_state["success"])
+                self.assertEqual(
+                    newer_state["release_trees"][MODULE.PUBLIC_OWNER]["sha"],
+                    newer_sha,
+                )
+            finally:
+                release_older_download.set()
+                if older.ident is not None:
+                    older.join(10)
+                if newer.ident is not None:
+                    newer.join(10)
+
+        self.assertFalse(older.is_alive())
+        self.assertIsInstance(errors.get("older"), MODULE.SyncError)
+        assert isinstance(errors["older"], MODULE.SyncError)
+        self.assertEqual(errors["older"].code, "scheduled-sync-superseded")
+        self.assertEqual(
+            MODULE._current_sha(self.home, MODULE.PUBLIC_OWNER),
+            newer_sha,
+        )
+        self.assertFalse(
+            (self.home / "personal-sync" / "releases" / older_sha).exists()
+        )
+        self.assertEqual(
+            MODULE._read_scheduler_runtime_state(self.home),
+            newer_state,
+        )
+
     def test_scheduler_attempt_recovers_from_unbounded_or_noncanonical_time(
         self,
     ) -> None:
