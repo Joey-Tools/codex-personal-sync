@@ -6999,9 +6999,34 @@ class CodexPersonalSyncTests(unittest.TestCase):
     def test_uninstall_scheduler_runs_macos_disable_commands(self) -> None:
         home = self.root / "home" / ".codex"
         (self.root / "home" / "Library" / "LaunchAgents").mkdir(parents=True)
-        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        query_count = 0
 
-        with mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
+        def run_native(
+            args: list[str],
+            **_kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal query_count
+            if args[1:2] == ["print"]:
+                query_count += 1
+                if query_count == 1:
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                return subprocess.CompletedProcess(
+                    args,
+                    113,
+                    "",
+                    (
+                        "Bad request.\n"
+                        f'Could not find service "{MODULE.LAUNCHD_LABEL}" '
+                        f"in domain for user gui: {os.getuid()}"
+                    ),
+                )
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(
+            MODULE.subprocess,
+            "run",
+            side_effect=run_native,
+        ) as run:
             self.run_quietly(
                 MODULE.uninstall_scheduler,
                 home,
@@ -7010,16 +7035,17 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 disable=True,
             )
 
-        plist_path = (
-            self.root
-            / "home"
-            / "Library"
-            / "LaunchAgents"
-            / f"{MODULE.LAUNCHD_LABEL}.plist"
-        )
         domain = f"gui/{os.getuid()}"
         calls = [call.args[0] for call in run.call_args_list]
-        self.assertIn(["/bin/launchctl", "bootout", domain, str(plist_path)], calls)
+        self.assertEqual(query_count, 2)
+        self.assertIn(
+            [
+                "/bin/launchctl",
+                "bootout",
+                f"{domain}/{MODULE.LAUNCHD_LABEL}",
+            ],
+            calls,
+        )
         self.assertIn(
             ["/bin/launchctl", "disable", f"{domain}/{MODULE.LAUNCHD_LABEL}"],
             calls,

@@ -82,7 +82,9 @@ path/identity/access/size/content manifest. Before repository Git runs, a
 bounded `--file`/`--no-includes` parse of only the private `config` and optional
 `config.worktree` snapshot rejects include directives and every partial-clone
 or promisor key by presence, while direct object inventory rejects promisor and
-alternate markers. Every later Git argv also carries `--no-lazy-fetch` and
+alternate markers. Every later Git call carries `--no-lazy-fetch` and forces
+`core.commitGraph=false` plus `core.multiPackIndex=false`, so copied derived
+caches cannot redefine commit ancestry or object-to-pack offsets. It also
 revalidates the complete pack/idx/loose manifest before and after the child;
 stable file change signals avoid rereading pack bytes while still failing
 closed if content stability can no longer be proved. Git calls use only that

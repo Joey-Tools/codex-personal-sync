@@ -36,6 +36,12 @@ GENERATOR_CONTRACT_VERSION = 2
 RULES_CONTRACT_VERSION = 1
 HASH_ALGORITHM = "sha256"
 GIT_EXECUTABLE = Path("/usr/bin/git")
+GIT_DERIVED_CACHE_DISABLE_ARGUMENTS = (
+    "-c",
+    "core.commitGraph=false",
+    "-c",
+    "core.multiPackIndex=false",
+)
 LAUNCHER_EXECUTABLE = Path("/usr/bin/python3")
 LAUNCHER_PROGRAM = (
     "import os,sys;"
@@ -5540,6 +5546,7 @@ def _run_private_git_config_process(
         "--no-lazy-fetch",
         "--no-optional-locks",
         "--no-replace-objects",
+        *GIT_DERIVED_CACHE_DISABLE_ARGUMENTS,
         "config",
         f"--file={config_name}",
         "--no-includes",
@@ -5672,6 +5679,7 @@ def _run_git_process(
         f"--work-tree={bound_root.path}",
         "--no-optional-locks",
         "--no-replace-objects",
+        *GIT_DERIVED_CACHE_DISABLE_ARGUMENTS,
         "-c",
         "core.fsmonitor=false",
         "-c",

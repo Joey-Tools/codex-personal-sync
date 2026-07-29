@@ -684,7 +684,11 @@ class SchedulerDaemonQuery:
     def enabled(self) -> bool | None:
         if self.classification == "enabled":
             return True
-        if self.classification == "disabled":
+        if self.classification in {
+            "active-disabled",
+            "disabled",
+            "enabled-inactive",
+        }:
             return False
         return None
 
@@ -20652,11 +20656,17 @@ def _cleanup_legacy_launchd_schedulers(
         label: str,
         legacy_plist: Path,
         legacy_binding: SchedulerActivationBinding | None,
+        legacy_present: bool,
         complete_bindings: tuple[SchedulerActivationBinding, ...],
     ) -> None:
         if disable:
+            bootout_args = (
+                ["launchctl", "bootout", domain, str(legacy_plist)]
+                if legacy_present
+                else ["launchctl", "bootout", f"{domain}/{label}"]
+            )
             _run_native_scheduler_action(
-                ["launchctl", "bootout", domain, str(legacy_plist)],
+                bootout_args,
                 dry_run=dry_run,
                 allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
                 activation_bindings=live_bindings(complete_bindings),
@@ -20697,6 +20707,7 @@ def _cleanup_legacy_launchd_schedulers(
                 label,
                 legacy_plist,
                 legacy_binding,
+                legacy_binding.expected.exists,
                 activation_bindings,
             )
         return
@@ -20706,7 +20717,13 @@ def _cleanup_legacy_launchd_schedulers(
         legacy_snapshot = _scheduler_config_snapshot(legacy_plist)
 
         if dry_run:
-            cleanup_one(label, legacy_plist, None, ())
+            cleanup_one(
+                label,
+                legacy_plist,
+                None,
+                legacy_snapshot.exists,
+                (),
+            )
             continue
         with _retain_launchd_activation_binding(
             legacy_plist,
@@ -20717,6 +20734,7 @@ def _cleanup_legacy_launchd_schedulers(
                 label,
                 legacy_plist,
                 legacy_binding,
+                legacy_snapshot.exists,
                 (*activation_bindings, legacy_binding),
             )
 
@@ -21490,6 +21508,8 @@ def _scheduler_daemon_enabled(
     *,
     config_audit: SchedulerConfigAudit | None = None,
     activation_bindings: tuple[SchedulerActivationBinding, ...] = (),
+    activation_snapshot: ManagedStateFileSnapshot | None = None,
+    uninstall_snapshot: ManagedStateFileSnapshot | None = None,
 ) -> SchedulerDaemonQuery:
     def revalidate(boundary: str) -> None:
         for binding in activation_bindings:
@@ -21497,6 +21517,34 @@ def _scheduler_daemon_enabled(
                 binding,
                 boundary=boundary,
             )
+        if uninstall_snapshot is not None:
+            current_uninstall = _scheduler_config_snapshot(
+                _scheduler_uninstall_transaction_path(paths),
+                MAX_SCHEDULER_UNINSTALL_TRANSACTION_BYTES,
+            )
+            if not _scheduler_file_snapshots_match(
+                current_uninstall,
+                uninstall_snapshot,
+            ):
+                raise SyncError(
+                    "scheduler uninstall transaction changed during "
+                    f"daemon query at {boundary}",
+                    code="scheduler-uninstall-incomplete",
+                )
+        if activation_snapshot is not None:
+            current_activation = _scheduler_config_snapshot(
+                _scheduler_activation_transaction_path(paths),
+                MAX_SCHEDULER_ACTIVATION_TRANSACTION_BYTES,
+            )
+            if not _scheduler_file_snapshots_match(
+                current_activation,
+                activation_snapshot,
+            ):
+                raise SyncError(
+                    "scheduler activation transaction changed during "
+                    f"daemon query at {boundary}",
+                    code="scheduler-activation-incomplete",
+                )
         if config_audit is not None:
             _revalidate_scheduler_status_audit(paths, config_audit)
 
@@ -21545,7 +21593,11 @@ def _scheduler_daemon_enabled(
         *,
         description: str,
     ) -> str:
-        evidence = (completed.stdout + "\n" + completed.stderr).strip().casefold()
+        evidence = re.sub(
+            r"\s+",
+            " ",
+            (completed.stdout + "\n" + completed.stderr).strip().casefold(),
+        )
         if any(
             marker in evidence
             for marker in (
@@ -21586,13 +21638,6 @@ def _scheduler_daemon_enabled(
                 "scheduler daemon query output exceeded its byte limit",
             )
         evidence = (completed.stdout + "\n" + completed.stderr).strip().casefold()
-        if completed.returncode == 0:
-            return SchedulerDaemonQuery("enabled")
-        if "could not find service" in evidence or "service not found" in evidence:
-            return SchedulerDaemonQuery(
-                "disabled",
-                "launchd reports that the scheduler service is not loaded",
-            )
         if any(
             marker in evidence
             for marker in (
@@ -21601,12 +21646,40 @@ def _scheduler_daemon_enabled(
                 "access denied",
             )
         ):
-            reason = "launchd scheduler query was denied"
-        else:
-            reason = (
-                "launchd scheduler query failed without explicit not-loaded evidence"
+            return SchedulerDaemonQuery(
+                "unavailable",
+                "launchd scheduler query was denied",
             )
-        return SchedulerDaemonQuery("unavailable", reason)
+        if completed.stderr.strip() and completed.returncode == 0:
+            return SchedulerDaemonQuery(
+                "unavailable",
+                "launchd scheduler query returned contradictory error output",
+            )
+        if completed.returncode == 0:
+            return SchedulerDaemonQuery("enabled")
+        escaped_label = re.escape(LAUNCHD_LABEL.casefold())
+        escaped_uid = re.escape(str(os.getuid()))
+        if any(
+            re.fullmatch(pattern, evidence) is not None
+            for pattern in (
+                r"could not find specified service[.;]?",
+                r"could not find service in domain[.;]?",
+                r"service not found in domain[.;]?",
+                (
+                    r"(?:bad request\.\s+)?could not find service "
+                    rf'"{escaped_label}" in domain for user gui: '
+                    rf"{escaped_uid}[.;]?"
+                ),
+            )
+        ):
+            return SchedulerDaemonQuery(
+                "disabled",
+                "launchd reports that the scheduler service is not loaded",
+            )
+        return SchedulerDaemonQuery(
+            "unavailable",
+            "launchd scheduler query failed without explicit not-loaded evidence",
+        )
 
     if paths.platform != "linux":
         return SchedulerDaemonQuery(
@@ -21640,31 +21713,86 @@ def _scheduler_daemon_enabled(
             "unavailable",
             "scheduler daemon query output exceeded its byte limit",
         )
+    if enabled_result.stderr.strip():
+        return SchedulerDaemonQuery(
+            "unavailable",
+            systemd_unavailable_reason(
+                enabled_result,
+                description="enablement query",
+            ),
+        )
+    if active_result.stderr.strip():
+        return SchedulerDaemonQuery(
+            "unavailable",
+            systemd_unavailable_reason(
+                active_result,
+                description="activity query",
+            ),
+        )
     enabled_state = enabled_result.stdout.strip().casefold()
+    active_state = active_result.stdout.strip().casefold()
+    active_or_transitional_states = {
+        "active",
+        "activating",
+        "deactivating",
+        "maintenance",
+        "reloading",
+    }
+    inactive_states = {
+        "failed",
+        "inactive",
+        "not-found",
+        "unknown",
+    }
+    if active_result.returncode == 0 and active_state in inactive_states:
+        return SchedulerDaemonQuery(
+            "unavailable",
+            "systemd scheduler activity query returned contradictory "
+            f"success state {active_state}",
+        )
     if not (enabled_result.returncode == 0 and enabled_state == "enabled"):
-        if enabled_state in {
-            "alias",
+        terminal_disabled_states = {
             "disabled",
+            "masked",
+            "masked-runtime",
+            "not-found",
+        }
+        residual_enablement_states = {
+            "alias",
             "disabled-runtime",
             "enabled-runtime",
             "generated",
             "indirect",
             "linked",
             "linked-runtime",
-            "masked",
-            "masked-runtime",
-            "not-found",
             "static",
             "transient",
-        }:
+        }
+        if enabled_state in terminal_disabled_states | residual_enablement_states:
+            if active_state in active_or_transitional_states:
+                return SchedulerDaemonQuery(
+                    "active-disabled",
+                    "systemd reports that the scheduler timer has "
+                    f"activity state {active_state} despite unit state "
+                    f"{enabled_state}",
+                )
+            if active_state not in inactive_states:
+                return SchedulerDaemonQuery(
+                    "unavailable",
+                    systemd_unavailable_reason(
+                        active_result,
+                        description="activity query",
+                    ),
+                )
+            if enabled_state in residual_enablement_states:
+                return SchedulerDaemonQuery(
+                    "enabled-inactive",
+                    "systemd scheduler retains non-terminal unit state "
+                    f"{enabled_state} while activity state is {active_state}",
+                )
             return SchedulerDaemonQuery(
                 "disabled",
-                (
-                    "systemd reports scheduler runtime-only enablement "
-                    f"state {enabled_state}"
-                    if enabled_state == "enabled-runtime"
-                    else f"systemd reports scheduler unit state {enabled_state}"
-                ),
+                f"systemd reports scheduler unit state {enabled_state}",
             )
         return SchedulerDaemonQuery(
             "unavailable",
@@ -21673,21 +21801,11 @@ def _scheduler_daemon_enabled(
                 description="enablement query",
             ),
         )
-    active_state = active_result.stdout.strip().casefold()
     if active_result.returncode == 0 and active_state == "active":
         return SchedulerDaemonQuery("enabled")
-    if active_state in {
-        "activating",
-        "deactivating",
-        "failed",
-        "inactive",
-        "maintenance",
-        "not-found",
-        "reloading",
-        "unknown",
-    }:
+    if active_state in active_or_transitional_states | inactive_states:
         return SchedulerDaemonQuery(
-            "disabled",
+            "enabled-inactive",
             f"systemd scheduler timer is enabled but not active (state {active_state})",
         )
     return SchedulerDaemonQuery(
@@ -24438,6 +24556,37 @@ def _retain_scheduler_uninstall_transaction(
         )
     )
 
+
+def _query_orphan_scheduler_for_uninstall(
+    paths: SchedulerPaths,
+    bindings: tuple[SchedulerActivationBinding, ...],
+    *,
+    require_disabled: bool,
+) -> SchedulerDaemonQuery:
+    query = _scheduler_daemon_enabled(
+        paths,
+        activation_bindings=bindings,
+    )
+    if query.classification not in {
+        "enabled",
+        "disabled",
+        "active-disabled",
+        "enabled-inactive",
+    }:
+        raise SyncError(
+            query.reason
+            or "scheduler daemon state is unavailable during orphan cleanup",
+            code="scheduler-uninstall-incomplete",
+        )
+    if require_disabled and query.classification != "disabled":
+        raise SyncError(
+            "scheduler daemon remains active after orphan cleanup"
+            + (f": {query.reason}" if query.reason else ""),
+            code="scheduler-uninstall-incomplete",
+        )
+    return query
+
+
 def uninstall_scheduler(
     home: Path,
     platform_name: str,
@@ -24457,7 +24606,8 @@ def uninstall_scheduler(
             disable=disable,
         )
         return
-    if _scheduler_config_parent_is_missing(paths):
+    config_parent_missing = _scheduler_config_parent_is_missing(paths)
+    if config_parent_missing and not disable:
         print(
             f"{selected_platform} scheduler already absent; "
             f"config parent is missing: {_scheduler_config_parent(paths)}"
@@ -24482,12 +24632,28 @@ def _uninstall_scheduler_transaction(
     disable: bool,
 ) -> None:
     _recover_scheduler_pair_transaction(paths, dry_run=dry_run)
-    if not dry_run and _scheduler_config_parent_is_missing(paths):
+    config_parent_missing = (
+        not dry_run and _scheduler_config_parent_is_missing(paths)
+    )
+    if config_parent_missing and not disable:
         print(
             f"{selected_platform} scheduler already absent; "
             f"config parent is missing: {_scheduler_config_parent(paths)}"
         )
         return
+    if config_parent_missing and disable:
+        config_parent_fd = _open_or_create_directory_beneath(
+            Path.home().expanduser(),
+            _scheduler_config_parent(paths),
+            mode=0o755,
+        )
+        _close_fd_quietly(config_parent_fd)
+        if _scheduler_config_parent_is_missing(paths):
+            raise SyncError(
+                "scheduler config parent is still missing after orphan "
+                f"cleanup preparation: {_scheduler_config_parent(paths)}",
+                code="scheduler-uninstall-incomplete",
+            )
     uninstall_marker_before, recorded_disable = _scheduler_uninstall_transaction_state(
         home, paths
     )
@@ -24527,6 +24693,7 @@ def _uninstall_scheduler_transaction(
             ),
             activation_marker_snapshot,
         )
+        orphan_cleanup = disable and not snapshots[0].exists
 
         def uninstall_macos(
             binding: SchedulerActivationBinding | None,
@@ -24538,10 +24705,26 @@ def _uninstall_scheduler_transaction(
             complete_bindings = (
                 (*bindings, marker_binding) if marker_binding is not None else bindings
             )
+            if orphan_cleanup and not dry_run:
+                _query_orphan_scheduler_for_uninstall(
+                    paths,
+                    complete_bindings,
+                    require_disabled=False,
+                )
             if disable:
                 domain = f"gui/{os.getuid()}"
+                bootout_args = (
+                    ["launchctl", "bootout", f"{domain}/{LAUNCHD_LABEL}"]
+                    if orphan_cleanup
+                    else [
+                        "launchctl",
+                        "bootout",
+                        domain,
+                        str(paths.launchd_plist),
+                    ]
+                )
                 _run_native_scheduler_action(
-                    ["launchctl", "bootout", domain, str(paths.launchd_plist)],
+                    bootout_args,
                     dry_run=dry_run,
                     allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
                     activation_bindings=complete_bindings,
@@ -24560,6 +24743,12 @@ def _uninstall_scheduler_transaction(
                 activation_bindings=complete_bindings,
                 retained_legacy_bindings=legacy_bindings,
             )
+            if orphan_cleanup and not dry_run:
+                _query_orphan_scheduler_for_uninstall(
+                    paths,
+                    complete_bindings,
+                    require_disabled=True,
+                )
             if dry_run:
                 _unlink_file(paths.launchd_plist, dry_run=True)
                 _unlink_file(
@@ -24629,6 +24818,11 @@ def _uninstall_scheduler_transaction(
             _scheduler_config_snapshot(paths.systemd_timer),
             activation_marker_snapshot,
         )
+        orphan_cleanup = (
+            disable
+            and not snapshots[0].exists
+            and not snapshots[1].exists
+        )
 
         def uninstall_linux(
             bindings: tuple[SchedulerActivationBinding, ...],
@@ -24637,6 +24831,12 @@ def _uninstall_scheduler_transaction(
             complete_bindings = (
                 (*bindings, marker_binding) if marker_binding is not None else bindings
             )
+            if orphan_cleanup and not dry_run:
+                _query_orphan_scheduler_for_uninstall(
+                    paths,
+                    complete_bindings,
+                    require_disabled=False,
+                )
             if disable:
                 _run_native_scheduler_action(
                     [
@@ -24672,6 +24872,12 @@ def _uninstall_scheduler_transaction(
                     ["systemctl", "--user", "daemon-reload"],
                     dry_run=dry_run,
                     activation_bindings=complete_bindings,
+                )
+            if orphan_cleanup and not dry_run:
+                _query_orphan_scheduler_for_uninstall(
+                    paths,
+                    complete_bindings,
+                    require_disabled=True,
                 )
             if not dry_run:
                 assert marker_binding is not None
@@ -25505,6 +25711,7 @@ def doctor(
                 "scheduler-config-drift",
                 "scheduler-daemon-unavailable",
                 "scheduler-daemon-disabled",
+                "scheduler-orphan-active",
                 "scheduler-runner-drift",
                 "scheduler-activation-incomplete",
                 "scheduler-activation-state-invalid",
@@ -26400,14 +26607,24 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
     config_audit: SchedulerConfigAudit | None = None
     config_bindings: tuple[SchedulerActivationBinding, ...] = ()
     status_bindings: tuple[SchedulerActivationBinding, ...] = ()
+    retained_activation_snapshot = False
+    retained_uninstall_snapshot = False
     config_binding_stack = contextlib.ExitStack()
     failures: list[tuple[str | None, str]] = []
     activation_snapshot: ManagedStateFileSnapshot | None = None
+    uninstall_snapshot: ManagedStateFileSnapshot | None = None
     activation_problem = False
+    uninstall_problem = False
+    config_problem = False
     activation_codes = {
         "scheduler-activation-incomplete",
         "scheduler-activation-state-invalid",
     }
+    uninstall_codes = {
+        "scheduler-uninstall-incomplete",
+        "scheduler-uninstall-state-invalid",
+    }
+    transaction_codes = activation_codes | uninstall_codes
 
     def record_failure(
         code: str | None,
@@ -26428,10 +26645,12 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
             failures.append(entry)
 
     try:
-        uninstall_snapshot, _recorded_disable = (
-            _scheduler_uninstall_transaction_state(home, paths)
+        uninstall_snapshot, _recorded_disable = _scheduler_uninstall_transaction_state(
+            home,
+            paths,
         )
         if uninstall_snapshot.exists:
+            uninstall_problem = True
             marker = _scheduler_uninstall_transaction_path(paths)
             record_failure(
                 "scheduler-uninstall-incomplete",
@@ -26439,6 +26658,7 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
                 primary=True,
             )
     except SyncError as error:
+        uninstall_problem = True
         record_failure(
             error.code or "scheduler-uninstall-state-invalid",
             str(error),
@@ -26478,11 +26698,16 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
         config = None
         config_audit = None
         config_bindings = ()
+        config_problem = True
         record_failure(
             error.code or "scheduler-config-invalid",
             str(error),
         )
-    if config is not None and activation_snapshot is not None:
+    if (
+        activation_snapshot is not None
+        and activation_snapshot.parent_identity is not None
+        and not config_problem
+    ):
         try:
             activation_binding = config_binding_stack.enter_context(
                 _retain_launchd_activation_binding(
@@ -26493,10 +26718,35 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
                 )
             )
             status_bindings = (*config_bindings, activation_binding)
+            retained_activation_snapshot = True
         except SyncError as error:
             activation_problem = True
             record_failure(
                 error.code or "scheduler-activation-state-invalid",
+                str(error),
+                primary=True,
+            )
+    if (
+        uninstall_snapshot is not None
+        and uninstall_snapshot.parent_identity is not None
+        and not uninstall_problem
+        and not config_problem
+    ):
+        try:
+            uninstall_binding = config_binding_stack.enter_context(
+                _retain_launchd_activation_binding(
+                    _scheduler_uninstall_transaction_path(paths),
+                    uninstall_snapshot,
+                    description="scheduler uninstall transaction",
+                    failure_code="scheduler-uninstall-incomplete",
+                )
+            )
+            status_bindings = (*status_bindings, uninstall_binding)
+            retained_uninstall_snapshot = True
+        except SyncError as error:
+            uninstall_problem = True
+            record_failure(
+                error.code or "scheduler-uninstall-state-invalid",
                 str(error),
                 primary=True,
             )
@@ -26574,58 +26824,90 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
         )
     enabled: bool | None = None
     daemon_query: SchedulerDaemonQuery | None = None
-    daemon_failure_is_activation = False
-    if installed:
+    daemon_failure_is_transaction = False
+    if activation_problem or uninstall_problem or config_problem:
+        daemon_failure_is_transaction = True
         if activation_problem:
-            daemon_failure_is_activation = True
             daemon_query = SchedulerDaemonQuery(
                 "unavailable",
                 "scheduler activation is incomplete; the on-disk "
                 "configuration is not proven loaded",
             )
+        elif uninstall_problem:
+            daemon_query = SchedulerDaemonQuery(
+                "unavailable",
+                "scheduler uninstall is incomplete; daemon state is not "
+                "proven terminal",
+            )
         else:
-            try:
-                raw_daemon_query = _scheduler_daemon_enabled(
-                    paths,
-                    config_audit=config_audit,
-                    activation_bindings=status_bindings,
+            daemon_query = SchedulerDaemonQuery(
+                "unavailable",
+                "scheduler configuration is invalid; daemon state cannot be "
+                "bound to an audited configuration",
+            )
+    else:
+        try:
+            raw_daemon_query = _scheduler_daemon_enabled(
+                paths,
+                config_audit=config_audit,
+                activation_bindings=status_bindings,
+                activation_snapshot=(
+                    activation_snapshot
+                    if not retained_activation_snapshot
+                    else None
+                ),
+                uninstall_snapshot=(
+                    uninstall_snapshot
+                    if not retained_uninstall_snapshot
+                    else None
+                ),
+            )
+            if isinstance(raw_daemon_query, SchedulerDaemonQuery):
+                daemon_query = raw_daemon_query
+            elif raw_daemon_query is True:
+                daemon_query = SchedulerDaemonQuery("enabled")
+            elif raw_daemon_query is False:
+                daemon_query = SchedulerDaemonQuery(
+                    "disabled",
+                    "scheduler daemon explicitly reports a disabled state",
                 )
-                if isinstance(raw_daemon_query, SchedulerDaemonQuery):
-                    daemon_query = raw_daemon_query
-                elif raw_daemon_query is True:
-                    daemon_query = SchedulerDaemonQuery("enabled")
-                elif raw_daemon_query is False:
-                    daemon_query = SchedulerDaemonQuery(
-                        "disabled",
-                        "scheduler daemon explicitly reports a disabled state",
-                    )
-                else:
-                    daemon_query = SchedulerDaemonQuery(
-                        "unavailable",
-                        "scheduler daemon query returned no structured evidence",
-                    )
-            except SyncError as error:
-                failure_code = error.code or "scheduler-config-drift"
-                daemon_failure_is_activation = failure_code in activation_codes
-                record_failure(
-                    failure_code,
-                    str(error),
-                    primary=True,
-                )
+            else:
                 daemon_query = SchedulerDaemonQuery(
                     "unavailable",
-                    "scheduler daemon query was invalidated by scheduler "
-                    "configuration or activation drift",
+                    "scheduler daemon query returned no structured evidence",
                 )
-        assert daemon_query is not None
-        enabled = daemon_query.enabled
+        except SyncError as error:
+            failure_code = error.code or "scheduler-config-drift"
+            daemon_failure_is_transaction = failure_code in transaction_codes
+            record_failure(
+                failure_code,
+                str(error),
+                primary=True,
+            )
+            daemon_query = SchedulerDaemonQuery(
+                "unavailable",
+                "scheduler daemon query was invalidated by scheduler "
+                "configuration or transaction drift",
+            )
+    assert daemon_query is not None
+    enabled = daemon_query.enabled
+    if installed:
         if daemon_query.classification == "disabled":
             record_failure(
                 "scheduler-daemon-disabled",
                 daemon_query.reason or "scheduler daemon is not enabled",
             )
+        elif daemon_query.classification in {
+            "active-disabled",
+            "enabled-inactive",
+        }:
+            record_failure(
+                "scheduler-daemon-disabled",
+                daemon_query.reason
+                or "scheduler daemon is active without durable enablement",
+            )
         elif daemon_query.classification == "unavailable":
-            if not daemon_failure_is_activation:
+            if not daemon_failure_is_transaction:
                 record_failure(
                     "scheduler-daemon-unavailable",
                     daemon_query.reason or "scheduler daemon state is unavailable",
@@ -26640,11 +26922,39 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
                 "scheduler-daemon-unavailable",
                 daemon_query.reason,
             )
+    elif daemon_query.classification in {
+        "active-disabled",
+        "enabled",
+        "enabled-inactive",
+    }:
+        enabled = True
+        record_failure(
+            "scheduler-orphan-active",
+            daemon_query.reason
+            or "scheduler daemon is active without installed configuration",
+            primary=True,
+        )
+    elif daemon_query.classification == "unavailable":
+        if not daemon_failure_is_transaction:
+            record_failure(
+                "scheduler-daemon-unavailable",
+                daemon_query.reason or "scheduler daemon state is unavailable",
+            )
+    elif daemon_query.classification != "disabled":
+        daemon_query = SchedulerDaemonQuery(
+            "unavailable",
+            "scheduler daemon query returned an invalid classification",
+        )
+        enabled = None
+        record_failure(
+            "scheduler-daemon-unavailable",
+            daemon_query.reason,
+        )
     try:
         config_binding_stack.close()
     except SyncError as error:
         failure_code = error.code or "scheduler-config-drift"
-        activation_drift = failure_code in activation_codes
+        transaction_drift = failure_code in transaction_codes
         record_failure(
             failure_code,
             str(error),
@@ -26653,10 +26963,10 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
         daemon_query = SchedulerDaemonQuery(
             "unavailable",
             "scheduler daemon query was invalidated by scheduler "
-            "configuration or activation drift",
+            "configuration or transaction drift",
         )
         enabled = None
-        if installed:
+        if daemon_query is not None:
             failures[:] = [
                 entry
                 for entry in failures
@@ -26664,9 +26974,10 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
                 not in {
                     "scheduler-daemon-disabled",
                     "scheduler-daemon-unavailable",
+                    "scheduler-orphan-active",
                 }
             ]
-            if not activation_drift:
+            if not transaction_drift:
                 record_failure(
                     "scheduler-daemon-unavailable",
                     daemon_query.reason,

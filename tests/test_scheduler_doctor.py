@@ -4472,17 +4472,211 @@ class SchedulerDoctorTests(unittest.TestCase):
                 self.assertEqual(legacy.read_bytes(), payload)
                 self.assertNotIn("removed ", output.getvalue())
 
-    def test_uninstall_missing_config_parent_is_idempotent_noop(self) -> None:
+    def test_uninstall_missing_config_parent_no_disable_is_idempotent_noop(
+        self,
+    ) -> None:
         for platform_name in ("macos", "linux"):
-            for disable in (False, True):
-                with self.subTest(platform=platform_name, disable=disable):
+            with self.subTest(platform=platform_name):
+                case_user_home = (
+                    self.root / f"missing-parent-{platform_name}-no-disable" / "home"
+                )
+                case_user_home.mkdir(parents=True)
+                case_home = case_user_home / ".codex"
+                output = io.StringIO()
+                with (
+                    mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "installation_lock",
+                        side_effect=AssertionError(
+                            "missing-parent no-op acquired the install lock"
+                        ),
+                    ) as install_lock,
+                    mock.patch.object(
+                        MODULE,
+                        "_run_native_command",
+                        side_effect=AssertionError(
+                            "missing-parent no-op ran a native command"
+                        ),
+                    ) as native_command,
+                    contextlib.redirect_stdout(output),
+                ):
+                    MODULE.uninstall_scheduler(
+                        case_home,
+                        platform_name,
+                        dry_run=False,
+                        disable=False,
+                    )
+
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    paths = MODULE._scheduler_paths(platform_name, case_home)
+                self.assertFalse(MODULE._scheduler_config_parent(paths).exists())
+                self.assertFalse(case_home.exists())
+                install_lock.assert_not_called()
+                native_command.assert_not_called()
+                self.assertIn("scheduler already absent", output.getvalue())
+
+    def test_uninstall_missing_config_disables_orphan_daemon_by_identity(
+        self,
+    ) -> None:
+        for platform_name in ("macos", "linux"):
+            for precreate_parent in (False, True):
+                with self.subTest(
+                    platform=platform_name,
+                    precreate_parent=precreate_parent,
+                ):
                     case_user_home = (
                         self.root
-                        / f"missing-parent-{platform_name}-{disable}"
+                        / f"orphan-{platform_name}-{precreate_parent}"
                         / "home"
                     )
                     case_user_home.mkdir(parents=True)
                     case_home = case_user_home / ".codex"
+                    with mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ):
+                        paths = MODULE._scheduler_paths(platform_name, case_home)
+                    if precreate_parent:
+                        MODULE._scheduler_config_parent(paths).mkdir(parents=True)
+                    native_calls: list[list[str]] = []
+
+                    def capture_native(
+                        args: list[str],
+                        *,
+                        dry_run: bool,
+                        allow_fail: bool | str = False,
+                    ) -> None:
+                        self.assertFalse(dry_run)
+                        del allow_fail
+                        native_calls.append(args)
+
+                    with (
+                        mock.patch.object(
+                            MODULE.Path,
+                            "home",
+                            return_value=case_user_home,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_scheduler_daemon_enabled",
+                            side_effect=(
+                                MODULE.SchedulerDaemonQuery("enabled"),
+                                MODULE.SchedulerDaemonQuery(
+                                    "disabled",
+                                    "daemon is absent",
+                                ),
+                            ),
+                        ) as daemon_query,
+                        mock.patch.object(
+                            MODULE,
+                            "_run_native_command",
+                            side_effect=capture_native,
+                        ),
+                        contextlib.redirect_stdout(io.StringIO()),
+                    ):
+                        MODULE.uninstall_scheduler(
+                            case_home,
+                            platform_name,
+                            dry_run=False,
+                            disable=True,
+                        )
+
+                    self.assertEqual(daemon_query.call_count, 2)
+                    self.assertTrue(MODULE._scheduler_config_parent(paths).is_dir())
+                    self.assertFalse(
+                        MODULE._scheduler_uninstall_transaction_path(paths).exists()
+                    )
+                    if platform_name == "macos":
+                        domain = f"gui/{os.getuid()}"
+                        self.assertIn(
+                            [
+                                "launchctl",
+                                "bootout",
+                                f"{domain}/{MODULE.LAUNCHD_LABEL}",
+                            ],
+                            native_calls,
+                        )
+                        for label in MODULE.LEGACY_LAUNCHD_LABELS:
+                            self.assertIn(
+                                [
+                                    "launchctl",
+                                    "bootout",
+                                    f"{domain}/{label}",
+                                ],
+                                native_calls,
+                            )
+                        assert paths.launchd_plist is not None
+                        self.assertFalse(paths.launchd_plist.exists())
+                    else:
+                        self.assertIn(
+                            [
+                                "systemctl",
+                                "--user",
+                                "disable",
+                                "--now",
+                                f"{MODULE.SYSTEMD_UNIT}.timer",
+                            ],
+                            native_calls,
+                        )
+                        self.assertIn(
+                            ["systemctl", "--user", "daemon-reload"],
+                            native_calls,
+                        )
+                        assert paths.systemd_service is not None
+                        assert paths.systemd_timer is not None
+                        self.assertFalse(paths.systemd_service.exists())
+                        self.assertFalse(paths.systemd_timer.exists())
+
+    def test_uninstall_orphan_daemon_uncertainty_and_failures_retain_marker(
+        self,
+    ) -> None:
+        for platform_name in ("macos", "linux"):
+            for failure_point in ("prequery", "native", "postquery"):
+                with self.subTest(
+                    platform=platform_name,
+                    failure_point=failure_point,
+                ):
+                    case_user_home = (
+                        self.root
+                        / f"orphan-failure-{platform_name}-{failure_point}"
+                        / "home"
+                    )
+                    case_user_home.mkdir(parents=True)
+                    case_home = case_user_home / ".codex"
+                    with mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ):
+                        paths = MODULE._scheduler_paths(platform_name, case_home)
+                    queries = (
+                        (
+                            MODULE.SchedulerDaemonQuery(
+                                "unavailable",
+                                "daemon query denied",
+                            ),
+                        )
+                        if failure_point == "prequery"
+                        else (
+                            MODULE.SchedulerDaemonQuery("enabled"),
+                            MODULE.SchedulerDaemonQuery("active-disabled"),
+                        )
+                    )
+                    native_failure = (
+                        MODULE.SyncError("native cleanup failed")
+                        if failure_point == "native"
+                        else None
+                    )
                     output = io.StringIO()
                     with (
                         mock.patch.object(
@@ -4492,38 +4686,307 @@ class SchedulerDoctorTests(unittest.TestCase):
                         ),
                         mock.patch.object(
                             MODULE,
-                            "installation_lock",
-                            side_effect=AssertionError(
-                                "missing-parent no-op acquired the install lock"
-                            ),
-                        ) as install_lock,
+                            "_scheduler_daemon_enabled",
+                            side_effect=queries,
+                        ) as daemon_query,
                         mock.patch.object(
                             MODULE,
                             "_run_native_command",
-                            side_effect=AssertionError(
-                                "missing-parent no-op ran a native command"
-                            ),
+                            side_effect=native_failure,
                         ) as native_command,
                         contextlib.redirect_stdout(output),
+                        self.assertRaises(MODULE.SyncError) as raised,
                     ):
                         MODULE.uninstall_scheduler(
                             case_home,
                             platform_name,
                             dry_run=False,
-                            disable=disable,
+                            disable=True,
                         )
 
-                    with mock.patch.object(
+                    marker = MODULE._scheduler_uninstall_transaction_path(paths)
+                    self.assertTrue(marker.is_file())
+                    self.assertNotIn("removed ", output.getvalue())
+                    if failure_point == "prequery":
+                        self.assertEqual(
+                            raised.exception.code,
+                            "scheduler-uninstall-incomplete",
+                        )
+                        native_command.assert_not_called()
+                    elif failure_point == "native":
+                        self.assertEqual(str(raised.exception), "native cleanup failed")
+                        self.assertEqual(daemon_query.call_count, 1)
+                    else:
+                        self.assertEqual(
+                            raised.exception.code,
+                            "scheduler-uninstall-incomplete",
+                        )
+                        self.assertEqual(daemon_query.call_count, 2)
+
+    def test_uninstall_orphan_publishes_marker_before_native_cleanup(
+        self,
+    ) -> None:
+        for platform_name in ("macos", "linux"):
+            with self.subTest(platform=platform_name):
+                case_user_home = (
+                    self.root / f"orphan-marker-failure-{platform_name}" / "home"
+                )
+                case_user_home.mkdir(parents=True)
+                case_home = case_user_home / ".codex"
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    paths = MODULE._scheduler_paths(platform_name, case_home)
+
+                with (
+                    mock.patch.object(
                         MODULE.Path,
                         "home",
                         return_value=case_user_home,
-                    ):
-                        paths = MODULE._scheduler_paths(platform_name, case_home)
-                    self.assertFalse(MODULE._scheduler_config_parent(paths).exists())
-                    self.assertFalse(case_home.exists())
-                    install_lock.assert_not_called()
-                    native_command.assert_not_called()
-                    self.assertIn("scheduler already absent", output.getvalue())
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_retain_scheduler_uninstall_transaction",
+                        side_effect=MODULE.SyncError(
+                            "marker publication failed",
+                            code="scheduler-uninstall-incomplete",
+                        ),
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_scheduler_daemon_enabled",
+                        side_effect=AssertionError(
+                            "daemon query ran before durable marker publication"
+                        ),
+                    ) as daemon_query,
+                    mock.patch.object(
+                        MODULE,
+                        "_run_native_command",
+                        side_effect=AssertionError(
+                            "native cleanup ran before durable marker publication"
+                        ),
+                    ) as native_command,
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "marker publication failed",
+                    ),
+                ):
+                    MODULE.uninstall_scheduler(
+                        case_home,
+                        platform_name,
+                        dry_run=False,
+                        disable=True,
+                    )
+
+                daemon_query.assert_not_called()
+                native_command.assert_not_called()
+                self.assertTrue(MODULE._scheduler_config_parent(paths).is_dir())
+                self.assertFalse(
+                    MODULE._scheduler_uninstall_transaction_path(paths).exists()
+                )
+
+    def test_uninstall_orphan_retries_from_durable_marker(self) -> None:
+        for platform_name in ("macos", "linux"):
+            with self.subTest(platform=platform_name):
+                case_user_home = (
+                    self.root / f"orphan-retry-{platform_name}" / "home"
+                )
+                case_user_home.mkdir(parents=True)
+                case_home = case_user_home / ".codex"
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    paths = MODULE._scheduler_paths(platform_name, case_home)
+                marker = MODULE._scheduler_uninstall_transaction_path(paths)
+
+                with (
+                    mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_scheduler_daemon_enabled",
+                        return_value=MODULE.SchedulerDaemonQuery(
+                            "unavailable",
+                            "daemon query denied",
+                        ),
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_run_native_command",
+                        side_effect=AssertionError(
+                            "native cleanup ran after an inconclusive pre-query"
+                        ),
+                    ) as first_native,
+                    contextlib.redirect_stdout(io.StringIO()),
+                    self.assertRaises(MODULE.SyncError) as first_failure,
+                ):
+                    MODULE.uninstall_scheduler(
+                        case_home,
+                        platform_name,
+                        dry_run=False,
+                        disable=True,
+                    )
+
+                self.assertEqual(
+                    first_failure.exception.code,
+                    "scheduler-uninstall-incomplete",
+                )
+                first_native.assert_not_called()
+                self.assertTrue(marker.is_file())
+                self.assertTrue(MODULE._scheduler_config_parent(paths).is_dir())
+
+                native_calls: list[list[str]] = []
+
+                def capture_native(
+                    args: list[str],
+                    *,
+                    dry_run: bool,
+                    allow_fail: bool | str = False,
+                ) -> None:
+                    self.assertFalse(dry_run)
+                    del allow_fail
+                    native_calls.append(args)
+
+                with (
+                    mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_scheduler_daemon_enabled",
+                        side_effect=(
+                            MODULE.SchedulerDaemonQuery("enabled"),
+                            MODULE.SchedulerDaemonQuery("disabled"),
+                        ),
+                    ) as daemon_query,
+                    mock.patch.object(
+                        MODULE,
+                        "_run_native_command",
+                        side_effect=capture_native,
+                    ),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    MODULE.uninstall_scheduler(
+                        case_home,
+                        platform_name,
+                        dry_run=False,
+                        disable=True,
+                    )
+
+                self.assertEqual(daemon_query.call_count, 2)
+                self.assertFalse(marker.exists())
+                if platform_name == "macos":
+                    domain = f"gui/{os.getuid()}"
+                    self.assertIn(
+                        [
+                            "launchctl",
+                            "bootout",
+                            f"{domain}/{MODULE.LAUNCHD_LABEL}",
+                        ],
+                        native_calls,
+                    )
+                else:
+                    self.assertIn(
+                        [
+                            "systemctl",
+                            "--user",
+                            "disable",
+                            "--now",
+                            f"{MODULE.SYSTEMD_UNIT}.timer",
+                        ],
+                        native_calls,
+                    )
+
+    def test_uninstall_orphan_binds_config_absence_across_daemon_query(
+        self,
+    ) -> None:
+        for platform_name in ("macos", "linux"):
+            with self.subTest(platform=platform_name):
+                case_user_home = (
+                    self.root / f"orphan-config-race-{platform_name}" / "home"
+                )
+                case_user_home.mkdir(parents=True)
+                case_home = case_user_home / ".codex"
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    paths = MODULE._scheduler_paths(platform_name, case_home)
+                target = (
+                    paths.launchd_plist
+                    if platform_name == "macos"
+                    else paths.systemd_service
+                )
+                assert target is not None
+                payload = f"concurrent {platform_name} config\n".encode()
+                native_queries: list[list[str]] = []
+
+                def appear_during_query(
+                    args: list[str],
+                    **_kwargs: object,
+                ) -> subprocess.CompletedProcess[str]:
+                    native_queries.append(args)
+                    target.write_bytes(payload)
+                    target.chmod(0o600)
+                    return subprocess.CompletedProcess(
+                        args,
+                        0,
+                        "enabled\n",
+                        "",
+                    )
+
+                with (
+                    mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_native_scheduler_argv",
+                        side_effect=lambda args: args,
+                    ),
+                    mock.patch.object(
+                        MODULE.subprocess,
+                        "run",
+                        side_effect=appear_during_query,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_run_native_command",
+                        side_effect=AssertionError(
+                            "native cleanup ran after scheduler config appeared"
+                        ),
+                    ) as native_command,
+                    contextlib.redirect_stdout(io.StringIO()),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "appeared after initial absence",
+                    ),
+                ):
+                    MODULE.uninstall_scheduler(
+                        case_home,
+                        platform_name,
+                        dry_run=False,
+                        disable=True,
+                    )
+
+                self.assertEqual(len(native_queries), 1)
+                native_command.assert_not_called()
+                self.assertEqual(target.read_bytes(), payload)
+                self.assertTrue(
+                    MODULE._scheduler_uninstall_transaction_path(paths).is_file()
+                )
 
     def test_uninstall_missing_parent_race_fails_closed_and_preserves_appearance(
         self,
@@ -5708,6 +6171,14 @@ class SchedulerDoctorTests(unittest.TestCase):
                 side_effect=lambda args: args,
             ),
             mock.patch.object(
+                MODULE,
+                "_scheduler_daemon_enabled",
+                side_effect=(
+                    MODULE.SchedulerDaemonQuery("enabled"),
+                    MODULE.SchedulerDaemonQuery("disabled"),
+                ),
+            ),
+            mock.patch.object(
                 MODULE.subprocess,
                 "run",
                 side_effect=recovered_results,
@@ -5726,12 +6197,15 @@ class SchedulerDoctorTests(unittest.TestCase):
         self,
     ) -> None:
         cases = (
-            ("macos", 0, "", "", "enabled", None),
+            ("macos", 0, "", "", None, None, None, "enabled", None),
             (
                 "macos",
                 113,
                 "",
                 "Could not find service in domain",
+                None,
+                None,
+                None,
                 "disabled",
                 "not loaded",
             ),
@@ -5740,22 +6214,107 @@ class SchedulerDoctorTests(unittest.TestCase):
                 1,
                 "",
                 "Operation not permitted",
+                None,
+                None,
+                None,
                 "unavailable",
                 "denied",
             ),
-            ("linux", 0, "enabled\n", "", "enabled", None),
+            (
+                "linux",
+                0,
+                "enabled\n",
+                "",
+                0,
+                "active\n",
+                "",
+                "enabled",
+                None,
+            ),
+            (
+                "linux",
+                0,
+                "enabled\n",
+                "",
+                3,
+                "inactive\n",
+                "",
+                "enabled-inactive",
+                "enabled but not active",
+            ),
             (
                 "linux",
                 0,
                 "enabled-runtime\n",
                 "",
-                "disabled",
-                "runtime-only enablement",
+                0,
+                "active\n",
+                "",
+                "active-disabled",
+                "runtime",
+            ),
+            (
+                "linux",
+                0,
+                "enabled-runtime\n",
+                "",
+                3,
+                "inactive\n",
+                "",
+                "enabled-inactive",
+                "non-terminal unit state enabled-runtime",
+            ),
+            (
+                "linux",
+                1,
+                "linked-runtime\n",
+                "",
+                3,
+                "inactive\n",
+                "",
+                "enabled-inactive",
+                "non-terminal unit state linked-runtime",
+            ),
+            (
+                "linux",
+                1,
+                "static\n",
+                "",
+                3,
+                "inactive\n",
+                "",
+                "enabled-inactive",
+                "non-terminal unit state static",
             ),
             (
                 "linux",
                 1,
                 "disabled\n",
+                "",
+                0,
+                "active\n",
+                "",
+                "active-disabled",
+                "activity state active",
+            ),
+            (
+                "linux",
+                1,
+                "disabled\n",
+                "",
+                0,
+                "inactive\n",
+                "",
+                "unavailable",
+                "contradictory",
+            ),
+            (
+                "linux",
+                1,
+                "disabled\n",
+                "",
+                3,
+                "inactive\n",
                 "",
                 "disabled",
                 "state disabled",
@@ -5765,6 +6324,9 @@ class SchedulerDoctorTests(unittest.TestCase):
                 1,
                 "",
                 "Failed to connect to bus",
+                3,
+                "inactive\n",
+                "",
                 "unavailable",
                 "user bus",
             ),
@@ -5773,38 +6335,58 @@ class SchedulerDoctorTests(unittest.TestCase):
                 1,
                 "unexpected\n",
                 "",
+                3,
+                "inactive\n",
+                "",
                 "unavailable",
                 "no recognized",
+            ),
+            (
+                "linux",
+                1,
+                "disabled\n",
+                "Permission denied",
+                3,
+                "inactive\n",
+                "",
+                "unavailable",
+                "denied",
             ),
         )
         for (
             platform_name,
-            returncode,
-            stdout,
-            stderr,
+            enable_returncode,
+            enable_stdout,
+            enable_stderr,
+            active_returncode,
+            active_stdout,
+            active_stderr,
             classification,
             reason,
         ) in cases:
             with self.subTest(
                 platform=platform_name,
-                returncode=returncode,
-                stdout=stdout,
-                stderr=stderr,
+                enable_returncode=enable_returncode,
+                enable_stdout=enable_stdout,
+                enable_stderr=enable_stderr,
+                active_returncode=active_returncode,
+                active_stdout=active_stdout,
+                active_stderr=active_stderr,
             ):
                 completed = subprocess.CompletedProcess(
                     ["scheduler-query"],
-                    returncode,
-                    stdout,
-                    stderr,
+                    enable_returncode,
+                    enable_stdout,
+                    enable_stderr,
                 )
                 results = [completed]
                 if platform_name == "linux":
                     results.append(
                         subprocess.CompletedProcess(
                             ["scheduler-activity-query"],
-                            0,
-                            "active\n",
-                            "",
+                            active_returncode,
+                            active_stdout,
+                            active_stderr,
                         )
                     )
                 with (
@@ -5829,12 +6411,279 @@ class SchedulerDoctorTests(unittest.TestCase):
                         True
                         if classification == "enabled"
                         else False
-                        if classification == "disabled"
+                        if classification
+                        in {
+                            "active-disabled",
+                            "disabled",
+                            "enabled-inactive",
+                        }
                         else None
                     ),
                 )
                 if reason is not None:
                     self.assertIn(reason, query.reason or "")
+
+    def test_macos_daemon_query_rejects_mixed_absence_and_denial(self) -> None:
+        for evidence, expected_classification, expected_reason in (
+            (
+                "Permission denied: Could not find service in domain",
+                "unavailable",
+                "denied",
+            ),
+            (
+                "Input/output error: Could not find service in domain",
+                "unavailable",
+                "without explicit",
+            ),
+            (
+                "Bad request.\n"
+                f'Could not find service "{MODULE.LAUNCHD_LABEL}" '
+                f"in domain for user gui: {os.getuid()}",
+                "disabled",
+                "not loaded",
+            ),
+        ):
+            with self.subTest(evidence=evidence):
+                completed = subprocess.CompletedProcess(
+                    ["launchctl", "print"],
+                    113,
+                    "",
+                    evidence,
+                )
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_native_scheduler_argv",
+                        side_effect=lambda args: args,
+                    ),
+                    mock.patch.object(
+                        MODULE.subprocess,
+                        "run",
+                        return_value=completed,
+                    ),
+                ):
+                    query = MODULE._scheduler_daemon_enabled(
+                        MODULE.SchedulerPaths(platform="macos")
+                    )
+                self.assertEqual(
+                    query.classification,
+                    expected_classification,
+                )
+                self.assertIn(expected_reason, query.reason or "")
+
+    def test_scheduler_report_and_doctor_detect_orphan_daemon(self) -> None:
+        for platform_name, classification in (
+            ("macos", "enabled"),
+            ("linux", "active-disabled"),
+            ("linux", "enabled-inactive"),
+        ):
+            with self.subTest(
+                platform=platform_name,
+                classification=classification,
+            ):
+                case_user_home = (
+                    self.root
+                    / f"orphan-status-{platform_name}-{classification}"
+                    / "home"
+                )
+                case_user_home.mkdir(parents=True)
+                case_home = case_user_home / ".codex"
+                query = MODULE.SchedulerDaemonQuery(
+                    classification,
+                    f"observed {classification}",
+                )
+                with (
+                    mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_scheduler_daemon_enabled",
+                        return_value=query,
+                    ) as daemon_query,
+                    mock.patch.object(
+                        MODULE,
+                        "audit_active_skills",
+                        return_value=[],
+                    ),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    report = MODULE.scheduler_report(
+                        case_home,
+                        platform_name,
+                    )
+                    _doctor_report, issues = MODULE.doctor(
+                        case_home,
+                        platform_name,
+                        json_output=False,
+                    )
+
+                self.assertGreaterEqual(daemon_query.call_count, 2)
+                self.assertFalse(report.installed)
+                self.assertTrue(report.enabled)
+                self.assertEqual(report.failure_code, "scheduler-orphan-active")
+                self.assertEqual(
+                    report.daemon_query,
+                    query,
+                )
+                issue_codes = {issue.code for issue in issues}
+                self.assertIn("scheduler-not-installed", issue_codes)
+                self.assertIn("scheduler-orphan-active", issue_codes)
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    paths = MODULE._scheduler_paths(platform_name, case_home)
+                self.assertFalse(MODULE._scheduler_config_parent(paths).exists())
+                self.assertFalse(case_home.exists())
+
+    def test_scheduler_status_binds_missing_parent_activation_absence(
+        self,
+    ) -> None:
+        for platform_name in ("macos", "linux"):
+            with self.subTest(platform=platform_name):
+                case_user_home = (
+                    self.root / f"orphan-activation-race-{platform_name}" / "home"
+                )
+                case_user_home.mkdir(parents=True)
+                case_home = case_user_home / ".codex"
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    paths = MODULE._scheduler_paths(platform_name, case_home)
+                marker = MODULE._scheduler_activation_transaction_path(paths)
+
+                def begin_activation_during_query(
+                    args: list[str],
+                    **_kwargs: object,
+                ) -> subprocess.CompletedProcess[str]:
+                    marker.parent.mkdir(parents=True, exist_ok=True)
+                    marker.write_bytes(
+                        MODULE._scheduler_activation_transaction_payload(
+                            case_home,
+                            paths,
+                        )
+                    )
+                    marker.chmod(0o600)
+                    return subprocess.CompletedProcess(
+                        args,
+                        0,
+                        "enabled\n",
+                        "",
+                    )
+
+                with (
+                    mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_native_scheduler_argv",
+                        side_effect=lambda args: args,
+                    ),
+                    mock.patch.object(
+                        MODULE.subprocess,
+                        "run",
+                        side_effect=begin_activation_during_query,
+                    ),
+                ):
+                    report = MODULE.scheduler_report(
+                        case_home,
+                        platform_name,
+                    )
+
+                self.assertTrue(marker.is_file())
+                self.assertFalse(report.installed)
+                self.assertIsNone(report.enabled)
+                self.assertEqual(
+                    report.failure_code,
+                    "scheduler-activation-incomplete",
+                )
+                assert report.daemon_query is not None
+                self.assertEqual(
+                    report.daemon_query.classification,
+                    "unavailable",
+                )
+
+    def test_scheduler_status_binds_missing_parent_uninstall_absence(
+        self,
+    ) -> None:
+        for platform_name in ("macos", "linux"):
+            with self.subTest(platform=platform_name):
+                case_user_home = (
+                    self.root / f"orphan-uninstall-race-{platform_name}" / "home"
+                )
+                case_user_home.mkdir(parents=True)
+                case_home = case_user_home / ".codex"
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    paths = MODULE._scheduler_paths(platform_name, case_home)
+                marker = MODULE._scheduler_uninstall_transaction_path(paths)
+
+                def begin_uninstall_during_query(
+                    args: list[str],
+                    **_kwargs: object,
+                ) -> subprocess.CompletedProcess[str]:
+                    marker.parent.mkdir(parents=True, exist_ok=True)
+                    marker.write_bytes(
+                        MODULE._scheduler_uninstall_transaction_payload(
+                            case_home,
+                            paths,
+                            disable=True,
+                        )
+                    )
+                    marker.chmod(0o600)
+                    return subprocess.CompletedProcess(
+                        args,
+                        0,
+                        "enabled\n",
+                        "",
+                    )
+
+                with (
+                    mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_native_scheduler_argv",
+                        side_effect=lambda args: args,
+                    ),
+                    mock.patch.object(
+                        MODULE.subprocess,
+                        "run",
+                        side_effect=begin_uninstall_during_query,
+                    ),
+                ):
+                    report = MODULE.scheduler_report(
+                        case_home,
+                        platform_name,
+                    )
+
+                self.assertTrue(marker.is_file())
+                self.assertFalse(report.installed)
+                self.assertIsNone(report.enabled)
+                self.assertEqual(
+                    report.failure_code,
+                    "scheduler-uninstall-incomplete",
+                )
+                assert report.daemon_query is not None
+                self.assertEqual(
+                    report.daemon_query.classification,
+                    "unavailable",
+                )
 
     def test_linux_status_requires_enabled_and_active_timer(self) -> None:
         self.write_runner()
@@ -5901,7 +6750,10 @@ class SchedulerDoctorTests(unittest.TestCase):
             "scheduler-daemon-disabled",
         )
         assert report.daemon_query is not None
-        self.assertEqual(report.daemon_query.classification, "disabled")
+        self.assertEqual(
+            report.daemon_query.classification,
+            "enabled-inactive",
+        )
         self.assertIn(
             "enabled but not active (state failed)",
             report.daemon_query.reason or "",
@@ -5929,10 +6781,16 @@ class SchedulerDoctorTests(unittest.TestCase):
             "base_repo": "owner/public-sync",
             "owner": MODULE.PUBLIC_OWNER,
         }
-        completed = subprocess.CompletedProcess(
+        enablement = subprocess.CompletedProcess(
             ["systemctl"],
             1,
             "disabled\n",
+            "",
+        )
+        activity = subprocess.CompletedProcess(
+            ["systemctl"],
+            3,
+            "inactive\n",
             "",
         )
         with (
@@ -5969,7 +6827,12 @@ class SchedulerDoctorTests(unittest.TestCase):
             mock.patch.object(
                 MODULE.subprocess,
                 "run",
-                return_value=completed,
+                side_effect=(
+                    enablement,
+                    activity,
+                    enablement,
+                    activity,
+                ),
             ),
             mock.patch.object(
                 MODULE,

@@ -136,6 +136,78 @@ class MirrorGeneratorTests(unittest.TestCase):
         self._git(root, "commit", "--no-gpg-sign", "-q", "-m", message)
         return self._git(root, "rev-parse", "HEAD").decode("ascii").strip()
 
+    def _build_forgeable_history(self) -> tuple[str, str, str, str]:
+        root_commit = self.source_commit
+        self.source_path.write_bytes(b"first ancestry change\n")
+        first_commit = self._commit(self.canonical_root, "first ancestry change")
+        self.source_path.write_bytes(b"review head\n")
+        head_commit = self._commit(self.canonical_root, "review head")
+        side_commit = (
+            self._git_with_input(
+                self.canonical_root,
+                b"forged side\n",
+                "commit-tree",
+                f"{root_commit}^{{tree}}",
+                "-p",
+                root_commit,
+            )
+            .decode("ascii")
+            .strip()
+        )
+        self._git(
+            self.canonical_root,
+            "update-ref",
+            "refs/heads/forged-side",
+            side_commit,
+        )
+        return root_commit, first_commit, head_commit, side_commit
+
+    def _git_cache_chunks(
+        self,
+        payload: bytes | bytearray,
+        *,
+        magic: bytes,
+        header_size: int,
+    ) -> dict[bytes, tuple[int, int]]:
+        self.assertEqual(payload[:4], magic)
+        self.assertEqual(payload[4], 1)
+        self.assertEqual(payload[5], 1)
+        chunk_count = payload[6]
+        table_end = header_size + (chunk_count + 1) * 12
+        self.assertLessEqual(table_end, len(payload))
+        entries: list[tuple[bytes, int]] = []
+        for index in range(chunk_count + 1):
+            offset = header_size + index * 12
+            chunk_id = bytes(payload[offset : offset + 4])
+            chunk_offset = int.from_bytes(
+                payload[offset + 4 : offset + 12],
+                "big",
+            )
+            entries.append((chunk_id, chunk_offset))
+        self.assertEqual(entries[-1][0], b"\0\0\0\0")
+        return {
+            chunk_id: (chunk_offset, entries[index + 1][1])
+            for index, (chunk_id, chunk_offset) in enumerate(entries[:-1])
+        }
+
+    def _cache_oid_index(
+        self,
+        payload: bytes | bytearray,
+        chunks: dict[bytes, tuple[int, int]],
+        object_id: str,
+    ) -> int:
+        fanout_start, fanout_end = chunks[b"OIDF"]
+        self.assertEqual(fanout_end - fanout_start, 256 * 4)
+        object_count = int.from_bytes(payload[fanout_end - 4 : fanout_end], "big")
+        lookup_start, lookup_end = chunks[b"OIDL"]
+        self.assertEqual(lookup_end - lookup_start, object_count * 20)
+        raw_object_id = bytes.fromhex(object_id)
+        object_ids = [
+            bytes(payload[offset : offset + 20])
+            for offset in range(lookup_start, lookup_end, 20)
+        ]
+        return object_ids.index(raw_object_id)
+
     def _generate(self, mirror: str = "toolbox") -> int:
         return MIRROR_MODULE.generate_mirror(
             self.canonical_root,
@@ -1844,12 +1916,288 @@ class MirrorGeneratorTests(unittest.TestCase):
         self.assertIn(MIRROR_MODULE.GIT_EXECUTABLE.as_posix(), captured["command"])
         self.assertIn("--no-lazy-fetch", captured["command"])
         self.assertIn("--git-dir=.", captured["command"])
+        self.assertIn("core.commitGraph=false", captured["command"])
+        self.assertIn("core.multiPackIndex=false", captured["command"])
         self.assertNotIn("cwd", captured)
         self.assertNotIn("preexec_fn", captured)
         self.assertIn(
             private_control_fd,
             captured["pass_fds"],
         )
+
+    def test_private_config_git_disables_derived_object_caches(self) -> None:
+        captured: dict[str, object] = {}
+
+        def capture_popen(command, **kwargs):
+            captured["command"] = command
+            captured.update(kwargs)
+            return mock.Mock()
+
+        bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        try:
+            MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE.subprocess,
+                    "Popen",
+                    side_effect=capture_popen,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_collect_bounded_git_output",
+                    return_value=(0, b"", b""),
+                ),
+            ):
+                MIRROR_MODULE._run_private_git_config_process(
+                    bound_root,
+                    "config",
+                )
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        command = captured["command"]
+        self.assertIsInstance(command, list)
+        self.assertIn("core.commitGraph=false", command)
+        self.assertIn("core.multiPackIndex=false", command)
+        self.assertLess(
+            command.index("core.commitGraph=false"),
+            command.index("config"),
+        )
+        self.assertLess(
+            command.index("core.multiPackIndex=false"),
+            command.index("config"),
+        )
+
+    def test_private_git_ignores_forged_commit_graph_ancestry(self) -> None:
+        object_format = (
+            self._git(
+                self.canonical_root,
+                "rev-parse",
+                "--show-object-format",
+            )
+            .decode("ascii")
+            .strip()
+        )
+        if object_format != "sha1":
+            self.skipTest("forged cache fixture currently covers SHA-1 repositories")
+        _root_commit, first_commit, head_commit, side_commit = (
+            self._build_forgeable_history()
+        )
+        self._git(
+            self.canonical_root,
+            "commit-graph",
+            "write",
+            "--reachable",
+            "--no-changed-paths",
+        )
+        graph_path = (
+            self.canonical_root / ".git" / "objects" / "info" / "commit-graph"
+        )
+        graph_payload = bytearray(graph_path.read_bytes())
+        chunks = self._git_cache_chunks(
+            graph_payload,
+            magic=b"CGPH",
+            header_size=8,
+        )
+        head_index = self._cache_oid_index(
+            graph_payload,
+            chunks,
+            head_commit,
+        )
+        side_index = self._cache_oid_index(
+            graph_payload,
+            chunks,
+            side_commit,
+        )
+        commit_data_start, commit_data_end = chunks[b"CDAT"]
+        object_count = (commit_data_end - commit_data_start) // 36
+        self.assertEqual(commit_data_end - commit_data_start, object_count * 36)
+        parent_offset = commit_data_start + head_index * 36 + 20
+        graph_payload[parent_offset : parent_offset + 4] = side_index.to_bytes(
+            4,
+            "big",
+        )
+        graph_payload[-20:] = hashlib.sha1(
+            graph_payload[:-20],
+            usedforsecurity=False,
+        ).digest()
+        graph_path.chmod(0o600)
+        graph_path.write_bytes(graph_payload)
+
+        forged = self._git(
+            self.canonical_root,
+            "-c",
+            "core.commitGraph=true",
+            "-c",
+            "core.multiPackIndex=false",
+            "rev-list",
+            "--parents",
+            "--max-count=1",
+            head_commit,
+        )
+        uncached = self._git(
+            self.canonical_root,
+            "-c",
+            "core.commitGraph=false",
+            "-c",
+            "core.multiPackIndex=false",
+            "rev-list",
+            "--parents",
+            "--max-count=1",
+            head_commit,
+        )
+        self.assertEqual(
+            forged,
+            f"{head_commit} {side_commit}\n".encode("ascii"),
+        )
+        self.assertEqual(
+            uncached,
+            f"{head_commit} {first_commit}\n".encode("ascii"),
+        )
+
+        bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        try:
+            MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            assert bound_root.git_control is not None
+            private_graph = (
+                bound_root.git_control.private_path
+                / "objects"
+                / "info"
+                / "commit-graph"
+            )
+            self.assertEqual(private_graph.read_bytes(), graph_payload)
+            observed = MIRROR_MODULE._run_git(
+                bound_root,
+                "rev-list",
+                "--parents",
+                "--max-count=1",
+                head_commit,
+            )
+            self.assertEqual(observed, uncached)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_private_git_ignores_forged_midx_object_offsets(self) -> None:
+        object_format = (
+            self._git(
+                self.canonical_root,
+                "rev-parse",
+                "--show-object-format",
+            )
+            .decode("ascii")
+            .strip()
+        )
+        if object_format != "sha1":
+            self.skipTest("forged cache fixture currently covers SHA-1 repositories")
+        root_commit, first_commit, head_commit, side_commit = (
+            self._build_forgeable_history()
+        )
+        self._git(
+            self.canonical_root,
+            "-c",
+            "gc.writeCommitGraph=false",
+            "repack",
+            "-a",
+            "-d",
+            "-f",
+            "--window=0",
+            "--no-write-bitmap-index",
+        )
+        self._git(
+            self.canonical_root,
+            "multi-pack-index",
+            "write",
+        )
+        midx_path = (
+            self.canonical_root
+            / ".git"
+            / "objects"
+            / "pack"
+            / "multi-pack-index"
+        )
+        midx_payload = bytearray(midx_path.read_bytes())
+        chunks = self._git_cache_chunks(
+            midx_payload,
+            magic=b"MIDX",
+            header_size=12,
+        )
+        head_index = self._cache_oid_index(
+            midx_payload,
+            chunks,
+            head_commit,
+        )
+        side_index = self._cache_oid_index(
+            midx_payload,
+            chunks,
+            side_commit,
+        )
+        offsets_start, offsets_end = chunks[b"OOFF"]
+        object_count = (offsets_end - offsets_start) // 8
+        self.assertEqual(offsets_end - offsets_start, object_count * 8)
+        head_offset = offsets_start + head_index * 8
+        side_offset = offsets_start + side_index * 8
+        midx_payload[head_offset : head_offset + 8] = midx_payload[
+            side_offset : side_offset + 8
+        ]
+        midx_payload[-20:] = hashlib.sha1(
+            midx_payload[:-20],
+            usedforsecurity=False,
+        ).digest()
+        midx_path.chmod(0o600)
+        midx_path.write_bytes(midx_payload)
+
+        forged = self._git(
+            self.canonical_root,
+            "-c",
+            "core.commitGraph=false",
+            "-c",
+            "core.multiPackIndex=true",
+            "rev-list",
+            "--parents",
+            "--max-count=1",
+            head_commit,
+        )
+        uncached = self._git(
+            self.canonical_root,
+            "-c",
+            "core.commitGraph=false",
+            "-c",
+            "core.multiPackIndex=false",
+            "rev-list",
+            "--parents",
+            "--max-count=1",
+            head_commit,
+        )
+        self.assertEqual(
+            forged,
+            f"{head_commit} {root_commit}\n".encode("ascii"),
+        )
+        self.assertEqual(
+            uncached,
+            f"{head_commit} {first_commit}\n".encode("ascii"),
+        )
+
+        bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        try:
+            MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            assert bound_root.git_control is not None
+            private_midx = (
+                bound_root.git_control.private_path
+                / "objects"
+                / "pack"
+                / "multi-pack-index"
+            )
+            self.assertEqual(private_midx.read_bytes(), midx_payload)
+            observed = MIRROR_MODULE._run_git(
+                bound_root,
+                "rev-list",
+                "--parents",
+                "--max-count=1",
+                head_commit,
+            )
+            self.assertEqual(observed, uncached)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
 
     def test_run_git_uses_bound_root_during_swap_and_restore(self) -> None:
         real_popen = subprocess.Popen
