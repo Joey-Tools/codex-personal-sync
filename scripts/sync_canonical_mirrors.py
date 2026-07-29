@@ -42,12 +42,13 @@ GIT_DERIVED_CACHE_DISABLE_ARGUMENTS = (
     "-c",
     "core.multiPackIndex=false",
 )
-LAUNCHER_EXECUTABLE = Path("/usr/bin/python3")
 LAUNCHER_PROGRAM = (
     "import os,sys;"
     "os.fchdir(int(sys.argv[1]));"
     "os.execve(sys.argv[2],sys.argv[2:],os.environ)"
 )
+MAX_LAUNCHER_SYMLINKS = 40
+MAX_LAUNCHER_PATH_COMPONENTS = 256
 PRIVATE_GIT_CONTROL_PARENT = Path(
     "/private/tmp" if sys.platform == "darwin" else "/var/tmp"
 )
@@ -144,6 +145,85 @@ class MirrorSyncError(RuntimeError):
 
 class MissingPathError(MirrorSyncError):
     pass
+
+
+def _resolve_launcher_executable(raw_executable: str) -> Path:
+    if not raw_executable:
+        raise MirrorSyncError("current Python executable path is empty")
+    unresolved = Path(raw_executable)
+    if not unresolved.is_absolute():
+        raise MirrorSyncError(
+            f"current Python executable must be absolute: {raw_executable!r}"
+        )
+
+    resolved = Path(unresolved.anchor)
+    pending = list(unresolved.parts[1:])
+    symlink_count = 0
+    component_count = 0
+    while pending:
+        component = pending.pop(0)
+        component_count += 1
+        if component_count > MAX_LAUNCHER_PATH_COMPONENTS:
+            raise MirrorSyncError(
+                "current Python executable resolution exceeds the "
+                f"{MAX_LAUNCHER_PATH_COMPONENTS}-component limit"
+            )
+        if component in {"", "."}:
+            continue
+        if component == "..":
+            resolved = resolved.parent
+            continue
+
+        candidate = resolved / component
+        try:
+            metadata = os.stat(candidate, follow_symlinks=False)
+        except OSError as error:
+            raise MirrorSyncError(
+                f"cannot resolve current Python executable {raw_executable!r}: "
+                f"{error}"
+            ) from error
+        if not stat.S_ISLNK(metadata.st_mode):
+            resolved = candidate
+            continue
+
+        symlink_count += 1
+        if symlink_count > MAX_LAUNCHER_SYMLINKS:
+            raise MirrorSyncError(
+                "current Python executable resolution exceeds the "
+                f"{MAX_LAUNCHER_SYMLINKS}-symlink limit"
+            )
+        try:
+            target = Path(os.readlink(candidate))
+        except OSError as error:
+            raise MirrorSyncError(
+                f"cannot read current Python executable symlink {candidate}: {error}"
+            ) from error
+        if target.is_absolute():
+            resolved = Path(target.anchor)
+            target_parts = list(target.parts[1:])
+        else:
+            target_parts = list(target.parts)
+        pending = target_parts + pending
+
+    resolved = Path(os.path.abspath(resolved))
+    try:
+        metadata = os.stat(resolved, follow_symlinks=False)
+    except OSError as error:
+        raise MirrorSyncError(
+            f"cannot inspect resolved Python executable {resolved}: {error}"
+        ) from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise MirrorSyncError(
+            f"resolved Python executable must not be a symlink: {resolved}"
+        )
+    if not stat.S_ISREG(metadata.st_mode):
+        raise MirrorSyncError(
+            f"resolved Python executable must be a regular file: {resolved}"
+        )
+    return resolved
+
+
+LAUNCHER_EXECUTABLE = _resolve_launcher_executable(sys.executable)
 
 
 @dataclass(frozen=True)
@@ -2880,7 +2960,6 @@ def _bind_root(root: Path, *, exclusive: bool = False) -> BoundRoot:
             LAUNCHER_EXECUTABLE,
             "Git launcher executable",
             require_directory=False,
-            bind_content=False,
         )
     except BaseException:
         os.close(git_executable.fd)
@@ -2897,6 +2976,15 @@ def _bind_root(root: Path, *, exclusive: bool = False) -> BoundRoot:
         git_executable=git_executable,
         launcher_executable=launcher_executable,
     )
+
+
+def _bound_launcher_path(root: BoundRoot) -> str:
+    binding = root.launcher_executable
+    if binding.path is None or binding.content_digest is None:
+        raise MirrorSyncError(
+            "Git launcher executable must be an absolute content-bound file"
+        )
+    return binding.path.as_posix()
 
 
 def _revalidate_bound_root_directory(root: BoundRoot) -> None:
@@ -5478,7 +5566,7 @@ def _verify_git_capability(bound_root: BoundRoot) -> None:
         _revalidate_bound_root(bound_root)
         return
     command = [
-        LAUNCHER_EXECUTABLE.as_posix(),
+        _bound_launcher_path(bound_root),
         "-I",
         "-B",
         "-S",
@@ -5545,7 +5633,7 @@ def _run_private_git_config_process(
     if not bound_root.git_capability_verified:
         raise MirrorSyncError("Git capability gate has not completed")
     command = [
-        LAUNCHER_EXECUTABLE.as_posix(),
+        _bound_launcher_path(bound_root),
         "-I",
         "-B",
         "-S",
@@ -5697,7 +5785,7 @@ def _run_private_git_process(
         *arguments,
     ]
     command = [
-        LAUNCHER_EXECUTABLE.as_posix(),
+        _bound_launcher_path(bound_root),
         "-I",
         "-B",
         "-S",

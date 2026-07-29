@@ -2378,6 +2378,131 @@ class MirrorGeneratorTests(unittest.TestCase):
 
         self.assertEqual(observed_head, self.source_commit)
 
+    def test_launcher_resolution_follows_symlinked_current_executable(self) -> None:
+        runtime = self.root / "runtime"
+        runtime.mkdir()
+        executable = runtime / "python-real"
+        executable.write_bytes(b"resolved launcher\n")
+        executable.chmod(0o755)
+        intermediate = self.root / "python-intermediate"
+        intermediate.symlink_to(Path("runtime") / executable.name)
+        launcher = self.root / "python"
+        launcher.symlink_to(intermediate.name)
+
+        self.assertEqual(
+            MIRROR_MODULE._resolve_launcher_executable(launcher.as_posix()),
+            executable.resolve(strict=True),
+        )
+        with (
+            mock.patch.object(MIRROR_MODULE, "MAX_LAUNCHER_SYMLINKS", 1),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "1-symlink limit",
+            ),
+        ):
+            MIRROR_MODULE._resolve_launcher_executable(launcher.as_posix())
+
+    def test_module_invocation_resolves_symlinked_python_argv(self) -> None:
+        launcher = self.root / "python-symlink"
+        launcher.symlink_to(Path(sys.executable))
+        program = (
+            "import runpy,sys;"
+            "scope=runpy.run_path(sys.argv[1]);"
+            "print(scope['LAUNCHER_EXECUTABLE'])"
+        )
+        completed = subprocess.run(
+            [
+                launcher.as_posix(),
+                "-I",
+                "-B",
+                "-S",
+                "-c",
+                program,
+                (REPOSITORY_ROOT / MIRROR_MODULE.GENERATOR_PATH.as_posix()).as_posix(),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(
+            Path(completed.stdout.strip()),
+            Path(sys.executable).resolve(strict=True),
+        )
+
+    def test_launcher_binding_does_not_revisit_resolved_symlink(self) -> None:
+        first = self.root / "python-first"
+        first.write_bytes(b"first launcher\n")
+        first.chmod(0o755)
+        second = self.root / "python-second"
+        second.write_bytes(b"second launcher\n")
+        second.chmod(0o755)
+        launcher = self.root / "python"
+        launcher.symlink_to(first.name)
+        resolved = MIRROR_MODULE._resolve_launcher_executable(launcher.as_posix())
+        launcher.unlink()
+        launcher.symlink_to(second.name)
+
+        with mock.patch.object(MIRROR_MODULE, "LAUNCHER_EXECUTABLE", resolved):
+            bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        try:
+            self.assertEqual(bound_root.launcher_executable.path, first.resolve())
+            MIRROR_MODULE._revalidate_bound_root(bound_root)
+        finally:
+            MIRROR_MODULE._close_bound_root(bound_root)
+
+    def test_launcher_binding_rejects_real_target_replacement(self) -> None:
+        launcher = self.root / "python-real"
+        launcher.write_bytes(b"original launcher\n")
+        launcher.chmod(0o755)
+        with mock.patch.object(MIRROR_MODULE, "LAUNCHER_EXECUTABLE", launcher):
+            bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        preserved = self.root / "python-preserved"
+        launcher.rename(preserved)
+        launcher.write_bytes(b"replacement launcher\n")
+        launcher.chmod(0o755)
+        try:
+            with self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "Git launcher executable was replaced",
+            ):
+                MIRROR_MODULE._revalidate_bound_root(bound_root)
+        finally:
+            MIRROR_MODULE._close_bound_root(bound_root)
+
+    def test_launcher_binding_rejects_real_target_content_change(self) -> None:
+        launcher = self.root / "python-real"
+        launcher.write_bytes(b"launcher-a\n")
+        launcher.chmod(0o755)
+        with mock.patch.object(MIRROR_MODULE, "LAUNCHER_EXECUTABLE", launcher):
+            bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        launcher.write_bytes(b"launcher-b\n")
+        try:
+            with self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "Git launcher executable content changed",
+            ):
+                MIRROR_MODULE._revalidate_bound_root(bound_root)
+        finally:
+            MIRROR_MODULE._close_bound_root(bound_root)
+
+    def test_launcher_binding_rejects_real_target_access_policy_change(self) -> None:
+        launcher = self.root / "python-real"
+        launcher.write_bytes(b"launcher\n")
+        launcher.chmod(0o755)
+        with mock.patch.object(MIRROR_MODULE, "LAUNCHER_EXECUTABLE", launcher):
+            bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        launcher.chmod(0o700)
+        try:
+            with self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "Git launcher executable access policy changed",
+            ):
+                MIRROR_MODULE._revalidate_bound_root(bound_root)
+        finally:
+            MIRROR_MODULE._close_bound_root(bound_root)
+
     def test_run_git_uses_a_fixed_launcher_without_preexec_fn(self) -> None:
         captured: dict[str, object] = {}
 
@@ -2390,6 +2515,11 @@ class MirrorGeneratorTests(unittest.TestCase):
         try:
             MIRROR_MODULE._ensure_git_control_binding(bound_root)
             with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "LAUNCHER_EXECUTABLE",
+                    Path("/unused-after-binding"),
+                ),
                 mock.patch.object(
                     MIRROR_MODULE.subprocess,
                     "Popen",
@@ -2404,7 +2534,7 @@ class MirrorGeneratorTests(unittest.TestCase):
                 MIRROR_MODULE._run_git(bound_root, "rev-parse", "HEAD")
             self.assertEqual(
                 captured["command"][0],
-                MIRROR_MODULE.LAUNCHER_EXECUTABLE.as_posix(),
+                bound_root.launcher_executable.path.as_posix(),
             )
             self.assertIn(
                 MIRROR_MODULE.LAUNCHER_PROGRAM,

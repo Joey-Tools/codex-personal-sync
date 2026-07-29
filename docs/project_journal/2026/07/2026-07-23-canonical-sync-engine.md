@@ -172,6 +172,14 @@ superseded_by:
   suite. Native and Python 3.9 compileall, Ruff, source-lock verification, and
   `git diff --check` passed; the refreshed source-lock SHA-256 is
   `cb876ccf5a761b09eebaf77559cf0a01c6bcffa8183a81b2b7537bd1bd8f8d6c`.
+- The PR #5 Ubuntu source-lock follow-up removes the fixed
+  `/usr/bin/python3` launcher assumption. Mirror verification now resolves the
+  current interpreter once through bounded absolute symlink traversal, binds
+  the resulting ordinary target by object identity, complete content, and
+  access policy, and executes only that bound path. Retargeting the original
+  symlink cannot redirect a later launch. Seven focused launcher tests, both
+  129-test native/Python 3.9.6 source-lock suites, both 26-test workflow
+  suites, and a symlink-invoked `refresh-lock --check` pass.
 
 ## Validation Evidence
 
