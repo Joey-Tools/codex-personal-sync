@@ -185,6 +185,10 @@ SCHEDULER_PAIR_TRANSACTION_NAME = (
     ".codex-personal-sync-scheduler-transaction.json"
 )
 MAX_SCHEDULER_PAIR_TRANSACTION_BYTES = 4 * 1024 * 1024
+SCHEDULER_ACTIVATION_TRANSACTION_NAME = (
+    ".codex-personal-sync-scheduler-activation-incomplete.json"
+)
+MAX_SCHEDULER_ACTIVATION_TRANSACTION_BYTES = 64 * 1024
 SCHEDULER_UNINSTALL_TRANSACTION_NAME = (
     ".codex-personal-sync-scheduler-uninstall-incomplete.json"
 )
@@ -22810,8 +22814,99 @@ def _scheduler_pair_transaction_path(paths: SchedulerPaths) -> Path:
     assert paths.systemd_service is not None
     return paths.systemd_service.parent / SCHEDULER_PAIR_TRANSACTION_NAME
 
+def _scheduler_activation_transaction_path(paths: SchedulerPaths) -> Path:
+    return _scheduler_config_parent(paths) / SCHEDULER_ACTIVATION_TRANSACTION_NAME
+
+
 def _scheduler_uninstall_transaction_path(paths: SchedulerPaths) -> Path:
     return _scheduler_config_parent(paths) / SCHEDULER_UNINSTALL_TRANSACTION_NAME
+
+
+def _scheduler_activation_transaction_payload(
+    home: Path,
+    paths: SchedulerPaths,
+) -> bytes:
+    return _bounded_json_document(
+        {
+            "version": 1,
+            "platform": paths.platform,
+            "home": str(home.expanduser()),
+            "phase": "activation-required",
+        },
+        max_bytes=MAX_SCHEDULER_ACTIVATION_TRANSACTION_BYTES,
+        overflow_error="scheduler activation transaction exceeds the size limit",
+    )
+
+
+def _scheduler_activation_transaction_state(
+    home: Path,
+    paths: SchedulerPaths,
+) -> ManagedStateFileSnapshot:
+    marker = _scheduler_activation_transaction_path(paths)
+    try:
+        snapshot = _scheduler_config_snapshot(
+            marker,
+            MAX_SCHEDULER_ACTIVATION_TRANSACTION_BYTES,
+        )
+    except SyncError as error:
+        raise SyncError(
+            f"scheduler activation transaction is invalid: {marker}: {error}",
+            code="scheduler-activation-state-invalid",
+        ) from error
+    if not snapshot.exists:
+        return snapshot
+    assert snapshot.payload is not None
+    try:
+        data = _decode_managed_state_json(snapshot.payload, marker)
+    except SyncError as error:
+        raise SyncError(
+            f"scheduler activation transaction is invalid: {marker}: {error}",
+            code="scheduler-activation-state-invalid",
+        ) from error
+    if set(data) != {
+        "version",
+        "platform",
+        "home",
+        "phase",
+    }:
+        raise SyncError(
+            f"scheduler activation transaction has unsupported fields: {marker}",
+            code="scheduler-activation-state-invalid",
+        )
+    if (
+        data.get("version") != 1
+        or data.get("platform") != paths.platform
+        or data.get("home") != str(home.expanduser())
+        or data.get("phase") != "activation-required"
+        or snapshot.payload != _scheduler_activation_transaction_payload(home, paths)
+    ):
+        raise SyncError(
+            f"scheduler activation transaction is not canonical: {marker}",
+            code="scheduler-activation-state-invalid",
+        )
+    return snapshot
+
+
+def _ensure_scheduler_activation_transaction(
+    home: Path,
+    paths: SchedulerPaths,
+    *,
+    before: ManagedStateFileSnapshot,
+    dry_run: bool,
+) -> ManagedStateFileSnapshot | None:
+    marker = _scheduler_activation_transaction_path(paths)
+    if before.exists:
+        return before
+    payload = _scheduler_activation_transaction_payload(home, paths)
+    if dry_run:
+        print(f"would write scheduler activation transaction: {marker}")
+        return None
+    return _atomic_write_scheduler_config(
+        marker,
+        payload,
+        expected_snapshot=before,
+    )
+
 
 def _scheduler_uninstall_transaction_payload(
     home: Path,
@@ -23581,6 +23676,22 @@ def _install_scheduler_transaction(
             "scheduler already matches audited configuration; "
             f"preserved {existing.interval_minutes}-minute interval"
         )
+    activation_before = _scheduler_activation_transaction_state(home, paths)
+    activation_required = (
+        activation_before.exists
+        or enable
+        or (existing is not None and not config_matches)
+    )
+    activation_snapshot = (
+        _ensure_scheduler_activation_transaction(
+            home,
+            paths,
+            before=activation_before,
+            dry_run=dry_run,
+        )
+        if activation_required
+        else None
+    )
     if selected_platform == "macos":
         assert paths.launchd_plist is not None
         published_launchd_snapshot: ManagedStateFileSnapshot | None
@@ -23612,6 +23723,7 @@ def _install_scheduler_transaction(
         def activate(
             bindings: tuple[SchedulerActivationBinding, ...],
             legacy_bindings: tuple[SchedulerActivationBinding, ...] | None,
+            activation_binding: SchedulerActivationBinding | None,
         ) -> None:
             _cleanup_legacy_launchd_schedulers(
                 paths,
@@ -23639,9 +23751,24 @@ def _install_scheduler_transaction(
                     dry_run=dry_run,
                     activation_bindings=bindings,
                 )
+                if dry_run:
+                    _unlink_file(
+                        _scheduler_activation_transaction_path(paths),
+                        dry_run=True,
+                    )
+                else:
+                    assert activation_binding is not None
+                    _commit_scheduler_activation_transaction(
+                        activation_binding,
+                        related_bindings=tuple(
+                            binding
+                            for binding in bindings
+                            if binding is not activation_binding
+                        ),
+                    )
 
         if dry_run:
-            activate((), None)
+            activate((), None, None)
         else:
             assert published_launchd_snapshot is not None
             legacy_binding_specs = (
@@ -23667,20 +23794,42 @@ def _install_scheduler_transaction(
                 *legacy_binding_specs,
             )
             with contextlib.ExitStack() as stack:
-                bindings = tuple(
+                config_bindings = tuple(
                     stack.enter_context(
                         _retain_launchd_activation_binding(
                             path,
                             snapshot,
                             description=description,
+                            revalidate_on_exit=not enable,
                         )
                     )
                     for path, snapshot, description in binding_specs
                 )
+                activation_binding = (
+                    _retain_scheduler_activation_transaction(
+                        stack,
+                        paths,
+                        activation_snapshot,
+                        revalidate_on_exit=not enable,
+                    )
+                    if activation_snapshot is not None
+                    else None
+                )
+                bindings = (
+                    (*config_bindings, activation_binding)
+                    if activation_binding is not None
+                    else config_bindings
+                )
                 activate(
                     bindings,
-                    bindings[1:],
+                    config_bindings[1:],
+                    activation_binding,
                 )
+        if activation_required and not enable:
+            print(
+                "scheduler activation remains incomplete: "
+                f"{_scheduler_activation_transaction_path(paths)}"
+            )
         print(f"installed macOS launchd scheduler: {paths.launchd_plist}")
         return
 
@@ -23782,18 +23931,13 @@ def _install_scheduler_transaction(
                 service_snapshot,
                 timer_snapshot,
             )
-        if enable:
-            _revalidate_systemd_drop_ins(
-                paths,
-                config_audit.systemd_drop_ins,
-            )
-            if published_systemd_snapshots is not None:
-                _revalidate_published_systemd_pair(
-                    paths,
-                    published_systemd_snapshots,
-                )
-            _run_native_command(
-                ["systemctl", "--user", "daemon-reload"], dry_run=dry_run
+
+        def activate_linux(
+            bindings: tuple[SchedulerActivationBinding, ...],
+            activation_binding: SchedulerActivationBinding | None,
+        ) -> None:
+            config_bindings = tuple(
+                binding for binding in bindings if binding is not activation_binding
             )
             _revalidate_systemd_drop_ins(
                 paths,
@@ -23804,9 +23948,24 @@ def _install_scheduler_transaction(
                     paths,
                     published_systemd_snapshots,
                 )
-            _run_native_command(
+            _run_native_scheduler_action(
+                ["systemctl", "--user", "daemon-reload"],
+                dry_run=dry_run,
+                activation_bindings=bindings,
+            )
+            _revalidate_systemd_drop_ins(
+                paths,
+                config_audit.systemd_drop_ins,
+            )
+            if published_systemd_snapshots is not None:
+                _revalidate_published_systemd_pair(
+                    paths,
+                    published_systemd_snapshots,
+                )
+            _run_native_scheduler_action(
                 ["systemctl", "--user", "enable", f"{SYSTEMD_UNIT}.timer"],
                 dry_run=dry_run,
+                activation_bindings=bindings,
             )
             _revalidate_systemd_drop_ins(
                 paths,
@@ -23817,19 +23976,96 @@ def _install_scheduler_transaction(
                     paths,
                     published_systemd_snapshots,
                 )
-            _run_native_command(
+            _run_native_scheduler_action(
                 ["systemctl", "--user", "start", f"{SYSTEMD_UNIT}.timer"],
                 dry_run=dry_run,
+                activation_bindings=bindings,
+            )
+            _revalidate_systemd_drop_ins(
+                paths,
+                config_audit.systemd_drop_ins,
             )
             if published_systemd_snapshots is not None:
                 _revalidate_published_systemd_pair(
                     paths,
                     published_systemd_snapshots,
                 )
-        _revalidate_systemd_drop_ins(
-            paths,
-            config_audit.systemd_drop_ins,
-        )
+            if dry_run:
+                _unlink_file(
+                    _scheduler_activation_transaction_path(paths),
+                    dry_run=True,
+                )
+            else:
+                assert activation_binding is not None
+                _commit_scheduler_activation_transaction(
+                    activation_binding,
+                    related_bindings=config_bindings,
+                )
+
+        if dry_run:
+            if enable:
+                activate_linux((), None)
+            else:
+                _revalidate_systemd_drop_ins(
+                    paths,
+                    config_audit.systemd_drop_ins,
+                )
+        else:
+            assert published_systemd_snapshots is not None
+            with contextlib.ExitStack() as stack:
+                config_bindings = tuple(
+                    stack.enter_context(
+                        _retain_launchd_activation_binding(
+                            path,
+                            snapshot,
+                            description=description,
+                            revalidate_on_exit=not enable,
+                        )
+                    )
+                    for path, snapshot, description in (
+                        (
+                            paths.systemd_service,
+                            published_systemd_snapshots[0],
+                            "Linux systemd scheduler service",
+                        ),
+                        (
+                            paths.systemd_timer,
+                            published_systemd_snapshots[1],
+                            "Linux systemd scheduler timer",
+                        ),
+                    )
+                )
+                activation_binding = (
+                    _retain_scheduler_activation_transaction(
+                        stack,
+                        paths,
+                        activation_snapshot,
+                        revalidate_on_exit=not enable,
+                    )
+                    if activation_snapshot is not None
+                    else None
+                )
+                bindings = (
+                    (*config_bindings, activation_binding)
+                    if activation_binding is not None
+                    else config_bindings
+                )
+                if enable:
+                    activate_linux(bindings, activation_binding)
+                else:
+                    _revalidate_systemd_drop_ins(
+                        paths,
+                        config_audit.systemd_drop_ins,
+                    )
+                    _revalidate_published_systemd_pair(
+                        paths,
+                        published_systemd_snapshots,
+                    )
+        if activation_required and not enable:
+            print(
+                "scheduler activation remains incomplete: "
+                f"{_scheduler_activation_transaction_path(paths)}"
+            )
         print(f"installed Linux systemd user scheduler: {paths.systemd_timer}")
         return
 
@@ -23882,6 +24118,159 @@ def _report_preserved_systemd_drop_ins(paths: SchedulerPaths) -> None:
                 "preserved foreign systemd drop-in residue without an "
                 f"ownership receipt: {drop_in}"
             )
+
+
+def _scheduler_activation_commit_group(
+    marker_binding: SchedulerActivationBinding,
+    related_bindings: tuple[SchedulerActivationBinding, ...],
+) -> tuple[SchedulerActivationBinding, ...]:
+    bindings = (*related_bindings, marker_binding)
+    if len({id(binding) for binding in bindings}) != len(bindings):
+        raise SyncError(
+            "scheduler activation commit received duplicate file bindings",
+            code=marker_binding.failure_code,
+        )
+    parent_path = marker_binding.path.parent
+    parent_identity = marker_binding.expected.parent_identity
+    if parent_identity is None:
+        raise SyncError(
+            "scheduler activation commit has incomplete parent evidence",
+            code=marker_binding.failure_code,
+        )
+    shared_parent_fd = marker_binding.parent_fd
+    for binding in bindings:
+        if (
+            binding.home != marker_binding.home
+            or binding.path.parent != parent_path
+            or binding.expected.parent_identity != parent_identity
+        ):
+            raise SyncError(
+                "scheduler activation commit object group disagrees on its parent",
+                code=marker_binding.failure_code,
+            )
+    try:
+        if _directory_identity(
+            shared_parent_fd
+        ) != parent_identity or not _bound_directory_matches(
+            marker_binding.home,
+            parent_path,
+            shared_parent_fd,
+        ):
+            raise SyncError("scheduler activation commit parent identity changed")
+    except (OSError, SyncError) as error:
+        raise SyncError(
+            "scheduler activation commit object group parent is unreadable",
+            code=marker_binding.failure_code,
+        ) from error
+    return tuple(replace(binding, parent_fd=shared_parent_fd) for binding in bindings)
+
+
+def _revalidate_scheduler_activation_commit_group(
+    bindings: tuple[SchedulerActivationBinding, ...],
+) -> None:
+    if not bindings:
+        raise SyncError("scheduler activation commit object group is empty")
+    shared_parent_fd = bindings[0].parent_fd
+    parent_identity = bindings[0].expected.parent_identity
+    home = bindings[0].home
+    parent_path = bindings[0].path.parent
+    if (
+        parent_identity is None
+        or any(binding.parent_fd != shared_parent_fd for binding in bindings)
+        or any(binding.home != home for binding in bindings)
+        or any(binding.path.parent != parent_path for binding in bindings)
+        or any(
+            binding.expected.parent_identity != parent_identity for binding in bindings
+        )
+    ):
+        raise SyncError("scheduler activation commit object group is inconsistent")
+    # Exact config/marker identity, bytes, access policy, and canonical-name
+    # presence or absence are the protected properties. Two stabilization
+    # passes plus a final whole-group pass catch an earlier member changing
+    # while a later member is checked.
+    for _verification_round in range(2):
+        for binding in bindings:
+            _revalidate_launchd_activation_binding(
+                binding,
+                boundary="after daemon activation before transaction commit",
+            )
+    for binding in bindings:
+        _revalidate_launchd_activation_binding(
+            binding,
+            boundary="after daemon activation before transaction commit",
+        )
+    try:
+        if _directory_identity(
+            shared_parent_fd
+        ) != parent_identity or not _bound_directory_matches(
+            home,
+            parent_path,
+            shared_parent_fd,
+        ):
+            raise SyncError("scheduler activation commit parent identity changed")
+    except (OSError, SyncError) as error:
+        raise SyncError(
+            "scheduler activation commit object group parent is unreadable"
+        ) from error
+
+
+def _commit_scheduler_activation_transaction(
+    marker_binding: SchedulerActivationBinding,
+    *,
+    related_bindings: tuple[SchedulerActivationBinding, ...],
+) -> None:
+    bindings = _scheduler_activation_commit_group(
+        marker_binding,
+        related_bindings,
+    )
+    try:
+        os.fsync(marker_binding.parent_fd)
+    except OSError as error:
+        raise SyncError(
+            f"failed to sync scheduler activation transaction: {marker_binding.path}",
+            code=marker_binding.failure_code,
+        ) from error
+    _revalidate_scheduler_activation_commit_group(bindings)
+    try:
+        os.unlink(
+            marker_binding.path.name,
+            dir_fd=marker_binding.parent_fd,
+        )
+    except OSError as error:
+        raise SyncError(
+            f"failed to commit scheduler activation transaction: {marker_binding.path}",
+            code=marker_binding.failure_code,
+        ) from error
+    # Exact marker unlink is the activation commit point. The caller performs
+    # only descriptor cleanup and success reporting afterward.
+    marker_binding.expected = ManagedStateFileSnapshot(
+        exists=False,
+        parent_identity=marker_binding.expected.parent_identity,
+    )
+    marker_binding.removed = True
+
+
+def _retain_scheduler_activation_transaction(
+    stack: contextlib.ExitStack,
+    paths: SchedulerPaths,
+    snapshot: ManagedStateFileSnapshot,
+    *,
+    revalidate_on_exit: bool,
+) -> SchedulerActivationBinding:
+    if not snapshot.exists:
+        raise SyncError(
+            "scheduler activation transaction is missing before binding",
+            code="scheduler-activation-incomplete",
+        )
+    return stack.enter_context(
+        _retain_launchd_activation_binding(
+            _scheduler_activation_transaction_path(paths),
+            snapshot,
+            description="scheduler activation transaction",
+            failure_code="scheduler-activation-incomplete",
+            revalidate_on_exit=revalidate_on_exit,
+        )
+    )
 
 
 def _scheduler_uninstall_commit_group(
@@ -24108,6 +24497,10 @@ def _uninstall_scheduler_transaction(
             f"{_scheduler_uninstall_transaction_path(paths)}",
             code="scheduler-uninstall-incomplete",
         )
+    activation_marker_snapshot = _scheduler_config_snapshot(
+        _scheduler_activation_transaction_path(paths),
+        MAX_SCHEDULER_ACTIVATION_TRANSACTION_BYTES,
+    )
     if selected_platform == "macos":
         assert paths.launchd_plist is not None
         binding_specs = (
@@ -24122,15 +24515,24 @@ def _uninstall_scheduler_transaction(
                 )
                 for label in LEGACY_LAUNCHD_LABELS
             ),
+            (
+                _scheduler_activation_transaction_path(paths),
+                "scheduler activation transaction",
+            ),
         )
-        snapshots = tuple(
-            _scheduler_config_snapshot(path) for path, _description in binding_specs
+        snapshots = (
+            *(
+                _scheduler_config_snapshot(path)
+                for path, _description in binding_specs[:-1]
+            ),
+            activation_marker_snapshot,
         )
 
         def uninstall_macos(
             binding: SchedulerActivationBinding | None,
             bindings: tuple[SchedulerActivationBinding, ...],
             legacy_bindings: tuple[SchedulerActivationBinding, ...] | None,
+            activation_binding: SchedulerActivationBinding | None,
             marker_binding: SchedulerActivationBinding | None,
         ) -> None:
             complete_bindings = (
@@ -24160,12 +24562,22 @@ def _uninstall_scheduler_transaction(
             )
             if dry_run:
                 _unlink_file(paths.launchd_plist, dry_run=True)
+                _unlink_file(
+                    _scheduler_activation_transaction_path(paths),
+                    dry_run=True,
+                )
             else:
                 assert binding is not None
+                assert activation_binding is not None
                 assert marker_binding is not None
                 _conditionally_remove_bound_scheduler_config(
                     binding,
                     boundary="before conditional scheduler removal",
+                    related_bindings=complete_bindings,
+                )
+                _conditionally_remove_bound_scheduler_config(
+                    activation_binding,
+                    boundary="before conditional activation marker removal",
                     related_bindings=complete_bindings,
                 )
                 _commit_scheduler_uninstall_transaction(
@@ -24174,7 +24586,7 @@ def _uninstall_scheduler_transaction(
                 )
 
         if dry_run:
-            uninstall_macos(None, (), None, None)
+            uninstall_macos(None, (), None, None, None)
         else:
             with contextlib.ExitStack() as stack:
                 bindings = tuple(
@@ -24202,7 +24614,8 @@ def _uninstall_scheduler_transaction(
                 uninstall_macos(
                     bindings[0],
                     bindings,
-                    bindings[1:],
+                    bindings[1:-1],
+                    bindings[-1],
                     marker_binding,
                 )
         print(f"removed macOS launchd scheduler: {paths.launchd_plist}")
@@ -24214,6 +24627,7 @@ def _uninstall_scheduler_transaction(
         snapshots = (
             _scheduler_config_snapshot(paths.systemd_service),
             _scheduler_config_snapshot(paths.systemd_timer),
+            activation_marker_snapshot,
         )
 
         def uninstall_linux(
@@ -24241,7 +24655,7 @@ def _uninstall_scheduler_transaction(
                 _unlink_file(paths.systemd_service, dry_run=True)
             else:
                 assert marker_binding is not None
-                service_binding, timer_binding = bindings
+                service_binding, timer_binding = bindings[:2]
                 _conditionally_remove_bound_scheduler_config(
                     timer_binding,
                     boundary="before conditional scheduler timer removal",
@@ -24261,9 +24675,20 @@ def _uninstall_scheduler_transaction(
                 )
             if not dry_run:
                 assert marker_binding is not None
+                activation_binding = bindings[-1]
+                _conditionally_remove_bound_scheduler_config(
+                    activation_binding,
+                    boundary="before conditional activation marker removal",
+                    related_bindings=complete_bindings,
+                )
                 _commit_scheduler_uninstall_transaction(
                     marker_binding,
                     related_bindings=bindings,
+                )
+            else:
+                _unlink_file(
+                    _scheduler_activation_transaction_path(paths),
+                    dry_run=True,
                 )
 
         if dry_run:
@@ -24289,6 +24714,11 @@ def _uninstall_scheduler_transaction(
                             paths.systemd_timer,
                             snapshots[1],
                             "Linux systemd scheduler timer",
+                        ),
+                        (
+                            _scheduler_activation_transaction_path(paths),
+                            snapshots[2],
+                            "scheduler activation transaction",
                         ),
                     )
                 )
@@ -25076,6 +25506,8 @@ def doctor(
                 "scheduler-daemon-unavailable",
                 "scheduler-daemon-disabled",
                 "scheduler-runner-drift",
+                "scheduler-activation-incomplete",
+                "scheduler-activation-state-invalid",
                 "scheduler-uninstall-incomplete",
                 "scheduler-uninstall-state-invalid",
             }
@@ -25089,14 +25521,20 @@ def doctor(
                         _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
                         if issue_code.startswith("quarantine-")
                         else (
-                            _scheduler_uninstall_transaction_path(
+                            _scheduler_activation_transaction_path(
                                 _scheduler_paths(report.platform, home)
                             )
-                            if issue_code.startswith("scheduler-uninstall-")
+                            if issue_code.startswith("scheduler-activation-")
                             else (
-                                report.config_paths[0]
-                                if report.config_paths
-                                else home
+                                _scheduler_uninstall_transaction_path(
+                                    _scheduler_paths(report.platform, home)
+                                )
+                                if issue_code.startswith("scheduler-uninstall-")
+                                else (
+                                    report.config_paths[0]
+                                    if report.config_paths
+                                    else home
+                                )
                             )
                         )
                     ),
@@ -25961,8 +26399,15 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
     config: SchedulerConfig | None = None
     config_audit: SchedulerConfigAudit | None = None
     config_bindings: tuple[SchedulerActivationBinding, ...] = ()
+    status_bindings: tuple[SchedulerActivationBinding, ...] = ()
     config_binding_stack = contextlib.ExitStack()
     failures: list[tuple[str | None, str]] = []
+    activation_snapshot: ManagedStateFileSnapshot | None = None
+    activation_problem = False
+    activation_codes = {
+        "scheduler-activation-incomplete",
+        "scheduler-activation-state-invalid",
+    }
 
     def record_failure(
         code: str | None,
@@ -26000,6 +26445,23 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
             primary=True,
         )
     try:
+        activation_snapshot = _scheduler_activation_transaction_state(home, paths)
+        if activation_snapshot.exists:
+            activation_problem = True
+            marker = _scheduler_activation_transaction_path(paths)
+            record_failure(
+                "scheduler-activation-incomplete",
+                f"scheduler has an incomplete activation transaction: {marker}",
+                primary=True,
+            )
+    except SyncError as error:
+        activation_problem = True
+        record_failure(
+            error.code or "scheduler-activation-state-invalid",
+            str(error),
+            primary=True,
+        )
+    try:
         config_audit = _audit_scheduler_config(paths)
         config = config_audit.config
         if config is not None:
@@ -26009,6 +26471,7 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
                     config_audit,
                 )
             )
+            status_bindings = config_bindings
     except SyncError as error:
         config_binding_stack.close()
         config_binding_stack = contextlib.ExitStack()
@@ -26019,6 +26482,24 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
             error.code or "scheduler-config-invalid",
             str(error),
         )
+    if config is not None and activation_snapshot is not None:
+        try:
+            activation_binding = config_binding_stack.enter_context(
+                _retain_launchd_activation_binding(
+                    _scheduler_activation_transaction_path(paths),
+                    activation_snapshot,
+                    description="scheduler activation transaction",
+                    failure_code="scheduler-activation-incomplete",
+                )
+            )
+            status_bindings = (*config_bindings, activation_binding)
+        except SyncError as error:
+            activation_problem = True
+            record_failure(
+                error.code or "scheduler-activation-state-invalid",
+                str(error),
+                primary=True,
+            )
     runtime_state: dict[str, Any] | None = None
     try:
         runtime_state = _read_scheduler_runtime_state(home)
@@ -26093,38 +26574,50 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
         )
     enabled: bool | None = None
     daemon_query: SchedulerDaemonQuery | None = None
+    daemon_failure_is_activation = False
     if installed:
-        try:
-            raw_daemon_query = _scheduler_daemon_enabled(
-                paths,
-                config_audit=config_audit,
-                activation_bindings=config_bindings,
-            )
-            if isinstance(raw_daemon_query, SchedulerDaemonQuery):
-                daemon_query = raw_daemon_query
-            elif raw_daemon_query is True:
-                daemon_query = SchedulerDaemonQuery("enabled")
-            elif raw_daemon_query is False:
-                daemon_query = SchedulerDaemonQuery(
-                    "disabled",
-                    "scheduler daemon explicitly reports a disabled state",
-                )
-            else:
-                daemon_query = SchedulerDaemonQuery(
-                    "unavailable",
-                    "scheduler daemon query returned no structured evidence",
-                )
-        except SyncError as error:
-            record_failure(
-                error.code or "scheduler-config-drift",
-                str(error),
-                primary=True,
-            )
+        if activation_problem:
+            daemon_failure_is_activation = True
             daemon_query = SchedulerDaemonQuery(
                 "unavailable",
-                "scheduler daemon query was invalidated by scheduler "
-                "configuration drift",
+                "scheduler activation is incomplete; the on-disk "
+                "configuration is not proven loaded",
             )
+        else:
+            try:
+                raw_daemon_query = _scheduler_daemon_enabled(
+                    paths,
+                    config_audit=config_audit,
+                    activation_bindings=status_bindings,
+                )
+                if isinstance(raw_daemon_query, SchedulerDaemonQuery):
+                    daemon_query = raw_daemon_query
+                elif raw_daemon_query is True:
+                    daemon_query = SchedulerDaemonQuery("enabled")
+                elif raw_daemon_query is False:
+                    daemon_query = SchedulerDaemonQuery(
+                        "disabled",
+                        "scheduler daemon explicitly reports a disabled state",
+                    )
+                else:
+                    daemon_query = SchedulerDaemonQuery(
+                        "unavailable",
+                        "scheduler daemon query returned no structured evidence",
+                    )
+            except SyncError as error:
+                failure_code = error.code or "scheduler-config-drift"
+                daemon_failure_is_activation = failure_code in activation_codes
+                record_failure(
+                    failure_code,
+                    str(error),
+                    primary=True,
+                )
+                daemon_query = SchedulerDaemonQuery(
+                    "unavailable",
+                    "scheduler daemon query was invalidated by scheduler "
+                    "configuration or activation drift",
+                )
+        assert daemon_query is not None
         enabled = daemon_query.enabled
         if daemon_query.classification == "disabled":
             record_failure(
@@ -26132,10 +26625,11 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
                 daemon_query.reason or "scheduler daemon is not enabled",
             )
         elif daemon_query.classification == "unavailable":
-            record_failure(
-                "scheduler-daemon-unavailable",
-                daemon_query.reason or "scheduler daemon state is unavailable",
-            )
+            if not daemon_failure_is_activation:
+                record_failure(
+                    "scheduler-daemon-unavailable",
+                    daemon_query.reason or "scheduler daemon state is unavailable",
+                )
         elif daemon_query.classification != "enabled":
             daemon_query = SchedulerDaemonQuery(
                 "unavailable",
@@ -26149,14 +26643,17 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
     try:
         config_binding_stack.close()
     except SyncError as error:
+        failure_code = error.code or "scheduler-config-drift"
+        activation_drift = failure_code in activation_codes
         record_failure(
-            error.code or "scheduler-config-drift",
+            failure_code,
             str(error),
             primary=True,
         )
         daemon_query = SchedulerDaemonQuery(
             "unavailable",
-            "scheduler daemon query was invalidated by scheduler configuration drift",
+            "scheduler daemon query was invalidated by scheduler "
+            "configuration or activation drift",
         )
         enabled = None
         if installed:
@@ -26169,10 +26666,11 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
                     "scheduler-daemon-unavailable",
                 }
             ]
-            record_failure(
-                "scheduler-daemon-unavailable",
-                daemon_query.reason,
-            )
+            if not activation_drift:
+                record_failure(
+                    "scheduler-daemon-unavailable",
+                    daemon_query.reason,
+                )
     config_paths = (
         config.config_paths
         if config is not None

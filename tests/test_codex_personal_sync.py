@@ -6632,7 +6632,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
-                "published systemd scheduler service/timer pair changed",
+                "Linux systemd scheduler service content changed "
+                "after native action systemctl --user daemon-reload",
             ),
         ):
             MODULE.install_scheduler(
@@ -6686,7 +6687,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
-                "published systemd scheduler service/timer pair changed",
+                "Linux systemd scheduler service object identity changed "
+                "after native action systemctl --user enable",
             ),
         ):
             MODULE.install_scheduler(

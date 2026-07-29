@@ -471,6 +471,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                 mock.call(
                     ["systemctl", "--user", "daemon-reload"],
                     dry_run=False,
+                    allow_fail=False,
                 ),
                 mock.call(
                     [
@@ -480,6 +481,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                         f"{MODULE.SYSTEMD_UNIT}.timer",
                     ],
                     dry_run=False,
+                    allow_fail=False,
                 ),
                 mock.call(
                     [
@@ -489,6 +491,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                         f"{MODULE.SYSTEMD_UNIT}.timer",
                     ],
                     dry_run=False,
+                    allow_fail=False,
                 ),
             ],
         )
@@ -503,6 +506,337 @@ class SchedulerDoctorTests(unittest.TestCase):
             ),
             before,
         )
+
+    def test_active_scheduler_change_without_enable_requires_reactivation(
+        self,
+    ) -> None:
+        self.write_runner()
+        for platform_name in ("macos", "linux"):
+            with self.subTest(platform=platform_name):
+                with mock.patch.object(MODULE, "_run_native_command"):
+                    self.install_scheduler_quietly(
+                        f"owner/{platform_name}-sync",
+                        17,
+                        platform_name,
+                        enable=True,
+                    )
+                paths = MODULE._scheduler_paths(platform_name, self.home)
+                marker = MODULE._scheduler_activation_transaction_path(paths)
+                self.assertFalse(marker.exists())
+
+                self.install_scheduler_quietly(
+                    f"owner/{platform_name}-sync",
+                    29,
+                    platform_name,
+                    enable=False,
+                )
+                self.assertTrue(marker.exists())
+                config_paths = tuple(
+                    path
+                    for path in (
+                        paths.launchd_plist,
+                        paths.systemd_service,
+                        paths.systemd_timer,
+                    )
+                    if path is not None
+                )
+                before = tuple(
+                    (
+                        path.read_bytes(),
+                        path.stat().st_dev,
+                        path.stat().st_ino,
+                        path.stat().st_mtime_ns,
+                    )
+                    for path in config_paths
+                )
+
+                with mock.patch.object(
+                    MODULE,
+                    "_scheduler_daemon_enabled",
+                    return_value=MODULE.SchedulerDaemonQuery("enabled"),
+                ) as daemon_enabled:
+                    report = MODULE.scheduler_report(self.home, platform_name)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        _doctor_report, issues = MODULE.doctor(
+                            self.home,
+                            platform_name,
+                            json_output=False,
+                        )
+                daemon_enabled.assert_not_called()
+                self.assertTrue(report.installed)
+                self.assertIsNone(report.enabled)
+                self.assertEqual(
+                    report.failure_code,
+                    "scheduler-activation-incomplete",
+                )
+                self.assertIsNotNone(report.daemon_query)
+                assert report.daemon_query is not None
+                self.assertEqual(
+                    report.daemon_query.classification,
+                    "unavailable",
+                )
+                self.assertNotIn(
+                    "scheduler-daemon-unavailable",
+                    {code for code, _reason in report.failures},
+                )
+                self.assertTrue(
+                    any(
+                        issue.code == "scheduler-activation-incomplete"
+                        and issue.path == marker
+                        for issue in issues
+                    )
+                )
+
+                writer_name = (
+                    "_write_plist" if platform_name == "macos" else "_write_text"
+                )
+                with (
+                    mock.patch.object(MODULE, writer_name) as writer,
+                    mock.patch.object(MODULE, "_run_native_command"),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    MODULE.install_scheduler(
+                        self.home,
+                        f"owner/{platform_name}-sync",
+                        None,
+                        platform_name,
+                        None,
+                        dry_run=False,
+                        enable=True,
+                    )
+                writer.assert_not_called()
+                self.assertFalse(marker.exists())
+                self.assertEqual(
+                    tuple(
+                        (
+                            path.read_bytes(),
+                            path.stat().st_dev,
+                            path.stat().st_ino,
+                            path.stat().st_mtime_ns,
+                        )
+                        for path in config_paths
+                    ),
+                    before,
+                )
+                with mock.patch.object(
+                    MODULE,
+                    "_scheduler_daemon_enabled",
+                    return_value=MODULE.SchedulerDaemonQuery("enabled"),
+                ):
+                    recovered = MODULE.scheduler_report(
+                        self.home,
+                        platform_name,
+                    )
+                self.assertTrue(recovered.enabled)
+                self.assertNotEqual(
+                    recovered.failure_code,
+                    "scheduler-activation-incomplete",
+                )
+                self.assertEqual(recovered.interval_minutes, 29)
+
+    def test_activation_failure_persists_marker_until_exact_retry(self) -> None:
+        self.write_runner()
+        failure_actions = {
+            "macos": "bootstrap",
+            "linux": "daemon-reload",
+        }
+        for platform_name, failure_action in failure_actions.items():
+            with self.subTest(platform=platform_name):
+                paths = MODULE._scheduler_paths(platform_name, self.home)
+                marker = MODULE._scheduler_activation_transaction_path(paths)
+
+                def fail_activation(
+                    args: list[str],
+                    *,
+                    dry_run: bool,
+                    allow_fail: bool | str = False,
+                ) -> None:
+                    del dry_run, allow_fail
+                    if failure_action in args:
+                        raise MODULE.SyncError(f"simulated {failure_action} failure")
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_run_native_command",
+                        side_effect=fail_activation,
+                    ),
+                    contextlib.redirect_stdout(io.StringIO()),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        f"simulated {failure_action} failure",
+                    ),
+                ):
+                    MODULE.install_scheduler(
+                        self.home,
+                        f"owner/{platform_name}-failure",
+                        31,
+                        platform_name,
+                        None,
+                        dry_run=False,
+                        enable=True,
+                    )
+                self.assertTrue(marker.exists())
+                config_paths = tuple(
+                    path
+                    for path in (
+                        paths.launchd_plist,
+                        paths.systemd_service,
+                        paths.systemd_timer,
+                    )
+                    if path is not None
+                )
+                before = tuple(
+                    (
+                        path.read_bytes(),
+                        path.stat().st_dev,
+                        path.stat().st_ino,
+                        path.stat().st_mtime_ns,
+                    )
+                    for path in config_paths
+                )
+                with mock.patch.object(
+                    MODULE,
+                    "_scheduler_daemon_enabled",
+                    return_value=MODULE.SchedulerDaemonQuery("enabled"),
+                ) as daemon_enabled:
+                    report = MODULE.scheduler_report(self.home, platform_name)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        _doctor_report, issues = MODULE.doctor(
+                            self.home,
+                            platform_name,
+                            json_output=False,
+                        )
+                daemon_enabled.assert_not_called()
+                self.assertIsNone(report.enabled)
+                self.assertEqual(
+                    report.failure_code,
+                    "scheduler-activation-incomplete",
+                )
+                self.assertTrue(
+                    any(
+                        issue.code == "scheduler-activation-incomplete"
+                        and issue.path == marker
+                        for issue in issues
+                    )
+                )
+
+                writer_name = (
+                    "_write_plist" if platform_name == "macos" else "_write_text"
+                )
+                with (
+                    mock.patch.object(MODULE, writer_name) as writer,
+                    mock.patch.object(MODULE, "_run_native_command"),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    MODULE.install_scheduler(
+                        self.home,
+                        f"owner/{platform_name}-failure",
+                        None,
+                        platform_name,
+                        None,
+                        dry_run=False,
+                        enable=True,
+                    )
+                writer.assert_not_called()
+                self.assertFalse(marker.exists())
+                self.assertEqual(
+                    tuple(
+                        (
+                            path.read_bytes(),
+                            path.stat().st_dev,
+                            path.stat().st_ino,
+                            path.stat().st_mtime_ns,
+                        )
+                        for path in config_paths
+                    ),
+                    before,
+                )
+                with mock.patch.object(
+                    MODULE,
+                    "_scheduler_daemon_enabled",
+                    return_value=MODULE.SchedulerDaemonQuery("enabled"),
+                ):
+                    recovered = MODULE.scheduler_report(
+                        self.home,
+                        platform_name,
+                    )
+                self.assertTrue(recovered.enabled)
+                self.assertEqual(recovered.interval_minutes, 31)
+
+    def test_invalid_activation_state_fails_closed_and_uninstall_clears_it(
+        self,
+    ) -> None:
+        self.write_runner()
+        for platform_name in ("macos", "linux"):
+            with self.subTest(platform=platform_name):
+                self.install_scheduler_quietly(
+                    f"owner/{platform_name}-invalid",
+                    23,
+                    platform_name,
+                )
+                paths = MODULE._scheduler_paths(platform_name, self.home)
+                marker = MODULE._scheduler_activation_transaction_path(paths)
+                marker.write_text("{invalid\n", encoding="utf-8")
+
+                with mock.patch.object(
+                    MODULE,
+                    "_scheduler_daemon_enabled",
+                    return_value=MODULE.SchedulerDaemonQuery("enabled"),
+                ) as daemon_enabled:
+                    report = MODULE.scheduler_report(self.home, platform_name)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        _doctor_report, issues = MODULE.doctor(
+                            self.home,
+                            platform_name,
+                            json_output=False,
+                        )
+                daemon_enabled.assert_not_called()
+                self.assertIsNone(report.enabled)
+                self.assertEqual(
+                    report.failure_code,
+                    "scheduler-activation-state-invalid",
+                )
+                self.assertTrue(
+                    any(
+                        issue.code == "scheduler-activation-state-invalid"
+                        and issue.path == marker
+                        for issue in issues
+                    )
+                )
+
+                writer_name = (
+                    "_write_plist" if platform_name == "macos" else "_write_text"
+                )
+                with (
+                    mock.patch.object(MODULE, writer_name) as writer,
+                    mock.patch.object(MODULE, "_run_native_command") as native,
+                    self.assertRaises(MODULE.SyncError) as raised,
+                ):
+                    MODULE.install_scheduler(
+                        self.home,
+                        f"owner/{platform_name}-invalid",
+                        37,
+                        platform_name,
+                        None,
+                        dry_run=False,
+                        enable=True,
+                    )
+                self.assertEqual(
+                    raised.exception.code,
+                    "scheduler-activation-state-invalid",
+                )
+                writer.assert_not_called()
+                native.assert_not_called()
+
+                with contextlib.redirect_stdout(io.StringIO()):
+                    MODULE.uninstall_scheduler(
+                        self.home,
+                        platform_name,
+                        dry_run=False,
+                        disable=False,
+                    )
+                self.assertFalse(marker.exists())
 
     def test_status_report_includes_config_releases_and_runtime_health(self) -> None:
         runner = self.write_runner()
@@ -5762,6 +6096,99 @@ class SchedulerDoctorTests(unittest.TestCase):
                     {code for code, _reason in report.failures},
                 )
 
+    def test_scheduler_status_binds_activation_absence_across_native_query(
+        self,
+    ) -> None:
+        for platform_name in ("macos", "linux"):
+            with self.subTest(platform=platform_name):
+                case_user_home = (
+                    self.root / f"activation-status-{platform_name}" / "home"
+                )
+                case_home = case_user_home / ".codex"
+                runner = case_home / "bin" / "codex-personal-sync"
+                runner.parent.mkdir(parents=True)
+                runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                runner.chmod(0o755)
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        MODULE.install_scheduler(
+                            case_home,
+                            "owner/public-sync",
+                            17,
+                            platform_name,
+                            None,
+                            dry_run=False,
+                            enable=False,
+                        )
+                    paths = MODULE._scheduler_paths(platform_name, case_home)
+                    marker = MODULE._scheduler_activation_transaction_path(paths)
+                    self.assertFalse(marker.exists())
+
+                    def begin_activation_during_status(
+                        args: list[str],
+                        **_kwargs: object,
+                    ) -> subprocess.CompletedProcess[str]:
+                        marker.write_bytes(
+                            MODULE._scheduler_activation_transaction_payload(
+                                case_home,
+                                paths,
+                            )
+                        )
+                        marker.chmod(0o600)
+                        return subprocess.CompletedProcess(
+                            args,
+                            0,
+                            "enabled\n",
+                            "",
+                        )
+
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_native_scheduler_argv",
+                            side_effect=lambda args: args,
+                        ),
+                        mock.patch.object(
+                            MODULE.subprocess,
+                            "run",
+                            side_effect=begin_activation_during_status,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_stable_scheduler_runner_matches",
+                            return_value=True,
+                        ),
+                    ):
+                        report = MODULE.scheduler_report(
+                            case_home,
+                            platform_name,
+                        )
+
+                self.assertEqual(
+                    report.failure_code,
+                    "scheduler-activation-incomplete",
+                )
+                self.assertIsNone(report.enabled)
+                self.assertIn("appeared", report.failure_reason or "")
+                assert report.daemon_query is not None
+                self.assertEqual(
+                    report.daemon_query.classification,
+                    "unavailable",
+                )
+                failure_codes = {code for code, _reason in report.failures}
+                self.assertIn(
+                    "scheduler-activation-incomplete",
+                    failure_codes,
+                )
+                self.assertNotIn(
+                    "scheduler-daemon-unavailable",
+                    failure_codes,
+                )
+
     def test_scheduler_status_allows_mtime_churn_and_reports_unavailable(
         self,
     ) -> None:
@@ -6412,6 +6839,13 @@ class SchedulerDoctorTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     MODULE,
+                    "_retain_launchd_activation_binding",
+                    return_value=contextlib.nullcontext(
+                        mock.sentinel.activation_binding
+                    ),
+                ),
+                mock.patch.object(
+                    MODULE,
                     "_read_scheduler_runtime_state",
                     return_value=None,
                 ),
@@ -6478,6 +6912,11 @@ class SchedulerDoctorTests(unittest.TestCase):
                 MODULE,
                 "_retain_scheduler_config_audit_bindings",
                 return_value=contextlib.nullcontext(()),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_retain_launchd_activation_binding",
+                return_value=contextlib.nullcontext(mock.sentinel.activation_binding),
             ),
             mock.patch.object(
                 MODULE,
