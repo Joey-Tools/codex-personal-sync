@@ -3,7 +3,10 @@
 ## Current State
 
 - Canonical sync engine work is active; delivery status and validation checkpoints live in the [current workstream journal](project_journal/2026/07/2026-07-23-canonical-sync-engine.md).
-- `Joey-Tools/codex-personal-sync` owns canonical sources. `codex-toolbox` and `codex-private-workflows` receive only source-lock-declared generated mirrors.
+- `Joey-Tools/codex-personal-sync` owns canonical sources. `codex-toolbox`
+  receives the only source-lock-declared generated mirror;
+  `codex-private-workflows` consumes that runtime from an exact receipt-bound
+  toolbox release.
 
 ## Recovery Pointers
 

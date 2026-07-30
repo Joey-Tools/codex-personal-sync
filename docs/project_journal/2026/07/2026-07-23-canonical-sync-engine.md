@@ -3,7 +3,7 @@ id: 20260723-canonical-sync-engine
 title: Canonical Sync Engine
 status: active
 created: 2026-07-23
-updated: 2026-07-29
+updated: 2026-07-30
 branch: codex/canonical-sync-engine
 pr:
 supersedes: []
@@ -25,7 +25,9 @@ superseded_by:
 
 ## Scope
 
-- Establish a one-way canonical source lock and explicit `toolbox` / `private` mirror generation boundary.
+- Establish a one-way canonical source lock and explicit canonical → toolbox →
+  private propagation boundary, with toolbox as the only direct generated
+  mirror.
 - Keep release trees immutable after publication, bind `current` and managed-link transitions to durable evidence, and make `removed_links` an exact migration proof rather than a broad deletion authority.
 - Run schedulers through the stable installed runner, preserve audited interval configuration, and publish a bounded runtime status contract.
 - Audit the active skill discovery root read-only.
@@ -688,6 +690,17 @@ superseded_by:
   lint/format, JSON parsing, and `git diff --check` also passed. Production
   refresh remains intentionally blocked until a separate recovery-authorized
   quarantine workstream resolves the retained evidence.
+- A final ownership audit found that the repository lock still modeled
+  canonical-to-private generation even though the approved release topology is
+  canonical → toolbox → private. The real lock now declares only the toolbox
+  mirror; private propagation is explicitly receipt-bound to the exact toolbox
+  commit and complete immutable public release. The generic multi-consumer
+  parser fixture remains covered, so this governance correction does not
+  remove engine support for another declared consumer. The exact follow-up
+  bytes passed all 133 source-lock tests in 598.528 seconds with Python 3.13.0
+  and 636.144 seconds with Xcode Python 3.9.6. The focused repository-lock and
+  documented credential-interface selections passed in both runtimes; JSON
+  parsing, targeted Ruff lint/format, and `git diff --check` also passed.
 
 ## Installed Host Baseline
 
@@ -723,12 +736,13 @@ configuration.
 ## Downstream Dependencies
 
 - `Joey-Tools/codex-toolbox` consumes only files declared by the `toolbox` mirror in `sync-source-lock.json`.
-- `Joey-Tools/codex-private-workflows` consumes only files declared by the `private` mirror in `sync-source-lock.json`.
-- After canonical bytes and mode are finalized, the lock must be refreshed, both generated mirrors must be updated and checked, and consumer validation must run there. Consumer copies must not become alternate sources.
+- `Joey-Tools/codex-private-workflows` consumes the synchronizer only through an exact receipt-bound toolbox commit and its complete immutable public release; no direct canonical-to-private mirror is permitted.
+- After canonical bytes and mode are finalized, the lock must be refreshed, the generated toolbox mirror must be updated and checked, and toolbox validation must run there. Private propagation starts only after that exact toolbox release is complete. Consumer copies must not become alternate sources.
 
 ## Next Steps
 
-- Generate and validate the declared downstream mirrors.
+- Generate and validate the declared toolbox mirror, then bridge its exact
+  immutable release into the private overlay.
 - Push/open the canonical PR and continue downstream mirror/PR delivery only
   when the parent workstream authorizes those remote mutations.
 - Provision `CODEX_TOOLBOX_SYNC_TOKEN` separately only if the repository owner

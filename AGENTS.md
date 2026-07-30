@@ -2,9 +2,12 @@
 
 - This repository is the canonical owner of `scripts/codex_personal_sync.py`,
   its `tests/test_*.py` suites, and `schema/sync-manifest.schema.json`.
-- Copies declared in `sync-source-lock.json` are generated, read-only consumer
-  mirrors. Never import changes from `codex-toolbox` or
-  `codex-private-workflows` back into this repository.
+- The `codex-toolbox` copy declared in `sync-source-lock.json` is the generated,
+  read-only consumer mirror. Never import toolbox changes back into this
+  repository.
+- `codex-private-workflows` must consume the synchronizer only from an exact
+  receipt-bound toolbox commit and immutable public release. Never generate or
+  publish a direct canonical-to-private mirror.
 - After changing a locked canonical source, run
   `python3 scripts/sync_canonical_mirrors.py refresh-lock`, then run the source
   lock tests.
@@ -24,5 +27,6 @@
   no-clobber conditional publication, durable per-file and whole-generation
   crash recovery, terminal whole-target-group validation, and final
   `generated-sync-source-lock.json` provenance receipt.
-- Generate each consumer, review its resulting diff, and use `check` to prove
-  receipt and byte parity. Make semantic changes only in this repository.
+- Generate the toolbox consumer, review its resulting diff, and use `check` to
+  prove receipt and byte parity. Make semantic changes only in this repository;
+  private overlay propagation begins from the accepted toolbox release.

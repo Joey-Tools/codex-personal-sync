@@ -116,9 +116,10 @@ administrators must provision and rotate the secret outside this workflow.
 
 ## Limitations
 
-- This repository currently has no configured sync credential. This change does
-  not invent, commit, or install one; runs fail at the first validation step
-  until an administrator provisions `CODEX_TOOLBOX_SYNC_TOKEN`.
+- The sync credential is externally provisioned deployment state that source
+  code cannot attest. The workflow does not invent, commit, install, or fall
+  back from it; runs fail at the first validation step unless an administrator
+  has made `CODEX_TOOLBOX_SYNC_TOKEN` available to this repository.
 - The token identity determines the push and pull-request actor. The generated
   commit uses `github-actions[bot]` as its author but is not GPG-signed.
 - The workflow deliberately fails on unsafe or oversized branch history,
