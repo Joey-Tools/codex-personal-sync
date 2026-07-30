@@ -66,9 +66,7 @@ def tree_snapshot(
 ) -> tuple[tuple[str, str, int, tuple[int, int], bytes | str | None], ...]:
     if not os.path.lexists(root):
         return ()
-    entries: list[
-        tuple[str, str, int, tuple[int, int], bytes | str | None]
-    ] = []
+    entries: list[tuple[str, str, int, tuple[int, int], bytes | str | None]] = []
 
     def visit(path: Path) -> None:
         metadata = path.lstat()
@@ -365,9 +363,7 @@ class ReleaseRetentionTests(unittest.TestCase):
         self.assertTrue(self.release_path(SHA_A).is_dir())
         self.assertTrue(self.release_path(SHA_B).is_dir())
         self.assertTrue(batch.batch_root.is_dir())
-        self.assertTrue(
-            os.path.lexists(MODULE._pending_link_pointer_path(self.home))
-        )
+        self.assertTrue(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
 
     def test_user_pin_preserves_unreferenced_release(self) -> None:
         self.install_pair()
@@ -818,9 +814,7 @@ class ReleaseRetentionTests(unittest.TestCase):
             MODULE._personal_sync_root(self.home)
             / MODULE.RELEASE_RETENTION_QUARANTINE_RELATIVE_PATH
         )
-        orphan = retention_root / (
-            f"{MODULE.RELEASE_RETENTION_BATCH_PREFIX}orphan"
-        )
+        orphan = retention_root / (f"{MODULE.RELEASE_RETENTION_BATCH_PREFIX}orphan")
         orphan.mkdir(parents=True, mode=0o700)
 
         with self.assertRaisesRegex(
@@ -875,9 +869,7 @@ class ReleaseRetentionTests(unittest.TestCase):
             self.assertEqual(removed, [])
             self.assertIn("no installed personal sync releases", output.getvalue())
             self.assertEqual(tree_snapshot(self.root), before)
-            self.assertFalse(
-                os.path.lexists(candidate_home / "personal-sync")
-            )
+            self.assertFalse(os.path.lexists(candidate_home / "personal-sync"))
 
     def test_dry_run_recovery_reports_but_does_not_mutate_transaction(
         self,
@@ -1003,8 +995,7 @@ class ReleaseRetentionTests(unittest.TestCase):
             SHA_A,
         )
         retained_name = (
-            f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}{pin.name}-"
-            "123-0123456789abcdef"
+            f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}{pin.name}-123-0123456789abcdef"
         )
 
         def isolate_then_fail(

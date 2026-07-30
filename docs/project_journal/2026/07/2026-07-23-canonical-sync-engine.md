@@ -596,10 +596,10 @@ superseded_by:
 - The formal fresh-context Codex single review of
   `6c4878f33f5c82714e988b0470ccc5f4f33c0b70..30ff8cfd36c7aee7b1b5f2e3fa6de14816f7bfaa`
   returned one P1: binding the source Git object did not bind the executable
-  image selected by `Popen(pathname)` at the final spawn boundary. Direct
-  Claude Code review is temporarily waived by Joey through
-  `2026-08-01 00:00 Asia/Shanghai`; that waiver is not counted as a completed
-  double or triple review, and no Claude lane was started or awaited.
+  image selected by `Popen(pathname)` at the final spawn boundary.
+  Claude lane temporarily waived by Joey before 2026-08-01 00:00 Asia/Shanghai
+  The lane was not run or counted, so this is not a completed named double or
+  triple review.
 - The follow-up protects the bytes actually executed. The source Git
   descriptor is identity/access-bound and double-read into a stable SHA-256
   digest, then copied with exclusive creation into the parent-private snapshot,
@@ -653,6 +653,26 @@ superseded_by:
   refresh was retried and no retained host evidence was deleted, moved, or
   rewritten; the isolated gate is green while production admission remains
   blocked.
+- An independent read-only terminal verification of signed head `9912396`
+  again passed all 806 repository tests: Python 3.13.0 completed in 998.362
+  seconds and Xcode Python 3.9.6 completed in 1106.207 seconds, each with only
+  the Linux read-lease integration fixture skipped. The exact Git-executable
+  boundary selection passed 9 tests in 8.790 and 9.429 seconds, the quarantine
+  saturation/lock-order/revalidation selection passed 13 tests in 64.844 and
+  68.446 seconds, and scheduler/doctor passed all 116 tests in 11.293 and
+  12.637 seconds. Dual-runtime compilation, Ruff lint, the recorded
+  changed-file format gate, actionlint, JSON/schema/source-lock validation,
+  isolated-root six-source lock verification, project-journal validation, and
+  `git diff --check` passed. The verifier did not run production sync or
+  scheduler activation and did not read or modify the retained production
+  quarantine.
+- The terminal verifier also proved that the narrower recorded format gate
+  omitted two changed test modules. Ruff mechanically formatted
+  `test_personal_sync_reconciliation_safety.py` and
+  `test_release_retention.py`; the resulting full-tree format and lint gates
+  pass. Their combined 331 tests passed after formatting under Python 3.13.0
+  in 115.367 seconds and Xcode Python 3.9.6 in 135.477 seconds. No production
+  state or test fixture semantics changed.
 
 ## Installed Host Baseline
 
