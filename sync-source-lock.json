@@ -43,12 +43,12 @@
     "reconciliation_safety_tests": {
       "mode": "0644",
       "path": "tests/test_personal_sync_reconciliation_safety.py",
-      "sha256": "bdd8b6ebc0c267a627c411d6bf6ed3aaa2609abf69d0c71d581e478855933647"
+      "sha256": "1ed909e7ca46286a18cba4b61ba2d5634e0aaa86277f7e790748d9bcebcf88a8"
     },
     "release_retention_tests": {
       "mode": "0644",
       "path": "tests/test_release_retention.py",
-      "sha256": "45da5ecc297dee101a8a12b8e3443d2df3250c94dd2cb22389944f06304920f8"
+      "sha256": "88e30c2fefc4d486787cbf8eddac521a202677013cda3aa46200ae846f9e8525"
     },
     "scheduler_doctor_tests": {
       "mode": "0644",

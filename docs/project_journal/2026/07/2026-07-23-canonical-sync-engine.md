@@ -673,6 +673,20 @@ superseded_by:
   pass. Their combined 331 tests passed after formatting under Python 3.13.0
   in 115.367 seconds and Xcode Python 3.9.6 in 135.477 seconds. No production
   state or test fixture semantics changed.
+- A fresh whole-range named-single review of signed head `7b5017d` found that
+  the two mechanically formatted test files no longer matched their canonical
+  source-lock entries. Production `refresh-lock` and `refresh-lock --check`
+  each stopped at the already-proved 10,000-entry durable-quarantine cap; no
+  retained entry was read, deleted, moved, or rewritten, and no bypass was
+  added. The exact two SHA-256 entries were updated to the independently
+  measured current bytes, producing canonical source-lock SHA-256
+  `5c0d635b58a8da462a59ee750a432eb4657815a971cb7f4d4b81855ecce77a79`.
+  The repository-current and canonical-serialization checks passed in both
+  runtimes, followed by all 133 source-lock tests in 625.609 seconds with
+  Python 3.13.0 and 656.929 seconds with Xcode Python 3.9.6. Full-tree Ruff
+  lint/format, JSON parsing, and `git diff --check` also passed. Production
+  refresh remains intentionally blocked until a separate recovery-authorized
+  quarantine workstream resolves the retained evidence.
 
 ## Installed Host Baseline
 
