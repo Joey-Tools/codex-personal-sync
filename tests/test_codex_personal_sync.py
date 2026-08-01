@@ -3212,7 +3212,11 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
         workspace_path: Path | None = None
         with (
-            mock.patch.object(MODULE.sys, "platform", "darwin"),
+            mock.patch.object(
+                MODULE,
+                "_uses_macos_system_temp_alias",
+                return_value=True,
+            ),
             mock.patch.object(
                 MODULE,
                 "MACOS_SYSTEM_TEMP_ALIAS",
@@ -3278,7 +3282,11 @@ class CodexPersonalSyncTests(unittest.TestCase):
             return real_open(path, flags, mode, dir_fd=dir_fd)
 
         with (
-            mock.patch.object(MODULE.sys, "platform", "darwin"),
+            mock.patch.object(
+                MODULE,
+                "_uses_macos_system_temp_alias",
+                return_value=True,
+            ),
             mock.patch.object(
                 MODULE,
                 "MACOS_SYSTEM_TEMP_ALIAS",
@@ -3306,6 +3314,162 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertTrue(alias_parent.is_symlink())
         self.assertTrue(canonical_parent.is_dir())
 
+    def test_macos_system_temp_alias_descriptor_closes_before_yield(self) -> None:
+        canonical_parent = self.root / "descriptor-private-tmp"
+        alias_parent = self.root / "descriptor-tmp"
+        canonical_parent.mkdir(mode=0o700)
+        canonical_parent = canonical_parent.resolve()
+        alias_parent.symlink_to(canonical_parent, target_is_directory=True)
+        real_open = MODULE.os.open
+        alias_fd = -1
+
+        def capture_alias_fd(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal alias_fd
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if Path(path) == alias_parent and dir_fd is None:
+                alias_fd = descriptor
+            return descriptor
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_uses_macos_system_temp_alias",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_ALIAS",
+                alias_parent,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_DIRECTORY",
+                canonical_parent,
+            ),
+            mock.patch.object(MODULE.os, "open", side_effect=capture_alias_fd),
+        ):
+            with MODULE.bind_archive_workspace(alias_parent):
+                self.assertGreaterEqual(alias_fd, 0)
+                with self.assertRaises(OSError):
+                    os.fstat(alias_fd)
+
+    def test_macos_system_temp_alias_close_failure_is_reported(self) -> None:
+        canonical_parent = self.root / "descriptor-close-private-tmp"
+        alias_parent = self.root / "descriptor-close-tmp"
+        canonical_parent.mkdir(mode=0o700)
+        canonical_parent = canonical_parent.resolve()
+        alias_parent.symlink_to(canonical_parent, target_is_directory=True)
+        real_open = MODULE.os.open
+        real_close = MODULE.os.close
+        alias_fd = -1
+        close_failed = False
+
+        def capture_alias_fd(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal alias_fd
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if Path(path) == alias_parent and dir_fd is None:
+                alias_fd = descriptor
+            return descriptor
+
+        def fail_alias_close(file_descriptor: int) -> None:
+            nonlocal close_failed
+            if file_descriptor == alias_fd and not close_failed:
+                close_failed = True
+                real_close(file_descriptor)
+                raise OSError("simulated alias descriptor close failure")
+            real_close(file_descriptor)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_uses_macos_system_temp_alias",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_ALIAS",
+                alias_parent,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_DIRECTORY",
+                canonical_parent,
+            ),
+            mock.patch.object(MODULE.os, "open", side_effect=capture_alias_fd),
+            mock.patch.object(MODULE.os, "close", side_effect=fail_alias_close),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "failed to close system temporary archive alias",
+            ),
+        ):
+            with MODULE.bind_archive_workspace(alias_parent):
+                self.fail("an alias close failure must prevent workspace use")
+
+        self.assertTrue(close_failed)
+
+    def test_macos_system_temp_alias_close_failure_preserves_primary(self) -> None:
+        canonical_parent = self.root / "descriptor-primary-private-tmp"
+        unexpected_parent = self.root / "descriptor-primary-unexpected-tmp"
+        alias_parent = self.root / "descriptor-primary-tmp"
+        canonical_parent.mkdir(mode=0o700)
+        unexpected_parent.mkdir(mode=0o700)
+        canonical_parent = canonical_parent.resolve()
+        unexpected_parent = unexpected_parent.resolve()
+        alias_parent.symlink_to(unexpected_parent, target_is_directory=True)
+        real_open = MODULE.os.open
+        real_close = MODULE.os.close
+        alias_fd = -1
+        close_failed = False
+        stderr = io.StringIO()
+
+        def capture_alias_fd(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal alias_fd
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if Path(path) == alias_parent and dir_fd is None:
+                alias_fd = descriptor
+            return descriptor
+
+        def fail_alias_close(file_descriptor: int) -> None:
+            nonlocal close_failed
+            if file_descriptor == alias_fd and not close_failed:
+                close_failed = True
+                real_close(file_descriptor)
+                raise OSError("simulated alias descriptor close failure")
+            real_close(file_descriptor)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_uses_macos_system_temp_alias",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_ALIAS",
+                alias_parent,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_DIRECTORY",
+                canonical_parent,
+            ),
+            mock.patch.object(MODULE.os, "open", side_effect=capture_alias_fd),
+            mock.patch.object(MODULE.os, "close", side_effect=fail_alias_close),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "refusing non-standard macOS system temporary alias",
+            ),
+        ):
+            with MODULE.bind_archive_workspace(alias_parent):
+                self.fail("the unexpected alias target must not be yielded")
+
+        self.assertTrue(close_failed)
+        self.assertIn(
+            "warning: failed to close system temporary archive alias",
+            stderr.getvalue(),
+        )
+
     def test_macos_system_temp_alias_rejects_unexpected_target(self) -> None:
         canonical_parent = self.root / "expected-private-tmp"
         unexpected_parent = self.root / "unexpected-private-tmp"
@@ -3317,7 +3481,11 @@ class CodexPersonalSyncTests(unittest.TestCase):
         alias_parent.symlink_to(unexpected_parent, target_is_directory=True)
 
         with (
-            mock.patch.object(MODULE.sys, "platform", "darwin"),
+            mock.patch.object(
+                MODULE,
+                "_uses_macos_system_temp_alias",
+                return_value=True,
+            ),
             mock.patch.object(
                 MODULE,
                 "MACOS_SYSTEM_TEMP_ALIAS",

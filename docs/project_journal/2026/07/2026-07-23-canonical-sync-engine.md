@@ -17,8 +17,9 @@ superseded_by:
 - Delivery status: `delivery_gate_in_progress`.
 - The workstream is consolidating personal sync ownership in `Joey-Tools/codex-personal-sync` and hardening mirror generation, scheduler observability, active-skill auditing, reconciliation, and release retention.
 - PR #5 remains the canonical delivery vehicle. The current append-only
-  follow-up closes the final audit gaps after signed head
-  `4bcf8f5ef81125d364f708213ae95bc3ec439cc0`; it does not rewrite the existing
+  follow-up closes the macOS `/tmp` alias regressions exposed by Ubuntu Python
+  3.14 CI on signed ownership-merge head
+  `dfa65d17c1468fe393f32ad0fd001e975257c2d5`; it does not rewrite the existing
   signed history, merge the PR, generate a consumer, or mutate a host
   scheduler. Source-lock refresh and verification use a task-private control
   root because production admission remains blocked by the retained host
@@ -38,10 +39,13 @@ superseded_by:
 ## Current State
 
 - The final Darwin archive-workspace follow-up recognizes only the platform's
-  exact `/tmp -> /private/tmp` alias and continues through a no-follow binding
-  of the canonical directory. It protects alias and target object identity plus
-  access policy while accepting benign directory timestamp and child-entry
-  churn; every other leaf symlink remains fail-closed. Mirror-control,
+  exact `/tmp -> /private/tmp` alias, pins that symlink object through a retained
+  descriptor until canonical-directory binding and revalidation complete, and
+  then continues through a no-follow binding of the canonical directory. It
+  protects alias and target object identity plus access policy while accepting
+  benign directory timestamp and child-entry churn; unlink/recreate cannot be
+  hidden by immediate inode reuse, and every other leaf symlink remains
+  fail-closed. Mirror-control,
   private-object, cleanup, and tool-root inventories now stop at `limit + 1`
   producer entries, retain and sort no more than the declared limit, close the
   iterator on every path, and reserve all sibling names before recursion so a
@@ -777,6 +781,37 @@ superseded_by:
   project-journal validation, source-lock verification, and staged
   `git diff --check` also passed. The retained production quarantine and host
   scheduler state were not mutated.
+- Ubuntu Python 3.14 CI run `30713957335` on ownership-merge head
+  `dfa65d17c1468fe393f32ad0fd001e975257c2d5` exposed two Darwin-test boundary
+  defects: a broad `sys.platform` mock selected the host-incompatible
+  `renameatx_np` cleanup primitive, and unlink/recreate could reuse the prior
+  alias inode before path-only revalidation. The superseding append-only fix
+  gives platform simulation a narrow predicate and retains an exact symlink
+  descriptor through target binding and revalidation. The protected
+  properties are alias object identity and access policy, link target, resolved
+  target, and target-directory object identity/access policy; directory mtime
+  and child-entry churn remain deliberately benign. Alias close failures are
+  reported without masking an already-active primary failure, and the
+  descriptor is closed before the workspace is yielded.
+- The exact follow-up bytes passed all 842 disjoint repository tests under
+  Python 3.13.12 and Xcode Python 3.9.6, with only the expected Linux read-lease
+  integration fixture skipped in each runtime: 212 engine tests in 33.611 and
+  40.170 seconds, 450 reconciliation/retention/scheduler tests in 122.729 and
+  147.093 seconds, 27 toolbox automation tests in 260.030 and 258.664 seconds,
+  and 153 source-lock tests in 790.403 and 836.454 seconds. Seven focused
+  macOS-alias regressions, including the real `/tmp -> /private/tmp` path,
+  passed in 0.011 and 0.017 seconds. Two task-private source-lock refreshes
+  were byte-identical, followed by a successful currentness check; SHA-256 is
+  `dbcffb38b173ed3cab845039a5a3cf797f57d3236baf1373667c3a10fe91a513`
+  for `sync-source-lock.json`,
+  `c29b102b62650ba8def788d115845236224ca5f867a40fdf54af9d46488660d2`
+  for the engine, and
+  `1c339c39e7e355a0b7f7d950e84c33a14423ffaa08017617e23ab6d6631e9fe6`
+  for its tests. Dual-runtime compileall, full-tree Ruff lint/format, JSON
+  parsing, actionlint, project-journal validation, and `git diff --check`
+  passed; task-private bytecode roots were removed and no repository bytecode
+  cache remains. The retained production quarantine and host scheduler state
+  were not read for payload inspection, mutated, or cleaned.
 
 ## Installed Host Baseline
 

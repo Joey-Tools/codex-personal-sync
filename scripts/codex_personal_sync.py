@@ -306,6 +306,7 @@ class BoundArchiveWorkspace:
 class ArchiveWorkspaceAliasBinding:
     path: Path
     target: Path
+    fd: int
     link_target: str
     identity: tuple[int, int, int]
     access_policy: tuple[int, int, int]
@@ -2153,6 +2154,21 @@ def _archive_directory_open_flags() -> int:
     return flags
 
 
+def _archive_symlink_open_flags() -> int:
+    flags = getattr(os, "O_CLOEXEC", 0)
+    if sys.platform == "darwin":
+        # Python 3.9 on macOS does not expose O_SYMLINK, although the native
+        # kernel interface is available and required to bind the link object.
+        return os.O_RDONLY | getattr(os, "O_SYMLINK", 0x00200000) | flags
+    if hasattr(os, "O_PATH"):
+        return os.O_PATH | getattr(os, "O_NOFOLLOW", 0) | flags
+    raise SyncError("binding a symbolic-link object is unsupported")
+
+
+def _uses_macos_system_temp_alias() -> bool:
+    return sys.platform == "darwin"
+
+
 def _archive_workspace_object_identity(
     metadata: os.stat_result,
 ) -> tuple[int, int, int]:
@@ -2165,17 +2181,39 @@ def _archive_workspace_access_policy(
     return stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid
 
 
+def _close_archive_workspace_alias_fd(
+    file_descriptor: int,
+    path: Path,
+    *,
+    active_error: bool,
+) -> None:
+    if file_descriptor < 0:
+        return
+    try:
+        os.close(file_descriptor)
+    except OSError as error:
+        close_error = SyncError(
+            f"failed to close system temporary archive alias {path}: {error}"
+        )
+        if active_error:
+            print(f"warning: {close_error}", file=sys.stderr)
+        else:
+            raise close_error from error
+
+
 def _normalize_archive_workspace_path(
     path: Path,
 ) -> tuple[Path, ArchiveWorkspaceAliasBinding | None]:
     """Resolve only the exact macOS system temp alias to its fixed target.
 
-    The alias object, link value, and access policy plus the target directory's
-    object identity and access policy are protected. Directory timestamps and
-    child-entry churn are deliberately not treated as content mutation.
+    The alias descriptor pins its filesystem object through target binding, so
+    unlink/recreate cannot hide behind immediate inode reuse. The link value
+    and access policy plus the target directory's object identity and access
+    policy are also protected. Directory timestamps and child-entry churn are
+    deliberately not treated as content mutation.
     """
     workspace_path = Path(os.path.abspath(path))
-    if sys.platform != "darwin" or workspace_path != MACOS_SYSTEM_TEMP_ALIAS:
+    if not _uses_macos_system_temp_alias() or workspace_path != MACOS_SYSTEM_TEMP_ALIAS:
         return workspace_path, None
     try:
         alias_metadata = os.lstat(workspace_path)
@@ -2186,21 +2224,52 @@ def _normalize_archive_workspace_path(
     if not stat.S_ISLNK(alias_metadata.st_mode):
         return workspace_path, None
 
-    canonical_path = Path(os.path.realpath(MACOS_SYSTEM_TEMP_DIRECTORY))
-    expected_link_targets = {
-        str(canonical_path),
-        os.path.relpath(canonical_path, workspace_path.parent),
-    }
+    alias_fd = -1
     try:
+        alias_fd = os.open(workspace_path, _archive_symlink_open_flags())
+        bound_alias_metadata = os.fstat(alias_fd)
+        current_alias_metadata = os.lstat(workspace_path)
+        if (
+            not stat.S_ISLNK(bound_alias_metadata.st_mode)
+            or _archive_workspace_object_identity(bound_alias_metadata)
+            != _archive_workspace_object_identity(alias_metadata)
+            or _archive_workspace_object_identity(current_alias_metadata)
+            != _archive_workspace_object_identity(bound_alias_metadata)
+            or _archive_workspace_access_policy(bound_alias_metadata)
+            != _archive_workspace_access_policy(alias_metadata)
+            or _archive_workspace_access_policy(current_alias_metadata)
+            != _archive_workspace_access_policy(bound_alias_metadata)
+        ):
+            raise SyncError(
+                f"system temporary archive alias changed while binding: "
+                f"{workspace_path}"
+            )
+        canonical_path = Path(os.path.realpath(MACOS_SYSTEM_TEMP_DIRECTORY))
+        expected_link_targets = {
+            str(canonical_path),
+            os.path.relpath(canonical_path, workspace_path.parent),
+        }
         link_target = os.readlink(workspace_path)
         resolved_path = Path(os.path.realpath(workspace_path))
         canonical_metadata = os.lstat(canonical_path)
         followed_metadata = os.stat(workspace_path)
     except OSError as error:
+        _close_archive_workspace_alias_fd(
+            alias_fd,
+            workspace_path,
+            active_error=True,
+        )
         raise SyncError(
-            f"failed to resolve system temporary archive workspace "
+            f"failed to bind system temporary archive workspace "
             f"{workspace_path}: {error}"
         ) from error
+    except BaseException:
+        _close_archive_workspace_alias_fd(
+            alias_fd,
+            workspace_path,
+            active_error=True,
+        )
+        raise
     target_identity = _archive_workspace_object_identity(canonical_metadata)
     target_access_policy = _archive_workspace_access_policy(canonical_metadata)
     if (
@@ -2210,15 +2279,21 @@ def _normalize_archive_workspace_path(
         or _archive_workspace_object_identity(followed_metadata) != target_identity
         or _archive_workspace_access_policy(followed_metadata) != target_access_policy
     ):
+        _close_archive_workspace_alias_fd(
+            alias_fd,
+            workspace_path,
+            active_error=True,
+        )
         raise SyncError(
             f"refusing non-standard macOS system temporary alias: {workspace_path}"
         )
     return canonical_path, ArchiveWorkspaceAliasBinding(
         path=workspace_path,
         target=canonical_path,
+        fd=alias_fd,
         link_target=link_target,
-        identity=_archive_workspace_object_identity(alias_metadata),
-        access_policy=_archive_workspace_access_policy(alias_metadata),
+        identity=_archive_workspace_object_identity(bound_alias_metadata),
+        access_policy=_archive_workspace_access_policy(bound_alias_metadata),
         target_identity=target_identity,
         target_access_policy=target_access_policy,
     )
@@ -2230,6 +2305,7 @@ def _revalidate_archive_workspace_alias(
 ) -> None:
     """Revalidate the system alias snapshot against the opened target fd."""
     try:
+        bound_alias_metadata = os.fstat(binding.fd)
         alias_metadata = os.lstat(binding.path)
         link_target = os.readlink(binding.path)
         resolved_path = Path(os.path.realpath(binding.path))
@@ -2241,7 +2317,10 @@ def _revalidate_archive_workspace_alias(
             f"{binding.path}: {error}"
         ) from error
     if (
-        _archive_workspace_object_identity(alias_metadata) != binding.identity
+        _archive_workspace_object_identity(bound_alias_metadata) != binding.identity
+        or _archive_workspace_access_policy(bound_alias_metadata)
+        != binding.access_policy
+        or _archive_workspace_object_identity(alias_metadata) != binding.identity
         or _archive_workspace_access_policy(alias_metadata) != binding.access_policy
         or link_target != binding.link_target
         or resolved_path != binding.target
@@ -2275,6 +2354,20 @@ def _revalidate_archive_workspace_alias(
         )
 
 
+def _close_archive_workspace_alias(
+    binding: ArchiveWorkspaceAliasBinding | None,
+    *,
+    active_error: bool,
+) -> None:
+    if binding is None:
+        return
+    _close_archive_workspace_alias_fd(
+        binding.fd,
+        binding.path,
+        active_error=active_error,
+    )
+
+
 @contextlib.contextmanager
 def bind_archive_workspace(path: Path) -> Iterator[BoundArchiveWorkspace]:
     workspace_path, alias_binding = _normalize_archive_workspace_path(path)
@@ -2286,6 +2379,7 @@ def bind_archive_workspace(path: Path) -> Iterator[BoundArchiveWorkspace]:
     except OSError as error:
         if workspace_fd >= 0:
             os.close(workspace_fd)
+        _close_archive_workspace_alias(alias_binding, active_error=True)
         raise SyncError(
             f"failed to bind archive workspace {workspace_path}: {error}"
         ) from error
@@ -2298,10 +2392,17 @@ def bind_archive_workspace(path: Path) -> Iterator[BoundArchiveWorkspace]:
         or _archive_workspace_access_policy(path_metadata) != access_policy
     ):
         os.close(workspace_fd)
+        _close_archive_workspace_alias(alias_binding, active_error=True)
         raise SyncError(f"archive workspace changed while binding: {workspace_path}")
     if alias_binding is not None:
         try:
             _revalidate_archive_workspace_alias(alias_binding, opened_metadata)
+        except BaseException:
+            os.close(workspace_fd)
+            _close_archive_workspace_alias(alias_binding, active_error=True)
+            raise
+        try:
+            _close_archive_workspace_alias(alias_binding, active_error=False)
         except BaseException:
             os.close(workspace_fd)
             raise
