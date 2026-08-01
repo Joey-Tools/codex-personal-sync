@@ -16,14 +16,16 @@ superseded_by:
 
 - Delivery status: `delivery_gate_in_progress`.
 - The workstream is consolidating personal sync ownership in `Joey-Tools/codex-personal-sync` and hardening mirror generation, scheduler observability, active-skill auditing, reconciliation, and release retention.
-- PR #5 remains the canonical delivery vehicle. The current append-only
-  follow-up closes the macOS `/tmp` alias regressions exposed by Ubuntu Python
-  3.14 CI on signed ownership-merge head
-  `dfa65d17c1468fe393f32ad0fd001e975257c2d5`; it does not rewrite the existing
-  signed history, merge the PR, generate a consumer, or mutate a host
-  scheduler. Source-lock refresh and verification use a task-private control
-  root because production admission remains blocked by the retained host
-  quarantine at its exact capacity.
+- PR #5 remains the canonical delivery vehicle. Append-only head `a902bcf`
+  closed the macOS `/tmp` alias regressions exposed by Ubuntu Python 3.14 CI
+  on signed ownership-merge head
+  `dfa65d17c1468fe393f32ad0fd001e975257c2d5`. Its formal current-range review
+  then found three pre-yield/process-supervision gaps and one Darwin CI gap;
+  the current uncommitted follow-up remediates those findings without
+  rewriting the signed history, merging the PR, generating a consumer, or
+  mutating a host scheduler. Source-lock refresh and verification use a
+  task-private control root because production admission remains blocked by
+  the retained host quarantine at its exact capacity.
 
 ## Scope
 
@@ -50,6 +52,24 @@ superseded_by:
   producer entries, retain and sort no more than the declared limit, close the
   iterator on every path, and reserve all sibling names before recursion so a
   deep first child cannot multiply the aggregate entry budget.
+- Archive-workspace failure cleanup now treats the target-directory fd and
+  retained `/tmp` alias fd as independent owned resources: every pre-yield
+  failure attempts each close exactly once, retains the binding/revalidation
+  error as primary, and reports every cleanup failure separately. Canonical
+  mirror process launch likewise keeps ownership of a successfully created
+  child until the saved parent-directory fd is restored and closed; any
+  return-before-handoff cleanup failure terminates and reaps that child before
+  reporting the combined cleanup error.
+- Native scheduler actions and daemon queries now share a binary-mode bounded
+  supervisor. Producer bytes are counted independently for stdout and stderr,
+  retained bytes never exceed 64 KiB per stream, and a monotonic 30-second
+  action or 10-second query deadline bounds runtime. Overflow or timeout
+  performs terminate, bounded drain, kill fallback, child reap, and process-
+  group verification; cleanup uncertainty remains distinct from the primary
+  output/deadline classification. A focused macOS CI matrix uses Python 3.9
+  for the literal `O_SYMLINK` fallback and Python 3.13 for the runtime-provided
+  flag, verifies the real `/tmp -> /private/tmp` alias, and runs all alias
+  binding/revalidation/close regressions.
 - The 2026-08-01 closure makes GitHub repository identities
   ASCII-case-insensitive, rejects portable source-path aliases and source modes
   other than `0644` / `0755`, and keeps transaction-journal inspection
@@ -812,6 +832,56 @@ superseded_by:
   passed; task-private bytecode roots were removed and no repository bytecode
   cache remains. The retained production quarantine and host scheduler state
   were not read for payload inspection, mutated, or cleaned.
+- Formal single review of exact range
+  `6c4878f33f5c82714e988b0470ccc5f4f33c0b70..a902bcf37d071f91f4e738c24734545316f668d2`
+  completed from a fresh trusted-bundle materialization after the initial
+  prompt correctly stopped before any Git call because its sanitized Git argv
+  prefix was absent. The same reviewer resumed only after receiving the exact
+  opaque prefix. Terminal revalidation kept the worktree on `a902bcf`, and the
+  trusted playbook/guard/runtime digests matched their parent records. The
+  resulting findings were the dual-fd cleanup gap, the post-`Popen` saved-fd
+  orphan path, the scheduler's post-hoc/unbounded output capture, and missing
+  native Darwin CI coverage.
+- The remediation passed the focused engine/scheduler regressions under Python
+  3.13 and Xcode Python 3.9.6, including exact-N pass/N+1 fail raw-byte caps for
+  both streams, deadline cleanup, payload-suppressed classifications, both
+  Darwin symlink flag paths, dual-owned-fd cleanup, and real child reaping after
+  a saved-directory close failure. A final independent audit then found two
+  additional scheduler boundaries: `allow_fail=True` could suppress an
+  inconclusive process cleanup, and selector allocation could fail after
+  `Popen` but before cleanup protection. The final implementation always
+  propagates `scheduler-cleanup-inconclusive`, sends `SIGTERM` before optional
+  selector allocation, and retains monotonic `SIGKILL`, reap, process-group,
+  and pipe-close cleanup even when both supervision and cleanup selector
+  allocation fail. The independent audit revalidated the fix and returned
+  `No findings.`
+- The exact final engine suite passed all 213 tests under Python 3.13.0 in
+  37.641 seconds and Xcode Python 3.9.6 in 44.898 seconds, with only the
+  expected Linux read-lease integration fixture skipped in each runtime. The
+  exact scheduler/doctor suite passed all 125 tests in 10.203 and 12.113
+  seconds under `ResourceWarning=error`; this includes a real child proving
+  reap and pipe closure when runner and cleanup selector allocation both fail,
+  plus the regression proving cleanup uncertainty cannot be allow-failed. The
+  exact final source-lock suite passed all 154 tests under the same warning
+  policy in 662.913 and 702.806 seconds. Earlier reconciliation, retention,
+  and toolbox automation evidence remains applicable because those production
+  and test bytes did not change after its exact final run.
+- Two task-private source-lock refreshes were byte-identical and the currentness
+  check verified all six sources. SHA-256 is
+  `a9bda725d8031c5ffe103d55edf5bc45015a78ac22703558a38907ab875dc960`
+  for `sync-source-lock.json`,
+  `418a4aa9e2231ccadafec212a1f99bfb555bf884dddda64f3954258f04bcfcc7`
+  for the engine,
+  `bd56d9abcf58d745ba3f88df3e29f4c43c62be61c7d5d717dc10c31420402172`
+  for its tests,
+  `107e097e54f90a78a643679ac7e227894c2ccf0fc9bdfb390df3376381118b95`
+  for scheduler/doctor tests, and
+  `39e73e72c8ebd017ad467e481a606ae7907b124b6d5b630fcb53205ef723de8f`
+  for the generated-mirror controller. Dual-runtime compileall, Ruff
+  lint/format, actionlint, JSON parsing, project-journal validation,
+  source-lock verification, and `git diff --check` passed. The mode-0700
+  task-private control root was used throughout; production quarantine and host
+  scheduler state were not read for payload inspection, mutated, or cleaned.
 
 ## Installed Host Baseline
 

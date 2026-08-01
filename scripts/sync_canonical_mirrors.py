@@ -5792,6 +5792,67 @@ def _terminate_git_process(process: subprocess.Popen[bytes]) -> None:
         ) from error
 
 
+def _drain_and_close_git_process_output(process: subprocess.Popen[bytes]) -> None:
+    """Discard bounded pending pipe bytes when a launched process has no caller."""
+    selector = selectors.DefaultSelector()
+    errors: list[str] = []
+    streams = {
+        "stdout": process.stdout,
+        "stderr": process.stderr,
+    }
+    for name, stream in streams.items():
+        if stream is None:
+            continue
+        try:
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, name)
+        except (OSError, ValueError) as error:
+            errors.append(f"cannot register Git {name} cleanup drain: {error}")
+    deadline = time.monotonic() + GIT_CLEANUP_TIMEOUT_SECONDS
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                errors.append("Git output cleanup drain exceeded its deadline")
+                break
+            try:
+                events = selector.select(remaining)
+            except OSError as error:
+                errors.append(f"cannot select Git cleanup output: {error}")
+                break
+            if not events:
+                continue
+            for key, _mask in events:
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+                except BlockingIOError:
+                    continue
+                except OSError as error:
+                    errors.append(f"cannot drain Git {key.data}: {error}")
+                    try:
+                        selector.unregister(key.fileobj)
+                    except (KeyError, OSError, ValueError):
+                        pass
+                    continue
+                if chunk:
+                    continue
+                try:
+                    selector.unregister(key.fileobj)
+                except (KeyError, OSError, ValueError):
+                    pass
+    finally:
+        selector.close()
+        for name, stream in streams.items():
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except (OSError, ValueError) as error:
+                errors.append(f"cannot close Git {name} after cleanup: {error}")
+    if errors:
+        raise MirrorSyncError("; ".join(errors))
+
+
 def _collect_bounded_process_output(
     process: subprocess.Popen[bytes],
     operation: OperationBudget | None,
@@ -6027,6 +6088,7 @@ def _popen_from_bound_directory(
     # redirect the child, and no Python executable has to be re-executed.
     saved_directory_fd = os.open(".", _DIRECTORY_FLAGS)
     process: subprocess.Popen[bytes] | None = None
+    primary_error: BaseException | None = None
     try:
         executable_path: str | None = None
         if executable_binding is not None:
@@ -6074,18 +6136,57 @@ def _popen_from_bound_directory(
             except BaseException:
                 _terminate_git_process(process)
                 raise
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
+        cleanup_errors: list[MirrorSyncError] = []
         try:
             os.fchdir(saved_directory_fd)
         except OSError as error:
-            if process is not None:
-                _terminate_git_process(process)
-            raise MirrorSyncError(
-                "cannot restore the parent working directory after bounded "
-                f"{directory_label} process launch: {error}"
-            ) from error
-        finally:
+            cleanup_errors.append(
+                MirrorSyncError(
+                    "cannot restore the parent working directory after bounded "
+                    f"{directory_label} process launch: {error}"
+                )
+            )
+        try:
             os.close(saved_directory_fd)
+        except OSError as error:
+            cleanup_errors.append(
+                MirrorSyncError(
+                    "cannot close the saved parent-directory descriptor after "
+                    f"bounded {directory_label} process launch: {error}"
+                )
+            )
+        if cleanup_errors and process is not None:
+            try:
+                _terminate_git_process(process)
+            except BaseException as error:
+                cleanup_errors.append(
+                    MirrorSyncError(
+                        "cannot recover the bounded process after parent-directory "
+                        f"cleanup failed: {error}"
+                    )
+                )
+            try:
+                _drain_and_close_git_process_output(process)
+            except BaseException as error:
+                cleanup_errors.append(
+                    MirrorSyncError(
+                        "cannot drain and close the bounded process after "
+                        f"parent-directory cleanup failed: {error}"
+                    )
+                )
+        if cleanup_errors:
+            if primary_error is not None:
+                for error in cleanup_errors:
+                    print(f"warning: {error}", file=sys.stderr)
+            else:
+                raise MirrorSyncError(
+                    "bounded process launch cleanup failed: "
+                    + "; ".join(str(error) for error in cleanup_errors)
+                ) from cleanup_errors[0]
     if process is None:
         raise MirrorSyncError(f"cannot start bounded {directory_label} process")
     return process

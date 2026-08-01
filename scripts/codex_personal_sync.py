@@ -179,6 +179,10 @@ SCHEDULER_STATUS_PUBLICATION_MARKER_NAME = (
 MAX_SCHEDULER_STATUS_BYTES = 64 * 1024
 MAX_SCHEDULER_ATTEMPT_FUTURE_SKEW = timedelta(minutes=5)
 MAX_SCHEDULER_RUNNER_BYTES = 16 * 1024 * 1024
+MAX_SCHEDULER_NATIVE_STDOUT_BYTES = 64 * 1024
+MAX_SCHEDULER_NATIVE_STDERR_BYTES = 64 * 1024
+SCHEDULER_NATIVE_ACTION_TIMEOUT_SECONDS = 30.0
+SCHEDULER_NATIVE_QUERY_TIMEOUT_SECONDS = 10.0
 MIRROR_PRIVATE_CONTROL_PARENT = Path(
     "/private/tmp" if sys.platform == "darwin" else "/var/tmp"
 )
@@ -2368,6 +2372,62 @@ def _close_archive_workspace_alias(
     )
 
 
+def _close_archive_workspace_fd(
+    file_descriptor: int,
+    path: Path,
+    *,
+    active_error: bool,
+) -> None:
+    if file_descriptor < 0:
+        return
+    try:
+        os.close(file_descriptor)
+    except OSError as error:
+        close_error = SyncError(f"failed to close archive workspace {path}: {error}")
+        if active_error:
+            print(f"warning: {close_error}", file=sys.stderr)
+        else:
+            raise close_error from error
+
+
+def _close_archive_workspace_bindings(
+    workspace_fd: int,
+    workspace_path: Path,
+    alias_binding: ArchiveWorkspaceAliasBinding | None,
+    *,
+    active_error: bool,
+) -> None:
+    """Attempt each independently owned close without retrying an uncertain fd."""
+    close_errors: list[SyncError] = []
+    for close in (
+        lambda: _close_archive_workspace_fd(
+            workspace_fd,
+            workspace_path,
+            active_error=False,
+        ),
+        lambda: _close_archive_workspace_alias(
+            alias_binding,
+            active_error=False,
+        ),
+    ):
+        try:
+            close()
+        except SyncError as error:
+            close_errors.append(error)
+    if not close_errors:
+        return
+    if active_error:
+        for error in close_errors:
+            print(f"warning: {error}", file=sys.stderr)
+        return
+    if len(close_errors) == 1:
+        raise close_errors[0]
+    raise SyncError(
+        "archive workspace cleanup failed: "
+        + "; ".join(str(error) for error in close_errors)
+    ) from close_errors[0]
+
+
 @contextlib.contextmanager
 def bind_archive_workspace(path: Path) -> Iterator[BoundArchiveWorkspace]:
     workspace_path, alias_binding = _normalize_archive_workspace_path(path)
@@ -2377,9 +2437,12 @@ def bind_archive_workspace(path: Path) -> Iterator[BoundArchiveWorkspace]:
         opened_metadata = os.fstat(workspace_fd)
         path_metadata = os.lstat(workspace_path)
     except OSError as error:
-        if workspace_fd >= 0:
-            os.close(workspace_fd)
-        _close_archive_workspace_alias(alias_binding, active_error=True)
+        _close_archive_workspace_bindings(
+            workspace_fd,
+            workspace_path,
+            alias_binding,
+            active_error=True,
+        )
         raise SyncError(
             f"failed to bind archive workspace {workspace_path}: {error}"
         ) from error
@@ -2391,20 +2454,35 @@ def bind_archive_workspace(path: Path) -> Iterator[BoundArchiveWorkspace]:
         or (path_metadata.st_dev, path_metadata.st_ino) != identity
         or _archive_workspace_access_policy(path_metadata) != access_policy
     ):
-        os.close(workspace_fd)
-        _close_archive_workspace_alias(alias_binding, active_error=True)
-        raise SyncError(f"archive workspace changed while binding: {workspace_path}")
+        primary = SyncError(
+            f"archive workspace changed while binding: {workspace_path}"
+        )
+        _close_archive_workspace_bindings(
+            workspace_fd,
+            workspace_path,
+            alias_binding,
+            active_error=True,
+        )
+        raise primary
     if alias_binding is not None:
         try:
             _revalidate_archive_workspace_alias(alias_binding, opened_metadata)
         except BaseException:
-            os.close(workspace_fd)
-            _close_archive_workspace_alias(alias_binding, active_error=True)
+            _close_archive_workspace_bindings(
+                workspace_fd,
+                workspace_path,
+                alias_binding,
+                active_error=True,
+            )
             raise
         try:
             _close_archive_workspace_alias(alias_binding, active_error=False)
         except BaseException:
-            os.close(workspace_fd)
+            _close_archive_workspace_fd(
+                workspace_fd,
+                workspace_path,
+                active_error=True,
+            )
             raise
     try:
         yield BoundArchiveWorkspace(
@@ -2415,16 +2493,11 @@ def bind_archive_workspace(path: Path) -> Iterator[BoundArchiveWorkspace]:
         )
     finally:
         active_error = sys.exc_info()[0] is not None
-        try:
-            os.close(workspace_fd)
-        except OSError as error:
-            close_error = SyncError(
-                f"failed to close archive workspace {workspace_path}: {error}"
-            )
-            if active_error:
-                print(f"warning: {close_error}", file=sys.stderr)
-            else:
-                raise close_error from error
+        _close_archive_workspace_fd(
+            workspace_fd,
+            workspace_path,
+            active_error=active_error,
+        )
 
 
 def _duplicate_bound_archive_workspace(workspace: BoundArchiveWorkspace) -> int:
@@ -16666,6 +16739,8 @@ def _gh_process_group_exists(process: subprocess.Popen[bytes]) -> bool | None:
 def _signal_gh_process_group(
     process: subprocess.Popen[bytes],
     signal_number: int,
+    *,
+    process_label: str = "gh",
 ) -> tuple[bool, str | None]:
     process_id = getattr(process, "pid", None)
     group_error: OSError | None = None
@@ -16690,10 +16765,11 @@ def _signal_gh_process_group(
             else None
         )
     except OSError as error:
-        detail = f"cannot signal gh process: {error}"
+        detail = f"cannot signal {process_label} process: {error}"
         if group_error is not None:
             detail = (
-                f"cannot signal gh process group ({group_error}) or child ({error})"
+                f"cannot signal {process_label} process group ({group_error}) "
+                f"or child ({error})"
             )
         return False, detail
 
@@ -16710,6 +16786,8 @@ def _close_gh_process_streams(process: subprocess.Popen[bytes]) -> None:
 
 def _cleanup_gh_process_group(
     process: subprocess.Popen[bytes],
+    *,
+    process_label: str = "gh",
 ) -> _GhCleanupReceipt:
     cleanup_deadline = time.monotonic() + GH_CLEANUP_TIMEOUT_SECONDS
     terminate_deadline = min(
@@ -16718,7 +16796,19 @@ def _cleanup_gh_process_group(
     )
     errors: list[str] = []
     drained = {"stdout": False, "stderr": False}
-    selector = selectors.DefaultSelector()
+    term_sent, term_error = _signal_gh_process_group(
+        process,
+        signal.SIGTERM,
+        process_label=process_label,
+    )
+    if term_error is not None:
+        errors.append(term_error)
+
+    selector: selectors.BaseSelector | None = None
+    try:
+        selector = selectors.DefaultSelector()
+    except (OSError, ValueError) as error:
+        errors.append(f"cannot create {process_label} cleanup selector: {error}")
     streams = {
         "stdout": process.stdout,
         "stderr": process.stderr,
@@ -16727,15 +16817,13 @@ def _cleanup_gh_process_group(
         if stream is None:
             errors.append(f"{name} pipe is missing")
             continue
+        if selector is None:
+            continue
         try:
             os.set_blocking(stream.fileno(), False)
             selector.register(stream, selectors.EVENT_READ, name)
         except (OSError, ValueError) as error:
             errors.append(f"cannot register {name} cleanup drain: {error}")
-
-    term_sent, term_error = _signal_gh_process_group(process, signal.SIGTERM)
-    if term_error is not None:
-        errors.append(term_error)
     kill_sent = False
     child_reaped = False
     process_group_gone = False
@@ -16746,15 +16834,18 @@ def _cleanup_gh_process_group(
                 kill_sent, kill_error = _signal_gh_process_group(
                     process,
                     signal.SIGKILL,
+                    process_label=process_label,
                 )
                 if kill_error is not None:
                     errors.append(kill_error)
             timeout = min(0.05, max(0.0, cleanup_deadline - now))
-            if selector.get_map():
+            if selector is not None and selector.get_map():
                 try:
                     events = selector.select(timeout)
                 except OSError as error:
-                    errors.append(f"cannot drain gh process pipes: {error}")
+                    errors.append(
+                        f"cannot drain {process_label} process pipes: {error}"
+                    )
                     events = []
                 for key, _mask in events:
                     name = key.data
@@ -16763,7 +16854,7 @@ def _cleanup_gh_process_group(
                     except BlockingIOError:
                         continue
                     except OSError as error:
-                        errors.append(f"cannot drain gh {name}: {error}")
+                        errors.append(f"cannot drain {process_label} {name}: {error}")
                         try:
                             selector.unregister(key.fileobj)
                         except (KeyError, OSError, ValueError):
@@ -16781,19 +16872,24 @@ def _cleanup_gh_process_group(
             try:
                 child_reaped = process.poll() is not None
             except OSError as error:
-                errors.append(f"cannot reap gh process: {error}")
+                errors.append(f"cannot reap {process_label} process: {error}")
                 child_reaped = False
             group_state = _gh_process_group_exists(process)
-            if child_reaped and not selector.get_map() and group_state is False:
+            selector_drained = selector is None or not selector.get_map()
+            if child_reaped and selector_drained and group_state is False:
                 break
         try:
             child_reaped = process.poll() is not None
         except OSError as error:
-            errors.append(f"cannot confirm gh child reaping: {error}")
+            errors.append(f"cannot confirm {process_label} child reaping: {error}")
             child_reaped = False
         process_group_gone = _gh_process_group_exists(process) is False
     finally:
-        selector.close()
+        if selector is not None:
+            try:
+                selector.close()
+            except (OSError, ValueError) as error:
+                errors.append(f"cannot close {process_label} cleanup selector: {error}")
         _close_gh_process_streams(process)
     return _GhCleanupReceipt(
         term_sent=term_sent,
@@ -16879,11 +16975,12 @@ def _run_bounded_gh_process(
             ),
         )
 
-    selector = selectors.DefaultSelector()
+    selector: selectors.BaseSelector | None = None
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     totals = {"stdout": 0, "stderr": 0}
     limits = {"stdout": stdout_limit, "stderr": stderr_limit}
     try:
+        selector = selectors.DefaultSelector()
         for name, stream in (
             ("stdout", process.stdout),
             ("stderr", process.stderr),
@@ -16964,7 +17061,8 @@ def _run_bounded_gh_process(
     except BaseException as primary:
         _raise_gh_failure_after_cleanup(process, primary)
     finally:
-        selector.close()
+        if selector is not None:
+            selector.close()
         _close_gh_process_streams(process)
 
 
@@ -21704,6 +21802,161 @@ def _native_scheduler_failure_is_already_absent(
     return False
 
 
+def _raise_scheduler_failure_after_cleanup(
+    process: subprocess.Popen[bytes],
+    primary: BaseException,
+) -> NoReturn:
+    try:
+        receipt = _cleanup_gh_process_group(
+            process,
+            process_label="scheduler",
+        )
+    except Exception as cleanup_error:
+        raise SyncError(
+            f"{primary}; scheduler process cleanup raised an exception: "
+            f"{cleanup_error}",
+            code="scheduler-cleanup-inconclusive",
+        ) from primary
+    if not receipt.complete:
+        raise SyncError(
+            f"{primary}; scheduler process cleanup was inconclusive: "
+            f"{_gh_cleanup_detail(receipt)}",
+            code="scheduler-cleanup-inconclusive",
+        ) from primary
+    raise primary
+
+
+def _run_bounded_scheduler_process(
+    native_args: list[str],
+    *,
+    timeout_seconds: float,
+) -> subprocess.CompletedProcess[str]:
+    """Run a fixed native scheduler argv with hard raw-byte and runtime caps."""
+    if timeout_seconds <= 0:
+        raise SyncError(
+            "scheduler native timeout must be positive",
+            code="scheduler-timeout",
+        )
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        process = subprocess.Popen(
+            native_args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_scheduler_native_environment(),
+            start_new_session=True,
+        )
+    except OSError as error:
+        raise SyncError(
+            f"scheduler native command could not start: {error}",
+            code="scheduler-command-unavailable",
+        ) from error
+    if process.stdout is None or process.stderr is None:
+        _raise_scheduler_failure_after_cleanup(
+            process,
+            SyncError(
+                "scheduler native command did not provide bounded output pipes",
+                code="scheduler-process-io",
+            ),
+        )
+
+    selector: selectors.BaseSelector | None = None
+    retained = {"stdout": bytearray(), "stderr": bytearray()}
+    producer_bytes = {"stdout": 0, "stderr": 0}
+    limits = {
+        "stdout": MAX_SCHEDULER_NATIVE_STDOUT_BYTES,
+        "stderr": MAX_SCHEDULER_NATIVE_STDERR_BYTES,
+    }
+    try:
+        selector = selectors.DefaultSelector()
+        for name, stream in (
+            ("stdout", process.stdout),
+            ("stderr", process.stderr),
+        ):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, name)
+        while selector.get_map():
+            remaining_runtime = deadline - time.monotonic()
+            if remaining_runtime <= 0:
+                raise SyncError(
+                    "scheduler native command exceeded its monotonic deadline",
+                    code="scheduler-timeout",
+                )
+            events = selector.select(remaining_runtime)
+            if not events:
+                continue
+            for key, _mask in events:
+                name = key.data
+                remaining_bytes = limits[name] - producer_bytes[name]
+                try:
+                    chunk = os.read(
+                        key.fileobj.fileno(),
+                        min(64 * 1024, remaining_bytes + 1),
+                    )
+                except BlockingIOError:
+                    continue
+                except OSError as error:
+                    raise SyncError(
+                        f"cannot read scheduler native {name}: {error}",
+                        code="scheduler-process-io",
+                    ) from error
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                producer_bytes[name] += len(chunk)
+                if producer_bytes[name] > limits[name]:
+                    raise SyncError(
+                        "scheduler native command "
+                        f"{name} exceeds the {limits[name]}-byte raw output limit",
+                        code="scheduler-output-limit",
+                    )
+                retained[name].extend(chunk)
+        remaining_runtime = deadline - time.monotonic()
+        if remaining_runtime <= 0:
+            raise SyncError(
+                "scheduler native command exceeded its monotonic deadline",
+                code="scheduler-timeout",
+            )
+        try:
+            returncode = process.wait(timeout=remaining_runtime)
+        except subprocess.TimeoutExpired as error:
+            raise SyncError(
+                "scheduler native command exceeded its monotonic deadline",
+                code="scheduler-timeout",
+            ) from error
+        if _gh_process_group_exists(process) is not False:
+            raise SyncError(
+                "scheduler native command left an unverified process group "
+                "after child exit",
+                code="scheduler-process-group-residual",
+            )
+        stdout = bytes(retained["stdout"]).decode("utf-8", errors="replace")
+        stderr = bytes(retained["stderr"]).decode("utf-8", errors="replace")
+        return subprocess.CompletedProcess(
+            args=native_args,
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    except SyncError as primary:
+        _raise_scheduler_failure_after_cleanup(process, primary)
+    except (OSError, ValueError) as error:
+        _raise_scheduler_failure_after_cleanup(
+            process,
+            SyncError(
+                f"scheduler bounded process supervision failed: {error}",
+                code="scheduler-process-io",
+            ),
+        )
+    except BaseException as primary:
+        _raise_scheduler_failure_after_cleanup(process, primary)
+    finally:
+        if selector is not None:
+            selector.close()
+        _close_gh_process_streams(process)
+
+
 def _run_native_command(
     args: list[str],
     *,
@@ -21717,19 +21970,18 @@ def _run_native_command(
         return
     native_args = _native_scheduler_argv(args)
     try:
-        completed = subprocess.run(
+        completed = _run_bounded_scheduler_process(
             native_args,
-            check=False,
-            text=True,
-            capture_output=True,
-            timeout=30,
-            env=_scheduler_native_environment(),
+            timeout_seconds=SCHEDULER_NATIVE_ACTION_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        if allow_fail is True:
+    except SyncError as error:
+        if allow_fail is True and error.code != "scheduler-cleanup-inconclusive":
             print(f"ignored failed command {' '.join(args)}: {error}")
             return
-        raise SyncError(f"failed to run {' '.join(args)}: {error}") from error
+        raise SyncError(
+            f"failed to run {' '.join(args)}: {error}",
+            code=error.code,
+        ) from error
     if completed.returncode != 0:
         message = completed.stderr.strip() or completed.stdout.strip()
         if (
@@ -22581,23 +22833,34 @@ def _scheduler_daemon_enabled(
         try:
             try:
                 native_args = _native_scheduler_argv(args)
-                return subprocess.run(
+                return _run_bounded_scheduler_process(
                     native_args,
-                    check=False,
-                    text=True,
-                    capture_output=True,
-                    timeout=10,
-                    env=_scheduler_native_environment(),
+                    timeout_seconds=SCHEDULER_NATIVE_QUERY_TIMEOUT_SECONDS,
                 )
-            except subprocess.TimeoutExpired:
+            except SyncError as error:
+                if error.code == "scheduler-timeout":
+                    return SchedulerDaemonQuery(
+                        "unavailable",
+                        f"scheduler daemon {description} timed out",
+                    )
+                if error.code == "scheduler-output-limit":
+                    return SchedulerDaemonQuery(
+                        "unavailable",
+                        "scheduler daemon query output exceeded its byte limit",
+                    )
+                if error.code == "scheduler-cleanup-inconclusive":
+                    return SchedulerDaemonQuery(
+                        "unavailable",
+                        f"scheduler daemon {description} cleanup was inconclusive",
+                    )
+                if error.code == "scheduler-command-unavailable":
+                    return SchedulerDaemonQuery(
+                        "unavailable",
+                        f"scheduler daemon {description} executable is unavailable",
+                    )
                 return SchedulerDaemonQuery(
                     "unavailable",
-                    f"scheduler daemon {description} timed out",
-                )
-            except SyncError:
-                return SchedulerDaemonQuery(
-                    "unavailable",
-                    f"scheduler daemon {description} executable is unavailable",
+                    f"scheduler daemon {description} could not be supervised",
                 )
             except OSError:
                 return SchedulerDaemonQuery(
@@ -22606,11 +22869,6 @@ def _scheduler_daemon_enabled(
                 )
         finally:
             revalidate(f"after native scheduler {description}")
-
-    def output_is_bounded(
-        completed: subprocess.CompletedProcess[str],
-    ) -> bool:
-        return len(completed.stdout) <= 64 * 1024 and len(completed.stderr) <= 64 * 1024
 
     def systemd_unavailable_reason(
         completed: subprocess.CompletedProcess[str],
@@ -22656,11 +22914,6 @@ def _scheduler_daemon_enabled(
         )
         if isinstance(completed, SchedulerDaemonQuery):
             return completed
-        if not output_is_bounded(completed):
-            return SchedulerDaemonQuery(
-                "unavailable",
-                "scheduler daemon query output exceeded its byte limit",
-            )
         evidence = (completed.stdout + "\n" + completed.stderr).strip().casefold()
         if any(
             marker in evidence
@@ -22729,11 +22982,6 @@ def _scheduler_daemon_enabled(
     )
     if isinstance(active_result, SchedulerDaemonQuery):
         return active_result
-    if not output_is_bounded(enabled_result) or not output_is_bounded(active_result):
-        return SchedulerDaemonQuery(
-            "unavailable",
-            "scheduler daemon query output exceeded its byte limit",
-        )
     if enabled_result.stderr.strip():
         return SchedulerDaemonQuery(
             "unavailable",

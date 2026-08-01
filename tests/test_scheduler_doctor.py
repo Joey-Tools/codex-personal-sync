@@ -3853,7 +3853,10 @@ class SchedulerDoctorTests(unittest.TestCase):
             (
                 "timeout",
                 0,
-                subprocess.TimeoutExpired(["launchctl", "bootout"], 30),
+                MODULE.SyncError(
+                    "scheduler native command exceeded its monotonic deadline",
+                    code="scheduler-timeout",
+                ),
                 "failed to run launchctl bootout",
             ),
             (
@@ -3928,8 +3931,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                         side_effect=lambda args: args,
                     ),
                     mock.patch.object(
-                        MODULE.subprocess,
-                        "run",
+                        MODULE,
+                        "_run_bounded_scheduler_process",
                         side_effect=run_native,
                     ),
                     contextlib.redirect_stdout(output),
@@ -4038,8 +4041,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                 side_effect=lambda args: args,
             ),
             mock.patch.object(
-                MODULE.subprocess,
-                "run",
+                MODULE,
+                "_run_bounded_scheduler_process",
                 side_effect=run_native,
             ),
             contextlib.redirect_stdout(output),
@@ -5161,8 +5164,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                         side_effect=lambda args: args,
                     ),
                     mock.patch.object(
-                        MODULE.subprocess,
-                        "run",
+                        MODULE,
+                        "_run_bounded_scheduler_process",
                         side_effect=appear_during_query,
                     ),
                     mock.patch.object(
@@ -5774,8 +5777,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                 side_effect=lambda args: ["/usr/bin/systemctl", *args[1:]],
             ),
             mock.patch.object(
-                MODULE.subprocess,
-                "run",
+                MODULE,
+                "_run_bounded_scheduler_process",
                 return_value=subprocess.CompletedProcess(
                     args=[],
                     returncode=0,
@@ -6073,7 +6076,10 @@ class SchedulerDoctorTests(unittest.TestCase):
                 "macos",
                 "timeout",
                 0,
-                subprocess.TimeoutExpired(["launchctl", "bootout"], 30),
+                MODULE.SyncError(
+                    "scheduler native command exceeded its monotonic deadline",
+                    code="scheduler-timeout",
+                ),
             ),
             (
                 "macos",
@@ -6101,7 +6107,10 @@ class SchedulerDoctorTests(unittest.TestCase):
                 "linux",
                 "timeout",
                 0,
-                subprocess.TimeoutExpired(["systemctl", "disable"], 30),
+                MODULE.SyncError(
+                    "scheduler native command exceeded its monotonic deadline",
+                    code="scheduler-timeout",
+                ),
             ),
             (
                 "linux",
@@ -6169,8 +6178,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                             side_effect=lambda args: args,
                         ),
                         mock.patch.object(
-                            MODULE.subprocess,
-                            "run",
+                            MODULE,
+                            "_run_bounded_scheduler_process",
                             side_effect=native_results,
                         ),
                         contextlib.redirect_stdout(output),
@@ -6275,8 +6284,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                         side_effect=lambda selected: selected,
                     ),
                     mock.patch.object(
-                        MODULE.subprocess,
-                        "run",
+                        MODULE,
+                        "_run_bounded_scheduler_process",
                         return_value=completed,
                     ),
                     contextlib.redirect_stdout(io.StringIO()),
@@ -6392,8 +6401,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                         side_effect=lambda selected: selected,
                     ),
                     mock.patch.object(
-                        MODULE.subprocess,
-                        "run",
+                        MODULE,
+                        "_run_bounded_scheduler_process",
                         return_value=completed,
                     ),
                     self.assertRaisesRegex(
@@ -6442,8 +6451,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                 side_effect=lambda args: args,
             ),
             mock.patch.object(
-                MODULE.subprocess,
-                "run",
+                MODULE,
+                "_run_bounded_scheduler_process",
                 side_effect=failed_results,
             ),
             contextlib.redirect_stdout(output),
@@ -6533,8 +6542,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                 ),
             ),
             mock.patch.object(
-                MODULE.subprocess,
-                "run",
+                MODULE,
+                "_run_bounded_scheduler_process",
                 side_effect=recovered_results,
             ),
             contextlib.redirect_stdout(io.StringIO()),
@@ -6546,6 +6555,247 @@ class SchedulerDoctorTests(unittest.TestCase):
                 disable=True,
             )
         self.assertFalse(marker.exists())
+
+    def test_bounded_scheduler_process_enforces_raw_byte_limits(self) -> None:
+        limit = 4096
+        with (
+            mock.patch.object(MODULE, "MAX_SCHEDULER_NATIVE_STDOUT_BYTES", limit),
+            mock.patch.object(MODULE, "MAX_SCHEDULER_NATIVE_STDERR_BYTES", limit),
+        ):
+            exact = MODULE._run_bounded_scheduler_process(
+                [
+                    sys.executable,
+                    "-c",
+                    (f"import os;os.write(1,b'o'*{limit});os.write(2,b'e'*{limit})"),
+                ],
+                timeout_seconds=5.0,
+            )
+            self.assertEqual(len(exact.stdout.encode("utf-8")), limit)
+            self.assertEqual(len(exact.stderr.encode("utf-8")), limit)
+
+            for stream_name, file_descriptor in (("stdout", 1), ("stderr", 2)):
+                with self.subTest(stream=stream_name):
+                    processes: list[subprocess.Popen[bytes]] = []
+                    real_popen = subprocess.Popen
+
+                    def capture_process(args, **kwargs):
+                        process = real_popen(args, **kwargs)
+                        processes.append(process)
+                        return process
+
+                    with (
+                        mock.patch.object(
+                            MODULE.subprocess,
+                            "Popen",
+                            side_effect=capture_process,
+                        ),
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            f"{stream_name} exceeds the {limit}-byte raw output limit",
+                        ) as raised,
+                    ):
+                        MODULE._run_bounded_scheduler_process(
+                            [
+                                sys.executable,
+                                "-c",
+                                (
+                                    "import os,time;"
+                                    f"os.write({file_descriptor},b'x'*{limit + 1});"
+                                    "time.sleep(30)"
+                                ),
+                            ],
+                            timeout_seconds=5.0,
+                        )
+
+                    self.assertEqual(raised.exception.code, "scheduler-output-limit")
+                    self.assertEqual(len(processes), 1)
+                    self.assertIsNotNone(processes[0].poll())
+
+    def test_bounded_scheduler_process_times_out_and_reaps_child(self) -> None:
+        processes: list[subprocess.Popen[bytes]] = []
+        real_popen = subprocess.Popen
+
+        def capture_process(args, **kwargs):
+            process = real_popen(args, **kwargs)
+            processes.append(process)
+            return process
+
+        with (
+            mock.patch.object(
+                MODULE.subprocess,
+                "Popen",
+                side_effect=capture_process,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "exceeded its monotonic deadline",
+            ) as raised,
+        ):
+            MODULE._run_bounded_scheduler_process(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                timeout_seconds=0.05,
+            )
+
+        self.assertEqual(raised.exception.code, "scheduler-timeout")
+        self.assertEqual(len(processes), 1)
+        self.assertIsNotNone(processes[0].poll())
+
+    def test_bounded_scheduler_process_reaps_child_when_selectors_fail(self) -> None:
+        processes: list[subprocess.Popen[bytes]] = []
+        real_popen = subprocess.Popen
+
+        def capture_process(args, **kwargs):
+            process = real_popen(args, **kwargs)
+            processes.append(process)
+            return process
+
+        with (
+            mock.patch.object(
+                MODULE.subprocess,
+                "Popen",
+                side_effect=capture_process,
+            ),
+            mock.patch.object(
+                MODULE.selectors,
+                "DefaultSelector",
+                side_effect=OSError("simulated selector exhaustion"),
+            ),
+            mock.patch.object(MODULE, "GH_TERMINATE_GRACE_SECONDS", 0.05),
+            mock.patch.object(MODULE, "GH_CLEANUP_TIMEOUT_SECONDS", 1.0),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "cleanup was inconclusive.*cleanup selector",
+            ) as raised,
+        ):
+            MODULE._run_bounded_scheduler_process(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                timeout_seconds=5.0,
+            )
+
+        self.assertEqual(raised.exception.code, "scheduler-cleanup-inconclusive")
+        self.assertEqual(len(processes), 1)
+        self.assertIsNotNone(processes[0].poll())
+        self.assertTrue(processes[0].stdout.closed)
+        self.assertTrue(processes[0].stderr.closed)
+
+    def test_scheduler_cleanup_uncertainty_preserves_primary_classification(
+        self,
+    ) -> None:
+        primary = MODULE.SyncError(
+            "scheduler stdout exceeded its raw output limit",
+            code="scheduler-output-limit",
+        )
+        incomplete = MODULE._GhCleanupReceipt(
+            term_sent=True,
+            kill_sent=True,
+            child_reaped=False,
+            stdout_drained=False,
+            stderr_drained=True,
+            process_group_gone=False,
+            errors=("simulated cleanup uncertainty",),
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_cleanup_gh_process_group",
+                return_value=incomplete,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "scheduler stdout exceeded.*cleanup was inconclusive",
+            ) as raised,
+        ):
+            MODULE._raise_scheduler_failure_after_cleanup(mock.Mock(), primary)
+
+        self.assertEqual(raised.exception.code, "scheduler-cleanup-inconclusive")
+        self.assertIs(raised.exception.__cause__, primary)
+        self.assertIn("stdout-not-drained", str(raised.exception))
+
+    def test_scheduler_daemon_query_reports_stream_limit_without_payload(
+        self,
+    ) -> None:
+        payload = "unbounded-native-payload"
+        with (
+            mock.patch.object(
+                MODULE,
+                "_native_scheduler_argv",
+                side_effect=lambda args: args,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_run_bounded_scheduler_process",
+                side_effect=MODULE.SyncError(
+                    f"scheduler stdout exceeded; suppressed {payload}",
+                    code="scheduler-output-limit",
+                ),
+            ),
+        ):
+            query = MODULE._scheduler_daemon_enabled(
+                MODULE.SchedulerPaths(platform="macos")
+            )
+
+        self.assertEqual(query.classification, "unavailable")
+        self.assertIn("output exceeded its byte limit", query.reason or "")
+        self.assertNotIn(payload, query.reason or "")
+
+    def test_scheduler_native_allow_fail_does_not_echo_overflow_payload(self) -> None:
+        payload = "unbounded-native-payload"
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                MODULE,
+                "_native_scheduler_argv",
+                side_effect=lambda args: args,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_run_bounded_scheduler_process",
+                side_effect=MODULE.SyncError(
+                    "scheduler stdout exceeded its raw output limit",
+                    code="scheduler-output-limit",
+                ),
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            MODULE._run_native_command(
+                ["systemctl", "--user", "daemon-reload"],
+                dry_run=False,
+                allow_fail=True,
+            )
+
+        self.assertNotIn(payload, output.getvalue())
+        self.assertIn("raw output limit", output.getvalue())
+
+    def test_scheduler_native_allow_fail_propagates_cleanup_uncertainty(self) -> None:
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                MODULE,
+                "_native_scheduler_argv",
+                side_effect=lambda args: args,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_run_bounded_scheduler_process",
+                side_effect=MODULE.SyncError(
+                    "scheduler cleanup could not be proved complete",
+                    code="scheduler-cleanup-inconclusive",
+                ),
+            ),
+            contextlib.redirect_stdout(output),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "scheduler cleanup could not be proved complete",
+            ) as raised,
+        ):
+            MODULE._run_native_command(
+                ["launchctl", "bootout", "gui/501/com.example.sync"],
+                dry_run=False,
+                allow_fail=True,
+            )
+
+        self.assertEqual(raised.exception.code, "scheduler-cleanup-inconclusive")
+        self.assertEqual(output.getvalue(), "")
 
     def test_scheduler_daemon_query_classifies_only_explicit_state_evidence(
         self,
@@ -6750,8 +7000,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                         side_effect=lambda args: args,
                     ),
                     mock.patch.object(
-                        MODULE.subprocess,
-                        "run",
+                        MODULE,
+                        "_run_bounded_scheduler_process",
                         side_effect=results,
                     ),
                 ):
@@ -6840,8 +7090,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                         side_effect=lambda args: args,
                     ),
                     mock.patch.object(
-                        MODULE.subprocess,
-                        "run",
+                        MODULE,
+                        "_run_bounded_scheduler_process",
                         return_value=completed,
                     ),
                 ):
@@ -6972,8 +7222,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                         side_effect=lambda args: args,
                     ),
                     mock.patch.object(
-                        MODULE.subprocess,
-                        "run",
+                        MODULE,
+                        "_run_bounded_scheduler_process",
                         side_effect=begin_activation_during_query,
                     ),
                 ):
@@ -7045,8 +7295,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                         side_effect=lambda args: args,
                     ),
                     mock.patch.object(
-                        MODULE.subprocess,
-                        "run",
+                        MODULE,
+                        "_run_bounded_scheduler_process",
                         side_effect=begin_uninstall_during_query,
                     ),
                 ):
@@ -7096,8 +7346,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                 side_effect=lambda args: args,
             ),
             mock.patch.object(
-                MODULE.subprocess,
-                "run",
+                MODULE,
+                "_run_bounded_scheduler_process",
                 side_effect=query_results,
             ) as run,
             mock.patch.object(
@@ -7208,8 +7458,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                 side_effect=lambda args: args,
             ),
             mock.patch.object(
-                MODULE.subprocess,
-                "run",
+                MODULE,
+                "_run_bounded_scheduler_process",
                 side_effect=(
                     enablement,
                     activity,
@@ -7310,8 +7560,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                             side_effect=lambda args: args,
                         ),
                         mock.patch.object(
-                            MODULE.subprocess,
-                            "run",
+                            MODULE,
+                            "_run_bounded_scheduler_process",
                             side_effect=mutate_during_status,
                         ),
                         mock.patch.object(
@@ -7399,8 +7649,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                             side_effect=lambda args: args,
                         ),
                         mock.patch.object(
-                            MODULE.subprocess,
-                            "run",
+                            MODULE,
+                            "_run_bounded_scheduler_process",
                             side_effect=begin_activation_during_status,
                         ),
                         mock.patch.object(
@@ -7515,8 +7765,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                     )
                     stack.enter_context(
                         mock.patch.object(
-                            MODULE.subprocess,
-                            "run",
+                            MODULE,
+                            "_run_bounded_scheduler_process",
                             side_effect=touch_during_status,
                         )
                     )
@@ -7554,8 +7804,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                         return_value=0,
                     ),
                     mock.patch.object(
-                        MODULE.subprocess,
-                        "run",
+                        MODULE,
+                        "_run_bounded_scheduler_process",
                         side_effect=OSError("status unavailable"),
                     ),
                 ):
@@ -8736,12 +8986,6 @@ class SchedulerDoctorTests(unittest.TestCase):
         self.assertNotIn("active.owner.json", detail)
 
     def test_native_scheduler_commands_use_closed_environment(self) -> None:
-        completed = MODULE.subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout="",
-            stderr="",
-        )
         injected = {
             "LD_PRELOAD": "/tmp/injected.so",
             "LD_LIBRARY_PATH": "/tmp/injected",
@@ -8750,25 +8994,33 @@ class SchedulerDoctorTests(unittest.TestCase):
             "ENV": "/tmp/shell-env",
             "PYTHONPATH": "/tmp/python",
         }
+        captured: dict[str, object] = {}
+        real_popen = subprocess.Popen
+
+        def capture_popen(args, **kwargs):
+            captured.update(kwargs)
+            return real_popen(args, **kwargs)
+
         with (
             mock.patch.dict(MODULE.os.environ, injected, clear=False),
             mock.patch.object(
                 MODULE,
                 "_native_scheduler_argv",
-                return_value=["/usr/bin/systemctl", "--user", "daemon-reload"],
+                return_value=[sys.executable, "-c", "pass"],
             ),
             mock.patch.object(
                 MODULE.subprocess,
-                "run",
-                return_value=completed,
-            ) as run,
+                "Popen",
+                side_effect=capture_popen,
+            ),
         ):
             MODULE._run_native_command(
                 ["systemctl", "--user", "daemon-reload"],
                 dry_run=False,
             )
 
-        environment = run.call_args.kwargs["env"]
+        environment = captured["env"]
+        assert isinstance(environment, dict)
         self.assertEqual(environment["PATH"], "/usr/bin:/bin")
         self.assertEqual(environment["LC_ALL"], "C")
         for name in injected:

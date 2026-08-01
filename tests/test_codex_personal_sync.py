@@ -3470,6 +3470,78 @@ class CodexPersonalSyncTests(unittest.TestCase):
             stderr.getvalue(),
         )
 
+    def test_macos_system_temp_alias_cleanup_attempts_both_owned_fds(self) -> None:
+        canonical_parent = self.root / "descriptor-dual-close-private-tmp"
+        alias_parent = self.root / "descriptor-dual-close-tmp"
+        canonical_parent.mkdir(mode=0o700)
+        canonical_parent = canonical_parent.resolve()
+        alias_parent.symlink_to(canonical_parent, target_is_directory=True)
+        real_open = MODULE.os.open
+        real_close = MODULE.os.close
+        alias_fd = -1
+        workspace_fd = -1
+        closed_fds: list[int] = []
+        stderr = io.StringIO()
+
+        def capture_owned_fds(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal alias_fd, workspace_fd
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if Path(path) == alias_parent and dir_fd is None:
+                alias_fd = descriptor
+            elif Path(path) == canonical_parent and dir_fd is None:
+                workspace_fd = descriptor
+            return descriptor
+
+        def fail_owned_close(file_descriptor: int) -> None:
+            if file_descriptor in {alias_fd, workspace_fd}:
+                closed_fds.append(file_descriptor)
+                real_close(file_descriptor)
+                raise OSError(f"simulated close failure for fd {file_descriptor}")
+            real_close(file_descriptor)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_uses_macos_system_temp_alias",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_ALIAS",
+                alias_parent,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_DIRECTORY",
+                canonical_parent,
+            ),
+            mock.patch.object(MODULE.os, "open", side_effect=capture_owned_fds),
+            mock.patch.object(MODULE.os, "close", side_effect=fail_owned_close),
+            mock.patch.object(
+                MODULE,
+                "_revalidate_archive_workspace_alias",
+                side_effect=MODULE.SyncError("simulated alias revalidation failure"),
+            ),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "simulated alias revalidation failure",
+            ),
+        ):
+            with MODULE.bind_archive_workspace(alias_parent):
+                self.fail("failed alias revalidation must not yield the workspace")
+
+        self.assertEqual(set(closed_fds), {alias_fd, workspace_fd})
+        for file_descriptor in (alias_fd, workspace_fd):
+            with self.assertRaises(OSError):
+                os.fstat(file_descriptor)
+        cleanup_output = stderr.getvalue()
+        self.assertIn("warning: failed to close archive workspace", cleanup_output)
+        self.assertIn(
+            "warning: failed to close system temporary archive alias",
+            cleanup_output,
+        )
+
     def test_macos_system_temp_alias_rejects_unexpected_target(self) -> None:
         canonical_parent = self.root / "expected-private-tmp"
         unexpected_parent = self.root / "unexpected-private-tmp"
@@ -7087,7 +7159,11 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 "_native_scheduler_argv",
                 side_effect=lambda args: ["/bin/launchctl", *args[1:]],
             ),
-            mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run,
+            mock.patch.object(
+                MODULE,
+                "_run_bounded_scheduler_process",
+                return_value=completed,
+            ) as run,
         ):
             self.run_quietly(
                 MODULE.install_scheduler,
@@ -7163,7 +7239,11 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 "_native_scheduler_argv",
                 side_effect=lambda args: ["/usr/bin/systemctl", *args[1:]],
             ),
-            mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run,
+            mock.patch.object(
+                MODULE,
+                "_run_bounded_scheduler_process",
+                return_value=completed,
+            ) as run,
         ):
             self.run_quietly(
                 MODULE.install_scheduler,
@@ -8234,8 +8314,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 side_effect=lambda args: ["/bin/launchctl", *args[1:]],
             ),
             mock.patch.object(
-                MODULE.subprocess,
-                "run",
+                MODULE,
+                "_run_bounded_scheduler_process",
                 side_effect=run_native,
             ) as run,
         ):

@@ -2958,6 +2958,103 @@ class MirrorGeneratorTests(unittest.TestCase):
         finally:
             os.close(binding.fd)
 
+    def test_bound_directory_launch_reaps_child_when_saved_fd_close_fails(
+        self,
+    ) -> None:
+        launch_directory = self.root / "close-failure-launch-directory"
+        launch_directory.mkdir(mode=0o700)
+        binding = MIRROR_MODULE._bind_absolute_control_object(
+            launch_directory,
+            "test launch directory",
+            require_directory=True,
+        )
+        real_open = MIRROR_MODULE.os.open
+        real_close = MIRROR_MODULE.os.close
+        real_popen = subprocess.Popen
+        saved_directory_fd = -1
+        process: subprocess.Popen[bytes] | None = None
+        parent_identity = MIRROR_MODULE._object_identity(
+            os.stat(".", follow_symlinks=False)
+        )
+
+        def capture_saved_directory(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal saved_directory_fd
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if path == "." and dir_fd is None:
+                saved_directory_fd = descriptor
+            return descriptor
+
+        def fail_saved_directory_close(file_descriptor: int) -> None:
+            if file_descriptor == saved_directory_fd:
+                time.sleep(0.05)
+                real_close(file_descriptor)
+                raise OSError("simulated saved-directory close failure")
+            real_close(file_descriptor)
+
+        def capture_process(command, **kwargs):
+            nonlocal process
+            process = real_popen(command, **kwargs)
+            return process
+
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE.os,
+                    "open",
+                    side_effect=capture_saved_directory,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE.os,
+                    "close",
+                    side_effect=fail_saved_directory_close,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE.subprocess,
+                    "Popen",
+                    side_effect=capture_process,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "saved parent-directory descriptor.*simulated",
+                ),
+            ):
+                MIRROR_MODULE._popen_from_bound_directory(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os,time;"
+                            "os.write(1,b'x'*8192);"
+                            "os.write(2,b'y'*8192);"
+                            "time.sleep(30)"
+                        ),
+                    ],
+                    directory_fd=binding.fd,
+                    directory_identity=binding.identity,
+                    directory_access_policy=binding.access_policy,
+                    directory_label=binding.label,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+
+            self.assertIsNotNone(process)
+            assert process is not None
+            self.assertIsNotNone(process.poll())
+            assert process.stdout is not None
+            assert process.stderr is not None
+            self.assertTrue(process.stdout.closed)
+            self.assertTrue(process.stderr.closed)
+            self.assertEqual(
+                MIRROR_MODULE._object_identity(os.stat(".", follow_symlinks=False)),
+                parent_identity,
+            )
+            with self.assertRaises(OSError):
+                os.fstat(saved_directory_fd)
+        finally:
+            os.close(binding.fd)
+
     def test_bound_directory_launch_rejects_access_policy_change(self) -> None:
         launch_directory = self.root / "launch-directory"
         launch_directory.mkdir(mode=0o700)

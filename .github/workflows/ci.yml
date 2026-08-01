@@ -23,3 +23,29 @@ jobs:
         run: python3 -m compileall -q scripts tests
       - name: Run tests
         run: python3 -m unittest discover -s tests
+
+  macos-system-temp-alias:
+    name: macOS system temp alias (Python ${{ matrix.python-version }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Python 3.9 exercises the literal O_SYMLINK fallback; Python 3.13
+        # exercises the runtime-provided flag used by the current native lane.
+        python-version: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Verify Darwin system temp alias
+        run: >-
+          python3 -c 'from pathlib import Path; import sys;
+          assert sys.platform == "darwin";
+          assert Path("/tmp").is_symlink();
+          assert Path("/tmp").resolve() == Path("/private/tmp")'
+      - name: Run Darwin alias binding tests
+        run: >-
+          python3 -m unittest discover -s tests
+          -p 'test_codex_personal_sync.py'
+          -k macos_system_temp_alias
