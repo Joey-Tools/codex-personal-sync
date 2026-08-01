@@ -882,6 +882,48 @@ superseded_by:
   source-lock verification, and `git diff --check` passed. The mode-0700
   task-private control root was used throughout; production quarantine and host
   scheduler state were not read for payload inspection, mutated, or cleaned.
+- Signed head `cfc1d1eb7a2e0c19aa2d16977c22820827419239` passed hosted CI
+  run `30718963989`, including the main test job and both new macOS Python 3.9
+  and 3.13 alias jobs, plus review-gate run `30718963214`. Its exact-secret
+  admission was clean with complete temporary cleanup over the exact
+  `6c4878f..cfc1d1e` range. A fresh prior-trusted-bundle named-single review
+  used a separately materialized and validated private worktree and found one
+  blocking macOS locator defect: the closed Git environment omitted `TMPDIR`,
+  so sandboxed `xcrun --find git` returned a valid path plus a `confstr()`
+  fallback warning that the strict stderr gate rejected during module import.
+  The finding matched a direct sandbox reproduction. Post-lane validation
+  remained bound to `cfc1d1e`, the trusted control digests were unchanged, and
+  the private review workspace was removed completely. All of those head-bound
+  gates become stale when the follow-up fix is committed.
+- The follow-up binds fixed `/private/tmp` through the existing absolute
+  no-follow control-object binder, requires exact root-owned mode-`01777`
+  access policy, and revalidates directory object identity and access policy
+  immediately before `Popen` and again in the terminal `finally`. Only that
+  bound absolute path is added as `TMPDIR` for fixed `/usr/bin/xcrun`; ambient
+  `TMPDIR` remains excluded and every stderr byte remains fatal. The protected
+  properties are temporary-root object identity and access policy. Child-entry
+  churn is deliberately not compared. Adversarial tests cover the sanitized
+  import/`--help` path, exact environment injection, nonzero exit, stderr,
+  ambiguous/relative/shim stdout, initial symlink or policy mismatch, and
+  post-bind replacement or policy drift. The focused locator suite passed all
+  6 tests under Python 3.13.0 and Xcode Python 3.9.6 in 1.503 and 1.681
+  seconds; an independent read-only audit returned `No findings.`
+- The final affected suites passed under `ResourceWarning=error`: all 160
+  source-lock tests in 593.845 and 628.869 seconds, and all 27 toolbox
+  automation tests in 184.297 and 192.706 seconds, for Python 3.13.0 and Xcode
+  Python 3.9.6 respectively. Two sandbox-local task-private source-lock
+  refreshes were byte-identical and the currentness check verified all six
+  sources without an escape. The unchanged lock SHA-256 is
+  `a9bda725d8031c5ffe103d55edf5bc45015a78ac22703558a38907ab875dc960`;
+  the final generated-mirror controller, source-lock tests, and CI workflow
+  SHA-256 values are
+  `40e6068d141b3f5f7b9d0fd02b5bc392c1c62f785c49d0b8322b7df9702defb9`,
+  `d374afbd75fdc684de06f3c8488741cee83124e4fccdd8f4a01eb866b845d955`,
+  and
+  `6c926d12cd5bfe58c5f56e7d6a3a4f6529e7f0d3dd74e476750419ba39374cfa`.
+  Dual-runtime compileall, Ruff lint/format, actionlint, JSON parsing,
+  project-journal validation, source-lock verification, and `git diff --check`
+  passed; no repository bytecode cache remains.
 
 ## Installed Host Baseline
 

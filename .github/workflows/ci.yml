@@ -49,3 +49,8 @@ jobs:
           python3 -m unittest discover -s tests
           -p 'test_codex_personal_sync.py'
           -k macos_system_temp_alias
+      - name: Run macOS Git locator tests
+        run: >-
+          python3 -m unittest discover -s tests
+          -p 'test_source_lock.py'
+          -k macos_git_locator

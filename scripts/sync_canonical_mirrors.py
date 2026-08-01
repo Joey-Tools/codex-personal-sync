@@ -37,6 +37,8 @@ RULES_CONTRACT_VERSION = 1
 HASH_ALGORITHM = "sha256"
 GIT_EXECUTABLE = Path("/usr/bin/git")
 MACOS_GIT_LOCATOR_EXECUTABLE = Path("/usr/bin/xcrun")
+MACOS_GIT_LOCATOR_TEMP_DIRECTORY = Path("/private/tmp")
+MACOS_GIT_LOCATOR_TEMP_ACCESS_POLICY = (0o1777, 0, 0)
 GIT_DERIVED_CACHE_DISABLE_ARGUMENTS = (
     "-c",
     "core.commitGraph=false",
@@ -5951,6 +5953,24 @@ def _collect_bounded_git_output(
     )
 
 
+def _bind_macos_git_locator_temp_directory(
+    path: Path,
+    expected_access_policy: tuple[int, int, int],
+) -> ControlObjectBinding:
+    binding = _bind_absolute_control_object(
+        path,
+        "macOS Git locator temporary directory",
+        require_directory=True,
+    )
+    if binding.access_policy != expected_access_policy:
+        os.close(binding.fd)
+        raise MirrorSyncError(
+            "macOS Git locator temporary directory must have access policy "
+            f"{expected_access_policy}, observed {binding.access_policy}"
+        )
+    return binding
+
+
 def _resolve_macos_git_executable() -> Path:
     # `/usr/bin/git` is an Apple platform shim whose copied bytes are not
     # executable outside the sealed system volume. Treat the fixed system
@@ -5961,9 +5981,24 @@ def _resolve_macos_git_executable() -> Path:
         "macOS Git locator executable",
         require_directory=False,
     )
+    try:
+        temporary_directory = _bind_macos_git_locator_temp_directory(
+            MACOS_GIT_LOCATOR_TEMP_DIRECTORY,
+            MACOS_GIT_LOCATOR_TEMP_ACCESS_POLICY,
+        )
+    except BaseException:
+        os.close(locator.fd)
+        raise
     process: subprocess.Popen[bytes] | None = None
     try:
         _revalidate_absolute_control_object(locator)
+        _revalidate_absolute_control_object(temporary_directory)
+        if temporary_directory.path is None:
+            raise MirrorSyncError(
+                "macOS Git locator temporary directory has no absolute path"
+            )
+        environment = _git_environment()
+        environment["TMPDIR"] = temporary_directory.path.as_posix()
         process = subprocess.Popen(
             [
                 MACOS_GIT_LOCATOR_EXECUTABLE.as_posix(),
@@ -5973,7 +6008,7 @@ def _resolve_macos_git_executable() -> Path:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=_git_environment(),
+            env=environment,
             start_new_session=True,
         )
         return_code, stdout, stderr = _collect_bounded_process_output(
@@ -5992,9 +6027,15 @@ def _resolve_macos_git_executable() -> Path:
         ) from error
     finally:
         try:
-            _revalidate_absolute_control_object(locator)
+            try:
+                _revalidate_absolute_control_object(temporary_directory)
+            finally:
+                os.close(temporary_directory.fd)
         finally:
-            os.close(locator.fd)
+            try:
+                _revalidate_absolute_control_object(locator)
+            finally:
+                os.close(locator.fd)
     if return_code != 0:
         detail = stderr.decode("utf-8", errors="replace").strip()
         if len(detail) > 500:

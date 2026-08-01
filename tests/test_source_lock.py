@@ -181,6 +181,28 @@ class MirrorGeneratorTests(unittest.TestCase):
         )
         return completed.stdout
 
+    def _macos_git_locator_fixture(
+        self,
+        suffix: str = "",
+    ) -> tuple[Path, Path, Path, tuple[int, int, int]]:
+        locator = self.root / f"xcrun-fixture{suffix}"
+        shutil.copyfile("/usr/bin/true", locator)
+        locator.chmod(0o755)
+        temporary_directory = self.root / f"locator-temporary-directory{suffix}"
+        temporary_directory.mkdir(mode=0o700)
+        developer_git = self.root / f"developer-git{suffix}"
+        shutil.copyfile(MIRROR_MODULE.GIT_EXECUTABLE, developer_git)
+        developer_git.chmod(0o755)
+        expected_access_policy = MIRROR_MODULE._access_policy(
+            temporary_directory.stat()
+        )
+        return (
+            locator,
+            temporary_directory,
+            developer_git,
+            expected_access_policy,
+        )
+
     def _init_git_repository(self, root: Path, repository: str) -> None:
         self._git(root, "init", "-q")
         self._git(root, "config", "user.name", "Mirror Fixture")
@@ -2113,6 +2135,329 @@ class MirrorGeneratorTests(unittest.TestCase):
                     self.assertEqual(command[-1], "--version")
                 finally:
                     MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_macos_git_locator_uses_bound_deterministic_tmpdir(self) -> None:
+        (
+            locator,
+            temporary_directory,
+            developer_git,
+            expected_access_policy,
+        ) = self._macos_git_locator_fixture()
+        captured: dict[str, object] = {}
+        temporary_binding = None
+        real_bind_temporary = MIRROR_MODULE._bind_macos_git_locator_temp_directory
+
+        def capture_temporary_binding(path, access_policy):
+            nonlocal temporary_binding
+            temporary_binding = real_bind_temporary(path, access_policy)
+            return temporary_binding
+
+        def capture_popen(command, **kwargs):
+            captured["command"] = command
+            captured.update(kwargs)
+            return mock.Mock()
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "MACOS_GIT_LOCATOR_EXECUTABLE",
+                locator,
+            ),
+            mock.patch.object(
+                MIRROR_MODULE,
+                "MACOS_GIT_LOCATOR_TEMP_DIRECTORY",
+                temporary_directory,
+            ),
+            mock.patch.object(
+                MIRROR_MODULE,
+                "MACOS_GIT_LOCATOR_TEMP_ACCESS_POLICY",
+                expected_access_policy,
+            ),
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_bind_macos_git_locator_temp_directory",
+                side_effect=capture_temporary_binding,
+            ),
+            mock.patch.object(
+                MIRROR_MODULE.subprocess,
+                "Popen",
+                side_effect=capture_popen,
+            ),
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_collect_bounded_process_output",
+                return_value=(0, f"{developer_git}\n".encode(), b""),
+            ),
+            mock.patch.dict(os.environ, {"TMPDIR": "/untrusted/ambient"}),
+        ):
+            resolved = MIRROR_MODULE._resolve_macos_git_executable()
+
+        self.assertEqual(resolved, developer_git)
+        self.assertEqual(
+            captured["command"],
+            [locator.as_posix(), "--find", "git"],
+        )
+        environment = captured["env"]
+        self.assertIsInstance(environment, dict)
+        self.assertEqual(environment["TMPDIR"], temporary_directory.as_posix())
+        self.assertNotEqual(environment["TMPDIR"], "/untrusted/ambient")
+        self.assertIsNotNone(temporary_binding)
+        with self.assertRaises(OSError):
+            os.fstat(temporary_binding.fd)
+
+    def test_macos_git_locator_keeps_stderr_fail_closed(self) -> None:
+        (
+            locator,
+            temporary_directory,
+            developer_git,
+            expected_access_policy,
+        ) = self._macos_git_locator_fixture()
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "MACOS_GIT_LOCATOR_EXECUTABLE",
+                locator,
+            ),
+            mock.patch.object(
+                MIRROR_MODULE,
+                "MACOS_GIT_LOCATOR_TEMP_DIRECTORY",
+                temporary_directory,
+            ),
+            mock.patch.object(
+                MIRROR_MODULE,
+                "MACOS_GIT_LOCATOR_TEMP_ACCESS_POLICY",
+                expected_access_policy,
+            ),
+            mock.patch.object(
+                MIRROR_MODULE.subprocess,
+                "Popen",
+                return_value=mock.Mock(),
+            ),
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_collect_bounded_process_output",
+                return_value=(
+                    0,
+                    f"{developer_git}\n".encode(),
+                    b"xcrun: warning: simulated warning\n",
+                ),
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "returned unexpected stderr",
+            ),
+        ):
+            MIRROR_MODULE._resolve_macos_git_executable()
+
+    def test_macos_git_locator_rejects_invalid_results(self) -> None:
+        (
+            locator,
+            temporary_directory,
+            developer_git,
+            expected_access_policy,
+        ) = self._macos_git_locator_fixture()
+        cases = (
+            (
+                "nonzero",
+                (1, b"", b"xcrun failed\n"),
+                "macOS Git locator failed: xcrun failed",
+            ),
+            (
+                "ambiguous stdout",
+                (0, f"{developer_git}\n{developer_git}\n".encode(), b""),
+                "returned a malformed path",
+            ),
+            (
+                "relative stdout",
+                (0, b"relative/git\n", b""),
+                "returned a non-canonical path",
+            ),
+            (
+                "system shim",
+                (0, b"/usr/bin/git\n", b""),
+                "returned the non-snapshot-capable system shim",
+            ),
+        )
+        for name, result, expected_error in cases:
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "MACOS_GIT_LOCATOR_EXECUTABLE",
+                    locator,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "MACOS_GIT_LOCATOR_TEMP_DIRECTORY",
+                    temporary_directory,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "MACOS_GIT_LOCATOR_TEMP_ACCESS_POLICY",
+                    expected_access_policy,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE.subprocess,
+                    "Popen",
+                    return_value=mock.Mock(),
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_collect_bounded_process_output",
+                    return_value=result,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    expected_error,
+                ),
+            ):
+                MIRROR_MODULE._resolve_macos_git_executable()
+
+    def test_macos_git_locator_rejects_temp_symlink_and_initial_policy(
+        self,
+    ) -> None:
+        locator, temporary_directory, _developer_git, _policy = (
+            self._macos_git_locator_fixture()
+        )
+        real_temporary_directory = self.root / "real-locator-temporary-directory"
+        real_temporary_directory.mkdir(mode=0o700)
+        temporary_directory.rmdir()
+        temporary_directory.symlink_to(real_temporary_directory)
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "MACOS_GIT_LOCATOR_EXECUTABLE",
+                locator,
+            ),
+            mock.patch.object(
+                MIRROR_MODULE,
+                "MACOS_GIT_LOCATOR_TEMP_DIRECTORY",
+                temporary_directory,
+            ),
+            mock.patch.object(
+                MIRROR_MODULE,
+                "MACOS_GIT_LOCATOR_TEMP_ACCESS_POLICY",
+                (0o700, os.geteuid(), os.getegid()),
+            ),
+            mock.patch.object(MIRROR_MODULE.subprocess, "Popen") as popen,
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "temporary directory must not be a symlink",
+            ),
+        ):
+            MIRROR_MODULE._resolve_macos_git_executable()
+        popen.assert_not_called()
+
+        temporary_directory.unlink()
+        temporary_directory.mkdir(mode=0o755)
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "MACOS_GIT_LOCATOR_EXECUTABLE",
+                locator,
+            ),
+            mock.patch.object(
+                MIRROR_MODULE,
+                "MACOS_GIT_LOCATOR_TEMP_DIRECTORY",
+                temporary_directory,
+            ),
+            mock.patch.object(
+                MIRROR_MODULE,
+                "MACOS_GIT_LOCATOR_TEMP_ACCESS_POLICY",
+                (0o700, os.geteuid(), os.getegid()),
+            ),
+            mock.patch.object(MIRROR_MODULE.subprocess, "Popen") as popen,
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "must have access policy",
+            ),
+        ):
+            MIRROR_MODULE._resolve_macos_git_executable()
+        popen.assert_not_called()
+
+    def test_macos_git_locator_rejects_temp_replacement_and_policy_drift(
+        self,
+    ) -> None:
+        for mutation in ("replacement", "policy"):
+            with self.subTest(mutation=mutation):
+                (
+                    locator,
+                    temporary_directory,
+                    developer_git,
+                    expected_access_policy,
+                ) = self._macos_git_locator_fixture(f"-{mutation}")
+                moved = temporary_directory.with_name(
+                    temporary_directory.name + f"-{mutation}-preserved"
+                )
+
+                def mutate_temporary_directory(_command, **_kwargs):
+                    if mutation == "replacement":
+                        temporary_directory.rename(moved)
+                        temporary_directory.mkdir(mode=0o700)
+                    else:
+                        temporary_directory.chmod(0o755)
+                    return mock.Mock()
+
+                expected_error = (
+                    "temporary directory was replaced"
+                    if mutation == "replacement"
+                    else "temporary directory access policy changed"
+                )
+                with (
+                    mock.patch.object(
+                        MIRROR_MODULE,
+                        "MACOS_GIT_LOCATOR_EXECUTABLE",
+                        locator,
+                    ),
+                    mock.patch.object(
+                        MIRROR_MODULE,
+                        "MACOS_GIT_LOCATOR_TEMP_DIRECTORY",
+                        temporary_directory,
+                    ),
+                    mock.patch.object(
+                        MIRROR_MODULE,
+                        "MACOS_GIT_LOCATOR_TEMP_ACCESS_POLICY",
+                        expected_access_policy,
+                    ),
+                    mock.patch.object(
+                        MIRROR_MODULE.subprocess,
+                        "Popen",
+                        side_effect=mutate_temporary_directory,
+                    ),
+                    mock.patch.object(
+                        MIRROR_MODULE,
+                        "_collect_bounded_process_output",
+                        return_value=(0, f"{developer_git}\n".encode(), b""),
+                    ),
+                    self.assertRaisesRegex(
+                        MIRROR_MODULE.MirrorSyncError,
+                        expected_error,
+                    ),
+                ):
+                    MIRROR_MODULE._resolve_macos_git_executable()
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS xcrun")
+    def test_macos_git_locator_cli_help_with_sanitized_environment(self) -> None:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(REPOSITORY_ROOT / "scripts" / "sync_canonical_mirrors.py"),
+                "--help",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            env={
+                "HOME": "/",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin",
+            },
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        self.assertEqual(completed.stderr, b"")
+        self.assertIn(b"refresh-lock", completed.stdout)
 
     def test_git_capability_probe_bounds_output_and_runtime_before_snapshot(
         self,
