@@ -95,6 +95,16 @@ may never enter the Git control plane. Target validation also rejects
 case-insensitive/NFC collisions and overlap in either ancestry direction with
 the receipt, transaction markers, or per-target exchange journals.
 
+Directory inventories for Git controls, private objects, cleanup trees, and
+the private tool root use incremental `scandir` collection. They request at
+most `limit + 1` producer entries, retain at most `limit`, stop immediately on
+the first overflow entry, and sort only the bounded retained set. Iterator
+cleanup is guaranteed on overflow and producer errors; an entry cap is never
+implemented by first allocating an unbounded `listdir` result. Each successful
+scan reserves its retained names against both the recursive scan budget and
+the operation-wide entry budget before child recursion begins, so unprocessed
+sibling names cannot be multiplied by a deep first child.
+
 The live Git binding includes `HEAD`, its resolved loose ref when present,
 `packed-refs`, common/worktree config, the index, and explicit absence records
 for optional controls. The source Git executable is identity/access-bound and
@@ -215,6 +225,16 @@ for every managed target and receipt. It therefore rejects staged generated
 bytes even when the worktree happens to match the lock. `generate` may leave
 its expected uncommitted generated diff for review, but it never accepts an
 unrelated index or worktree edit as source material.
+
+On macOS, a scheduler process without `TMPDIR` may receive `/tmp` from Python.
+The synchronizer recognizes only the platform's exact `/tmp -> /private/tmp`
+alias, normalizes it to `/private/tmp`, and opens that real directory with
+no-follow semantics. Before yielding a temporary archive workspace it binds
+and revalidates the alias object, exact link value and access policy together
+with the target directory's object identity and access policy. Arbitrary leaf
+symlinks and replacement races still fail closed. Directory timestamps and
+ordinary child-entry churn are not treated as replacement or access-policy
+changes.
 
 ## Scheduler operator runbook
 

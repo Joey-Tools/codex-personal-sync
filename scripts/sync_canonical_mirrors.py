@@ -416,6 +416,73 @@ def _consume_operation_budget(
         )
 
 
+def _bounded_sorted_directory_names(
+    directory_fd: int,
+    *,
+    maximum_entries: int,
+    label: str,
+    limit_error: str,
+    operation: OperationBudget | None = None,
+) -> tuple[str, ...]:
+    """Scan at most limit + 1 names, retaining no more than limit.
+
+    The producer count is bounded independently from the retained collection:
+    the first overflow entry proves the limit violation but is never appended
+    or sorted. The scandir iterator is explicitly closed on every exit path.
+    """
+    if maximum_entries < 0:
+        raise MirrorSyncError("directory scan limit must be nonnegative")
+    _operation_checkpoint(operation, f"scanning {label}")
+    effective_maximum = maximum_entries
+    effective_limit_error = limit_error
+    if operation is not None and operation.remaining_entries < effective_maximum:
+        effective_maximum = max(0, operation.remaining_entries)
+        effective_limit_error = (
+            f"mirror operation exceeds the {MAX_OPERATION_ENTRIES}-entry "
+            f"aggregate budget during scanning {label}"
+        )
+    names: list[str] = []
+    scanned_count = 0
+    entries: Any | None = None
+    try:
+        entries = os.scandir(directory_fd)
+        for entry in entries:
+            scanned_count += 1
+            if scanned_count > effective_maximum:
+                raise MirrorSyncError(
+                    f"{effective_limit_error}; scanned at least "
+                    f"{scanned_count} "
+                    f"entries and retained {len(names)}"
+                )
+            name = entry.name
+            if not isinstance(name, str) or name in {"", ".", ".."} or "/" in name:
+                raise MirrorSyncError(f"{label} has an unsafe entry: {name!r}")
+            names.append(name)
+            if scanned_count == 1 or scanned_count % 1024 == 0:
+                _operation_checkpoint(operation, f"scanning {label}")
+    except OSError as error:
+        raise MirrorSyncError(f"cannot inventory {label}: {error}") from error
+    finally:
+        if entries is not None:
+            active_error = sys.exc_info()[0] is not None
+            try:
+                entries.close()
+            except OSError as error:
+                close_error = MirrorSyncError(
+                    f"failed to close directory scan for {label}: {error}"
+                )
+                if active_error:
+                    print(f"warning: {close_error}", file=sys.stderr)
+                else:
+                    raise close_error from error
+    _consume_operation_budget(
+        operation,
+        entry_count=len(names),
+        label=f"scanning {label}",
+    )
+    return tuple(sorted(names))
+
+
 def _require_nofollow_support() -> None:
     if not getattr(os, "O_NOFOLLOW", 0) or not getattr(os, "O_DIRECTORY", 0):
         raise MirrorSyncError(
@@ -746,20 +813,16 @@ def _control_marker_collision_names(
     label: str,
 ) -> tuple[str, ...]:
     marker_key = _path_collision_key(PurePosixPath(name))
-    try:
-        names = os.listdir(parent.fd)
-    except OSError as error:
-        raise MirrorSyncError(f"cannot inventory {label} parent: {error}") from error
+    names = _bounded_sorted_directory_names(
+        parent.fd,
+        maximum_entries=MAX_GIT_SNAPSHOT_ENTRIES,
+        label=f"{label} parent",
+        limit_error=(
+            f"{label} parent exceeds the {MAX_GIT_SNAPSHOT_ENTRIES}-entry limit"
+        ),
+    )
     collisions: list[str] = []
     for candidate in names:
-        if (
-            not isinstance(candidate, str)
-            or candidate in {"", ".", ".."}
-            or "/" in candidate
-        ):
-            raise MirrorSyncError(
-                f"{label} parent contains an unsafe entry: {candidate!r}"
-            )
         if _path_collision_key(PurePosixPath(candidate)) == marker_key:
             collisions.append(candidate)
     return tuple(sorted(collisions))
@@ -931,27 +994,21 @@ def _snapshot_git_directory_tree(
     skip_entries: frozenset[PurePosixPath] = frozenset(),
 ) -> list[tuple[object, ...]]:
     _operation_checkpoint(operation, f"snapshotting Git control tree {prefix}")
-    try:
-        names = sorted(os.listdir(source_fd))
-    except OSError as error:
-        raise MirrorSyncError(
-            f"cannot inventory Git control directory {prefix}: {error}"
-        ) from error
+    scanned_entries = budget.setdefault("scanned_entries", 0)
+    names = _bounded_sorted_directory_names(
+        source_fd,
+        maximum_entries=max(0, MAX_GIT_SNAPSHOT_ENTRIES - scanned_entries),
+        label=f"Git control directory {prefix}",
+        limit_error="Git control snapshot exceeds its entry limit",
+        operation=operation,
+    )
+    budget["scanned_entries"] = scanned_entries + len(names)
     manifest: list[tuple[object, ...]] = []
     for name in names:
-        if not isinstance(name, str) or name in {"", ".", ".."} or "/" in name:
-            raise MirrorSyncError(
-                f"Git control directory has an unsafe entry: {name!r}"
-            )
         relative_path = prefix / name
         if relative_path in skip_entries:
             continue
         budget["entries"] += 1
-        _consume_operation_budget(
-            operation,
-            entry_count=1,
-            label=f"snapshotting Git control entry {relative_path}",
-        )
         if budget["entries"] > MAX_GIT_SNAPSHOT_ENTRIES:
             raise MirrorSyncError("Git control snapshot exceeds its entry limit")
         try:
@@ -1212,24 +1269,18 @@ def _inventory_private_git_objects(
             operation,
             f"binding private Git object snapshot {prefix}",
         )
-        try:
-            names = sorted(os.listdir(directory_fd))
-        except OSError as error:
-            raise MirrorSyncError(
-                f"cannot inventory private Git object directory {prefix}: {error}"
-            ) from error
+        scanned_entries = budget.setdefault("scanned_entries", 0)
+        names = _bounded_sorted_directory_names(
+            directory_fd,
+            maximum_entries=max(0, MAX_GIT_SNAPSHOT_ENTRIES - scanned_entries),
+            label=f"private Git object directory {prefix}",
+            limit_error="private Git object snapshot exceeds its entry limit",
+            operation=operation,
+        )
+        budget["scanned_entries"] = scanned_entries + len(names)
         for name in names:
-            if not isinstance(name, str) or name in {"", ".", ".."} or "/" in name:
-                raise MirrorSyncError(
-                    f"private Git object directory has an unsafe entry: {name!r}"
-                )
             relative_path = prefix / name
             budget["entries"] += 1
-            _consume_operation_budget(
-                operation,
-                entry_count=1,
-                label=f"binding private Git object entry {relative_path}",
-            )
             if budget["entries"] > MAX_GIT_SNAPSHOT_ENTRIES:
                 raise MirrorSyncError(
                     "private Git object snapshot exceeds its entry limit"
@@ -1910,8 +1961,16 @@ def _prepare_private_git_executable(
                 executable.content_digest,
             ),
         )
-        names = sorted(os.listdir(private.fd))
-        if names != [executable_name]:
+        names = _bounded_sorted_directory_names(
+            private.fd,
+            maximum_entries=1,
+            label="private Git executable directory",
+            limit_error=(
+                "private Git executable directory contains unexpected entries"
+            ),
+            operation=root.operation,
+        )
+        if names != (executable_name,):
             raise MirrorSyncError(
                 "private Git executable directory contains unexpected entries"
             )
@@ -1965,13 +2024,14 @@ def _revalidate_private_git_executable(
     _revalidate_control_object(root, binding.private)
     _revalidate_control_object(root, binding.owner_record)
     _revalidate_control_object(root, binding.executable)
-    try:
-        names = sorted(os.listdir(binding.private.fd))
-    except OSError as error:
-        raise MirrorSyncError(
-            f"private Git executable directory became unreadable: {error}"
-        ) from error
-    if names != [binding.executable_name]:
+    names = _bounded_sorted_directory_names(
+        binding.private.fd,
+        maximum_entries=1,
+        label="private Git executable directory",
+        limit_error="private Git executable directory contains unexpected entries",
+        operation=root.operation,
+    )
+    if names != (binding.executable_name,):
         raise MirrorSyncError(
             "private Git executable directory namespace changed before "
             "transaction completion"
@@ -2517,17 +2577,17 @@ def _revalidate_control_absence(
 ) -> None:
     _revalidate_control_object(root, binding.parent)
     if binding.collision_key is not None:
-        try:
-            names = os.listdir(binding.parent.fd)
-        except OSError as error:
-            raise MirrorSyncError(
-                f"{binding.label} absence became unreadable: {error}"
-            ) from error
+        names = _bounded_sorted_directory_names(
+            binding.parent.fd,
+            maximum_entries=MAX_GIT_SNAPSHOT_ENTRIES,
+            label=f"{binding.label} absence parent",
+            limit_error=(
+                f"{binding.label} absence parent exceeds the "
+                f"{MAX_GIT_SNAPSHOT_ENTRIES}-entry limit"
+            ),
+            operation=root.operation,
+        )
         for name in names:
-            if not isinstance(name, str) or name in {"", ".", ".."} or "/" in name:
-                raise MirrorSyncError(
-                    f"{binding.label} parent contains an unsafe entry: {name!r}"
-                )
             if _path_collision_key(PurePosixPath(name)) == binding.collision_key:
                 raise MirrorSyncError(
                     f"{binding.label} appeared before transaction completion"
@@ -2585,27 +2645,20 @@ def _remove_private_tree_contents(
         operation,
         f"cleaning isolated private Git directory {display_path}",
     )
-    try:
-        names = sorted(os.listdir(directory_fd))
-    except OSError as error:
-        raise MirrorSyncError(
-            f"cannot inventory isolated private Git control directory "
-            f"{display_path}: {error}"
-        ) from error
+    scanned_entries = budget.setdefault("scanned_entries", 0)
+    names = _bounded_sorted_directory_names(
+        directory_fd,
+        maximum_entries=max(0, MAX_GIT_SNAPSHOT_ENTRIES - scanned_entries),
+        label=f"isolated private Git control directory {display_path}",
+        limit_error="isolated private Git cleanup exceeds its entry limit",
+        operation=operation,
+    )
+    budget["scanned_entries"] = scanned_entries + len(names)
     for name in names:
         budget["entries"] += 1
         if budget["entries"] > MAX_GIT_SNAPSHOT_ENTRIES:
             raise MirrorSyncError(
                 "isolated private Git cleanup exceeds its entry limit"
-            )
-        _consume_operation_budget(
-            operation,
-            entry_count=1,
-            label=f"cleaning isolated private Git entry {display_path / name}",
-        )
-        if not isinstance(name, str) or name in {"", ".", ".."} or "/" in name:
-            raise MirrorSyncError(
-                f"isolated private Git control directory has an unsafe entry: {name!r}"
             )
         child_path = display_path / name
         try:
@@ -2775,20 +2828,12 @@ def _recover_stale_private_snapshots(
     tool_root: ControlObjectBinding,
 ) -> None:
     _operation_checkpoint(root.operation, "scanning private Git tool root")
-    try:
-        names = sorted(os.listdir(tool_root.fd))
-    except OSError as error:
-        raise MirrorSyncError(
-            f"cannot inventory private Git tool root: {error}"
-        ) from error
-    if len(names) > MAX_TOOL_ROOT_ENTRIES:
-        raise MirrorSyncError(
-            f"private Git tool root exceeds {MAX_TOOL_ROOT_ENTRIES} entries"
-        )
-    _consume_operation_budget(
-        root.operation,
-        entry_count=len(names),
-        label="scanning private Git tool root",
+    names = _bounded_sorted_directory_names(
+        tool_root.fd,
+        maximum_entries=MAX_TOOL_ROOT_ENTRIES,
+        label="private Git tool root",
+        limit_error=(f"private Git tool root exceeds {MAX_TOOL_ROOT_ENTRIES} entries"),
+        operation=root.operation,
     )
     owner_names = [
         name

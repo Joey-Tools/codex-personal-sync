@@ -3201,6 +3201,175 @@ class CodexPersonalSyncTests(unittest.TestCase):
             self.assertNotEqual(workspace.path.parent, real_parent)
             self.assertTrue(workspace.path.is_dir())
 
+    def test_temporary_archive_workspace_normalizes_macos_system_temp_alias(
+        self,
+    ) -> None:
+        canonical_parent = self.root / "private-tmp"
+        alias_parent = self.root / "tmp"
+        canonical_parent.mkdir(mode=0o700)
+        canonical_parent = canonical_parent.resolve()
+        alias_parent.symlink_to(canonical_parent, target_is_directory=True)
+
+        workspace_path: Path | None = None
+        with (
+            mock.patch.object(MODULE.sys, "platform", "darwin"),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_ALIAS",
+                alias_parent,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_DIRECTORY",
+                canonical_parent,
+            ),
+            mock.patch.object(
+                MODULE.tempfile,
+                "gettempdir",
+                return_value=str(alias_parent),
+            ),
+        ):
+            with MODULE.temporary_archive_workspace(
+                prefix="macos-system-temp."
+            ) as workspace:
+                workspace_path = workspace.path
+                self.assertEqual(workspace.path.parent, canonical_parent)
+                self.assertEqual(stat.S_IMODE(workspace.path.stat().st_mode), 0o700)
+
+        assert workspace_path is not None
+        self.assertFalse(workspace_path.exists())
+        self.assertTrue(alias_parent.is_symlink())
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and Path("/tmp").is_symlink(),
+        "requires the macOS system /tmp alias",
+    )
+    def test_actual_macos_system_temp_alias_binds_private_tmp(self) -> None:
+        workspace_path: Path | None = None
+
+        with MODULE.temporary_archive_workspace(
+            prefix="codex-system-tmp-regression.",
+            parent=Path("/tmp"),
+        ) as workspace:
+            workspace_path = workspace.path
+            self.assertEqual(workspace.path.parent, Path("/private/tmp"))
+            self.assertEqual(stat.S_IMODE(workspace.path.stat().st_mode), 0o700)
+
+        assert workspace_path is not None
+        self.assertFalse(workspace_path.exists())
+
+    def test_macos_system_temp_alias_replacement_during_binding_fails_closed(
+        self,
+    ) -> None:
+        canonical_parent = self.root / "replacement-private-tmp"
+        alias_parent = self.root / "replacement-tmp"
+        canonical_parent.mkdir(mode=0o700)
+        canonical_parent = canonical_parent.resolve()
+        alias_parent.symlink_to(canonical_parent, target_is_directory=True)
+        real_open = MODULE.os.open
+        replaced = False
+
+        def replace_alias_before_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal replaced
+            if not replaced and Path(path) == canonical_parent and dir_fd is None:
+                replaced = True
+                alias_parent.unlink()
+                alias_parent.symlink_to(canonical_parent, target_is_directory=True)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with (
+            mock.patch.object(MODULE.sys, "platform", "darwin"),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_ALIAS",
+                alias_parent,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_DIRECTORY",
+                canonical_parent,
+            ),
+            mock.patch.object(
+                MODULE.os,
+                "open",
+                side_effect=replace_alias_before_open,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "system temporary archive alias changed while binding",
+            ),
+        ):
+            with MODULE.bind_archive_workspace(alias_parent):
+                self.fail("a replaced system temporary alias must not be yielded")
+
+        self.assertTrue(replaced)
+        self.assertTrue(alias_parent.is_symlink())
+        self.assertTrue(canonical_parent.is_dir())
+
+    def test_macos_system_temp_alias_rejects_unexpected_target(self) -> None:
+        canonical_parent = self.root / "expected-private-tmp"
+        unexpected_parent = self.root / "unexpected-private-tmp"
+        alias_parent = self.root / "unexpected-tmp"
+        canonical_parent.mkdir(mode=0o700)
+        unexpected_parent.mkdir(mode=0o700)
+        canonical_parent = canonical_parent.resolve()
+        unexpected_parent = unexpected_parent.resolve()
+        alias_parent.symlink_to(unexpected_parent, target_is_directory=True)
+
+        with (
+            mock.patch.object(MODULE.sys, "platform", "darwin"),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_ALIAS",
+                alias_parent,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_DIRECTORY",
+                canonical_parent,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "refusing non-standard macOS system temporary alias",
+            ),
+        ):
+            with MODULE.bind_archive_workspace(alias_parent):
+                self.fail("an unexpected system temporary target must not be yielded")
+
+    def test_archive_workspace_revalidates_access_policy_not_child_churn(
+        self,
+    ) -> None:
+        parent = self.root / "archive-access-policy"
+        parent.mkdir(mode=0o700)
+
+        with MODULE.bind_archive_workspace(parent) as workspace:
+            child = parent / "benign-child"
+            child.write_text(
+                "content churn is not parent replacement\n", encoding="utf-8"
+            )
+            check_fd = MODULE._duplicate_bound_archive_workspace(workspace)
+            os.close(check_fd)
+
+            parent.chmod(0o755)
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "archive workspace binding changed",
+            ):
+                MODULE._duplicate_bound_archive_workspace(workspace)
+
+    def test_arbitrary_archive_workspace_leaf_symlink_remains_rejected(self) -> None:
+        canonical_parent = self.root / "arbitrary-real-temp"
+        alias_parent = self.root / "arbitrary-temp-alias"
+        canonical_parent.mkdir(mode=0o700)
+        alias_parent.symlink_to(canonical_parent, target_is_directory=True)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "failed to bind archive workspace",
+        ):
+            with MODULE.bind_archive_workspace(alias_parent):
+                self.fail("an arbitrary leaf symlink must remain rejected")
+
     def test_temporary_archive_workspace_rejects_leaf_replacement_before_open(
         self,
     ) -> None:
@@ -3692,6 +3861,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 path=first_workspace.path,
                 fd=second_workspace.fd,
                 identity=first_workspace.identity,
+                access_policy=first_workspace.access_policy,
             )
             with self.assertRaisesRegex(
                 MODULE.SyncError,

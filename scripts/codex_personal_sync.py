@@ -182,6 +182,8 @@ MAX_SCHEDULER_RUNNER_BYTES = 16 * 1024 * 1024
 MIRROR_PRIVATE_CONTROL_PARENT = Path(
     "/private/tmp" if sys.platform == "darwin" else "/var/tmp"
 )
+MACOS_SYSTEM_TEMP_ALIAS = Path("/tmp")
+MACOS_SYSTEM_TEMP_DIRECTORY = Path("/private/tmp")
 MIRROR_PRIVATE_TOOL_ROOT_NAME = "codex-sync-canonical-mirrors"
 MIRROR_DURABLE_QUARANTINE_ROOT_NAME = ".codex-sync-canonical-mirror-quarantine"
 MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT = 10_000
@@ -297,6 +299,18 @@ class BoundArchiveWorkspace:
     path: Path
     fd: int
     identity: tuple[int, int]
+    access_policy: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class ArchiveWorkspaceAliasBinding:
+    path: Path
+    target: Path
+    link_target: str
+    identity: tuple[int, int, int]
+    access_policy: tuple[int, int, int]
+    target_identity: tuple[int, int, int]
+    target_access_policy: tuple[int, int, int]
 
 
 @dataclass(frozen=True)
@@ -2139,9 +2153,131 @@ def _archive_directory_open_flags() -> int:
     return flags
 
 
+def _archive_workspace_object_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int]:
+    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+
+def _archive_workspace_access_policy(
+    metadata: os.stat_result,
+) -> tuple[int, int, int]:
+    return stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid
+
+
+def _normalize_archive_workspace_path(
+    path: Path,
+) -> tuple[Path, ArchiveWorkspaceAliasBinding | None]:
+    """Resolve only the exact macOS system temp alias to its fixed target.
+
+    The alias object, link value, and access policy plus the target directory's
+    object identity and access policy are protected. Directory timestamps and
+    child-entry churn are deliberately not treated as content mutation.
+    """
+    workspace_path = Path(os.path.abspath(path))
+    if sys.platform != "darwin" or workspace_path != MACOS_SYSTEM_TEMP_ALIAS:
+        return workspace_path, None
+    try:
+        alias_metadata = os.lstat(workspace_path)
+    except OSError as error:
+        raise SyncError(
+            f"failed to inspect archive workspace {workspace_path}: {error}"
+        ) from error
+    if not stat.S_ISLNK(alias_metadata.st_mode):
+        return workspace_path, None
+
+    canonical_path = Path(os.path.realpath(MACOS_SYSTEM_TEMP_DIRECTORY))
+    expected_link_targets = {
+        str(canonical_path),
+        os.path.relpath(canonical_path, workspace_path.parent),
+    }
+    try:
+        link_target = os.readlink(workspace_path)
+        resolved_path = Path(os.path.realpath(workspace_path))
+        canonical_metadata = os.lstat(canonical_path)
+        followed_metadata = os.stat(workspace_path)
+    except OSError as error:
+        raise SyncError(
+            f"failed to resolve system temporary archive workspace "
+            f"{workspace_path}: {error}"
+        ) from error
+    target_identity = _archive_workspace_object_identity(canonical_metadata)
+    target_access_policy = _archive_workspace_access_policy(canonical_metadata)
+    if (
+        link_target not in expected_link_targets
+        or resolved_path != canonical_path
+        or not stat.S_ISDIR(canonical_metadata.st_mode)
+        or _archive_workspace_object_identity(followed_metadata) != target_identity
+        or _archive_workspace_access_policy(followed_metadata) != target_access_policy
+    ):
+        raise SyncError(
+            f"refusing non-standard macOS system temporary alias: {workspace_path}"
+        )
+    return canonical_path, ArchiveWorkspaceAliasBinding(
+        path=workspace_path,
+        target=canonical_path,
+        link_target=link_target,
+        identity=_archive_workspace_object_identity(alias_metadata),
+        access_policy=_archive_workspace_access_policy(alias_metadata),
+        target_identity=target_identity,
+        target_access_policy=target_access_policy,
+    )
+
+
+def _revalidate_archive_workspace_alias(
+    binding: ArchiveWorkspaceAliasBinding,
+    descriptor_metadata: os.stat_result,
+) -> None:
+    """Revalidate the system alias snapshot against the opened target fd."""
+    try:
+        alias_metadata = os.lstat(binding.path)
+        link_target = os.readlink(binding.path)
+        resolved_path = Path(os.path.realpath(binding.path))
+        canonical_metadata = os.lstat(binding.target)
+        followed_metadata = os.stat(binding.path)
+    except OSError as error:
+        raise SyncError(
+            f"system temporary archive alias became unavailable: "
+            f"{binding.path}: {error}"
+        ) from error
+    if (
+        _archive_workspace_object_identity(alias_metadata) != binding.identity
+        or _archive_workspace_access_policy(alias_metadata) != binding.access_policy
+        or link_target != binding.link_target
+        or resolved_path != binding.target
+    ):
+        raise SyncError(
+            f"system temporary archive alias changed while binding: {binding.path}"
+        )
+    if (
+        _archive_workspace_object_identity(canonical_metadata)
+        != binding.target_identity
+        or _archive_workspace_object_identity(followed_metadata)
+        != binding.target_identity
+        or _archive_workspace_object_identity(descriptor_metadata)
+        != binding.target_identity
+    ):
+        raise SyncError(
+            "system temporary archive directory was replaced while binding: "
+            f"{binding.target}"
+        )
+    if (
+        _archive_workspace_access_policy(canonical_metadata)
+        != binding.target_access_policy
+        or _archive_workspace_access_policy(followed_metadata)
+        != binding.target_access_policy
+        or _archive_workspace_access_policy(descriptor_metadata)
+        != binding.target_access_policy
+    ):
+        raise SyncError(
+            "system temporary archive directory access policy changed while "
+            f"binding: {binding.target}"
+        )
+
+
 @contextlib.contextmanager
 def bind_archive_workspace(path: Path) -> Iterator[BoundArchiveWorkspace]:
-    workspace_path = Path(os.path.abspath(path))
+    workspace_path, alias_binding = _normalize_archive_workspace_path(path)
     workspace_fd = -1
     try:
         workspace_fd = os.open(workspace_path, _archive_directory_open_flags())
@@ -2154,18 +2290,27 @@ def bind_archive_workspace(path: Path) -> Iterator[BoundArchiveWorkspace]:
             f"failed to bind archive workspace {workspace_path}: {error}"
         ) from error
     identity = (opened_metadata.st_dev, opened_metadata.st_ino)
+    access_policy = _archive_workspace_access_policy(opened_metadata)
     if (
         not stat.S_ISDIR(opened_metadata.st_mode)
         or not stat.S_ISDIR(path_metadata.st_mode)
         or (path_metadata.st_dev, path_metadata.st_ino) != identity
+        or _archive_workspace_access_policy(path_metadata) != access_policy
     ):
         os.close(workspace_fd)
         raise SyncError(f"archive workspace changed while binding: {workspace_path}")
+    if alias_binding is not None:
+        try:
+            _revalidate_archive_workspace_alias(alias_binding, opened_metadata)
+        except BaseException:
+            os.close(workspace_fd)
+            raise
     try:
         yield BoundArchiveWorkspace(
             path=workspace_path,
             fd=workspace_fd,
             identity=identity,
+            access_policy=access_policy,
         )
     finally:
         active_error = sys.exc_info()[0] is not None
@@ -2202,6 +2347,8 @@ def _duplicate_bound_archive_workspace(workspace: BoundArchiveWorkspace) -> int:
         or not stat.S_ISDIR(path_metadata.st_mode)
         or identity != workspace.identity
         or (path_metadata.st_dev, path_metadata.st_ino) != workspace.identity
+        or _archive_workspace_access_policy(opened_metadata) != workspace.access_policy
+        or _archive_workspace_access_policy(path_metadata) != workspace.access_policy
     ):
         os.close(workspace_fd)
         raise SyncError(f"archive workspace binding changed: {workspace_path}")
@@ -2500,6 +2647,7 @@ def create_bound_temporary_archive_workspace(
             path=workspace_path,
             fd=workspace_fd,
             identity=workspace_identity,
+            access_policy=_archive_workspace_access_policy(opened_metadata),
         )
         check_fd = _duplicate_bound_archive_workspace(workspace)
         os.close(check_fd)
@@ -17279,6 +17427,7 @@ def _download_and_extract_release_with_deadline(
         path=Path(os.path.abspath(destination)),
         fd=destination_fd,
         identity=_directory_identity(destination_fd),
+        access_policy=_archive_workspace_access_policy(os.fstat(destination_fd)),
     )
     try:
         download_release_assets(

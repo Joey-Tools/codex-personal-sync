@@ -35,6 +35,15 @@ superseded_by:
 
 ## Current State
 
+- The final Darwin archive-workspace follow-up recognizes only the platform's
+  exact `/tmp -> /private/tmp` alias and continues through a no-follow binding
+  of the canonical directory. It protects alias and target object identity plus
+  access policy while accepting benign directory timestamp and child-entry
+  churn; every other leaf symlink remains fail-closed. Mirror-control,
+  private-object, cleanup, and tool-root inventories now stop at `limit + 1`
+  producer entries, retain and sort no more than the declared limit, close the
+  iterator on every path, and reserve all sibling names before recursion so a
+  deep first child cannot multiply the aggregate entry budget.
 - The 2026-08-01 closure makes GitHub repository identities
   ASCII-case-insensitive, rejects portable source-path aliases and source modes
   other than `0644` / `0755`, and keeps transaction-journal inspection
@@ -236,6 +245,23 @@ superseded_by:
 
 ## Validation Evidence
 
+- The post-review archive/bounded-inventory follow-up passed all 839 native
+  Python 3.13 tests: 686 non-source-lock tests in 872.714 seconds with the one
+  expected Linux-only skip, plus 153 source-lock tests in 1,310.454 seconds.
+  Its 18 new focused tests also passed under Python 3.13 in 7.546 seconds and
+  Xcode Python 3.9.6 in 4.990 seconds. Both runtimes passed compileall with
+  task-private bytecode roots; full-tree Ruff lint/format, JSON parsing,
+  actionlint, project-journal validation, and `git diff --check` passed, and no
+  bytecode cache remains in the repository.
+- Task-private `refresh-lock` and `refresh-lock --check` both verified all six
+  canonical sources without accessing or mutating the retained production
+  quarantine. The resulting SHA-256 values are
+  `5333f82f4487b13bd99d3a97b17cbe50446e3eab11ceee2c8a4a77f1af2b1f62`
+  for `sync-source-lock.json`,
+  `31ea7eb6a8313a0e3a757dd875ba3e9e22705663b4e53495e5006b3bd2eb8f6d`
+  for the engine, and
+  `ecb1765b24e850ef9c54379c867ef2f6dca6e59ec54346b7e50fbdd7795db984`
+  for the mirror generator.
 - The 2026-08-01 final native-Python partition passed all 821 repository tests:
   203 engine tests in 49.518 seconds (one Linux-only skip), 118
   scheduler/doctor tests in 18.019 seconds, 359 reconciliation/retention/

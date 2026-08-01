@@ -41,6 +41,59 @@ ENGINE_MODULE = _load_module(
 )
 
 
+class CountingScandir:
+    class Entry:
+        def __init__(self, owner: CountingScandir, value: object) -> None:
+            self.owner = owner
+            self.value = value
+
+        @property
+        def name(self) -> object:
+            self.owner.name_reads += 1
+            return self.value
+
+    def __init__(
+        self,
+        names: list[object],
+        *,
+        error_at_next: int | None = None,
+        close_error: bool = False,
+    ) -> None:
+        self.names = names
+        self.error_at_next = error_at_next
+        self.close_error = close_error
+        self.index = 0
+        self.next_calls = 0
+        self.yielded_count = 0
+        self.name_reads = 0
+        self.closed = False
+
+    def __enter__(self) -> CountingScandir:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def __iter__(self) -> CountingScandir:
+        return self
+
+    def __next__(self) -> Entry:
+        self.next_calls += 1
+        if self.error_at_next == self.next_calls:
+            raise OSError("simulated scandir producer failure")
+        if self.index >= len(self.names):
+            raise StopIteration
+        value = self.names[self.index]
+        self.index += 1
+        self.yielded_count += 1
+        return self.Entry(self, value)
+
+    def close(self) -> None:
+        self.closed = True
+        if self.close_error:
+            raise OSError("simulated scandir close failure")
+
+
 class MirrorGeneratorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory(
@@ -286,6 +339,353 @@ class MirrorGeneratorTests(unittest.TestCase):
             json.dumps(payload, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+
+    def test_bounded_directory_scan_stops_at_limit_plus_one(self) -> None:
+        producer = CountingScandir(["c", "b", "a", "overflow", "unread"])
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE.os,
+                "scandir",
+                return_value=producer,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "scanned at least 4 entries and retained 3",
+            ),
+        ):
+            MIRROR_MODULE._bounded_sorted_directory_names(
+                123,
+                maximum_entries=3,
+                label="test directory",
+                limit_error="test directory exceeds its entry limit",
+            )
+
+        self.assertEqual(producer.next_calls, 4)
+        self.assertEqual(producer.yielded_count, 4)
+        self.assertEqual(producer.name_reads, 3)
+        self.assertTrue(producer.closed)
+
+    def test_bounded_directory_scan_sorts_only_bounded_names(self) -> None:
+        producer = CountingScandir(["c", "a", "b"])
+
+        with mock.patch.object(
+            MIRROR_MODULE.os,
+            "scandir",
+            return_value=producer,
+        ):
+            names = MIRROR_MODULE._bounded_sorted_directory_names(
+                123,
+                maximum_entries=3,
+                label="test directory",
+                limit_error="test directory exceeds its entry limit",
+            )
+
+        self.assertEqual(names, ("a", "b", "c"))
+        self.assertEqual(producer.yielded_count, 3)
+        self.assertEqual(producer.name_reads, 3)
+        self.assertTrue(producer.closed)
+
+    def test_bounded_directory_scan_closes_iterator_after_producer_error(
+        self,
+    ) -> None:
+        producer = CountingScandir(
+            ["first", "unread"],
+            error_at_next=2,
+        )
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE.os,
+                "scandir",
+                return_value=producer,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "cannot inventory test directory: simulated scandir producer failure",
+            ),
+        ):
+            MIRROR_MODULE._bounded_sorted_directory_names(
+                123,
+                maximum_entries=3,
+                label="test directory",
+                limit_error="test directory exceeds its entry limit",
+            )
+
+        self.assertEqual(producer.yielded_count, 1)
+        self.assertEqual(producer.name_reads, 1)
+        self.assertTrue(producer.closed)
+
+    def test_bounded_directory_scan_honors_remaining_operation_budget(
+        self,
+    ) -> None:
+        producer = CountingScandir(["a", "b", "overflow", "unread"])
+        operation = MIRROR_MODULE.OperationBudget(
+            deadline=time.monotonic() + 30,
+            remaining_bytes=1024,
+            remaining_entries=2,
+        )
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE.os,
+                "scandir",
+                return_value=producer,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "aggregate budget.*scanned at least 3 entries and retained 2",
+            ),
+        ):
+            MIRROR_MODULE._bounded_sorted_directory_names(
+                123,
+                maximum_entries=100,
+                label="test directory",
+                limit_error="test directory exceeds its entry limit",
+                operation=operation,
+            )
+
+        self.assertEqual(producer.yielded_count, 3)
+        self.assertEqual(producer.name_reads, 2)
+        self.assertTrue(producer.closed)
+
+    def test_bounded_directory_scan_reports_close_failure_distinctly(self) -> None:
+        producer = CountingScandir(["entry"], close_error=True)
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE.os,
+                "scandir",
+                return_value=producer,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "failed to close directory scan for test directory: "
+                "simulated scandir close failure",
+            ),
+        ):
+            MIRROR_MODULE._bounded_sorted_directory_names(
+                123,
+                maximum_entries=1,
+                label="test directory",
+                limit_error="test directory exceeds its entry limit",
+            )
+
+        self.assertTrue(producer.closed)
+
+    def test_bounded_directory_scan_close_failure_preserves_cap_error(
+        self,
+    ) -> None:
+        producer = CountingScandir(["retained", "overflow"], close_error=True)
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE.os,
+                "scandir",
+                return_value=producer,
+            ),
+            redirect_stderr(stderr),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "test directory exceeds its entry limit; "
+                "scanned at least 2 entries and retained 1",
+            ),
+        ):
+            MIRROR_MODULE._bounded_sorted_directory_names(
+                123,
+                maximum_entries=1,
+                label="test directory",
+                limit_error="test directory exceeds its entry limit",
+            )
+
+        self.assertTrue(producer.closed)
+        self.assertIn(
+            "warning: failed to close directory scan for test directory",
+            stderr.getvalue(),
+        )
+
+    def test_git_snapshot_scan_applies_remaining_entry_cap_before_sort(
+        self,
+    ) -> None:
+        directory = self.root / "bounded-git-snapshot"
+        directory.mkdir()
+        for name in ("a", "b", "c"):
+            (directory / name).write_bytes(name.encode("ascii"))
+        directory_fd = os.open(directory, MIRROR_MODULE._DIRECTORY_FLAGS)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "MAX_GIT_SNAPSHOT_ENTRIES",
+                    2,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "Git control snapshot exceeds its entry limit; "
+                    "scanned at least 3 entries and retained 2",
+                ),
+            ):
+                MIRROR_MODULE._snapshot_git_directory_tree(
+                    directory_fd,
+                    None,
+                    prefix=PurePosixPath("git"),
+                    budget={"entries": 0, "bytes": 0},
+                )
+        finally:
+            os.close(directory_fd)
+
+    def test_private_object_scan_applies_remaining_entry_cap_before_sort(
+        self,
+    ) -> None:
+        directory = self.root / "bounded-object-snapshot"
+        directory.mkdir()
+        for name in ("a", "b", "c"):
+            (directory / name).write_bytes(name.encode("ascii"))
+        directory_fd = os.open(directory, MIRROR_MODULE._DIRECTORY_FLAGS)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "MAX_GIT_SNAPSHOT_ENTRIES",
+                    2,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "private Git object snapshot exceeds its entry limit; "
+                    "scanned at least 3 entries and retained 2",
+                ),
+            ):
+                MIRROR_MODULE._inventory_private_git_objects(
+                    directory_fd,
+                    None,
+                    bind_content=False,
+                )
+        finally:
+            os.close(directory_fd)
+
+    def test_git_snapshot_scan_reserves_siblings_before_recursing(self) -> None:
+        directory = self.root / "recursive-git-snapshot"
+        (directory / "a").mkdir(parents=True)
+        (directory / "a" / "child").write_bytes(b"child\n")
+        (directory / "z").write_bytes(b"sibling\n")
+        directory_fd = os.open(directory, MIRROR_MODULE._DIRECTORY_FLAGS)
+        budget = {"entries": 0, "bytes": 0}
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "MAX_GIT_SNAPSHOT_ENTRIES",
+                    2,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "Git control snapshot exceeds its entry limit; "
+                    "scanned at least 1 entries and retained 0",
+                ),
+            ):
+                MIRROR_MODULE._snapshot_git_directory_tree(
+                    directory_fd,
+                    None,
+                    prefix=PurePosixPath("git"),
+                    budget=budget,
+                )
+        finally:
+            os.close(directory_fd)
+
+        self.assertEqual(budget["scanned_entries"], 2)
+        self.assertEqual(budget["entries"], 1)
+
+    def test_private_object_scan_reserves_siblings_before_recursing(self) -> None:
+        directory = self.root / "recursive-object-snapshot"
+        (directory / "a").mkdir(parents=True)
+        (directory / "a" / "child").write_bytes(b"child\n")
+        (directory / "z").write_bytes(b"sibling\n")
+        directory_fd = os.open(directory, MIRROR_MODULE._DIRECTORY_FLAGS)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "MAX_GIT_SNAPSHOT_ENTRIES",
+                    2,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "private Git object snapshot exceeds its entry limit; "
+                    "scanned at least 1 entries and retained 0",
+                ),
+            ):
+                MIRROR_MODULE._inventory_private_git_objects(
+                    directory_fd,
+                    None,
+                    bind_content=False,
+                )
+        finally:
+            os.close(directory_fd)
+
+    def test_private_cleanup_scan_reserves_siblings_before_recursing(self) -> None:
+        directory = self.root / "recursive-cleanup-snapshot"
+        (directory / "a").mkdir(parents=True)
+        (directory / "a" / "child").write_bytes(b"child\n")
+        (directory / "z").write_bytes(b"sibling\n")
+        directory_fd = os.open(directory, MIRROR_MODULE._DIRECTORY_FLAGS)
+        budget = {"entries": 0}
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "MAX_GIT_SNAPSHOT_ENTRIES",
+                    2,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "isolated private Git cleanup exceeds its entry limit; "
+                    "scanned at least 1 entries and retained 0",
+                ),
+            ):
+                MIRROR_MODULE._remove_private_tree_contents(
+                    directory_fd,
+                    PurePosixPath("cleanup"),
+                    budget=budget,
+                )
+        finally:
+            os.close(directory_fd)
+
+        self.assertEqual(budget["scanned_entries"], 2)
+        self.assertEqual(budget["entries"], 1)
+        self.assertTrue((directory / "a" / "child").is_file())
+        self.assertTrue((directory / "z").is_file())
+
+    def test_private_tool_root_scan_applies_cap_before_sort(self) -> None:
+        tool_root_path = (
+            MIRROR_MODULE.PRIVATE_GIT_CONTROL_PARENT
+            / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        )
+        tool_root_path.mkdir(mode=0o700)
+        for name in ("a", "b", "c"):
+            (tool_root_path / name).write_bytes(name.encode("ascii"))
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        tool_root = MIRROR_MODULE._bind_absolute_control_object(
+            tool_root_path,
+            "test private Git tool root",
+            require_directory=True,
+        )
+        try:
+            with (
+                mock.patch.object(MIRROR_MODULE, "MAX_TOOL_ROOT_ENTRIES", 2),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "private Git tool root exceeds 2 entries; "
+                    "scanned at least 3 entries and retained 2",
+                ),
+            ):
+                MIRROR_MODULE._recover_stale_private_snapshots(
+                    bound_root,
+                    tool_root,
+                )
+        finally:
+            os.close(tool_root.fd)
+            MIRROR_MODULE._finish_bound_roots(bound_root)
 
     def test_generate_and_check_are_strictly_one_way(self) -> None:
         target = self.target_root / "scripts" / "engine.py"
