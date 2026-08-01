@@ -4,8 +4,8 @@
 
 `Joey-Tools/codex-personal-sync` 是同步引擎、manifest schema 和兼容性测试的 canonical source（唯一权威可编辑来源）。[`sync-source-lock.json`](../sync-source-lock.json) 记录 canonical 文件的 SHA-256、mode，以及它们在下游仓库中的目标路径；[`scripts/sync_canonical_mirrors.py`](../scripts/sync_canonical_mirrors.py) 只允许显式选择一个 mirror 和一个现有 target root。
 
-- `toolbox` 和 `private` mirrors 都消费 lock 声明的引擎、schema，以及 reconciliation safety、release retention、scheduler/doctor 定向测试。
-- 只有面向 `Joey-Tools/codex-toolbox` 的 `toolbox` mirror 额外消费完整 `tests/test_codex_personal_sync.py`；`private` mirror 面向 `Joey-Tools/codex-private-workflows`。
+- 面向 `Joey-Tools/codex-toolbox` 的 `toolbox` mirror 消费 lock 声明的引擎、schema、完整 `tests/test_codex_personal_sync.py`，以及 reconciliation safety、release retention、scheduler/doctor 定向测试。
+- `Joey-Tools/codex-private-workflows` 不属于 canonical source lock 的直接 mirror。它只能从 receipt 绑定的 exact toolbox commit 与对应完整 immutable public release 消费 synchronizer；同步链固定为 canonical → toolbox → private。
 - `refresh-lock` 只读取 canonical source；`managed-paths` 只读地返回当前 target 与经旧 receipt/HEAD/index/worktree 共同证明的退役 target；`generate` 只执行 canonical → consumer 的条件写入/删除；`check` 只比较已声明的 bytes 和 mode。任何 canonical hash/mode 漂移都会先失败。
 - consumer 中的生成文件不是反向输入，也不应手工修补。新增 mirror 文件必须先进入 source lock，不能靠目录级复制扩大边界。
 

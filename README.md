@@ -11,14 +11,15 @@ tests, and the sync-manifest JSON Schema:
 - `tests/test_*.py`
 - `schema/sync-manifest.schema.json`
 
-`sync-source-lock.json` declares generated consumer mirrors in
-`Joey-Tools/codex-toolbox` and `Joey-Tools/codex-private-workflows`. Treat those
-copies as read-only. Changes flow from this repository to consumers and never
-in the reverse direction.
+`sync-source-lock.json` declares the generated consumer mirror in
+`Joey-Tools/codex-toolbox`. Treat that copy as read-only. Changes flow from this
+repository to toolbox and never in the reverse direction.
 
-Both consumers receive the engine, manifest Schema, and focused safety,
-retention, and scheduler/doctor tests. The toolbox mirror additionally receives
-the full `tests/test_codex_personal_sync.py` behavior suite.
+The toolbox mirror receives the engine, manifest schema, full behavior suite,
+and focused safety, retention, and scheduler/doctor tests.
+`Joey-Tools/codex-private-workflows` consumes the synchronizer only from a
+receipt-bound exact toolbox commit and its complete immutable public release;
+there is no direct canonical-to-private mirror.
 
 Canonical `master` pushes can open or update the scoped toolbox mirror pull
 request through `.github/workflows/sync-toolbox.yml`. The workflow requires the
@@ -60,14 +61,6 @@ python3 scripts/sync_canonical_mirrors.py generate \
 python3 scripts/sync_canonical_mirrors.py check \
   --mirror toolbox \
   --target-root /path/to/codex-toolbox
-
-python3 scripts/sync_canonical_mirrors.py generate \
-  --mirror private \
-  --target-root /path/to/codex-private-workflows \
-  --source-commit "$SOURCE_COMMIT"
-python3 scripts/sync_canonical_mirrors.py check \
-  --mirror private \
-  --target-root /path/to/codex-private-workflows
 ```
 
 The generator binds canonical and consumer roots by directory file descriptor

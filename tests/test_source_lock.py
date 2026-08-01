@@ -6491,21 +6491,12 @@ class RepositorySourceLockTests(unittest.TestCase):
                 "scheduler_doctor_tests",
             },
         )
+        self.assertEqual(set(source_lock.mirrors), {"toolbox"})
         self.assertEqual(
             set(source_lock.mirrors["toolbox"].files),
             {
                 "engine",
                 "engine_tests",
-                "manifest_schema",
-                "reconciliation_safety_tests",
-                "release_retention_tests",
-                "scheduler_doctor_tests",
-            },
-        )
-        self.assertEqual(
-            set(source_lock.mirrors["private"].files),
-            {
-                "engine",
                 "manifest_schema",
                 "reconciliation_safety_tests",
                 "release_retention_tests",

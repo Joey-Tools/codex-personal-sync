@@ -26,7 +26,9 @@ superseded_by:
 
 ## Scope
 
-- Establish a one-way canonical source lock and explicit `toolbox` / `private` mirror generation boundary.
+- Establish a one-way canonical source lock and explicit canonical → toolbox →
+  private propagation boundary, with toolbox as the only direct generated
+  mirror.
 - Keep release trees immutable after publication, bind `current` and managed-link transitions to durable evidence, and make `removed_links` an exact migration proof rather than a broad deletion authority.
 - Run schedulers through the stable installed runner, preserve audited interval configuration, and publish a bounded runtime status contract.
 - Audit the active skill discovery root read-only.
@@ -746,6 +748,35 @@ superseded_by:
   lint/format, JSON parsing, and `git diff --check` also passed. Production
   refresh remains intentionally blocked until a separate recovery-authorized
   quarantine workstream resolves the retained evidence.
+- A final ownership audit found that the repository lock still modeled
+  canonical-to-private generation even though the approved release topology is
+  canonical → toolbox → private. The real lock now declares only the toolbox
+  mirror; private propagation is explicitly receipt-bound to the exact toolbox
+  commit and complete immutable public release. The generic multi-consumer
+  parser fixture remains covered, so this governance correction does not
+  remove engine support for another declared consumer. The exact follow-up
+  bytes passed all 133 source-lock tests in 598.528 seconds with Python 3.13.0
+  and 636.144 seconds with Xcode Python 3.9.6. The focused repository-lock and
+  documented credential-interface selections passed in both runtimes; JSON
+  parsing, targeted Ruff lint/format, and `git diff --check` also passed.
+- The final ordinary ownership merge preserves signed safety head
+  `39c7e63358196b055f583f8827ec7db57875bff8` as its first parent and signed
+  toolbox-only ownership commit `4136b174a3faba3d98206d1a5192de1fe423bff3`
+  as its second parent without rebasing or rewriting either line. The merged
+  lock has exactly one `toolbox` mirror. Two task-private refreshes were
+  byte-identical, `refresh-lock --check` verified all six sources, and the
+  resulting `sync-source-lock.json` SHA-256 is
+  `1789ea2aee5ef0d1325201fba6a7d82f0bfe41c5930695bb6a8a39eccf694d0f`.
+  After the merge, all 153 source-lock tests passed under Python 3.13.0 in
+  871.566 seconds and Xcode Python 3.9.6 in 921.177 seconds; all 27 toolbox
+  automation tests passed under Python 3.13.0 in 399.025 seconds. The merge
+  changes only governance/docs, the source lock, and its ownership expectation,
+  so the already-recorded 839-test full implementation gate remains applicable
+  to the unchanged engine/scheduler/reconciliation bytes. Dual-runtime
+  compileall, full-tree Ruff lint/format, JSON parsing, actionlint,
+  project-journal validation, source-lock verification, and staged
+  `git diff --check` also passed. The retained production quarantine and host
+  scheduler state were not mutated.
 
 ## Installed Host Baseline
 
@@ -781,14 +812,15 @@ configuration.
 ## Downstream Dependencies
 
 - `Joey-Tools/codex-toolbox` consumes only files declared by the `toolbox` mirror in `sync-source-lock.json`.
-- `Joey-Tools/codex-private-workflows` consumes only files declared by the `private` mirror in `sync-source-lock.json`.
-- After canonical bytes and mode are finalized, the lock must be refreshed, both generated mirrors must be updated and checked, and consumer validation must run there. Consumer copies must not become alternate sources.
+- `Joey-Tools/codex-private-workflows` consumes the synchronizer only through an exact receipt-bound toolbox commit and its complete immutable public release; no direct canonical-to-private mirror is permitted.
+- After canonical bytes and mode are finalized, the lock must be refreshed, the generated toolbox mirror must be updated and checked, and toolbox validation must run there. Private propagation starts only after that exact toolbox release is complete. Consumer copies must not become alternate sources.
 
 ## Next Steps
 
 - Complete exact-current-head admission, named review, and CI for canonical PR
   #5 before it leaves draft state; do not merge it from this workstream.
 - After the canonical change merges, generate and validate the declared
-  downstream mirrors in their separately owned consumer workstreams.
+  toolbox mirror, publish its exact immutable public release, and bridge that
+  receipt-bound release into the separately owned private-overlay workstream.
 - Provision `CODEX_TOOLBOX_SYNC_TOKEN` separately only if the repository owner
   wants the sync-PR workflow to become operational.

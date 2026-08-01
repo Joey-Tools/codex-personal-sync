@@ -2,16 +2,6 @@
   "canonical_repository": "Joey-Tools/codex-personal-sync",
   "hash_algorithm": "sha256",
   "mirrors": {
-    "private": {
-      "files": {
-        "engine": "scripts/codex_personal_sync.py",
-        "manifest_schema": "schema/sync-manifest.schema.json",
-        "reconciliation_safety_tests": "tests/test_personal_sync_reconciliation_safety.py",
-        "release_retention_tests": "tests/test_release_retention.py",
-        "scheduler_doctor_tests": "tests/test_scheduler_doctor.py"
-      },
-      "repository": "Joey-Tools/codex-private-workflows"
-    },
     "toolbox": {
       "files": {
         "engine": "scripts/codex_personal_sync.py",
