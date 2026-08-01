@@ -120,6 +120,7 @@ GIT_VERSION_RE = re.compile(
     rb"(?:[ .+()A-Za-z0-9_-]*)\n"
 )
 MODE_RE = re.compile(r"^0[0-7]{3}$")
+SUPPORTED_SOURCE_MODES = frozenset({0o644, 0o755})
 PRIVATE_SNAPSHOT_RE = re.compile(r"^sync-canonical-git-control\.[0-9]+\.[0-9a-f]{32}$")
 QUARANTINE_FILE_RE = re.compile(
     r"^(recovery|transient)-file-"
@@ -350,6 +351,14 @@ class FileSnapshot:
     identity: tuple[int, int, int]
     access_policy: tuple[int, int, int]
     size: int
+
+
+@dataclass(frozen=True)
+class TransactionJournalInspection:
+    completion: FileSnapshot | None
+    published: FileSnapshot | None
+    temporary: FileSnapshot | None
+    transaction: tuple[FileSnapshot, dict[str, Any]] | None
 
 
 @dataclass(frozen=True)
@@ -5375,6 +5384,11 @@ def _validate_repository(raw: object, field_name: str) -> str:
     return raw
 
 
+def _repository_identity(repository: str) -> str:
+    """Return GitHub's ASCII case-insensitive repository identity."""
+    return repository.casefold()
+
+
 def _path_collision_key(path: PurePosixPath) -> tuple[str, ...]:
     return tuple(
         unicodedata.normalize("NFC", component).casefold() for component in path.parts
@@ -5484,7 +5498,8 @@ def _parse_source_lock(payload: bytes) -> SourceLock:
     if not raw_sources:
         raise MirrorSyncError("sources must not be empty")
     sources: dict[str, SourceSpec] = {}
-    source_paths: set[PurePosixPath] = set()
+    source_paths: dict[tuple[str, ...], PurePosixPath] = {}
+    lock_path_identity = _path_collision_key(LOCK_PATH)
     for raw_name, raw_source in raw_sources.items():
         name = _validate_name(raw_name, "source name")
         source = _expect_object(raw_source, f"source {name}")
@@ -5495,19 +5510,26 @@ def _parse_source_lock(payload: bytes) -> SourceLock:
             field_name=f"source {name}",
         )
         path = _validate_relative_path(source["path"], f"source {name} path")
-        if path == LOCK_PATH:
+        path_identity = _path_collision_key(path)
+        if path_identity == lock_path_identity:
             raise MirrorSyncError("source lock must not hash itself")
-        if path in source_paths:
-            raise MirrorSyncError(f"duplicate canonical source path: {path}")
-        source_paths.add(path)
+        prior_source_path = source_paths.get(path_identity)
+        if prior_source_path is not None:
+            raise MirrorSyncError(
+                "duplicate/colliding canonical source path under NFC+casefold "
+                f"portability rules: {prior_source_path} and {path}"
+            )
+        source_paths[path_identity] = path
         sha256 = source["sha256"]
         if not isinstance(sha256, str) or SHA256_RE.fullmatch(sha256) is None:
             raise MirrorSyncError(f"source {name} sha256 must be lowercase hex")
         raw_mode = source["mode"]
-        if not isinstance(raw_mode, str) or MODE_RE.fullmatch(raw_mode) is None:
-            raise MirrorSyncError(
-                f"source {name} mode must be a four-digit octal string"
-            )
+        if (
+            not isinstance(raw_mode, str)
+            or MODE_RE.fullmatch(raw_mode) is None
+            or int(raw_mode, 8) not in SUPPORTED_SOURCE_MODES
+        ):
+            raise MirrorSyncError(f"source {name} mode must be 0644 or 0755")
         sources[name] = SourceSpec(
             name=name,
             path=path,
@@ -5519,7 +5541,8 @@ def _parse_source_lock(payload: bytes) -> SourceLock:
     if not raw_mirrors:
         raise MirrorSyncError("mirrors must not be empty")
     mirrors: dict[str, MirrorSpec] = {}
-    repositories: set[str] = set()
+    repositories: dict[str, str] = {}
+    canonical_repository_identity = _repository_identity(canonical_repository)
     for raw_name, raw_mirror in raw_mirrors.items():
         name = _validate_name(raw_name, "mirror name")
         mirror = _expect_object(raw_mirror, f"mirror {name}")
@@ -5533,13 +5556,18 @@ def _parse_source_lock(payload: bytes) -> SourceLock:
             mirror["repository"],
             f"mirror {name} repository",
         )
-        if repository == canonical_repository:
+        repository_identity = _repository_identity(repository)
+        if repository_identity == canonical_repository_identity:
             raise MirrorSyncError(
                 f"mirror {name} must not point back to the canonical repository"
             )
-        if repository in repositories:
-            raise MirrorSyncError(f"duplicate mirror repository: {repository}")
-        repositories.add(repository)
+        prior_repository = repositories.get(repository_identity)
+        if prior_repository is not None:
+            raise MirrorSyncError(
+                "duplicate/colliding mirror repository under GitHub "
+                f"case-insensitive identity: {prior_repository} and {repository}"
+            )
+        repositories[repository_identity] = repository
         raw_files = _expect_object(mirror["files"], f"mirror {name} files")
         if not raw_files:
             raise MirrorSyncError(f"mirror {name} files must not be empty")
@@ -7631,7 +7659,9 @@ def _verify_repository_origin(
         "origin",
     ).decode("utf-8", errors="strict")
     actual_repository = _repository_from_remote(raw_remote)
-    if actual_repository != expected_repository:
+    if _repository_identity(actual_repository) != _repository_identity(
+        expected_repository
+    ):
         raise MirrorSyncError(
             f"{role} repository does not match {expected_repository}: "
             f"{actual_repository}"
@@ -8251,83 +8281,9 @@ def _write_transaction_journal(
                 pass
 
 
-def _load_transaction_journal(
-    target_root: BoundRoot,
-) -> tuple[FileSnapshot, dict[str, Any]] | None:
-    completion = _optional_safe_read_snapshot(
-        target_root,
-        TRANSACTION_COMPLETE_PATH,
-    )
-    published = _optional_safe_read_snapshot(
-        target_root,
-        TRANSACTION_PATH,
-    )
-    if completion is not None:
-        if published is None:
-            try:
-                os.link(
-                    TRANSACTION_COMPLETE_PATH.as_posix(),
-                    TRANSACTION_PATH.as_posix(),
-                    src_dir_fd=target_root.fd,
-                    dst_dir_fd=target_root.fd,
-                    follow_symlinks=False,
-                )
-            except FileExistsError as error:
-                raise MirrorSyncError(
-                    "generation transaction completion raced during recovery"
-                ) from error
-            os.fsync(target_root.fd)
-            published = _safe_read_snapshot(
-                target_root,
-                TRANSACTION_PATH,
-            )
-        if published != completion:
-            raise MirrorSyncError(
-                "generation transaction completion and journal differ"
-            )
-        _isolate_and_remove_file(
-            target_root,
-            target_root.fd,
-            TRANSACTION_COMPLETE_PATH.as_posix(),
-            completion,
-            TRANSACTION_COMPLETE_PATH,
-            retention_kind=QUARANTINE_TRANSIENT_KIND,
-        )
-    temporary = _optional_safe_read_snapshot(
-        target_root,
-        TRANSACTION_TEMP_PATH,
-    )
-    if temporary is not None:
-        if published is None:
-            # Target mutation starts only after the complete pending file is
-            # hard-linked as the authoritative journal. A lone pending file is
-            # therefore a pre-mutation crash and can be discarded, even if its
-            # JSON write was interrupted.
-            _isolate_and_remove_file(
-                target_root,
-                target_root.fd,
-                TRANSACTION_TEMP_PATH.as_posix(),
-                temporary,
-                TRANSACTION_TEMP_PATH,
-                retention_kind=QUARANTINE_TRANSIENT_KIND,
-            )
-            temporary = None
-        elif published != temporary:
-            raise MirrorSyncError(
-                "generation transaction pending and published journals differ"
-            )
-        else:
-            _isolate_and_remove_file(
-                target_root,
-                target_root.fd,
-                TRANSACTION_TEMP_PATH.as_posix(),
-                temporary,
-                TRANSACTION_TEMP_PATH,
-                retention_kind=QUARANTINE_TRANSIENT_KIND,
-            )
-    snapshot = published
-    if snapshot is None:
-        return None
+def _parse_transaction_journal_snapshot(
+    snapshot: FileSnapshot,
+) -> dict[str, Any]:
     if snapshot.mode != 0o600:
         raise MirrorSyncError("generation transaction journal has unsafe mode")
     try:
@@ -8343,7 +8299,133 @@ def _load_transaction_journal(
         raise MirrorSyncError("generation transaction journal is invalid") from error
     if not isinstance(raw, dict):
         raise MirrorSyncError("generation transaction journal must be an object")
-    return snapshot, raw
+    return raw
+
+
+def _inspect_transaction_journal(
+    target_root: BoundRoot,
+) -> TransactionJournalInspection:
+    """Classify transaction artifacts without mutating the consumer."""
+    completion = _optional_safe_read_snapshot(
+        target_root,
+        TRANSACTION_COMPLETE_PATH,
+    )
+    published = _optional_safe_read_snapshot(
+        target_root,
+        TRANSACTION_PATH,
+    )
+    temporary = _optional_safe_read_snapshot(
+        target_root,
+        TRANSACTION_TEMP_PATH,
+    )
+    authoritative = published or completion
+    if completion is not None and published is not None and completion != published:
+        raise MirrorSyncError("generation transaction completion and journal differ")
+    if (
+        temporary is not None
+        and authoritative is not None
+        and temporary != authoritative
+    ):
+        raise MirrorSyncError(
+            "generation transaction pending and published journals differ"
+        )
+    transaction = (
+        None
+        if authoritative is None
+        else (
+            authoritative,
+            _parse_transaction_journal_snapshot(authoritative),
+        )
+    )
+    return TransactionJournalInspection(
+        completion=completion,
+        published=published,
+        temporary=temporary,
+        transaction=transaction,
+    )
+
+
+def _load_transaction_journal(
+    target_root: BoundRoot,
+) -> tuple[FileSnapshot, dict[str, Any]] | None:
+    """Read transaction state without performing recovery writes."""
+    return _inspect_transaction_journal(target_root).transaction
+
+
+def _recover_transaction_journal_artifacts(
+    target_root: BoundRoot,
+    inspection: TransactionJournalInspection,
+) -> tuple[FileSnapshot, dict[str, Any]] | None:
+    """Normalize the exact inspected artifacts after target/stage-0 proof."""
+    completion = inspection.completion
+    published = inspection.published
+    temporary = inspection.temporary
+    if completion is not None:
+        if _safe_read_snapshot(target_root, TRANSACTION_COMPLETE_PATH) != completion:
+            raise MirrorSyncError(
+                "generation transaction completion changed before recovery"
+            )
+        if published is None:
+            if _optional_safe_read_snapshot(target_root, TRANSACTION_PATH) is not None:
+                raise MirrorSyncError(
+                    "generation transaction journal appeared before recovery"
+                )
+            try:
+                os.link(
+                    TRANSACTION_COMPLETE_PATH.as_posix(),
+                    TRANSACTION_PATH.as_posix(),
+                    src_dir_fd=target_root.fd,
+                    dst_dir_fd=target_root.fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as error:
+                raise MirrorSyncError(
+                    "generation transaction completion raced during recovery"
+                ) from error
+            os.fsync(target_root.fd)
+            published = _safe_read_snapshot(target_root, TRANSACTION_PATH)
+        elif _safe_read_snapshot(target_root, TRANSACTION_PATH) != published:
+            raise MirrorSyncError(
+                "generation transaction journal changed before recovery"
+            )
+        if published != completion:
+            raise MirrorSyncError(
+                "generation transaction completion and journal differ"
+            )
+        _isolate_and_remove_file(
+            target_root,
+            target_root.fd,
+            TRANSACTION_COMPLETE_PATH.as_posix(),
+            completion,
+            TRANSACTION_COMPLETE_PATH,
+            retention_kind=QUARANTINE_TRANSIENT_KIND,
+        )
+    elif published is not None and (
+        _safe_read_snapshot(target_root, TRANSACTION_PATH) != published
+    ):
+        raise MirrorSyncError("generation transaction journal changed before recovery")
+    if temporary is not None:
+        if _safe_read_snapshot(target_root, TRANSACTION_TEMP_PATH) != temporary:
+            raise MirrorSyncError(
+                "generation transaction pending file changed before recovery"
+            )
+        _isolate_and_remove_file(
+            target_root,
+            target_root.fd,
+            TRANSACTION_TEMP_PATH.as_posix(),
+            temporary,
+            TRANSACTION_TEMP_PATH,
+            retention_kind=QUARANTINE_TRANSIENT_KIND,
+        )
+    if published is None:
+        return None
+    recovered = _safe_read_snapshot(target_root, TRANSACTION_PATH)
+    if recovered != published:
+        raise MirrorSyncError("generation transaction journal changed during recovery")
+    document = _parse_transaction_journal_snapshot(recovered)
+    if inspection.transaction is None or document != inspection.transaction[1]:
+        raise MirrorSyncError("generation transaction document changed during recovery")
+    return recovered, document
 
 
 def _transaction_managed_paths(document: dict[str, Any]) -> set[PurePosixPath]:
@@ -9214,7 +9296,8 @@ def _generate_mirror_bound(
 ) -> int:
     _reject_canonical_target(repository_root, target_root)
     requested_source_commit = source_commit
-    pending_transaction = _load_transaction_journal(target_root)
+    transaction_inspection = _inspect_transaction_journal(target_root)
+    pending_transaction = transaction_inspection.transaction
     recovering_prior_transaction = pending_transaction is not None
     transaction_paths: set[PurePosixPath] = set()
     canonical_head_commit = _current_commit(repository_root)
@@ -9281,6 +9364,20 @@ def _generate_mirror_bound(
         target_root,
         mirror,
         managed_additional_paths,
+    )
+    # Recovery may link, quarantine, or remove journal files. Reprove the
+    # semantic target identity and complete stage-0 namespace immediately
+    # before allowing any such write.
+    _verify_target_repository(target_root, mirror.repository)
+    _require_same_target_index(
+        target_root,
+        mirror,
+        initial_index,
+        managed_additional_paths,
+    )
+    pending_transaction = _recover_transaction_journal_artifacts(
+        target_root,
+        transaction_inspection,
     )
     _configure_managed_ancestors(
         target_root,
@@ -9723,6 +9820,12 @@ def refresh_source_lock(repository_root: Path, *, check: bool) -> int:
             source_lock.canonical_repository,
         )
         initial_sources = _source_group_snapshots(canonical, source_lock)
+        for name, snapshot in initial_sources.items():
+            if snapshot.mode not in SUPPORTED_SOURCE_MODES:
+                raise MirrorSyncError(
+                    f"canonical source {name} mode must be 0644 or 0755, "
+                    f"not {snapshot.mode:04o}"
+                )
         refreshed_sources = {
             name: replace(
                 source,

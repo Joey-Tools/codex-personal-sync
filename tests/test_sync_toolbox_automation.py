@@ -582,6 +582,11 @@ class SyncToolboxAutomationTests(unittest.TestCase):
         self.assertNotIn("pull_request", trigger)
         self.assertNotIn("pull_request_target", trigger)
 
+    def test_mirror_workflow_never_mutates_host_scheduler(self) -> None:
+        self.assertNotIn("install-scheduler", self.workflow)
+        self.assertNotIn("uninstall-scheduler", self.workflow)
+        self.assertNotIn("status-scheduler", self.workflow)
+
     def test_source_repository_permissions_are_read_only(self) -> None:
         permissions = self._top_level_block("permissions", "concurrency")
         self.assertEqual(permissions.strip(), "contents: read")

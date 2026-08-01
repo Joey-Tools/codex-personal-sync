@@ -28,17 +28,17 @@
     "engine": {
       "mode": "0755",
       "path": "scripts/codex_personal_sync.py",
-      "sha256": "a8dd98e16da8dffb6894aa366fcd6d61f79f4f4ec973d59accadf0dd30336dae"
+      "sha256": "955ac2caf7e5e0dc0309dc55603c19b3f923efcf5c2096debd5732b9f0fb451b"
     },
     "engine_tests": {
       "mode": "0644",
       "path": "tests/test_codex_personal_sync.py",
-      "sha256": "4e66b8548e96a93ae252b69d86e11987d14427468b642893b535634ad2019db4"
+      "sha256": "4d87220c9f1db60454981da21b3a395e39f4b34d296b79e83c68755e8cc2eb86"
     },
     "manifest_schema": {
       "mode": "0644",
       "path": "schema/sync-manifest.schema.json",
-      "sha256": "b4c14caa311fc279bb7220cfad2f8feb987eba094551caf8d9634b786ee48672"
+      "sha256": "1050a4290ef79aa8dbd0512b5428e52108b21351e74b16d2788b1841a331b0c2"
     },
     "reconciliation_safety_tests": {
       "mode": "0644",
@@ -48,12 +48,12 @@
     "release_retention_tests": {
       "mode": "0644",
       "path": "tests/test_release_retention.py",
-      "sha256": "88e30c2fefc4d486787cbf8eddac521a202677013cda3aa46200ae846f9e8525"
+      "sha256": "bfc9a3be29cb08f6f9defe102ea19b8efc80407ca96382d17772b85075a197b1"
     },
     "scheduler_doctor_tests": {
       "mode": "0644",
       "path": "tests/test_scheduler_doctor.py",
-      "sha256": "29e9be4cb6e659e24ed97ab63a52aba4299d0df07a4e90500938f4607dee4dd5"
+      "sha256": "be16a82a9b9bc1ede0a3beffdbdda81f29749ac4b45ae41338e3ef51f50b1911"
     }
   },
   "version": 1

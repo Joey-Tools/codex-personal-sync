@@ -1352,6 +1352,14 @@ class MirrorGeneratorTests(unittest.TestCase):
             partial_path.write_bytes(b'{"partial":')
             partial_path.chmod(0o600)
             self.assertIsNone(MIRROR_MODULE._load_transaction_journal(bound_root))
+            self.assertTrue(partial_path.exists())
+            inspection = MIRROR_MODULE._inspect_transaction_journal(bound_root)
+            self.assertIsNone(
+                MIRROR_MODULE._recover_transaction_journal_artifacts(
+                    bound_root,
+                    inspection,
+                )
+            )
             self.assertFalse(partial_path.exists())
 
             expected = MIRROR_MODULE._write_transaction_journal(
@@ -1369,7 +1377,11 @@ class MirrorGeneratorTests(unittest.TestCase):
                 MIRROR_MODULE.TRANSACTION_PATH.as_posix(),
                 dir_fd=bound_root.fd,
             )
-            recovered = MIRROR_MODULE._load_transaction_journal(bound_root)
+            inspection = MIRROR_MODULE._inspect_transaction_journal(bound_root)
+            recovered = MIRROR_MODULE._recover_transaction_journal_artifacts(
+                bound_root,
+                inspection,
+            )
             self.assertIsNotNone(recovered)
             self.assertEqual(recovered[0], expected)
             self.assertFalse(
@@ -1384,6 +1396,66 @@ class MirrorGeneratorTests(unittest.TestCase):
             )
         finally:
             MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_generate_performs_no_journal_recovery_write_before_target_proof(
+        self,
+    ) -> None:
+        partial_path = self.target_root / MIRROR_MODULE.TRANSACTION_TEMP_PATH.as_posix()
+        partial_payload = b'{"partial":'
+        partial_path.write_bytes(partial_payload)
+        partial_path.chmod(0o600)
+        target_origin_error = MIRROR_MODULE.MirrorSyncError("wrong target origin")
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_verify_target_repository",
+                side_effect=(None, target_origin_error),
+            ) as verify_target,
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_recover_transaction_journal_artifacts",
+                wraps=MIRROR_MODULE._recover_transaction_journal_artifacts,
+            ) as recover,
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "wrong target origin",
+            ),
+        ):
+            self._generate()
+
+        self.assertEqual(verify_target.call_count, 2)
+        recover.assert_not_called()
+        self.assertEqual(partial_path.read_bytes(), partial_payload)
+
+    def test_generate_performs_no_journal_recovery_write_before_stage_zero_reproof(
+        self,
+    ) -> None:
+        partial_path = self.target_root / MIRROR_MODULE.TRANSACTION_TEMP_PATH.as_posix()
+        partial_payload = b'{"partial":'
+        partial_path.write_bytes(partial_payload)
+        partial_path.chmod(0o600)
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_require_same_target_index",
+                side_effect=MIRROR_MODULE.MirrorSyncError("stage-0 target drift"),
+            ),
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_recover_transaction_journal_artifacts",
+                wraps=MIRROR_MODULE._recover_transaction_journal_artifacts,
+            ) as recover,
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "stage-0 target drift",
+            ),
+        ):
+            self._generate()
+
+        recover.assert_not_called()
+        self.assertEqual(partial_path.read_bytes(), partial_payload)
 
     def test_transaction_cleanup_preserves_a_racing_replacement(
         self,
@@ -4156,6 +4228,101 @@ class MirrorGeneratorTests(unittest.TestCase):
         ):
             MIRROR_MODULE.load_source_lock(self.canonical_root)
 
+    def test_lock_uses_github_case_insensitive_repository_identity(self) -> None:
+        lock_path = self.canonical_root / MIRROR_MODULE.LOCK_PATH.as_posix()
+        base = json.loads(lock_path.read_text(encoding="utf-8"))
+
+        canonical_alias = json.loads(json.dumps(base))
+        canonical_alias["mirrors"]["toolbox"]["repository"] = (
+            "joey-tools/CANONICAL-FIXTURE"
+        )
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "must not point back",
+        ):
+            MIRROR_MODULE._parse_source_lock(
+                (json.dumps(canonical_alias) + "\n").encode("utf-8")
+            )
+
+        duplicate_alias = json.loads(json.dumps(base))
+        duplicate_alias["mirrors"]["private"]["repository"] = (
+            "joey-tools/TOOLBOX-FIXTURE"
+        )
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "duplicate/colliding mirror repository",
+        ):
+            MIRROR_MODULE._parse_source_lock(
+                (json.dumps(duplicate_alias) + "\n").encode("utf-8")
+            )
+
+    def test_repository_origin_accepts_github_case_alias(self) -> None:
+        self._git(
+            self.canonical_root,
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/joey-tools/CANONICAL-FIXTURE.git",
+        )
+        bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        try:
+            MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            MIRROR_MODULE._verify_canonical_repository(
+                bound_root,
+                "Joey-Tools/canonical-fixture",
+            )
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_lock_rejects_portable_source_aliases_and_self_alias(self) -> None:
+        lock_path = self.canonical_root / MIRROR_MODULE.LOCK_PATH.as_posix()
+        base = json.loads(lock_path.read_text(encoding="utf-8"))
+        extra_record = {
+            "path": "Scripts/Engine.py",
+            "sha256": "0" * 64,
+            "mode": "0644",
+        }
+        collision = json.loads(json.dumps(base))
+        collision["sources"]["extra"] = extra_record
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "NFC\\+casefold",
+        ):
+            MIRROR_MODULE._parse_source_lock(
+                (json.dumps(collision) + "\n").encode("utf-8")
+            )
+
+        self_alias = json.loads(json.dumps(base))
+        self_alias["sources"]["engine"]["path"] = "SYNC-SOURCE-LOCK.JSON"
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "must not hash itself",
+        ):
+            MIRROR_MODULE._parse_source_lock(
+                (json.dumps(self_alias) + "\n").encode("utf-8")
+            )
+
+    def test_lock_and_refresh_reject_unsupported_source_modes(self) -> None:
+        lock_path = self.canonical_root / MIRROR_MODULE.LOCK_PATH.as_posix()
+        for raw_mode in ("0600", "0700"):
+            with self.subTest(parser_mode=raw_mode):
+                lock = json.loads(lock_path.read_text(encoding="utf-8"))
+                lock["sources"]["engine"]["mode"] = raw_mode
+                with self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "mode must be 0644 or 0755",
+                ):
+                    MIRROR_MODULE._parse_source_lock(
+                        (json.dumps(lock) + "\n").encode("utf-8")
+                    )
+
+        self.source_path.chmod(0o600)
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "canonical source engine mode must be 0644 or 0755",
+        ):
+            MIRROR_MODULE.refresh_source_lock(self.canonical_root, check=False)
+
     def test_lock_rejects_bidirectional_reserved_and_casefold_overlap(
         self,
     ) -> None:
@@ -6062,6 +6229,39 @@ class ManifestSchemaParityTests(unittest.TestCase):
             set(self.schema["$defs"]["removedLink"]["required"]),
             {"id", "source", "target", "kind"},
         )
+
+    def test_schema_matches_runtime_nullable_base_release_fields(self) -> None:
+        base_release = self.schema["properties"]["base_release"]
+        self.assertEqual(set(base_release["type"]), {"object", "null"})
+        repo_options = base_release["properties"]["repo"]["anyOf"]
+        self.assertIn({"type": "null"}, repo_options)
+        self.assertEqual(
+            set(base_release["properties"]["sha"]["type"]),
+            {"string", "null"},
+        )
+
+        manifest = ENGINE_MODULE._parse_manifest_data(
+            {
+                "version": 1,
+                "links": [
+                    {
+                        "source": "personal_codex/AGENTS.md",
+                        "target": "AGENTS.md",
+                        "kind": "file",
+                    }
+                ],
+                "base_release": {"repo": None, "sha": None},
+            },
+            lambda _path: "file",
+        )
+        self.assertIsNone(manifest.base_release_repo)
+        self.assertIsNone(manifest.base_release_sha)
+
+    def test_schema_and_runtime_both_reject_backslash_paths(self) -> None:
+        pattern = self.schema["$defs"]["relativePath"]["pattern"]
+        self.assertIsNone(re.fullmatch(pattern, "skills\\example"))
+        with self.assertRaisesRegex(ENGINE_MODULE.SyncError, "safe POSIX"):
+            ENGINE_MODULE._validate_relative_path("skills\\example", "target")
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ id: 20260723-canonical-sync-engine
 title: Canonical Sync Engine
 status: active
 created: 2026-07-23
-updated: 2026-07-29
+updated: 2026-08-01
 branch: codex/canonical-sync-engine
 pr:
 supersedes: []
@@ -14,14 +14,15 @@ superseded_by:
 
 ## Summary
 
-- Delivery status: `delivery_gate_blocked`.
+- Delivery status: `delivery_gate_in_progress`.
 - The workstream is consolidating personal sync ownership in `Joey-Tools/codex-personal-sync` and hardening mirror generation, scheduler observability, active-skill auditing, reconciliation, and release retention.
-- Signed commit `30ff8cfd36c7aee7b1b5f2e3fa6de14816f7bfaa` is the
-  formal-review head and fixed parent of the current follow-up. The code
-  candidate is locally gated in an isolated private-control root, while
-  production admission remains blocked by the retained host quarantine at its
-  exact capacity. No push, consumer generation, PR mutation, or external
-  deployment was performed.
+- PR #5 remains the canonical delivery vehicle. The current append-only
+  follow-up closes the final audit gaps after signed head
+  `4bcf8f5ef81125d364f708213ae95bc3ec439cc0`; it does not rewrite the existing
+  signed history, merge the PR, generate a consumer, or mutate a host
+  scheduler. Source-lock refresh and verification use a task-private control
+  root because production admission remains blocked by the retained host
+  quarantine at its exact capacity.
 
 ## Scope
 
@@ -34,6 +35,19 @@ superseded_by:
 
 ## Current State
 
+- The 2026-08-01 closure makes GitHub repository identities
+  ASCII-case-insensitive, rejects portable source-path aliases and source modes
+  other than `0644` / `0755`, and keeps transaction-journal inspection
+  read-only until target-origin and complete stage-0 revalidation have passed.
+  Manifest runtime/schema path rules now agree on backslash rejection and
+  nullable base-release fields.
+- Release-retention dry-run uses the stable home lock without creating a
+  missing `install.lock`. Bare scheduler repair preserves audited mode, repo,
+  base repo, owner, and interval while migrating legacy commands to
+  `run-scheduled`; status exposes the reconstructable target and
+  `migration_needed`. Foreign systemd drop-ins remain outside uninstall
+  ownership, and ordinary release/mirror workflows do not mutate scheduler
+  configuration.
 - The signed `30ff8cfd36c7aee7b1b5f2e3fa6de14816f7bfaa` candidate has
   been superseded locally by the follow-up candidate containing this journal.
 - Scheduler installation now binds the exact semantically audited macOS/Linux
@@ -222,6 +236,24 @@ superseded_by:
 
 ## Validation Evidence
 
+- The 2026-08-01 final native-Python partition passed all 821 repository tests:
+  203 engine tests in 49.518 seconds (one Linux-only skip), 118
+  scheduler/doctor tests in 18.019 seconds, 359 reconciliation/retention/
+  toolbox-automation tests in 431.586 seconds, and 141 source-lock tests in
+  873.307 seconds. The final Python 3.9.6 focused compatibility selection
+  passed 19 audit-closure tests in 16.644 seconds.
+- Native and Python 3.9.6 compileall, JSON parsing, actionlint, full-tree Ruff
+  lint/format, project-journal validation, and `git diff --check` passed. No
+  bytecode cache remains in the repository.
+- A task-private mode-0700 control root was used for both source-lock refresh
+  and verification; all six sources matched. The production quarantine was not
+  opened for payload inspection, moved, rewritten, or cleaned. Final SHA-256
+  values are `c6df36fc87f4a1f1a618731aef958a3d112b2b334a34d83b293c34ac024daaa6`
+  for `sync-source-lock.json`,
+  `955ac2caf7e5e0dc0309dc55603c19b3f923efcf5c2096debd5732b9f0fb451b`
+  for the engine, and
+  `bff5e520f4d2e1ba62ea7b485991456ed41898444f399da26d1a257dab57002c`
+  for the mirror generator.
 - A final orchestration audit found that target-base OID revalidation covered
   push but not the no-push pull-request create/edit/close paths. The workflow
   now binds `baseRefOid` in owned-PR evidence, queries the exact live target
@@ -728,8 +760,9 @@ configuration.
 
 ## Next Steps
 
-- Generate and validate the declared downstream mirrors.
-- Push/open the canonical PR and continue downstream mirror/PR delivery only
-  when the parent workstream authorizes those remote mutations.
+- Complete exact-current-head admission, named review, and CI for canonical PR
+  #5 before it leaves draft state; do not merge it from this workstream.
+- After the canonical change merges, generate and validate the declared
+  downstream mirrors in their separately owned consumer workstreams.
 - Provision `CODEX_TOOLBOX_SYNC_TOKEN` separately only if the repository owner
   wants the sync-PR workflow to become operational.

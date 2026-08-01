@@ -558,8 +558,11 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 parser.parse_args(["install"])
             with self.assertRaises(SystemExit):
                 parser.parse_args(["install-private"])
-            with self.assertRaises(SystemExit):
-                parser.parse_args(["install-scheduler"])
+        scheduler_args = parser.parse_args(["install-scheduler"])
+        self.assertIsNone(scheduler_args.repo)
+        self.assertIsNone(scheduler_args.mode)
+        self.assertIsNone(scheduler_args.base_repo)
+        self.assertIsNone(scheduler_args.owner)
 
     def test_default_release_repo_can_be_overridden_by_environment(self) -> None:
         with mock.patch.dict(
@@ -575,7 +578,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertEqual(install_args.repo, "ExampleOrg/example-codex")
         self.assertEqual(install_private_args.repo, "ExampleOrg/example-codex")
         self.assertEqual(install_private_args.base_repo, "Joey-Tools/codex-toolbox")
-        self.assertEqual(scheduler_args.repo, "ExampleOrg/example-codex")
+        self.assertIsNone(scheduler_args.repo)
 
     def test_empty_release_repo_environment_is_ignored(self) -> None:
         with mock.patch.dict(
@@ -592,8 +595,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 parser.parse_args(["install"])
             with self.assertRaises(SystemExit):
                 parser.parse_args(["install-private"])
-            with self.assertRaises(SystemExit):
-                parser.parse_args(["install-scheduler"])
+        scheduler_defaults = parser.parse_args(["install-scheduler"])
+        self.assertIsNone(scheduler_defaults.repo)
 
         install_private_args = parser.parse_args(
             ["install-private", "--repo", "ExampleOrg/private-codex"]
@@ -609,7 +612,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
         )
 
         self.assertEqual(install_private_args.base_repo, "Joey-Tools/codex-toolbox")
-        self.assertEqual(scheduler_args.base_repo, "Joey-Tools/codex-toolbox")
+        self.assertIsNone(scheduler_args.base_repo)
 
     def test_base_release_repo_can_be_overridden_by_environment(self) -> None:
         with mock.patch.dict(
@@ -625,7 +628,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
         scheduler_args = parser.parse_args(["install-scheduler", "--mode", "private"])
 
         self.assertEqual(install_private_args.base_repo, "ExampleOrg/public-codex")
-        self.assertEqual(scheduler_args.base_repo, "ExampleOrg/public-codex")
+        self.assertIsNone(scheduler_args.base_repo)
 
     def test_install_private_downloads_public_base_and_overlay(self) -> None:
         public_release = self.root / "public-release"
@@ -4867,6 +4870,17 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 with self.assertRaisesRegex(MODULE.SyncError, "owner/repo string"):
                     MODULE._load_base_release_spec(manifest, fallback)
 
+    def test_manifest_relative_paths_reject_backslashes(self) -> None:
+        for field_name, raw_path in (
+            ("source", "personal_codex\\AGENTS.md"),
+            ("target", "skills\\example"),
+        ):
+            with (
+                self.subTest(field=field_name),
+                self.assertRaisesRegex(MODULE.SyncError, "safe POSIX"),
+            ):
+                MODULE._validate_relative_path(raw_path, field_name)
+
     def test_manifest_payload_digest_translates_serialization_errors(self) -> None:
         data = {
             "version": 1,
@@ -6599,6 +6613,102 @@ class CodexPersonalSyncTests(unittest.TestCase):
             MODULE.MACOS_SCHEDULER_PATH,
         )
         self.assertIn("codex-personal-sync.out.log", payload["StandardOutPath"])
+
+    def test_bare_install_scheduler_preserves_legacy_private_target(self) -> None:
+        home = self.user_home / ".codex"
+        runner = write_scheduler_runner(home)
+        paths = MODULE._scheduler_paths("macos", home)
+        assert paths.launchd_plist is not None
+        paths.launchd_plist.parent.mkdir(parents=True)
+        legacy = MODULE._launchd_plist(
+            home,
+            "Joey-Tools/codex-private-workflows",
+            73,
+            runner,
+            mode="private",
+            base_repo="Joey-Tools/codex-toolbox",
+            owner="private",
+        )
+        legacy["ProgramArguments"] = [
+            str(runner),
+            "install-private",
+            "--repo",
+            "Joey-Tools/codex-private-workflows",
+            "--base-repo",
+            "Joey-Tools/codex-toolbox",
+            "--owner",
+            "private",
+            "--home",
+            str(home),
+        ]
+        paths.launchd_plist.write_bytes(plistlib.dumps(legacy, sort_keys=True))
+        before = MODULE._load_macos_scheduler_config(paths)
+        assert before is not None
+        self.assertEqual(before.command, "install-private")
+
+        self.run_quietly(
+            MODULE.install_scheduler,
+            home,
+            None,
+            None,
+            "macos",
+            None,
+            dry_run=False,
+            enable=False,
+        )
+
+        migrated = MODULE._load_macos_scheduler_config(paths)
+        assert migrated is not None
+        self.assertEqual(migrated.command, "run-scheduled")
+        self.assertEqual(migrated.mode, "private")
+        self.assertEqual(migrated.repo, "Joey-Tools/codex-private-workflows")
+        self.assertEqual(migrated.base_repo, "Joey-Tools/codex-toolbox")
+        self.assertEqual(migrated.owner, "private")
+        self.assertEqual(migrated.interval_minutes, 73)
+
+    def test_ordinary_release_install_does_not_mutate_scheduler(self) -> None:
+        home = self.user_home / ".codex"
+        initial_release_root = self.root / "initial-release"
+        write_minimal_release(initial_release_root)
+        (initial_release_root / "scripts" / "codex_personal_sync.py").chmod(0o755)
+        self.run_quietly(
+            MODULE.install_release_tree,
+            initial_release_root,
+            home,
+            "2" * 40,
+            dry_run=False,
+        )
+        self.run_quietly(
+            MODULE.install_scheduler,
+            home,
+            "owner/public-sync",
+            61,
+            "macos",
+            None,
+            dry_run=False,
+            enable=False,
+        )
+        paths = MODULE._scheduler_paths("macos", home)
+        assert paths.launchd_plist is not None
+        before_metadata = paths.launchd_plist.stat()
+        before = paths.launchd_plist.read_bytes()
+        release_root = self.root / "ordinary-release"
+        write_minimal_release(release_root)
+
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_root,
+            home,
+            "3" * 40,
+            dry_run=False,
+        )
+
+        after_metadata = paths.launchd_plist.stat()
+        self.assertEqual(paths.launchd_plist.read_bytes(), before)
+        self.assertEqual(
+            (after_metadata.st_dev, after_metadata.st_ino),
+            (before_metadata.st_dev, before_metadata.st_ino),
+        )
 
     def test_install_scheduler_no_enable_keeps_legacy_macos_plist(self) -> None:
         home = self.root / "home" / ".codex"

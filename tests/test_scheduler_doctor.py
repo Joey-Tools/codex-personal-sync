@@ -920,9 +920,13 @@ class SchedulerDoctorTests(unittest.TestCase):
                 "interval_minutes": 31,
                 "runner": str(runner),
                 "stable_runner": False,
+                "command": "run-scheduled",
                 "mode": "private",
+                "repo": "owner/private-sync",
                 "base_repo": "owner/public-sync",
                 "private_repo": "owner/private-sync",
+                "owner": "private",
+                "migration_needed": False,
                 "last_attempt": "2026-07-23T09:15:00+00:00",
                 "recent_success": "2026-07-23T08:15:00+00:00",
                 "current_release": {
@@ -971,6 +975,70 @@ class SchedulerDoctorTests(unittest.TestCase):
                 ],
             },
         )
+
+    def test_status_reports_reconstructable_legacy_private_migration(self) -> None:
+        runner = self.write_runner()
+        paths = MODULE._scheduler_paths("linux", self.home)
+        assert paths.systemd_service is not None
+        assert paths.systemd_timer is not None
+        paths.systemd_service.parent.mkdir(parents=True)
+        service_lines = MODULE._systemd_service(
+            self.home,
+            "owner/private-sync",
+            runner,
+            mode="private",
+            base_repo="owner/public-sync",
+            owner="private",
+        ).splitlines()
+        legacy_arguments = [
+            str(runner),
+            "install-private",
+            "--repo",
+            "owner/private-sync",
+            "--base-repo",
+            "owner/public-sync",
+            "--owner",
+            "private",
+            "--home",
+            str(self.home),
+        ]
+        legacy_exec = " ".join(
+            MODULE._systemd_quote(argument) for argument in legacy_arguments
+        )
+        service_lines = [
+            f"ExecStart={legacy_exec}" if line.startswith("ExecStart=") else line
+            for line in service_lines
+        ]
+        paths.systemd_service.write_text(
+            "\n".join(service_lines),
+            encoding="utf-8",
+        )
+        paths.systemd_timer.write_text(MODULE._systemd_timer(47), encoding="utf-8")
+
+        with (
+            mock.patch.object(
+                MODULE, "_read_scheduler_runtime_state", return_value=None
+            ),
+            mock.patch.object(
+                MODULE, "_current_releases_for_scheduler", return_value=()
+            ),
+            mock.patch.object(MODULE, "_scheduler_daemon_enabled", return_value=False),
+            mock.patch.object(
+                MODULE,
+                "_scheduler_release_integrity_issues",
+                return_value=(),
+            ),
+        ):
+            report = MODULE.scheduler_report(self.home, "linux")
+
+        payload = MODULE._scheduler_report_payload(report)
+        self.assertEqual(payload["command"], "install-private")
+        self.assertEqual(payload["mode"], "private")
+        self.assertEqual(payload["repo"], "owner/private-sync")
+        self.assertEqual(payload["base_repo"], "owner/public-sync")
+        self.assertEqual(payload["owner"], "private")
+        self.assertEqual(payload["interval_minutes"], 47)
+        self.assertTrue(payload["migration_needed"])
 
     def test_run_scheduled_persists_success_state(self) -> None:
         with (
@@ -5676,6 +5744,63 @@ class SchedulerDoctorTests(unittest.TestCase):
                             )
                             if mutation == "replacement":
                                 self.assertEqual(target.read_bytes(), original)
+
+    def test_linux_uninstall_preserves_foreign_systemd_drop_ins(self) -> None:
+        self.write_runner()
+        self.install_scheduler_quietly(
+            "owner/public-sync",
+            17,
+            "linux",
+            enable=False,
+        )
+        paths = MODULE._scheduler_paths("linux", self.home)
+        assert paths.systemd_service is not None
+        assert paths.systemd_timer is not None
+        service_drop_in = paths.systemd_service.with_name(
+            paths.systemd_service.name + ".d"
+        )
+        timer_drop_in = paths.systemd_timer.with_name(paths.systemd_timer.name + ".d")
+        service_drop_in.mkdir()
+        timer_drop_in.mkdir()
+        service_override = service_drop_in / "foreign.conf"
+        timer_override = timer_drop_in / "foreign.conf"
+        service_override.write_text("[Service]\nNice=5\n", encoding="utf-8")
+        timer_override.write_text("[Timer]\nRandomizedDelaySec=1m\n", encoding="utf-8")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_native_scheduler_argv",
+                side_effect=lambda args: ["/usr/bin/systemctl", *args[1:]],
+            ),
+            mock.patch.object(
+                MODULE.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout="",
+                    stderr="",
+                ),
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            MODULE.uninstall_scheduler(
+                self.home,
+                "linux",
+                dry_run=False,
+                disable=True,
+            )
+
+        self.assertFalse(paths.systemd_service.exists())
+        self.assertFalse(paths.systemd_timer.exists())
+        self.assertEqual(
+            service_override.read_text(encoding="utf-8"), "[Service]\nNice=5\n"
+        )
+        self.assertEqual(
+            timer_override.read_text(encoding="utf-8"),
+            "[Timer]\nRandomizedDelaySec=1m\n",
+        )
 
     def test_linux_uninstall_revalidates_unit_absence_around_daemon_reload(
         self,

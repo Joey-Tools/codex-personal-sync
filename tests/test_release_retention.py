@@ -871,6 +871,22 @@ class ReleaseRetentionTests(unittest.TestCase):
             self.assertEqual(tree_snapshot(self.root), before)
             self.assertFalse(os.path.lexists(candidate_home / "personal-sync"))
 
+    def test_dry_run_partial_sync_root_does_not_create_install_lock(self) -> None:
+        candidate_home = self.root / "partial-home"
+        sync_root = candidate_home / "personal-sync"
+        sync_root.mkdir(parents=True, mode=0o700)
+        lock_path = sync_root / "install.lock"
+        before = tree_snapshot(candidate_home)
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            removed = MODULE.prune_releases(candidate_home, dry_run=True)
+
+        self.assertEqual(removed, [])
+        self.assertIn("no unreferenced releases to prune", output.getvalue())
+        self.assertFalse(os.path.lexists(lock_path))
+        self.assertEqual(tree_snapshot(candidate_home), before)
+
     def test_dry_run_recovery_reports_but_does_not_mutate_transaction(
         self,
     ) -> None:

@@ -802,6 +802,10 @@ class SchedulerReport:
     recent_success: str | None
     current_releases: tuple[tuple[str, str], ...]
     failure_reason: str | None
+    command: str | None = None
+    repo: str | None = None
+    owner: str | None = None
+    migration_needed: bool = False
     failure_code: str | None = None
     quarantine_batches: int | None = None
     quarantine_limit: int = MAX_RETAINED_QUARANTINE_BATCHES
@@ -893,6 +897,8 @@ def _validate_relative_path(raw: object, field_name: str) -> PurePosixPath:
         raise SyncError(f"{field_name} must be a non-empty relative path")
     if "\0" in raw:
         raise SyncError(f"{field_name} must not contain embedded NUL")
+    if "\\" in raw:
+        raise SyncError(f"{field_name} must use safe POSIX path components")
     try:
         raw.encode("utf-8", errors="strict")
     except UnicodeEncodeError as error:
@@ -6547,17 +6553,19 @@ def _install_lock_binding_matches(
 
 
 @contextlib.contextmanager
-def installation_lock(home: Path):
+def installation_lock(home: Path, *, create: bool = True):
     """Serialize cooperative installers on a stable local sync-home inode."""
     lock_path = _install_lock_path(home)
     sync_root = lock_path.parent
-    home_fd = _open_or_create_sync_home(home)
+    home_fd = _open_or_create_sync_home(home) if create else _open_sync_home(home)
     directory_fd = -1
     lock_fd = -1
     home_lock_acquired = False
     lock_acquired = False
     binding_token = None
-    lock_flags = os.O_RDWR | os.O_CREAT
+    lock_flags = os.O_RDWR
+    if create:
+        lock_flags |= os.O_CREAT
     lock_flags |= getattr(os, "O_CLOEXEC", 0)
     lock_flags |= getattr(os, "O_NOFOLLOW", 0)
     lock_flags |= getattr(os, "O_NONBLOCK", 0)
@@ -6571,11 +6579,19 @@ def installation_lock(home: Path):
             home_fd
         ) != home_identity or not _bound_directory_matches(home, home, home_fd):
             raise SyncError(f"install lock stable home changed: {home}")
-        directory_fd = _open_or_create_directory_beneath(
-            home,
-            sync_root,
-            mode=0o700,
-            home_fd=home_fd,
+        directory_fd = (
+            _open_or_create_directory_beneath(
+                home,
+                sync_root,
+                mode=0o700,
+                home_fd=home_fd,
+            )
+            if create
+            else _open_directory_beneath(
+                home,
+                sync_root,
+                home_fd=home_fd,
+            )
         )
         parent_identity = _directory_identity(directory_fd)
         if not _bound_directory_matches(home, sync_root, directory_fd):
@@ -6587,38 +6603,43 @@ def installation_lock(home: Path):
                 0o600,
                 dir_fd=directory_fd,
             )
+        except FileNotFoundError:
+            if create:
+                raise
+            lock_fd = -1
         except OSError as error:
             raise SyncError(
                 f"refusing unsafe install lock: {lock_path}: {error}"
             ) from error
-        lock_metadata = os.fstat(lock_fd)
-        if not stat.S_ISREG(lock_metadata.st_mode):
-            raise SyncError(f"refusing non-file install lock: {lock_path}")
-        lock_identity = (lock_metadata.st_dev, lock_metadata.st_ino)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        lock_acquired = True
-        if not _install_lock_binding_matches(
-            home,
-            lock_path,
-            directory_fd,
-            parent_identity,
-            lock_fd,
-            lock_identity,
-        ):
-            raise SyncError(
-                f"install lock binding changed after acquisition: {lock_path}"
-            )
-        if not _install_lock_binding_matches(
-            home,
-            lock_path,
-            directory_fd,
-            parent_identity,
-            lock_fd,
-            lock_identity,
-        ):
-            raise SyncError(
-                f"install lock binding changed before transaction: {lock_path}"
-            )
+        if lock_fd >= 0:
+            lock_metadata = os.fstat(lock_fd)
+            if not stat.S_ISREG(lock_metadata.st_mode):
+                raise SyncError(f"refusing non-file install lock: {lock_path}")
+            lock_identity = (lock_metadata.st_dev, lock_metadata.st_ino)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            lock_acquired = True
+            if not _install_lock_binding_matches(
+                home,
+                lock_path,
+                directory_fd,
+                parent_identity,
+                lock_fd,
+                lock_identity,
+            ):
+                raise SyncError(
+                    f"install lock binding changed after acquisition: {lock_path}"
+                )
+            if not _install_lock_binding_matches(
+                home,
+                lock_path,
+                directory_fd,
+                parent_identity,
+                lock_fd,
+                lock_identity,
+            ):
+                raise SyncError(
+                    f"install lock binding changed before transaction: {lock_path}"
+                )
         binding_token = _LOCKED_SYNC_HOME_BINDINGS.set(
             _LOCKED_SYNC_HOME_BINDINGS.get()
             + ((_sync_home_binding_key(home), home_fd),)
@@ -6633,19 +6654,20 @@ def installation_lock(home: Path):
                 raise SyncError(
                     f"install lock stable home changed during transaction: {home}"
                 )
-            if not _install_lock_binding_matches(
-                home,
-                lock_path,
-                directory_fd,
-                parent_identity,
-                lock_fd,
-                lock_identity,
-            ):
-                raise SyncError(
-                    f"install lock binding changed during transaction: {lock_path}"
-                )
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            lock_acquired = False
+            if lock_fd >= 0:
+                if not _install_lock_binding_matches(
+                    home,
+                    lock_path,
+                    directory_fd,
+                    parent_identity,
+                    lock_fd,
+                    lock_identity,
+                ):
+                    raise SyncError(
+                        f"install lock binding changed during transaction: {lock_path}"
+                    )
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                lock_acquired = False
     finally:
         if binding_token is not None:
             _LOCKED_SYNC_HOME_BINDINGS.reset(binding_token)
@@ -19368,7 +19390,7 @@ def prune_releases(
     if dry_run and not _path_exists_or_is_link(_personal_sync_root(home)):
         print(f"no installed personal sync releases under {_display_path(home)}")
         return removed
-    with installation_lock(home):
+    with installation_lock(home, create=not dry_run):
         recovered_retention = _recover_release_retention_transaction(
             home,
             dry_run=dry_run,
@@ -24548,16 +24570,16 @@ def _recover_scheduler_pair_transaction(
 
 def install_scheduler(
     home: Path,
-    repo: str,
+    repo: str | None,
     interval_minutes: int | None,
     platform_name: str,
     runner: str | None,
     *,
     dry_run: bool,
     enable: bool,
-    mode: str = "public",
-    base_repo: str = DEFAULT_PUBLIC_RELEASE_REPO,
-    owner: str = "private",
+    mode: str | None = None,
+    base_repo: str | None = None,
+    owner: str | None = None,
 ) -> None:
     if interval_minutes is not None and interval_minutes < 1:
         raise SyncError("scheduler interval must be at least 1 minute")
@@ -24569,13 +24591,14 @@ def install_scheduler(
             "scheduler interval must not exceed "
             f"{MAX_SCHEDULER_INTERVAL_MINUTES} minutes"
         )
-    if mode not in {"public", "private"}:
+    if mode is not None and mode not in {"public", "private"}:
         raise SyncError(f"unsupported scheduler mode: {mode}")
-    if REPOSITORY_RE.fullmatch(repo) is None:
+    if repo is not None and REPOSITORY_RE.fullmatch(repo) is None:
         raise SyncError("scheduler repository must be an owner/repo string")
-    if REPOSITORY_RE.fullmatch(base_repo) is None:
+    if base_repo is not None and REPOSITORY_RE.fullmatch(base_repo) is None:
         raise SyncError("scheduler base repository must be an owner/repo string")
-    owner = _validate_owner(owner)
+    if owner is not None:
+        owner = _validate_owner(owner)
     if mode == "private" and owner == PUBLIC_OWNER:
         raise SyncError("private scheduler owner must not be public")
     home = home.expanduser()
@@ -24583,14 +24606,12 @@ def install_scheduler(
     runner_path = _scheduler_runner(home, runner)
     paths = _scheduler_paths(selected_platform, home)
     if selected_platform == "linux":
-        _systemd_service(
-            home,
-            repo,
-            runner_path,
-            mode=mode,
-            base_repo=base_repo,
-            owner=owner,
-        )
+        # Reject path bytes that systemd cannot represent before entering any
+        # scheduler recovery or publication transaction. Repository and owner
+        # values are constrained by their lexical validators above or after
+        # an omitted value is reconstructed from an audited config.
+        _systemd_quote(str(runner_path))
+        _systemd_quote(str(home))
     if dry_run:
         _install_scheduler_transaction(
             home,
@@ -24627,7 +24648,7 @@ def install_scheduler(
 
 def _install_scheduler_transaction(
     home: Path,
-    repo: str,
+    repo: str | None,
     interval_minutes: int | None,
     selected_platform: str,
     runner_path: Path,
@@ -24635,9 +24656,9 @@ def _install_scheduler_transaction(
     *,
     dry_run: bool,
     enable: bool,
-    mode: str,
-    base_repo: str,
-    owner: str,
+    mode: str | None,
+    base_repo: str | None,
+    owner: str | None,
 ) -> None:
     with contextlib.ExitStack() as binding_stack:
         _install_scheduler_transaction_with_bindings(
@@ -24658,7 +24679,7 @@ def _install_scheduler_transaction(
 
 def _install_scheduler_transaction_with_bindings(
     home: Path,
-    repo: str,
+    repo: str | None,
     interval_minutes: int | None,
     selected_platform: str,
     runner_path: Path,
@@ -24666,9 +24687,9 @@ def _install_scheduler_transaction_with_bindings(
     *,
     dry_run: bool,
     enable: bool,
-    mode: str,
-    base_repo: str,
-    owner: str,
+    mode: str | None,
+    base_repo: str | None,
+    owner: str | None,
     binding_stack: contextlib.ExitStack,
 ) -> None:
     _assert_scheduler_uninstall_not_pending(home, paths)
@@ -24694,6 +24715,43 @@ def _install_scheduler_transaction_with_bindings(
             "existing scheduler targets a different Codex home: "
             f"{existing.home} (expected {home})"
         )
+    effective_mode = (
+        existing.mode if mode is None and existing is not None else mode or "public"
+    )
+    effective_repo = (
+        existing.repo
+        if repo is None and existing is not None
+        else repo or default_release_repo()
+    )
+    if effective_repo is None or REPOSITORY_RE.fullmatch(effective_repo) is None:
+        raise SyncError("scheduler repository must be supplied for a new installation")
+    if effective_mode == "private":
+        effective_base_repo = (
+            existing.base_repo
+            if base_repo is None and existing is not None and existing.mode == "private"
+            else base_repo or default_base_release_repo()
+        )
+        effective_owner = (
+            existing.owner
+            if owner is None and existing is not None and existing.mode == "private"
+            else owner or "private"
+        )
+        if (
+            effective_base_repo is None
+            or REPOSITORY_RE.fullmatch(effective_base_repo) is None
+        ):
+            raise SyncError("scheduler base repository must be an owner/repo string")
+        assert effective_owner is not None
+        effective_owner = _validate_owner(effective_owner)
+        if effective_owner == PUBLIC_OWNER:
+            raise SyncError("private scheduler owner must not be public")
+    else:
+        effective_base_repo = effective_repo
+        effective_owner = PUBLIC_OWNER
+    mode = effective_mode
+    repo = effective_repo
+    base_repo = effective_base_repo
+    owner = effective_owner
     effective_interval = (
         existing.interval_minutes
         if interval_minutes is None and existing is not None
@@ -28839,11 +28897,15 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
         interval_minutes=config.interval_minutes if config is not None else None,
         runner=config.runner if config is not None else None,
         stable_runner=stable_runner,
+        command=config.command if config is not None else None,
         mode=config.mode if config is not None else None,
+        repo=config.repo if config is not None else None,
         base_repo=config.base_repo if config is not None else None,
         private_repo=(
             config.repo if config is not None and config.mode == "private" else None
         ),
+        owner=config.owner if config is not None else None,
+        migration_needed=(config is not None and config.command != "run-scheduled"),
         last_attempt=(
             runtime_state.get("last_attempt")
             if runtime_matches_config and runtime_state is not None
@@ -28952,9 +29014,13 @@ def _scheduler_report_payload(report: SchedulerReport) -> dict[str, Any]:
         "interval_minutes": report.interval_minutes,
         "runner": str(report.runner) if report.runner is not None else None,
         "stable_runner": report.stable_runner,
+        "command": report.command,
         "mode": report.mode,
+        "repo": report.repo,
         "base_repo": report.base_repo,
         "private_repo": report.private_repo,
+        "owner": report.owner,
+        "migration_needed": report.migration_needed,
         "last_attempt": report.last_attempt,
         "recent_success": report.recent_success,
         "current_release": dict(report.current_releases),
@@ -29026,9 +29092,13 @@ def _print_scheduler_report(report: SchedulerReport) -> None:
     )
     print(f"scheduler runner: {report.runner or 'unknown'}")
     print(f"scheduler stable runner: {'yes' if report.stable_runner else 'no'}")
+    print(f"scheduler command: {report.command or 'unknown'}")
     print(f"scheduler mode: {report.mode or 'unknown'}")
+    print(f"scheduler repo: {report.repo or 'unknown'}")
     print(f"scheduler base repo: {report.base_repo or 'unknown'}")
     print(f"scheduler private repo: {report.private_repo or 'none'}")
+    print(f"scheduler owner: {report.owner or 'unknown'}")
+    print("scheduler migration needed: " + ("yes" if report.migration_needed else "no"))
     print(f"scheduler last attempt: {report.last_attempt or 'none'}")
     print(f"scheduler recent success: {report.recent_success or 'none'}")
     print(
@@ -29233,13 +29303,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Install a user-level scheduler that periodically runs install",
     )
     scheduler_parser.add_argument(
-        "--repo", default=release_repo, required=release_repo is None
+        "--repo",
+        default=None,
+        help=(
+            "Release repository; preserves an existing audited scheduler value "
+            "when omitted"
+        ),
     )
     scheduler_parser.add_argument(
-        "--mode", choices=("public", "private"), default="public"
+        "--mode",
+        choices=("public", "private"),
+        default=None,
+        help="Scheduler mode; preserves an existing audited mode when omitted",
     )
-    scheduler_parser.add_argument("--base-repo", default=base_release_repo)
-    scheduler_parser.add_argument("--owner", default="private")
+    scheduler_parser.add_argument(
+        "--base-repo",
+        default=None,
+        help="Public base repository for private mode; preserves it when omitted",
+    )
+    scheduler_parser.add_argument(
+        "--owner",
+        default=None,
+        help="Overlay owner for private mode; preserves it when omitted",
+    )
     scheduler_parser.add_argument("--home", default="~/.codex")
     scheduler_parser.add_argument(
         "--interval-minutes",

@@ -216,6 +216,51 @@ bytes even when the worktree happens to match the lock. `generate` may leave
 its expected uncommitted generated diff for review, but it never accepts an
 unrelated index or worktree edit as source material.
 
+## Scheduler operator runbook
+
+Audit an existing host before changing it:
+
+```bash
+~/.codex/bin/codex-personal-sync status-scheduler --json --strict
+~/.codex/bin/codex-personal-sync doctor --json --strict
+```
+
+The JSON report includes the audited `command`, `mode`, `repo`, `base_repo`,
+`owner`, `interval_minutes`, and `migration_needed`, so the installed command
+can be reconstructed without guessing. A legacy `install` or
+`install-private` command sets `migration_needed: true`.
+
+A bare repair preserves an existing audited mode, repository, base repository,
+owner, and interval while migrating the command to the stable
+`run-scheduled` entrypoint:
+
+```bash
+~/.codex/bin/codex-personal-sync install-scheduler
+```
+
+Use explicit arguments only for an intentional target change or a first
+installation. For example:
+
+```bash
+~/.codex/bin/codex-personal-sync install-scheduler \
+  --mode private \
+  --repo Joey-Tools/codex-private-workflows \
+  --base-repo Joey-Tools/codex-toolbox \
+  --owner private \
+  --interval-minutes 60
+```
+
+Activation recovery is roll-forward: a failed native activation retains its
+durable incomplete marker and the published configuration; it does not
+silently restore the prior config. Re-run the audited install with the same
+intent after resolving the reported failure. Successful Linux uninstall
+removes only the owned service/timer files and preserves foreign `.d`
+drop-ins, reporting them for manual disposition. Ordinary release install,
+mirror automation, and retention dry-runs never install, reconfigure, or
+remove a scheduler. Do not blindly reinstall hosts or delete a saturated
+private-control quarantine; use the report evidence and the separately
+reviewed recovery procedure.
+
 ## Test
 
 ```bash

@@ -45,10 +45,20 @@
       "additionalProperties": false,
       "properties": {
         "repo": {
-          "$ref": "#/$defs/repository"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/repository"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "sha": {
-          "type": "string",
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^[0-9a-f]{40}$"
         }
       }
