@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterator
 import contextlib
 from contextvars import ContextVar
 import ctypes
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field as dataclass_field, replace
 from datetime import datetime, timedelta, timezone
 import fcntl
 from graphlib import CycleError, TopologicalSorter
@@ -20,6 +20,7 @@ import os
 from pathlib import Path, PurePosixPath
 import plistlib
 import posixpath
+import pwd
 import re
 import selectors
 import shutil
@@ -280,17 +281,106 @@ MAX_SCHEDULER_NATIVE_STDOUT_BYTES = 64 * 1024
 MAX_SCHEDULER_NATIVE_STDERR_BYTES = 64 * 1024
 SCHEDULER_NATIVE_ACTION_TIMEOUT_SECONDS = 30.0
 SCHEDULER_NATIVE_QUERY_TIMEOUT_SECONDS = 10.0
-MIRROR_PRIVATE_CONTROL_PARENT = Path(
+MIRROR_PRIVATE_CONTROL_PRIMARY_ROOT_ID = "primary-home-v1"
+MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID = "legacy-shared-v0"
+MIRROR_PRIVATE_CONTROL_NAMESPACE_NAME = ".codex-sync-canonical-mirrors-v1"
+MIRROR_PRIVATE_CONTROL_LEGACY_PARENT = Path(
     "/private/tmp" if sys.platform == "darwin" else "/var/tmp"
 )
+MIRROR_PRIVATE_CONTROL_REASON_LEGACY_PENDING = "legacy-recovery-pending"
+MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE = "private-control-root-inconclusive"
+MIRROR_PRIVATE_CONTROL_MAX_ANCESTORS = 256
+MIRROR_PRIVATE_CONTROL_PREALLOCATION_ALLOWED_STATES = frozenset(
+    {"absent", "duplicate", "foreign-unrelated", "same-uid-empty"}
+)
+
+
+@dataclass(frozen=True)
+class MirrorPrivateControlRootSpec:
+    root_id: str
+    parent_path: Path
+    allocate: bool
+    account_home: Path | None
+    shared_parent: bool
+
+
+def _mirror_private_control_legacy_ownership_state(
+    children: tuple[tuple[tuple[int, int, int], tuple[int, int, int]], ...],
+    *,
+    effective_uid: int | None = None,
+) -> str:
+    if not children:
+        return "absent"
+    selected_uid = os.geteuid() if effective_uid is None else effective_uid
+    owners = {child[1][1] for child in children}
+    if owners == {selected_uid}:
+        return "same-uid"
+    if selected_uid not in owners:
+        return "foreign-unrelated"
+    return "inconclusive"
+
+
+def _mirror_private_control_preallocation_decision(
+    legacy_states: tuple[str, ...],
+) -> tuple[bool, str | None]:
+    if MIRROR_PRIVATE_CONTROL_REASON_LEGACY_PENDING in legacy_states:
+        return False, MIRROR_PRIVATE_CONTROL_REASON_LEGACY_PENDING
+    if MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH in legacy_states:
+        return False, MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH
+    if any(
+        state not in MIRROR_PRIVATE_CONTROL_PREALLOCATION_ALLOWED_STATES
+        for state in legacy_states
+    ):
+        return False, MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE
+    return True, None
+
+
+def _mirror_canonical_account_home_directory() -> Path:
+    try:
+        account = pwd.getpwuid(os.geteuid())
+    except KeyError as error:
+        raise RuntimeError(
+            "cannot resolve the current account home directory"
+        ) from error
+    if account.pw_uid != os.geteuid() or not account.pw_dir:
+        raise RuntimeError("cannot resolve the current account home directory")
+    path = Path(account.pw_dir)
+    if not path.is_absolute():
+        raise RuntimeError("current account home directory must be absolute")
+    return Path(os.path.abspath(path))
+
+
+def _mirror_private_control_root_specs() -> tuple[MirrorPrivateControlRootSpec, ...]:
+    account_home = _mirror_canonical_account_home_directory()
+    return (
+        MirrorPrivateControlRootSpec(
+            root_id=MIRROR_PRIVATE_CONTROL_PRIMARY_ROOT_ID,
+            parent_path=account_home / MIRROR_PRIVATE_CONTROL_NAMESPACE_NAME,
+            allocate=True,
+            account_home=account_home,
+            shared_parent=False,
+        ),
+        MirrorPrivateControlRootSpec(
+            root_id=MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            parent_path=MIRROR_PRIVATE_CONTROL_LEGACY_PARENT,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        ),
+    )
+
+
+MIRROR_PRIVATE_CONTROL_ROOT_SPECS = _mirror_private_control_root_specs()
+MIRROR_PRIVATE_CONTROL_PARENT = MIRROR_PRIVATE_CONTROL_ROOT_SPECS[0].parent_path
 MACOS_SYSTEM_TEMP_ALIAS = Path("/tmp")
 MACOS_SYSTEM_TEMP_DIRECTORY = Path("/private/tmp")
 MIRROR_PRIVATE_TOOL_ROOT_NAME = "codex-sync-canonical-mirrors"
 MIRROR_DURABLE_QUARANTINE_ROOT_NAME = ".codex-sync-canonical-mirror-quarantine"
 MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT = 10_000
 MIRROR_PRIVATE_TOOL_ROOT_ENTRY_LIMIT = 256
-MIRROR_PRIVATE_OWNER_RECORD_VERSION = 1
-MIRROR_PRIVATE_OWNER_RECORD_FIELDS = frozenset(
+MIRROR_PRIVATE_OWNER_RECORD_LEGACY_VERSION = 1
+MIRROR_PRIVATE_OWNER_RECORD_VERSION = 2
+MIRROR_PRIVATE_OWNER_RECORD_LEGACY_FIELDS = frozenset(
     {
         "version",
         "owner_pid",
@@ -302,8 +392,40 @@ MIRROR_PRIVATE_OWNER_RECORD_FIELDS = frozenset(
         "private_identity",
     }
 )
+MIRROR_PRIVATE_OWNER_RECORD_FIELDS = MIRROR_PRIVATE_OWNER_RECORD_LEGACY_FIELDS | {
+    "root_id"
+}
+MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH = "private-owner-root-mismatch"
 MIRROR_PRIVATE_OWNER_RECORD_PHASES = frozenset({"building", "ready", "cleanup"})
 MAX_MIRROR_PRIVATE_OWNER_RECORD_BYTES = 4096
+
+
+def _mirror_private_owner_record_root_scope(
+    record: object,
+    expected_root_id: str,
+) -> str:
+    if not isinstance(record, dict):
+        return "generic-invalid"
+    version = record.get("version")
+    fields = set(record)
+    if type(version) is int and version == MIRROR_PRIVATE_OWNER_RECORD_LEGACY_VERSION:
+        if fields != MIRROR_PRIVATE_OWNER_RECORD_LEGACY_FIELDS:
+            return MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH
+        if expected_root_id != MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID:
+            return MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH
+        return "accepted-legacy"
+    if type(version) is int and version == MIRROR_PRIVATE_OWNER_RECORD_VERSION:
+        if fields != MIRROR_PRIVATE_OWNER_RECORD_FIELDS:
+            return MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH
+        root_id = record.get("root_id")
+        if not isinstance(root_id, str) or root_id != expected_root_id:
+            return MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH
+        return "accepted-current"
+    if "version" in record or "root_id" in record:
+        return MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH
+    return "generic-invalid"
+
+
 MIRROR_PRIVATE_SNAPSHOT_RE = re.compile(
     r"^sync-canonical-git-control\.[0-9]+\.[0-9a-f]{32}$"
 )
@@ -935,6 +1057,23 @@ class MirrorQuarantineOwnerRecord:
     expected_private_identity: tuple[int, int, int] | None = None
     observed_private_identity: tuple[int, int, int] | None = None
     private_state: str | None = None
+    root_id: str | None = None
+    reason_code: str | None = None
+
+
+@dataclass(frozen=True)
+class MirrorQuarantineRootReceipt:
+    root_id: str
+    parent_path: Path
+    scope: str
+    parent_identity: tuple[int, int, int] | None
+    parent_access_policy: tuple[int, int, int] | None
+    tool_record: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None
+    quarantine_record: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None
+    absence_anchor_path: Path | None = None
+    absence_name: str | None = None
+    absence_anchor_identity: tuple[int, int, int] | None = None
+    absence_anchor_access_policy: tuple[int, int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -948,6 +1087,16 @@ class MirrorQuarantineAudit:
     segment_access_policy: tuple[int, int, int] | None
     owner_records: tuple[MirrorQuarantineOwnerRecord, ...] = ()
     detail: str | None = None
+    root_id: str = MIRROR_PRIVATE_CONTROL_PRIMARY_ROOT_ID
+    reason_code: str | None = None
+    root_parent_identity: tuple[int, int, int] | None = None
+    tool_identity: tuple[int, int, int] | None = None
+    root_audits: tuple[MirrorQuarantineAudit, ...] = ()
+    root_receipt: MirrorQuarantineRootReceipt | None = dataclass_field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -27938,7 +28087,10 @@ def doctor(
         issue_code = (
             "mirror-quarantine-saturated"
             if report.mirror_quarantine.classification == "saturated"
-            else "mirror-quarantine-audit-inconclusive"
+            else (
+                report.mirror_quarantine.reason_code
+                or "mirror-quarantine-audit-inconclusive"
+            )
         )
         detail = _mirror_quarantine_failure_detail(report.mirror_quarantine)
         issues.append(
@@ -27957,6 +28109,9 @@ def doctor(
                 "immutable-release-drift",
                 "mirror-quarantine-saturated",
                 "mirror-quarantine-audit-inconclusive",
+                MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+                "legacy-recovery-pending",
+                "private-control-root-inconclusive",
                 "quarantine-saturated",
                 "quarantine-audit-inconclusive",
                 "scheduler-config-drift",
@@ -27983,6 +28138,12 @@ def doctor(
                             / MIRROR_DURABLE_QUARANTINE_ROOT_NAME
                         )
                         if issue_code.startswith("mirror-quarantine-")
+                        or issue_code
+                        in {
+                            MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+                            MIRROR_PRIVATE_CONTROL_REASON_LEGACY_PENDING,
+                            MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE,
+                        }
                         else (_personal_sync_root(home) / QUARANTINE_RELATIVE_PATH)
                         if issue_code.startswith("quarantine-")
                         else (
@@ -28904,6 +29065,56 @@ def _mirror_access_policy(metadata: os.stat_result) -> tuple[int, int, int]:
     )
 
 
+def _release_mirror_descriptors_best_effort(
+    descriptors: tuple[tuple[str, int, bool], ...],
+) -> tuple[str, ...]:
+    errors: list[str] = []
+    released_fds: set[int] = set()
+    for label, descriptor, unlock_attempted in descriptors:
+        if descriptor < 0 or descriptor in released_fds:
+            continue
+        released_fds.add(descriptor)
+        if unlock_attempted:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError as error:
+                errors.append(f"cannot release {label}: {error}")
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            errors.append(f"cannot close {label}: {error}")
+    return tuple(errors)
+
+
+def _raise_sync_with_secondary_cleanup(
+    primary_error: BaseException,
+    label: str,
+    cleanup_errors: tuple[str, ...] | list[str],
+) -> NoReturn:
+    if cleanup_errors:
+        raise SyncError(
+            f"{primary_error}; secondary {label}: " + "; ".join(cleanup_errors)
+        ) from primary_error
+    raise primary_error
+
+
+@contextlib.contextmanager
+def _mirror_descriptor_cleanup_scope(
+    descriptors: Callable[[], tuple[tuple[str, int, bool], ...]],
+    *,
+    label: str,
+) -> Iterator[None]:
+    try:
+        yield
+    except (OSError, SyncError) as error:
+        cleanup_errors = _release_mirror_descriptors_best_effort(descriptors())
+        _raise_sync_with_secondary_cleanup(error, label, cleanup_errors)
+    else:
+        cleanup_errors = _release_mirror_descriptors_best_effort(descriptors())
+        if cleanup_errors:
+            raise SyncError(f"{label}: " + "; ".join(cleanup_errors))
+
+
 def _bind_mirror_audit_directory(
     path: Path,
     label: str,
@@ -28922,20 +29133,356 @@ def _bind_mirror_audit_directory(
     try:
         descriptor_metadata = os.fstat(directory_fd)
     except OSError as error:
-        os.close(directory_fd)
-        raise SyncError(f"cannot inspect the bound {label}: {path}: {error}") from error
+        close_errors = _release_mirror_descriptors_best_effort(
+            ((label, directory_fd, False),)
+        )
+        _raise_sync_with_secondary_cleanup(
+            SyncError(f"cannot inspect the bound {label}: {path}: {error}"),
+            f"{label} bind cleanup failures",
+            close_errors,
+        )
     if _mirror_object_identity(path_metadata) != _mirror_object_identity(
         descriptor_metadata
     ) or _mirror_access_policy(path_metadata) != _mirror_access_policy(
         descriptor_metadata
     ):
-        os.close(directory_fd)
-        raise SyncError(f"{label} changed while binding it: {path}")
+        close_errors = _release_mirror_descriptors_best_effort(
+            ((label, directory_fd, False),)
+        )
+        _raise_sync_with_secondary_cleanup(
+            SyncError(f"{label} changed while binding it: {path}"),
+            f"{label} bind cleanup failures",
+            close_errors,
+        )
     return (
         directory_fd,
         _mirror_object_identity(descriptor_metadata),
         _mirror_access_policy(descriptor_metadata),
     )
+
+
+def _bind_mirror_trusted_account_home(
+    path: Path,
+) -> tuple[int, tuple[int, int, int], tuple[int, int, int]]:
+    path = Path(os.path.abspath(path))
+    if not path.is_absolute() or path == Path("/"):
+        raise SyncError("canonical account home must be an absolute child path")
+    components = path.parts[1:]
+    if not components or len(components) > MIRROR_PRIVATE_CONTROL_MAX_ANCESTORS:
+        raise SyncError("canonical account home exceeds its ancestor limit")
+    current_path = Path("/")
+    current_fd = os.open(current_path, _source_directory_flags())
+    try:
+        for component in components:
+            child_fd = -1
+            try:
+                path_metadata = os.stat(
+                    component,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISDIR(path_metadata.st_mode):
+                    raise SyncError(
+                        "canonical account-home ancestors must be non-symlink "
+                        f"directories: {current_path / component}"
+                    )
+                child_fd = os.open(
+                    component,
+                    _source_directory_flags(),
+                    dir_fd=current_fd,
+                )
+                child_metadata = os.fstat(child_fd)
+                if _mirror_object_identity(path_metadata) != _mirror_object_identity(
+                    child_metadata
+                ) or _mirror_access_policy(path_metadata) != _mirror_access_policy(
+                    child_metadata
+                ):
+                    raise SyncError(
+                        "canonical account-home ancestor changed while binding it: "
+                        f"{current_path / component}"
+                    )
+                mode, uid, _gid = _mirror_access_policy(child_metadata)
+                if uid not in {0, os.geteuid()} or mode & 0o022:
+                    raise SyncError(
+                        "canonical account-home ancestors must be root/current-owned "
+                        "and not group/world writable: "
+                        f"{current_path / component}"
+                    )
+            except OSError as error:
+                close_errors = _release_mirror_descriptors_best_effort(
+                    (("unadopted account-home ancestor", child_fd, False),)
+                )
+                child_fd = -1
+                _raise_sync_with_secondary_cleanup(
+                    SyncError(
+                        f"cannot bind canonical account-home ancestor "
+                        f"{current_path / component}: {error}"
+                    ),
+                    "account-home child cleanup failures",
+                    close_errors,
+                )
+            except BaseException as error:
+                close_errors = _release_mirror_descriptors_best_effort(
+                    (("unadopted account-home ancestor", child_fd, False),)
+                )
+                child_fd = -1
+                _raise_sync_with_secondary_cleanup(
+                    error,
+                    "account-home child cleanup failures",
+                    close_errors,
+                )
+            previous_fd = current_fd
+            current_fd = child_fd
+            child_fd = -1
+            current_path /= component
+            close_errors = _release_mirror_descriptors_best_effort(
+                (("previous account-home ancestor", previous_fd, False),)
+            )
+            if close_errors:
+                raise SyncError("; ".join(close_errors))
+        metadata = os.fstat(current_fd)
+        access_policy = _mirror_access_policy(metadata)
+        if access_policy[1] != os.geteuid() or access_policy[0] & 0o022:
+            raise SyncError(
+                "canonical account home must be owned by the current uid and "
+                "not group/world writable"
+            )
+        result = current_fd, _mirror_object_identity(metadata), access_policy
+        current_fd = -1
+        return result
+    except BaseException as error:
+        close_errors = _release_mirror_descriptors_best_effort(
+            (("current account-home ancestor", current_fd, False),)
+        )
+        current_fd = -1
+        _raise_sync_with_secondary_cleanup(
+            error,
+            "account-home cleanup failures",
+            close_errors,
+        )
+
+
+def _bind_mirror_primary_control_parent(
+    spec: MirrorPrivateControlRootSpec,
+) -> tuple[int, tuple[int, int, int], tuple[int, int, int]] | None:
+    if (
+        not spec.allocate
+        or spec.shared_parent
+        or spec.account_home is None
+        or spec.parent_path != spec.account_home / MIRROR_PRIVATE_CONTROL_NAMESPACE_NAME
+    ):
+        raise SyncError(f"private-control root schema is invalid [{spec.root_id}]")
+    home_fd, home_identity, home_access_policy = _bind_mirror_trusted_account_home(
+        spec.account_home
+    )
+    parent_fd = -1
+    result: tuple[int, tuple[int, int, int], tuple[int, int, int]] | None = None
+    try:
+        try:
+            os.stat(
+                MIRROR_PRIVATE_CONTROL_NAMESPACE_NAME,
+                dir_fd=home_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            parent_fd, parent_identity, parent_access_policy = (
+                _bind_mirror_audit_child_directory(
+                    home_fd,
+                    spec.account_home,
+                    MIRROR_PRIVATE_CONTROL_NAMESPACE_NAME,
+                    f"private-control allocation root [{spec.root_id}]",
+                )
+            )
+            if (
+                parent_access_policy[0] != 0o700
+                or parent_access_policy[1] != os.geteuid()
+            ):
+                raise SyncError(
+                    f"private-control allocation root [{spec.root_id}] must be "
+                    "mode 0700 and owned by the current uid"
+                )
+            _revalidate_mirror_audit_directory(
+                spec.account_home,
+                home_fd,
+                home_identity,
+                home_access_policy,
+                "canonical account home",
+            )
+            result = parent_fd, parent_identity, parent_access_policy
+    except BaseException as error:
+        close_errors = _release_mirror_descriptors_best_effort(
+            (
+                (f"private-control parent [{spec.root_id}]", parent_fd, False),
+                (f"canonical account home [{spec.root_id}]", home_fd, False),
+            )
+        )
+        parent_fd = -1
+        home_fd = -1
+        _raise_sync_with_secondary_cleanup(
+            error,
+            "primary private-control bind cleanup failures",
+            close_errors,
+        )
+    home_close_errors = _release_mirror_descriptors_best_effort(
+        ((f"canonical account home [{spec.root_id}]", home_fd, False),)
+    )
+    home_fd = -1
+    if home_close_errors:
+        parent_close_errors = _release_mirror_descriptors_best_effort(
+            ((f"private-control parent [{spec.root_id}]", parent_fd, False),)
+        )
+        parent_fd = -1
+        raise SyncError(
+            "primary private-control bind cleanup failures: "
+            + "; ".join((*home_close_errors, *parent_close_errors))
+        )
+    return result
+
+
+def _capture_mirror_quarantine_parent_absence(
+    spec: MirrorPrivateControlRootSpec,
+) -> MirrorQuarantineRootReceipt:
+    parent_path = Path(os.path.abspath(spec.parent_path))
+    if spec.allocate:
+        if (
+            spec.shared_parent
+            or spec.account_home is None
+            or parent_path
+            != Path(os.path.abspath(spec.account_home))
+            / MIRROR_PRIVATE_CONTROL_NAMESPACE_NAME
+        ):
+            raise SyncError(f"private-control root schema is invalid [{spec.root_id}]")
+        anchor_path = Path(os.path.abspath(spec.account_home))
+        absence_name = MIRROR_PRIVATE_CONTROL_NAMESPACE_NAME
+        anchor_fd, anchor_identity, anchor_access_policy = (
+            _bind_mirror_trusted_account_home(anchor_path)
+        )
+        anchor_label = f"canonical account home [{spec.root_id}]"
+    else:
+        if (
+            not spec.shared_parent
+            or spec.account_home is not None
+            or parent_path == Path("/")
+            or parent_path.name in {"", ".", ".."}
+        ):
+            raise SyncError(f"private-control root schema is invalid [{spec.root_id}]")
+        anchor_path = parent_path.parent
+        absence_name = parent_path.name
+        anchor_fd, anchor_identity, anchor_access_policy = _bind_mirror_audit_directory(
+            anchor_path,
+            f"legacy private-control absence anchor [{spec.root_id}]",
+        )
+        anchor_label = f"legacy private-control absence anchor [{spec.root_id}]"
+    receipt: MirrorQuarantineRootReceipt | None = None
+    primary_error: BaseException | None = None
+    try:
+        try:
+            os.stat(
+                absence_name,
+                dir_fd=anchor_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise SyncError(
+                f"cannot verify absent private-control parent [{spec.root_id}]: {error}"
+            ) from error
+        else:
+            raise SyncError(
+                f"private-control parent [{spec.root_id}] is no longer absent"
+            )
+        _revalidate_mirror_audit_directory(
+            anchor_path,
+            anchor_fd,
+            anchor_identity,
+            anchor_access_policy,
+            anchor_label,
+        )
+        receipt = MirrorQuarantineRootReceipt(
+            root_id=spec.root_id,
+            parent_path=parent_path,
+            scope="parent-absent",
+            parent_identity=None,
+            parent_access_policy=None,
+            absence_anchor_path=anchor_path,
+            absence_name=absence_name,
+            absence_anchor_identity=anchor_identity,
+            absence_anchor_access_policy=anchor_access_policy,
+        )
+    except BaseException as error:
+        primary_error = error
+    close_errors = _release_mirror_descriptors_best_effort(
+        ((anchor_label, anchor_fd, False),)
+    )
+    anchor_fd = -1
+    if primary_error is not None:
+        _raise_sync_with_secondary_cleanup(
+            primary_error,
+            "absence-anchor cleanup failures",
+            close_errors,
+        )
+    if close_errors:
+        raise SyncError("absence-anchor cleanup failures: " + "; ".join(close_errors))
+    assert receipt is not None
+    return receipt
+
+
+def _mirror_legacy_shared_parent_policy_is_valid(
+    access_policy: tuple[int, int, int],
+) -> bool:
+    mode, uid, _gid = access_policy
+    return mode == 0o1777 and uid == 0
+
+
+def _mirror_private_control_child_metadata(
+    parent_fd: int,
+    name: str,
+    label: str,
+) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise SyncError(f"cannot inspect {label} {name}: {error}") from error
+    return _mirror_object_identity(metadata), _mirror_access_policy(metadata)
+
+
+def _mirror_legacy_child_metadata(
+    parent_fd: int,
+    name: str,
+    root_id: str,
+) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
+    return _mirror_private_control_child_metadata(
+        parent_fd,
+        name,
+        f"legacy private-control child [{root_id}]",
+    )
+
+
+def _mirror_private_control_alias_error(
+    parent_identity: tuple[int, int, int],
+    tool_record: tuple[tuple[int, int, int], tuple[int, int, int]] | None,
+    quarantine_record: tuple[tuple[int, int, int], tuple[int, int, int]] | None,
+    seen_parent_identities: set[tuple[int, int, int]],
+    seen_child_identities: set[tuple[int, int, int]],
+) -> str | None:
+    observed = tuple(
+        record for record in (tool_record, quarantine_record) if record is not None
+    )
+    child_identities = {record[0] for record in observed}
+    if parent_identity in seen_child_identities:
+        return "private-control parent aliases an earlier fixed child"
+    if len(child_identities) != len(observed):
+        return "private-control fixed child roles alias each other"
+    if parent_identity in child_identities:
+        return "private-control fixed child aliases its own parent"
+    if child_identities & (seen_parent_identities | seen_child_identities):
+        return "distinct private-control parent aliases an earlier control object"
+    return None
 
 
 def _bind_mirror_audit_child_directory(
@@ -28971,17 +29518,29 @@ def _bind_mirror_audit_child_directory(
     try:
         descriptor_metadata = os.fstat(directory_fd)
     except OSError as error:
-        os.close(directory_fd)
-        raise SyncError(
-            f"cannot inspect the bound {label}: {parent_path / name}: {error}"
-        ) from error
+        close_errors = _release_mirror_descriptors_best_effort(
+            ((label, directory_fd, False),)
+        )
+        _raise_sync_with_secondary_cleanup(
+            SyncError(
+                f"cannot inspect the bound {label}: {parent_path / name}: {error}"
+            ),
+            f"{label} bind cleanup failures",
+            close_errors,
+        )
     if _mirror_object_identity(path_metadata) != _mirror_object_identity(
         descriptor_metadata
     ) or _mirror_access_policy(path_metadata) != _mirror_access_policy(
         descriptor_metadata
     ):
-        os.close(directory_fd)
-        raise SyncError(f"{label} changed while binding it: {parent_path / name}")
+        close_errors = _release_mirror_descriptors_best_effort(
+            ((label, directory_fd, False),)
+        )
+        _raise_sync_with_secondary_cleanup(
+            SyncError(f"{label} changed while binding it: {parent_path / name}"),
+            f"{label} bind cleanup failures",
+            close_errors,
+        )
     return (
         directory_fd,
         _mirror_object_identity(descriptor_metadata),
@@ -29011,6 +29570,198 @@ def _revalidate_mirror_audit_directory(
         or _mirror_access_policy(descriptor_metadata) != access_policy
     ):
         raise SyncError(f"{label} access policy changed during audit: {path}")
+
+
+def _mirror_directory_is_at_or_below(
+    candidate_fd: int,
+    ancestor_identity: tuple[int, int, int],
+    *,
+    label: str,
+) -> bool:
+    try:
+        current_fd = os.dup(candidate_fd)
+    except OSError as error:
+        raise SyncError(
+            f"cannot duplicate {label} for ancestry audit: {error}"
+        ) from error
+    result: bool | None = None
+    primary_error: BaseException | None = None
+    try:
+        for _depth in range(MIRROR_PRIVATE_CONTROL_MAX_ANCESTORS):
+            try:
+                current_identity = _mirror_object_identity(os.fstat(current_fd))
+            except OSError as error:
+                raise SyncError(f"cannot inspect {label} ancestry: {error}") from error
+            if current_identity == ancestor_identity:
+                result = True
+                break
+            parent_fd = -1
+            try:
+                parent_fd = os.open(
+                    "..",
+                    _source_directory_flags(),
+                    dir_fd=current_fd,
+                )
+                parent_identity = _mirror_object_identity(os.fstat(parent_fd))
+            except OSError as error:
+                close_errors = _release_mirror_descriptors_best_effort(
+                    ((f"unadopted {label} ancestry parent", parent_fd, False),)
+                )
+                _raise_sync_with_secondary_cleanup(
+                    SyncError(f"cannot inspect {label} ancestry: {error}"),
+                    f"{label} ancestry parent cleanup failures",
+                    close_errors,
+                )
+            previous_fd = current_fd
+            current_fd = parent_fd
+            parent_fd = -1
+            close_errors = _release_mirror_descriptors_best_effort(
+                ((f"previous {label} ancestry directory", previous_fd, False),)
+            )
+            if close_errors:
+                raise SyncError("; ".join(close_errors))
+            if parent_identity == current_identity:
+                result = False
+                break
+        else:
+            raise SyncError(
+                f"{label} ancestry exceeds "
+                f"{MIRROR_PRIVATE_CONTROL_MAX_ANCESTORS} directories"
+            )
+    except BaseException as error:
+        primary_error = error
+    close_errors = _release_mirror_descriptors_best_effort(
+        ((f"current {label} ancestry directory", current_fd, False),)
+    )
+    current_fd = -1
+    if primary_error is not None:
+        _raise_sync_with_secondary_cleanup(
+            primary_error,
+            f"{label} ancestry cleanup failures",
+            close_errors,
+        )
+    if close_errors:
+        raise SyncError("; ".join(close_errors))
+    assert result is not None
+    return result
+
+
+def _validate_mirror_private_control_metadata_topology(
+    *,
+    root_id: str,
+    parent_fd: int,
+    parent_identity: tuple[int, int, int],
+    tool_record: tuple[tuple[int, int, int], tuple[int, int, int]] | None,
+    quarantine_record: tuple[tuple[int, int, int], tuple[int, int, int]] | None,
+) -> None:
+    """Validate topology observable without opening either fixed child."""
+
+    children = tuple(
+        (label, record)
+        for label, record in (
+            ("mirror private tool root", tool_record),
+            ("mirror durable quarantine segment", quarantine_record),
+        )
+        if record is not None
+    )
+    for label, record in children:
+        identity, _access_policy = record
+        # The no-follow lookup through parent_fd proves that the fixed name is
+        # directly below the bound parent. Walking only the parent upward also
+        # rejects inverted containment without opening a foreign child.
+        if identity == parent_identity or _mirror_directory_is_at_or_below(
+            parent_fd,
+            identity,
+            label=f"private-control parent [{root_id}]",
+        ):
+            raise SyncError(
+                f"{label} [{root_id}] does not have strict parent-to-child containment"
+            )
+    if tool_record is not None and quarantine_record is not None:
+        if tool_record[0][0] != quarantine_record[0][0]:
+            raise SyncError(
+                f"mirror private tool and quarantine roots [{root_id}] must be "
+                "on the same filesystem"
+            )
+        if tool_record[0] == quarantine_record[0]:
+            raise SyncError(
+                f"mirror private tool and quarantine roots [{root_id}] overlap"
+            )
+
+
+def _validate_mirror_private_control_bound_topology(
+    *,
+    root_id: str,
+    parent_fd: int,
+    parent_identity: tuple[int, int, int],
+    tool_fd: int = -1,
+    tool_identity: tuple[int, int, int] | None = None,
+    quarantine_fd: int = -1,
+    quarantine_identity: tuple[int, int, int] | None = None,
+) -> None:
+    if (tool_fd >= 0) != (tool_identity is not None) or (quarantine_fd >= 0) != (
+        quarantine_identity is not None
+    ):
+        raise SyncError(
+            f"mirror private-control topology binding [{root_id}] is incomplete"
+        )
+    children = tuple(
+        (label, directory_fd, identity)
+        for label, directory_fd, identity in (
+            ("mirror private tool root", tool_fd, tool_identity),
+            (
+                "mirror durable quarantine segment",
+                quarantine_fd,
+                quarantine_identity,
+            ),
+        )
+        if directory_fd >= 0 and identity is not None
+    )
+    for label, directory_fd, identity in children:
+        if (
+            identity == parent_identity
+            or not _mirror_directory_is_at_or_below(
+                directory_fd,
+                parent_identity,
+                label=f"{label} [{root_id}]",
+            )
+            or _mirror_directory_is_at_or_below(
+                parent_fd,
+                identity,
+                label=f"private-control parent [{root_id}]",
+            )
+        ):
+            raise SyncError(
+                f"{label} [{root_id}] is not a strict descendant of its "
+                "fixed-name parent"
+            )
+    if tool_fd >= 0 and quarantine_fd >= 0:
+        try:
+            tool_metadata = os.fstat(tool_fd)
+            quarantine_metadata = os.fstat(quarantine_fd)
+        except OSError as error:
+            raise SyncError(
+                f"cannot inspect mirror private-control topology [{root_id}]: {error}"
+            ) from error
+        if tool_metadata.st_dev != quarantine_metadata.st_dev:
+            raise SyncError(
+                f"mirror private tool and quarantine roots [{root_id}] must be "
+                "on the same filesystem"
+            )
+        assert tool_identity is not None
+        assert quarantine_identity is not None
+        if _mirror_directory_is_at_or_below(
+            tool_fd,
+            quarantine_identity,
+            label=f"mirror private tool root [{root_id}]",
+        ) or _mirror_directory_is_at_or_below(
+            quarantine_fd,
+            tool_identity,
+            label=f"mirror durable quarantine segment [{root_id}]",
+        ):
+            raise SyncError(
+                f"mirror private tool and quarantine roots [{root_id}] overlap"
+            )
 
 
 def _acquire_mirror_audit_shared_lock(
@@ -29127,6 +29878,7 @@ def _is_strict_json_integer(value: object) -> bool:
 def _audit_mirror_owner_record(
     tool_fd: int,
     owner_name: str,
+    expected_root_id: str,
 ) -> MirrorQuarantineOwnerRecord:
     label = f"mirror private owner record {owner_name}"
     try:
@@ -29144,7 +29896,10 @@ def _audit_mirror_owner_record(
         )
     except OSError as error:
         raise SyncError(f"cannot bind {label}: {error}") from error
-    try:
+    with _mirror_descriptor_cleanup_scope(
+        lambda: ((label, owner_fd, False),),
+        label=f"{label} descriptor cleanup failures",
+    ):
         try:
             descriptor_metadata = os.fstat(owner_fd)
         except OSError as error:
@@ -29179,6 +29934,7 @@ def _audit_mirror_owner_record(
                 sha256=None,
                 state="active",
                 detail="owner record is held by an active exclusive lease",
+                root_id=expected_root_id,
             )
         except OSError as error:
             raise SyncError(
@@ -29219,6 +29975,29 @@ def _audit_mirror_owner_record(
                     state="invalid",
                     detail=f"owner record schema is invalid: {error}",
                 )
+            root_scope = _mirror_private_owner_record_root_scope(
+                record,
+                expected_root_id,
+            )
+            observed_root_id = (
+                record.get("root_id") if isinstance(record, dict) else None
+            )
+            if root_scope == MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH:
+                return MirrorQuarantineOwnerRecord(
+                    name=owner_name,
+                    identity=identity,
+                    access_policy=access_policy,
+                    sha256=digest,
+                    state="invalid",
+                    detail=(
+                        "owner record root scope does not match its containing "
+                        f"root {expected_root_id}"
+                    ),
+                    root_id=(
+                        observed_root_id if isinstance(observed_root_id, str) else None
+                    ),
+                    reason_code=MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+                )
             private_name = (
                 record.get("private_name") if isinstance(record, dict) else None
             )
@@ -29227,9 +30006,7 @@ def _audit_mirror_owner_record(
             )
             valid = (
                 isinstance(record, dict)
-                and set(record) == MIRROR_PRIVATE_OWNER_RECORD_FIELDS
-                and type(record["version"]) is int
-                and record["version"] == MIRROR_PRIVATE_OWNER_RECORD_VERSION
+                and root_scope in {"accepted-legacy", "accepted-current"}
                 and _is_strict_json_integer(record["owner_pid"])
                 and record["owner_pid"] > 0
                 and type(record["owner_uid"]) is int
@@ -29296,6 +30073,7 @@ def _audit_mirror_owner_record(
                 expected_private_identity=expected_private_identity,
                 observed_private_identity=observed_private_identity,
                 private_state=private_state,
+                root_id=expected_root_id,
             )
         finally:
             try:
@@ -29304,20 +30082,25 @@ def _audit_mirror_owner_record(
                 raise SyncError(
                     f"cannot release the {label} audit lease: {error}"
                 ) from error
-    finally:
-        os.close(owner_fd)
 
 
-def _mirror_quarantine_audit() -> MirrorQuarantineAudit:
-    parent_path = Path(os.path.abspath(MIRROR_PRIVATE_CONTROL_PARENT))
+def _mirror_quarantine_root_audit(
+    spec: MirrorPrivateControlRootSpec,
+    seen_parent_identities: set[tuple[int, int, int]] | None = None,
+    seen_child_identities: set[tuple[int, int, int]] | None = None,
+) -> MirrorQuarantineAudit:
+    parent_path = Path(os.path.abspath(spec.parent_path))
     tool_path = parent_path / MIRROR_PRIVATE_TOOL_ROOT_NAME
     quarantine_path = parent_path / MIRROR_DURABLE_QUARANTINE_ROOT_NAME
     parent_fd = -1
     tool_fd = -1
     quarantine_fd = -1
+    tool_lease_attempted = False
+    quarantine_lease_attempted = False
     tool_was_present = False
     quarantine_inspection_attempted = False
     quarantine_was_present = False
+    quarantine_coordination_ready = True
     entry_count: int | None = None
     count_is_lower_bound = False
     tool_identity: tuple[int, int, int] | None = None
@@ -29326,11 +30109,243 @@ def _mirror_quarantine_audit() -> MirrorQuarantineAudit:
     segment_access_policy: tuple[int, int, int] | None = None
     owner_records: list[MirrorQuarantineOwnerRecord] = []
     audit_errors: list[str] = []
+    tool_names: tuple[str, ...] = ()
+    parent_identity: tuple[int, int, int] | None = None
+    parent_access_policy: tuple[int, int, int] | None = None
+    first_tool: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None
+    first_quarantine: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None
+    fixed_metadata_captured = False
+    forced_reason_code: str | None = None
+    prior_parent_identities = (
+        set() if seen_parent_identities is None else seen_parent_identities
+    )
+    prior_child_identities = (
+        set() if seen_child_identities is None else seen_child_identities
+    )
     try:
-        parent_fd, parent_identity, parent_access_policy = _bind_mirror_audit_directory(
-            parent_path,
-            "mirror private-control parent",
-        )
+        if spec.allocate:
+            primary_binding = _bind_mirror_primary_control_parent(spec)
+            if primary_binding is None:
+                root_receipt = _capture_mirror_quarantine_parent_absence(spec)
+                return MirrorQuarantineAudit(
+                    classification="absent",
+                    path=quarantine_path,
+                    entry_count=0,
+                    entry_limit=MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT,
+                    count_is_lower_bound=False,
+                    segment_identity=None,
+                    segment_access_policy=None,
+                    root_id=spec.root_id,
+                    root_receipt=root_receipt,
+                )
+            parent_fd, parent_identity, parent_access_policy = primary_binding
+            if (
+                seen_parent_identities is not None
+                and parent_identity in seen_parent_identities
+            ):
+                _revalidate_mirror_audit_directory(
+                    parent_path,
+                    parent_fd,
+                    parent_identity,
+                    parent_access_policy,
+                    f"private-control parent [{spec.root_id}]",
+                )
+                return MirrorQuarantineAudit(
+                    classification="duplicate",
+                    path=quarantine_path,
+                    entry_count=None,
+                    entry_limit=MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT,
+                    count_is_lower_bound=False,
+                    segment_identity=None,
+                    segment_access_policy=None,
+                    root_id=spec.root_id,
+                    root_parent_identity=parent_identity,
+                    root_receipt=MirrorQuarantineRootReceipt(
+                        root_id=spec.root_id,
+                        parent_path=parent_path,
+                        scope="parent-only",
+                        parent_identity=parent_identity,
+                        parent_access_policy=parent_access_policy,
+                    ),
+                )
+            first_tool = _mirror_private_control_child_metadata(
+                parent_fd,
+                MIRROR_PRIVATE_TOOL_ROOT_NAME,
+                f"primary private-control child [{spec.root_id}]",
+            )
+            first_quarantine = _mirror_private_control_child_metadata(
+                parent_fd,
+                MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+                f"primary private-control child [{spec.root_id}]",
+            )
+            fixed_metadata_captured = True
+            alias_error = _mirror_private_control_alias_error(
+                parent_identity,
+                first_tool,
+                first_quarantine,
+                prior_parent_identities,
+                prior_child_identities,
+            )
+            if alias_error is not None:
+                tool_identity = None if first_tool is None else first_tool[0]
+                segment_identity = (
+                    None if first_quarantine is None else first_quarantine[0]
+                )
+                raise SyncError(alias_error)
+            _validate_mirror_private_control_metadata_topology(
+                root_id=spec.root_id,
+                parent_fd=parent_fd,
+                parent_identity=parent_identity,
+                tool_record=first_tool,
+                quarantine_record=first_quarantine,
+            )
+        else:
+            if not spec.shared_parent or spec.account_home is not None:
+                raise SyncError(
+                    f"private-control root schema is invalid [{spec.root_id}]"
+                )
+            try:
+                (
+                    parent_fd,
+                    parent_identity,
+                    parent_access_policy,
+                ) = _bind_mirror_audit_directory(
+                    parent_path,
+                    f"legacy shared private-control parent [{spec.root_id}]",
+                )
+            except SyncError as bind_error:
+                try:
+                    root_receipt = _capture_mirror_quarantine_parent_absence(spec)
+                except SyncError as absence_error:
+                    raise SyncError(
+                        f"{bind_error}; secondary absence-anchor verification "
+                        f"failure: {absence_error}"
+                    ) from bind_error
+                return MirrorQuarantineAudit(
+                    classification="absent",
+                    path=quarantine_path,
+                    entry_count=0,
+                    entry_limit=MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT,
+                    count_is_lower_bound=False,
+                    segment_identity=None,
+                    segment_access_policy=None,
+                    root_id=spec.root_id,
+                    root_receipt=root_receipt,
+                )
+            if not _mirror_legacy_shared_parent_policy_is_valid(parent_access_policy):
+                raise SyncError(
+                    f"legacy shared private-control parent [{spec.root_id}] "
+                    "must be root-owned mode 1777"
+                )
+            if (
+                seen_parent_identities is not None
+                and parent_identity in seen_parent_identities
+            ):
+                _revalidate_mirror_audit_directory(
+                    parent_path,
+                    parent_fd,
+                    parent_identity,
+                    parent_access_policy,
+                    f"legacy shared private-control parent [{spec.root_id}]",
+                )
+                return MirrorQuarantineAudit(
+                    classification="duplicate",
+                    path=quarantine_path,
+                    entry_count=None,
+                    entry_limit=MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT,
+                    count_is_lower_bound=False,
+                    segment_identity=None,
+                    segment_access_policy=None,
+                    root_id=spec.root_id,
+                    root_parent_identity=parent_identity,
+                    root_receipt=MirrorQuarantineRootReceipt(
+                        root_id=spec.root_id,
+                        parent_path=parent_path,
+                        scope="parent-only",
+                        parent_identity=parent_identity,
+                        parent_access_policy=parent_access_policy,
+                    ),
+                )
+            first_tool = _mirror_legacy_child_metadata(
+                parent_fd,
+                MIRROR_PRIVATE_TOOL_ROOT_NAME,
+                spec.root_id,
+            )
+            first_quarantine = _mirror_legacy_child_metadata(
+                parent_fd,
+                MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+                spec.root_id,
+            )
+            fixed_metadata_captured = True
+            alias_error = _mirror_private_control_alias_error(
+                parent_identity,
+                first_tool,
+                first_quarantine,
+                prior_parent_identities,
+                prior_child_identities,
+            )
+            if alias_error is not None:
+                tool_identity = None if first_tool is None else first_tool[0]
+                segment_identity = (
+                    None if first_quarantine is None else first_quarantine[0]
+                )
+                raise SyncError(alias_error)
+            observed = tuple(
+                item for item in (first_tool, first_quarantine) if item is not None
+            )
+            ownership_state = _mirror_private_control_legacy_ownership_state(observed)
+            if ownership_state == "foreign-unrelated":
+                second_tool = _mirror_legacy_child_metadata(
+                    parent_fd,
+                    MIRROR_PRIVATE_TOOL_ROOT_NAME,
+                    spec.root_id,
+                )
+                second_quarantine = _mirror_legacy_child_metadata(
+                    parent_fd,
+                    MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+                    spec.root_id,
+                )
+                if (second_tool, second_quarantine) != (
+                    first_tool,
+                    first_quarantine,
+                ):
+                    raise SyncError(
+                        "foreign-unrelated legacy metadata changed during audit"
+                    )
+                _revalidate_mirror_audit_directory(
+                    parent_path,
+                    parent_fd,
+                    parent_identity,
+                    parent_access_policy,
+                    f"legacy shared private-control parent [{spec.root_id}]",
+                )
+                return MirrorQuarantineAudit(
+                    classification="foreign-unrelated",
+                    path=quarantine_path,
+                    entry_count=None,
+                    entry_limit=MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT,
+                    count_is_lower_bound=False,
+                    segment_identity=(
+                        None if first_quarantine is None else first_quarantine[0]
+                    ),
+                    segment_access_policy=(
+                        None if first_quarantine is None else first_quarantine[1]
+                    ),
+                    root_id=spec.root_id,
+                    root_parent_identity=parent_identity,
+                    tool_identity=None if first_tool is None else first_tool[0],
+                    root_receipt=MirrorQuarantineRootReceipt(
+                        root_id=spec.root_id,
+                        parent_path=parent_path,
+                        scope="fixed-metadata",
+                        parent_identity=parent_identity,
+                        parent_access_policy=parent_access_policy,
+                        tool_record=first_tool,
+                        quarantine_record=first_quarantine,
+                    ),
+                )
+            if ownership_state == "inconclusive":
+                raise SyncError("legacy private-control children have mixed ownership")
         tool_coordination_ready = True
         try:
             os.stat(
@@ -29357,6 +30372,17 @@ def _mirror_quarantine_audit() -> MirrorQuarantineAudit:
                     "mirror private tool root",
                 )
                 if (
+                    not spec.allocate
+                    and (
+                        tool_identity,
+                        tool_access_policy,
+                    )
+                    != first_tool
+                ):
+                    raise SyncError(
+                        "legacy private tool root changed before audit binding"
+                    )
+                if (
                     tool_access_policy[0] != 0o700
                     or tool_access_policy[1] != os.geteuid()
                 ):
@@ -29364,6 +30390,14 @@ def _mirror_quarantine_audit() -> MirrorQuarantineAudit:
                         "mirror private tool root must be mode 0700 and "
                         "owned by the current uid"
                     )
+                _validate_mirror_private_control_bound_topology(
+                    root_id=spec.root_id,
+                    parent_fd=parent_fd,
+                    parent_identity=parent_identity,
+                    tool_fd=tool_fd,
+                    tool_identity=tool_identity,
+                )
+                tool_lease_attempted = True
                 _acquire_mirror_audit_shared_lock(
                     tool_fd,
                     "mirror private tool root",
@@ -29371,42 +30405,6 @@ def _mirror_quarantine_audit() -> MirrorQuarantineAudit:
             except SyncError as error:
                 tool_coordination_ready = False
                 audit_errors.append(str(error))
-            else:
-                try:
-                    tool_names, tool_overflow = _bounded_mirror_directory_names(
-                        tool_fd,
-                        limit=MIRROR_PRIVATE_TOOL_ROOT_ENTRY_LIMIT,
-                        label="mirror private tool root",
-                    )
-                    if tool_overflow:
-                        raise SyncError(
-                            "mirror private tool root exceeds its bounded "
-                            f"{MIRROR_PRIVATE_TOOL_ROOT_ENTRY_LIMIT}-entry audit"
-                        )
-                    for owner_name in tool_names:
-                        if not owner_name.endswith(".owner.json"):
-                            continue
-                        private_name = owner_name[: -len(".owner.json")]
-                        if MIRROR_PRIVATE_SNAPSHOT_RE.fullmatch(private_name) is None:
-                            continue
-                        try:
-                            owner_records.append(
-                                _audit_mirror_owner_record(
-                                    tool_fd,
-                                    owner_name,
-                                )
-                            )
-                        except SyncError as error:
-                            audit_errors.append(str(error))
-                except SyncError as error:
-                    audit_errors.append(str(error))
-                _revalidate_mirror_audit_directory(
-                    tool_path,
-                    tool_fd,
-                    tool_identity,
-                    tool_access_policy,
-                    "mirror private tool root",
-                )
 
         if tool_coordination_ready and not tool_was_present:
             quarantine_inspection_attempted = True
@@ -29419,11 +30417,14 @@ def _mirror_quarantine_audit() -> MirrorQuarantineAudit:
             except FileNotFoundError:
                 entry_count = 0
             except OSError as error:
+                quarantine_coordination_ready = False
                 audit_errors.append(
                     f"cannot inspect mirror quarantine segment presence: {error}"
                 )
             else:
                 quarantine_was_present = True
+                if not spec.allocate:
+                    forced_reason_code = MIRROR_PRIVATE_CONTROL_REASON_LEGACY_PENDING
                 audit_errors.append(
                     "mirror durable quarantine segment exists without its "
                     "coordination tool root"
@@ -29439,6 +30440,7 @@ def _mirror_quarantine_audit() -> MirrorQuarantineAudit:
             except FileNotFoundError:
                 entry_count = 0
             except OSError as error:
+                quarantine_coordination_ready = False
                 audit_errors.append(
                     f"cannot inspect mirror quarantine segment: {error}"
                 )
@@ -29456,6 +30458,17 @@ def _mirror_quarantine_audit() -> MirrorQuarantineAudit:
                         "mirror durable quarantine segment",
                     )
                     if (
+                        not spec.allocate
+                        and (
+                            segment_identity,
+                            segment_access_policy,
+                        )
+                        != first_quarantine
+                    ):
+                        raise SyncError(
+                            "legacy durable quarantine changed before audit binding"
+                        )
+                    if (
                         segment_access_policy[0] != 0o700
                         or segment_access_policy[1] != os.geteuid()
                     ):
@@ -29463,10 +30476,57 @@ def _mirror_quarantine_audit() -> MirrorQuarantineAudit:
                             "mirror durable quarantine segment must be mode 0700 "
                             "and owned by the current uid"
                         )
+                    _validate_mirror_private_control_bound_topology(
+                        root_id=spec.root_id,
+                        parent_fd=parent_fd,
+                        parent_identity=parent_identity,
+                        tool_fd=tool_fd,
+                        tool_identity=tool_identity,
+                        quarantine_fd=quarantine_fd,
+                        quarantine_identity=segment_identity,
+                    )
+                    quarantine_lease_attempted = True
                     _acquire_mirror_audit_shared_lock(
                         quarantine_fd,
                         "mirror durable quarantine segment",
                     )
+                except SyncError as error:
+                    quarantine_coordination_ready = False
+                    audit_errors.append(str(error))
+
+        if (
+            tool_coordination_ready
+            and tool_was_present
+            and quarantine_coordination_ready
+        ):
+            try:
+                tool_names, tool_overflow = _bounded_mirror_directory_names(
+                    tool_fd,
+                    limit=MIRROR_PRIVATE_TOOL_ROOT_ENTRY_LIMIT,
+                    label="mirror private tool root",
+                )
+                if tool_overflow:
+                    raise SyncError(
+                        "mirror private tool root exceeds its bounded "
+                        f"{MIRROR_PRIVATE_TOOL_ROOT_ENTRY_LIMIT}-entry audit"
+                    )
+                for owner_name in tool_names:
+                    if not owner_name.endswith(".owner.json"):
+                        continue
+                    private_name = owner_name[: -len(".owner.json")]
+                    if MIRROR_PRIVATE_SNAPSHOT_RE.fullmatch(private_name) is None:
+                        continue
+                    try:
+                        owner_records.append(
+                            _audit_mirror_owner_record(
+                                tool_fd,
+                                owner_name,
+                                spec.root_id,
+                            )
+                        )
+                    except SyncError as error:
+                        audit_errors.append(str(error))
+                if quarantine_fd >= 0:
                     quarantine_names, count_is_lower_bound = (
                         _bounded_mirror_directory_names(
                             quarantine_fd,
@@ -29475,6 +30535,23 @@ def _mirror_quarantine_audit() -> MirrorQuarantineAudit:
                         )
                     )
                     entry_count = len(quarantine_names)
+                for owner_record in owner_records:
+                    if (
+                        owner_record.reason_code
+                        == MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH
+                    ):
+                        audit_errors.append(
+                            f"{owner_record.reason_code} [{spec.root_id}]: "
+                            f"{owner_record.name}"
+                        )
+                _revalidate_mirror_audit_directory(
+                    tool_path,
+                    tool_fd,
+                    tool_identity,
+                    tool_access_policy,
+                    "mirror private tool root",
+                )
+                if quarantine_fd >= 0:
                     _revalidate_mirror_audit_directory(
                         quarantine_path,
                         quarantine_fd,
@@ -29482,8 +30559,8 @@ def _mirror_quarantine_audit() -> MirrorQuarantineAudit:
                         segment_access_policy,
                         "mirror durable quarantine segment",
                     )
-                except SyncError as error:
-                    audit_errors.append(str(error))
+            except SyncError as error:
+                audit_errors.append(str(error))
 
         if not tool_was_present:
             try:
@@ -29551,6 +30628,22 @@ def _mirror_quarantine_audit() -> MirrorQuarantineAudit:
             except SyncError as error:
                 audit_errors.append(str(error))
 
+        if not spec.allocate:
+            final_tool = _mirror_legacy_child_metadata(
+                parent_fd,
+                MIRROR_PRIVATE_TOOL_ROOT_NAME,
+                spec.root_id,
+            )
+            final_quarantine = _mirror_legacy_child_metadata(
+                parent_fd,
+                MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+                spec.root_id,
+            )
+            if (final_tool, final_quarantine) != (
+                first_tool,
+                first_quarantine,
+            ):
+                audit_errors.append("legacy fixed-root metadata changed during audit")
         _revalidate_mirror_audit_directory(
             parent_path,
             parent_fd,
@@ -29558,15 +30651,54 @@ def _mirror_quarantine_audit() -> MirrorQuarantineAudit:
             parent_access_policy,
             "mirror private-control parent",
         )
-    except SyncError as error:
+    except (OSError, SyncError) as error:
         audit_errors.append(str(error))
     finally:
-        for descriptor in (quarantine_fd, tool_fd, parent_fd):
-            if descriptor >= 0:
-                os.close(descriptor)
+        cleanup_errors = _release_mirror_descriptors_best_effort(
+            (
+                (
+                    "mirror durable quarantine segment",
+                    quarantine_fd,
+                    quarantine_lease_attempted,
+                ),
+                ("mirror private tool root", tool_fd, tool_lease_attempted),
+                ("mirror private-control parent", parent_fd, False),
+            )
+        )
+        quarantine_fd = -1
+        tool_fd = -1
+        parent_fd = -1
+        if cleanup_errors:
+            if audit_errors:
+                _raise_sync_with_secondary_cleanup(
+                    SyncError("; ".join(audit_errors)),
+                    "mirror private-control root cleanup failures",
+                    cleanup_errors,
+                )
+            raise SyncError(
+                "mirror private-control root cleanup failures: "
+                + "; ".join(cleanup_errors)
+            )
 
+    reason_code = None
     if audit_errors:
         classification = "inconclusive"
+        reason_code = (
+            MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH
+            if any(
+                record.reason_code == MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH
+                for record in owner_records
+            )
+            else forced_reason_code or MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE
+        )
+    elif not spec.allocate and (
+        tool_names or (entry_count is not None and entry_count > 0)
+    ):
+        classification = "inconclusive"
+        reason_code = MIRROR_PRIVATE_CONTROL_REASON_LEGACY_PENDING
+        audit_errors.append(
+            "same-uid legacy recovery evidence remains in its original root"
+        )
     elif (
         entry_count is not None and entry_count >= MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT
     ):
@@ -29575,6 +30707,17 @@ def _mirror_quarantine_audit() -> MirrorQuarantineAudit:
         classification = "absent"
     else:
         classification = "available"
+    root_receipt = None
+    if parent_identity is not None and parent_access_policy is not None:
+        root_receipt = MirrorQuarantineRootReceipt(
+            root_id=spec.root_id,
+            parent_path=parent_path,
+            scope="fixed-metadata" if fixed_metadata_captured else "parent-only",
+            parent_identity=parent_identity,
+            parent_access_policy=parent_access_policy,
+            tool_record=first_tool if fixed_metadata_captured else None,
+            quarantine_record=first_quarantine if fixed_metadata_captured else None,
+        )
     return MirrorQuarantineAudit(
         classification=classification,
         path=quarantine_path,
@@ -29585,6 +30728,387 @@ def _mirror_quarantine_audit() -> MirrorQuarantineAudit:
         segment_access_policy=segment_access_policy,
         owner_records=tuple(owner_records),
         detail="; ".join(audit_errors) if audit_errors else None,
+        root_id=spec.root_id,
+        reason_code=reason_code,
+        root_parent_identity=parent_identity,
+        tool_identity=tool_identity,
+        root_receipt=root_receipt,
+    )
+
+
+def _bind_mirror_terminal_registry_parent(
+    spec: MirrorPrivateControlRootSpec,
+) -> tuple[int, tuple[int, int, int], tuple[int, int, int]] | None:
+    if spec.allocate:
+        return _bind_mirror_primary_control_parent(spec)
+    if not spec.shared_parent or spec.account_home is not None:
+        raise SyncError(f"private-control root schema is invalid [{spec.root_id}]")
+    parent_path = Path(os.path.abspath(spec.parent_path))
+    try:
+        return _bind_mirror_audit_directory(
+            parent_path,
+            f"terminal legacy private-control parent [{spec.root_id}]",
+        )
+    except SyncError as bind_error:
+        try:
+            _capture_mirror_quarantine_parent_absence(spec)
+        except SyncError as absence_error:
+            raise SyncError(
+                f"{bind_error}; secondary absence-anchor verification failure: "
+                f"{absence_error}"
+            ) from bind_error
+        return None
+
+
+def _revalidate_mirror_quarantine_root_receipt(
+    spec: MirrorPrivateControlRootSpec,
+    audit: MirrorQuarantineAudit,
+) -> str:
+    """Revalidate fixed identity/access policy, not directory-entry contents.
+
+    Identity is dev/inode/type and access policy is mode/uid/gid. An anchored
+    missing fixed name is protected as absence. Directory timestamps and child
+    listings are deliberately excluded so benign child-entry churn is not
+    mistaken for replacement, content mutation, or access-policy drift.
+    """
+
+    receipt = audit.root_receipt
+    if receipt is None:
+        raise SyncError("initial root receipt is unavailable")
+    parent_path = Path(os.path.abspath(spec.parent_path))
+    if (
+        receipt.root_id != spec.root_id
+        or audit.root_id != spec.root_id
+        or receipt.parent_path != parent_path
+    ):
+        raise SyncError("root receipt does not match its registry entry")
+    absence_fields = (
+        receipt.absence_anchor_path,
+        receipt.absence_name,
+        receipt.absence_anchor_identity,
+        receipt.absence_anchor_access_policy,
+    )
+    if receipt.scope == "parent-absent":
+        if (
+            receipt.parent_identity is not None
+            or receipt.parent_access_policy is not None
+            or receipt.tool_record is not None
+            or receipt.quarantine_record is not None
+            or any(field is None for field in absence_fields)
+        ):
+            raise SyncError("absent-parent root receipt is incomplete")
+        current = _capture_mirror_quarantine_parent_absence(spec)
+        if (
+            current.absence_anchor_path,
+            current.absence_name,
+            current.absence_anchor_identity,
+            current.absence_anchor_access_policy,
+        ) != absence_fields:
+            raise SyncError("private-control parent absence anchor changed")
+        return "stable(parent-absent)"
+    if receipt.scope not in {"parent-only", "fixed-metadata"}:
+        raise SyncError(f"root receipt scope is invalid: {receipt.scope}")
+    if (
+        receipt.parent_identity is None
+        or receipt.parent_access_policy is None
+        or any(field is not None for field in absence_fields)
+        or (
+            receipt.scope == "parent-only"
+            and (
+                receipt.tool_record is not None or receipt.quarantine_record is not None
+            )
+        )
+    ):
+        raise SyncError("present-parent root receipt is incomplete")
+    parent_binding = _bind_mirror_terminal_registry_parent(spec)
+    if parent_binding is None:
+        raise SyncError("private-control parent disappeared")
+    parent_fd, parent_identity, parent_access_policy = parent_binding
+    with _mirror_descriptor_cleanup_scope(
+        lambda: (
+            (
+                f"terminal private-control parent [{spec.root_id}]",
+                parent_fd,
+                False,
+            ),
+        ),
+        label="terminal private-control parent cleanup failures",
+    ):
+        if (
+            parent_identity != receipt.parent_identity
+            or parent_access_policy != receipt.parent_access_policy
+        ):
+            raise SyncError("private-control parent identity or access policy changed")
+        if not spec.allocate and not _mirror_legacy_shared_parent_policy_is_valid(
+            parent_access_policy
+        ):
+            raise SyncError("legacy shared private-control parent policy changed")
+        if receipt.scope == "parent-only":
+            _revalidate_mirror_audit_directory(
+                parent_path,
+                parent_fd,
+                parent_identity,
+                parent_access_policy,
+                f"terminal private-control parent [{spec.root_id}]",
+            )
+            return "stable(parent-only)"
+        if spec.allocate:
+            tool_record = _mirror_private_control_child_metadata(
+                parent_fd,
+                MIRROR_PRIVATE_TOOL_ROOT_NAME,
+                f"terminal primary private-control child [{spec.root_id}]",
+            )
+            quarantine_record = _mirror_private_control_child_metadata(
+                parent_fd,
+                MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+                f"terminal primary private-control child [{spec.root_id}]",
+            )
+        else:
+            tool_record = _mirror_legacy_child_metadata(
+                parent_fd,
+                MIRROR_PRIVATE_TOOL_ROOT_NAME,
+                spec.root_id,
+            )
+            quarantine_record = _mirror_legacy_child_metadata(
+                parent_fd,
+                MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+                spec.root_id,
+            )
+        if spec.allocate or audit.classification != "foreign-unrelated":
+            _validate_mirror_private_control_metadata_topology(
+                root_id=spec.root_id,
+                parent_fd=parent_fd,
+                parent_identity=parent_identity,
+                tool_record=tool_record,
+                quarantine_record=quarantine_record,
+            )
+        if (
+            tool_record != receipt.tool_record
+            or quarantine_record != receipt.quarantine_record
+        ):
+            raise SyncError(
+                "private-control fixed-name identity or access policy changed"
+            )
+        _revalidate_mirror_audit_directory(
+            parent_path,
+            parent_fd,
+            parent_identity,
+            parent_access_policy,
+            f"terminal private-control parent [{spec.root_id}]",
+        )
+        return "stable(fixed-metadata)"
+
+
+def _revalidate_mirror_quarantine_registry(
+    root_audits: list[MirrorQuarantineAudit],
+) -> tuple[list[MirrorQuarantineAudit], str | None]:
+    if len(root_audits) != len(MIRROR_PRIVATE_CONTROL_ROOT_SPECS):
+        raise SyncError("private-control registry audit coverage is incomplete")
+    updated: list[MirrorQuarantineAudit] = []
+    statuses: list[str] = []
+    failed = False
+    for spec, audit in zip(MIRROR_PRIVATE_CONTROL_ROOT_SPECS, root_audits):
+        try:
+            state = _revalidate_mirror_quarantine_root_receipt(spec, audit)
+        except (OSError, SyncError) as error:
+            failed = True
+            statuses.append(f"{spec.root_id}=inconclusive({error})")
+            updated.append(
+                replace(
+                    audit,
+                    classification="inconclusive",
+                    reason_code=(
+                        audit.reason_code
+                        if audit.reason_code
+                        == MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH
+                        else MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE
+                    ),
+                    detail=(
+                        f"terminal root revalidation failed: {error}"
+                        if audit.detail is None
+                        else f"{audit.detail}; terminal root revalidation "
+                        f"failed: {error}"
+                    ),
+                )
+            )
+        else:
+            statuses.append(f"{spec.root_id}={state}")
+            updated.append(audit)
+    if not failed:
+        return updated, None
+    return (
+        updated,
+        "terminal mirror quarantine registry revalidation covered every root "
+        f"[{'; '.join(statuses)}]",
+    )
+
+
+def _mirror_quarantine_audit() -> MirrorQuarantineAudit:
+    root_ids = [spec.root_id for spec in MIRROR_PRIVATE_CONTROL_ROOT_SPECS]
+    if len(root_ids) != len(set(root_ids)):
+        raise SyncError("private-control root ids must be unique")
+    if sum(1 for spec in MIRROR_PRIVATE_CONTROL_ROOT_SPECS if spec.allocate) != 1:
+        raise SyncError(
+            "private-control registry must contain exactly one allocation root"
+        )
+    allocation_root_id = next(
+        spec.root_id for spec in MIRROR_PRIVATE_CONTROL_ROOT_SPECS if spec.allocate
+    )
+    root_audits: list[MirrorQuarantineAudit] = []
+    seen_parent_identities: set[tuple[int, int, int]] = set()
+    seen_child_identities: set[tuple[int, int, int]] = set()
+    for spec in MIRROR_PRIVATE_CONTROL_ROOT_SPECS:
+        try:
+            audit = _mirror_quarantine_root_audit(
+                spec,
+                seen_parent_identities,
+                seen_child_identities,
+            )
+        except (OSError, SyncError) as error:
+            audit = MirrorQuarantineAudit(
+                classification="inconclusive",
+                path=(
+                    Path(os.path.abspath(spec.parent_path))
+                    / MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+                ),
+                entry_count=None,
+                entry_limit=MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT,
+                count_is_lower_bound=False,
+                segment_identity=None,
+                segment_access_policy=None,
+                detail=f"initial root audit failed: {error}",
+                root_id=spec.root_id,
+                reason_code=MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE,
+            )
+        if audit.classification == "duplicate":
+            root_audits.append(audit)
+            continue
+        receipt = audit.root_receipt
+        root_parent_identity = (
+            receipt.parent_identity
+            if receipt is not None
+            else audit.root_parent_identity
+        )
+        observed_child_identities = (
+            tuple(
+                identity
+                for identity in (audit.tool_identity, audit.segment_identity)
+                if identity is not None
+            )
+            if receipt is None
+            else tuple(
+                record[0]
+                for record in (receipt.tool_record, receipt.quarantine_record)
+                if record is not None
+            )
+        )
+        child_identities = set(observed_child_identities)
+        alias_error = None
+        if (
+            root_parent_identity is not None
+            and root_parent_identity in seen_child_identities
+        ):
+            alias_error = "private-control parent aliases an earlier fixed child"
+        elif len(child_identities) != len(observed_child_identities):
+            alias_error = "private-control fixed child roles alias each other"
+        elif (
+            root_parent_identity is not None
+            and root_parent_identity in child_identities
+        ):
+            alias_error = "private-control fixed child aliases its own parent"
+        elif child_identities & (seen_parent_identities | seen_child_identities):
+            alias_error = (
+                "distinct private-control parent aliases an earlier control object"
+            )
+        if alias_error is not None:
+            audit = replace(
+                audit,
+                classification="inconclusive",
+                reason_code=MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE,
+                detail=(
+                    alias_error
+                    if audit.detail is None
+                    else f"{audit.detail}; {alias_error}"
+                ),
+            )
+        if root_parent_identity is not None:
+            seen_parent_identities.add(root_parent_identity)
+        seen_child_identities.update(child_identities)
+        root_audits.append(audit)
+    root_audits, terminal_revalidation_detail = _revalidate_mirror_quarantine_registry(
+        root_audits
+    )
+    legacy_states = tuple(
+        (
+            audit.reason_code
+            if audit.reason_code is not None
+            else "foreign-unrelated"
+            if audit.classification == "foreign-unrelated"
+            else "absent"
+            if audit.classification == "absent"
+            else "duplicate"
+            if audit.classification == "duplicate"
+            else "same-uid-empty"
+            if audit.classification == "available" and audit.entry_count == 0
+            else MIRROR_PRIVATE_CONTROL_REASON_LEGACY_PENDING
+        )
+        for audit in root_audits
+        if audit.root_id != allocation_root_id
+    )
+    allocation_allowed, aggregate_reason = (
+        _mirror_private_control_preallocation_decision(legacy_states)
+    )
+    if terminal_revalidation_detail is not None:
+        allocation_allowed = False
+        if aggregate_reason is None:
+            aggregate_reason = MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE
+    decisive = None
+    if not allocation_allowed:
+        decisive = next(
+            (
+                audit
+                for audit in root_audits
+                if audit.reason_code == aggregate_reason
+                or (
+                    aggregate_reason == MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE
+                    and audit.classification == "inconclusive"
+                )
+            ),
+            None,
+        )
+    if decisive is None:
+        decisive = next(
+            (audit for audit in root_audits if audit.classification == "inconclusive"),
+            None,
+        )
+    if decisive is None:
+        decisive = next(
+            (audit for audit in root_audits if audit.classification == "saturated"),
+            None,
+        )
+    if decisive is None:
+        decisive = next(
+            (audit for audit in root_audits if audit.root_id == allocation_root_id),
+            root_audits[0],
+        )
+    return replace(
+        decisive,
+        classification=(
+            "inconclusive" if not allocation_allowed else decisive.classification
+        ),
+        reason_code=(
+            aggregate_reason if not allocation_allowed else decisive.reason_code
+        ),
+        detail=(
+            decisive.detail
+            if terminal_revalidation_detail is None
+            else (
+                terminal_revalidation_detail
+                if decisive.detail is None
+                else f"{decisive.detail}; {terminal_revalidation_detail}"
+            )
+        ),
+        root_audits=tuple(root_audits),
     )
 
 
@@ -29645,6 +31169,7 @@ def _mirror_quarantine_failure_detail(
             f"{record.name}"
             f"[identity={owner_identity},access={owner_access_policy},"
             f"sha256={record.sha256 or 'unavailable'},"
+            f"root={record.root_id},reason={record.reason_code},"
             f"pid={record.owner_pid},nonce={record.owner_nonce},"
             f"phase={record.phase},private={record.private_name},"
             f"expected-private-identity={expected_private_identity},"
@@ -29659,7 +31184,7 @@ def _mirror_quarantine_failure_detail(
     if len(blocked_recovery_records) > 8:
         recovery_preview += f", ... ({len(blocked_recovery_records) - 8} more)"
     detail = (
-        f"mirror durable quarantine segment {audit.path} is "
+        f"mirror durable quarantine root {audit.root_id} segment {audit.path} is "
         f"{audit.classification}: count={rendered_count}, "
         f"cap={audit.entry_limit}, identity={identity}, access={access_policy}, "
         f"blocked-recovery-owner-records={recovery_preview}"
@@ -29900,7 +31425,7 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
         )
     elif mirror_quarantine.classification == "inconclusive":
         record_failure(
-            "mirror-quarantine-audit-inconclusive",
+            mirror_quarantine.reason_code or "mirror-quarantine-audit-inconclusive",
             _mirror_quarantine_failure_detail(mirror_quarantine),
         )
     try:
@@ -30165,8 +31690,10 @@ def _mirror_quarantine_payload(
 ) -> dict[str, Any] | None:
     if audit is None:
         return None
-    return {
+    payload = {
         "classification": audit.classification,
+        "root_id": audit.root_id,
+        "reason_code": audit.reason_code,
         "path": str(audit.path),
         "entry_count": audit.entry_count,
         "entry_limit": audit.entry_limit,
@@ -30175,6 +31702,7 @@ def _mirror_quarantine_payload(
         "segment_entry_limit": audit.entry_limit,
         "count_is_lower_bound": audit.count_is_lower_bound,
         "segment_identity": _mirror_identity_payload(audit.segment_identity),
+        "root_parent_identity": _mirror_identity_payload(audit.root_parent_identity),
         "segment_access_policy": _mirror_access_policy_payload(
             audit.segment_access_policy
         ),
@@ -30186,6 +31714,8 @@ def _mirror_quarantine_payload(
                 "sha256": record.sha256,
                 "state": record.state,
                 "detail": record.detail,
+                "root_id": record.root_id,
+                "reason_code": record.reason_code,
                 "owner_pid": record.owner_pid,
                 "owner_nonce": record.owner_nonce,
                 "phase": record.phase,
@@ -30202,6 +31732,11 @@ def _mirror_quarantine_payload(
         ],
         "detail": audit.detail,
     }
+    payload["roots"] = [
+        _mirror_quarantine_payload(replace(root_audit, root_audits=()))
+        for root_audit in audit.root_audits
+    ]
+    return payload
 
 
 def _scheduler_report_payload(report: SchedulerReport) -> dict[str, Any]:
@@ -30363,6 +31898,8 @@ def _print_scheduler_report(report: SchedulerReport) -> None:
         print(
             "scheduler mirror quarantine: "
             f"{report.mirror_quarantine.classification} "
+            f"root={report.mirror_quarantine.root_id} "
+            f"reason={report.mirror_quarantine.reason_code or 'none'} "
             f"{mirror_count}/{report.mirror_quarantine.entry_limit} "
             f"segment={MIRROR_DURABLE_QUARANTINE_ROOT_NAME} "
             f"path={report.mirror_quarantine.path} "

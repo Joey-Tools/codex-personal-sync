@@ -101,10 +101,13 @@ class MirrorGeneratorTests(unittest.TestCase):
         self.temporary_directory = tempfile.TemporaryDirectory(
             prefix="canonical-mirror-tests."
         )
-        self.root = Path(self.temporary_directory.name)
+        self.root = Path(os.path.realpath(self.temporary_directory.name))
         self.host_private_git_control_parent = MIRROR_MODULE.PRIVATE_GIT_CONTROL_PARENT
-        self.private_git_control_parent = self.root / "private-control-parent"
-        self.private_git_control_parent.mkdir()
+        self.host_private_control_root_specs = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS
+        self.private_git_control_parent = (
+            self.root / MIRROR_MODULE.PRIVATE_CONTROL_NAMESPACE_NAME
+        )
+        self.private_git_control_parent.mkdir(mode=0o700)
         self.private_control_parent_patch = mock.patch.object(
             MIRROR_MODULE,
             "PRIVATE_GIT_CONTROL_PARENT",
@@ -112,6 +115,21 @@ class MirrorGeneratorTests(unittest.TestCase):
         )
         self.private_control_parent_patch.start()
         self.addCleanup(self.private_control_parent_patch.stop)
+        self.private_control_root_specs_patch = mock.patch.object(
+            MIRROR_MODULE,
+            "PRIVATE_CONTROL_ROOT_SPECS",
+            (
+                MIRROR_MODULE.PrivateControlRootSpec(
+                    root_id="test-primary-home-v1",
+                    parent_path=self.private_git_control_parent,
+                    allocate=True,
+                    account_home=self.root,
+                    shared_parent=False,
+                ),
+            ),
+        )
+        self.private_control_root_specs_patch.start()
+        self.addCleanup(self.private_control_root_specs_patch.stop)
         self.canonical_root = self.root / "canonical"
         self.target_root = self.root / "consumer"
         self.canonical_root.mkdir()
@@ -187,6 +205,28 @@ class MirrorGeneratorTests(unittest.TestCase):
         read_fd, write_fd = os.pipe()
         os.set_blocking(read_fd, False)
         return read_fd, write_fd
+
+    def _assert_directory_lock_contended(self, path: Path) -> None:
+        competitor_fd = os.open(path, MIRROR_MODULE._DIRECTORY_FLAGS)
+        try:
+            with self.assertRaises(BlockingIOError):
+                MIRROR_MODULE.fcntl.flock(
+                    competitor_fd,
+                    MIRROR_MODULE.fcntl.LOCK_EX | MIRROR_MODULE.fcntl.LOCK_NB,
+                )
+        finally:
+            os.close(competitor_fd)
+
+    def _assert_directory_lock_available(self, path: Path) -> None:
+        competitor_fd = os.open(path, MIRROR_MODULE._DIRECTORY_FLAGS)
+        try:
+            MIRROR_MODULE.fcntl.flock(
+                competitor_fd,
+                MIRROR_MODULE.fcntl.LOCK_EX | MIRROR_MODULE.fcntl.LOCK_NB,
+            )
+            MIRROR_MODULE.fcntl.flock(competitor_fd, MIRROR_MODULE.fcntl.LOCK_UN)
+        finally:
+            os.close(competitor_fd)
 
     def _assert_process_liveness_pipe_closed(
         self,
@@ -571,6 +611,71 @@ class MirrorGeneratorTests(unittest.TestCase):
             stderr.getvalue(),
         )
 
+    def test_private_owner_reader_charges_both_bounded_reads(self) -> None:
+        owner_path = self.root / "bounded-owner-record.json"
+        owner_path.write_bytes(b"{}\n")
+        parent_fd = os.open(self.root, MIRROR_MODULE._DIRECTORY_FLAGS)
+        owner_fd = os.open(owner_path, MIRROR_MODULE._FILE_READ_FLAGS)
+        operation = MIRROR_MODULE.OperationBudget(
+            deadline=time.monotonic() + 30,
+            remaining_bytes=100,
+            remaining_entries=10,
+        )
+        try:
+            snapshot = MIRROR_MODULE._safe_read_private_owner_record_snapshot(
+                parent_fd,
+                owner_path.name,
+                PurePosixPath(owner_path.name),
+                file_fd=owner_fd,
+                operation=operation,
+            )
+        finally:
+            os.close(owner_fd)
+            os.close(parent_fd)
+        self.assertEqual(snapshot.payload, b"{}\n")
+        self.assertEqual(operation.remaining_bytes, 94)
+
+    def test_private_owner_reader_stops_at_hard_limit_plus_one(self) -> None:
+        owner_path = self.root / "producer-bounded-owner-record.json"
+        owner_path.write_bytes(b"")
+        parent_fd = os.open(self.root, MIRROR_MODULE._DIRECTORY_FLAGS)
+        owner_fd = os.open(owner_path, MIRROR_MODULE._FILE_READ_FLAGS)
+        operation = MIRROR_MODULE.OperationBudget(
+            deadline=time.monotonic() + 30,
+            remaining_bytes=10_000,
+            remaining_entries=10,
+        )
+        requested_sizes = []
+
+        def produce_full_chunk(_fd, requested):
+            requested_sizes.append(requested)
+            return b"x" * requested
+
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE.os,
+                    "read",
+                    side_effect=produce_full_chunk,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "private owner record exceeds 4096 bytes",
+                ),
+            ):
+                MIRROR_MODULE._safe_read_private_owner_record_snapshot(
+                    parent_fd,
+                    owner_path.name,
+                    PurePosixPath(owner_path.name),
+                    file_fd=owner_fd,
+                    operation=operation,
+                )
+        finally:
+            os.close(owner_fd)
+            os.close(parent_fd)
+        self.assertEqual(requested_sizes, [4096, 1])
+        self.assertEqual(operation.remaining_bytes, 10_000 - 4097)
+
     def test_git_snapshot_scan_applies_remaining_entry_cap_before_sort(
         self,
     ) -> None:
@@ -728,6 +833,11 @@ class MirrorGeneratorTests(unittest.TestCase):
             / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
         )
         tool_root_path.mkdir(mode=0o700)
+        quarantine_path = (
+            MIRROR_MODULE.PRIVATE_GIT_CONTROL_PARENT
+            / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        )
+        quarantine_path.mkdir(mode=0o700)
         for name in ("a", "b", "c"):
             (tool_root_path / name).write_bytes(name.encode("ascii"))
         bound_root = MIRROR_MODULE._bind_root(self.target_root)
@@ -736,7 +846,16 @@ class MirrorGeneratorTests(unittest.TestCase):
             "test private Git tool root",
             require_directory=True,
         )
+        quarantine = MIRROR_MODULE._bind_absolute_control_object(
+            quarantine_path,
+            "test private Git quarantine root",
+            require_directory=True,
+        )
+        root_id = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0].root_id
+        tool_root.root_id = root_id
+        quarantine.root_id = root_id
         try:
+            MIRROR_MODULE.fcntl.flock(quarantine.fd, MIRROR_MODULE.fcntl.LOCK_EX)
             with (
                 mock.patch.object(MIRROR_MODULE, "MAX_TOOL_ROOT_ENTRIES", 2),
                 self.assertRaisesRegex(
@@ -748,8 +867,12 @@ class MirrorGeneratorTests(unittest.TestCase):
                 MIRROR_MODULE._recover_stale_private_snapshots(
                     bound_root,
                     tool_root,
+                    quarantine=quarantine,
+                    quarantine_locked=True,
                 )
         finally:
+            MIRROR_MODULE.fcntl.flock(quarantine.fd, MIRROR_MODULE.fcntl.LOCK_UN)
+            os.close(quarantine.fd)
             os.close(tool_root.fd)
             MIRROR_MODULE._finish_bound_roots(bound_root)
 
@@ -5467,7 +5590,15 @@ class MirrorGeneratorTests(unittest.TestCase):
         real_create_owner = MIRROR_MODULE._create_owner_record
         observed_lock = False
 
-        def assert_locked(root, tool_root, private_name, private):
+        def assert_locked(
+            root,
+            tool_root,
+            quarantine,
+            private_name,
+            private,
+            *,
+            quarantine_locked,
+        ):
             nonlocal observed_lock
             assert tool_root.path is not None
             competitor_fd = os.open(
@@ -5486,8 +5617,10 @@ class MirrorGeneratorTests(unittest.TestCase):
             return real_create_owner(
                 root,
                 tool_root,
+                quarantine,
                 private_name,
                 private,
+                quarantine_locked=quarantine_locked,
             )
 
         bound_root = MIRROR_MODULE._bind_root(self.target_root)
@@ -5502,7 +5635,1308 @@ class MirrorGeneratorTests(unittest.TestCase):
         finally:
             MIRROR_MODULE._finish_bound_roots(bound_root)
 
-    def test_private_cleanup_binds_quarantine_before_control_paths_move(
+    def test_primary_stale_recovery_retains_quarantine_lease_until_outer_release(
+        self,
+    ) -> None:
+        initial_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            MIRROR_MODULE._ensure_git_control_binding(initial_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(initial_root)
+
+        tool_root_path = (
+            self.private_git_control_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        )
+        quarantine_path = (
+            self.private_git_control_parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        )
+        private_name = (
+            f"sync-canonical-git-control.{os.getpid()}.11111111111111111111111111111111"
+        )
+        owner_name = f"{private_name}.owner.json"
+        owner_path = tool_root_path / owner_name
+        owner_path.write_bytes(
+            MIRROR_MODULE._owner_record_payload(
+                MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0].root_id,
+                private_name,
+                (123, 456, stat.S_IFDIR),
+                "11111111111111111111111111111111",
+                "cleanup",
+            )
+        )
+        owner_path.chmod(0o600)
+        os.chown(owner_path, os.geteuid(), os.getegid())
+        real_remove_owner = MIRROR_MODULE._remove_stale_owner_record
+        observed_nested_cleanup = False
+
+        def remove_then_probe(*args, **kwargs):
+            nonlocal observed_nested_cleanup
+            result = real_remove_owner(*args, **kwargs)
+            self.assertTrue(kwargs["quarantine_locked"])
+            self._assert_directory_lock_contended(quarantine_path)
+            observed_nested_cleanup = True
+            return result
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with mock.patch.object(
+                MIRROR_MODULE,
+                "_remove_stale_owner_record",
+                side_effect=remove_then_probe,
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            self.assertTrue(observed_nested_cleanup)
+            self._assert_directory_lock_available(quarantine_path)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_legacy_stale_recovery_retains_quarantine_lease_until_outer_release(
+        self,
+    ) -> None:
+        legacy_directory = tempfile.TemporaryDirectory(
+            prefix="canonical-mirror-legacy-lock-lifetime."
+        )
+        self.addCleanup(legacy_directory.cleanup)
+        shared_parent = Path(os.path.realpath(legacy_directory.name))
+        tool_root_path = shared_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        quarantine_path = shared_parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        tool_root_path.mkdir(mode=0o700)
+        quarantine_path.mkdir(mode=0o700)
+        private_name = (
+            f"sync-canonical-git-control.{os.getpid()}.22222222222222222222222222222222"
+        )
+        owner_name = f"{private_name}.owner.json"
+        owner_path = tool_root_path / owner_name
+        owner_path.write_text(
+            json.dumps(
+                {
+                    "version": MIRROR_MODULE.PRIVATE_OWNER_RECORD_LEGACY_VERSION,
+                    "owner_pid": os.getpid(),
+                    "owner_uid": os.geteuid(),
+                    "owner_gid": os.getegid(),
+                    "owner_nonce": "22222222222222222222222222222222",
+                    "phase": "cleanup",
+                    "private_name": private_name,
+                    "private_identity": [123, 456, stat.S_IFDIR],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        owner_path.chmod(0o600)
+        os.chown(owner_path, os.geteuid(), os.getegid())
+        primary_spec = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0]
+        legacy_spec = MIRROR_MODULE.PrivateControlRootSpec(
+            root_id=MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        real_remove_owner = MIRROR_MODULE._remove_stale_owner_record
+        observed_nested_cleanup = False
+
+        def remove_then_probe(*args, **kwargs):
+            nonlocal observed_nested_cleanup
+            result = real_remove_owner(*args, **kwargs)
+            self.assertTrue(kwargs["quarantine_locked"])
+            self._assert_directory_lock_contended(quarantine_path)
+            observed_nested_cleanup = True
+            return result
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "PRIVATE_CONTROL_ROOT_SPECS",
+                    (primary_spec, legacy_spec),
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_legacy_shared_parent_policy_is_valid",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_remove_stale_owner_record",
+                    side_effect=remove_then_probe,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    MIRROR_MODULE.PRIVATE_CONTROL_REASON_LEGACY_PENDING,
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            self.assertTrue(observed_nested_cleanup)
+            self._assert_directory_lock_available(quarantine_path)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_legacy_cutover_fence_spans_owner_publication_and_releases(self) -> None:
+        legacy_directory = tempfile.TemporaryDirectory(
+            prefix="canonical-mirror-legacy-publication."
+        )
+        self.addCleanup(legacy_directory.cleanup)
+        shared_parent = Path(os.path.realpath(legacy_directory.name))
+        tool_root_path = shared_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        quarantine_path = shared_parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        tool_root_path.mkdir(mode=0o700)
+        quarantine_path.mkdir(mode=0o700)
+        primary_spec = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0]
+        legacy_spec = MIRROR_MODULE.PrivateControlRootSpec(
+            root_id="test-legacy-publication-v1",
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        real_create_owner = MIRROR_MODULE._create_owner_record
+        retained_receipts = []
+        publication_count = 0
+
+        def create_owner_then_probe(*args, **kwargs):
+            nonlocal publication_count
+            private_parent = args[1]
+            context = private_parent.private_control_context
+            assert context is not None
+            self.assertEqual(len(context.legacy_receipts), 1)
+            self._assert_directory_lock_contended(tool_root_path)
+            self._assert_directory_lock_contended(quarantine_path)
+            result = real_create_owner(*args, **kwargs)
+            self._assert_directory_lock_contended(tool_root_path)
+            self._assert_directory_lock_contended(quarantine_path)
+            retained_receipts.extend(context.legacy_receipts)
+            publication_count += 1
+            return result
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "PRIVATE_CONTROL_ROOT_SPECS",
+                    (primary_spec, legacy_spec),
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_legacy_shared_parent_policy_is_valid",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_create_owner_record",
+                    side_effect=create_owner_then_probe,
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            self.assertEqual(publication_count, 1)
+            self.assertTrue(retained_receipts)
+            for receipt in retained_receipts:
+                assert receipt.parent_binding is not None
+                assert receipt.tool_binding is not None
+                assert receipt.quarantine_binding is not None
+                self.assertEqual(receipt.parent_binding.fd, -1)
+                self.assertEqual(receipt.tool_binding.fd, -1)
+                self.assertEqual(receipt.quarantine_binding.fd, -1)
+            assert bound_root.git_control is not None
+            context = bound_root.git_control.private_parent.private_control_context
+            assert context is not None
+            self.assertEqual(context.legacy_receipts, ())
+            self._assert_directory_lock_available(tool_root_path)
+            self._assert_directory_lock_available(quarantine_path)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_legacy_cutover_fence_releases_after_owner_publication_failure(
+        self,
+    ) -> None:
+        legacy_directory = tempfile.TemporaryDirectory(
+            prefix="canonical-mirror-legacy-publication-failure."
+        )
+        self.addCleanup(legacy_directory.cleanup)
+        shared_parent = Path(os.path.realpath(legacy_directory.name))
+        tool_root_path = shared_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        quarantine_path = shared_parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        tool_root_path.mkdir(mode=0o700)
+        quarantine_path.mkdir(mode=0o700)
+        primary_spec = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0]
+        legacy_spec = MIRROR_MODULE.PrivateControlRootSpec(
+            root_id="test-legacy-publication-failure-v1",
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        retained_receipts = []
+
+        def fail_owner_publication(*args, **_kwargs):
+            private_parent = args[1]
+            context = private_parent.private_control_context
+            assert context is not None
+            retained_receipts.extend(context.legacy_receipts)
+            self._assert_directory_lock_contended(tool_root_path)
+            self._assert_directory_lock_contended(quarantine_path)
+            raise MIRROR_MODULE.MirrorSyncError("injected owner publication failure")
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "PRIVATE_CONTROL_ROOT_SPECS",
+                    (primary_spec, legacy_spec),
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_legacy_shared_parent_policy_is_valid",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_create_owner_record",
+                    side_effect=fail_owner_publication,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "injected owner publication failure",
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            self.assertTrue(retained_receipts)
+            for receipt in retained_receipts:
+                assert receipt.parent_binding is not None
+                assert receipt.tool_binding is not None
+                assert receipt.quarantine_binding is not None
+                self.assertEqual(receipt.parent_binding.fd, -1)
+                self.assertEqual(receipt.tool_binding.fd, -1)
+                self.assertEqual(receipt.quarantine_binding.fd, -1)
+            self._assert_directory_lock_available(tool_root_path)
+            self._assert_directory_lock_available(quarantine_path)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_legacy_terminal_evidence_after_owner_publication_blocks_cutover(
+        self,
+    ) -> None:
+        legacy_directory = tempfile.TemporaryDirectory(
+            prefix="canonical-mirror-legacy-terminal-evidence."
+        )
+        self.addCleanup(legacy_directory.cleanup)
+        shared_parent = Path(os.path.realpath(legacy_directory.name))
+        tool_root_path = shared_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        quarantine_path = shared_parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        tool_root_path.mkdir(mode=0o700)
+        quarantine_path.mkdir(mode=0o700)
+        primary_spec = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0]
+        legacy_spec = MIRROR_MODULE.PrivateControlRootSpec(
+            root_id="test-legacy-terminal-evidence-v1",
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        real_create_owner = MIRROR_MODULE._create_owner_record
+        sentinel = tool_root_path / "late-recovery-evidence"
+        injected = False
+
+        def create_owner_then_inject(*args, **kwargs):
+            nonlocal injected
+            result = real_create_owner(*args, **kwargs)
+            sentinel.write_bytes(b"late legacy evidence\n")
+            injected = True
+            return result
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "PRIVATE_CONTROL_ROOT_SPECS",
+                    (primary_spec, legacy_spec),
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_legacy_shared_parent_policy_is_valid",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_create_owner_record",
+                    side_effect=create_owner_then_inject,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    MIRROR_MODULE.PRIVATE_CONTROL_REASON_LEGACY_PENDING,
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            self.assertTrue(injected)
+            self.assertEqual(sentinel.read_bytes(), b"late legacy evidence\n")
+            self._assert_directory_lock_available(tool_root_path)
+            self._assert_directory_lock_available(quarantine_path)
+            primary_tool = (
+                self.private_git_control_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+            )
+            self.assertEqual(tuple(primary_tool.iterdir()), ())
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_terminal_legacy_scan_budget_blocks_all_primary_allocation(
+        self,
+    ) -> None:
+        cases = (
+            "expired",
+            "expired-after-terminal",
+            "zero-bytes",
+            "zero-entries",
+        )
+        real_decision = MIRROR_MODULE._private_control_preallocation_decision
+        real_terminal = MIRROR_MODULE._revalidate_legacy_private_control_receipts
+        for case in cases:
+            with self.subTest(case=case):
+                primary_home = self.root / f"budget-primary-home-{case}"
+                primary_home.mkdir(mode=0o700)
+                primary_parent = (
+                    primary_home / MIRROR_MODULE.PRIVATE_CONTROL_NAMESPACE_NAME
+                )
+                legacy_parent = self.root / f"budget-legacy-parent-{case}"
+                legacy_parent.mkdir(mode=0o700)
+                legacy_tool = legacy_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+                legacy_quarantine = (
+                    legacy_parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+                )
+                legacy_tool.mkdir(mode=0o700)
+                legacy_quarantine.mkdir(mode=0o700)
+                before = (
+                    legacy_tool.stat().st_ino,
+                    legacy_quarantine.stat().st_ino,
+                )
+                primary_spec = MIRROR_MODULE.PrivateControlRootSpec(
+                    root_id=f"budget-primary-{case}",
+                    parent_path=primary_parent,
+                    allocate=True,
+                    account_home=primary_home,
+                    shared_parent=False,
+                )
+                legacy_spec = MIRROR_MODULE.PrivateControlRootSpec(
+                    root_id=f"budget-legacy-{case}",
+                    parent_path=legacy_parent,
+                    allocate=False,
+                    account_home=None,
+                    shared_parent=True,
+                )
+                bound_root = MIRROR_MODULE._bind_root(self.target_root)
+                bound_root.operation = MIRROR_MODULE.OperationBudget(
+                    deadline=time.monotonic() + 30,
+                    remaining_bytes=10_000_000,
+                    remaining_entries=10_000,
+                )
+
+                def exhaust_terminal_budget(states):
+                    decision = real_decision(states)
+                    assert bound_root.operation is not None
+                    if case == "expired":
+                        bound_root.operation.deadline = time.monotonic() - 1
+                    elif case == "zero-bytes":
+                        bound_root.operation.remaining_bytes = 0
+                    elif case == "zero-entries":
+                        bound_root.operation.remaining_entries = 0
+                    return decision
+
+                def expire_after_terminal(receipts, *, operation):
+                    real_terminal(receipts, operation=operation)
+                    if case == "expired-after-terminal":
+                        assert operation is not None
+                        operation.deadline = time.monotonic() - 1
+
+                try:
+                    with (
+                        mock.patch.object(
+                            MIRROR_MODULE,
+                            "PRIVATE_CONTROL_ROOT_SPECS",
+                            (primary_spec, legacy_spec),
+                        ),
+                        mock.patch.object(
+                            MIRROR_MODULE,
+                            "_legacy_shared_parent_policy_is_valid",
+                            return_value=True,
+                        ),
+                        mock.patch.object(
+                            MIRROR_MODULE,
+                            "_private_control_preallocation_decision",
+                            side_effect=exhaust_terminal_budget,
+                        ),
+                        mock.patch.object(
+                            MIRROR_MODULE,
+                            "_revalidate_legacy_private_control_receipts",
+                            side_effect=expire_after_terminal,
+                        ),
+                        self.assertRaisesRegex(
+                            MIRROR_MODULE.MirrorSyncError,
+                            "mirror operation exceeded|aggregate budget",
+                        ),
+                    ):
+                        MIRROR_MODULE._ensure_git_control_binding(bound_root)
+                finally:
+                    bound_root.operation = None
+                    MIRROR_MODULE._finish_bound_roots(bound_root)
+
+                self.assertFalse(primary_parent.exists())
+                self.assertEqual(
+                    (
+                        legacy_tool.stat().st_ino,
+                        legacy_quarantine.stat().st_ino,
+                    ),
+                    before,
+                )
+                self.assertEqual(tuple(legacy_tool.iterdir()), ())
+                self.assertEqual(tuple(legacy_quarantine.iterdir()), ())
+
+    def test_absent_legacy_receipt_rejects_anchor_replacement(self) -> None:
+        primary_home = self.root / "absence-primary-home"
+        primary_home.mkdir(mode=0o700)
+        primary_parent = primary_home / MIRROR_MODULE.PRIVATE_CONTROL_NAMESPACE_NAME
+        anchor = self.root / "absence-anchor"
+        anchor.mkdir(mode=0o700)
+        saved_anchor = self.root / "saved-absence-anchor"
+        legacy_parent = anchor / "custom-legacy-parent"
+        primary_spec = MIRROR_MODULE.PrivateControlRootSpec(
+            root_id="custom-primary-absence-v2",
+            parent_path=primary_parent,
+            allocate=True,
+            account_home=primary_home,
+            shared_parent=False,
+        )
+        legacy_spec = MIRROR_MODULE.PrivateControlRootSpec(
+            root_id="custom-legacy-absence-v1",
+            parent_path=legacy_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        real_preflight = MIRROR_MODULE._preflight_legacy_private_control_roots
+        real_decision = MIRROR_MODULE._private_control_preallocation_decision
+        captured_receipts = []
+        replaced = False
+
+        def capture_preflight(*args, **kwargs):
+            states, receipts = real_preflight(*args, **kwargs)
+            captured_receipts.extend(receipts)
+            return states, receipts
+
+        def replace_anchor_after_preflight(states):
+            nonlocal replaced
+            decision = real_decision(states)
+            anchor.rename(saved_anchor)
+            anchor.mkdir(mode=0o700)
+            replaced = True
+            return decision
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "PRIVATE_CONTROL_ROOT_SPECS",
+                    (primary_spec, legacy_spec),
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_preflight_legacy_private_control_roots",
+                    side_effect=capture_preflight,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_private_control_preallocation_decision",
+                    side_effect=replace_anchor_after_preflight,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "absence anchor.*replaced before transaction completion",
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        self.assertTrue(replaced)
+        self.assertEqual(len(captured_receipts), 1)
+        receipt = captured_receipts[0]
+        self.assertEqual(receipt.root_id, legacy_spec.root_id)
+        self.assertEqual(receipt.parent_path, legacy_parent)
+        self.assertEqual(receipt.absence_anchor_path, anchor)
+        self.assertEqual(receipt.absence_name, legacy_parent.name)
+        self.assertIsNotNone(receipt.absence_anchor_identity)
+        self.assertIsNotNone(receipt.absence_anchor_access_policy)
+        self.assertIsNotNone(receipt.absence_binding)
+        assert receipt.absence_binding is not None
+        self.assertEqual(receipt.absence_binding.parent.fd, -1)
+        self.assertFalse(legacy_parent.exists())
+        self.assertFalse((saved_anchor / legacy_parent.name).exists())
+        self.assertFalse(primary_parent.exists())
+
+    def test_owner_creation_error_cleanup_retains_lease_and_closes_context(
+        self,
+    ) -> None:
+        real_write_all = MIRROR_MODULE._write_all
+        real_remove_owner = MIRROR_MODULE._remove_stale_owner_record
+        observed_nested_cleanup = False
+        captured_context = None
+
+        def fail_after_owner_write(file_fd, payload, display_path):
+            real_write_all(file_fd, payload, display_path)
+            if display_path.name.endswith(".owner.json"):
+                raise MIRROR_MODULE.MirrorSyncError(
+                    "injected owner publication failure"
+                )
+
+        def remove_then_probe(*args, **kwargs):
+            nonlocal observed_nested_cleanup, captured_context
+            tool_root = args[1]
+            captured_context = tool_root.private_control_context
+            result = real_remove_owner(*args, **kwargs)
+            self.assertTrue(kwargs["quarantine_locked"])
+            assert kwargs["quarantine"].path is not None
+            self._assert_directory_lock_contended(kwargs["quarantine"].path)
+            observed_nested_cleanup = True
+            return result
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_write_all",
+                    side_effect=fail_after_owner_write,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_remove_stale_owner_record",
+                    side_effect=remove_then_probe,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_remove_bound_private_directory",
+                    side_effect=MIRROR_MODULE.MirrorSyncError(
+                        "injected secondary snapshot cleanup failure"
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "injected owner publication failure; secondary "
+                    "private-control cleanup failures: .*injected secondary "
+                    "snapshot cleanup failure",
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        self.assertTrue(observed_nested_cleanup)
+        self.assertIsNotNone(captured_context)
+        assert captured_context is not None
+        self.assertEqual(captured_context.home.fd, -1)
+        self.assertEqual(captured_context.parent.fd, -1)
+        self.assertEqual(captured_context.quarantine.fd, -1)
+        self._assert_directory_lock_available(captured_context.quarantine.path)
+
+    def test_post_publication_revalidation_failure_closes_owner_and_can_retry(
+        self,
+    ) -> None:
+        real_create_owner = MIRROR_MODULE._create_owner_record
+        real_revalidate = MIRROR_MODULE._revalidate_primary_private_control_context
+        captured_owner = None
+        owner_published = False
+        injected = False
+
+        def capture_owner(*args, **kwargs):
+            nonlocal captured_owner, owner_published
+            result = real_create_owner(*args, **kwargs)
+            captured_owner = result[2]
+            owner_published = True
+            return result
+
+        def fail_after_publication(tool_root):
+            nonlocal injected
+            if owner_published and not injected:
+                injected = True
+                raise MIRROR_MODULE.MirrorSyncError(
+                    "injected post-publication context failure"
+                )
+            return real_revalidate(tool_root)
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_create_owner_record",
+                    side_effect=capture_owner,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_revalidate_primary_private_control_context",
+                    side_effect=fail_after_publication,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "injected post-publication context failure",
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+
+            self.assertTrue(injected)
+            self.assertIsNotNone(captured_owner)
+            assert captured_owner is not None
+            self.assertEqual(captured_owner.fd, -1)
+            assert captured_owner.path is not None
+            self.assertFalse(captured_owner.path.exists())
+
+            MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            self.assertIsNotNone(bound_root.git_control)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_second_publication_lock_error_closes_retained_context(self) -> None:
+        real_bind_tool_root = MIRROR_MODULE._bind_private_tool_root
+        real_flock = MIRROR_MODULE.fcntl.flock
+        captured_tool_root = None
+        injected = False
+
+        def capture_tool_root(*args, **kwargs):
+            nonlocal captured_tool_root
+            captured_tool_root = real_bind_tool_root(*args, **kwargs)
+            return captured_tool_root
+
+        def fail_quarantine_lock(file_fd, operation):
+            nonlocal injected
+            if captured_tool_root is not None:
+                context = captured_tool_root.private_control_context
+                if (
+                    context is not None
+                    and file_fd == context.quarantine.fd
+                    and operation
+                    == MIRROR_MODULE.fcntl.LOCK_EX | MIRROR_MODULE.fcntl.LOCK_NB
+                    and not injected
+                ):
+                    injected = True
+                    raise OSError("injected quarantine lease failure")
+            return real_flock(file_fd, operation)
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_bind_private_tool_root",
+                    side_effect=capture_tool_root,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE.fcntl,
+                    "flock",
+                    side_effect=fail_quarantine_lock,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "busy or unleaseable",
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        self.assertTrue(injected)
+        self.assertIsNotNone(captured_tool_root)
+        assert captured_tool_root is not None
+        context = captured_tool_root.private_control_context
+        self.assertIsNone(context)
+        self.assertEqual(captured_tool_root.fd, -1)
+        tool_path = (
+            self.private_git_control_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        )
+        quarantine_path = (
+            self.private_git_control_parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        )
+        self._assert_directory_lock_available(tool_path)
+        self._assert_directory_lock_available(quarantine_path)
+
+    def test_retained_context_close_error_does_not_interrupt_root_cleanup(
+        self,
+    ) -> None:
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        assert bound_root.git_control is not None
+        context = bound_root.git_control.private_parent.private_control_context
+        self.assertIsNotNone(context)
+        assert context is not None
+        failing_fd = context.parent.fd
+        real_close = MIRROR_MODULE.os.close
+        injected = False
+
+        def close_then_report_error(file_fd):
+            nonlocal injected
+            if file_fd == failing_fd and not injected:
+                injected = True
+                real_close(file_fd)
+                raise OSError("injected retained parent close failure")
+            return real_close(file_fd)
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE.os,
+                "close",
+                side_effect=close_then_report_error,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "cannot close every retained private-control descriptor",
+            ),
+        ):
+            MIRROR_MODULE._close_bound_root(bound_root)
+
+        self.assertTrue(injected)
+        self.assertIsNone(bound_root.git_control)
+        self.assertEqual(bound_root.fd, -1)
+        self.assertEqual(bound_root.git_executable.fd, -1)
+        self.assertEqual(bound_root.managed_ancestors, {})
+        self.assertEqual(context.home.fd, -1)
+        self.assertEqual(context.parent.fd, -1)
+        self.assertEqual(context.quarantine.fd, -1)
+
+    def test_normal_owner_cleanup_retains_quarantine_lease_until_outer_release(
+        self,
+    ) -> None:
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        assert bound_root.git_control is not None
+        context = bound_root.git_control.private_parent.private_control_context
+        self.assertIsNotNone(context)
+        assert context is not None
+        quarantine_path = context.quarantine.path
+        assert quarantine_path is not None
+        real_remove_owner = MIRROR_MODULE._remove_bound_owner_record
+        observed_nested_cleanup = False
+
+        def remove_then_probe(*args, **kwargs):
+            nonlocal observed_nested_cleanup
+            result = real_remove_owner(*args, **kwargs)
+            self.assertTrue(kwargs["quarantine_locked"])
+            self._assert_directory_lock_contended(quarantine_path)
+            observed_nested_cleanup = True
+            return result
+
+        with mock.patch.object(
+            MIRROR_MODULE,
+            "_remove_bound_owner_record",
+            side_effect=remove_then_probe,
+        ):
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        self.assertTrue(observed_nested_cleanup)
+        self._assert_directory_lock_available(quarantine_path)
+
+    def test_private_cleanup_aggregates_raw_acquire_errors_and_closes_all(
+        self,
+    ) -> None:
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        assert bound_root.git_control is not None
+        tool_root = bound_root.git_control.private_parent
+        context = tool_root.private_control_context
+        assert context is not None
+        lease_labels = {
+            tool_root.fd: "tool-root",
+            context.quarantine.fd: "quarantine",
+        }
+        real_flock = MIRROR_MODULE.fcntl.flock
+        acquire_attempts = []
+
+        def fail_each_cleanup_acquire(file_fd, operation):
+            label = lease_labels.get(file_fd)
+            if (
+                label is not None
+                and operation
+                == MIRROR_MODULE.fcntl.LOCK_EX | MIRROR_MODULE.fcntl.LOCK_NB
+            ):
+                acquire_attempts.append(label)
+                raise OSError(f"injected raw {label} acquire failure")
+            return real_flock(file_fd, operation)
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE.fcntl,
+                "flock",
+                side_effect=fail_each_cleanup_acquire,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "tool-root acquire: OSError: injected raw tool-root acquire "
+                "failure.*quarantine acquire: OSError: injected raw quarantine "
+                "acquire failure",
+            ),
+        ):
+            MIRROR_MODULE._close_bound_root(bound_root)
+
+        self.assertEqual(acquire_attempts, ["tool-root", "quarantine"])
+        self.assertIsNone(bound_root.git_control)
+        self.assertEqual(bound_root.fd, -1)
+        self.assertEqual(bound_root.git_executable.fd, -1)
+        self.assertEqual(tool_root.fd, -1)
+        self.assertEqual(context.quarantine.fd, -1)
+        self.assertEqual(context.parent.fd, -1)
+        self.assertEqual(context.home.fd, -1)
+
+    def test_private_cleanup_first_unlock_failure_does_not_skip_second(
+        self,
+    ) -> None:
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        assert bound_root.git_control is not None
+        tool_root = bound_root.git_control.private_parent
+        context = tool_root.private_control_context
+        assert context is not None
+        lease_labels = {
+            tool_root.fd: "tool-root",
+            context.quarantine.fd: "quarantine",
+        }
+        real_flock = MIRROR_MODULE.fcntl.flock
+        unlock_attempts = []
+        injected = False
+
+        def fail_first_unlock_after_release(file_fd, operation):
+            nonlocal injected
+            label = lease_labels.get(file_fd)
+            if label is not None and operation == MIRROR_MODULE.fcntl.LOCK_UN:
+                unlock_attempts.append(label)
+                result = real_flock(file_fd, operation)
+                if not injected:
+                    injected = True
+                    raise OSError("injected first cleanup unlock failure")
+                return result
+            return real_flock(file_fd, operation)
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE.fcntl,
+                "flock",
+                side_effect=fail_first_unlock_after_release,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "quarantine unlock: OSError: injected first cleanup unlock failure",
+            ),
+        ):
+            MIRROR_MODULE._close_bound_root(bound_root)
+
+        self.assertTrue(injected)
+        self.assertEqual(unlock_attempts, ["quarantine", "tool-root"])
+        self.assertIsNone(bound_root.git_control)
+        self.assertEqual(bound_root.fd, -1)
+        self.assertEqual(tool_root.fd, -1)
+        self.assertEqual(context.quarantine.fd, -1)
+
+    def test_private_cleanup_failure_covers_and_aggregates_later_roots(
+        self,
+    ) -> None:
+        first_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        second_root = MIRROR_MODULE._bind_root(self.target_root)
+        MIRROR_MODULE._ensure_git_control_binding(first_root)
+        MIRROR_MODULE._ensure_git_control_binding(second_root)
+        assert first_root.git_control is not None
+        assert second_root.git_control is not None
+        tool_roots = {
+            first_root.git_control.private_parent.fd: "first-root",
+            second_root.git_control.private_parent.fd: "second-root",
+        }
+        real_flock = MIRROR_MODULE.fcntl.flock
+        covered_roots = []
+
+        def fail_each_root_cleanup_acquire(file_fd, operation):
+            label = tool_roots.get(file_fd)
+            if (
+                label is not None
+                and operation
+                == MIRROR_MODULE.fcntl.LOCK_EX | MIRROR_MODULE.fcntl.LOCK_NB
+            ):
+                covered_roots.append(label)
+                raise OSError(f"injected {label} cleanup acquire failure")
+            return real_flock(file_fd, operation)
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE.fcntl,
+                "flock",
+                side_effect=fail_each_root_cleanup_acquire,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "injected second-root cleanup acquire failure.*secondary "
+                "bound-root finalization failures: .*injected first-root "
+                "cleanup acquire failure",
+            ),
+        ):
+            MIRROR_MODULE._finish_bound_roots(first_root, second_root)
+
+        self.assertEqual(covered_roots, ["second-root", "first-root"])
+        for bound_root in (first_root, second_root):
+            self.assertIsNone(bound_root.git_control)
+            self.assertEqual(bound_root.fd, -1)
+            self.assertEqual(bound_root.git_executable.fd, -1)
+
+    def test_private_cleanup_body_raw_oserror_covers_later_roots(self) -> None:
+        first_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        second_root = MIRROR_MODULE._bind_root(self.target_root)
+        MIRROR_MODULE._ensure_git_control_binding(first_root)
+        MIRROR_MODULE._ensure_git_control_binding(second_root)
+        contexts = []
+        for bound_root in (first_root, second_root):
+            assert bound_root.git_control is not None
+            context = bound_root.git_control.private_parent.private_control_context
+            assert context is not None
+            contexts.append(context)
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_set_owner_record_phase",
+                side_effect=OSError("injected raw cleanup body failure"),
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "injected raw cleanup body failure.*secondary bound-root "
+                "finalization failures: .*injected raw cleanup body failure",
+            ),
+        ):
+            MIRROR_MODULE._finish_bound_roots(first_root, second_root)
+
+        for bound_root, context in zip(
+            (first_root, second_root),
+            contexts,
+        ):
+            self.assertIsNone(bound_root.git_control)
+            self.assertEqual(bound_root.fd, -1)
+            self.assertEqual(bound_root.git_executable.fd, -1)
+            self.assertEqual(context.home.fd, -1)
+            self.assertEqual(context.parent.fd, -1)
+            self.assertEqual(context.quarantine.fd, -1)
+
+    def test_private_executable_cleanup_body_raw_oserror_closes_all(self) -> None:
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        admin = MIRROR_MODULE._bind_absolute_control_object(
+            self.target_root / ".git",
+            "test Git admin directory",
+            require_directory=True,
+        )
+        common = MIRROR_MODULE._duplicate_directory_control(
+            admin,
+            self.target_root / ".git",
+            "test Git common directory",
+        )
+        try:
+            binding = MIRROR_MODULE._prepare_private_git_executable(
+                bound_root,
+                admin,
+                common,
+            )
+        finally:
+            os.close(common.fd)
+            common.fd = -1
+            os.close(admin.fd)
+            admin.fd = -1
+        bound_root.private_git_executable = binding
+        context = binding.private_parent.private_control_context
+        assert context is not None
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_set_owner_record_phase",
+                side_effect=OSError("injected raw executable cleanup failure"),
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "private Git executable cleanup failed: injected raw "
+                "executable cleanup failure",
+            ),
+        ):
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        self.assertIsNone(bound_root.private_git_executable)
+        self.assertEqual(bound_root.fd, -1)
+        self.assertEqual(bound_root.git_executable.fd, -1)
+        self.assertEqual(binding.executable.fd, -1)
+        self.assertEqual(binding.private.fd, -1)
+        self.assertEqual(binding.owner_record.fd, -1)
+        self.assertEqual(binding.private_parent.fd, -1)
+        self.assertEqual(context.quarantine.fd, -1)
+        self.assertEqual(context.parent.fd, -1)
+        self.assertEqual(context.home.fd, -1)
+
+    def test_finish_bound_roots_aggregates_raw_revalidation_oserrors(self) -> None:
+        first_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        second_root = MIRROR_MODULE._bind_root(self.target_root)
+        revalidated = []
+
+        def fail_raw_revalidation(bound_root):
+            revalidated.append(bound_root.path)
+            raise OSError(f"injected raw revalidation failure for {bound_root.path}")
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_revalidate_bound_root",
+                side_effect=fail_raw_revalidation,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "injected raw revalidation failure.*secondary bound-root "
+                "finalization failures: .*injected raw revalidation failure",
+            ),
+        ):
+            MIRROR_MODULE._finish_bound_roots(first_root, second_root)
+
+        self.assertEqual(
+            revalidated,
+            [first_root.path, second_root.path],
+        )
+        for bound_root in (first_root, second_root):
+            self.assertEqual(bound_root.fd, -1)
+            self.assertEqual(bound_root.git_executable.fd, -1)
+
+    def test_private_control_walkers_transfer_fd_before_effectful_close_error(
+        self,
+    ) -> None:
+        real_close = MIRROR_MODULE.os.close
+
+        for label, invoke in (
+            (
+                "account-home",
+                lambda: MIRROR_MODULE._bind_trusted_account_home(self.root),
+            ),
+            (
+                "ancestry",
+                lambda: self._invoke_ancestry_with_open_candidate(),
+            ),
+        ):
+            with self.subTest(label=label):
+                close_calls: list[int] = []
+                failed_fd: int | None = None
+
+                def fail_first_close_after_effect(descriptor: int) -> None:
+                    nonlocal failed_fd
+                    close_calls.append(descriptor)
+                    real_close(descriptor)
+                    if failed_fd is None:
+                        failed_fd = descriptor
+                        raise OSError(f"injected {label} close-after-effect")
+
+                with (
+                    mock.patch.object(
+                        MIRROR_MODULE.os,
+                        "close",
+                        side_effect=fail_first_close_after_effect,
+                    ),
+                    self.assertRaisesRegex(
+                        MIRROR_MODULE.MirrorSyncError,
+                        f"injected {label} close-after-effect",
+                    ),
+                ):
+                    invoke()
+
+                assert failed_fd is not None
+                self.assertEqual(close_calls.count(failed_fd), 1)
+                self.assertGreaterEqual(len(set(close_calls)), 2)
+
+    def _invoke_ancestry_with_open_candidate(self) -> None:
+        candidate_fd = os.open(self.target_root, MIRROR_MODULE._DIRECTORY_FLAGS)
+        try:
+            MIRROR_MODULE._directory_is_at_or_below(
+                candidate_fd,
+                (-1, -1, stat.S_IFDIR),
+            )
+        finally:
+            os.close(candidate_fd)
+
+    def test_primary_bind_and_prebind_cleanup_cover_every_owned_descriptor(
+        self,
+    ) -> None:
+        spec = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0]
+        real_close = MIRROR_MODULE.os.close
+        cleanup_enabled = False
+        close_calls: list[int] = []
+        failed_fd: int | None = None
+
+        def fail_revalidation(_binding) -> None:
+            nonlocal cleanup_enabled
+            cleanup_enabled = True
+            raise MIRROR_MODULE.MirrorSyncError("injected primary bind body failure")
+
+        def fail_first_cleanup_close_after_effect(descriptor: int) -> None:
+            nonlocal failed_fd
+            if cleanup_enabled:
+                close_calls.append(descriptor)
+            real_close(descriptor)
+            if cleanup_enabled and failed_fd is None:
+                failed_fd = descriptor
+                raise OSError("injected primary bind close-after-effect")
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_revalidate_absolute_control_object",
+                side_effect=fail_revalidation,
+            ),
+            mock.patch.object(
+                MIRROR_MODULE.os,
+                "close",
+                side_effect=fail_first_cleanup_close_after_effect,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "injected primary bind body failure.*injected primary bind "
+                "close-after-effect",
+            ),
+        ):
+            MIRROR_MODULE._bind_primary_private_control_parent_impl(
+                spec,
+                create=False,
+            )
+
+        assert failed_fd is not None
+        self.assertEqual(close_calls.count(failed_fd), 1)
+        self.assertGreaterEqual(len(set(close_calls)), 2)
+
+        tool = self.private_git_control_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        tool.mkdir(mode=0o700)
+        tool.chmod(0o755)
+        tool_identity = MIRROR_MODULE._object_identity(tool.stat())
+        close_calls = []
+        failed_fd = None
+
+        def fail_tool_close_after_effect(descriptor: int) -> None:
+            nonlocal failed_fd
+            descriptor_identity = MIRROR_MODULE._object_identity(os.fstat(descriptor))
+            if failed_fd is not None or descriptor_identity == tool_identity:
+                close_calls.append(descriptor)
+            real_close(descriptor)
+            if descriptor_identity == tool_identity and failed_fd is None:
+                failed_fd = descriptor
+                raise OSError("injected primary child close-after-effect")
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE.os,
+                "close",
+                side_effect=fail_tool_close_after_effect,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "must be mode 0700.*injected primary child close-after-effect",
+            ),
+        ):
+            MIRROR_MODULE._prebind_existing_primary_private_control_root(spec)
+
+        assert failed_fd is not None
+        self.assertEqual(close_calls.count(failed_fd), 1)
+        self.assertGreaterEqual(len(set(close_calls)), 3)
+
+    def test_absence_and_temporary_allocation_preserve_cleanup_failures(
+        self,
+    ) -> None:
+        real_close = MIRROR_MODULE.os.close
+        legacy_parent = self.root / "legacy-present-for-absence"
+        legacy_parent.mkdir(mode=0o700)
+        legacy_spec = MIRROR_MODULE.PrivateControlRootSpec(
+            root_id="legacy-absence-cleanup",
+            parent_path=legacy_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        anchor_identity = MIRROR_MODULE._object_identity(self.root.stat())
+        failed_fds: list[int] = []
+
+        def fail_anchor_close_after_effect(descriptor: int) -> None:
+            descriptor_identity = MIRROR_MODULE._object_identity(os.fstat(descriptor))
+            real_close(descriptor)
+            if descriptor_identity == anchor_identity and not failed_fds:
+                failed_fds.append(descriptor)
+                raise OSError("injected absence-anchor close-after-effect")
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE.os,
+                "close",
+                side_effect=fail_anchor_close_after_effect,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "is not absent.*injected absence-anchor close-after-effect",
+            ),
+        ):
+            MIRROR_MODULE._capture_legacy_private_control_parent_absence(legacy_spec)
+
+        self.assertEqual(len(failed_fds), 1)
+
+        parent = MIRROR_MODULE._bind_absolute_control_object(
+            self.private_git_control_parent,
+            "allocation-test parent",
+            require_directory=True,
+        )
+        cleanup_enabled = False
+        failed_fds = []
+
+        def fail_publish(*_args, **_kwargs) -> None:
+            nonlocal cleanup_enabled
+            cleanup_enabled = True
+            raise OSError("injected allocation publish failure")
+
+        def fail_temporary_close_after_effect(descriptor: int) -> None:
+            real_close(descriptor)
+            if cleanup_enabled and not failed_fds:
+                failed_fds.append(descriptor)
+                raise OSError("injected temporary close-after-effect")
+
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_rename_directory_entry_noreplace",
+                    side_effect=fail_publish,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE.os,
+                    "close",
+                    side_effect=fail_temporary_close_after_effect,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "injected allocation publish failure.*injected temporary "
+                    "close-after-effect",
+                ),
+            ):
+                MIRROR_MODULE._create_private_control_directory_noreplace(
+                    parent,
+                    "allocation-target",
+                    "allocation-test directory",
+                    "allocation-test-root",
+                )
+        finally:
+            os.close(parent.fd)
+            parent.fd = -1
+
+        self.assertEqual(len(failed_fds), 1)
+        self.assertFalse(
+            any(
+                child.name.startswith(".private-control-create-")
+                for child in self.private_git_control_parent.iterdir()
+            )
+        )
+
+    def test_private_cleanup_uses_retained_quarantine_before_paths_move(
         self,
     ) -> None:
         bound_root = MIRROR_MODULE._bind_root(self.target_root)
@@ -5512,30 +6946,31 @@ class MirrorGeneratorTests(unittest.TestCase):
         owner_path = bound_root.git_control.owner_record.path
         assert private_path is not None
         assert owner_path is not None
-        real_bind = MIRROR_MODULE._bind_durable_quarantine_root
+        real_remove = MIRROR_MODULE._remove_bound_private_directory
         observed_pre_teardown_paths = False
 
-        def assert_control_paths_still_exist(root, **kwargs):
+        def assert_control_paths_still_exist(*args, **kwargs):
             nonlocal observed_pre_teardown_paths
             self.assertTrue(private_path.exists())
             self.assertTrue(owner_path.exists())
+            context = bound_root.git_control.private_parent.private_control_context
+            self.assertIsNotNone(context)
+            assert context is not None
+            self.assertGreaterEqual(context.quarantine.fd, 0)
             observed_pre_teardown_paths = True
-            quarantine = real_bind(root, **kwargs)
-            self.assertEqual(
-                quarantine.path,
-                MIRROR_MODULE.PRIVATE_GIT_CONTROL_PARENT
-                / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME,
-            )
-            self.assertEqual(
-                os.fstat(quarantine.fd).st_dev,
-                os.fstat(bound_root.git_control.private_parent.fd).st_dev,
-            )
-            return quarantine
+            return real_remove(*args, **kwargs)
 
-        with mock.patch.object(
-            MIRROR_MODULE,
-            "_bind_durable_quarantine_root",
-            side_effect=assert_control_paths_still_exist,
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_bind_durable_quarantine_root",
+                side_effect=AssertionError("lexical quarantine bind is forbidden"),
+            ),
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_remove_bound_private_directory",
+                side_effect=assert_control_paths_still_exist,
+            ),
         ):
             MIRROR_MODULE._finish_bound_roots(bound_root)
 
@@ -5563,6 +6998,7 @@ class MirrorGeneratorTests(unittest.TestCase):
         owner_path = tool_root_path / owner_name
         owner_path.write_bytes(
             MIRROR_MODULE._owner_record_payload(
+                MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0].root_id,
                 private_name,
                 (123, 456, stat.S_IFDIR),
                 "abcdef0123456789abcdef0123456789",
@@ -5578,39 +7014,37 @@ class MirrorGeneratorTests(unittest.TestCase):
             "test private Git tool root",
             require_directory=True,
         )
-        real_bind = MIRROR_MODULE._bind_durable_quarantine_root
-        observed_private_parent = False
-
-        def require_private_parent(root, **kwargs):
-            nonlocal observed_private_parent
-            self.assertEqual(
-                kwargs.get("quarantine_parent"),
-                MIRROR_MODULE.PRIVATE_GIT_CONTROL_PARENT,
-            )
-            self.assertEqual(
-                kwargs.get("source_parent_fd"),
-                tool_root.fd,
-            )
-            observed_private_parent = True
-            return real_bind(root, **kwargs)
+        quarantine = MIRROR_MODULE._bind_absolute_control_object(
+            MIRROR_MODULE.PRIVATE_GIT_CONTROL_PARENT
+            / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME,
+            "test retained private Git quarantine",
+            require_directory=True,
+        )
+        root_id = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0].root_id
+        tool_root.root_id = root_id
+        quarantine.root_id = root_id
 
         try:
             MIRROR_MODULE.fcntl.flock(tool_root.fd, MIRROR_MODULE.fcntl.LOCK_EX)
+            MIRROR_MODULE.fcntl.flock(quarantine.fd, MIRROR_MODULE.fcntl.LOCK_EX)
             with mock.patch.object(
                 MIRROR_MODULE,
                 "_bind_durable_quarantine_root",
-                side_effect=require_private_parent,
+                side_effect=AssertionError("lexical quarantine bind is forbidden"),
             ):
                 MIRROR_MODULE._recover_stale_private_snapshots(
                     bound_root,
                     tool_root,
+                    quarantine=quarantine,
+                    quarantine_locked=True,
                 )
         finally:
+            MIRROR_MODULE.fcntl.flock(quarantine.fd, MIRROR_MODULE.fcntl.LOCK_UN)
             MIRROR_MODULE.fcntl.flock(tool_root.fd, MIRROR_MODULE.fcntl.LOCK_UN)
+            os.close(quarantine.fd)
             os.close(tool_root.fd)
             MIRROR_MODULE._finish_bound_roots(bound_root)
 
-        self.assertTrue(observed_private_parent)
         self.assertFalse(owner_path.exists())
 
     def test_stale_owner_recovery_quarantines_unhashable_phase_schema(
@@ -5621,6 +7055,11 @@ class MirrorGeneratorTests(unittest.TestCase):
             / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
         )
         tool_root_path.mkdir(mode=0o700)
+        quarantine_path = (
+            MIRROR_MODULE.PRIVATE_GIT_CONTROL_PARENT
+            / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        )
+        quarantine_path.mkdir(mode=0o700)
         private_name = (
             f"sync-canonical-git-control.{os.getpid()}.abcdefabcdefabcdefabcdefabcdefab"
         )
@@ -5630,6 +7069,7 @@ class MirrorGeneratorTests(unittest.TestCase):
             json.dumps(
                 {
                     "version": MIRROR_MODULE.PRIVATE_OWNER_RECORD_VERSION,
+                    "root_id": MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0].root_id,
                     "owner_pid": os.getpid(),
                     "owner_uid": os.geteuid(),
                     "owner_gid": os.getegid(),
@@ -5653,14 +7093,27 @@ class MirrorGeneratorTests(unittest.TestCase):
             "test private Git tool root",
             require_directory=True,
         )
+        quarantine = MIRROR_MODULE._bind_absolute_control_object(
+            quarantine_path,
+            "test retained private Git quarantine",
+            require_directory=True,
+        )
+        root_id = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0].root_id
+        tool_root.root_id = root_id
+        quarantine.root_id = root_id
         try:
             MIRROR_MODULE.fcntl.flock(tool_root.fd, MIRROR_MODULE.fcntl.LOCK_EX)
+            MIRROR_MODULE.fcntl.flock(quarantine.fd, MIRROR_MODULE.fcntl.LOCK_EX)
             MIRROR_MODULE._recover_stale_private_snapshots(
                 bound_root,
                 tool_root,
+                quarantine=quarantine,
+                quarantine_locked=True,
             )
         finally:
+            MIRROR_MODULE.fcntl.flock(quarantine.fd, MIRROR_MODULE.fcntl.LOCK_UN)
             MIRROR_MODULE.fcntl.flock(tool_root.fd, MIRROR_MODULE.fcntl.LOCK_UN)
+            os.close(quarantine.fd)
             os.close(tool_root.fd)
             MIRROR_MODULE._finish_bound_roots(bound_root)
 
@@ -5699,6 +7152,7 @@ class MirrorGeneratorTests(unittest.TestCase):
         private_identity = MIRROR_MODULE._object_identity(private_path.stat())
         owner_path.write_bytes(
             MIRROR_MODULE._owner_record_payload(
+                MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0].root_id,
                 private_name,
                 private_identity,
                 "fedcba9876543210fedcba9876543210",
@@ -5714,31 +7168,32 @@ class MirrorGeneratorTests(unittest.TestCase):
             "test private Git tool root",
             require_directory=True,
         )
-        real_bind = MIRROR_MODULE._bind_durable_quarantine_root
+        quarantine = MIRROR_MODULE._bind_absolute_control_object(
+            MIRROR_MODULE.PRIVATE_GIT_CONTROL_PARENT
+            / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME,
+            "test retained private Git quarantine",
+            require_directory=True,
+        )
+        root_id = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0].root_id
+        tool_root.root_id = root_id
+        quarantine.root_id = root_id
         real_remove_private = MIRROR_MODULE._remove_bound_private_directory
-        quarantine_bound = False
-
-        def observe_quarantine_bind(root, **kwargs):
-            nonlocal quarantine_bound
-            self.assertEqual(
-                kwargs.get("quarantine_parent"),
-                MIRROR_MODULE.PRIVATE_GIT_CONTROL_PARENT,
-            )
-            self.assertEqual(kwargs.get("source_parent_fd"), tool_root.fd)
-            quarantine_bound = True
-            return real_bind(root, **kwargs)
+        retained_quarantine_verified = False
 
         def require_prebound_quarantine(*args, **kwargs):
-            self.assertTrue(quarantine_bound)
+            nonlocal retained_quarantine_verified
+            self.assertGreaterEqual(quarantine.fd, 0)
+            retained_quarantine_verified = True
             return real_remove_private(*args, **kwargs)
 
         try:
             MIRROR_MODULE.fcntl.flock(tool_root.fd, MIRROR_MODULE.fcntl.LOCK_EX)
+            MIRROR_MODULE.fcntl.flock(quarantine.fd, MIRROR_MODULE.fcntl.LOCK_EX)
             with (
                 mock.patch.object(
                     MIRROR_MODULE,
                     "_bind_durable_quarantine_root",
-                    side_effect=observe_quarantine_bind,
+                    side_effect=AssertionError("lexical quarantine bind is forbidden"),
                 ),
                 mock.patch.object(
                     MIRROR_MODULE,
@@ -5749,13 +7204,17 @@ class MirrorGeneratorTests(unittest.TestCase):
                 MIRROR_MODULE._recover_stale_private_snapshots(
                     bound_root,
                     tool_root,
+                    quarantine=quarantine,
+                    quarantine_locked=True,
                 )
         finally:
+            MIRROR_MODULE.fcntl.flock(quarantine.fd, MIRROR_MODULE.fcntl.LOCK_UN)
             MIRROR_MODULE.fcntl.flock(tool_root.fd, MIRROR_MODULE.fcntl.LOCK_UN)
+            os.close(quarantine.fd)
             os.close(tool_root.fd)
             MIRROR_MODULE._finish_bound_roots(bound_root)
 
-        self.assertTrue(quarantine_bound)
+        self.assertTrue(retained_quarantine_verified)
         self.assertFalse(private_path.exists())
         self.assertFalse(owner_path.exists())
 
@@ -6025,6 +7484,7 @@ class MirrorGeneratorTests(unittest.TestCase):
         private_metadata = private_path.stat()
         owner_path.write_bytes(
             MIRROR_MODULE._owner_record_payload(
+                MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0].root_id,
                 private_name,
                 MIRROR_MODULE._object_identity(private_metadata),
                 "abcdef0123456789abcdef0123456789",
@@ -6033,10 +7493,10 @@ class MirrorGeneratorTests(unittest.TestCase):
         )
         owner_path.chmod(0o600)
         os.chown(owner_path, os.geteuid(), os.getegid())
-        real_read = MIRROR_MODULE._safe_read_leaf_snapshot
+        real_read = MIRROR_MODULE._safe_read_private_owner_record_snapshot
         injected = False
 
-        def replace_owner_after_lock(parent_fd, name, display_path):
+        def replace_owner_after_lock(parent_fd, name, display_path, **kwargs):
             nonlocal injected
             if name == owner_name and not injected:
                 injected = True
@@ -6044,19 +7504,19 @@ class MirrorGeneratorTests(unittest.TestCase):
                 owner_path.write_bytes(saved_owner.read_bytes())
                 owner_path.chmod(0o600)
                 os.chown(owner_path, os.geteuid(), os.getegid())
-            return real_read(parent_fd, name, display_path)
+            return real_read(parent_fd, name, display_path, **kwargs)
 
         bound_root = MIRROR_MODULE._bind_root(self.target_root)
         try:
             with (
                 mock.patch.object(
                     MIRROR_MODULE,
-                    "_safe_read_leaf_snapshot",
+                    "_safe_read_private_owner_record_snapshot",
                     side_effect=replace_owner_after_lock,
                 ),
                 self.assertRaisesRegex(
                     MIRROR_MODULE.MirrorSyncError,
-                    "owner path was replaced after its lock",
+                    "private owner record was replaced while opening it",
                 ),
             ):
                 MIRROR_MODULE._ensure_git_control_binding(bound_root)
@@ -6356,8 +7816,19 @@ class MirrorGeneratorTests(unittest.TestCase):
             with (
                 mock.patch.object(
                     MIRROR_MODULE,
-                    "PRIVATE_GIT_CONTROL_PARENT",
-                    self.target_root,
+                    "PRIVATE_CONTROL_ROOT_SPECS",
+                    (
+                        MIRROR_MODULE.PrivateControlRootSpec(
+                            root_id="test-overlapping-primary-home-v1",
+                            parent_path=(
+                                self.target_root
+                                / MIRROR_MODULE.PRIVATE_CONTROL_NAMESPACE_NAME
+                            ),
+                            allocate=True,
+                            account_home=self.target_root,
+                            shared_parent=False,
+                        ),
+                    ),
                 ),
                 self.assertRaisesRegex(
                     MIRROR_MODULE.MirrorSyncError,
@@ -6367,6 +7838,257 @@ class MirrorGeneratorTests(unittest.TestCase):
                 MIRROR_MODULE._ensure_git_control_binding(overlapping_root)
         finally:
             MIRROR_MODULE._finish_bound_roots(overlapping_root)
+
+    def test_primary_cross_filesystem_quarantine_fails_before_recovery(self) -> None:
+        tool = self.private_git_control_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        quarantine = (
+            self.private_git_control_parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        )
+        tool.mkdir(mode=0o700)
+        quarantine.mkdir(mode=0o700)
+        tool_sentinel = tool / "tool-sentinel"
+        quarantine_sentinel = quarantine / "quarantine-sentinel"
+        tool_sentinel.write_bytes(b"tool bytes\n")
+        quarantine_sentinel.write_bytes(b"quarantine bytes\n")
+        primary_root_id = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0].root_id
+        real_validate = MIRROR_MODULE._validate_private_control_root_topology
+        real_fstat = os.fstat
+        recovery_calls = 0
+
+        def inject_cross_device(*args, **kwargs):
+            quarantine_binding = kwargs["quarantine"]
+            if kwargs["root_id"] != primary_root_id or quarantine_binding is None:
+                return real_validate(*args, **kwargs)
+
+            def report_distinct_quarantine_device(fd):
+                metadata = real_fstat(fd)
+                if fd != quarantine_binding.fd:
+                    return metadata
+                values = list(metadata)
+                values[2] = metadata.st_dev + 1
+                return os.stat_result(values)
+
+            with mock.patch.object(
+                MIRROR_MODULE.os,
+                "fstat",
+                side_effect=report_distinct_quarantine_device,
+            ):
+                return real_validate(*args, **kwargs)
+
+        def reject_recovery(*_args, **_kwargs):
+            nonlocal recovery_calls
+            recovery_calls += 1
+            self.fail("primary recovery ran before topology validation")
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_validate_private_control_root_topology",
+                    side_effect=inject_cross_device,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_recover_stale_private_snapshots",
+                    side_effect=reject_recovery,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "must be on the same filesystem",
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+        self.assertEqual(recovery_calls, 0)
+        self.assertEqual(tool_sentinel.read_bytes(), b"tool bytes\n")
+        self.assertEqual(quarantine_sentinel.read_bytes(), b"quarantine bytes\n")
+
+    def test_legacy_child_overlap_with_primary_home_is_zero_mutation(self) -> None:
+        shared_parent = self.root / "legacy-primary-home-overlap"
+        shared_parent.mkdir(mode=0o700)
+        tool = shared_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        quarantine = shared_parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        tool.mkdir(mode=0o700)
+        quarantine.mkdir(mode=0o700)
+        sentinel = tool / "recovery-sentinel"
+        sentinel.write_bytes(b"must not be recovered\n")
+        primary_spec = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0]
+        legacy_spec = MIRROR_MODULE.PrivateControlRootSpec(
+            root_id="test-legacy-primary-home-overlap-v1",
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "PRIVATE_CONTROL_ROOT_SPECS",
+                    (primary_spec, legacy_spec),
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_legacy_shared_parent_policy_is_valid",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_recover_stale_private_snapshots",
+                    side_effect=AssertionError(
+                        "legacy recovery ran before topology validation"
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "overlaps primary account home",
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+        self.assertEqual(sentinel.read_bytes(), b"must not be recovered\n")
+        self.assertFalse(
+            (
+                self.private_git_control_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+            ).exists()
+        )
+
+    def test_private_control_topology_rejects_reciprocal_child_ancestry(
+        self,
+    ) -> None:
+        topology_parent = self.root / "reciprocal-topology-parent"
+        topology_parent.mkdir(mode=0o700)
+        tool_path = topology_parent / "tool"
+        quarantine_path = topology_parent / "quarantine"
+        tool_path.mkdir(mode=0o700)
+        quarantine_path.mkdir(mode=0o700)
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        parent = MIRROR_MODULE._bind_absolute_control_object(
+            topology_parent,
+            "test topology parent",
+            require_directory=True,
+        )
+        tool = MIRROR_MODULE._bind_absolute_control_object(
+            tool_path,
+            "test topology tool",
+            require_directory=True,
+        )
+        quarantine = MIRROR_MODULE._bind_absolute_control_object(
+            quarantine_path,
+            "test topology quarantine",
+            require_directory=True,
+        )
+        admin = MIRROR_MODULE._bind_absolute_control_object(
+            self.target_root / ".git",
+            "test topology Git admin",
+            require_directory=True,
+        )
+        real_is_below = MIRROR_MODULE._directory_is_at_or_below
+
+        def report_parent_below_tool(candidate_fd, ancestor_identity):
+            candidate_identity = MIRROR_MODULE._object_identity(os.fstat(candidate_fd))
+            if (
+                candidate_identity == parent.identity
+                and ancestor_identity == tool.identity
+            ):
+                return True
+            return real_is_below(candidate_fd, ancestor_identity)
+
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_directory_is_at_or_below",
+                    side_effect=report_parent_below_tool,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "not a strict descendant",
+                ),
+            ):
+                MIRROR_MODULE._validate_private_control_root_topology(
+                    root_id="test-reciprocal-topology-v1",
+                    parent=parent,
+                    tool_root=tool,
+                    quarantine=quarantine,
+                    repository_root=bound_root,
+                    admin=admin,
+                    common=admin,
+                )
+        finally:
+            os.close(admin.fd)
+            os.close(quarantine.fd)
+            os.close(tool.fd)
+            os.close(parent.fd)
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_private_control_topology_rejects_child_root_overlap(self) -> None:
+        topology_parent = self.root / "overlap-topology-parent"
+        topology_parent.mkdir(mode=0o700)
+        tool_path = topology_parent / "tool"
+        quarantine_path = topology_parent / "quarantine"
+        tool_path.mkdir(mode=0o700)
+        quarantine_path.mkdir(mode=0o700)
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        parent = MIRROR_MODULE._bind_absolute_control_object(
+            topology_parent,
+            "test topology parent",
+            require_directory=True,
+        )
+        tool = MIRROR_MODULE._bind_absolute_control_object(
+            tool_path,
+            "test topology tool",
+            require_directory=True,
+        )
+        quarantine = MIRROR_MODULE._bind_absolute_control_object(
+            quarantine_path,
+            "test topology quarantine",
+            require_directory=True,
+        )
+        admin = MIRROR_MODULE._bind_absolute_control_object(
+            self.target_root / ".git",
+            "test topology Git admin",
+            require_directory=True,
+        )
+        real_overlap = MIRROR_MODULE._directory_bindings_overlap
+
+        def report_child_overlap(left_fd, right_fd):
+            if {left_fd, right_fd} == {tool.fd, quarantine.fd}:
+                return True
+            return real_overlap(left_fd, right_fd)
+
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_directory_bindings_overlap",
+                    side_effect=report_child_overlap,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "must not overlap",
+                ),
+            ):
+                MIRROR_MODULE._validate_private_control_root_topology(
+                    root_id="test-child-overlap-topology-v1",
+                    parent=parent,
+                    tool_root=tool,
+                    quarantine=quarantine,
+                    repository_root=bound_root,
+                    admin=admin,
+                    common=admin,
+                )
+        finally:
+            os.close(admin.fd)
+            os.close(quarantine.fd)
+            os.close(tool.fd)
+            os.close(parent.fd)
+            MIRROR_MODULE._finish_bound_roots(bound_root)
 
     def test_private_git_snapshot_never_binds_the_default_host_parent(self) -> None:
         observed_paths = []
@@ -6390,10 +8112,1080 @@ class MirrorGeneratorTests(unittest.TestCase):
                 side_effect=reject_default_host_parent,
             ):
                 MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            self.assertEqual(
+                bound_root.git_control.private_path.parent,
+                self.private_git_control_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME,
+            )
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+        self.assertTrue(observed_paths)
+
+    def test_foreign_preclaimed_legacy_leaf_cannot_block_primary_home_root(
+        self,
+    ) -> None:
+        shared_parent = self.root / "legacy-shared-parent"
+        shared_parent.mkdir(mode=0o700)
+        shared_parent.chmod(0o1777)
+        preclaimed = shared_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        preclaimed.mkdir(mode=0o700)
+        preclaimed.chmod(0o000)
+        before = preclaimed.lstat()
+        primary_spec = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0]
+        legacy_spec = MIRROR_MODULE.PrivateControlRootSpec(
+            root_id=MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        real_metadata = MIRROR_MODULE._legacy_child_metadata
+        real_bind_child = MIRROR_MODULE._bind_relative_control_directory
+        legacy_child_opens = []
+
+        def classify_preclaim_as_foreign(parent_fd, name, root_id):
+            observed = real_metadata(parent_fd, name, root_id)
+            if name == MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME and observed is not None:
+                identity, access_policy = observed
+                return identity, (
+                    access_policy[0],
+                    os.geteuid() + 1,
+                    access_policy[2],
+                )
+            return observed
+
+        def reject_legacy_child_open(parent, name, label):
+            if parent.path == shared_parent:
+                legacy_child_opens.append(name)
+                self.fail(f"foreign legacy child was opened: {name}")
+            return real_bind_child(parent, name, label)
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        observed_after = None
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "PRIVATE_CONTROL_ROOT_SPECS",
+                    (primary_spec, legacy_spec),
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_legacy_shared_parent_policy_is_valid",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_legacy_child_metadata",
+                    side_effect=classify_preclaim_as_foreign,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_bind_relative_control_directory",
+                    side_effect=reject_legacy_child_open,
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            self.assertEqual(
+                bound_root.git_control.private_path.parent,
+                self.private_git_control_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME,
+            )
+            observed_after = preclaimed.lstat()
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+            preclaimed.chmod(0o700)
+
+        assert observed_after is not None
+        self.assertEqual(
+            (
+                observed_after.st_dev,
+                observed_after.st_ino,
+                stat.S_IMODE(observed_after.st_mode),
+            ),
+            (before.st_dev, before.st_ino, stat.S_IMODE(before.st_mode)),
+        )
+        self.assertEqual(legacy_child_opens, [])
+
+    def test_primary_home_root_rejects_unsafe_ancestor_and_parent_policy(
+        self,
+    ) -> None:
+        unsafe_ancestor = self.root / "unsafe-ancestor"
+        unsafe_ancestor.mkdir(mode=0o700)
+        unsafe_ancestor.chmod(0o777)
+        unsafe_home = unsafe_ancestor / "home"
+        unsafe_home.mkdir(mode=0o700)
+        unsafe_spec = MIRROR_MODULE.PrivateControlRootSpec(
+            root_id="test-unsafe-primary-home-v1",
+            parent_path=(unsafe_home / MIRROR_MODULE.PRIVATE_CONTROL_NAMESPACE_NAME),
+            allocate=True,
+            account_home=unsafe_home,
+            shared_parent=False,
+        )
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "ancestors must be root/current-owned and not group/world writable",
+        ):
+            MIRROR_MODULE._bind_primary_private_control_parent(unsafe_spec)
+        self.assertFalse(unsafe_spec.parent_path.exists())
+
+        safe_home = self.root / "safe-home"
+        safe_home.mkdir(mode=0o700)
+        unsafe_parent = safe_home / MIRROR_MODULE.PRIVATE_CONTROL_NAMESPACE_NAME
+        unsafe_parent.mkdir(mode=0o755)
+        unsafe_parent_spec = MIRROR_MODULE.PrivateControlRootSpec(
+            root_id="test-unsafe-parent-primary-home-v1",
+            parent_path=unsafe_parent,
+            allocate=True,
+            account_home=safe_home,
+            shared_parent=False,
+        )
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "must be mode 0700 and owned by the current uid",
+        ):
+            MIRROR_MODULE._bind_primary_private_control_parent(unsafe_parent_spec)
+
+    def test_legacy_evidence_without_initial_quarantine_is_zero_mutation_pending(
+        self,
+    ) -> None:
+        shared_parent = self.root / "legacy-without-quarantine"
+        shared_parent.mkdir(mode=0o700)
+        tool = shared_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        tool.mkdir(mode=0o700)
+        evidence = tool / "recovery-evidence"
+        evidence.write_bytes(b"must remain in the original root\n")
+        before = (tool.lstat().st_ino, evidence.lstat().st_ino, evidence.read_bytes())
+        primary_spec = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0]
+        legacy_spec = MIRROR_MODULE.PrivateControlRootSpec(
+            root_id=MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "PRIVATE_CONTROL_ROOT_SPECS",
+                    (primary_spec, legacy_spec),
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_legacy_shared_parent_policy_is_valid",
+                    return_value=True,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    MIRROR_MODULE.PRIVATE_CONTROL_REASON_LEGACY_PENDING,
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
         finally:
             MIRROR_MODULE._finish_bound_roots(bound_root)
 
-        self.assertIn(self.private_git_control_parent, observed_paths)
+        self.assertEqual(
+            (tool.lstat().st_ino, evidence.lstat().st_ino, evidence.read_bytes()),
+            before,
+        )
+        self.assertFalse(
+            (
+                self.private_git_control_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+            ).exists()
+        )
+        self.assertFalse(
+            (
+                self.private_git_control_parent
+                / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+            ).exists()
+        )
+
+    def test_legacy_tool_replacement_before_binding_preserves_both_objects(
+        self,
+    ) -> None:
+        shared_parent = self.root / "legacy-tool-replacement"
+        shared_parent.mkdir(mode=0o700)
+        tool = shared_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        quarantine = shared_parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        tool.mkdir(mode=0o700)
+        quarantine.mkdir(mode=0o700)
+        saved_tool = shared_parent / "saved-tool-root"
+        primary_spec = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0]
+        legacy_spec = MIRROR_MODULE.PrivateControlRootSpec(
+            root_id=MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        real_bind = MIRROR_MODULE._bind_relative_control_directory
+        injected = False
+
+        def replace_tool(parent, name, label):
+            nonlocal injected
+            if (
+                parent.path == shared_parent
+                and name == MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+                and not injected
+            ):
+                tool.rename(saved_tool)
+                tool.mkdir(mode=0o700)
+                injected = True
+            return real_bind(parent, name, label)
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "PRIVATE_CONTROL_ROOT_SPECS",
+                    (primary_spec, legacy_spec),
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_legacy_shared_parent_policy_is_valid",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_bind_relative_control_directory",
+                    side_effect=replace_tool,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "tool root changed before recovery binding",
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        self.assertTrue(injected)
+        self.assertTrue(tool.is_dir())
+        self.assertTrue(saved_tool.is_dir())
+        self.assertEqual(tuple(tool.iterdir()), ())
+        self.assertEqual(tuple(saved_tool.iterdir()), ())
+        self.assertFalse(
+            (
+                self.private_git_control_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+            ).exists()
+        )
+
+    def test_terminal_registry_revalidation_covers_later_legacy_roots(
+        self,
+    ) -> None:
+        primary_spec = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0]
+        legacy_specs = []
+        for index in range(2):
+            parent = self.root / f"terminal-legacy-{index}"
+            parent.mkdir(mode=0o700)
+            legacy_specs.append(
+                MIRROR_MODULE.PrivateControlRootSpec(
+                    root_id=f"terminal-legacy-{index}",
+                    parent_path=parent,
+                    allocate=False,
+                    account_home=None,
+                    shared_parent=True,
+                )
+            )
+        real_metadata = MIRROR_MODULE._legacy_child_metadata
+        calls: dict[tuple[str, str], int] = {}
+        injected = False
+
+        def mutate_first_root_on_terminal_pass(parent_fd, name, root_id):
+            nonlocal injected
+            key = (root_id, name)
+            calls[key] = calls.get(key, 0) + 1
+            if (
+                root_id == legacy_specs[0].root_id
+                and name == MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+                and calls[key] == 3
+            ):
+                (legacy_specs[0].parent_path / name).mkdir(mode=0o700)
+                injected = True
+            return real_metadata(parent_fd, name, root_id)
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "PRIVATE_CONTROL_ROOT_SPECS",
+                    (primary_spec, *legacy_specs),
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_legacy_shared_parent_policy_is_valid",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_legacy_child_metadata",
+                    side_effect=mutate_first_root_on_terminal_pass,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "terminal legacy registry revalidation covered every root",
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        self.assertTrue(injected)
+        self.assertGreaterEqual(
+            calls[(legacy_specs[1].root_id, MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME)],
+            3,
+        )
+        self.assertFalse(
+            (
+                self.private_git_control_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+            ).exists()
+        )
+
+    def test_terminal_registry_revalidation_aggregates_uncertain_parent_close(
+        self,
+    ) -> None:
+        receipts = []
+        parent_identities = []
+        for index in range(2):
+            parent = self.root / f"terminal-close-parent-{index}"
+            parent.mkdir(mode=0o700)
+            metadata = parent.stat()
+            identity = MIRROR_MODULE._object_identity(metadata)
+            parent_identities.append(identity)
+            receipts.append(
+                MIRROR_MODULE.LegacyPrivateControlReceipt(
+                    root_id=f"terminal-close-root-{index}",
+                    parent_path=parent,
+                    parent_identity=identity,
+                    parent_access_policy=MIRROR_MODULE._access_policy(metadata),
+                    tool_record=None,
+                    quarantine_record=None,
+                    state="absent",
+                )
+            )
+        real_close = os.close
+        real_fstat = os.fstat
+        second_root_metadata_calls = 0
+        injected = False
+        real_metadata = MIRROR_MODULE._legacy_child_metadata
+
+        def close_then_report_uncertain(fd):
+            nonlocal injected
+            identity = MIRROR_MODULE._object_identity(real_fstat(fd))
+            real_close(fd)
+            if identity == parent_identities[0] and not injected:
+                injected = True
+                raise OSError("injected close uncertainty")
+
+        def record_later_root(parent_fd, name, root_id):
+            nonlocal second_root_metadata_calls
+            if root_id == receipts[1].root_id:
+                second_root_metadata_calls += 1
+            return real_metadata(parent_fd, name, root_id)
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_legacy_shared_parent_policy_is_valid",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_legacy_child_metadata",
+                side_effect=record_later_root,
+            ),
+            mock.patch.object(
+                MIRROR_MODULE.os,
+                "close",
+                side_effect=close_then_report_uncertain,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "terminal legacy registry revalidation covered every root.*"
+                "injected close uncertainty",
+            ),
+        ):
+            MIRROR_MODULE._revalidate_legacy_private_control_receipts(
+                tuple(receipts),
+                operation=None,
+            )
+
+        self.assertTrue(injected)
+        self.assertEqual(second_root_metadata_calls, 2)
+
+    def test_legacy_quarantine_replacement_before_recovery_is_not_mutated(
+        self,
+    ) -> None:
+        shared_parent = self.root / "legacy-quarantine-replacement"
+        shared_parent.mkdir(mode=0o700)
+        tool = shared_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        quarantine = shared_parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        tool.mkdir(mode=0o700)
+        quarantine.mkdir(mode=0o700)
+        saved_quarantine = shared_parent / "saved-quarantine-root"
+        primary_spec = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0]
+        legacy_spec = MIRROR_MODULE.PrivateControlRootSpec(
+            root_id=MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        real_bind = MIRROR_MODULE._bind_relative_control_directory
+        injected = False
+
+        def replace_quarantine(parent, name, label):
+            nonlocal injected
+            if (
+                parent.path == shared_parent
+                and name == MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+                and not injected
+            ):
+                quarantine.rename(saved_quarantine)
+                quarantine.mkdir(mode=0o700)
+                injected = True
+            return real_bind(parent, name, label)
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "PRIVATE_CONTROL_ROOT_SPECS",
+                    (primary_spec, legacy_spec),
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_legacy_shared_parent_policy_is_valid",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_bind_relative_control_directory",
+                    side_effect=replace_quarantine,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "quarantine changed before recovery binding",
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        self.assertTrue(injected)
+        self.assertTrue(quarantine.is_dir())
+        self.assertTrue(saved_quarantine.is_dir())
+        self.assertEqual(tuple(quarantine.iterdir()), ())
+        self.assertEqual(tuple(saved_quarantine.iterdir()), ())
+        self.assertFalse(
+            (
+                self.private_git_control_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+            ).exists()
+        )
+
+    def test_distinct_legacy_parent_child_alias_is_inconclusive(self) -> None:
+        primary_spec = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0]
+        legacy_directory = tempfile.TemporaryDirectory(
+            prefix="canonical-mirror-distinct-legacy-alias."
+        )
+        self.addCleanup(legacy_directory.cleanup)
+        legacy_root = Path(os.path.realpath(legacy_directory.name))
+        parents = []
+        legacy_specs = []
+        for index in range(2):
+            parent = legacy_root / f"alias-legacy-{index}"
+            parent.mkdir(mode=0o700)
+            (parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME).mkdir(mode=0o700)
+            parents.append(parent)
+            legacy_specs.append(
+                MIRROR_MODULE.PrivateControlRootSpec(
+                    root_id=f"alias-legacy-{index}",
+                    parent_path=parent,
+                    allocate=False,
+                    account_home=None,
+                    shared_parent=True,
+                )
+            )
+        real_metadata = MIRROR_MODULE._legacy_child_metadata
+        first_tool_record = None
+
+        def alias_second_tool(parent_fd, name, root_id):
+            nonlocal first_tool_record
+            observed = real_metadata(parent_fd, name, root_id)
+            if name != MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME:
+                return observed
+            if root_id == legacy_specs[0].root_id:
+                first_tool_record = observed
+                return observed
+            assert first_tool_record is not None
+            return first_tool_record
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "PRIVATE_CONTROL_ROOT_SPECS",
+                    (primary_spec, *legacy_specs),
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_legacy_shared_parent_policy_is_valid",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_legacy_child_metadata",
+                    side_effect=alias_second_tool,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "distinct legacy parent aliases an earlier control object",
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        self.assertFalse(
+            (
+                self.private_git_control_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+            ).exists()
+        )
+
+    def test_existing_primary_alias_matrix_is_rejected_before_child_open(
+        self,
+    ) -> None:
+        tool = self.private_git_control_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        quarantine = (
+            self.private_git_control_parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        )
+        tool.mkdir(mode=0o700)
+        quarantine.mkdir(mode=0o700)
+        spec = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0]
+        parent_identity = MIRROR_MODULE._object_identity(
+            self.private_git_control_parent.stat()
+        )
+        real_metadata = MIRROR_MODULE._private_control_child_metadata
+        real_bind = MIRROR_MODULE._bind_existing_private_control_directory
+
+        for scenario in ("parent-child", "child-child"):
+            with self.subTest(scenario=scenario):
+                tool_record = None
+                child_opens: list[str] = []
+
+                def aliased_metadata(parent_fd, name, label):
+                    nonlocal tool_record
+                    observed = real_metadata(parent_fd, name, label)
+                    assert observed is not None
+                    if name == MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME:
+                        tool_record = observed
+                        if scenario == "parent-child":
+                            return parent_identity, observed[1]
+                        return observed
+                    if scenario == "child-child":
+                        assert tool_record is not None
+                        return tool_record
+                    return observed
+
+                def reject_child_open(parent, name, label, root_id, expected_record):
+                    if name in {
+                        MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME,
+                        MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME,
+                    }:
+                        child_opens.append(name)
+                        self.fail(f"aliased primary child was opened: {name}")
+                    return real_bind(parent, name, label, root_id, expected_record)
+
+                with (
+                    mock.patch.object(
+                        MIRROR_MODULE,
+                        "_private_control_child_metadata",
+                        side_effect=aliased_metadata,
+                    ),
+                    mock.patch.object(
+                        MIRROR_MODULE,
+                        "_bind_existing_private_control_directory",
+                        side_effect=reject_child_open,
+                    ),
+                    self.assertRaisesRegex(
+                        MIRROR_MODULE.MirrorSyncError,
+                        "fixed child roles alias|fixed child aliases its own parent",
+                    ),
+                ):
+                    MIRROR_MODULE._prebind_existing_primary_private_control_root(spec)
+                self.assertEqual(child_opens, [])
+
+    def test_existing_primary_root_is_validated_before_legacy_or_allocation(
+        self,
+    ) -> None:
+        unsafe_tool_root = (
+            self.private_git_control_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        )
+        unsafe_tool_root.mkdir(mode=0o700)
+        unsafe_tool_root.chmod(0o755)
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_preflight_legacy_private_control_roots",
+                ) as legacy_preflight,
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "existing primary private Git tool root.*must be mode 0700",
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+            legacy_preflight.assert_not_called()
+        finally:
+            unsafe_tool_root.chmod(0o700)
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_generator_deduplicates_legacy_roots_by_bound_parent_identity(
+        self,
+    ) -> None:
+        shared_parent = self.root / "duplicate-legacy-shared-parent"
+        shared_parent.mkdir(mode=0o700)
+        shared_parent.chmod(0o1777)
+        primary_spec = MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS[0]
+        legacy_specs = tuple(
+            MIRROR_MODULE.PrivateControlRootSpec(
+                root_id=f"test-legacy-duplicate-{index}",
+                parent_path=shared_parent,
+                allocate=False,
+                account_home=None,
+                shared_parent=True,
+            )
+            for index in range(2)
+        )
+        real_metadata = MIRROR_MODULE._legacy_child_metadata
+        metadata_calls = []
+
+        def record_metadata(parent_fd, name, root_id):
+            metadata_calls.append((name, root_id))
+            return real_metadata(parent_fd, name, root_id)
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "PRIVATE_CONTROL_ROOT_SPECS",
+                    (primary_spec, *legacy_specs),
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_legacy_shared_parent_policy_is_valid",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_legacy_child_metadata",
+                    side_effect=record_metadata,
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        self.assertTrue(metadata_calls)
+        self.assertEqual(
+            {root_id for _name, root_id in metadata_calls},
+            {legacy_specs[0].root_id},
+        )
+        self.assertEqual(
+            [name for name, _root_id in metadata_calls].count(
+                MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+            ),
+            5,
+        )
+        self.assertEqual(
+            [name for name, _root_id in metadata_calls].count(
+                MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+            ),
+            5,
+        )
+
+    def test_primary_namespace_appearance_after_absence_is_not_adopted(
+        self,
+    ) -> None:
+        self.private_git_control_parent.rmdir()
+        sentinel_payload = b"attacker-owned namespace\n"
+        real_terminal = MIRROR_MODULE._revalidate_legacy_private_control_receipts
+        injected = False
+
+        def create_competing_namespace(receipts, *, operation):
+            nonlocal injected
+            real_terminal(receipts, operation=operation)
+            self.private_git_control_parent.mkdir(mode=0o700)
+            tool = (
+                self.private_git_control_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+            )
+            quarantine = (
+                self.private_git_control_parent
+                / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+            )
+            tool.mkdir(mode=0o700)
+            quarantine.mkdir(mode=0o700)
+            (tool / "sentinel").write_bytes(sentinel_payload)
+            injected = True
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_revalidate_legacy_private_control_receipts",
+                    side_effect=create_competing_namespace,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "appeared before exclusive allocation",
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        self.assertTrue(injected)
+        self.assertEqual(
+            (
+                self.private_git_control_parent
+                / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+                / "sentinel"
+            ).read_bytes(),
+            sentinel_payload,
+        )
+        self.assertFalse(
+            any(
+                path.name.startswith(".private-control-create-")
+                for path in self.root.iterdir()
+            )
+        )
+
+    def test_failed_private_control_allocation_removes_exact_empty_temporary(
+        self,
+    ) -> None:
+        parent = MIRROR_MODULE._bind_absolute_control_object(
+            self.private_git_control_parent,
+            "test private-control parent",
+            require_directory=True,
+        )
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_rename_directory_entry_noreplace",
+                    side_effect=OSError("injected publication failure"),
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "cannot publish test private-control child exclusively",
+                ),
+            ):
+                MIRROR_MODULE._create_private_control_directory_noreplace(
+                    parent,
+                    "test-child",
+                    "test private-control child",
+                    "test-primary-home-v1",
+                )
+        finally:
+            os.close(parent.fd)
+
+        self.assertFalse(
+            any(
+                path.name.startswith(".private-control-create-")
+                for path in self.private_git_control_parent.iterdir()
+            )
+        )
+
+    def test_failed_private_control_allocation_retains_nonempty_without_listing(
+        self,
+    ) -> None:
+        parent = MIRROR_MODULE._bind_absolute_control_object(
+            self.private_git_control_parent,
+            "test private-control parent",
+            require_directory=True,
+        )
+
+        def fill_temporary_then_fail(parent_fd, temporary_name, final_name):
+            temporary = self.private_git_control_parent / temporary_name
+            for index in range(129):
+                (temporary / f"entry-{index:03d}").write_bytes(b"retained\n")
+            raise OSError("injected nonempty publication failure")
+
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_rename_directory_entry_noreplace",
+                    side_effect=fill_temporary_then_fail,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE.os,
+                    "listdir",
+                    side_effect=AssertionError("unbounded listing is forbidden"),
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "cannot publish test private-control child exclusively",
+                ),
+            ):
+                MIRROR_MODULE._create_private_control_directory_noreplace(
+                    parent,
+                    "test-child",
+                    "test private-control child",
+                    "test-primary-home-v1",
+                )
+        finally:
+            os.close(parent.fd)
+
+        retained = [
+            path
+            for path in self.private_git_control_parent.iterdir()
+            if path.name.startswith(".private-control-create-")
+        ]
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(len(tuple(retained[0].iterdir())), 129)
+
+    def test_primary_recovery_uses_retained_namespace_not_lexical_decoy(
+        self,
+    ) -> None:
+        initial_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            MIRROR_MODULE._ensure_git_control_binding(initial_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(initial_root)
+
+        original_parent = self.private_git_control_parent
+        original_tool = original_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        malformed_owner = original_tool / (
+            "sync-canonical-git-control.123.0123456789abcdef0123456789abcdef.owner.json"
+        )
+        malformed_owner.write_bytes(b"{not-json\n")
+        malformed_owner.chmod(0o600)
+        saved_parent = self.root / "saved-primary-control"
+        decoy_sentinel = b"lexical decoy must remain untouched\n"
+        real_recover = MIRROR_MODULE._recover_stale_private_snapshots
+        injected = False
+
+        def replace_namespace_before_recovery(
+            root,
+            tool_root,
+            *,
+            quarantine,
+            quarantine_locked,
+        ):
+            nonlocal injected
+            original_parent.rename(saved_parent)
+            original_parent.mkdir(mode=0o700)
+            decoy_tool = original_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+            decoy_quarantine = (
+                original_parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+            )
+            decoy_tool.mkdir(mode=0o700)
+            decoy_quarantine.mkdir(mode=0o700)
+            (decoy_tool / "sentinel").write_bytes(decoy_sentinel)
+            injected = True
+            return real_recover(
+                root,
+                tool_root,
+                quarantine=quarantine,
+                quarantine_locked=quarantine_locked,
+            )
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_recover_stale_private_snapshots",
+                    side_effect=replace_namespace_before_recovery,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "allocation root fixed name changed|was replaced",
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        self.assertTrue(injected)
+        self.assertEqual(
+            (
+                original_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME / "sentinel"
+            ).read_bytes(),
+            decoy_sentinel,
+        )
+        self.assertEqual(
+            sorted(
+                path.name
+                for path in (
+                    original_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+                ).iterdir()
+            ),
+            ["sentinel"],
+        )
+        self.assertFalse(malformed_owner.exists())
+        self.assertTrue(
+            any(
+                path.name.startswith(".quarantine-")
+                for path in (
+                    saved_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+                ).iterdir()
+            )
+        )
+
+    def test_legacy_owner_root_mismatch_precedes_pending_without_mutation(
+        self,
+    ) -> None:
+        account_home = self.root / "mismatch-primary-home"
+        account_home.mkdir(mode=0o700)
+        primary_spec = MIRROR_MODULE.PrivateControlRootSpec(
+            root_id="mismatch-primary-home-v1",
+            parent_path=(account_home / MIRROR_MODULE.PRIVATE_CONTROL_NAMESPACE_NAME),
+            allocate=True,
+            account_home=account_home,
+            shared_parent=False,
+        )
+        legacy_parent = self.root / "mismatch-legacy-parent"
+        legacy_parent.mkdir(mode=0o700)
+        legacy_spec = MIRROR_MODULE.PrivateControlRootSpec(
+            root_id="mismatch-legacy-v0",
+            parent_path=legacy_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        tool = legacy_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        quarantine = legacy_parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        tool.mkdir(mode=0o700)
+        quarantine.mkdir(mode=0o700)
+        private_name = "sync-canonical-git-control.123.33333333333333333333333333333333"
+        private = tool / private_name
+        private.mkdir(mode=0o700)
+        private_identity = MIRROR_MODULE._object_identity(private.stat())
+        owner = tool / f"{private_name}.owner.json"
+        owner.write_bytes(
+            MIRROR_MODULE._owner_record_payload(
+                "wrong-legacy-root-v9",
+                private_name,
+                private_identity,
+                "44444444444444444444444444444444",
+                "cleanup",
+            )
+        )
+        owner.chmod(0o600)
+        owner_before = (owner.lstat().st_ino, owner.read_bytes())
+        private_before = private.lstat().st_ino
+        tool_before = tuple(sorted(path.name for path in tool.iterdir()))
+        quarantine_before = tuple(sorted(path.name for path in quarantine.iterdir()))
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "PRIVATE_CONTROL_ROOT_SPECS",
+                    (primary_spec, legacy_spec),
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_legacy_shared_parent_policy_is_valid",
+                    return_value=True,
+                ),
+                self.assertRaises(MIRROR_MODULE.MirrorSyncError) as caught,
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        reason = str(caught.exception).partition(":")[0]
+        self.assertEqual(
+            reason,
+            MIRROR_MODULE.PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+        )
+        self.assertIn(
+            MIRROR_MODULE.PRIVATE_CONTROL_REASON_LEGACY_PENDING,
+            str(caught.exception),
+        )
+        self.assertEqual(
+            MIRROR_MODULE._private_control_preallocation_decision((reason,)),
+            (
+                False,
+                MIRROR_MODULE.PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+            ),
+        )
+        self.assertEqual(
+            ENGINE_MODULE._mirror_private_control_preallocation_decision((reason,)),
+            (
+                False,
+                ENGINE_MODULE.MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+            ),
+        )
+        self.assertFalse(primary_spec.parent_path.exists())
+        self.assertEqual((owner.lstat().st_ino, owner.read_bytes()), owner_before)
+        self.assertEqual(private.lstat().st_ino, private_before)
+        self.assertEqual(
+            tuple(sorted(path.name for path in tool.iterdir())),
+            tool_before,
+        )
+        self.assertEqual(
+            tuple(sorted(path.name for path in quarantine.iterdir())),
+            quarantine_before,
+        )
+
+    def test_primary_owner_root_mismatch_is_retained_without_mutation(self) -> None:
+        initial_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            MIRROR_MODULE._ensure_git_control_binding(initial_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(initial_root)
+
+        tool = self.private_git_control_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        quarantine = (
+            self.private_git_control_parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        )
+        private_name = "sync-canonical-git-control.123.fedcba9876543210fedcba9876543210"
+        private = tool / private_name
+        private.mkdir(mode=0o700)
+        private_identity = MIRROR_MODULE._object_identity(private.stat())
+        owner = tool / f"{private_name}.owner.json"
+        owner.write_bytes(
+            MIRROR_MODULE._owner_record_payload(
+                "wrong-primary-root-v9",
+                private_name,
+                private_identity,
+                "fedcba9876543210fedcba9876543210",
+                "cleanup",
+            )
+        )
+        owner.chmod(0o600)
+        owner_before = (owner.lstat().st_ino, owner.read_bytes())
+        private_before = private.lstat().st_ino
+        quarantine_before = tuple(sorted(path.name for path in quarantine.iterdir()))
+
+        bound_root = MIRROR_MODULE._bind_root(self.target_root)
+        try:
+            with self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                MIRROR_MODULE.PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        self.assertEqual((owner.lstat().st_ino, owner.read_bytes()), owner_before)
+        self.assertEqual(private.lstat().st_ino, private_before)
+        self.assertEqual(
+            tuple(sorted(path.name for path in quarantine.iterdir())),
+            quarantine_before,
+        )
 
     def test_private_git_cleanup_preserves_a_replaced_top_directory(
         self,
@@ -8382,6 +11174,281 @@ class RepositorySourceLockTests(unittest.TestCase):
 
 
 class MirrorQuarantineContractParityTests(unittest.TestCase):
+    def test_owner_record_root_scope_matrix_is_equivalent(self) -> None:
+        self.assertEqual(
+            MIRROR_MODULE.PRIVATE_OWNER_RECORD_LEGACY_VERSION,
+            ENGINE_MODULE.MIRROR_PRIVATE_OWNER_RECORD_LEGACY_VERSION,
+        )
+        self.assertEqual(
+            MIRROR_MODULE.PRIVATE_OWNER_RECORD_LEGACY_FIELDS,
+            ENGINE_MODULE.MIRROR_PRIVATE_OWNER_RECORD_LEGACY_FIELDS,
+        )
+        self.assertEqual(
+            MIRROR_MODULE.PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+            ENGINE_MODULE.MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+        )
+        common = {
+            "owner_pid": 123,
+            "owner_uid": 501,
+            "owner_gid": 20,
+            "owner_nonce": "0123456789abcdef0123456789abcdef",
+            "phase": "cleanup",
+            "private_name": (
+                "sync-canonical-git-control.123.0123456789abcdef0123456789abcdef"
+            ),
+            "private_identity": [1, 2, stat.S_IFDIR],
+        }
+        legacy_root = MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID
+        primary_root = MIRROR_MODULE.PRIVATE_CONTROL_PRIMARY_ROOT_ID
+        scenarios = (
+            (
+                "v1-legacy",
+                {
+                    "version": MIRROR_MODULE.PRIVATE_OWNER_RECORD_LEGACY_VERSION,
+                    **common,
+                },
+                legacy_root,
+                "accepted-legacy",
+            ),
+            (
+                "v1-primary",
+                {
+                    "version": MIRROR_MODULE.PRIVATE_OWNER_RECORD_LEGACY_VERSION,
+                    **common,
+                },
+                primary_root,
+                MIRROR_MODULE.PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+            ),
+            (
+                "v2-primary-exact",
+                {
+                    "version": MIRROR_MODULE.PRIVATE_OWNER_RECORD_VERSION,
+                    "root_id": primary_root,
+                    **common,
+                },
+                primary_root,
+                "accepted-current",
+            ),
+            (
+                "v2-legacy-exact",
+                {
+                    "version": MIRROR_MODULE.PRIVATE_OWNER_RECORD_VERSION,
+                    "root_id": legacy_root,
+                    **common,
+                },
+                legacy_root,
+                "accepted-current",
+            ),
+            (
+                "v2-cross-root",
+                {
+                    "version": MIRROR_MODULE.PRIVATE_OWNER_RECORD_VERSION,
+                    "root_id": legacy_root,
+                    **common,
+                },
+                primary_root,
+                MIRROR_MODULE.PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+            ),
+            (
+                "v2-unknown-root",
+                {
+                    "version": MIRROR_MODULE.PRIVATE_OWNER_RECORD_VERSION,
+                    "root_id": "unknown-root-v9",
+                    **common,
+                },
+                primary_root,
+                MIRROR_MODULE.PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+            ),
+            (
+                "v2-missing-root",
+                {"version": MIRROR_MODULE.PRIVATE_OWNER_RECORD_VERSION, **common},
+                primary_root,
+                MIRROR_MODULE.PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+            ),
+            (
+                "v2-extra-field",
+                {
+                    "version": MIRROR_MODULE.PRIVATE_OWNER_RECORD_VERSION,
+                    "root_id": primary_root,
+                    "future": True,
+                    **common,
+                },
+                primary_root,
+                MIRROR_MODULE.PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+            ),
+            (
+                "unknown-version",
+                {"version": 99, **common},
+                primary_root,
+                MIRROR_MODULE.PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+            ),
+        )
+        for label, record, expected_root, expected in scenarios:
+            with self.subTest(label=label):
+                generator_result = MIRROR_MODULE._private_owner_record_root_scope(
+                    record,
+                    expected_root,
+                )
+                engine_result = ENGINE_MODULE._mirror_private_owner_record_root_scope(
+                    record,
+                    expected_root,
+                )
+                self.assertEqual(generator_result, expected)
+                self.assertEqual(engine_result, expected)
+                self.assertEqual(generator_result, engine_result)
+
+    def test_private_control_root_registry_and_scenario_matrix_are_equivalent(
+        self,
+    ) -> None:
+        self.assertEqual(
+            tuple(MIRROR_MODULE.PrivateControlRootSpec.__dataclass_fields__),
+            tuple(ENGINE_MODULE.MirrorPrivateControlRootSpec.__dataclass_fields__),
+        )
+        generator_roots = tuple(
+            (
+                spec.root_id,
+                spec.parent_path,
+                spec.allocate,
+                spec.account_home,
+                spec.shared_parent,
+            )
+            for spec in MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS
+        )
+        engine_roots = tuple(
+            (
+                spec.root_id,
+                spec.parent_path,
+                spec.allocate,
+                spec.account_home,
+                spec.shared_parent,
+            )
+            for spec in ENGINE_MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS
+        )
+        self.assertEqual(generator_roots, engine_roots)
+        self.assertEqual(
+            [spec.root_id for spec in MIRROR_MODULE.PRIVATE_CONTROL_ROOT_SPECS],
+            [
+                MIRROR_MODULE.PRIVATE_CONTROL_PRIMARY_ROOT_ID,
+                MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            ],
+        )
+        self.assertEqual(
+            MIRROR_MODULE.PRIVATE_CONTROL_NAMESPACE_NAME,
+            ENGINE_MODULE.MIRROR_PRIVATE_CONTROL_NAMESPACE_NAME,
+        )
+        self.assertEqual(
+            MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_PARENT,
+            ENGINE_MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_PARENT,
+        )
+        self.assertEqual(
+            MIRROR_MODULE.PRIVATE_CONTROL_REASON_LEGACY_PENDING,
+            ENGINE_MODULE.MIRROR_PRIVATE_CONTROL_REASON_LEGACY_PENDING,
+        )
+        self.assertEqual(
+            MIRROR_MODULE.PRIVATE_CONTROL_REASON_INCONCLUSIVE,
+            ENGINE_MODULE.MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE,
+        )
+        self.assertEqual(
+            MIRROR_MODULE.PRIVATE_CONTROL_MAX_ANCESTORS,
+            ENGINE_MODULE.MIRROR_PRIVATE_CONTROL_MAX_ANCESTORS,
+        )
+        self.assertEqual(
+            MIRROR_MODULE.PRIVATE_CONTROL_PREALLOCATION_ALLOWED_STATES,
+            ENGINE_MODULE.MIRROR_PRIVATE_CONTROL_PREALLOCATION_ALLOWED_STATES,
+        )
+
+        selected_uid = 501
+        shared_parent_policies = (
+            ((0o1777, 0, 0), True),
+            ((0o1777, selected_uid, 0), False),
+            ((0o0777, 0, 0), False),
+            ((0o0700, 0, 0), False),
+        )
+        for access_policy, expected in shared_parent_policies:
+            with self.subTest(access_policy=access_policy, expected=expected):
+                self.assertEqual(
+                    MIRROR_MODULE._legacy_shared_parent_policy_is_valid(access_policy),
+                    expected,
+                )
+                self.assertEqual(
+                    ENGINE_MODULE._mirror_legacy_shared_parent_policy_is_valid(
+                        access_policy
+                    ),
+                    expected,
+                )
+
+        def child(owner: int, seed: int):
+            return (
+                (1, seed, stat.S_IFDIR),
+                (0o700, owner, 20),
+            )
+
+        ownership_scenarios = (
+            ((), "absent"),
+            ((child(777, 1),), "foreign-unrelated"),
+            ((child(777, 1), child(778, 2)), "foreign-unrelated"),
+            ((child(selected_uid, 1),), "same-uid"),
+            (
+                (child(selected_uid, 1), child(selected_uid, 2)),
+                "same-uid",
+            ),
+            ((child(selected_uid, 1), child(777, 2)), "inconclusive"),
+        )
+        for children, expected in ownership_scenarios:
+            with self.subTest(children=children, expected=expected):
+                self.assertEqual(
+                    MIRROR_MODULE._private_control_legacy_ownership_state(
+                        children,
+                        effective_uid=selected_uid,
+                    ),
+                    expected,
+                )
+                self.assertEqual(
+                    ENGINE_MODULE._mirror_private_control_legacy_ownership_state(
+                        children,
+                        effective_uid=selected_uid,
+                    ),
+                    expected,
+                )
+
+        allocation_scenarios = (
+            ((), (True, None)),
+            (("absent",), (True, None)),
+            (("duplicate", "foreign-unrelated"), (True, None)),
+            (("same-uid-empty",), (True, None)),
+            (
+                (MIRROR_MODULE.PRIVATE_CONTROL_REASON_LEGACY_PENDING,),
+                (
+                    False,
+                    MIRROR_MODULE.PRIVATE_CONTROL_REASON_LEGACY_PENDING,
+                ),
+            ),
+            (
+                (MIRROR_MODULE.PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,),
+                (
+                    False,
+                    MIRROR_MODULE.PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+                ),
+            ),
+            (
+                ("inconclusive",),
+                (False, MIRROR_MODULE.PRIVATE_CONTROL_REASON_INCONCLUSIVE),
+            ),
+            (("unknown",), (False, MIRROR_MODULE.PRIVATE_CONTROL_REASON_INCONCLUSIVE)),
+        )
+        for states, expected in allocation_scenarios:
+            with self.subTest(states=states, expected=expected):
+                self.assertEqual(
+                    MIRROR_MODULE._private_control_preallocation_decision(states),
+                    expected,
+                )
+                self.assertEqual(
+                    ENGINE_MODULE._mirror_private_control_preallocation_decision(
+                        states
+                    ),
+                    expected,
+                )
+
     def test_scheduler_probe_matches_generator_recovery_contract(self) -> None:
         self.assertEqual(
             ENGINE_MODULE.MIRROR_PRIVATE_CONTROL_PARENT,

@@ -30,7 +30,7 @@ import sys
 
 sys.dont_write_bytecode = True
 generator_path = Path(sys.argv[1])
-private_control_parent = Path(sys.argv[2])
+private_account_home = Path(sys.argv[2])
 spec = importlib.util.spec_from_file_location(
     "sync_canonical_mirrors_isolated_test_runner",
     generator_path,
@@ -40,7 +40,20 @@ if spec is None or spec.loader is None:
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
+private_control_parent = (
+    private_account_home / module.PRIVATE_CONTROL_NAMESPACE_NAME
+)
+private_control_parent.mkdir(mode=0o700, exist_ok=True)
 module.PRIVATE_GIT_CONTROL_PARENT = private_control_parent
+module.PRIVATE_CONTROL_ROOT_SPECS = (
+    module.PrivateControlRootSpec(
+        root_id="isolated-primary-home-v1",
+        parent_path=private_control_parent,
+        allocate=True,
+        account_home=private_control_parent.parent,
+        shared_parent=False,
+    ),
+)
 raise SystemExit(module.main(sys.argv[3:]))
 """
 
@@ -52,8 +65,8 @@ def _isolated_generator_command(
     *arguments: str,
 ) -> list[str]:
     runner = root / "run-sync-canonical-mirrors.py"
-    private_control_parent = root / "mirror-private-control"
-    private_control_parent.mkdir(mode=0o700, exist_ok=True)
+    private_account_home = Path(os.path.realpath(root)) / "mirror-account-home"
+    private_account_home.mkdir(mode=0o700, exist_ok=True)
     runner.write_text(
         ISOLATED_GENERATOR_RUNNER_SOURCE,
         encoding="utf-8",
@@ -62,7 +75,7 @@ def _isolated_generator_command(
         interpreter,
         str(runner),
         str(generator_path),
-        str(private_control_parent),
+        str(private_account_home),
         *arguments,
     ]
 

@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import pwd
 import re
 import secrets
 import select
@@ -20,7 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Callable, Union
+from typing import Any, Callable, NoReturn, Union
 import unicodedata
 
 
@@ -48,12 +49,116 @@ GIT_DERIVED_CACHE_DISABLE_ARGUMENTS = (
     "-c",
     "core.multiPackIndex=false",
 )
-PRIVATE_GIT_CONTROL_PARENT = Path(
+PRIVATE_CONTROL_PRIMARY_ROOT_ID = "primary-home-v1"
+PRIVATE_CONTROL_LEGACY_ROOT_ID = "legacy-shared-v0"
+PRIVATE_CONTROL_NAMESPACE_NAME = ".codex-sync-canonical-mirrors-v1"
+PRIVATE_CONTROL_LEGACY_PARENT = Path(
     "/private/tmp" if sys.platform == "darwin" else "/var/tmp"
 )
+PRIVATE_CONTROL_REASON_LEGACY_PENDING = "legacy-recovery-pending"
+PRIVATE_CONTROL_REASON_INCONCLUSIVE = "private-control-root-inconclusive"
+PRIVATE_CONTROL_MAX_ANCESTORS = 256
+PRIVATE_CONTROL_PREALLOCATION_ALLOWED_STATES = frozenset(
+    {"absent", "duplicate", "foreign-unrelated", "same-uid-empty"}
+)
+
+
+@dataclass(frozen=True)
+class PrivateControlRootSpec:
+    root_id: str
+    parent_path: Path
+    allocate: bool
+    account_home: Path | None
+    shared_parent: bool
+
+
+def _private_control_legacy_ownership_state(
+    children: tuple[tuple[tuple[int, int, int], tuple[int, int, int]], ...],
+    *,
+    effective_uid: int | None = None,
+) -> str:
+    if not children:
+        return "absent"
+    selected_uid = os.geteuid() if effective_uid is None else effective_uid
+    owners = {child[1][1] for child in children}
+    if owners == {selected_uid}:
+        return "same-uid"
+    if selected_uid not in owners:
+        return "foreign-unrelated"
+    return "inconclusive"
+
+
+def _private_control_preallocation_decision(
+    legacy_states: tuple[str, ...],
+) -> tuple[bool, str | None]:
+    if PRIVATE_CONTROL_REASON_LEGACY_PENDING in legacy_states:
+        return False, PRIVATE_CONTROL_REASON_LEGACY_PENDING
+    if PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH in legacy_states:
+        return False, PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH
+    if any(
+        state not in PRIVATE_CONTROL_PREALLOCATION_ALLOWED_STATES
+        for state in legacy_states
+    ):
+        return False, PRIVATE_CONTROL_REASON_INCONCLUSIVE
+    return True, None
+
+
+def _private_control_preflight_failure_reason(
+    first_error: BaseException,
+    coverage_states: tuple[str, ...],
+) -> str:
+    error_detail = str(first_error)
+    if PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH in error_detail:
+        return PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH
+    if (
+        PRIVATE_CONTROL_REASON_LEGACY_PENDING in error_detail
+        or PRIVATE_CONTROL_REASON_LEGACY_PENDING in coverage_states
+    ):
+        return PRIVATE_CONTROL_REASON_LEGACY_PENDING
+    return PRIVATE_CONTROL_REASON_INCONCLUSIVE
+
+
+def _canonical_account_home_directory() -> Path:
+    try:
+        account = pwd.getpwuid(os.geteuid())
+    except KeyError as error:
+        raise RuntimeError(
+            "cannot resolve the current account home directory"
+        ) from error
+    if account.pw_uid != os.geteuid() or not account.pw_dir:
+        raise RuntimeError("cannot resolve the current account home directory")
+    path = Path(account.pw_dir)
+    if not path.is_absolute():
+        raise RuntimeError("current account home directory must be absolute")
+    return Path(os.path.abspath(path))
+
+
+def _private_control_root_specs() -> tuple[PrivateControlRootSpec, ...]:
+    account_home = _canonical_account_home_directory()
+    return (
+        PrivateControlRootSpec(
+            root_id=PRIVATE_CONTROL_PRIMARY_ROOT_ID,
+            parent_path=account_home / PRIVATE_CONTROL_NAMESPACE_NAME,
+            allocate=True,
+            account_home=account_home,
+            shared_parent=False,
+        ),
+        PrivateControlRootSpec(
+            root_id=PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            parent_path=PRIVATE_CONTROL_LEGACY_PARENT,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        ),
+    )
+
+
+PRIVATE_CONTROL_ROOT_SPECS = _private_control_root_specs()
+PRIVATE_GIT_CONTROL_PARENT = PRIVATE_CONTROL_ROOT_SPECS[0].parent_path
 PRIVATE_TOOL_ROOT_NAME = "codex-sync-canonical-mirrors"
-PRIVATE_OWNER_RECORD_VERSION = 1
-PRIVATE_OWNER_RECORD_FIELDS = frozenset(
+PRIVATE_OWNER_RECORD_LEGACY_VERSION = 1
+PRIVATE_OWNER_RECORD_VERSION = 2
+PRIVATE_OWNER_RECORD_LEGACY_FIELDS = frozenset(
     {
         "version",
         "owner_pid",
@@ -65,8 +170,41 @@ PRIVATE_OWNER_RECORD_FIELDS = frozenset(
         "private_identity",
     }
 )
+PRIVATE_OWNER_RECORD_FIELDS = PRIVATE_OWNER_RECORD_LEGACY_FIELDS | {"root_id"}
+PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH = "private-owner-root-mismatch"
 PRIVATE_OWNER_RECORD_PHASES = frozenset({"building", "ready", "cleanup"})
 MAX_PRIVATE_OWNER_RECORD_BYTES = 4096
+
+
+def _private_owner_record_root_scope(
+    record: object,
+    expected_root_id: str,
+) -> str:
+    if not isinstance(record, dict):
+        return "generic-invalid"
+    version = record.get("version")
+    fields = set(record)
+    if type(version) is int and version == PRIVATE_OWNER_RECORD_LEGACY_VERSION:
+        if fields != PRIVATE_OWNER_RECORD_LEGACY_FIELDS:
+            return PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH
+        if expected_root_id != PRIVATE_CONTROL_LEGACY_ROOT_ID:
+            return PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH
+        return "accepted-legacy"
+    if type(version) is int and version == PRIVATE_OWNER_RECORD_VERSION:
+        if fields != PRIVATE_OWNER_RECORD_FIELDS:
+            return PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH
+        root_id = record.get("root_id")
+        if not isinstance(root_id, str) or root_id != expected_root_id:
+            return PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH
+        return "accepted-current"
+    # Unknown record versions are not safe to rewrite or quarantine. A future
+    # writer may have extended the ownership contract in ways this runtime does
+    # not understand, so retain the record under the stable root-scope reason.
+    if "version" in record or "root_id" in record:
+        return PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH
+    return "generic-invalid"
+
+
 PRIVATE_GIT_EXECUTABLE_PREFIX = ".bound-git-executable."
 MAX_PRIVATE_GIT_EXECUTABLE_ATTEMPTS = 32
 DURABLE_QUARANTINE_ROOT_NAME = ".codex-sync-canonical-mirror-quarantine"
@@ -289,6 +427,61 @@ class ControlObjectBinding:
     identity: tuple[int, int, int]
     access_policy: tuple[int, int, int]
     content_digest: bytes | None
+    root_id: str | None = None
+    private_control_context: "PrimaryPrivateControlContext | None" = None
+
+
+@dataclass
+class PrimaryPrivateControlPrebinding:
+    home: ControlObjectBinding
+    parent: ControlObjectBinding | None
+    tool_record: tuple[tuple[int, int, int], tuple[int, int, int]] | None
+    quarantine_record: tuple[tuple[int, int, int], tuple[int, int, int]] | None
+
+    @property
+    def child_identities(self) -> set[tuple[int, int, int]]:
+        identities: set[tuple[int, int, int]] = set()
+        for record in (self.tool_record, self.quarantine_record):
+            if record is not None:
+                identities.add(record[0])
+        return identities
+
+
+@dataclass
+class PrimaryPrivateControlContext:
+    root_id: str
+    home: ControlObjectBinding
+    parent: ControlObjectBinding
+    quarantine: ControlObjectBinding
+    parent_record: tuple[tuple[int, int, int], tuple[int, int, int]]
+    tool_record: tuple[tuple[int, int, int], tuple[int, int, int]]
+    quarantine_record: tuple[tuple[int, int, int], tuple[int, int, int]]
+    legacy_receipts: tuple[LegacyPrivateControlReceipt, ...] = ()
+
+
+@dataclass(frozen=True)
+class LegacyPrivateControlReceipt:
+    root_id: str
+    parent_path: Path
+    parent_identity: tuple[int, int, int] | None
+    parent_access_policy: tuple[int, int, int] | None
+    tool_record: tuple[tuple[int, int, int], tuple[int, int, int]] | None
+    quarantine_record: tuple[tuple[int, int, int], tuple[int, int, int]] | None
+    state: str
+    absence_anchor_path: Path | None = None
+    absence_name: str | None = None
+    absence_anchor_identity: tuple[int, int, int] | None = None
+    absence_anchor_access_policy: tuple[int, int, int] | None = None
+    absence_binding: ControlAbsenceBinding | None = field(
+        default=None,
+        compare=False,
+    )
+    parent_binding: ControlObjectBinding | None = field(default=None, compare=False)
+    tool_binding: ControlObjectBinding | None = field(default=None, compare=False)
+    quarantine_binding: ControlObjectBinding | None = field(
+        default=None,
+        compare=False,
+    )
 
 
 @dataclass
@@ -1505,77 +1698,2024 @@ def _directory_bindings_overlap(
     )
 
 
+def _validate_private_control_root_topology(
+    *,
+    root_id: str,
+    parent: ControlObjectBinding,
+    tool_root: ControlObjectBinding | None,
+    quarantine: ControlObjectBinding | None,
+    repository_root: BoundRoot,
+    admin: ControlObjectBinding,
+    common: ControlObjectBinding,
+    home: ControlObjectBinding | None = None,
+    additional_protected: tuple[tuple[str, int], ...] = (),
+) -> None:
+    """Prove the directory relationships needed for safe private-control moves."""
+
+    reason = f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{root_id}]"
+    if home is not None:
+        if (
+            parent.identity == home.identity
+            or not _directory_is_at_or_below(parent.fd, home.identity)
+            or _directory_is_at_or_below(home.fd, parent.identity)
+        ):
+            raise MirrorSyncError(
+                f"{reason}: private-control allocation root is not a strict "
+                "descendant of the bound account home"
+            )
+    children = tuple(
+        (label, binding)
+        for label, binding in (
+            ("private Git tool root", tool_root),
+            ("durable quarantine root", quarantine),
+        )
+        if binding is not None
+    )
+    for label, binding in children:
+        if (
+            binding.identity == parent.identity
+            or not _directory_is_at_or_below(binding.fd, parent.identity)
+            or _directory_is_at_or_below(parent.fd, binding.identity)
+        ):
+            raise MirrorSyncError(
+                f"{reason}: {label} is not a strict descendant of its bound "
+                "fixed-name parent"
+            )
+    if tool_root is not None and quarantine is not None:
+        tool_metadata = os.fstat(tool_root.fd)
+        quarantine_metadata = os.fstat(quarantine.fd)
+        if tool_metadata.st_dev != quarantine_metadata.st_dev:
+            raise MirrorSyncError(
+                f"{reason}: private Git tool root and durable quarantine root "
+                "must be on the same filesystem"
+            )
+        if _directory_bindings_overlap(tool_root.fd, quarantine.fd):
+            raise MirrorSyncError(
+                f"{reason}: private Git tool root and durable quarantine root "
+                "must not overlap"
+            )
+    protected = (
+        ("repository root", repository_root.fd),
+        ("Git admin directory", admin.fd),
+        ("Git common directory", common.fd),
+        *additional_protected,
+    )
+    for child_label, child in children:
+        for protected_label, protected_fd in protected:
+            if _directory_bindings_overlap(child.fd, protected_fd):
+                raise MirrorSyncError(
+                    f"{reason}: {child_label} overlaps {protected_label}"
+                )
+
+
+def _close_control_bindings_best_effort(
+    bindings: tuple[ControlObjectBinding | None, ...],
+) -> tuple[str, ...]:
+    errors: list[str] = []
+    closed_fds: set[int] = set()
+    for binding in bindings:
+        if binding is None or binding.fd < 0:
+            continue
+        fd = binding.fd
+        if fd in closed_fds:
+            binding.fd = -1
+            continue
+        closed_fds.add(fd)
+        try:
+            os.close(fd)
+        except OSError as error:
+            errors.append(f"cannot close {binding.label}: {error}")
+        finally:
+            # A failed close leaves descriptor state unspecified; never retry.
+            binding.fd = -1
+    return tuple(errors)
+
+
+def _close_raw_descriptors_best_effort(
+    descriptors: tuple[tuple[str, int], ...],
+) -> tuple[str, ...]:
+    errors: list[str] = []
+    closed_fds: set[int] = set()
+    for label, descriptor in descriptors:
+        if descriptor < 0 or descriptor in closed_fds:
+            continue
+        closed_fds.add(descriptor)
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            errors.append(f"cannot close {label}: {error}")
+    return tuple(errors)
+
+
+def _raise_with_secondary_cleanup(
+    primary_error: BaseException,
+    label: str,
+    cleanup_errors: tuple[str, ...] | list[str],
+) -> NoReturn:
+    if cleanup_errors:
+        raise MirrorSyncError(
+            f"{primary_error}; secondary {label}: " + "; ".join(cleanup_errors)
+        ) from primary_error
+    raise primary_error
+
+
+def _private_control_primary_spec() -> PrivateControlRootSpec:
+    root_ids = [spec.root_id for spec in PRIVATE_CONTROL_ROOT_SPECS]
+    if len(root_ids) != len(set(root_ids)):
+        raise MirrorSyncError("private-control root ids must be unique")
+    candidates = [spec for spec in PRIVATE_CONTROL_ROOT_SPECS if spec.allocate]
+    if len(candidates) != 1:
+        raise MirrorSyncError(
+            "private-control registry must contain exactly one allocation root"
+        )
+    primary = candidates[0]
+    if (
+        primary.shared_parent
+        or primary.account_home is None
+        or primary.parent_path != primary.account_home / PRIVATE_CONTROL_NAMESPACE_NAME
+    ):
+        raise MirrorSyncError("private-control allocation root schema is invalid")
+    return primary
+
+
+def _bind_trusted_account_home(path: Path) -> ControlObjectBinding:
+    path = Path(os.path.abspath(path))
+    if not path.is_absolute() or path == Path("/"):
+        raise MirrorSyncError("canonical account home must be an absolute child path")
+    components = path.parts[1:]
+    if not components or len(components) > PRIVATE_CONTROL_MAX_ANCESTORS:
+        raise MirrorSyncError("canonical account home exceeds its ancestor limit")
+    current_path = Path("/")
+    current_fd = os.open(current_path, _DIRECTORY_FLAGS)
+    try:
+        for component in components:
+            child_fd = -1
+            try:
+                path_metadata = os.stat(
+                    component,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISDIR(path_metadata.st_mode):
+                    raise MirrorSyncError(
+                        "canonical account-home ancestors must be non-symlink "
+                        f"directories: {current_path / component}"
+                    )
+                child_fd = os.open(
+                    component,
+                    _DIRECTORY_FLAGS,
+                    dir_fd=current_fd,
+                )
+                child_metadata = os.fstat(child_fd)
+                if _object_identity(path_metadata) != _object_identity(
+                    child_metadata
+                ) or _access_policy(path_metadata) != _access_policy(child_metadata):
+                    raise MirrorSyncError(
+                        "canonical account-home ancestor changed while binding it: "
+                        f"{current_path / component}"
+                    )
+                mode, uid, _gid = _access_policy(child_metadata)
+                if uid not in {0, os.geteuid()} or mode & 0o022:
+                    raise MirrorSyncError(
+                        "canonical account-home ancestors must be root/current-owned "
+                        "and not group/world writable: "
+                        f"{current_path / component}"
+                    )
+            except OSError as error:
+                close_errors = _close_raw_descriptors_best_effort(
+                    (("unadopted account-home ancestor", child_fd),)
+                )
+                child_fd = -1
+                _raise_with_secondary_cleanup(
+                    MirrorSyncError(
+                        f"cannot bind canonical account-home ancestor "
+                        f"{current_path / component}: {error}"
+                    ),
+                    "account-home child cleanup failures",
+                    close_errors,
+                )
+            except BaseException as error:
+                close_errors = _close_raw_descriptors_best_effort(
+                    (("unadopted account-home ancestor", child_fd),)
+                )
+                child_fd = -1
+                _raise_with_secondary_cleanup(
+                    error,
+                    "account-home child cleanup failures",
+                    close_errors,
+                )
+            previous_fd = current_fd
+            current_fd = child_fd
+            child_fd = -1
+            current_path /= component
+            close_errors = _close_raw_descriptors_best_effort(
+                (("previous account-home ancestor", previous_fd),)
+            )
+            if close_errors:
+                raise MirrorSyncError("; ".join(close_errors))
+        metadata = os.fstat(current_fd)
+        mode, uid, _gid = _access_policy(metadata)
+        if uid != os.geteuid() or mode & 0o022:
+            raise MirrorSyncError(
+                "canonical account home must be owned by the current uid and "
+                "not group/world writable"
+            )
+        binding = ControlObjectBinding(
+            label="canonical account home",
+            path=path,
+            relative_path=None,
+            fd=current_fd,
+            identity=_object_identity(metadata),
+            access_policy=_access_policy(metadata),
+            content_digest=None,
+        )
+        current_fd = -1
+        return binding
+    except BaseException as error:
+        close_errors = _close_raw_descriptors_best_effort(
+            (("current account-home ancestor", current_fd),)
+        )
+        current_fd = -1
+        _raise_with_secondary_cleanup(
+            error,
+            "account-home cleanup failures",
+            close_errors,
+        )
+
+
+def _bind_primary_private_control_parent_impl(
+    spec: PrivateControlRootSpec,
+    *,
+    create: bool,
+) -> tuple[ControlObjectBinding, ControlObjectBinding | None]:
+    assert spec.account_home is not None
+    home = _bind_trusted_account_home(spec.account_home)
+    parent: ControlObjectBinding | None = None
+    try:
+        try:
+            initial_metadata = os.stat(
+                PRIVATE_CONTROL_NAMESPACE_NAME,
+                dir_fd=home.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            if not create:
+                return home, None
+            parent = _create_private_control_directory_noreplace(
+                home,
+                PRIVATE_CONTROL_NAMESPACE_NAME,
+                f"private-control allocation root [{spec.root_id}]",
+                spec.root_id,
+            )
+        except OSError as error:
+            raise MirrorSyncError(
+                f"cannot inspect private-control allocation root "
+                f"[{spec.root_id}]: {error}"
+            ) from error
+        else:
+            expected_record = (
+                _object_identity(initial_metadata),
+                _access_policy(initial_metadata),
+            )
+            parent = _bind_existing_private_control_directory(
+                home,
+                PRIVATE_CONTROL_NAMESPACE_NAME,
+                f"private-control allocation root [{spec.root_id}]",
+                spec.root_id,
+                expected_record,
+            )
+        if parent.access_policy[0] != 0o700 or parent.access_policy[1] != os.geteuid():
+            raise MirrorSyncError(
+                f"private-control allocation root [{spec.root_id}] must be "
+                "mode 0700 and owned by the current uid"
+            )
+        _revalidate_absolute_control_object(home)
+        return home, parent
+    except BaseException as error:
+        close_errors = _close_control_bindings_best_effort((parent, home))
+        _raise_with_secondary_cleanup(
+            error,
+            "primary parent bind cleanup failures",
+            close_errors,
+        )
+
+
+def _bind_primary_private_control_parent(
+    spec: PrivateControlRootSpec,
+) -> tuple[ControlObjectBinding, ControlObjectBinding]:
+    home, parent = _bind_primary_private_control_parent_impl(spec, create=True)
+    assert parent is not None
+    return home, parent
+
+
+def _prebind_existing_primary_private_control_root(
+    spec: PrivateControlRootSpec,
+) -> PrimaryPrivateControlPrebinding:
+    home, parent = _bind_primary_private_control_parent_impl(spec, create=False)
+    if parent is None:
+        return PrimaryPrivateControlPrebinding(
+            home=home,
+            parent=None,
+            tool_record=None,
+            quarantine_record=None,
+        )
+    try:
+        child_records: dict[
+            str,
+            tuple[tuple[int, int, int], tuple[int, int, int]] | None,
+        ] = {}
+        for name, label in (
+            (PRIVATE_TOOL_ROOT_NAME, "private Git tool root"),
+            (DURABLE_QUARANTINE_ROOT_NAME, "durable quarantine root"),
+        ):
+            child_records[name] = _private_control_child_metadata(
+                parent.fd,
+                name,
+                f"existing primary {label} [{spec.root_id}]",
+            )
+        observed = tuple(
+            record for record in child_records.values() if record is not None
+        )
+        observed_identities = {record[0] for record in observed}
+        if len(observed_identities) != len(observed):
+            raise MirrorSyncError(
+                f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
+                "existing primary fixed child roles alias each other"
+            )
+        if parent.identity in observed_identities:
+            raise MirrorSyncError(
+                f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
+                "existing primary fixed child aliases its own parent"
+            )
+        for name, label in (
+            (PRIVATE_TOOL_ROOT_NAME, "private Git tool root"),
+            (DURABLE_QUARANTINE_ROOT_NAME, "durable quarantine root"),
+        ):
+            expected_record = child_records[name]
+            if expected_record is None:
+                continue
+            child = _bind_existing_private_control_directory(
+                parent,
+                name,
+                f"existing primary {label} [{spec.root_id}]",
+                spec.root_id,
+                expected_record,
+            )
+            child_error: BaseException | None = None
+            try:
+                if (
+                    child.access_policy[0] != 0o700
+                    or child.access_policy[1] != os.geteuid()
+                ):
+                    raise MirrorSyncError(
+                        f"existing primary {label} [{spec.root_id}] must be "
+                        "mode 0700 and owned by the current uid"
+                    )
+                _revalidate_absolute_control_object(child)
+            except BaseException as error:
+                child_error = error
+            close_errors = _close_control_bindings_best_effort((child,))
+            if child_error is not None:
+                _raise_with_secondary_cleanup(
+                    child_error,
+                    "primary child prebind cleanup failures",
+                    close_errors,
+                )
+            if close_errors:
+                raise MirrorSyncError(
+                    "primary child prebind cleanup failures: " + "; ".join(close_errors)
+                )
+        _revalidate_absolute_control_object(parent)
+        _revalidate_absolute_control_object(home)
+        return PrimaryPrivateControlPrebinding(
+            home=home,
+            parent=parent,
+            tool_record=child_records[PRIVATE_TOOL_ROOT_NAME],
+            quarantine_record=child_records[DURABLE_QUARANTINE_ROOT_NAME],
+        )
+    except BaseException as error:
+        close_errors = _close_control_bindings_best_effort((parent, home))
+        _raise_with_secondary_cleanup(
+            error,
+            "primary prebind cleanup failures",
+            close_errors,
+        )
+
+
+def _private_control_child_metadata(
+    parent_fd: int,
+    name: str,
+    label: str,
+) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise MirrorSyncError(f"cannot inspect {label} {name}: {error}") from error
+    return _object_identity(metadata), _access_policy(metadata)
+
+
+def _legacy_child_metadata(
+    parent_fd: int,
+    name: str,
+    root_id: str,
+) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
+    return _private_control_child_metadata(
+        parent_fd,
+        name,
+        f"legacy private-control child [{root_id}]",
+    )
+
+
+def _legacy_shared_parent_policy_is_valid(
+    access_policy: tuple[int, int, int],
+) -> bool:
+    mode, uid, _gid = access_policy
+    return mode == 0o1777 and uid == 0
+
+
+def _capture_legacy_private_control_parent_absence(
+    spec: PrivateControlRootSpec,
+) -> ControlAbsenceBinding:
+    parent_path = Path(os.path.abspath(spec.parent_path))
+    if (
+        spec.allocate
+        or not spec.shared_parent
+        or spec.account_home is not None
+        or parent_path == Path("/")
+        or parent_path.name in {"", ".", ".."}
+    ):
+        raise MirrorSyncError(
+            f"private-control legacy root schema is invalid [{spec.root_id}]"
+        )
+    anchor_path = parent_path.parent
+    anchor = _bind_absolute_control_object(
+        anchor_path,
+        f"legacy private-control absence anchor [{spec.root_id}]",
+        require_directory=True,
+    )
+    try:
+        try:
+            os.stat(
+                parent_path.name,
+                dir_fd=anchor.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise MirrorSyncError(
+                f"cannot verify absent legacy private-control parent "
+                f"[{spec.root_id}]: {error}"
+            ) from error
+        else:
+            raise MirrorSyncError(
+                f"legacy private-control parent [{spec.root_id}] is not absent"
+            )
+        _revalidate_absolute_control_object(anchor)
+        return ControlAbsenceBinding(
+            label=f"legacy private-control parent absence [{spec.root_id}]",
+            parent=anchor,
+            name=parent_path.name,
+        )
+    except BaseException as error:
+        close_errors = _close_control_bindings_best_effort((anchor,))
+        _raise_with_secondary_cleanup(
+            error,
+            "legacy absence-anchor cleanup failures",
+            close_errors,
+        )
+
+
+def _bind_prebound_primary_private_control_children(
+    spec: PrivateControlRootSpec,
+    prebinding: PrimaryPrivateControlPrebinding,
+) -> tuple[ControlObjectBinding | None, ControlObjectBinding | None]:
+    parent = prebinding.parent
+    if parent is None:
+        return None, None
+    tool_root: ControlObjectBinding | None = None
+    quarantine: ControlObjectBinding | None = None
+    try:
+        if prebinding.tool_record is not None:
+            tool_root = _bind_existing_private_control_directory(
+                parent,
+                PRIVATE_TOOL_ROOT_NAME,
+                f"preflight primary private Git tool root [{spec.root_id}]",
+                spec.root_id,
+                prebinding.tool_record,
+            )
+        if prebinding.quarantine_record is not None:
+            quarantine = _bind_existing_private_control_directory(
+                parent,
+                DURABLE_QUARANTINE_ROOT_NAME,
+                f"preflight primary durable quarantine root [{spec.root_id}]",
+                spec.root_id,
+                prebinding.quarantine_record,
+            )
+        return tool_root, quarantine
+    except BaseException as binding_error:
+        close_errors = _close_control_bindings_best_effort((quarantine, tool_root))
+        if close_errors:
+            raise MirrorSyncError(
+                f"{binding_error}; secondary primary-child bind cleanup "
+                f"failures: {'; '.join(close_errors)}"
+            ) from binding_error
+        raise
+
+
+def _validate_prebound_primary_private_control_topology(
+    root: BoundRoot,
+    admin: ControlObjectBinding,
+    common: ControlObjectBinding,
+    spec: PrivateControlRootSpec,
+    prebinding: PrimaryPrivateControlPrebinding,
+) -> None:
+    parent = prebinding.parent
+    if parent is None:
+        _revalidate_absolute_control_object(prebinding.home)
+        return
+    tool_root, quarantine = _bind_prebound_primary_private_control_children(
+        spec,
+        prebinding,
+    )
+    validation_error: BaseException | None = None
+    try:
+        _validate_private_control_root_topology(
+            root_id=spec.root_id,
+            parent=parent,
+            tool_root=tool_root,
+            quarantine=quarantine,
+            repository_root=root,
+            admin=admin,
+            common=common,
+            home=prebinding.home,
+        )
+        _revalidate_absolute_control_object(parent)
+        _revalidate_absolute_control_object(prebinding.home)
+    except BaseException as error:
+        validation_error = error
+    close_errors = _close_control_bindings_best_effort((quarantine, tool_root))
+    if validation_error is not None:
+        if close_errors:
+            raise MirrorSyncError(
+                f"{validation_error}; secondary primary topology cleanup "
+                f"failures: {'; '.join(close_errors)}"
+            ) from validation_error
+        raise validation_error
+    if close_errors:
+        raise MirrorSyncError(
+            "cannot close every primary topology preflight descriptor: "
+            + "; ".join(close_errors)
+        )
+
+
+def _preflight_legacy_private_control_roots_once(
+    root: BoundRoot,
+    admin: ControlObjectBinding,
+    common: ControlObjectBinding,
+    primary_prebinding: PrimaryPrivateControlPrebinding,
+    retained_receipts: list[LegacyPrivateControlReceipt] | None = None,
+) -> tuple[tuple[str, ...], tuple[LegacyPrivateControlReceipt, ...]]:
+    legacy_states: list[str] = []
+    receipts = [] if retained_receipts is None else retained_receipts
+    primary_spec = _private_control_primary_spec()
+    seen_parent_identities = (
+        set()
+        if primary_prebinding.parent is None
+        else {primary_prebinding.parent.identity}
+    )
+    seen_child_identities = primary_prebinding.child_identities
+
+    def record_receipt(
+        spec: PrivateControlRootSpec,
+        parent: ControlObjectBinding | None,
+        tool_record: tuple[tuple[int, int, int], tuple[int, int, int]] | None,
+        quarantine_record: (tuple[tuple[int, int, int], tuple[int, int, int]] | None),
+        state: str,
+        *,
+        absence_binding: ControlAbsenceBinding | None = None,
+        parent_binding: ControlObjectBinding | None = None,
+        tool_binding: ControlObjectBinding | None = None,
+        quarantine_binding: ControlObjectBinding | None = None,
+    ) -> None:
+        receipts.append(
+            LegacyPrivateControlReceipt(
+                root_id=spec.root_id,
+                parent_path=Path(os.path.abspath(spec.parent_path)),
+                parent_identity=None if parent is None else parent.identity,
+                parent_access_policy=(None if parent is None else parent.access_policy),
+                tool_record=tool_record,
+                quarantine_record=quarantine_record,
+                state=state,
+                absence_anchor_path=(
+                    None if absence_binding is None else absence_binding.parent.path
+                ),
+                absence_name=(
+                    None if absence_binding is None else absence_binding.name
+                ),
+                absence_anchor_identity=(
+                    None if absence_binding is None else absence_binding.parent.identity
+                ),
+                absence_anchor_access_policy=(
+                    None
+                    if absence_binding is None
+                    else absence_binding.parent.access_policy
+                ),
+                absence_binding=absence_binding,
+                parent_binding=parent_binding,
+                tool_binding=tool_binding,
+                quarantine_binding=quarantine_binding,
+            )
+        )
+
+    for spec in PRIVATE_CONTROL_ROOT_SPECS:
+        if spec.allocate:
+            continue
+        if not spec.shared_parent or spec.account_home is not None:
+            raise MirrorSyncError(
+                f"private-control legacy root schema is invalid [{spec.root_id}]"
+            )
+        retain_same_uid_bindings = False
+        try:
+            parent = _bind_absolute_control_object(
+                spec.parent_path,
+                f"legacy shared private-control parent [{spec.root_id}]",
+                require_directory=True,
+            )
+        except MirrorSyncError as error:
+            try:
+                absence_binding = _capture_legacy_private_control_parent_absence(spec)
+            except MirrorSyncError as inspection_error:
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
+                    "cannot classify unavailable legacy parent with an "
+                    f"anchored absence receipt: {inspection_error}; "
+                    f"initial bind failure: {error}"
+                ) from inspection_error
+            legacy_states.append("absent")
+            record_receipt(
+                spec,
+                None,
+                None,
+                None,
+                "absent",
+                absence_binding=absence_binding,
+            )
+            continue
+        try:
+            if not _legacy_shared_parent_policy_is_valid(parent.access_policy):
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
+                    "legacy shared parent must be root-owned mode 1777"
+                )
+            if parent.identity in seen_child_identities:
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
+                    "legacy parent aliases an earlier fixed child role"
+                )
+            if parent.identity in seen_parent_identities:
+                _revalidate_absolute_control_object(parent)
+                legacy_states.append("duplicate")
+                record_receipt(
+                    spec,
+                    parent,
+                    None,
+                    None,
+                    "duplicate-parent",
+                )
+                continue
+            first_tool = _legacy_child_metadata(
+                parent.fd,
+                PRIVATE_TOOL_ROOT_NAME,
+                spec.root_id,
+            )
+            first_quarantine = _legacy_child_metadata(
+                parent.fd,
+                DURABLE_QUARANTINE_ROOT_NAME,
+                spec.root_id,
+            )
+            observed = tuple(
+                item for item in (first_tool, first_quarantine) if item is not None
+            )
+            observed_identities = {item[0] for item in observed}
+            if len(observed_identities) != len(observed):
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
+                    "legacy fixed child roles alias each other"
+                )
+            if parent.identity in observed_identities:
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
+                    "legacy fixed child aliases its own parent"
+                )
+            if observed_identities & (seen_parent_identities | seen_child_identities):
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
+                    "distinct legacy parent aliases an earlier control object"
+                )
+            ownership_state = _private_control_legacy_ownership_state(observed)
+            if ownership_state == "foreign-unrelated":
+                second_tool = _legacy_child_metadata(
+                    parent.fd,
+                    PRIVATE_TOOL_ROOT_NAME,
+                    spec.root_id,
+                )
+                second_quarantine = _legacy_child_metadata(
+                    parent.fd,
+                    DURABLE_QUARANTINE_ROOT_NAME,
+                    spec.root_id,
+                )
+                if (second_tool, second_quarantine) != (
+                    first_tool,
+                    first_quarantine,
+                ):
+                    raise MirrorSyncError(
+                        f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
+                        "foreign-unrelated legacy metadata changed during audit"
+                    )
+                _revalidate_absolute_control_object(parent)
+                seen_parent_identities.add(parent.identity)
+                seen_child_identities.update(observed_identities)
+                legacy_states.append(ownership_state)
+                record_receipt(
+                    spec,
+                    parent,
+                    first_tool,
+                    first_quarantine,
+                    ownership_state,
+                )
+                continue
+            if ownership_state == "absent":
+                second_tool = _legacy_child_metadata(
+                    parent.fd,
+                    PRIVATE_TOOL_ROOT_NAME,
+                    spec.root_id,
+                )
+                second_quarantine = _legacy_child_metadata(
+                    parent.fd,
+                    DURABLE_QUARANTINE_ROOT_NAME,
+                    spec.root_id,
+                )
+                if (second_tool, second_quarantine) != (
+                    first_tool,
+                    first_quarantine,
+                ):
+                    raise MirrorSyncError(
+                        f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
+                        "absent legacy metadata changed during audit"
+                    )
+                _revalidate_absolute_control_object(parent)
+                seen_parent_identities.add(parent.identity)
+                legacy_states.append(ownership_state)
+                record_receipt(
+                    spec,
+                    parent,
+                    first_tool,
+                    first_quarantine,
+                    ownership_state,
+                )
+                continue
+            if ownership_state == "inconclusive":
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
+                    "legacy children have mixed ownership"
+                )
+            if first_tool is None:
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_LEGACY_PENDING} [{spec.root_id}]: "
+                    "same-uid quarantine exists without its tool root"
+                )
+            if first_tool[0][2] != stat.S_IFDIR or first_tool[1][0] != 0o700:
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
+                    "same-uid legacy tool root must be mode 0700 directory"
+                )
+            if first_quarantine is not None and (
+                first_quarantine[0][2] != stat.S_IFDIR
+                or first_quarantine[1][0] != 0o700
+            ):
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
+                    "same-uid legacy quarantine must be mode 0700 directory"
+                )
+            tool_root = _bind_relative_control_directory(
+                parent,
+                PRIVATE_TOOL_ROOT_NAME,
+                f"legacy private-control tool root [{spec.root_id}]",
+            )
+            if tool_root is None:
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
+                    "same-uid legacy tool root disappeared"
+                )
+            quarantine: ControlObjectBinding | None = None
+            tool_lease_attempted = False
+            quarantine_lease_attempted = False
+            try:
+                if (
+                    tool_root.identity,
+                    tool_root.access_policy,
+                ) != first_tool:
+                    raise MirrorSyncError(
+                        f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
+                        "legacy tool root changed before recovery binding"
+                    )
+                tool_root.root_id = spec.root_id
+                try:
+                    tool_lease_attempted = True
+                    fcntl.flock(tool_root.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as error:
+                    raise MirrorSyncError(
+                        f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
+                        f"legacy tool root is busy or unleaseable: {error}"
+                    ) from error
+                initial_tool_names = _bounded_sorted_directory_names(
+                    tool_root.fd,
+                    maximum_entries=MAX_TOOL_ROOT_ENTRIES,
+                    label=(
+                        f"initial legacy private-control tool root [{spec.root_id}]"
+                    ),
+                    limit_error=(
+                        f"legacy private-control tool root [{spec.root_id}] "
+                        f"exceeds {MAX_TOOL_ROOT_ENTRIES} entries"
+                    ),
+                    operation=root.operation,
+                )
+                if first_quarantine is not None:
+                    quarantine = _bind_relative_control_directory(
+                        parent,
+                        DURABLE_QUARANTINE_ROOT_NAME,
+                        f"legacy durable quarantine [{spec.root_id}]",
+                    )
+                    if quarantine is None:
+                        raise MirrorSyncError(
+                            f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} "
+                            f"[{spec.root_id}]: legacy quarantine disappeared"
+                        )
+                    if (
+                        quarantine.identity,
+                        quarantine.access_policy,
+                    ) != first_quarantine:
+                        raise MirrorSyncError(
+                            f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} "
+                            f"[{spec.root_id}]: legacy quarantine changed "
+                            "before recovery binding"
+                        )
+                    quarantine.root_id = spec.root_id
+                    try:
+                        quarantine_lease_attempted = True
+                        fcntl.flock(
+                            quarantine.fd,
+                            fcntl.LOCK_EX | fcntl.LOCK_NB,
+                        )
+                    except OSError as error:
+                        raise MirrorSyncError(
+                            f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} "
+                            f"[{spec.root_id}]: legacy quarantine is busy "
+                            f"or unleaseable: {error}"
+                        ) from error
+                else:
+                    current_quarantine = _legacy_child_metadata(
+                        parent.fd,
+                        DURABLE_QUARANTINE_ROOT_NAME,
+                        spec.root_id,
+                    )
+                    if current_quarantine is not None:
+                        raise MirrorSyncError(
+                            f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} "
+                            f"[{spec.root_id}]: legacy quarantine appeared "
+                            "before recovery"
+                        )
+                    if initial_tool_names:
+                        raise MirrorSyncError(
+                            f"{PRIVATE_CONTROL_REASON_LEGACY_PENDING} "
+                            f"[{spec.root_id}]: legacy recovery evidence remains "
+                            "but its durable quarantine was initially absent"
+                        )
+                primary_tool, primary_quarantine = (
+                    _bind_prebound_primary_private_control_children(
+                        primary_spec,
+                        primary_prebinding,
+                    )
+                )
+                topology_error: BaseException | None = None
+                try:
+                    primary_protected: list[tuple[str, int]] = [
+                        ("primary account home", primary_prebinding.home.fd),
+                    ]
+                    if primary_prebinding.parent is not None:
+                        primary_protected.append(
+                            (
+                                "primary private-control allocation root",
+                                primary_prebinding.parent.fd,
+                            )
+                        )
+                    if primary_tool is not None:
+                        primary_protected.append(
+                            ("primary private Git tool root", primary_tool.fd)
+                        )
+                    if primary_quarantine is not None:
+                        primary_protected.append(
+                            (
+                                "primary durable quarantine root",
+                                primary_quarantine.fd,
+                            )
+                        )
+                    _validate_private_control_root_topology(
+                        root_id=spec.root_id,
+                        parent=parent,
+                        tool_root=tool_root,
+                        quarantine=quarantine,
+                        repository_root=root,
+                        admin=admin,
+                        common=common,
+                        additional_protected=tuple(primary_protected),
+                    )
+                    if primary_prebinding.parent is not None:
+                        _revalidate_absolute_control_object(primary_prebinding.parent)
+                    _revalidate_absolute_control_object(primary_prebinding.home)
+                except BaseException as error:
+                    topology_error = error
+                primary_close_errors = _close_control_bindings_best_effort(
+                    (primary_quarantine, primary_tool)
+                )
+                if topology_error is not None:
+                    if primary_close_errors:
+                        raise MirrorSyncError(
+                            f"{topology_error}; secondary protected-primary "
+                            "topology cleanup failures: "
+                            + "; ".join(primary_close_errors)
+                        ) from topology_error
+                    raise topology_error
+                if primary_close_errors:
+                    raise MirrorSyncError(
+                        "cannot close every protected primary topology "
+                        "descriptor: " + "; ".join(primary_close_errors)
+                    )
+                if quarantine is not None:
+                    _recover_stale_private_snapshots(
+                        root,
+                        tool_root,
+                        quarantine=quarantine,
+                        quarantine_locked=True,
+                    )
+                remaining = _bounded_sorted_directory_names(
+                    tool_root.fd,
+                    maximum_entries=MAX_TOOL_ROOT_ENTRIES,
+                    label=f"legacy private-control tool root [{spec.root_id}]",
+                    limit_error=(
+                        f"legacy private-control tool root [{spec.root_id}] "
+                        f"exceeds {MAX_TOOL_ROOT_ENTRIES} entries"
+                    ),
+                    operation=root.operation,
+                )
+                quarantine_names: tuple[str, ...] = ()
+                if quarantine is not None:
+                    quarantine_names = _bounded_sorted_directory_names(
+                        quarantine.fd,
+                        maximum_entries=MAX_DURABLE_QUARANTINE_ENTRIES,
+                        label=f"legacy durable quarantine [{spec.root_id}]",
+                        limit_error=(
+                            f"legacy durable quarantine [{spec.root_id}] "
+                            f"exceeds {MAX_DURABLE_QUARANTINE_ENTRIES} entries"
+                        ),
+                        operation=root.operation,
+                    )
+                    _revalidate_control_object(root, quarantine)
+                if remaining or quarantine_names:
+                    raise MirrorSyncError(
+                        f"{PRIVATE_CONTROL_REASON_LEGACY_PENDING} [{spec.root_id}]: "
+                        "same-uid legacy recovery evidence remains in its original root"
+                    )
+                _revalidate_control_object(root, tool_root)
+                final_tool = _legacy_child_metadata(
+                    parent.fd,
+                    PRIVATE_TOOL_ROOT_NAME,
+                    spec.root_id,
+                )
+                final_quarantine = _legacy_child_metadata(
+                    parent.fd,
+                    DURABLE_QUARANTINE_ROOT_NAME,
+                    spec.root_id,
+                )
+                if (final_tool, final_quarantine) != (
+                    first_tool,
+                    first_quarantine,
+                ):
+                    raise MirrorSyncError(
+                        f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
+                        "legacy fixed-root metadata changed during recovery"
+                    )
+                _revalidate_absolute_control_object(parent)
+                seen_parent_identities.add(parent.identity)
+                seen_child_identities.update(observed_identities)
+                legacy_states.append("same-uid-empty")
+                record_receipt(
+                    spec,
+                    parent,
+                    first_tool,
+                    first_quarantine,
+                    "same-uid-empty",
+                    parent_binding=parent,
+                    tool_binding=tool_root,
+                    quarantine_binding=quarantine,
+                )
+                retain_same_uid_bindings = True
+            finally:
+                if not retain_same_uid_bindings:
+                    active_error = sys.exc_info()[1]
+                    cleanup_errors: list[str] = []
+                    for binding, lease_attempted in (
+                        (quarantine, quarantine_lease_attempted),
+                        (tool_root, tool_lease_attempted),
+                    ):
+                        if binding is None or binding.fd < 0:
+                            continue
+                        if lease_attempted:
+                            try:
+                                fcntl.flock(binding.fd, fcntl.LOCK_UN)
+                            except OSError as error:
+                                cleanup_errors.append(
+                                    f"cannot release {binding.label}: {error}"
+                                )
+                        try:
+                            os.close(binding.fd)
+                        except OSError as error:
+                            cleanup_errors.append(
+                                f"cannot close {binding.label}: {error}"
+                            )
+                        finally:
+                            binding.fd = -1
+                    if cleanup_errors:
+                        detail = "; ".join(cleanup_errors)
+                        if active_error is not None:
+                            raise MirrorSyncError(
+                                f"{active_error}; secondary same-uid legacy "
+                                f"preflight cleanup failures: {detail}"
+                            ) from active_error
+                        raise MirrorSyncError(
+                            "same-uid legacy preflight cleanup failures: " + detail
+                        )
+        finally:
+            if not retain_same_uid_bindings:
+                active_error = sys.exc_info()[1]
+                close_errors = _close_control_bindings_best_effort((parent,))
+                if close_errors:
+                    detail = "; ".join(close_errors)
+                    if active_error is not None:
+                        raise MirrorSyncError(
+                            f"{active_error}; secondary legacy parent cleanup "
+                            f"failures: {detail}"
+                        ) from active_error
+                    raise MirrorSyncError("legacy parent cleanup failures: " + detail)
+    return tuple(legacy_states), tuple(receipts)
+
+
+def _release_legacy_private_control_receipts(
+    receipts: tuple[LegacyPrivateControlReceipt, ...]
+    | list[LegacyPrivateControlReceipt],
+) -> None:
+    errors: list[str] = []
+    closed_fds: set[int] = set()
+
+    def unlock_and_close(
+        binding: ControlObjectBinding | None,
+        *,
+        unlock: bool,
+    ) -> None:
+        if binding is None or binding.fd < 0:
+            return
+        fd = binding.fd
+        if fd in closed_fds:
+            binding.fd = -1
+            return
+        closed_fds.add(fd)
+        if unlock:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError as error:
+                errors.append(f"cannot release {binding.label}: {error}")
+        try:
+            os.close(fd)
+        except OSError as error:
+            errors.append(f"cannot close {binding.label}: {error}")
+        finally:
+            binding.fd = -1
+
+    for receipt in reversed(receipts):
+        unlock_and_close(receipt.quarantine_binding, unlock=True)
+        unlock_and_close(receipt.tool_binding, unlock=True)
+        unlock_and_close(receipt.parent_binding, unlock=False)
+        if receipt.absence_binding is not None:
+            unlock_and_close(receipt.absence_binding.parent, unlock=False)
+    if errors:
+        raise MirrorSyncError(
+            "cannot release every retained legacy private-control lease: "
+            + "; ".join(errors)
+        )
+
+
+def _release_primary_context_legacy_fences(
+    context: PrimaryPrivateControlContext,
+) -> None:
+    receipts = context.legacy_receipts
+    context.legacy_receipts = ()
+    if not receipts:
+        return
+    _release_legacy_private_control_receipts(receipts)
+
+
+def _audit_legacy_private_control_registry_coverage(
+    root: BoundRoot,
+    primary_prebinding: PrimaryPrivateControlPrebinding,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    states: list[str] = []
+    details: list[str] = []
+    seen_parent_identities = (
+        set()
+        if primary_prebinding.parent is None
+        else {primary_prebinding.parent.identity}
+    )
+    seen_child_identities = primary_prebinding.child_identities
+    for spec in PRIVATE_CONTROL_ROOT_SPECS:
+        if spec.allocate:
+            continue
+        state_start = len(states)
+        parent: ControlObjectBinding | None = None
+        tool: ControlObjectBinding | None = None
+        quarantine: ControlObjectBinding | None = None
+        tool_lease_attempted = False
+        quarantine_lease_attempted = False
+        try:
+            if not spec.shared_parent or spec.account_home is not None:
+                raise MirrorSyncError("legacy root schema is invalid")
+            try:
+                parent = _bind_absolute_control_object(
+                    spec.parent_path,
+                    f"coverage legacy shared parent [{spec.root_id}]",
+                    require_directory=True,
+                )
+            except MirrorSyncError as error:
+                try:
+                    absence = _capture_legacy_private_control_parent_absence(spec)
+                except MirrorSyncError as inspection_error:
+                    raise MirrorSyncError(
+                        "cannot classify unavailable parent with an anchored "
+                        f"absence receipt: {inspection_error}"
+                    ) from error
+                else:
+                    parent = absence.parent
+                    states.append("absent")
+                    details.append(f"{spec.root_id}=absent")
+                    continue
+            if not _legacy_shared_parent_policy_is_valid(parent.access_policy):
+                raise MirrorSyncError("shared parent policy is invalid")
+            if parent.identity in seen_child_identities:
+                raise MirrorSyncError("parent aliases an earlier fixed child")
+            if parent.identity in seen_parent_identities:
+                _revalidate_absolute_control_object(parent)
+                states.append("duplicate")
+                details.append(f"{spec.root_id}=duplicate")
+                continue
+            first_tool = _legacy_child_metadata(
+                parent.fd,
+                PRIVATE_TOOL_ROOT_NAME,
+                spec.root_id,
+            )
+            first_quarantine = _legacy_child_metadata(
+                parent.fd,
+                DURABLE_QUARANTINE_ROOT_NAME,
+                spec.root_id,
+            )
+            observed = tuple(
+                item for item in (first_tool, first_quarantine) if item is not None
+            )
+            observed_identities = {item[0] for item in observed}
+            if len(observed_identities) != len(observed):
+                raise MirrorSyncError("fixed child roles alias each other")
+            if parent.identity in observed_identities:
+                raise MirrorSyncError("fixed child aliases its own parent")
+            if observed_identities & (seen_parent_identities | seen_child_identities):
+                raise MirrorSyncError(
+                    "distinct parent aliases an earlier control object"
+                )
+            ownership_state = _private_control_legacy_ownership_state(observed)
+            if ownership_state == "inconclusive":
+                raise MirrorSyncError("fixed children have mixed ownership")
+            if ownership_state in {"absent", "foreign-unrelated"}:
+                state = ownership_state
+            else:
+                if first_tool is None:
+                    state = PRIVATE_CONTROL_REASON_LEGACY_PENDING
+                elif first_tool[0][2] != stat.S_IFDIR or first_tool[1][0] != 0o700:
+                    raise MirrorSyncError("tool root type or policy is invalid")
+                elif first_quarantine is not None and (
+                    first_quarantine[0][2] != stat.S_IFDIR
+                    or first_quarantine[1][0] != 0o700
+                ):
+                    raise MirrorSyncError("quarantine type or policy is invalid")
+                else:
+                    tool = _bind_existing_private_control_directory(
+                        parent,
+                        PRIVATE_TOOL_ROOT_NAME,
+                        f"coverage legacy tool root [{spec.root_id}]",
+                        spec.root_id,
+                        first_tool,
+                    )
+                    tool_lease_attempted = True
+                    fcntl.flock(tool.fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    tool_names = _bounded_sorted_directory_names(
+                        tool.fd,
+                        maximum_entries=MAX_TOOL_ROOT_ENTRIES,
+                        label=f"coverage legacy tool root [{spec.root_id}]",
+                        limit_error="legacy tool root exceeds its coverage limit",
+                        operation=root.operation,
+                    )
+                    quarantine_names: tuple[str, ...] = ()
+                    if first_quarantine is not None:
+                        quarantine = _bind_existing_private_control_directory(
+                            parent,
+                            DURABLE_QUARANTINE_ROOT_NAME,
+                            f"coverage legacy quarantine [{spec.root_id}]",
+                            spec.root_id,
+                            first_quarantine,
+                        )
+                        quarantine_lease_attempted = True
+                        fcntl.flock(
+                            quarantine.fd,
+                            fcntl.LOCK_SH | fcntl.LOCK_NB,
+                        )
+                        quarantine_names = _bounded_sorted_directory_names(
+                            quarantine.fd,
+                            maximum_entries=MAX_DURABLE_QUARANTINE_ENTRIES,
+                            label=f"coverage legacy quarantine [{spec.root_id}]",
+                            limit_error=(
+                                "legacy quarantine exceeds its coverage limit"
+                            ),
+                            operation=root.operation,
+                        )
+                    state = (
+                        PRIVATE_CONTROL_REASON_LEGACY_PENDING
+                        if tool_names or quarantine_names
+                        else "same-uid-empty"
+                    )
+            second_tool = _legacy_child_metadata(
+                parent.fd,
+                PRIVATE_TOOL_ROOT_NAME,
+                spec.root_id,
+            )
+            second_quarantine = _legacy_child_metadata(
+                parent.fd,
+                DURABLE_QUARANTINE_ROOT_NAME,
+                spec.root_id,
+            )
+            if (second_tool, second_quarantine) != (
+                first_tool,
+                first_quarantine,
+            ):
+                raise MirrorSyncError("fixed metadata changed during coverage audit")
+            _revalidate_absolute_control_object(parent)
+            seen_parent_identities.add(parent.identity)
+            seen_child_identities.update(observed_identities)
+            states.append(state)
+            details.append(f"{spec.root_id}={state}")
+        except (MirrorSyncError, OSError) as error:
+            states.append(PRIVATE_CONTROL_REASON_INCONCLUSIVE)
+            details.append(f"{spec.root_id}=inconclusive({error})")
+        finally:
+            cleanup_errors: list[str] = []
+            for binding, lease_attempted in (
+                (quarantine, quarantine_lease_attempted),
+                (tool, tool_lease_attempted),
+                (parent, False),
+            ):
+                if binding is not None and binding.fd >= 0:
+                    if lease_attempted:
+                        try:
+                            fcntl.flock(binding.fd, fcntl.LOCK_UN)
+                        except OSError as error:
+                            cleanup_errors.append(
+                                f"cannot release {binding.label}: {error}"
+                            )
+                    try:
+                        os.close(binding.fd)
+                    except OSError as error:
+                        cleanup_errors.append(f"cannot close {binding.label}: {error}")
+                    finally:
+                        binding.fd = -1
+            if cleanup_errors:
+                cleanup_detail = "; ".join(cleanup_errors)
+                if len(states) == state_start:
+                    states.append(PRIVATE_CONTROL_REASON_INCONCLUSIVE)
+                    details.append(f"{spec.root_id}=inconclusive({cleanup_detail})")
+                else:
+                    prior_detail = details[-1]
+                    states[-1] = PRIVATE_CONTROL_REASON_INCONCLUSIVE
+                    details[-1] = (
+                        f"{spec.root_id}=inconclusive({prior_detail}; "
+                        f"cleanup failures: {cleanup_detail})"
+                    )
+    return tuple(states), tuple(details)
+
+
+def _preflight_legacy_private_control_roots(
+    root: BoundRoot,
+    admin: ControlObjectBinding,
+    common: ControlObjectBinding,
+    primary_prebinding: PrimaryPrivateControlPrebinding,
+) -> tuple[tuple[str, ...], tuple[LegacyPrivateControlReceipt, ...]]:
+    retained_receipts: list[LegacyPrivateControlReceipt] = []
+    try:
+        return _preflight_legacy_private_control_roots_once(
+            root,
+            admin,
+            common,
+            primary_prebinding,
+            retained_receipts,
+        )
+    except BaseException as caught_error:
+        first_error: BaseException = caught_error
+        try:
+            _release_legacy_private_control_receipts(retained_receipts)
+        except MirrorSyncError as release_error:
+            first_error = MirrorSyncError(
+                f"{first_error}; secondary legacy lease release failure: "
+                f"{release_error}"
+            )
+        if not isinstance(caught_error, (MirrorSyncError, OSError)):
+            if first_error is not caught_error:
+                raise first_error from caught_error
+            raise
+        coverage_states, coverage_details = (
+            _audit_legacy_private_control_registry_coverage(
+                root,
+                primary_prebinding,
+            )
+        )
+        reason = _private_control_preflight_failure_reason(
+            first_error,
+            coverage_states,
+        )
+        raise MirrorSyncError(
+            f"{reason}: complete legacy registry coverage "
+            f"[{'; '.join(coverage_details)}]; first failure: {first_error}"
+        ) from first_error
+
+
+def _terminal_legacy_directory_names(
+    directory_fd: int,
+    *,
+    maximum_entries: int,
+    label: str,
+    limit_error: str,
+    operation: OperationBudget | None,
+) -> tuple[str, ...]:
+    _operation_checkpoint(operation, f"terminally scanning {label}")
+    if operation is not None:
+        if operation.remaining_bytes <= 0:
+            raise MirrorSyncError(
+                f"mirror operation exceeds the {MAX_OPERATION_BYTES}-byte "
+                f"aggregate budget before terminally scanning {label}"
+            )
+        if operation.remaining_entries <= 0:
+            raise MirrorSyncError(
+                f"mirror operation exceeds the {MAX_OPERATION_ENTRIES}-entry "
+                f"aggregate budget before terminally scanning {label}"
+            )
+    names = _bounded_sorted_directory_names(
+        directory_fd,
+        maximum_entries=maximum_entries,
+        label=label,
+        limit_error=limit_error,
+        operation=operation,
+    )
+    _consume_operation_budget(
+        operation,
+        byte_count=sum(len(os.fsencode(name)) for name in names),
+        label=f"terminally scanning {label}",
+    )
+    return names
+
+
+def _revalidate_legacy_private_control_receipts_once(
+    receipts: tuple[LegacyPrivateControlReceipt, ...],
+    *,
+    operation: OperationBudget | None,
+) -> None:
+    for receipt in receipts:
+        if receipt.tool_binding is not None:
+            parent = receipt.parent_binding
+            tool = receipt.tool_binding
+            quarantine = receipt.quarantine_binding
+            if parent is None or min(parent.fd, tool.fd) < 0:
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{receipt.root_id}]: "
+                    "retained legacy publication fence is unavailable"
+                )
+            if (
+                parent.identity != receipt.parent_identity
+                or parent.access_policy != receipt.parent_access_policy
+                or not _legacy_shared_parent_policy_is_valid(parent.access_policy)
+            ):
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{receipt.root_id}]: "
+                    "retained legacy parent changed before primary allocation"
+                )
+            _revalidate_absolute_control_object(parent)
+            _revalidate_absolute_control_object(tool)
+            if quarantine is not None:
+                _revalidate_absolute_control_object(quarantine)
+            tool_record = _legacy_child_metadata(
+                parent.fd,
+                PRIVATE_TOOL_ROOT_NAME,
+                receipt.root_id,
+            )
+            quarantine_record = _legacy_child_metadata(
+                parent.fd,
+                DURABLE_QUARANTINE_ROOT_NAME,
+                receipt.root_id,
+            )
+            if (
+                tool_record != receipt.tool_record
+                or quarantine_record != receipt.quarantine_record
+            ):
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{receipt.root_id}]: "
+                    "retained legacy fixed-root metadata changed before "
+                    "primary allocation"
+                )
+            tool_names = _terminal_legacy_directory_names(
+                tool.fd,
+                maximum_entries=MAX_TOOL_ROOT_ENTRIES,
+                label=f"terminal legacy tool root [{receipt.root_id}]",
+                limit_error="legacy tool root exceeds its terminal coverage limit",
+                operation=operation,
+            )
+            quarantine_names: tuple[str, ...] = ()
+            if quarantine is not None:
+                quarantine_names = _terminal_legacy_directory_names(
+                    quarantine.fd,
+                    maximum_entries=MAX_DURABLE_QUARANTINE_ENTRIES,
+                    label=f"terminal legacy quarantine [{receipt.root_id}]",
+                    limit_error=(
+                        "legacy quarantine exceeds its terminal coverage limit"
+                    ),
+                    operation=operation,
+                )
+            if tool_names or quarantine_names:
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_LEGACY_PENDING} [{receipt.root_id}]: "
+                    "legacy evidence appeared while the cutover fence was held"
+                )
+            _revalidate_absolute_control_object(parent)
+            continue
+        absence_fields = (
+            receipt.absence_anchor_path,
+            receipt.absence_name,
+            receipt.absence_anchor_identity,
+            receipt.absence_anchor_access_policy,
+        )
+        if receipt.parent_identity is None:
+            absence = receipt.absence_binding
+            if (
+                receipt.state != "absent"
+                or receipt.parent_access_policy is not None
+                or receipt.tool_record is not None
+                or receipt.quarantine_record is not None
+                or any(field is None for field in absence_fields)
+                or absence is None
+                or absence.parent.fd < 0
+                or absence.parent.path != receipt.absence_anchor_path
+                or absence.name != receipt.absence_name
+                or absence.parent.identity != receipt.absence_anchor_identity
+                or absence.parent.access_policy != receipt.absence_anchor_access_policy
+                or receipt.parent_path
+                != receipt.absence_anchor_path / receipt.absence_name
+            ):
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{receipt.root_id}]: "
+                    "absent legacy parent receipt is incomplete"
+                )
+            _revalidate_absolute_control_object(absence.parent)
+            try:
+                os.stat(
+                    absence.name,
+                    dir_fd=absence.parent.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{receipt.root_id}]: "
+                    f"cannot revalidate absent legacy parent: {error}"
+                ) from error
+            else:
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{receipt.root_id}]: "
+                    "legacy parent appeared before primary allocation"
+                )
+            _revalidate_absolute_control_object(absence.parent)
+            continue
+        if any(field is not None for field in absence_fields) or (
+            receipt.absence_binding is not None
+        ):
+            raise MirrorSyncError(
+                f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{receipt.root_id}]: "
+                "present legacy parent receipt has absence-anchor state"
+            )
+        parent = _bind_absolute_control_object(
+            receipt.parent_path,
+            f"terminal legacy shared private-control parent [{receipt.root_id}]",
+            require_directory=True,
+        )
+        try:
+            if (
+                parent.identity != receipt.parent_identity
+                or parent.access_policy != receipt.parent_access_policy
+                or not _legacy_shared_parent_policy_is_valid(parent.access_policy)
+            ):
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{receipt.root_id}]: "
+                    "legacy parent changed before primary allocation"
+                )
+            if receipt.state == "duplicate-parent":
+                _revalidate_absolute_control_object(parent)
+                continue
+            tool_record = _legacy_child_metadata(
+                parent.fd,
+                PRIVATE_TOOL_ROOT_NAME,
+                receipt.root_id,
+            )
+            quarantine_record = _legacy_child_metadata(
+                parent.fd,
+                DURABLE_QUARANTINE_ROOT_NAME,
+                receipt.root_id,
+            )
+            if (
+                tool_record != receipt.tool_record
+                or quarantine_record != receipt.quarantine_record
+            ):
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{receipt.root_id}]: "
+                    "legacy fixed-root metadata changed before primary allocation"
+                )
+            _revalidate_absolute_control_object(parent)
+        finally:
+            os.close(parent.fd)
+
+
+def _revalidate_legacy_private_control_receipts(
+    receipts: tuple[LegacyPrivateControlReceipt, ...],
+    *,
+    operation: OperationBudget | None,
+) -> None:
+    errors: list[str] = []
+    for receipt in receipts:
+        try:
+            _revalidate_legacy_private_control_receipts_once(
+                (receipt,),
+                operation=operation,
+            )
+        except (MirrorSyncError, OSError) as error:
+            errors.append(f"{receipt.root_id}={error}")
+    if errors:
+        raise MirrorSyncError(
+            f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE}: terminal legacy registry "
+            f"revalidation covered every root [{'; '.join(errors)}]"
+        )
+
+
+def _create_private_control_directory_noreplace(
+    parent: ControlObjectBinding,
+    name: str,
+    label: str,
+    root_id: str,
+) -> ControlObjectBinding:
+    if parent.path is None:
+        raise MirrorSyncError(f"{label} parent has no absolute path")
+    for _attempt in range(32):
+        temporary_name = (
+            f".private-control-create-{os.getpid()}-{secrets.token_hex(16)}"
+        )
+        temporary_fd = -1
+        renamed = False
+        temporary_identity: tuple[int, int, int] | None = None
+        try:
+            try:
+                os.mkdir(temporary_name, 0o700, dir_fd=parent.fd)
+            except FileExistsError:
+                continue
+            temporary_fd = os.open(
+                temporary_name,
+                _DIRECTORY_FLAGS,
+                dir_fd=parent.fd,
+            )
+            os.fchmod(temporary_fd, 0o700)
+            path_metadata = os.stat(
+                temporary_name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            descriptor_metadata = os.fstat(temporary_fd)
+            temporary_identity = _object_identity(descriptor_metadata)
+            if _object_identity(path_metadata) != temporary_identity or _access_policy(
+                path_metadata
+            ) != _access_policy(descriptor_metadata):
+                raise MirrorSyncError(f"{label} temporary directory was replaced")
+            try:
+                os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                raise MirrorSyncError(
+                    f"cannot confirm {label} allocation absence: {error}"
+                ) from error
+            else:
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{root_id}]: "
+                    f"{label} appeared before exclusive allocation"
+                )
+            try:
+                _rename_directory_entry_noreplace(
+                    parent.fd,
+                    temporary_name,
+                    name,
+                )
+                renamed = True
+                os.fsync(parent.fd)
+            except OSError as error:
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{root_id}]: "
+                    f"cannot publish {label} exclusively: {error}"
+                ) from error
+            final_metadata = os.stat(
+                name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            descriptor_metadata = os.fstat(temporary_fd)
+            if (
+                _object_identity(final_metadata) != temporary_identity
+                or _object_identity(descriptor_metadata) != temporary_identity
+                or _access_policy(final_metadata) != _access_policy(descriptor_metadata)
+            ):
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{root_id}]: "
+                    f"{label} changed during exclusive allocation"
+                )
+            if (
+                stat.S_IMODE(descriptor_metadata.st_mode) != 0o700
+                or descriptor_metadata.st_uid != os.geteuid()
+            ):
+                raise MirrorSyncError(
+                    f"{label} must be mode 0700 and owned by the current uid"
+                )
+            return ControlObjectBinding(
+                label=label,
+                path=parent.path / name,
+                relative_path=None,
+                fd=temporary_fd,
+                identity=temporary_identity,
+                access_policy=_access_policy(descriptor_metadata),
+                content_digest=None,
+                root_id=root_id,
+            )
+        except BaseException as error:
+            cleanup_errors: list[str] = []
+            if temporary_fd >= 0:
+                try:
+                    cleanup_name = name if renamed else temporary_name
+                    cleanup_metadata = os.stat(
+                        cleanup_name,
+                        dir_fd=parent.fd,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        temporary_identity is not None
+                        and _object_identity(cleanup_metadata) == temporary_identity
+                    ):
+                        # Let the kernel perform the bounded emptiness check.
+                        # ENOTEMPTY preserves attacker-added evidence without
+                        # materializing an unbounded directory listing.
+                        os.rmdir(cleanup_name, dir_fd=parent.fd)
+                        os.fsync(parent.fd)
+                except (OSError, MirrorSyncError) as cleanup_error:
+                    cleanup_errors.append(
+                        f"cannot clean temporary {label}: {cleanup_error}"
+                    )
+                cleanup_errors.extend(
+                    _close_raw_descriptors_best_effort(
+                        ((f"temporary {label}", temporary_fd),)
+                    )
+                )
+                temporary_fd = -1
+            _raise_with_secondary_cleanup(
+                error,
+                f"temporary {label} cleanup failures",
+                cleanup_errors,
+            )
+    raise MirrorSyncError(f"cannot allocate a unique temporary {label}")
+
+
+def _bind_existing_private_control_directory(
+    parent: ControlObjectBinding,
+    name: str,
+    label: str,
+    root_id: str,
+    expected_record: tuple[tuple[int, int, int], tuple[int, int, int]],
+) -> ControlObjectBinding:
+    binding = _bind_relative_control_directory(parent, name, label)
+    if binding is None:
+        raise MirrorSyncError(
+            f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{root_id}]: "
+            f"{label} disappeared before final binding"
+        )
+    observed_record = (binding.identity, binding.access_policy)
+    if observed_record != expected_record:
+        error = MirrorSyncError(
+            f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{root_id}]: "
+            f"{label} changed before final binding"
+        )
+        close_errors = _close_control_bindings_best_effort((binding,))
+        _raise_with_secondary_cleanup(
+            error,
+            f"{label} bind cleanup failures",
+            close_errors,
+        )
+    if binding.access_policy[0] != 0o700 or binding.access_policy[1] != os.geteuid():
+        error = MirrorSyncError(
+            f"{label} must be mode 0700 and owned by the current uid"
+        )
+        close_errors = _close_control_bindings_best_effort((binding,))
+        _raise_with_secondary_cleanup(
+            error,
+            f"{label} bind cleanup failures",
+            close_errors,
+        )
+    binding.root_id = root_id
+    return binding
+
+
 def _bind_private_tool_root(
     root: BoundRoot,
     admin: ControlObjectBinding,
     common: ControlObjectBinding,
 ) -> ControlObjectBinding:
-    parent = _bind_absolute_control_object(
-        PRIVATE_GIT_CONTROL_PARENT,
-        "private Git control parent",
-        require_directory=True,
-    )
+    spec = _private_control_primary_spec()
+    prebinding = _prebind_existing_primary_private_control_root(spec)
+    home = prebinding.home
+    parent = prebinding.parent
+    tool_root: ControlObjectBinding | None = None
+    quarantine: ControlObjectBinding | None = None
+    legacy_receipts: tuple[LegacyPrivateControlReceipt, ...] = ()
     try:
-        for label, directory_fd in (
-            ("repository root", root.fd),
-            ("Git admin directory", admin.fd),
-            ("Git common directory", common.fd),
-        ):
-            if _directory_bindings_overlap(parent.fd, directory_fd):
-                raise MirrorSyncError(
-                    f"private Git control parent overlaps {label}: "
-                    f"{PRIVATE_GIT_CONTROL_PARENT}"
-                )
-        try:
-            os.mkdir(PRIVATE_TOOL_ROOT_NAME, 0o700, dir_fd=parent.fd)
-            os.fsync(parent.fd)
-        except FileExistsError:
-            pass
-        except OSError as error:
-            raise MirrorSyncError(
-                f"cannot create private Git tool root: {error}"
-            ) from error
-        path_metadata = os.stat(
-            PRIVATE_TOOL_ROOT_NAME,
-            dir_fd=parent.fd,
-            follow_symlinks=False,
+        _validate_prebound_primary_private_control_topology(
+            root,
+            admin,
+            common,
+            spec,
+            prebinding,
         )
-        if not stat.S_ISDIR(path_metadata.st_mode):
-            raise MirrorSyncError("private Git tool root must be a directory")
-        tool_fd = os.open(
-            PRIVATE_TOOL_ROOT_NAME,
-            _DIRECTORY_FLAGS,
-            dir_fd=parent.fd,
+        legacy_states, legacy_receipts = _preflight_legacy_private_control_roots(
+            root,
+            admin,
+            common,
+            prebinding,
         )
-        opened_metadata = os.fstat(tool_fd)
-        if _object_identity(path_metadata) != _object_identity(
-            opened_metadata
-        ) or _access_policy(path_metadata) != _access_policy(opened_metadata):
-            os.close(tool_fd)
-            raise MirrorSyncError("private Git tool root was replaced while binding it")
-        if (
-            stat.S_IMODE(opened_metadata.st_mode) != 0o700
-            or opened_metadata.st_uid != os.geteuid()
-        ):
-            os.close(tool_fd)
+        allocation_allowed, reason_code = _private_control_preallocation_decision(
+            legacy_states
+        )
+        if not allocation_allowed:
             raise MirrorSyncError(
-                "private Git tool root must be mode 0700 and owned by the current uid"
+                f"{reason_code}: private-control primary allocation is blocked"
             )
-        return ControlObjectBinding(
-            label="private Git durable tool root",
-            path=Path(os.path.abspath(PRIVATE_GIT_CONTROL_PARENT))
-            / PRIVATE_TOOL_ROOT_NAME,
-            relative_path=None,
-            fd=tool_fd,
-            identity=_object_identity(opened_metadata),
-            access_policy=_access_policy(opened_metadata),
-            content_digest=None,
+        _revalidate_legacy_private_control_receipts(
+            legacy_receipts,
+            operation=root.operation,
         )
-    finally:
-        os.close(parent.fd)
+        if parent is None:
+            _operation_checkpoint(
+                root.operation,
+                "allocating the primary private-control namespace",
+            )
+            parent = _create_private_control_directory_noreplace(
+                home,
+                PRIVATE_CONTROL_NAMESPACE_NAME,
+                f"private-control allocation root [{spec.root_id}]",
+                spec.root_id,
+            )
+        else:
+            _revalidate_absolute_control_object(parent)
+            _revalidate_absolute_control_object(home)
+            current_tool_record = _private_control_child_metadata(
+                parent.fd,
+                PRIVATE_TOOL_ROOT_NAME,
+                f"existing primary private Git tool root [{spec.root_id}]",
+            )
+            current_quarantine_record = _private_control_child_metadata(
+                parent.fd,
+                DURABLE_QUARANTINE_ROOT_NAME,
+                f"existing primary durable quarantine root [{spec.root_id}]",
+            )
+            if (
+                current_tool_record != prebinding.tool_record
+                or current_quarantine_record != prebinding.quarantine_record
+            ):
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
+                    "existing primary fixed-root metadata changed during "
+                    "legacy preflight"
+                )
+        if prebinding.tool_record is None:
+            _operation_checkpoint(
+                root.operation,
+                "allocating the primary private-control tool root",
+            )
+            tool_root = _create_private_control_directory_noreplace(
+                parent,
+                PRIVATE_TOOL_ROOT_NAME,
+                f"private Git tool root [{spec.root_id}]",
+                spec.root_id,
+            )
+        else:
+            tool_root = _bind_existing_private_control_directory(
+                parent,
+                PRIVATE_TOOL_ROOT_NAME,
+                f"private Git tool root [{spec.root_id}]",
+                spec.root_id,
+                prebinding.tool_record,
+            )
+        if prebinding.quarantine_record is None:
+            _operation_checkpoint(
+                root.operation,
+                "allocating the primary private-control quarantine root",
+            )
+            quarantine = _create_private_control_directory_noreplace(
+                parent,
+                DURABLE_QUARANTINE_ROOT_NAME,
+                f"durable quarantine root [{spec.root_id}]",
+                spec.root_id,
+            )
+        else:
+            quarantine = _bind_existing_private_control_directory(
+                parent,
+                DURABLE_QUARANTINE_ROOT_NAME,
+                f"durable quarantine root [{spec.root_id}]",
+                spec.root_id,
+                prebinding.quarantine_record,
+            )
+        role_identities = {parent.identity, tool_root.identity, quarantine.identity}
+        if len(role_identities) != 3:
+            raise MirrorSyncError(
+                f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
+                "primary parent/tool/quarantine roles alias"
+            )
+        _validate_private_control_root_topology(
+            root_id=spec.root_id,
+            parent=parent,
+            tool_root=tool_root,
+            quarantine=quarantine,
+            repository_root=root,
+            admin=admin,
+            common=common,
+            home=home,
+        )
+        _revalidate_absolute_control_object(parent)
+        _revalidate_absolute_control_object(home)
+        _revalidate_legacy_private_control_receipts(
+            legacy_receipts,
+            operation=root.operation,
+        )
+        context = PrimaryPrivateControlContext(
+            root_id=spec.root_id,
+            home=home,
+            parent=parent,
+            quarantine=quarantine,
+            parent_record=(parent.identity, parent.access_policy),
+            tool_record=(tool_root.identity, tool_root.access_policy),
+            quarantine_record=(quarantine.identity, quarantine.access_policy),
+            legacy_receipts=legacy_receipts,
+        )
+        legacy_receipts = ()
+        tool_root.private_control_context = context
+        _revalidate_primary_private_control_context(tool_root)
+        return tool_root
+    except BaseException as setup_error:
+        cleanup_errors: list[str] = []
+        if tool_root is not None and tool_root.private_control_context is not None:
+            try:
+                _close_private_tool_root(tool_root)
+            except MirrorSyncError as close_error:
+                cleanup_errors.append(str(close_error))
+        else:
+            try:
+                _release_legacy_private_control_receipts(legacy_receipts)
+            except MirrorSyncError as release_error:
+                cleanup_errors.append(str(release_error))
+            closed_fds: set[int] = set()
+            for binding in (quarantine, tool_root, parent, home):
+                if binding is None or binding.fd < 0 or binding.fd in closed_fds:
+                    continue
+                closed_fds.add(binding.fd)
+                try:
+                    os.close(binding.fd)
+                except OSError as close_error:
+                    cleanup_errors.append(
+                        f"cannot close {binding.label}: {close_error}"
+                    )
+                finally:
+                    binding.fd = -1
+        if cleanup_errors:
+            raise MirrorSyncError(
+                f"{setup_error}; secondary private-control bind cleanup failures: "
+                + "; ".join(cleanup_errors)
+            ) from setup_error
+        raise
+
+
+def _revalidate_primary_private_control_context(
+    tool_root: ControlObjectBinding,
+) -> None:
+    context = tool_root.private_control_context
+    if context is None or tool_root.root_id != context.root_id:
+        raise MirrorSyncError("primary private-control context is missing or invalid")
+    _revalidate_absolute_control_object(context.home)
+    parent_record = _private_control_child_metadata(
+        context.home.fd,
+        PRIVATE_CONTROL_NAMESPACE_NAME,
+        f"primary private-control allocation root [{context.root_id}]",
+    )
+    if parent_record != context.parent_record:
+        raise MirrorSyncError(
+            f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{context.root_id}]: "
+            "primary allocation root fixed name changed"
+        )
+    _revalidate_absolute_control_object(context.parent)
+    tool_record = _private_control_child_metadata(
+        context.parent.fd,
+        PRIVATE_TOOL_ROOT_NAME,
+        f"primary private Git tool root [{context.root_id}]",
+    )
+    quarantine_record = _private_control_child_metadata(
+        context.parent.fd,
+        DURABLE_QUARANTINE_ROOT_NAME,
+        f"primary durable quarantine root [{context.root_id}]",
+    )
+    if (
+        tool_record != context.tool_record
+        or quarantine_record != context.quarantine_record
+    ):
+        raise MirrorSyncError(
+            f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{context.root_id}]: "
+            "primary fixed-root metadata changed"
+        )
+    _revalidate_absolute_control_object(tool_root)
+    _revalidate_absolute_control_object(context.quarantine)
+    _revalidate_absolute_control_object(context.parent)
+    _revalidate_absolute_control_object(context.home)
+
+
+def _close_private_tool_root(tool_root: ControlObjectBinding) -> None:
+    context = tool_root.private_control_context
+    tool_root.private_control_context = None
+    bindings = [tool_root]
+    close_errors: list[str] = []
+    if context is not None:
+        try:
+            _release_primary_context_legacy_fences(context)
+        except MirrorSyncError as release_error:
+            close_errors.append(str(release_error))
+        bindings.extend((context.quarantine, context.parent, context.home))
+    closed_fds: set[int] = set()
+    for binding in bindings:
+        if binding.fd < 0:
+            continue
+        fd = binding.fd
+        if fd in closed_fds:
+            binding.fd = -1
+            continue
+        if fd >= 0:
+            closed_fds.add(fd)
+            try:
+                os.close(fd)
+            except OSError as error:
+                close_errors.append(f"{binding.label}: {error}")
+            finally:
+                # Never retry a failed close: the descriptor's state is
+                # unspecified and its number may already have been reused.
+                binding.fd = -1
+    if close_errors:
+        raise MirrorSyncError(
+            "cannot close every retained private-control descriptor: "
+            + "; ".join(close_errors)
+        )
 
 
 def _owner_record_payload(
+    root_id: str,
     private_name: str,
     private_identity: tuple[int, int, int],
     owner_nonce: str,
@@ -1585,6 +3725,7 @@ def _owner_record_payload(
         json.dumps(
             {
                 "version": PRIVATE_OWNER_RECORD_VERSION,
+                "root_id": root_id,
                 "owner_pid": os.getpid(),
                 "owner_uid": os.geteuid(),
                 "owner_gid": os.getegid(),
@@ -1603,12 +3744,23 @@ def _owner_record_payload(
 def _create_owner_record(
     root: BoundRoot,
     tool_root: ControlObjectBinding,
+    quarantine: ControlObjectBinding,
     private_name: str,
     private: ControlObjectBinding,
+    *,
+    quarantine_locked: bool,
 ) -> tuple[str, str, ControlObjectBinding]:
+    if not quarantine_locked:
+        raise MirrorSyncError(
+            "private Git owner publication requires the caller-held "
+            "durable quarantine lock"
+        )
+    if tool_root.root_id is None:
+        raise MirrorSyncError("private Git tool root is missing its root id")
     owner_nonce = secrets.token_hex(16)
     owner_name = f"{private_name}.owner.json"
     payload = _owner_record_payload(
+        tool_root.root_id,
         private_name,
         private.identity,
         owner_nonce,
@@ -1635,14 +3787,17 @@ def _create_owner_record(
             identity=_object_identity(metadata),
             access_policy=_access_policy(metadata),
             content_digest=hashlib.sha256(payload).digest(),
+            root_id=tool_root.root_id,
         )
     except BaseException:
         try:
             owner_metadata = os.fstat(owner_fd)
-            owner_snapshot = _safe_read_leaf_snapshot(
+            owner_snapshot = _safe_read_private_owner_record_snapshot(
                 tool_root.fd,
                 owner_name,
                 PurePosixPath(owner_name),
+                file_fd=owner_fd,
+                operation=root.operation,
             )
             if owner_snapshot.identity == _object_identity(owner_metadata):
                 _remove_stale_owner_record(
@@ -1650,6 +3805,8 @@ def _create_owner_record(
                     tool_root,
                     owner_name,
                     owner_snapshot,
+                    quarantine=quarantine,
+                    quarantine_locked=True,
                 )
         except (OSError, MirrorSyncError):
             # An ambiguous record is retained for bounded stale recovery.
@@ -1667,7 +3824,10 @@ def _set_owner_record_phase(
     owner_nonce: str,
     phase: str,
 ) -> None:
+    if binding.root_id is None:
+        raise MirrorSyncError("private Git owner record is missing its root id")
     payload = _owner_record_payload(
+        binding.root_id,
         private_name,
         private_identity,
         owner_nonce,
@@ -1772,30 +3932,67 @@ def _create_owned_private_directory(
     )
     private_name: str | None = None
     private: ControlObjectBinding | None = None
+    owner_name: str | None = None
+    owner_record: ControlObjectBinding | None = None
     root_locked = False
+    quarantine_locked = False
+    locks_reliable = True
+    context = private_parent.private_control_context
+    if context is None:
+        _close_private_tool_root(private_parent)
+        raise MirrorSyncError("primary private-control context is missing")
     try:
-        fcntl.flock(
-            private_parent.fd,
-            fcntl.LOCK_EX | fcntl.LOCK_NB,
+        try:
+            fcntl.flock(
+                private_parent.fd,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+            root_locked = True
+            fcntl.flock(
+                context.quarantine.fd,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+            quarantine_locked = True
+        except OSError as error:
+            raise MirrorSyncError(
+                "private Git tool/quarantine root is busy or unleaseable with "
+                "another bounded snapshot, recovery, or cleanup publication"
+            ) from error
+        _revalidate_primary_private_control_context(private_parent)
+        _recover_stale_private_snapshots(
+            root,
+            private_parent,
+            quarantine=context.quarantine,
+            quarantine_locked=True,
         )
-        root_locked = True
-    except BlockingIOError as error:
-        os.close(private_parent.fd)
-        raise MirrorSyncError(
-            "private Git tool root is busy with another bounded "
-            "snapshot/recovery publication"
-        ) from error
-    try:
-        _recover_stale_private_snapshots(root, private_parent)
+        _revalidate_primary_private_control_context(private_parent)
         private_name, private_path, private = _create_private_git_directory(
             private_parent
         )
         owner_name, owner_nonce, owner_record = _create_owner_record(
             root,
             private_parent,
+            context.quarantine,
             private_name,
             private,
+            quarantine_locked=True,
         )
+        _revalidate_primary_private_control_context(private_parent)
+        _revalidate_legacy_private_control_receipts(
+            context.legacy_receipts,
+            operation=root.operation,
+        )
+        _release_primary_context_legacy_fences(context)
+        try:
+            fcntl.flock(context.quarantine.fd, fcntl.LOCK_UN)
+            quarantine_locked = False
+            fcntl.flock(private_parent.fd, fcntl.LOCK_UN)
+            root_locked = False
+        except OSError as error:
+            locks_reliable = False
+            raise MirrorSyncError(
+                f"cannot release private Git publication locks: {error}"
+            ) from error
         return (
             private_parent,
             private_name,
@@ -1805,8 +4002,11 @@ def _create_owned_private_directory(
             owner_name,
             owner_nonce,
         )
-    except BaseException:
-        if private is not None and private_name is not None:
+    except BaseException as setup_error:
+        cleanup_errors: list[str] = []
+        private_cleanup_succeeded = private is None
+        cleanup_can_mutate = root_locked and quarantine_locked and locks_reliable
+        if cleanup_can_mutate and private is not None and private_name is not None:
             try:
                 _remove_bound_private_directory(
                     root,
@@ -1815,16 +4015,96 @@ def _create_owned_private_directory(
                     private_name,
                     None,
                 )
+                private_cleanup_succeeded = True
+            except BaseException as cleanup_error:
+                cleanup_errors.append(
+                    "private snapshot cleanup: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
             finally:
+                try:
+                    os.close(private.fd)
+                except OSError as close_error:
+                    cleanup_errors.append(
+                        "private snapshot descriptor close: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                finally:
+                    private.fd = -1
+        elif private is not None:
+            cleanup_errors.append(
+                "private snapshot retained because both publication leases "
+                "were not reliably held"
+            )
+            try:
                 os.close(private.fd)
+            except OSError as close_error:
+                cleanup_errors.append(
+                    "private snapshot descriptor close: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            finally:
+                private.fd = -1
+        if owner_record is not None:
+            if (
+                cleanup_can_mutate
+                and private_cleanup_succeeded
+                and owner_name is not None
+            ):
+                try:
+                    _remove_bound_owner_record(
+                        root,
+                        private_parent,
+                        owner_record,
+                        owner_name,
+                        context.quarantine,
+                        quarantine_locked=True,
+                    )
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(
+                        "owner record cleanup: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            try:
+                os.close(owner_record.fd)
+            except OSError as close_error:
+                cleanup_errors.append(
+                    "owner record descriptor close: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            finally:
+                owner_record.fd = -1
+        # Release publication locks before closing the retained descriptor
+        # context. Every step is best-effort so a secondary cleanup failure
+        # cannot leak the remaining home/parent/tool/quarantine descriptors.
+        if quarantine_locked:
+            try:
+                fcntl.flock(context.quarantine.fd, fcntl.LOCK_UN)
+            except OSError as unlock_error:
+                cleanup_errors.append(
+                    f"quarantine unlock: {type(unlock_error).__name__}: {unlock_error}"
+                )
+            finally:
+                quarantine_locked = False
         if root_locked:
-            fcntl.flock(private_parent.fd, fcntl.LOCK_UN)
-            root_locked = False
-        os.close(private_parent.fd)
+            try:
+                fcntl.flock(private_parent.fd, fcntl.LOCK_UN)
+            except OSError as unlock_error:
+                cleanup_errors.append(
+                    f"tool-root unlock: {type(unlock_error).__name__}: {unlock_error}"
+                )
+            finally:
+                root_locked = False
+        try:
+            _close_private_tool_root(private_parent)
+        except MirrorSyncError as close_error:
+            cleanup_errors.append(f"retained context close: {close_error}")
+        if cleanup_errors:
+            raise MirrorSyncError(
+                f"{setup_error}; secondary private-control cleanup failures: "
+                + "; ".join(cleanup_errors)
+            ) from setup_error
         raise
-    finally:
-        if root_locked:
-            fcntl.flock(private_parent.fd, fcntl.LOCK_UN)
 
 
 def _snapshot_bound_git_executable(
@@ -2000,7 +4280,8 @@ def _prepare_private_git_executable(
             owner_record_name=owner_record_name,
             owner_nonce=owner_nonce,
         )
-    except BaseException:
+    except BaseException as setup_error:
+        cleanup_errors: list[str] = []
         try:
             _cleanup_private_git_control(
                 root,
@@ -2012,12 +4293,23 @@ def _prepare_private_git_executable(
                 owner_record_name,
                 owner_nonce,
             )
-        finally:
-            if executable is not None:
-                os.close(executable.fd)
-            os.close(owner_record.fd)
-            os.close(private.fd)
-            os.close(private_parent.fd)
+        except BaseException as cleanup_error:
+            cleanup_errors.append(
+                "private Git executable cleanup: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        cleanup_errors.extend(
+            _close_control_bindings_best_effort((executable, owner_record, private))
+        )
+        try:
+            _close_private_tool_root(private_parent)
+        except MirrorSyncError as close_error:
+            cleanup_errors.append(f"retained context close: {close_error}")
+        if cleanup_errors:
+            raise MirrorSyncError(
+                f"{setup_error}; secondary private Git executable cleanup "
+                f"failures: {'; '.join(cleanup_errors)}"
+            ) from setup_error
         raise
 
 
@@ -2025,6 +4317,7 @@ def _revalidate_private_git_executable(
     root: BoundRoot,
     binding: PrivateGitExecutableBinding,
 ) -> None:
+    _revalidate_primary_private_control_context(binding.private_parent)
     _revalidate_control_object(root, binding.private_parent)
     _revalidate_control_object(root, binding.private)
     _revalidate_control_object(root, binding.owner_record)
@@ -2043,6 +4336,7 @@ def _revalidate_private_git_executable(
         )
     _revalidate_control_object(root, binding.private)
     _revalidate_control_object(root, binding.private_parent)
+    _revalidate_primary_private_control_context(binding.private_parent)
 
 
 def _expected_private_manifest(
@@ -2203,9 +4497,8 @@ def _materialize_private_git_control(
             "ready",
         )
         os.fsync(private_parent.fd)
-    except BaseException:
-        for binding in source_files:
-            os.close(binding.fd)
+    except BaseException as setup_error:
+        cleanup_errors = list(_close_control_bindings_best_effort(tuple(source_files)))
         try:
             _cleanup_private_git_control(
                 root,
@@ -2217,12 +4510,26 @@ def _materialize_private_git_control(
                 owner_name,
                 owner_nonce,
             )
-        finally:
-            os.close(prepared.executable.fd)
-            os.close(owner_record.fd)
-            os.close(private.fd)
-            os.close(private_parent.fd)
-            root.private_git_executable = None
+        except BaseException as cleanup_error:
+            cleanup_errors.append(
+                "private Git materialization cleanup: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        cleanup_errors.extend(
+            _close_control_bindings_best_effort(
+                (prepared.executable, owner_record, private)
+            )
+        )
+        try:
+            _close_private_tool_root(private_parent)
+        except MirrorSyncError as close_error:
+            cleanup_errors.append(f"retained context close: {close_error}")
+        root.private_git_executable = None
+        if cleanup_errors:
+            raise MirrorSyncError(
+                f"{setup_error}; secondary private Git materialization "
+                f"cleanup failures: {'; '.join(cleanup_errors)}"
+            ) from setup_error
         raise
     return (
         private_parent,
@@ -2618,6 +4925,7 @@ def _revalidate_private_git_control(
     root: BoundRoot,
     binding: GitControlBinding,
 ) -> None:
+    _revalidate_primary_private_control_context(binding.private_parent)
     _revalidate_control_object(root, binding.private_parent)
     _revalidate_control_object(root, binding.private)
     _revalidate_control_object(root, binding.private_objects)
@@ -2636,6 +4944,7 @@ def _revalidate_private_git_control(
         raise MirrorSyncError(
             "private Git control snapshot changed before transaction completion"
         )
+    _revalidate_primary_private_control_context(binding.private_parent)
 
 
 def _remove_private_tree_contents(
@@ -2801,37 +5110,36 @@ def _remove_stale_owner_record(
     owner_name: str,
     owner_snapshot: FileSnapshot,
     *,
-    quarantine: ControlObjectBinding | None = None,
+    quarantine: ControlObjectBinding,
+    quarantine_locked: bool,
 ) -> None:
-    durable_quarantine = (
-        quarantine
-        if quarantine is not None
-        else _bind_durable_quarantine_root(
-            root,
-            quarantine_parent=PRIVATE_GIT_CONTROL_PARENT,
-            source_parent_fd=tool_root.fd,
-        )
+    _isolate_and_remove_file(
+        root,
+        tool_root.fd,
+        owner_name,
+        owner_snapshot,
+        PurePosixPath(owner_name),
+        quarantine=quarantine,
+        retention_kind=QUARANTINE_TRANSIENT_KIND,
+        quarantine_locked=quarantine_locked,
     )
-    close_quarantine = quarantine is None
-    try:
-        _isolate_and_remove_file(
-            root,
-            tool_root.fd,
-            owner_name,
-            owner_snapshot,
-            PurePosixPath(owner_name),
-            quarantine=durable_quarantine,
-            retention_kind=QUARANTINE_TRANSIENT_KIND,
-        )
-    finally:
-        if close_quarantine:
-            os.close(durable_quarantine.fd)
 
 
 def _recover_stale_private_snapshots(
     root: BoundRoot,
     tool_root: ControlObjectBinding,
+    *,
+    quarantine: ControlObjectBinding,
+    quarantine_locked: bool,
 ) -> None:
+    if not quarantine_locked:
+        raise MirrorSyncError(
+            "private Git stale recovery requires the caller-held durable "
+            "quarantine lock"
+        )
+    if tool_root.root_id is None:
+        raise MirrorSyncError("private Git tool root is missing its root id")
+
     _operation_checkpoint(root.operation, "scanning private Git tool root")
     names = _bounded_sorted_directory_names(
         tool_root.fd,
@@ -2871,10 +5179,12 @@ def _recover_stale_private_snapshots(
             except BlockingIOError:
                 continue
             locked_owner_metadata = os.fstat(owner_fd)
-            owner_snapshot = _safe_read_leaf_snapshot(
+            owner_snapshot = _safe_read_private_owner_record_snapshot(
                 tool_root.fd,
                 owner_name,
                 PurePosixPath(owner_name),
+                file_fd=owner_fd,
+                operation=root.operation,
             )
             if owner_snapshot.identity != _object_identity(
                 locked_owner_metadata
@@ -2917,12 +5227,19 @@ def _recover_stale_private_snapshots(
                     )
                 cleaned += 1
                 continue
+            root_scope = _private_owner_record_root_scope(
+                record,
+                tool_root.root_id,
+            )
+            if root_scope == PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH:
+                raise MirrorSyncError(
+                    f"{PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH} "
+                    f"[{tool_root.root_id}]: retaining owner record {owner_name}"
+                )
             valid_record = (
                 isinstance(record, dict)
                 and len(owner_snapshot.payload) <= MAX_PRIVATE_OWNER_RECORD_BYTES
-                and set(record) == PRIVATE_OWNER_RECORD_FIELDS
-                and type(record["version"]) is int
-                and record["version"] == PRIVATE_OWNER_RECORD_VERSION
+                and root_scope in {"accepted-legacy", "accepted-current"}
                 and type(record["owner_uid"]) is int
                 and record["owner_uid"] == os.geteuid()
                 and type(record["owner_gid"]) is int
@@ -2987,6 +5304,8 @@ def _recover_stale_private_snapshots(
                     tool_root,
                     owner_name,
                     owner_snapshot,
+                    quarantine=quarantine,
+                    quarantine_locked=True,
                 )
                 cleaned += 1
                 continue
@@ -3039,28 +5358,21 @@ def _recover_stale_private_snapshots(
                     access_policy=_access_policy(private_metadata),
                     content_digest=None,
                 )
-                quarantine = _bind_durable_quarantine_root(
+                _remove_bound_private_directory(
                     root,
-                    quarantine_parent=PRIVATE_GIT_CONTROL_PARENT,
-                    source_parent_fd=tool_root.fd,
+                    tool_root,
+                    private,
+                    private_name,
+                    None,
                 )
-                try:
-                    _remove_bound_private_directory(
-                        root,
-                        tool_root,
-                        private,
-                        private_name,
-                        None,
-                    )
-                    _remove_stale_owner_record(
-                        root,
-                        tool_root,
-                        owner_name,
-                        owner_snapshot,
-                        quarantine=quarantine,
-                    )
-                finally:
-                    os.close(quarantine.fd)
+                _remove_stale_owner_record(
+                    root,
+                    tool_root,
+                    owner_name,
+                    owner_snapshot,
+                    quarantine=quarantine,
+                    quarantine_locked=True,
+                )
             finally:
                 os.close(private_fd)
             cleaned += 1
@@ -3177,13 +5489,21 @@ def _remove_bound_owner_record(
     owner_record: ControlObjectBinding,
     owner_name: str,
     quarantine: ControlObjectBinding,
+    *,
+    quarantine_locked: bool,
 ) -> None:
+    if not quarantine_locked:
+        raise MirrorSyncError(
+            "private Git owner cleanup requires the caller-held durable quarantine lock"
+        )
     _revalidate_control_object(root, private_parent)
     _revalidate_control_object(root, owner_record)
-    owner_snapshot = _safe_read_leaf_snapshot(
+    owner_snapshot = _safe_read_private_owner_record_snapshot(
         private_parent.fd,
         owner_name,
         PurePosixPath(owner_name),
+        file_fd=owner_record.fd,
+        operation=root.operation,
     )
     if (
         owner_snapshot.identity != owner_record.identity
@@ -3200,6 +5520,7 @@ def _remove_bound_owner_record(
         PurePosixPath(owner_name),
         quarantine=quarantine,
         retention_kind=QUARANTINE_TRANSIENT_KIND,
+        quarantine_locked=True,
     )
     os.fsync(private_parent.fd)
 
@@ -3214,39 +5535,74 @@ def _cleanup_private_git_control(
     owner_name: str,
     owner_nonce: str,
 ) -> None:
-    # Bind the durable destination while every Git control path still exists.
-    # Removing the private snapshot first intentionally invalidates its path,
-    # so a later BoundRoot-based bind would fail recursive control-plane
-    # revalidation before the owner record could be preserved.
-    quarantine = _bind_durable_quarantine_root(
-        root,
-        quarantine_parent=PRIVATE_GIT_CONTROL_PARENT,
-        source_parent_fd=private_parent.fd,
-    )
-    try:
-        _set_owner_record_phase(
-            owner_record,
-            private_name,
-            private.identity,
-            owner_nonce,
-            "cleanup",
+    context = private_parent.private_control_context
+    if context is None:
+        raise MirrorSyncError("primary private-control context is missing at cleanup")
+    acquire_errors: list[str] = []
+    release_errors: list[str] = []
+    attempted_leases: list[tuple[str, int]] = []
+    for label, file_fd in (
+        ("tool-root", private_parent.fd),
+        ("quarantine", context.quarantine.fd),
+    ):
+        attempted_leases.append((label, file_fd))
+        try:
+            fcntl.flock(file_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            acquire_errors.append(f"{label} acquire: {type(error).__name__}: {error}")
+
+    cleanup_error: BaseException | None = None
+    if not acquire_errors:
+        try:
+            _revalidate_primary_private_control_context(private_parent)
+            _set_owner_record_phase(
+                owner_record,
+                private_name,
+                private.identity,
+                owner_nonce,
+                "cleanup",
+            )
+            _remove_bound_private_directory(
+                root,
+                private_parent,
+                private,
+                private_name,
+                expected_manifest,
+            )
+            _remove_bound_owner_record(
+                root,
+                private_parent,
+                owner_record,
+                owner_name,
+                context.quarantine,
+                quarantine_locked=True,
+            )
+            _revalidate_primary_private_control_context(private_parent)
+        except BaseException as error:
+            cleanup_error = error
+
+    for label, file_fd in reversed(attempted_leases):
+        try:
+            # An acquire error can be reported after the kernel changed the
+            # lease state. Always issue the matching release, but never mutate
+            # unless both acquisitions completed without error.
+            fcntl.flock(file_fd, fcntl.LOCK_UN)
+        except OSError as error:
+            release_errors.append(f"{label} unlock: {type(error).__name__}: {error}")
+
+    lease_errors = (*acquire_errors, *release_errors)
+    if cleanup_error is not None:
+        if lease_errors:
+            raise MirrorSyncError(
+                f"{cleanup_error}; secondary private Git cleanup lease "
+                f"failures: {'; '.join(lease_errors)}"
+            ) from cleanup_error
+        raise cleanup_error
+    if lease_errors:
+        raise MirrorSyncError(
+            "cannot complete private Git cleanup lease actions: "
+            + "; ".join(lease_errors)
         )
-        _remove_bound_private_directory(
-            root,
-            private_parent,
-            private,
-            private_name,
-            expected_manifest,
-        )
-        _remove_bound_owner_record(
-            root,
-            private_parent,
-            owner_record,
-            owner_name,
-            quarantine,
-        )
-    finally:
-        os.close(quarantine.fd)
 
 
 def _bind_root(root: Path, *, exclusive: bool = False) -> BoundRoot:
@@ -3364,37 +5720,69 @@ def _revalidate_bound_root(root: BoundRoot) -> None:
 
 
 def _close_bound_root(root: BoundRoot) -> None:
-    cleanup_error: MirrorSyncError | None = None
+    cleanup_errors: list[MirrorSyncError] = []
+    closed_fds: set[int] = set()
+
+    def remember(error: MirrorSyncError) -> None:
+        cleanup_errors.append(error)
+
+    def remember_terminal_error(label: str, error: MirrorSyncError | OSError) -> None:
+        if isinstance(error, MirrorSyncError):
+            remember(error)
+            return
+        remember(MirrorSyncError(f"{label}: {error}"))
+
+    def close_control(binding: ControlObjectBinding, label: str) -> None:
+        if binding.fd < 0:
+            return
+        fd = binding.fd
+        if fd in closed_fds:
+            binding.fd = -1
+            return
+        closed_fds.add(fd)
+        try:
+            os.close(fd)
+        except OSError as error:
+            remember(MirrorSyncError(f"cannot close {label}: {error}"))
+        finally:
+            # A failed close has unspecified descriptor state and must not be
+            # retried after the descriptor number may have been reused.
+            binding.fd = -1
+
     if root.git_control is not None:
+        git_control = root.git_control
         try:
             _cleanup_private_git_control(
                 root,
-                root.git_control.private_parent,
-                root.git_control.private,
-                root.git_control.private_name,
-                root.git_control.private_cleanup_manifest,
-                root.git_control.owner_record,
-                root.git_control.owner_record_name,
-                root.git_control.owner_nonce,
+                git_control.private_parent,
+                git_control.private,
+                git_control.private_name,
+                git_control.private_cleanup_manifest,
+                git_control.owner_record,
+                git_control.owner_record_name,
+                git_control.owner_nonce,
             )
-        except MirrorSyncError as error:
-            cleanup_error = error
+        except (MirrorSyncError, OSError) as error:
+            remember_terminal_error("private Git control cleanup failed", error)
         for binding in (
-            root.git_control.marker,
-            root.git_control.admin,
-            root.git_control.commondir_file,
-            root.git_control.common,
-            root.git_control.objects,
-            *root.git_control.source_files,
-            *root.git_control.source_directories,
-            root.git_control.private_objects,
-            root.git_control.private_git_executable,
-            root.git_control.private,
-            root.git_control.private_parent,
-            root.git_control.owner_record,
+            git_control.marker,
+            git_control.admin,
+            git_control.commondir_file,
+            git_control.common,
+            git_control.objects,
+            *git_control.source_files,
+            *git_control.source_directories,
+            git_control.private_objects,
+            git_control.private_git_executable,
+            git_control.private,
+            git_control.owner_record,
         ):
             if binding is not None:
-                os.close(binding.fd)
+                close_control(binding, binding.label)
+        try:
+            _close_private_tool_root(git_control.private_parent)
+        except (MirrorSyncError, OSError) as error:
+            remember_terminal_error("private Git control context close failed", error)
         root.git_control = None
     if root.private_git_executable is not None:
         binding = root.private_git_executable
@@ -3409,46 +5797,95 @@ def _close_bound_root(root: BoundRoot) -> None:
                 binding.owner_record_name,
                 binding.owner_nonce,
             )
-        except MirrorSyncError as error:
-            if cleanup_error is None:
-                cleanup_error = error
+        except (MirrorSyncError, OSError) as error:
+            remember_terminal_error("private Git executable cleanup failed", error)
         for control in (
             binding.executable,
             binding.private,
-            binding.private_parent,
             binding.owner_record,
         ):
-            os.close(control.fd)
+            close_control(control, control.label)
+        try:
+            _close_private_tool_root(binding.private_parent)
+        except (MirrorSyncError, OSError) as error:
+            remember_terminal_error(
+                "private Git executable context close failed",
+                error,
+            )
         root.private_git_executable = None
     for binding in root.managed_ancestors.values():
-        os.close(binding.fd)
+        close_control(binding, binding.label)
     root.managed_ancestors.clear()
     root.managed_ancestor_paths.clear()
-    os.close(root.git_executable.fd)
-    root.git_executable.fd = -1
-    fcntl.flock(root.fd, fcntl.LOCK_UN)
-    os.close(root.fd)
-    root.fd = -1
-    if cleanup_error is not None:
-        raise cleanup_error
+    close_control(root.git_executable, root.git_executable.label)
+    if root.fd >= 0:
+        root_fd = root.fd
+        try:
+            fcntl.flock(root_fd, fcntl.LOCK_UN)
+        except OSError as error:
+            remember(MirrorSyncError(f"cannot release bound root lock: {error}"))
+        try:
+            os.close(root_fd)
+        except OSError as error:
+            remember(MirrorSyncError(f"cannot close bound root descriptor: {error}"))
+        finally:
+            root.fd = -1
+    if len(cleanup_errors) == 1:
+        raise cleanup_errors[0]
+    if cleanup_errors:
+        first_error = cleanup_errors[0]
+        raise MirrorSyncError(
+            f"{first_error}; secondary root cleanup failures: "
+            + "; ".join(str(error) for error in cleanup_errors[1:])
+        ) from first_error
 
 
 def _finish_bound_roots(*roots: BoundRoot) -> None:
-    first_error: MirrorSyncError | None = None
+    errors: list[tuple[str, MirrorSyncError]] = []
+
+    def normalized_terminal_error(
+        label: str,
+        error: MirrorSyncError | OSError,
+    ) -> MirrorSyncError:
+        if isinstance(error, MirrorSyncError):
+            return error
+        return MirrorSyncError(f"{label}: {error}")
+
     for root in roots:
         try:
             _revalidate_bound_root(root)
-        except MirrorSyncError as error:
-            if first_error is None:
-                first_error = error
+        except (MirrorSyncError, OSError) as error:
+            errors.append(
+                (
+                    f"revalidate {root.path}",
+                    normalized_terminal_error(
+                        "bound-root revalidation failed",
+                        error,
+                    ),
+                )
+            )
     for root in reversed(roots):
         try:
             _close_bound_root(root)
-        except MirrorSyncError as error:
-            if first_error is None:
-                first_error = error
-    if first_error is not None:
-        raise first_error
+        except (MirrorSyncError, OSError) as error:
+            errors.append(
+                (
+                    f"close {root.path}",
+                    normalized_terminal_error(
+                        "bound-root close failed",
+                        error,
+                    ),
+                )
+            )
+    if len(errors) == 1:
+        raise errors[0][1]
+    if errors:
+        first_label, first_error = errors[0]
+        raise MirrorSyncError(
+            f"{first_label}: {first_error}; secondary bound-root "
+            "finalization failures: "
+            + "; ".join(f"{label}: {error}" for label, error in errors[1:])
+        ) from first_error
 
 
 def _root_path(root: Root) -> Path:
@@ -3469,27 +5906,58 @@ def _directory_is_at_or_below(
     ancestor_identity: tuple[int, int, int],
 ) -> bool:
     current_fd = os.dup(candidate_fd)
+    result: bool | None = None
+    primary_error: BaseException | None = None
     try:
         for _depth in range(MAX_ROOT_ANCESTOR_DEPTH):
             current_identity = _object_identity(os.fstat(current_fd))
             if current_identity == ancestor_identity:
-                return True
+                result = True
+                break
+            parent_fd = -1
             try:
                 parent_fd = os.open("..", _DIRECTORY_FLAGS, dir_fd=current_fd)
+                parent_identity = _object_identity(os.fstat(parent_fd))
             except OSError as error:
-                raise MirrorSyncError(
-                    f"cannot validate target root ancestry: {error}"
-                ) from error
-            parent_identity = _object_identity(os.fstat(parent_fd))
-            os.close(current_fd)
+                close_errors = _close_raw_descriptors_best_effort(
+                    (("unadopted ancestry parent", parent_fd),)
+                )
+                _raise_with_secondary_cleanup(
+                    MirrorSyncError(f"cannot validate target root ancestry: {error}"),
+                    "ancestry parent cleanup failures",
+                    close_errors,
+                )
+            previous_fd = current_fd
             current_fd = parent_fd
+            parent_fd = -1
+            close_errors = _close_raw_descriptors_best_effort(
+                (("previous ancestry directory", previous_fd),)
+            )
+            if close_errors:
+                raise MirrorSyncError("; ".join(close_errors))
             if parent_identity == current_identity:
-                return False
-    finally:
-        os.close(current_fd)
-    raise MirrorSyncError(
-        f"target root ancestry exceeds {MAX_ROOT_ANCESTOR_DEPTH} directories"
+                result = False
+                break
+        else:
+            raise MirrorSyncError(
+                f"target root ancestry exceeds {MAX_ROOT_ANCESTOR_DEPTH} directories"
+            )
+    except BaseException as error:
+        primary_error = error
+    close_errors = _close_raw_descriptors_best_effort(
+        (("current ancestry directory", current_fd),)
     )
+    current_fd = -1
+    if primary_error is not None:
+        _raise_with_secondary_cleanup(
+            primary_error,
+            "ancestry cleanup failures",
+            close_errors,
+        )
+    if close_errors:
+        raise MirrorSyncError("; ".join(close_errors))
+    assert result is not None
+    return result
 
 
 def _reject_canonical_target(
@@ -3825,6 +6293,133 @@ def _safe_read_leaf_snapshot(
             os.close(file_fd)
 
 
+def _safe_read_private_owner_record_snapshot(
+    parent_fd: int,
+    name: str,
+    display_path: PurePosixPath,
+    *,
+    file_fd: int | None = None,
+    operation: OperationBudget | None = None,
+) -> FileSnapshot:
+    """Read one owner record twice with a hard 4096+1 producer ceiling."""
+
+    owned_fd = -1
+    try:
+        try:
+            path_metadata = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as error:
+            raise MissingPathError(f"file is missing: {display_path}") from error
+        except OSError as error:
+            raise MirrorSyncError(
+                f"cannot inspect private owner record {display_path}: {error}"
+            ) from error
+        if stat.S_ISLNK(path_metadata.st_mode) or not stat.S_ISREG(
+            path_metadata.st_mode
+        ):
+            raise MirrorSyncError(
+                f"private owner record must be a non-symlink regular file: "
+                f"{display_path}"
+            )
+        if path_metadata.st_size > MAX_PRIVATE_OWNER_RECORD_BYTES:
+            raise MirrorSyncError(
+                f"private owner record exceeds {MAX_PRIVATE_OWNER_RECORD_BYTES} "
+                f"bytes: {display_path}"
+            )
+        if file_fd is None:
+            try:
+                owned_fd = os.open(name, _FILE_READ_FLAGS, dir_fd=parent_fd)
+            except OSError as error:
+                raise MirrorSyncError(
+                    f"cannot safely open private owner record {display_path}: {error}"
+                ) from error
+            file_fd = owned_fd
+        opened_metadata = os.fstat(file_fd)
+        if _object_identity(path_metadata) != _object_identity(opened_metadata):
+            raise MirrorSyncError(
+                f"private owner record was replaced while opening it: {display_path}"
+            )
+        _require_file_stability(path_metadata, opened_metadata, display_path)
+
+        def read_once() -> bytes:
+            _operation_checkpoint(
+                operation, f"reading private owner record {display_path}"
+            )
+            try:
+                os.lseek(file_fd, 0, os.SEEK_SET)
+            except OSError as error:
+                raise MirrorSyncError(
+                    f"cannot rewind private owner record {display_path}: {error}"
+                ) from error
+            payload = bytearray()
+            while len(payload) <= MAX_PRIVATE_OWNER_RECORD_BYTES:
+                _operation_checkpoint(
+                    operation,
+                    f"reading private owner record {display_path}",
+                )
+                try:
+                    chunk = os.read(
+                        file_fd,
+                        min(
+                            4096,
+                            MAX_PRIVATE_OWNER_RECORD_BYTES + 1 - len(payload),
+                        ),
+                    )
+                except OSError as error:
+                    raise MirrorSyncError(
+                        f"cannot read private owner record {display_path}: {error}"
+                    ) from error
+                if not chunk:
+                    break
+                _consume_operation_budget(
+                    operation,
+                    byte_count=len(chunk),
+                    label=f"reading private owner record {display_path}",
+                )
+                payload.extend(chunk)
+            if len(payload) > MAX_PRIVATE_OWNER_RECORD_BYTES:
+                raise MirrorSyncError(
+                    f"private owner record exceeds "
+                    f"{MAX_PRIVATE_OWNER_RECORD_BYTES} bytes: {display_path}"
+                )
+            return bytes(payload)
+
+        first_payload = read_once()
+        first_metadata = os.fstat(file_fd)
+        second_payload = read_once()
+        final_metadata = os.fstat(file_fd)
+        _require_file_stability(opened_metadata, first_metadata, display_path)
+        _require_file_stability(first_metadata, final_metadata, display_path)
+        if first_payload != second_payload:
+            raise MirrorSyncError(
+                f"private owner record content changed while reading it: {display_path}"
+            )
+        try:
+            final_path_metadata = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise MirrorSyncError(
+                f"cannot revalidate private owner record {display_path}: {error}"
+            ) from error
+        _require_file_stability(final_metadata, final_path_metadata, display_path)
+        return FileSnapshot(
+            payload=first_payload,
+            mode=stat.S_IMODE(final_metadata.st_mode),
+            identity=_object_identity(final_metadata),
+            access_policy=_access_policy(final_metadata),
+            size=final_metadata.st_size,
+        )
+    finally:
+        if owned_fd >= 0:
+            os.close(owned_fd)
+
+
 def _safe_read_snapshot(
     root: Root,
     relative_path: PurePosixPath,
@@ -4114,6 +6709,7 @@ def _bind_durable_quarantine_root(
     *,
     quarantine_parent: Path | None = None,
     source_parent_fd: int | None = None,
+    create: bool = True,
 ) -> ControlObjectBinding:
     root_path = _root_path(root)
     parent_path = (
@@ -4128,19 +6724,36 @@ def _bind_durable_quarantine_root(
     )
     quarantine_fd = -1
     try:
-        try:
-            os.mkdir(
-                DURABLE_QUARANTINE_ROOT_NAME,
-                0o700,
-                dir_fd=parent.fd,
-            )
-            os.fsync(parent.fd)
-        except FileExistsError:
-            pass
-        except OSError as error:
-            raise MirrorSyncError(
-                f"cannot create durable quarantine root: {error}"
-            ) from error
+        if create:
+            try:
+                os.mkdir(
+                    DURABLE_QUARANTINE_ROOT_NAME,
+                    0o700,
+                    dir_fd=parent.fd,
+                )
+                os.fsync(parent.fd)
+            except FileExistsError:
+                pass
+            except OSError as error:
+                raise MirrorSyncError(
+                    f"cannot create durable quarantine root: {error}"
+                ) from error
+        else:
+            try:
+                os.stat(
+                    DURABLE_QUARANTINE_ROOT_NAME,
+                    dir_fd=parent.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError as error:
+                raise MirrorSyncError(
+                    f"{PRIVATE_CONTROL_REASON_LEGACY_PENDING}: legacy durable "
+                    "quarantine is absent and allocation is forbidden"
+                ) from error
+            except OSError as error:
+                raise MirrorSyncError(
+                    f"cannot inspect non-allocating legacy durable quarantine: {error}"
+                ) from error
         path_metadata = os.stat(
             DURABLE_QUARANTINE_ROOT_NAME,
             dir_fd=parent.fd,
@@ -7407,20 +10020,9 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
         _verify_static_git_profile(root)
         _verify_private_git_object_integrity(root)
         _revalidate_bound_root(root)
-    except BaseException:
+    except BaseException as setup_error:
+        cleanup_errors: list[str] = []
         root.git_control = None
-        os.close(marker.fd)
-        if commondir_file is not None:
-            os.close(commondir_file.fd)
-        closed_source_fds: set[int] = set()
-        for binding in (
-            *source_files,
-            *source_directories,
-            *acquired_source_controls,
-        ):
-            if binding.fd not in closed_source_fds:
-                os.close(binding.fd)
-                closed_source_fds.add(binding.fd)
         if (
             private_parent is not None
             and private is not None
@@ -7450,19 +10052,43 @@ def _ensure_git_control_binding(root: BoundRoot) -> None:
                         private_name,
                         private_cleanup_manifest or None,
                     )
-            finally:
-                if owner_record is not None:
-                    os.close(owner_record.fd)
-                if prepared_private_git_executable is not None:
-                    os.close(prepared_private_git_executable.executable.fd)
-                os.close(private.fd)
-                os.close(private_parent.fd)
-                if root.private_git_executable is prepared_private_git_executable:
-                    root.private_git_executable = None
-        if private_objects is not None:
-            os.close(private_objects.fd)
-        for binding in controls:
-            os.close(binding.fd)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(
+                    "private Git control cleanup: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+        cleanup_errors.extend(
+            _close_control_bindings_best_effort(
+                (
+                    marker,
+                    commondir_file,
+                    *source_files,
+                    *source_directories,
+                    *acquired_source_controls,
+                    private_objects,
+                    owner_record,
+                    (
+                        None
+                        if prepared_private_git_executable is None
+                        else prepared_private_git_executable.executable
+                    ),
+                    private,
+                    *controls,
+                )
+            )
+        )
+        if private_parent is not None:
+            try:
+                _close_private_tool_root(private_parent)
+            except MirrorSyncError as close_error:
+                cleanup_errors.append(f"retained context close: {close_error}")
+        if root.private_git_executable is prepared_private_git_executable:
+            root.private_git_executable = None
+        if cleanup_errors:
+            raise MirrorSyncError(
+                f"{setup_error}; secondary Git control binding cleanup "
+                f"failures: {'; '.join(cleanup_errors)}"
+            ) from setup_error
         raise
 
 

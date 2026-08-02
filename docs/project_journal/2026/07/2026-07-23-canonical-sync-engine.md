@@ -16,16 +16,13 @@ superseded_by:
 
 - Delivery status: `delivery_gate_in_progress`.
 - The workstream is consolidating personal sync ownership in `Joey-Tools/codex-personal-sync` and hardening mirror generation, scheduler observability, active-skill auditing, reconciliation, and release retention.
-- PR #5 remains the canonical delivery vehicle. Append-only head `a902bcf`
-  closed the macOS `/tmp` alias regressions exposed by Ubuntu Python 3.14 CI
-  on signed ownership-merge head
-  `dfa65d17c1468fe393f32ad0fd001e975257c2d5`. Its formal current-range review
-  then found three pre-yield/process-supervision gaps and one Darwin CI gap;
-  the current uncommitted follow-up remediates those findings without
-  rewriting the signed history, merging the PR, generating a consumer, or
-  mutating a host scheduler. Source-lock refresh and verification use a
-  task-private control root because production admission remains blocked by
-  the retained host quarantine at its exact capacity.
+- PR #5 remains the canonical delivery vehicle. The append-only pushed head is
+  signed `0e32a526c04e658745006ea4a7e2bbbf25006c58`; the current uncommitted
+  follow-up closes its formal named-single P2 finding without rewriting signed
+  history, merging the PR, generating a consumer, or mutating a host
+  scheduler. Source-lock refresh and verification use a task-private control
+  root because production admission remains blocked by retained legacy
+  recovery evidence.
 
 ## Scope
 
@@ -40,6 +37,38 @@ superseded_by:
 
 ## Current State
 
+- The private Git control plane now uses an ordered machine-readable registry:
+  allocating `primary-home-v1` under the passwd-derived stable account home,
+  then non-allocating `legacy-shared-v0` at the platform shared temporary
+  parent. The full account-home ancestry is no-follow descriptor-bound and
+  policy-checked. Existing primary home/namespace/tool/quarantine objects are
+  retained across the legacy gate and the complete snapshot-owner lifecycle;
+  a missing fixed object is published from a random bound directory with a
+  no-replace rename and is never adopted after its absence receipt. Foreign
+  legacy children receive two metadata-only passes and are never opened.
+  Same-UID recovery exact-binds and leases the original tool/quarantine roots;
+  an initially absent quarantine plus any tool entry is a conservative
+  zero-mutation `legacy-recovery-pending` result. Parent identity alone
+  deduplicates a whole root. Every distinct-parent child alias is
+  inconclusive. Strict one-way parent/child containment, same-filesystem
+  disjoint tool/quarantine roots, and overlap gates against Git plus primary
+  control objects complete before any stale recovery mutation. Same-UID legacy
+  leases transfer into the primary context and remain held through owner-record
+  publication; pre-allocation, post-primary-bind, and publication-terminal
+  receipt passes cover every registry root, while every exit releases the
+  retained fences exactly once. Scheduler status/doctor consume the same
+  registry, perform their own aggregate-terminal receipt pass and shared
+  topology checks, and never stop coverage at the first result.
+- Private owner-record recovery now uses a descriptor-stable 4096+1-byte hard
+  producer ceiling. Both reads consume the shared operation deadline and byte
+  budget; malformed or oversized records can no longer amplify the generic
+  32-MiB source-reader contract before the 4-KiB schema limit is applied.
+- The installed engine remains a standalone one-file runtime and the mirror
+  generator remains a separate canonical controller. Their necessary dual
+  implementations are guarded as one contract by scenario parity over root
+  schema/order, platform paths, ancestor cap, shared-parent policy, reason
+  codes, ownership classification, and primary-allocation decisions. One-sided
+  private-control changes are explicitly unsupported.
 - The final Darwin archive-workspace follow-up recognizes only the platform's
   exact `/tmp -> /private/tmp` alias, pins that symlink object through a retained
   descriptor until canonical-directory binding and revalidation complete, and
@@ -1096,6 +1125,47 @@ superseded_by:
   compileall, Ruff format/check, and `git diff --check` also passed. Hosted CI,
   exact-head admission, and fresh formal review remain head-bound post-push
   gates rather than evidence for these uncommitted bytes.
+- The named-single P2 follow-up removes the predictable shared temporary
+  allocation root without abandoning its recovery evidence. New allocations
+  use the descriptor-bound passwd account-home namespace; the old shared root
+  is metadata-only for foreign owners and original-root-only for same-UID
+  recovery. Machine parity binds the generator and standalone engine registry,
+  policies, reason codes, ancestor cap, classification, allocation matrix, and
+  the owner-record v1/v2 root-scope matrix. New owner records are closed-field
+  version 2 with exact `root_id`; version 1 is accepted only in
+  `legacy-shared-v0`. Cross-root, missing, extra, and unknown-version scope is
+  retained without mutation as `private-owner-root-mismatch` in both generator
+  and doctor evidence.
+  The automation test runner was upgraded from a one-variable parent patch to
+  an isolated account-home plus RootSpec registry so subprocess tests cannot
+  fall through to production state.
+- The exact five-group remediation audit is clean. It verified close-once
+  descriptor ownership and later-root coverage in the generator and installed
+  engine, body/unlock/close error aggregation, anchored absence and terminal
+  receipt cleanup, and exact legacy owner-root mismatch routing. The final
+  mismatch fix preserves reason precedence as `private-owner-root-mismatch`,
+  then `legacy-recovery-pending`, then generic inconclusive. Its end-to-end
+  test uses a real same-UID legacy wrong-root owner record and proves the
+  primary namespace is not allocated while owner/private evidence and the
+  legacy tool/quarantine entry sets remain unchanged.
+- The final focused remediation/parity matrix passed 25 tests under both the
+  default Python 3.13 and macOS system Python 3.9. Full scheduler/doctor tests
+  passed 149 tests in 17.943 and 20.917 seconds respectively. Full toolbox-sync
+  automation tests passed 28 tests in 270.406 and 289.229 seconds. The first
+  230-test source-lock pass under each runtime had exactly the expected stale
+  lock-currentness error and no functional failure. After the task-private
+  account-home runner refreshed all six sources, both runtimes verified the
+  lock and the complete suite passed from scratch: 230 tests in 830.251 seconds
+  with one expected platform skip under Python 3.13, and 230 tests in 870.800
+  seconds under Python 3.9 with no skips.
+- The refreshed `sync-source-lock.json` SHA-256 is
+  `e42ed82769bc5f5e5cb998a009c4c4e54b50a82bef82d4d9a4a5f822f50803bc`.
+  The canonical engine SHA-256 is
+  `ba433d61f4b5aa8c3e4a17f8365488ca5089c58511e091b32e4bc2ae6b872a8a`,
+  and the generator SHA-256 is
+  `80a7d51804d91b96bae6a2ec3c352fc92fc70cac19640bec992d3b32809f601a`.
+  Hosted CI, exact-head admission, and formal PR review remain head-bound
+  post-push gates and are not claimed for these uncommitted bytes.
 
 ## Installed Host Baseline
 

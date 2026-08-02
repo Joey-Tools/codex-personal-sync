@@ -64,7 +64,7 @@ def snapshot_tree(root: Path) -> tuple[tuple[str, str, int, bytes | str | None],
 class SchedulerDoctorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmpdir = tempfile.TemporaryDirectory(prefix="scheduler-doctor.")
-        self.root = Path(self.tmpdir.name)
+        self.root = Path(os.path.realpath(self.tmpdir.name))
         self.user_home = self.root / "home"
         self.home = self.user_home / ".codex"
         self.home.mkdir(parents=True)
@@ -75,16 +75,36 @@ class SchedulerDoctorTests(unittest.TestCase):
         )
         self.path_home_patch.start()
         self.host_mirror_private_control_parent = MODULE.MIRROR_PRIVATE_CONTROL_PARENT
-        self.mirror_private_control_parent = self.root / "mirror-private-control"
-        self.mirror_private_control_parent.mkdir()
+        self.host_mirror_private_control_root_specs = (
+            MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS
+        )
+        self.mirror_private_control_parent = (
+            self.root / MODULE.MIRROR_PRIVATE_CONTROL_NAMESPACE_NAME
+        )
+        self.mirror_private_control_parent.mkdir(mode=0o700)
         self.mirror_private_control_parent_patch = mock.patch.object(
             MODULE,
             "MIRROR_PRIVATE_CONTROL_PARENT",
             self.mirror_private_control_parent,
         )
         self.mirror_private_control_parent_patch.start()
+        self.mirror_private_control_root_specs_patch = mock.patch.object(
+            MODULE,
+            "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+            (
+                MODULE.MirrorPrivateControlRootSpec(
+                    root_id="test-primary-home-v1",
+                    parent_path=self.mirror_private_control_parent,
+                    allocate=True,
+                    account_home=self.root,
+                    shared_parent=False,
+                ),
+            ),
+        )
+        self.mirror_private_control_root_specs_patch.start()
 
     def tearDown(self) -> None:
+        self.mirror_private_control_root_specs_patch.stop()
         self.mirror_private_control_parent_patch.stop()
         self.path_home_patch.stop()
         self.tmpdir.cleanup()
@@ -937,25 +957,9 @@ class SchedulerDoctorTests(unittest.TestCase):
                 "release_integrity": [],
                 "quarantine_batches": 0,
                 "quarantine_limit": MODULE.MAX_RETAINED_QUARANTINE_BATCHES,
-                "mirror_quarantine": {
-                    "classification": "absent",
-                    "path": str(
-                        self.mirror_private_control_parent
-                        / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
-                    ),
-                    "entry_count": 0,
-                    "entry_limit": (MODULE.MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT),
-                    "segment_name": (MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME),
-                    "segment_entry_count": 0,
-                    "segment_entry_limit": (
-                        MODULE.MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT
-                    ),
-                    "count_is_lower_bound": False,
-                    "segment_identity": None,
-                    "segment_access_policy": None,
-                    "owner_records": [],
-                    "detail": None,
-                },
+                "mirror_quarantine": MODULE._mirror_quarantine_payload(
+                    report.mirror_quarantine
+                ),
                 "failure_code": None,
                 "failure_reason": "network unavailable",
                 "daemon_query": {
@@ -8706,7 +8710,8 @@ class SchedulerDoctorTests(unittest.TestCase):
         owner_path.write_text(
             json.dumps(
                 {
-                    "version": 1,
+                    "version": MODULE.MIRROR_PRIVATE_OWNER_RECORD_VERSION,
+                    "root_id": MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS[0].root_id,
                     "owner_pid": os.getpid(),
                     "owner_uid": os.geteuid(),
                     "owner_gid": os.getegid(),
@@ -8723,17 +8728,17 @@ class SchedulerDoctorTests(unittest.TestCase):
         )
         owner_path.chmod(0o600)
         before = snapshot_tree(self.mirror_private_control_parent)
-        real_bind = MODULE._bind_mirror_audit_directory
+        real_bind = MODULE._bind_mirror_primary_control_parent
         observed_bind_paths = []
 
-        def reject_default_host_parent(path, label):
-            candidate = Path(os.path.abspath(path))
+        def reject_default_host_parent(spec):
+            candidate = Path(os.path.abspath(spec.parent_path))
             self.assertNotEqual(
                 candidate,
                 self.host_mirror_private_control_parent,
             )
             observed_bind_paths.append(candidate)
-            return real_bind(path, label)
+            return real_bind(spec)
 
         doctor_output = io.StringIO()
         strict_output = io.StringIO()
@@ -8745,7 +8750,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             ),
             mock.patch.object(
                 MODULE,
-                "_bind_mirror_audit_directory",
+                "_bind_mirror_primary_control_parent",
                 side_effect=reject_default_host_parent,
             ),
         ):
@@ -8812,6 +8817,8 @@ class SchedulerDoctorTests(unittest.TestCase):
             [
                 self.mirror_private_control_parent,
                 self.mirror_private_control_parent,
+                self.mirror_private_control_parent,
+                self.mirror_private_control_parent,
             ],
         )
         self.assertEqual(
@@ -8848,13 +8855,832 @@ class SchedulerDoctorTests(unittest.TestCase):
             audit.detail,
         )
         self.assertIn(
-            "mirror-quarantine-audit-inconclusive",
+            MODULE.MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE,
             {code for code, _detail in report.failures},
         )
         self.assertEqual(
             snapshot_tree(self.mirror_private_control_parent),
             before,
         )
+
+    def test_mirror_quarantine_registry_skips_foreign_legacy_without_opening_it(
+        self,
+    ) -> None:
+        shared_parent = self.root / "legacy-shared-parent"
+        shared_parent.mkdir(mode=0o700)
+        shared_parent.chmod(0o1777)
+        preclaimed = shared_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        preclaimed.mkdir(mode=0o700)
+        preclaimed.chmod(0o000)
+        before = preclaimed.lstat()
+        primary_spec = MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS[0]
+        legacy_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id=MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        real_metadata = MODULE._mirror_legacy_child_metadata
+        real_bind_child = MODULE._bind_mirror_audit_child_directory
+        legacy_child_opens = []
+        legacy_metadata_calls: dict[str, int] = {}
+
+        def classify_preclaim_as_foreign(parent_fd, name, root_id):
+            legacy_metadata_calls[name] = legacy_metadata_calls.get(name, 0) + 1
+            observed = real_metadata(parent_fd, name, root_id)
+            if name == MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME and observed is not None:
+                identity, access_policy = observed
+                return identity, (
+                    access_policy[0],
+                    os.geteuid() + 1,
+                    access_policy[2],
+                )
+            return observed
+
+        def reject_legacy_child_open(parent_fd, parent_path, name, label):
+            if parent_path == shared_parent:
+                legacy_child_opens.append(name)
+                self.fail(f"foreign legacy child was opened: {name}")
+            return real_bind_child(parent_fd, parent_path, name, label)
+
+        observed_after = None
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                    (primary_spec, legacy_spec),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_mirror_legacy_shared_parent_policy_is_valid",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_mirror_legacy_child_metadata",
+                    side_effect=classify_preclaim_as_foreign,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_bind_mirror_audit_child_directory",
+                    side_effect=reject_legacy_child_open,
+                ),
+            ):
+                audit = MODULE._mirror_quarantine_audit()
+            observed_after = preclaimed.lstat()
+        finally:
+            preclaimed.chmod(0o700)
+
+        self.assertEqual(audit.classification, "absent")
+        self.assertEqual(
+            [root.root_id for root in audit.root_audits],
+            [primary_spec.root_id, legacy_spec.root_id],
+        )
+        self.assertEqual(audit.root_audits[1].classification, "foreign-unrelated")
+        self.assertEqual(
+            legacy_metadata_calls,
+            {
+                MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME: 3,
+                MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME: 3,
+            },
+        )
+        payload = MODULE._mirror_quarantine_payload(audit)
+        assert payload is not None
+        self.assertEqual(payload["roots"][1]["root_id"], legacy_spec.root_id)
+        self.assertEqual(legacy_child_opens, [])
+        assert observed_after is not None
+        self.assertEqual(
+            (
+                observed_after.st_dev,
+                observed_after.st_ino,
+                stat.S_IMODE(observed_after.st_mode),
+            ),
+            (before.st_dev, before.st_ino, stat.S_IMODE(before.st_mode)),
+        )
+
+    def test_mirror_quarantine_terminal_revalidation_covers_every_root(
+        self,
+    ) -> None:
+        primary_spec = MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS[0]
+        legacy_specs = []
+        for index in range(2):
+            parent = self.root / f"terminal-legacy-{index}"
+            parent.mkdir(mode=0o700)
+            legacy_specs.append(
+                MODULE.MirrorPrivateControlRootSpec(
+                    root_id=f"terminal-legacy-{index}",
+                    parent_path=parent,
+                    allocate=False,
+                    account_home=None,
+                    shared_parent=True,
+                )
+            )
+        early_tool = legacy_specs[0].parent_path / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        early_tool.mkdir(mode=0o700)
+        real_root_audit = MODULE._mirror_quarantine_root_audit
+        real_metadata = MODULE._mirror_legacy_child_metadata
+        metadata_calls: dict[tuple[str, str], int] = {}
+        mutated = False
+
+        def count_metadata(parent_fd, name, root_id):
+            key = (root_id, name)
+            metadata_calls[key] = metadata_calls.get(key, 0) + 1
+            return real_metadata(parent_fd, name, root_id)
+
+        def mutate_early_root_after_last_audit(
+            spec,
+            seen_parent_identities=None,
+            seen_child_identities=None,
+        ):
+            nonlocal mutated
+            root_audit = real_root_audit(
+                spec,
+                seen_parent_identities,
+                seen_child_identities,
+            )
+            if spec.root_id == legacy_specs[-1].root_id:
+                early_tool.chmod(0o755)
+                mutated = True
+            return root_audit
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                (primary_spec, *legacy_specs),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_legacy_shared_parent_policy_is_valid",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_legacy_child_metadata",
+                side_effect=count_metadata,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_quarantine_root_audit",
+                side_effect=mutate_early_root_after_last_audit,
+            ),
+        ):
+            audit = MODULE._mirror_quarantine_audit()
+
+        self.assertTrue(mutated)
+        self.assertEqual(audit.classification, "inconclusive")
+        self.assertEqual(
+            audit.reason_code,
+            MODULE.MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE,
+        )
+        self.assertIn(
+            "terminal mirror quarantine registry revalidation covered every root",
+            audit.detail,
+        )
+        for spec in (primary_spec, *legacy_specs):
+            self.assertIn(spec.root_id, audit.detail)
+        self.assertEqual(audit.root_audits[1].classification, "inconclusive")
+        self.assertGreaterEqual(
+            metadata_calls[
+                (
+                    legacy_specs[-1].root_id,
+                    MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME,
+                )
+            ],
+            3,
+        )
+
+    def test_mirror_quarantine_terminal_revalidates_absent_parent_anchor(
+        self,
+    ) -> None:
+        primary_spec = MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS[0]
+        absent_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id="terminal-absent-legacy",
+            parent_path=self.root / "terminal-absent-legacy",
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        last_parent = self.root / "terminal-last-legacy"
+        last_parent.mkdir(mode=0o700)
+        last_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id="terminal-last-legacy",
+            parent_path=last_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        real_root_audit = MODULE._mirror_quarantine_root_audit
+
+        def create_absent_parent_after_last_audit(
+            spec,
+            seen_parent_identities=None,
+            seen_child_identities=None,
+        ):
+            root_audit = real_root_audit(
+                spec,
+                seen_parent_identities,
+                seen_child_identities,
+            )
+            if spec.root_id == last_spec.root_id:
+                absent_spec.parent_path.mkdir(mode=0o700)
+            return root_audit
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                (primary_spec, absent_spec, last_spec),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_legacy_shared_parent_policy_is_valid",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_quarantine_root_audit",
+                side_effect=create_absent_parent_after_last_audit,
+            ),
+        ):
+            audit = MODULE._mirror_quarantine_audit()
+
+        self.assertEqual(audit.classification, "inconclusive")
+        self.assertEqual(
+            audit.reason_code,
+            MODULE.MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE,
+        )
+        self.assertIn(absent_spec.root_id, audit.detail)
+        self.assertIn("is no longer absent", audit.detail)
+
+    def test_mirror_quarantine_terminal_revalidates_primary_absence_anchor(
+        self,
+    ) -> None:
+        account_home = self.root / "terminal-primary-home"
+        account_home.mkdir(mode=0o700)
+        primary_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id="terminal-absent-primary",
+            parent_path=(account_home / MODULE.MIRROR_PRIVATE_CONTROL_NAMESPACE_NAME),
+            allocate=True,
+            account_home=account_home,
+            shared_parent=False,
+        )
+        last_parent = self.root / "terminal-primary-last-legacy"
+        last_parent.mkdir(mode=0o700)
+        last_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id="terminal-primary-last-legacy",
+            parent_path=last_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        real_root_audit = MODULE._mirror_quarantine_root_audit
+
+        def create_primary_parent_after_last_audit(
+            spec,
+            seen_parent_identities=None,
+            seen_child_identities=None,
+        ):
+            root_audit = real_root_audit(
+                spec,
+                seen_parent_identities,
+                seen_child_identities,
+            )
+            if spec.root_id == last_spec.root_id:
+                primary_spec.parent_path.mkdir(mode=0o700)
+            return root_audit
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                (primary_spec, last_spec),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_legacy_shared_parent_policy_is_valid",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_quarantine_root_audit",
+                side_effect=create_primary_parent_after_last_audit,
+            ),
+        ):
+            audit = MODULE._mirror_quarantine_audit()
+
+        self.assertEqual(audit.classification, "inconclusive")
+        self.assertEqual(
+            audit.reason_code,
+            MODULE.MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE,
+        )
+        self.assertIn(primary_spec.root_id, audit.detail)
+        self.assertIn("is no longer absent", audit.detail)
+
+    def test_mirror_quarantine_terminal_duplicate_revalidates_only_parent(
+        self,
+    ) -> None:
+        primary_spec = MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS[0]
+        shared_parent = self.root / "terminal-duplicate-parent"
+        shared_parent.mkdir(mode=0o700)
+        first_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id="terminal-original-legacy",
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        duplicate_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id="terminal-duplicate-legacy",
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        real_metadata = MODULE._mirror_legacy_child_metadata
+        real_bind_child = MODULE._bind_mirror_audit_child_directory
+        metadata_root_ids: list[str] = []
+        duplicate_child_opens: list[str] = []
+
+        def record_metadata_root(parent_fd, name, root_id):
+            metadata_root_ids.append(root_id)
+            return real_metadata(parent_fd, name, root_id)
+
+        def reject_duplicate_child_open(parent_fd, parent_path, name, label):
+            if parent_path == shared_parent:
+                duplicate_child_opens.append(name)
+                self.fail(f"duplicate root child was opened: {name}")
+            return real_bind_child(parent_fd, parent_path, name, label)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                (primary_spec, first_spec, duplicate_spec),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_legacy_shared_parent_policy_is_valid",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_legacy_child_metadata",
+                side_effect=record_metadata_root,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_bind_mirror_audit_child_directory",
+                side_effect=reject_duplicate_child_open,
+            ),
+        ):
+            audit = MODULE._mirror_quarantine_audit()
+
+        self.assertEqual(audit.root_audits[2].classification, "duplicate")
+        self.assertNotIn(duplicate_spec.root_id, metadata_root_ids)
+        self.assertEqual(duplicate_child_opens, [])
+
+    def test_mirror_quarantine_foreign_topology_is_metadata_only(self) -> None:
+        primary_spec = MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS[0]
+        real_metadata = MODULE._mirror_legacy_child_metadata
+        real_bind_child = MODULE._bind_mirror_audit_child_directory
+        for topology_case in ("different-device", "inverted-containment"):
+            with self.subTest(topology_case=topology_case):
+                shared_parent = self.root / f"foreign-topology-{topology_case}"
+                shared_parent.mkdir(mode=0o700)
+                tool = shared_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+                quarantine = shared_parent / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+                tool.mkdir(mode=0o700)
+                quarantine.mkdir(mode=0o700)
+                legacy_spec = MODULE.MirrorPrivateControlRootSpec(
+                    root_id=f"foreign-topology-{topology_case}",
+                    parent_path=shared_parent,
+                    allocate=False,
+                    account_home=None,
+                    shared_parent=True,
+                )
+                ancestor_identity = MODULE._mirror_object_identity(
+                    shared_parent.parent.stat()
+                )
+                child_opens: list[str] = []
+
+                def foreign_topology_metadata(parent_fd, name, root_id):
+                    observed = real_metadata(parent_fd, name, root_id)
+                    assert observed is not None
+                    identity, access_policy = observed
+                    if (
+                        topology_case == "different-device"
+                        and name == MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+                    ):
+                        identity = (identity[0] + 1, identity[1], identity[2])
+                    elif (
+                        topology_case == "inverted-containment"
+                        and name == MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+                    ):
+                        identity = ancestor_identity
+                    return identity, (
+                        access_policy[0],
+                        os.geteuid() + 1,
+                        access_policy[2],
+                    )
+
+                def reject_foreign_child_open(parent_fd, parent_path, name, label):
+                    if parent_path == shared_parent:
+                        child_opens.append(name)
+                        self.fail(f"foreign topology child was opened: {name}")
+                    return real_bind_child(parent_fd, parent_path, name, label)
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                        (primary_spec, legacy_spec),
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_mirror_legacy_shared_parent_policy_is_valid",
+                        return_value=True,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_mirror_legacy_child_metadata",
+                        side_effect=foreign_topology_metadata,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_bind_mirror_audit_child_directory",
+                        side_effect=reject_foreign_child_open,
+                    ),
+                ):
+                    audit = MODULE._mirror_quarantine_audit()
+
+                self.assertEqual(audit.classification, "absent")
+                self.assertEqual(
+                    audit.root_audits[1].classification,
+                    "foreign-unrelated",
+                )
+                self.assertEqual(
+                    MODULE._mirror_private_control_preallocation_decision(
+                        ("foreign-unrelated",)
+                    ),
+                    (True, None),
+                )
+                self.assertEqual(child_opens, [])
+
+    def test_mirror_quarantine_bound_topology_requires_child_below_parent(
+        self,
+    ) -> None:
+        parent = self.root / "bound-topology-parent"
+        child = parent / "bound-topology-child"
+        child.mkdir(parents=True, mode=0o700)
+        parent_fd = os.open(parent, MODULE._source_directory_flags())
+        child_fd = os.open(child, MODULE._source_directory_flags())
+        try:
+            parent_identity = MODULE._mirror_object_identity(os.fstat(parent_fd))
+            child_identity = MODULE._mirror_object_identity(os.fstat(child_fd))
+            MODULE._validate_mirror_private_control_bound_topology(
+                root_id="valid-topology",
+                parent_fd=parent_fd,
+                parent_identity=parent_identity,
+                tool_fd=child_fd,
+                tool_identity=child_identity,
+            )
+            with self.assertRaisesRegex(MODULE.SyncError, "strict descendant"):
+                MODULE._validate_mirror_private_control_bound_topology(
+                    root_id="inverted-topology",
+                    parent_fd=child_fd,
+                    parent_identity=child_identity,
+                    tool_fd=parent_fd,
+                    tool_identity=parent_identity,
+                )
+        finally:
+            os.close(child_fd)
+            os.close(parent_fd)
+
+    def test_mirror_quarantine_bound_topology_requires_same_filesystem(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(
+                MODULE,
+                "_mirror_directory_is_at_or_below",
+                side_effect=(True, False, True, False),
+            ),
+            mock.patch.object(
+                MODULE.os,
+                "fstat",
+                side_effect=(mock.Mock(st_dev=1), mock.Mock(st_dev=2)),
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "same filesystem"),
+        ):
+            MODULE._validate_mirror_private_control_bound_topology(
+                root_id="same-uid-legacy",
+                parent_fd=10,
+                parent_identity=(1, 10, stat.S_IFDIR),
+                tool_fd=11,
+                tool_identity=(1, 11, stat.S_IFDIR),
+                quarantine_fd=12,
+                quarantine_identity=(2, 12, stat.S_IFDIR),
+            )
+
+    def test_mirror_quarantine_same_uid_legacy_topology_fails_before_scan(
+        self,
+    ) -> None:
+        shared_parent = self.root / "same-uid-topology-parent"
+        shared_parent.mkdir(mode=0o700)
+        (shared_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME).mkdir(mode=0o700)
+        (shared_parent / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME).mkdir(mode=0o700)
+        primary_spec = MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS[0]
+        legacy_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id="same-uid-topology-legacy",
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        real_validate = MODULE._validate_mirror_private_control_bound_topology
+
+        def reject_same_uid_combined_topology(**kwargs):
+            if (
+                kwargs["root_id"] == legacy_spec.root_id
+                and kwargs.get("quarantine_fd", -1) >= 0
+            ):
+                raise MODULE.SyncError("synthetic same-uid legacy topology failure")
+            return real_validate(**kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                (primary_spec, legacy_spec),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_legacy_shared_parent_policy_is_valid",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_validate_mirror_private_control_bound_topology",
+                side_effect=reject_same_uid_combined_topology,
+            ),
+            mock.patch.object(MODULE, "_bounded_mirror_directory_names") as inventory,
+        ):
+            audit = MODULE._mirror_quarantine_audit()
+
+        self.assertEqual(audit.classification, "inconclusive")
+        self.assertIn("synthetic same-uid legacy topology failure", audit.detail)
+        inventory.assert_not_called()
+
+    def test_mirror_quarantine_does_not_scan_before_full_topology_validation(
+        self,
+    ) -> None:
+        tool = self.mirror_private_control_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        quarantine = (
+            self.mirror_private_control_parent
+            / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+        )
+        tool.mkdir(mode=0o700)
+        quarantine.mkdir(mode=0o700)
+        real_validate = MODULE._validate_mirror_private_control_bound_topology
+
+        def reject_combined_topology(**kwargs):
+            if kwargs.get("quarantine_fd", -1) >= 0:
+                raise MODULE.SyncError("synthetic fixed-root overlap")
+            return real_validate(**kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_validate_mirror_private_control_bound_topology",
+                side_effect=reject_combined_topology,
+            ),
+            mock.patch.object(MODULE, "_bounded_mirror_directory_names") as inventory,
+        ):
+            audit = MODULE._mirror_quarantine_audit()
+
+        self.assertEqual(audit.classification, "inconclusive")
+        self.assertIn("synthetic fixed-root overlap", audit.detail)
+        inventory.assert_not_called()
+
+    def test_mirror_quarantine_terminal_allows_benign_child_entry_churn(
+        self,
+    ) -> None:
+        tool = self.mirror_private_control_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        quarantine = (
+            self.mirror_private_control_parent
+            / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+        )
+        tool.mkdir(mode=0o700)
+        quarantine.mkdir(mode=0o700)
+        primary_spec = MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS[0]
+        last_parent = self.root / "benign-churn-last-root"
+        last_parent.mkdir(mode=0o700)
+        last_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id="benign-churn-last-root",
+            parent_path=last_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        real_root_audit = MODULE._mirror_quarantine_root_audit
+
+        def add_benign_entry_after_last_audit(
+            spec,
+            seen_parent_identities=None,
+            seen_child_identities=None,
+        ):
+            root_audit = real_root_audit(
+                spec,
+                seen_parent_identities,
+                seen_child_identities,
+            )
+            if spec.root_id == last_spec.root_id:
+                (tool / "benign-child-entry").mkdir(mode=0o700)
+            return root_audit
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                (primary_spec, last_spec),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_legacy_shared_parent_policy_is_valid",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_quarantine_root_audit",
+                side_effect=add_benign_entry_after_last_audit,
+            ),
+        ):
+            audit = MODULE._mirror_quarantine_audit()
+
+        self.assertNotEqual(audit.classification, "inconclusive")
+
+    def test_mirror_quarantine_registry_reports_same_uid_legacy_pending(
+        self,
+    ) -> None:
+        shared_parent = self.root / "legacy-current-parent"
+        shared_parent.mkdir(mode=0o700)
+        shared_parent.chmod(0o1777)
+        (shared_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME).mkdir(mode=0o700)
+        quarantine = shared_parent / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+        quarantine.mkdir(mode=0o700)
+        evidence = quarantine / "retained-evidence"
+        evidence.write_bytes(b"retained\n")
+        evidence.chmod(0o600)
+        primary_spec = MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS[0]
+        legacy_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id=MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        before = snapshot_tree(shared_parent)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                (primary_spec, legacy_spec),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_legacy_shared_parent_policy_is_valid",
+                return_value=True,
+            ),
+        ):
+            audit = MODULE._mirror_quarantine_audit()
+
+        self.assertEqual(audit.classification, "inconclusive")
+        self.assertEqual(
+            audit.reason_code,
+            MODULE.MIRROR_PRIVATE_CONTROL_REASON_LEGACY_PENDING,
+        )
+        self.assertEqual(audit.root_id, legacy_spec.root_id)
+        self.assertEqual(audit.entry_count, 1)
+        self.assertIn("original root", audit.detail)
+        self.assertEqual(snapshot_tree(shared_parent), before)
+
+    def test_mirror_primary_alias_matrix_is_rejected_before_child_open(
+        self,
+    ) -> None:
+        tool = self.mirror_private_control_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        quarantine = (
+            self.mirror_private_control_parent
+            / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+        )
+        tool.mkdir(mode=0o700)
+        quarantine.mkdir(mode=0o700)
+        parent_identity = MODULE._mirror_object_identity(
+            self.mirror_private_control_parent.stat()
+        )
+        real_metadata = MODULE._mirror_private_control_child_metadata
+        real_bind_child = MODULE._bind_mirror_audit_child_directory
+
+        for scenario in ("parent-child", "child-child"):
+            with self.subTest(scenario=scenario):
+                tool_record = None
+                child_opens: list[str] = []
+
+                def aliased_metadata(parent_fd, name, label):
+                    nonlocal tool_record
+                    observed = real_metadata(parent_fd, name, label)
+                    assert observed is not None
+                    if name == MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME:
+                        tool_record = observed
+                        if scenario == "parent-child":
+                            return parent_identity, observed[1]
+                        return observed
+                    if scenario == "child-child":
+                        assert tool_record is not None
+                        return tool_record
+                    return observed
+
+                def reject_child_open(parent_fd, parent_path, name, label):
+                    if name in {
+                        MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME,
+                        MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+                    }:
+                        child_opens.append(name)
+                        self.fail(f"aliased mirror child was opened: {name}")
+                    return real_bind_child(parent_fd, parent_path, name, label)
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_mirror_private_control_child_metadata",
+                        side_effect=aliased_metadata,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_bind_mirror_audit_child_directory",
+                        side_effect=reject_child_open,
+                    ),
+                ):
+                    audit = MODULE._mirror_quarantine_audit()
+
+                self.assertEqual(audit.classification, "inconclusive")
+                self.assertEqual(
+                    audit.reason_code,
+                    MODULE.MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE,
+                )
+                self.assertRegex(
+                    audit.detail,
+                    "fixed child roles alias|fixed child aliases its own parent",
+                )
+                self.assertEqual(child_opens, [])
+
+    def test_mirror_legacy_quarantine_without_tool_is_recovery_pending(
+        self,
+    ) -> None:
+        shared_parent = self.root / "legacy-quarantine-without-tool"
+        shared_parent.mkdir(mode=0o700)
+        quarantine = shared_parent / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+        quarantine.mkdir(mode=0o700)
+        primary_spec = MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS[0]
+        legacy_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id=MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        before = snapshot_tree(shared_parent)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                (primary_spec, legacy_spec),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_legacy_shared_parent_policy_is_valid",
+                return_value=True,
+            ),
+        ):
+            audit = MODULE._mirror_quarantine_audit()
+
+        self.assertEqual(audit.classification, "inconclusive")
+        self.assertEqual(
+            audit.reason_code,
+            MODULE.MIRROR_PRIVATE_CONTROL_REASON_LEGACY_PENDING,
+        )
+        legacy_audit = audit.root_audits[1]
+        self.assertEqual(legacy_audit.classification, "inconclusive")
+        self.assertEqual(
+            legacy_audit.reason_code,
+            MODULE.MIRROR_PRIVATE_CONTROL_REASON_LEGACY_PENDING,
+        )
+        self.assertIn("without its coordination tool root", legacy_audit.detail)
+        self.assertEqual(snapshot_tree(shared_parent), before)
 
     def test_mirror_quarantine_audit_holds_directory_leases_without_mutation(
         self,
@@ -8876,6 +9702,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             json.dumps(
                 {
                     "version": MODULE.MIRROR_PRIVATE_OWNER_RECORD_VERSION,
+                    "root_id": MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS[0].root_id,
                     "owner_pid": os.getpid(),
                     "owner_uid": os.geteuid(),
                     "owner_gid": os.getegid(),
@@ -8934,6 +9761,555 @@ class SchedulerDoctorTests(unittest.TestCase):
         self.assertEqual(
             snapshot_tree(self.mirror_private_control_parent),
             before,
+        )
+
+    def test_mirror_quarantine_audit_retains_cross_root_owner_record(self) -> None:
+        tool_root = (
+            self.mirror_private_control_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        )
+        quarantine = (
+            self.mirror_private_control_parent
+            / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+        )
+        tool_root.mkdir(mode=0o700)
+        quarantine.mkdir(mode=0o700)
+        private_name = (
+            f"sync-canonical-git-control.{os.getpid()}.cccccccccccccccccccccccccccccccc"
+        )
+        owner_path = tool_root / f"{private_name}.owner.json"
+        owner_path.write_text(
+            json.dumps(
+                {
+                    "version": MODULE.MIRROR_PRIVATE_OWNER_RECORD_VERSION,
+                    "root_id": "wrong-primary-root-v9",
+                    "owner_pid": os.getpid(),
+                    "owner_uid": os.geteuid(),
+                    "owner_gid": os.getegid(),
+                    "owner_nonce": "dddddddddddddddddddddddddddddddd",
+                    "phase": "cleanup",
+                    "private_name": private_name,
+                    "private_identity": [123, 456, stat.S_IFDIR],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        owner_path.chmod(0o600)
+        before = snapshot_tree(self.mirror_private_control_parent)
+
+        audit = MODULE._mirror_quarantine_audit()
+
+        self.assertEqual(audit.classification, "inconclusive")
+        self.assertEqual(
+            audit.reason_code,
+            MODULE.MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+        )
+        self.assertEqual(len(audit.owner_records), 1)
+        self.assertEqual(
+            audit.owner_records[0].reason_code,
+            MODULE.MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+        )
+        self.assertEqual(
+            snapshot_tree(self.mirror_private_control_parent),
+            before,
+        )
+
+        report = MODULE.scheduler_report(self.home, "linux")
+        report_audit = report.mirror_quarantine
+        assert report_audit is not None
+        failure_detail = MODULE._mirror_quarantine_failure_detail(report_audit)
+        self.assertIn(
+            (
+                MODULE.MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+                failure_detail,
+            ),
+            report.failures,
+        )
+        with (
+            mock.patch.object(MODULE, "scheduler_report", return_value=report),
+            mock.patch.object(MODULE, "audit_active_skills", return_value=[]),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            _doctor_report, issues = MODULE.doctor(
+                self.home,
+                "linux",
+                json_output=True,
+            )
+
+        matching = [issue for issue in issues if issue.detail == failure_detail]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(
+            matching[0].code,
+            MODULE.MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+        )
+        self.assertEqual(matching[0].path, report_audit.path)
+        self.assertNotEqual(matching[0].path, self.home)
+        self.assertNotIn(
+            "scheduler-failure",
+            {issue.code for issue in matching},
+        )
+
+    def test_mirror_walkers_transfer_fd_before_effectful_close_error(self) -> None:
+        real_close = MODULE.os.close
+
+        def invoke_ancestry() -> None:
+            candidate_fd = os.open(
+                self.mirror_private_control_parent,
+                MODULE._source_directory_flags(),
+            )
+            try:
+                MODULE._mirror_directory_is_at_or_below(
+                    candidate_fd,
+                    (-1, -1, stat.S_IFDIR),
+                    label="fault-injected candidate",
+                )
+            finally:
+                os.close(candidate_fd)
+
+        for label, invoke in (
+            (
+                "account-home",
+                lambda: MODULE._bind_mirror_trusted_account_home(self.root),
+            ),
+            ("ancestry", invoke_ancestry),
+        ):
+            with self.subTest(label=label):
+                close_calls: list[int] = []
+                failed_fd: int | None = None
+
+                def fail_first_close_after_effect(descriptor: int) -> None:
+                    nonlocal failed_fd
+                    close_calls.append(descriptor)
+                    real_close(descriptor)
+                    if failed_fd is None:
+                        failed_fd = descriptor
+                        raise OSError(f"injected {label} close-after-effect")
+
+                with (
+                    mock.patch.object(
+                        MODULE.os,
+                        "close",
+                        side_effect=fail_first_close_after_effect,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        f"injected {label} close-after-effect",
+                    ),
+                ):
+                    invoke()
+
+                assert failed_fd is not None
+                self.assertEqual(close_calls.count(failed_fd), 1)
+                self.assertGreaterEqual(len(set(close_calls)), 2)
+
+    def test_owner_audit_aggregates_unlock_and_effectful_close_errors(self) -> None:
+        tool_root = (
+            self.mirror_private_control_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        )
+        tool_root.mkdir(mode=0o700)
+        private_name = (
+            f"sync-canonical-git-control.{os.getpid()}.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        )
+        owner_name = f"{private_name}.owner.json"
+        owner_path = tool_root / owner_name
+        owner_path.write_text(
+            json.dumps(
+                {
+                    "version": MODULE.MIRROR_PRIVATE_OWNER_RECORD_VERSION,
+                    "root_id": MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS[0].root_id,
+                    "owner_pid": os.getpid(),
+                    "owner_uid": os.geteuid(),
+                    "owner_gid": os.getegid(),
+                    "owner_nonce": "ffffffffffffffffffffffffffffffff",
+                    "phase": "cleanup",
+                    "private_name": private_name,
+                    "private_identity": [123, 456, stat.S_IFDIR],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        owner_path.chmod(0o600)
+        owner_identity = MODULE._mirror_object_identity(owner_path.stat())
+        tool_fd = os.open(tool_root, MODULE._source_directory_flags())
+        real_flock = MODULE.fcntl.flock
+        real_close = MODULE.os.close
+        owner_close_calls: list[int] = []
+
+        def fail_owner_unlock(descriptor: int, operation: int) -> None:
+            if (
+                operation == MODULE.fcntl.LOCK_UN
+                and MODULE._mirror_object_identity(os.fstat(descriptor))
+                == owner_identity
+            ):
+                raise OSError("injected owner unlock failure")
+            real_flock(descriptor, operation)
+
+        def fail_owner_close_after_effect(descriptor: int) -> None:
+            descriptor_identity = MODULE._mirror_object_identity(os.fstat(descriptor))
+            real_close(descriptor)
+            if descriptor_identity == owner_identity:
+                owner_close_calls.append(descriptor)
+                raise OSError("injected owner close-after-effect")
+
+        try:
+            with (
+                mock.patch.object(
+                    MODULE.fcntl,
+                    "flock",
+                    side_effect=fail_owner_unlock,
+                ),
+                mock.patch.object(
+                    MODULE.os,
+                    "close",
+                    side_effect=fail_owner_close_after_effect,
+                ),
+                self.assertRaises(MODULE.SyncError) as caught,
+            ):
+                MODULE._audit_mirror_owner_record(
+                    tool_fd,
+                    owner_name,
+                    MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS[0].root_id,
+                )
+        finally:
+            os.close(tool_fd)
+
+        self.assertIn("injected owner unlock failure", str(caught.exception))
+        self.assertIn("injected owner close-after-effect", str(caught.exception))
+        self.assertEqual(len(owner_close_calls), 1)
+
+    def test_initial_root_cleanup_failure_does_not_skip_later_roots(self) -> None:
+        tool_root = (
+            self.mirror_private_control_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        )
+        quarantine = (
+            self.mirror_private_control_parent
+            / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+        )
+        tool_root.mkdir(mode=0o700)
+        quarantine.mkdir(mode=0o700)
+        quarantine_identity = MODULE._mirror_object_identity(quarantine.stat())
+        primary_spec = MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS[0]
+        legacy_specs = []
+        for index in range(2):
+            parent = self.root / f"cleanup-later-root-{index}"
+            parent.mkdir(mode=0o700)
+            legacy_specs.append(
+                MODULE.MirrorPrivateControlRootSpec(
+                    root_id=f"cleanup-later-root-{index}",
+                    parent_path=parent,
+                    allocate=False,
+                    account_home=None,
+                    shared_parent=True,
+                )
+            )
+        real_acquire = MODULE._acquire_mirror_audit_shared_lock
+        real_close = MODULE.os.close
+        cleanup_enabled = False
+        failed_fds: list[int] = []
+
+        def enable_fault_after_quarantine_lease(descriptor: int, label: str) -> None:
+            nonlocal cleanup_enabled
+            real_acquire(descriptor, label)
+            if label == "mirror durable quarantine segment":
+                cleanup_enabled = True
+
+        def fail_quarantine_close_after_effect(descriptor: int) -> None:
+            descriptor_identity = MODULE._mirror_object_identity(os.fstat(descriptor))
+            real_close(descriptor)
+            if (
+                cleanup_enabled
+                and descriptor_identity == quarantine_identity
+                and not failed_fds
+            ):
+                failed_fds.append(descriptor)
+                raise OSError("injected initial-root close-after-effect")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                (primary_spec, *legacy_specs),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_legacy_shared_parent_policy_is_valid",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_acquire_mirror_audit_shared_lock",
+                side_effect=enable_fault_after_quarantine_lease,
+            ),
+            mock.patch.object(
+                MODULE.os,
+                "close",
+                side_effect=fail_quarantine_close_after_effect,
+            ),
+        ):
+            audit = MODULE._mirror_quarantine_audit()
+
+        self.assertEqual(len(failed_fds), 1)
+        self.assertEqual(
+            [root.root_id for root in audit.root_audits],
+            [primary_spec.root_id, *(spec.root_id for spec in legacy_specs)],
+        )
+        self.assertEqual(audit.root_audits[0].classification, "inconclusive")
+        self.assertIn("injected initial-root close-after-effect", audit.detail)
+        for spec in legacy_specs:
+            self.assertIn(spec.root_id, audit.detail)
+
+    def test_absence_and_terminal_close_failures_retain_body_and_coverage(
+        self,
+    ) -> None:
+        primary_spec = MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS[0]
+        absence_anchor = self.root / "absence-close-anchor"
+        absence_anchor.mkdir(mode=0o700)
+        absent_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id="absence-close-root",
+            parent_path=absence_anchor / "missing-parent",
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        later_parent = self.root / "absence-close-later"
+        later_parent.mkdir(mode=0o700)
+        later_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id="absence-close-later",
+            parent_path=later_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        anchor_identity = MODULE._mirror_object_identity(absence_anchor.stat())
+        real_close = MODULE.os.close
+        absence_faults: list[int] = []
+
+        def fail_absence_close_after_effect(descriptor: int) -> None:
+            descriptor_identity = MODULE._mirror_object_identity(os.fstat(descriptor))
+            real_close(descriptor)
+            if descriptor_identity == anchor_identity and not absence_faults:
+                absence_faults.append(descriptor)
+                raise OSError("injected absence close-after-effect")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                (primary_spec, absent_spec, later_spec),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_legacy_shared_parent_policy_is_valid",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE.os,
+                "close",
+                side_effect=fail_absence_close_after_effect,
+            ),
+        ):
+            audit = MODULE._mirror_quarantine_audit()
+
+        self.assertEqual(len(absence_faults), 1)
+        self.assertEqual(
+            [root.root_id for root in audit.root_audits],
+            [primary_spec.root_id, absent_spec.root_id, later_spec.root_id],
+        )
+        self.assertIn("injected absence close-after-effect", audit.detail)
+        self.assertIn(later_spec.root_id, audit.detail)
+
+        first_parent = self.root / "terminal-close-first"
+        second_anchor = self.root / "terminal-close-second-anchor"
+        first_parent.mkdir(mode=0o700)
+        second_anchor.mkdir(mode=0o700)
+        first_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id="terminal-close-first",
+            parent_path=first_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        second_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id="terminal-close-second",
+            parent_path=second_anchor / "missing-parent",
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        first_identity = MODULE._mirror_object_identity(first_parent.stat())
+        first_policy = MODULE._mirror_access_policy(first_parent.stat())
+        second_receipt = MODULE._capture_mirror_quarantine_parent_absence(second_spec)
+        first_audit = MODULE.MirrorQuarantineAudit(
+            classification="available",
+            path=first_parent / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+            entry_count=0,
+            entry_limit=MODULE.MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT,
+            count_is_lower_bound=False,
+            segment_identity=None,
+            segment_access_policy=None,
+            root_id=first_spec.root_id,
+            root_receipt=MODULE.MirrorQuarantineRootReceipt(
+                root_id=first_spec.root_id,
+                parent_path=first_parent,
+                scope="parent-only",
+                parent_identity=(
+                    first_identity[0],
+                    first_identity[1] + 1,
+                    first_identity[2],
+                ),
+                parent_access_policy=first_policy,
+            ),
+        )
+        second_audit = MODULE.MirrorQuarantineAudit(
+            classification="absent",
+            path=second_spec.parent_path / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+            entry_count=0,
+            entry_limit=MODULE.MIRROR_DURABLE_QUARANTINE_ENTRY_LIMIT,
+            count_is_lower_bound=False,
+            segment_identity=None,
+            segment_access_policy=None,
+            root_id=second_spec.root_id,
+            root_receipt=second_receipt,
+        )
+        terminal_faults: list[int] = []
+
+        def fail_terminal_close_after_effect(descriptor: int) -> None:
+            descriptor_identity = MODULE._mirror_object_identity(os.fstat(descriptor))
+            real_close(descriptor)
+            if descriptor_identity == first_identity and not terminal_faults:
+                terminal_faults.append(descriptor)
+                raise OSError("injected terminal close-after-effect")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                (first_spec, second_spec),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_legacy_shared_parent_policy_is_valid",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE.os,
+                "close",
+                side_effect=fail_terminal_close_after_effect,
+            ),
+        ):
+            updated, detail = MODULE._revalidate_mirror_quarantine_registry(
+                [first_audit, second_audit]
+            )
+
+        self.assertEqual(len(terminal_faults), 1)
+        assert detail is not None
+        self.assertIn("identity or access policy changed", updated[0].detail)
+        self.assertIn("injected terminal close-after-effect", updated[0].detail)
+        self.assertIn(first_spec.root_id, detail)
+        self.assertIn(second_spec.root_id, detail)
+        self.assertEqual(updated[1].classification, "absent")
+
+    def test_legacy_owner_root_mismatch_routes_exactly_once(self) -> None:
+        shared_parent = self.root / "legacy-owner-mismatch"
+        shared_parent.mkdir(mode=0o700)
+        tool_root = shared_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        tool_root.mkdir(mode=0o700)
+        private_name = (
+            f"sync-canonical-git-control.{os.getpid()}.11111111111111111111111111111111"
+        )
+        owner_path = tool_root / f"{private_name}.owner.json"
+        owner_path.write_text(
+            json.dumps(
+                {
+                    "version": MODULE.MIRROR_PRIVATE_OWNER_RECORD_VERSION,
+                    "root_id": "wrong-legacy-root",
+                    "owner_pid": os.getpid(),
+                    "owner_uid": os.geteuid(),
+                    "owner_gid": os.getegid(),
+                    "owner_nonce": "22222222222222222222222222222222",
+                    "phase": "cleanup",
+                    "private_name": private_name,
+                    "private_identity": [123, 456, stat.S_IFDIR],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        owner_path.chmod(0o600)
+        primary_spec = MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS[0]
+        legacy_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id="legacy-owner-mismatch",
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                (primary_spec, legacy_spec),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_legacy_shared_parent_policy_is_valid",
+                return_value=True,
+            ),
+        ):
+            audit = MODULE._mirror_quarantine_audit()
+            report = MODULE.scheduler_report(self.home, "linux")
+
+        self.assertEqual(
+            audit.reason_code,
+            MODULE.MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+        )
+        self.assertEqual(audit.root_id, legacy_spec.root_id)
+        self.assertEqual(
+            audit.path,
+            shared_parent / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+        )
+        report_audit = report.mirror_quarantine
+        assert report_audit is not None
+        failure_detail = MODULE._mirror_quarantine_failure_detail(report_audit)
+        self.assertIn(
+            (
+                MODULE.MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+                failure_detail,
+            ),
+            report.failures,
+        )
+        with (
+            mock.patch.object(MODULE, "scheduler_report", return_value=report),
+            mock.patch.object(MODULE, "audit_active_skills", return_value=[]),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            _doctor_report, issues = MODULE.doctor(
+                self.home,
+                "linux",
+                json_output=True,
+            )
+
+        matching = [issue for issue in issues if issue.detail == failure_detail]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(
+            matching[0].code,
+            MODULE.MIRROR_PRIVATE_OWNER_RECORD_REASON_ROOT_MISMATCH,
+        )
+        self.assertEqual(
+            matching[0].path,
+            shared_parent / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+        )
+        self.assertNotIn(
+            "scheduler-failure",
+            {issue.code for issue in matching},
         )
 
     def test_mirror_quarantine_audit_reports_busy_tool_root_without_scanning(

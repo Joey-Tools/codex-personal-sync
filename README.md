@@ -21,6 +21,16 @@ and focused safety, retention, and scheduler/doctor tests.
 receipt-bound exact toolbox commit and its complete immutable public release;
 there is no direct canonical-to-private mirror.
 
+The installed synchronizer remains a standalone one-file runtime, while the
+canonical mirror generator is a separate controller that is not installed on
+consumer hosts. Their shared private-control policy is therefore intentionally
+implemented twice, but it is one contract rather than two ownership sources.
+Machine parity tests bind the ordered root registry, schema fields, platform
+paths, reason codes, ancestor cap, ownership classification, shared-parent
+policy, and primary-allocation scenario matrix. A change to that contract must
+update both implementations and the parity matrix in the same commit; an
+independent one-sided edit is unsupported.
+
 Canonical `master` pushes can open or update the scoped toolbox mirror pull
 request through `.github/workflows/sync-toolbox.yml`. The workflow requires the
 explicit least-privilege `CODEX_TOOLBOX_SYNC_TOKEN` interface documented in
@@ -110,43 +120,91 @@ the sealed-system `/usr/bin/xcrun` locator selects the ordinary developer-tool
 Git binary because the `/usr/bin/git` platform shim cannot execute from a byte
 copy. The protected launch property is the exact snapshot byte sequence, not
 macOS descriptor execution. Snapshot identity, bytes, and access policy are
-revalidated immediately around each spawn. Private snapshots live below a
-durable mode-0700, current-owner tool root outside both repositories; that
-namespace excludes unauthorized other users but is not claimed to stop a
-hostile same-UID process. Locked owner/phase records make active snapshots
-distinguishable from bounded stale cleanup; invalid or identity-ambiguous
-leftovers are quarantined rather than deleted by pathname.
-Expected owner-record cleanup moves the exact file into a separate durable
-quarantine beside the private-control parent, on the same verified filesystem;
-stale-owner recovery uses that same explicit placement even when the consumer
-repository is on another filesystem. It therefore cannot fill the active tool
-root or cross a repository mount. Verified transaction temporaries, journals,
-and owner records use identity/content-bound `transient-file-*` names and are
-retained for identity-aware recovery alongside receipt-bound retired target
-bytes under `recovery-file-*` names. The synchronizer never converts a filename
-prefix alone into deletion authority; current and legacy unclassified entries
-remain for manual inspection. Capacity is reserved under the quarantine lock
-before a source pathname moves. At exactly 10,000 entries, the quarantine can
-still be opened to validate and diagnose journal-bound recovery, but cleanup
-that would retain another journal is blocked before that journal moves and the
-active journal remains in place until identity-aware maintenance frees
-capacity. Every operation that reaches private Git binding retains the exact
-owner-cleanup evidence, including `refresh-lock --check` and a target-level
+revalidated immediately around each spawn. Private snapshots live below the
+passwd-derived stable account-home namespace
+`~/.codex-sync-canonical-mirrors-v1/`. The controller binds every component
+from `/` to that exact account home with no-follow descriptor traversal: each
+ancestor must be root/current-owned and not group/world writable, the home must
+be current-owned, and the namespace parent must be current-owned mode `0700`.
+It retains the home, namespace-parent, tool-root, and quarantine descriptors
+through stale recovery, owner publication, and final owner cleanup. An absent
+fixed directory is created under a random mode-0700 name and published with a
+no-replace rename; a fixed name that appears after the initial absence receipt
+is never adopted. The namespace excludes unauthorized other users but is not
+claimed to stop a hostile same-UID process. Version-2 owner/phase records bind
+the allocating root id. Version-1 records are accepted only in
+`legacy-shared-v0`; a cross-root, missing, extra, or unknown-version root scope
+is retained under `private-owner-root-mismatch` without moving either the
+record or its private directory.
+
+The old shared parent (`/private/tmp` on macOS, `/var/tmp` on Linux) is retained
+as the non-allocating `legacy-shared-v0` recovery root. Before the primary root
+is allocated, the controller validates that shared parent as exact root-owned
+mode `1777` and audits both fixed children. A foreign-owned preclaim receives
+two metadata-only identity/policy passes and is never opened or traversed, so
+it cannot deny service to the stable account-home root. Same-UID legacy state
+is leased and recovered only inside its original root; no evidence is moved or
+copied across roots. If that root initially lacks a durable quarantine, any
+tool-root entry blocks with zero recovery mutation; the controller does not
+claim that in-tool-only cleanup is available at that boundary. Any retained
+owner, journal, tool-root, or quarantine
+entry—or an audit that cannot prove emptiness—fails closed as
+`legacy-recovery-pending` or `private-control-root-inconclusive` before primary
+allocation. Existing primary objects are descriptor-bound before that legacy
+gate and revalidated afterward. Only exact bound-parent identity deduplicates a
+whole registry root; a child alias under a distinct parent, a swapped role, or
+a partial alias is inconclusive. The terminal registry pass covers every
+legacy root even when an earlier root changed. Same-UID legacy tool/quarantine
+leases are transferred into the primary retained context, remain held across
+primary allocation and owner-record publication, and are released only after a
+second whole-registry terminal revalidation at that publication boundary.
+Every mutating root must prove strict parent-to-child containment without the
+reciprocal ancestor relation; tool and quarantine must be disjoint and on the
+same filesystem. Primary children must not overlap the repository, Git admin,
+or Git common roots, while legacy children additionally must not overlap the
+bound primary home, namespace, tool, or quarantine objects. These gates run
+before stale recovery or owner/private-snapshot mutation.
+
+Expected owner-record cleanup moves the exact file into the already retained
+durable quarantine beside its bound private-control parent, on the same
+verified filesystem. Recovery and cleanup never rebind that quarantine through
+the namespace's lexical path.
+Verified transaction temporaries, journals, and owner records use
+identity/content-bound `transient-file-*` names and are retained for
+identity-aware recovery alongside receipt-bound retired target bytes under
+`recovery-file-*` names. The synchronizer never converts a filename prefix
+alone into deletion authority; current and legacy unclassified entries remain
+for manual inspection. Capacity is reserved under the quarantine lock before a
+source pathname moves. At exactly 10,000 entries, the quarantine can still be
+opened to validate and diagnose journal-bound recovery, but cleanup that would
+retain another journal is blocked before that journal moves and the active
+journal remains in place until identity-aware maintenance frees capacity.
+Every operation that reaches private Git binding retains the exact owner-
+cleanup evidence, including `refresh-lock --check` and a target-level
 `generate` no-op. The no-op path below prevents only target transaction and
 target-sibling quarantine churn; it does not suppress private-control evidence
 growth.
 
-`status-scheduler` and `doctor` audit this private quarantine without modifying
-it. They bind the current-owner tool root first, take a nonblocking shared
-lease, then bind and lease the durable quarantine in the generator's
-tool-root-to-quarantine order. If a quarantine exists without that
-coordination root, the audit reports inconclusive without taking a quarantine
-lease. A concurrent writer, unstable namespace,
+`status-scheduler` and `doctor` audit the ordered `primary-home-v1`, then
+`legacy-shared-v0` registry without modifying either root. They aggregate every
+root result instead of stopping at the first problem, label exact parent
+duplicates without traversing their children, and JSON
+reports each root's id, reason, parent identity, and bounded evidence. Within a
+same-UID root they bind the current-owner tool root first, take a nonblocking
+shared lease, then bind and lease the durable quarantine in the generator's
+tool-root-to-quarantine order. Foreign legacy children remain metadata-only.
+If a quarantine exists without its coordination root, the audit reports
+inconclusive without taking a quarantine lease. A concurrent writer, unstable namespace,
 replacement, access-policy change, or unreadable evidence reports
 `mirror-quarantine-audit-inconclusive`; an exact-capacity segment reports
 `mirror-quarantine-saturated`. JSON includes the exact segment path, name,
 identity, access policy, count/cap, and bounded owner recovery records. Strict
-status and doctor exit unhealthy for either classification.
+status and doctor exit unhealthy for either classification. Before aggregate
+classification, a second read-only pass revalidates the absence or exact
+identity/access-policy receipt for every registry root and reports coverage for
+all roots even after an earlier failure. For same-UID roots it also enforces the
+generator's shared topology invariants: strict one-way parent-to-child
+containment plus same-filesystem, non-overlapping tool/quarantine roots.
 
 The current flat quarantine has no automatic rollover. Existing version-2
 exchange journals store only a quarantine basename, so searching that name
@@ -155,9 +213,11 @@ requires a separately reviewed journal-locator migration plus global
 entry/logical/allocated-byte ceilings. Until that work lands, a saturated
 production quarantine remains a blocking maintenance condition; status
 reporting does not claim to repair it.
-All source reads and Git stdout use the same 32 MiB per-file/per-command
-contract, while one shared operation deadline and aggregate byte/entry budget
-cover snapshotting, Git execution, recovery, generation, and cleanup.
+Canonical source reads and Git stdout use the same 32 MiB
+per-file/per-command contract. Private owner records instead use a dedicated
+4096+1-byte producer ceiling; both descriptor-stability reads consume the same
+operation deadline and aggregate byte budget. The shared byte/entry/deadline
+budgets cover snapshotting, Git execution, recovery, generation, and cleanup.
 
 Before every write it requires every existing managed target and receipt to
 match the clean consumer stage-0 index; entirely absent paths are the only
