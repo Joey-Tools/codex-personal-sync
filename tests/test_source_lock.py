@@ -183,6 +183,48 @@ class MirrorGeneratorTests(unittest.TestCase):
         )
         return completed.stdout
 
+    def _open_process_liveness_pipe(self) -> tuple[int, int]:
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(read_fd, False)
+        return read_fd, write_fd
+
+    def _assert_process_liveness_pipe_closed(
+        self,
+        read_fd: int,
+        *,
+        timeout: float = 1,
+    ) -> None:
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(read_fd, selectors.EVENT_READ)
+            events = selector.select(timeout)
+            self.assertTrue(
+                events,
+                "a launched process still retains the liveness writer",
+            )
+            self.assertEqual(
+                os.read(read_fd, 1),
+                b"",
+                "the liveness pipe contained unexpected payload bytes",
+            )
+        finally:
+            selector.close()
+
+    def _finish_process_group_fixture(
+        self,
+        process: subprocess.Popen[bytes],
+    ) -> None:
+        if process.returncode is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        process.wait(timeout=5)
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+
     def _macos_git_locator_fixture(
         self,
         suffix: str = "",
@@ -3605,6 +3647,7 @@ class MirrorGeneratorTests(unittest.TestCase):
         real_popen = subprocess.Popen
         validation_count = 0
         launched: subprocess.Popen[bytes] | None = None
+        liveness_read, liveness_write = self._open_process_liveness_pipe()
 
         def fail_post_launch_revalidation(root, binding):
             nonlocal validation_count
@@ -3617,8 +3660,11 @@ class MirrorGeneratorTests(unittest.TestCase):
             return real_revalidate(root, binding)
 
         def capture_process(command, **kwargs):
-            nonlocal launched
+            nonlocal launched, liveness_write
+            kwargs["pass_fds"] = (*kwargs.get("pass_fds", ()), liveness_write)
             launched = real_popen(command, **kwargs)
+            os.close(liveness_write)
+            liveness_write = -1
             return launched
 
         try:
@@ -3645,7 +3691,8 @@ class MirrorGeneratorTests(unittest.TestCase):
                         (
                             "import os,time;"
                             "child=os.fork();"
-                            "time.sleep(5) if child == 0 else time.sleep(5)"
+                            "time.sleep(5) if child == 0 else "
+                            f"(os.close({liveness_write}),time.sleep(5))"
                         ),
                     ],
                     owner=MIRROR_MODULE._ProcessOwner(),
@@ -3663,24 +3710,18 @@ class MirrorGeneratorTests(unittest.TestCase):
 
             self.assertIsNotNone(launched)
             assert launched is not None
-            with self.assertRaises((ProcessLookupError, PermissionError)):
-                os.killpg(launched.pid, 0)
+            self._assert_process_liveness_pipe_closed(liveness_read)
             self.assertIsNotNone(launched.poll())
             assert launched.stdout is not None
             assert launched.stderr is not None
             self.assertTrue(launched.stdout.closed)
             self.assertTrue(launched.stderr.closed)
         finally:
+            if liveness_write >= 0:
+                os.close(liveness_write)
             if launched is not None:
-                try:
-                    os.killpg(launched.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                launched.wait(timeout=5)
-                if launched.stdout is not None:
-                    launched.stdout.close()
-                if launched.stderr is not None:
-                    launched.stderr.close()
+                self._finish_process_group_fixture(launched)
+            os.close(liveness_read)
             os.close(executable_binding.fd)
             os.close(directory_binding.fd)
             MIRROR_MODULE._finish_bound_roots(control_root)
@@ -4045,6 +4086,39 @@ class MirrorGeneratorTests(unittest.TestCase):
             )
         self.assertIsNotNone(timeout_process.poll())
 
+    def test_process_liveness_pipe_requires_child_exit_after_parent_close(
+        self,
+    ) -> None:
+        process: subprocess.Popen[bytes] | None = None
+        liveness_read, liveness_write = self._open_process_liveness_pipe()
+        try:
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import time;time.sleep(30)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                pass_fds=(liveness_write,),
+            )
+            os.close(liveness_write)
+            liveness_write = -1
+            with self.assertRaisesRegex(
+                AssertionError,
+                "still retains the liveness writer",
+            ):
+                self._assert_process_liveness_pipe_closed(
+                    liveness_read,
+                    timeout=0.01,
+                )
+            self._finish_process_group_fixture(process)
+            self._assert_process_liveness_pipe_closed(liveness_read)
+        finally:
+            if liveness_write >= 0:
+                os.close(liveness_write)
+            if process is not None:
+                self._finish_process_group_fixture(process)
+            os.close(liveness_read)
+
     def test_git_output_collector_terminates_leader_first_exit_groups(self) -> None:
         programs = (
             (
@@ -4052,7 +4126,8 @@ class MirrorGeneratorTests(unittest.TestCase):
                 (
                     "import os,time;"
                     "child=os.fork();"
-                    "time.sleep(5) if child == 0 else os._exit(0)"
+                    "time.sleep(5) if child == 0 else "
+                    "(os.close({liveness_fd}),os._exit(0))"
                 ),
                 "exceeded",
                 0.05,
@@ -4064,23 +4139,33 @@ class MirrorGeneratorTests(unittest.TestCase):
                     "import os,time;"
                     "child=os.fork();"
                     "(os.close(1),os.close(2),time.sleep(5)) "
-                    "if child == 0 else os._exit(0)"
+                    "if child == 0 else "
+                    "(os.close({liveness_fd}),os._exit(0))"
                 ),
                 None,
                 2.0,
                 False,
             ),
         )
-        for name, program, expected, timeout_seconds, should_fail in programs:
+        for name, program_template, expected, timeout_seconds, should_fail in programs:
             with self.subTest(name=name):
-                process = subprocess.Popen(
-                    [sys.executable, "-c", program],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    start_new_session=True,
-                )
+                process: subprocess.Popen[bytes] | None = None
+                liveness_read, liveness_write = self._open_process_liveness_pipe()
                 try:
+                    process = subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-c",
+                            program_template.format(liveness_fd=liveness_write),
+                        ],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        start_new_session=True,
+                        pass_fds=(liveness_write,),
+                    )
+                    os.close(liveness_write)
+                    liveness_write = -1
                     if should_fail:
                         assert expected is not None
                         with self.assertRaisesRegex(
@@ -4105,46 +4190,47 @@ class MirrorGeneratorTests(unittest.TestCase):
                             label="leader-first-exit fixture",
                         )
                         self.assertEqual(result, (0, b"", b""))
-                    with self.assertRaises((ProcessLookupError, PermissionError)):
-                        os.killpg(process.pid, 0)
+                    self._assert_process_liveness_pipe_closed(liveness_read)
                     self.assertIsNotNone(process.poll())
                     assert process.stdout is not None
                     assert process.stderr is not None
                     self.assertTrue(process.stdout.closed)
                     self.assertTrue(process.stderr.closed)
                 finally:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
-                    process.wait(timeout=5)
-                    if process.stdout is not None:
-                        process.stdout.close()
-                    if process.stderr is not None:
-                        process.stderr.close()
+                    if liveness_write >= 0:
+                        os.close(liveness_write)
+                    if process is not None:
+                        self._finish_process_group_fixture(process)
+                    os.close(liveness_read)
 
     @unittest.skipUnless(
         sys.platform == "darwin" and not hasattr(os, "waitid"),
         "requires the Darwin Python without waitid(WNOWAIT)",
     )
     def test_git_output_collector_uses_darwin_kqueue_without_waitid(self) -> None:
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import os,time;"
-                    "child=os.fork();"
-                    "(os.close(1),os.close(2),time.sleep(5)) "
-                    "if child == 0 else os._exit(0)"
-                ),
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
+        process: subprocess.Popen[bytes] | None = None
+        liveness_read, liveness_write = self._open_process_liveness_pipe()
         try:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os,time;"
+                        "child=os.fork();"
+                        "(os.close(1),os.close(2),time.sleep(5)) "
+                        "if child == 0 else "
+                        f"(os.close({liveness_write}),os._exit(0))"
+                    ),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+                pass_fds=(liveness_write,),
+            )
+            os.close(liveness_write)
+            liveness_write = -1
             result = MIRROR_MODULE._collect_bounded_process_output(
                 process,
                 None,
@@ -4154,19 +4240,14 @@ class MirrorGeneratorTests(unittest.TestCase):
                 label="Darwin kqueue fixture",
             )
             self.assertEqual(result, (0, b"", b""))
-            with self.assertRaises((ProcessLookupError, PermissionError)):
-                os.killpg(process.pid, 0)
+            self._assert_process_liveness_pipe_closed(liveness_read)
             self.assertIsNotNone(process.poll())
         finally:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            process.wait(timeout=5)
-            if process.stdout is not None:
-                process.stdout.close()
-            if process.stderr is not None:
-                process.stderr.close()
+            if liveness_write >= 0:
+                os.close(liveness_write)
+            if process is not None:
+                self._finish_process_group_fixture(process)
+            os.close(liveness_read)
 
     def test_bounded_process_defers_keyboard_interrupt_until_collection(
         self,
@@ -4178,11 +4259,12 @@ class MirrorGeneratorTests(unittest.TestCase):
             self.skipTest("SIGINT is already blocked by the test runner")
         launched: subprocess.Popen[bytes] | None = None
         lifecycle: list[str] = []
+        liveness_read, liveness_write = self._open_process_liveness_pipe()
 
         def launch_then_interrupt(
             owner: object,
         ) -> subprocess.Popen[bytes]:
-            nonlocal launched
+            nonlocal launched, liveness_write
             launched = MIRROR_MODULE._owned_popen(
                 owner,
                 [
@@ -4191,14 +4273,18 @@ class MirrorGeneratorTests(unittest.TestCase):
                     (
                         "import os,time;child=os.fork();"
                         "(os.close(1),os.close(2),time.sleep(5)) "
-                        "if child == 0 else time.sleep(0.05)"
+                        "if child == 0 else "
+                        f"(os.close({liveness_write}),time.sleep(0.05))"
                     ),
                 ],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
+                pass_fds=(liveness_write,),
             )
+            os.close(liveness_write)
+            liveness_write = -1
             lifecycle.append("launched")
             signal.raise_signal(signal.SIGINT)
             lifecycle.append("interrupt-pending")
@@ -4234,24 +4320,18 @@ class MirrorGeneratorTests(unittest.TestCase):
             )
             self.assertIsNotNone(launched)
             assert launched is not None
-            with self.assertRaises((ProcessLookupError, PermissionError)):
-                os.killpg(launched.pid, 0)
+            self._assert_process_liveness_pipe_closed(liveness_read)
             self.assertIsNotNone(launched.poll())
             assert launched.stdout is not None
             assert launched.stderr is not None
             self.assertTrue(launched.stdout.closed)
             self.assertTrue(launched.stderr.closed)
         finally:
+            if liveness_write >= 0:
+                os.close(liveness_write)
             if launched is not None:
-                try:
-                    os.killpg(launched.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                launched.wait(timeout=5)
-                if launched.stdout is not None:
-                    launched.stdout.close()
-                if launched.stderr is not None:
-                    launched.stderr.close()
+                self._finish_process_group_fixture(launched)
+            os.close(liveness_read)
 
     def test_bounded_process_child_inherits_no_deferred_signal_mask(self) -> None:
         child_mask: tuple[int, bytes, bytes] | None = None
@@ -4306,11 +4386,14 @@ class MirrorGeneratorTests(unittest.TestCase):
 
         real_init = MIRROR_MODULE._REAL_SUBPROCESS_POPEN.__init__
         launched: subprocess.Popen[bytes] | None = None
+        liveness_read, liveness_write = self._open_process_liveness_pipe()
 
         def initialize_then_raise(process, *args, **kwargs):
-            nonlocal launched
+            nonlocal launched, liveness_write
             real_init(process, *args, **kwargs)
             launched = process
+            os.close(liveness_write)
+            liveness_write = -1
             raise InjectedAfterInit("injected after Popen.__init__")
 
         def launch(owner: object) -> subprocess.Popen[bytes]:
@@ -4321,6 +4404,7 @@ class MirrorGeneratorTests(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
+                pass_fds=(liveness_write,),
             )
 
         try:
@@ -4342,29 +4426,24 @@ class MirrorGeneratorTests(unittest.TestCase):
                 )
             self.assertIsNotNone(launched)
             assert launched is not None
-            with self.assertRaises((ProcessLookupError, PermissionError)):
-                os.killpg(launched.pid, 0)
+            self._assert_process_liveness_pipe_closed(liveness_read)
             self.assertIsNotNone(launched.returncode)
         finally:
+            if liveness_write >= 0:
+                os.close(liveness_write)
             if launched is not None:
-                try:
-                    os.killpg(launched.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                launched.wait(timeout=5)
-                if launched.stdout is not None:
-                    launched.stdout.close()
-                if launched.stderr is not None:
-                    launched.stderr.close()
+                self._finish_process_group_fixture(launched)
+            os.close(liveness_read)
 
     def test_owned_popen_cleans_launcher_post_spawn_base_exception(self) -> None:
         class InjectedAfterSpawn(BaseException):
             pass
 
         launched: subprocess.Popen[bytes] | None = None
+        liveness_read, liveness_write = self._open_process_liveness_pipe()
 
         def launch(owner: object) -> subprocess.Popen[bytes]:
-            nonlocal launched
+            nonlocal launched, liveness_write
             launched = MIRROR_MODULE._owned_popen(
                 owner,
                 [sys.executable, "-c", "import time;time.sleep(30)"],
@@ -4372,7 +4451,10 @@ class MirrorGeneratorTests(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
+                pass_fds=(liveness_write,),
             )
+            os.close(liveness_write)
+            liveness_write = -1
             raise InjectedAfterSpawn("injected after owned spawn")
 
         try:
@@ -4387,41 +4469,41 @@ class MirrorGeneratorTests(unittest.TestCase):
                 )
             self.assertIsNotNone(launched)
             assert launched is not None
-            with self.assertRaises((ProcessLookupError, PermissionError)):
-                os.killpg(launched.pid, 0)
+            self._assert_process_liveness_pipe_closed(liveness_read)
             self.assertIsNotNone(launched.returncode)
         finally:
+            if liveness_write >= 0:
+                os.close(liveness_write)
             if launched is not None:
-                try:
-                    os.killpg(launched.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                launched.wait(timeout=5)
-                if launched.stdout is not None:
-                    launched.stdout.close()
-                if launched.stderr is not None:
-                    launched.stderr.close()
+                self._finish_process_group_fixture(launched)
+            os.close(liveness_read)
 
     def test_git_output_collector_cleans_group_when_selector_setup_fails(
         self,
     ) -> None:
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import os,time;"
-                    "child=os.fork();"
-                    "time.sleep(5) if child == 0 else os._exit(0)"
-                ),
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        time.sleep(0.05)
+        process: subprocess.Popen[bytes] | None = None
+        liveness_read, liveness_write = self._open_process_liveness_pipe()
         try:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os,time;"
+                        "child=os.fork();"
+                        "time.sleep(5) if child == 0 else "
+                        f"(os.close({liveness_write}),os._exit(0))"
+                    ),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+                pass_fds=(liveness_write,),
+            )
+            os.close(liveness_write)
+            liveness_write = -1
+            time.sleep(0.05)
             with (
                 mock.patch.object(
                     MIRROR_MODULE.selectors,
@@ -4442,22 +4524,17 @@ class MirrorGeneratorTests(unittest.TestCase):
                     label="selector setup fixture",
                 )
             self.assertIsInstance(raised.exception.__cause__, OSError)
-            with self.assertRaises((ProcessLookupError, PermissionError)):
-                os.killpg(process.pid, 0)
+            self._assert_process_liveness_pipe_closed(liveness_read)
             assert process.stdout is not None
             assert process.stderr is not None
             self.assertTrue(process.stdout.closed)
             self.assertTrue(process.stderr.closed)
         finally:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            process.wait(timeout=5)
-            if process.stdout is not None:
-                process.stdout.close()
-            if process.stderr is not None:
-                process.stderr.close()
+            if liveness_write >= 0:
+                os.close(liveness_write)
+            if process is not None:
+                self._finish_process_group_fixture(process)
+            os.close(liveness_read)
 
     def test_git_output_collector_closes_partial_selector_setup(self) -> None:
         class FailSecondRegister:
@@ -4485,24 +4562,30 @@ class MirrorGeneratorTests(unittest.TestCase):
                 self.closed = True
                 self.inner.close()
 
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import os,time;"
-                    "child=os.fork();"
-                    "time.sleep(5) if child == 0 else os._exit(0)"
-                ),
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        time.sleep(0.05)
+        process: subprocess.Popen[bytes] | None = None
+        liveness_read, liveness_write = self._open_process_liveness_pipe()
         selector = FailSecondRegister()
         try:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os,time;"
+                        "child=os.fork();"
+                        "time.sleep(5) if child == 0 else "
+                        f"(os.close({liveness_write}),os._exit(0))"
+                    ),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+                pass_fds=(liveness_write,),
+            )
+            os.close(liveness_write)
+            liveness_write = -1
+            time.sleep(0.05)
             with (
                 mock.patch.object(
                     MIRROR_MODULE.selectors,
@@ -4523,22 +4606,17 @@ class MirrorGeneratorTests(unittest.TestCase):
                     label="partial selector fixture",
                 )
             self.assertTrue(selector.closed)
-            with self.assertRaises((ProcessLookupError, PermissionError)):
-                os.killpg(process.pid, 0)
+            self._assert_process_liveness_pipe_closed(liveness_read)
             assert process.stdout is not None
             assert process.stderr is not None
             self.assertTrue(process.stdout.closed)
             self.assertTrue(process.stderr.closed)
         finally:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            process.wait(timeout=5)
-            if process.stdout is not None:
-                process.stdout.close()
-            if process.stderr is not None:
-                process.stderr.close()
+            if liveness_write >= 0:
+                os.close(liveness_write)
+            if process is not None:
+                self._finish_process_group_fixture(process)
+            os.close(liveness_read)
 
     def test_git_cleanup_never_signals_an_already_reaped_group(self) -> None:
         process = mock.Mock()
@@ -4848,10 +4926,16 @@ class MirrorGeneratorTests(unittest.TestCase):
         process = mock.Mock()
         process.returncode = None
         process.pid = 424242
+        kq_filter_proc = -5
+        kq_note_exit = 0x80000000
+        kq_ev_add = 0x0001
+        kq_ev_enable = 0x0004
+        kq_ev_oneshot = 0x0010
+        kq_ev_error = 0x4000
         valid_event = mock.Mock()
         valid_event.ident = process.pid
-        valid_event.filter = MIRROR_MODULE.select.KQ_FILTER_PROC
-        valid_event.fflags = MIRROR_MODULE.select.KQ_NOTE_EXIT
+        valid_event.filter = kq_filter_proc
+        valid_event.fflags = kq_note_exit
         valid_event.flags = 0
 
         def run_with_queue(queue):
@@ -4867,11 +4951,49 @@ class MirrorGeneratorTests(unittest.TestCase):
                     MIRROR_MODULE.select,
                     "kqueue",
                     return_value=queue,
+                    create=True,
                 ),
                 mock.patch.object(
                     MIRROR_MODULE.select,
                     "kevent",
                     return_value=mock.Mock(),
+                    create=True,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE.select,
+                    "KQ_FILTER_PROC",
+                    kq_filter_proc,
+                    create=True,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE.select,
+                    "KQ_NOTE_EXIT",
+                    kq_note_exit,
+                    create=True,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE.select,
+                    "KQ_EV_ADD",
+                    kq_ev_add,
+                    create=True,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE.select,
+                    "KQ_EV_ENABLE",
+                    kq_ev_enable,
+                    create=True,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE.select,
+                    "KQ_EV_ONESHOT",
+                    kq_ev_oneshot,
+                    create=True,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE.select,
+                    "KQ_EV_ERROR",
+                    kq_ev_error,
+                    create=True,
                 ),
             ):
                 MIRROR_MODULE._wait_for_git_leader_exit_without_reaping(
@@ -4892,8 +5014,8 @@ class MirrorGeneratorTests(unittest.TestCase):
 
         invalid_event = mock.Mock()
         invalid_event.ident = process.pid + 1
-        invalid_event.filter = MIRROR_MODULE.select.KQ_FILTER_PROC
-        invalid_event.fflags = MIRROR_MODULE.select.KQ_NOTE_EXIT
+        invalid_event.filter = kq_filter_proc
+        invalid_event.fflags = kq_note_exit
         invalid_event.flags = 0
         invalid_queue = mock.Mock()
         invalid_queue.control.side_effect = [[], [invalid_event]]
@@ -4941,6 +5063,7 @@ class MirrorGeneratorTests(unittest.TestCase):
                 MIRROR_MODULE.select,
                 "kqueue",
                 side_effect=OSError("simulated kqueue creation failure"),
+                create=True,
             ),
             self.assertRaisesRegex(
                 MIRROR_MODULE.MirrorSyncError,

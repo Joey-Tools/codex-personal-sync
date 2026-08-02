@@ -983,6 +983,50 @@ superseded_by:
   for the workflow. Dual-runtime compileall, Ruff lint/format, actionlint,
   JSON parsing, project-journal validation, source-lock verification, and
   `git diff --check` passed before this evidence-only journal update.
+- Signed head `ee7bab62a47a65532228325decb47bef00cb3dc1` retained the two
+  successful macOS alias jobs and the workflow runner success, but its Linux
+  Python 3.14.6 main job failed after 881 tests in 913.746 seconds with five
+  failures and one error. All five failures used a post-return
+  `killpg(pgid, 0)` assertion that cannot distinguish a live member from an
+  orphan zombie on Linux; the error read Darwin-only kqueue constants before
+  installing the test's mocked Darwin surface. The in-progress fresh
+  named-single lane was immediately cancelled as stale/non-counting. Its
+  private worktree passed terminal trusted-guard validation, the external
+  control digests remained exact, and the owner-private review root was then
+  removed completely.
+- The portability follow-up leaves production process supervision unchanged:
+  the bound process-group `SIGKILL` still occurs while the leader is unreaped,
+  the leader still has exactly one final `wait`, and production performs no
+  numeric PID/PGID operation afterward. Each affected fixture now gives the
+  launched process an inherited liveness-pipe writer, closes the parent copy
+  immediately after spawn, and makes a fork leader close its copy so only the
+  intended descendant retains that capability. Bounded EOF therefore proves
+  that no live fixture descendant retains the writer without depending on
+  orphan-zombie or numeric-PGID observation semantics. A negative control
+  proves that closing only the parent writer cannot falsely satisfy the EOF
+  gate. Fixture cleanup itself signals the group only while the leader remains
+  unreaped. The kqueue lifecycle unit now injects its complete synthetic Darwin
+  constant/function surface before exercising the mocked observer on
+  non-Darwin hosts.
+- The settled portability-test bytes passed the 10-test focused matrix under
+  Homebrew Python 3.14 and system Python 3.9.6 in 2.784 and 3.014 seconds; the
+  Python 3.14 run had the expected no-`waitid` skip. The complete source-lock
+  suite then passed all 184 tests under both runtimes in 721.894 and 764.071
+  seconds respectively, with the same sole expected Python 3.14 skip. A fresh
+  independent read-only audit returned `No findings.` for the writer ownership,
+  close order, bounded EOF property, negative control, and cleanup paths. The
+  final source-lock-test SHA-256 is
+  `b77d80a1507262aeaad09a42bc8d54ad4644b05340c44f69b6af24d586366e1f`.
+  Both runtimes passed final compileall and independent six-source
+  `refresh-lock --check`; Ruff lint/format, project-journal validation, and
+  `git diff --check` also passed on the final test bytes.
+  The controller, toolbox-automation test, workflow, and source-lock bytes are
+  unchanged from signed head `ee7bab62a47a65532228325decb47bef00cb3dc1`, so
+  that head's successful dual-runtime compileall, automation matrix, Ruff,
+  actionlint, JSON, journal, source-lock-currentness, macOS alias, and workflow
+  runner evidence remains tree-valid for those exact unchanged files. Hosted
+  Linux CI, exact-secret admission, and formal named review remain head-bound
+  and must be rerun after the portability commit is pushed.
 
 ## Installed Host Baseline
 
