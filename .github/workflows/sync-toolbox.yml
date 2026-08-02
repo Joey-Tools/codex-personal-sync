@@ -1,0 +1,1217 @@
+name: Sync toolbox mirror
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-toolbox-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync-toolbox:
+    name: Generate scoped toolbox sync PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CANONICAL_ROOT: ${{ github.workspace }}/canonical
+      TARGET_ROOT: ${{ github.workspace }}/toolbox
+      TARGET_OWNER: Joey-Tools
+      TARGET_REPOSITORY: Joey-Tools/codex-toolbox
+      TARGET_BASE: master
+      SYNC_BRANCH: automation/canonical-personal-sync
+      MIRROR_NAME: toolbox
+      CANONICAL_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Validate sync credential
+        shell: bash
+        env:
+          CODEX_TOOLBOX_SYNC_TOKEN: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CODEX_TOOLBOX_SYNC_TOKEN}" ]]; then
+            echo "::error title=Missing CODEX_TOOLBOX_SYNC_TOKEN::Configure a fine-grained token scoped only to Joey-Tools/codex-toolbox with Contents read/write and Pull requests read/write."
+            exit 1
+          fi
+
+      - name: Check out exact canonical commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: canonical
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify canonical master and source lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != "refs/heads/master" ]]; then
+            echo "::error title=Unsupported canonical ref::Toolbox sync is restricted to canonical master."
+            exit 1
+          fi
+          observed_sha="$(git -C "${CANONICAL_ROOT}" rev-parse --verify HEAD)"
+          if [[ "${observed_sha}" != "${CANONICAL_SHA}" ]]; then
+            echo "::error title=Canonical commit mismatch::Checkout HEAD does not match the triggering canonical commit."
+            exit 1
+          fi
+          python3 "${CANONICAL_ROOT}/scripts/sync_canonical_mirrors.py" refresh-lock --check
+
+      - name: Check out toolbox master
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: Joey-Tools/codex-toolbox
+          token: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
+          path: toolbox
+          ref: master
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare scoped sync branch
+        id: prepare
+        shell: bash
+        env:
+          CODEX_TOOLBOX_SYNC_TOKEN: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          allowed_paths_file="${RUNNER_TEMP}/toolbox-sync-allowed-paths.json"
+          base_allowed_paths_file="$(
+            mktemp "${RUNNER_TEMP}/toolbox-sync-base-paths.XXXXXX"
+          )"
+          branch_allowed_paths_file="$(
+            mktemp "${RUNNER_TEMP}/toolbox-sync-branch-paths.XXXXXX"
+          )"
+          combined_allowed_paths_file="$(
+            mktemp "${RUNNER_TEMP}/toolbox-sync-combined-paths.XXXXXX"
+          )"
+          history_receipt_file="$(
+            mktemp "${RUNNER_TEMP}/toolbox-sync-history.XXXXXX"
+          )"
+          git_with_token() {
+            local basic_token
+            basic_token="$(
+              printf 'x-access-token:%s' "${CODEX_TOOLBOX_SYNC_TOKEN}" |
+                base64 -w 0
+            )"
+            GIT_CONFIG_COUNT=1 \
+              GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${basic_token}" \
+              git "$@"
+          }
+
+          if [[ "${SYNC_BRANCH}" == "${TARGET_BASE}" ]]; then
+            echo "::error title=Unsafe sync branch::The generated branch must differ from the target base."
+            exit 1
+          fi
+          if ! jq -e \
+            --arg repository "${TARGET_REPOSITORY}" \
+            --arg mirror "${MIRROR_NAME}" \
+            '.mirrors[$mirror].repository == $repository' \
+            "${CANONICAL_ROOT}/sync-source-lock.json" >/dev/null; then
+            echo "::error title=Toolbox lock mismatch::The canonical source lock does not name the expected target repository."
+            exit 1
+          fi
+          is_allowed_path() {
+            local path="$1"
+            jq -e --arg path "${path}" 'index($path) != null' \
+              "${allowed_paths_file}" >/dev/null
+          }
+          assert_allowed_paths() {
+            local label="$1"
+            shift
+            local unexpected=0
+            local paths_file
+            paths_file="$(
+              mktemp "${RUNNER_TEMP}/toolbox-sync-paths.XXXXXX"
+            )"
+            if ! "$@" >"${paths_file}"; then
+              echo "::error title=Toolbox scope inspection failed::${label} could not be enumerated safely."
+              rm -f "${paths_file}"
+              exit 1
+            fi
+            while IFS= read -r -d '' path; do
+              if ! is_allowed_path "${path}"; then
+                echo "::error title=Out-of-scope toolbox branch::${label} contains a path outside the canonical toolbox mirror."
+                printf 'Unexpected path: %q\n' "${path}" >&2
+                unexpected=1
+              fi
+            done <"${paths_file}"
+            rm -f "${paths_file}"
+            if ((unexpected != 0)); then
+              exit 1
+            fi
+          }
+          require_managed_paths() {
+            local label="$1"
+            local output_file="$2"
+            local target_commit="${3:-}"
+            local -a command=(
+              python3
+              "${CANONICAL_ROOT}/scripts/sync_canonical_mirrors.py"
+              managed-paths
+              --target-root "${TARGET_ROOT}"
+              --mirror "${MIRROR_NAME}"
+            )
+            if [[ -n "${target_commit}" ]]; then
+              command+=(--target-commit "${target_commit}")
+            fi
+            if ! "${command[@]}" >"${output_file}"; then
+              echo "::error title=Invalid managed path scope::${label} did not pass canonical receipt and managed-path validation."
+              exit 1
+            fi
+            if ! jq -e \
+              '
+                type == "array" and
+                all(.[]; type == "string") and
+                . == (unique | sort)
+              ' "${output_file}" >/dev/null; then
+              echo "::error title=Invalid managed path scope::${label} did not return one canonical sorted unique managed path list."
+              exit 1
+            fi
+          }
+
+          git -C "${TARGET_ROOT}" config user.name "github-actions[bot]"
+          git -C "${TARGET_ROOT}" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git_with_token -C "${TARGET_ROOT}" fetch --no-tags origin \
+            "refs/heads/${TARGET_BASE}:refs/remotes/origin/${TARGET_BASE}"
+          git -C "${TARGET_ROOT}" switch --detach \
+            "refs/remotes/origin/${TARGET_BASE}"
+          require_managed_paths \
+            "The target base" "${base_allowed_paths_file}"
+          target_base_sha="$(
+            git -C "${TARGET_ROOT}" rev-parse --verify \
+              "refs/remotes/origin/${TARGET_BASE}"
+          )"
+
+          remote_branch="$(
+            git_with_token -C "${TARGET_ROOT}" ls-remote --heads origin \
+              "refs/heads/${SYNC_BRANCH}"
+          )"
+          remote_branch_present=false
+          remote_branch_sha=""
+          if [[ -n "${remote_branch}" ]]; then
+            remote_branch_sha="${remote_branch%%$'\t'*}"
+            expected_remote_branch="$(
+              printf '%s\trefs/heads/%s' \
+                "${remote_branch_sha}" "${SYNC_BRANCH}"
+            )"
+            if [[ ! "${remote_branch_sha}" =~ ^[0-9a-f]{40}$ || \
+              "${remote_branch}" != "${expected_remote_branch}" ]]; then
+              echo "::error title=Ambiguous sync branch::The remote sync branch query did not return exactly one canonical lowercase SHA-1 record."
+              exit 1
+            fi
+            remote_branch_present=true
+            git_with_token -C "${TARGET_ROOT}" fetch --no-tags origin \
+              "refs/heads/${SYNC_BRANCH}:refs/remotes/origin/${SYNC_BRANCH}"
+            fetched_remote_branch_sha="$(
+              git -C "${TARGET_ROOT}" rev-parse --verify \
+                "refs/remotes/origin/${SYNC_BRANCH}"
+            )"
+            if [[ "${fetched_remote_branch_sha}" != "${remote_branch_sha}" ]]; then
+              echo "::error title=Sync branch fetch mismatch::The fetched tracking ref does not match the prepared remote branch snapshot."
+              exit 1
+            fi
+          fi
+          unset CODEX_TOOLBOX_SYNC_TOKEN
+          if [[ "${remote_branch_present}" == "true" ]]; then
+            require_managed_paths \
+              "The existing generated branch" \
+              "${branch_allowed_paths_file}" \
+              "${remote_branch_sha}"
+            if ! jq -s -e \
+              '
+                all(.[]; type == "array") and
+                (add | all(.[]; type == "string"))
+              ' \
+              "${base_allowed_paths_file}" \
+              "${branch_allowed_paths_file}" >/dev/null; then
+              echo "::error title=Invalid managed path scope::The proven base and branch managed path lists cannot be combined safely."
+              exit 1
+            fi
+            jq -s 'add | unique | sort' \
+              "${base_allowed_paths_file}" \
+              "${branch_allowed_paths_file}" \
+              >"${combined_allowed_paths_file}"
+            mv "${combined_allowed_paths_file}" "${allowed_paths_file}"
+            assert_allowed_paths \
+              "The existing generated branch" \
+              git -C "${TARGET_ROOT}" diff --no-renames --no-ext-diff \
+                --no-textconv --name-only -z \
+                "${target_base_sha}...${remote_branch_sha}"
+            if ! python3 \
+              "${CANONICAL_ROOT}/scripts/sync_canonical_mirrors.py" \
+              validate-branch-history \
+              --target-root "${TARGET_ROOT}" \
+              --base-ref "${target_base_sha}" \
+              --head-ref "${remote_branch_sha}" \
+              --worktree-head-ref "${target_base_sha}" \
+              --allowed-paths-file "${allowed_paths_file}" \
+              >"${history_receipt_file}"; then
+              echo "::error title=Unsafe sync branch history::The complete branch-exclusive commit history did not pass canonical edge, path, topology, and blob validation."
+              exit 1
+            fi
+            if ! jq -e \
+              --arg base "${target_base_sha}" \
+              --arg head "${remote_branch_sha}" \
+              '
+                .schema_version == 2 and
+                .base_sha == $base and
+                .head_sha == $head and
+                .worktree_head_sha == $base and
+                .profile == "branch-exclusive" and
+                (.history_sha256 | test("^[0-9a-f]{64}$"))
+              ' "${history_receipt_file}" >/dev/null; then
+              echo "::error title=Invalid sync history receipt::The branch history validator did not bind the exact prepared base and head."
+              exit 1
+            fi
+            remote_branch_history_sha256="$(
+              jq -r '.history_sha256' "${history_receipt_file}"
+            )"
+            git -C "${TARGET_ROOT}" switch --force-create "${SYNC_BRANCH}" \
+              "origin/${TARGET_BASE}"
+          else
+            git -C "${TARGET_ROOT}" switch --create "${SYNC_BRANCH}" \
+              "origin/${TARGET_BASE}"
+            mv "${base_allowed_paths_file}" "${allowed_paths_file}"
+            remote_branch_history_sha256="$(
+              printf '%064d' 0
+            )"
+          fi
+
+          assert_allowed_paths \
+            "The fresh generated branch" \
+            git -C "${TARGET_ROOT}" diff --no-renames --name-only -z \
+              "origin/${TARGET_BASE}...HEAD"
+          {
+            echo "target_base_sha=${target_base_sha}"
+            echo "remote_branch_present=${remote_branch_present}"
+            echo "remote_branch_sha=${remote_branch_sha}"
+            echo "remote_branch_history_sha256=${remote_branch_history_sha256}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Validate existing sync PR ownership
+        id: existing-pr
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          pull_requests="$(
+            gh pr list \
+              --repo "${TARGET_REPOSITORY}" \
+              --state open \
+              --base "${TARGET_BASE}" \
+              --head "${SYNC_BRANCH}" \
+              --limit 10 \
+              --json number,body,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepositoryOwner,isCrossRepository
+          )"
+          count="$(jq 'length' <<<"${pull_requests}")"
+          if ((count > 1)); then
+            echo "::error title=Ambiguous sync PR::More than one open PR uses the scoped toolbox sync branch."
+            exit 1
+          fi
+          if ((count == 1)); then
+            if [[ "${{ steps.prepare.outputs.remote_branch_present }}" != "true" ]]; then
+              echo "::error title=Sync PR branch missing::An open sync PR exists but its prepared remote branch is absent."
+              exit 1
+            fi
+            if ! jq -e \
+              --arg owner "${TARGET_OWNER}" \
+              --arg base "${TARGET_BASE}" \
+              --arg base_oid "${{ steps.prepare.outputs.target_base_sha }}" \
+              --arg head "${SYNC_BRANCH}" \
+              --arg head_oid "${{ steps.prepare.outputs.remote_branch_sha }}" \
+              '
+                .[0].state == "OPEN" and
+                .[0].isCrossRepository == false and
+                .[0].headRepositoryOwner.login == $owner and
+                .[0].baseRefName == $base and
+                .[0].baseRefOid == $base_oid and
+                .[0].headRefName == $head and
+                .[0].headRefOid == $head_oid and
+                (.[0].body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
+              ' \
+              <<<"${pull_requests}" >/dev/null; then
+              echo "::error title=Unowned sync PR::The existing PR does not exactly match the prepared repository, base, branch, head commit, owner, and canonical automation marker and will not be edited."
+              exit 1
+            fi
+            echo "number=$(jq -r '.[0].number' <<<"${pull_requests}")" \
+              >>"${GITHUB_OUTPUT}"
+          else
+            echo "number=" >>"${GITHUB_OUTPUT}"
+          fi
+
+      - name: Generate and verify exact toolbox mirror
+        shell: bash
+        run: |
+          set -euo pipefail
+          observed_sha="$(git -C "${CANONICAL_ROOT}" rev-parse --verify HEAD)"
+          if [[ "${observed_sha}" != "${CANONICAL_SHA}" ]]; then
+            echo "::error title=Canonical commit changed::Refusing to generate from a commit other than the triggering SHA."
+            exit 1
+          fi
+          python3 "${CANONICAL_ROOT}/scripts/sync_canonical_mirrors.py" generate \
+            --target-root "${TARGET_ROOT}" \
+            --mirror "${MIRROR_NAME}" \
+            --source-commit "${CANONICAL_SHA}"
+          python3 "${CANONICAL_ROOT}/scripts/sync_canonical_mirrors.py" check \
+            --target-root "${TARGET_ROOT}" \
+            --mirror "${MIRROR_NAME}"
+
+      - name: Commit scoped generated changes
+        id: commit
+        shell: bash
+        env:
+          PREPARED_REMOTE_BRANCH_PRESENT: ${{ steps.prepare.outputs.remote_branch_present }}
+          PREPARED_REMOTE_BRANCH_SHA: ${{ steps.prepare.outputs.remote_branch_sha }}
+        run: |
+          set -euo pipefail
+          allowed_paths_file="${RUNNER_TEMP}/toolbox-sync-allowed-paths.json"
+
+          is_allowed_path() {
+            local path="$1"
+            jq -e --arg path "${path}" 'index($path) != null' \
+              "${allowed_paths_file}" >/dev/null
+          }
+          assert_allowed_paths() {
+            local label="$1"
+            shift
+            local unexpected=0
+            local paths_file
+            paths_file="$(
+              mktemp "${RUNNER_TEMP}/toolbox-sync-paths.XXXXXX"
+            )"
+            if ! "$@" >"${paths_file}"; then
+              echo "::error title=Generated scope inspection failed::${label} could not be enumerated safely."
+              rm -f "${paths_file}"
+              exit 1
+            fi
+            while IFS= read -r -d '' path; do
+              if ! is_allowed_path "${path}"; then
+                echo "::error title=Out-of-scope generated change::${label} contains a path outside the canonical toolbox mirror."
+                printf 'Unexpected path: %q\n' "${path}" >&2
+                unexpected=1
+              fi
+            done <"${paths_file}"
+            rm -f "${paths_file}"
+            if ((unexpected != 0)); then
+              exit 1
+            fi
+          }
+
+          assert_allowed_paths \
+            "The generated untracked set" \
+            git -C "${TARGET_ROOT}" ls-files --others --exclude-standard -z
+
+          while IFS= read -r -d '' path; do
+            target_path="${TARGET_ROOT}/${path}"
+            if [[ -L "${target_path}" || \
+              ( -e "${target_path}" && ! -f "${target_path}" ) ]]; then
+              echo "::error title=Unsafe generated path::Refusing to stage a non-regular generated path."
+              printf 'Unsafe path: %q\n' "${path}" >&2
+              exit 1
+            fi
+            if [[ -e "${target_path}" ]]; then
+              git_mode="100644"
+              if [[ -x "${target_path}" ]]; then
+                git_mode="100755"
+              fi
+              object_id="$(
+                git -C "${TARGET_ROOT}" hash-object \
+                  --no-filters -w --stdin <"${target_path}"
+              )"
+              if [[ ! "${object_id}" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "::error title=Raw staging failed::Git did not return a full object ID."
+                exit 1
+              fi
+              git -C "${TARGET_ROOT}" update-index --add --cacheinfo \
+                "${git_mode},${object_id},${path}"
+            else
+              git -C "${TARGET_ROOT}" update-index --force-remove -- "${path}"
+            fi
+          done < <(jq -j '.[] | ., "\u0000"' "${allowed_paths_file}")
+
+          if [[ -n "$(
+            git -C "${TARGET_ROOT}" ls-files --others --exclude-standard
+          )" ]]; then
+            echo "::error title=Untracked generated change::The generator left an untracked path outside the staged toolbox scope."
+            exit 1
+          fi
+          assert_allowed_paths \
+            "The staged generated diff" \
+            git -C "${TARGET_ROOT}" diff --cached --no-renames --name-only -z
+          git -C "${TARGET_ROOT}" diff --cached --check
+
+          if ! git -C "${TARGET_ROOT}" diff --cached --quiet; then
+            parent_sha="$(git -C "${TARGET_ROOT}" rev-parse --verify HEAD)"
+            tree_sha="$(git -C "${TARGET_ROOT}" write-tree)"
+            commit_sha="$(
+              git -C "${TARGET_ROOT}" commit-tree "${tree_sha}" \
+                -p "${parent_sha}" \
+                -m "chore(sync): update canonical personal sync mirror" \
+                -m "Canonical-source: ${GITHUB_REPOSITORY}@${CANONICAL_SHA}"
+            )"
+            git -C "${TARGET_ROOT}" update-ref HEAD \
+              "${commit_sha}" "${parent_sha}"
+          fi
+
+          python3 "${CANONICAL_ROOT}/scripts/sync_canonical_mirrors.py" check \
+            --target-root "${TARGET_ROOT}" \
+            --mirror "${MIRROR_NAME}"
+
+          assert_allowed_paths \
+            "The final sync branch" \
+            git -C "${TARGET_ROOT}" diff --no-renames --name-only -z \
+              "origin/${TARGET_BASE}...HEAD"
+          pr_has_changes=true
+          if git -C "${TARGET_ROOT}" diff --quiet \
+            "origin/${TARGET_BASE}...HEAD"; then
+            pr_has_changes=false
+          fi
+          head_sha="$(git -C "${TARGET_ROOT}" rev-parse HEAD)"
+          branch_needs_update=false
+          case "${PREPARED_REMOTE_BRANCH_PRESENT}" in
+            true)
+              if [[ ! "${PREPARED_REMOTE_BRANCH_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "::error title=Invalid prepared branch::The prepared remote branch SHA is missing or malformed."
+                exit 1
+              fi
+              if [[ "${head_sha}" != "${PREPARED_REMOTE_BRANCH_SHA}" ]]; then
+                branch_needs_update=true
+              fi
+              ;;
+            false)
+              if [[ -n "${PREPARED_REMOTE_BRANCH_SHA}" ]]; then
+                echo "::error title=Invalid prepared branch::An absent prepared branch must not carry a SHA."
+                exit 1
+              fi
+              if [[ "${pr_has_changes}" == "true" ]]; then
+                branch_needs_update=true
+              fi
+              ;;
+            *)
+              echo "::error title=Invalid prepared branch::The prepared branch presence flag is malformed."
+              exit 1
+              ;;
+          esac
+          {
+            echo "pr_has_changes=${pr_has_changes}"
+            echo "branch_needs_update=${branch_needs_update}"
+            echo "head_sha=${head_sha}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Validate fresh generated branch history
+        id: history
+        shell: bash
+        env:
+          GENERATED_HEAD_SHA: ${{ steps.commit.outputs.head_sha }}
+          PREPARED_TARGET_BASE_SHA: ${{ steps.prepare.outputs.target_base_sha }}
+        run: |
+          set -euo pipefail
+          allowed_paths_file="${RUNNER_TEMP}/toolbox-sync-allowed-paths.json"
+          history_receipt_file="$(
+            mktemp "${RUNNER_TEMP}/toolbox-sync-fresh-history.XXXXXX"
+          )"
+          if [[ ! "${PREPARED_TARGET_BASE_SHA}" =~ ^[0-9a-f]{40}$ || \
+            ! "${GENERATED_HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Invalid generated history::The prepared base or generated head is malformed."
+            exit 1
+          fi
+          python3 \
+            "${CANONICAL_ROOT}/scripts/sync_canonical_mirrors.py" \
+            validate-branch-history \
+            --target-root "${TARGET_ROOT}" \
+            --base-ref "${PREPARED_TARGET_BASE_SHA}" \
+            --head-ref "${GENERATED_HEAD_SHA}" \
+            --worktree-head-ref "${GENERATED_HEAD_SHA}" \
+            --allowed-paths-file "${allowed_paths_file}" \
+            --require-fresh-head \
+            >"${history_receipt_file}"
+          if ! jq -e \
+            --arg base "${PREPARED_TARGET_BASE_SHA}" \
+            --arg head "${GENERATED_HEAD_SHA}" \
+            '
+              .schema_version == 2 and
+              .base_sha == $base and
+              .head_sha == $head and
+              .worktree_head_sha == $head and
+              .merge_base_sha == $base and
+              .profile == "fresh-single-commit" and
+              (.history_sha256 | test("^[0-9a-f]{64}$"))
+            ' "${history_receipt_file}" >/dev/null; then
+            echo "::error title=Invalid generated history receipt::The fresh-history validator did not bind the exact prepared base and generated head."
+            exit 1
+          fi
+          {
+            echo "head_sha=${GENERATED_HEAD_SHA}"
+            echo "history_sha256=$(jq -r '.history_sha256' "${history_receipt_file}")"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Push scoped sync branch
+        if: steps.commit.outputs.branch_needs_update == 'true'
+        shell: bash
+        env:
+          CODEX_TOOLBOX_SYNC_TOKEN: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
+          DESIRED_HEAD_SHA: ${{ steps.history.outputs.head_sha }}
+          DESIRED_HISTORY_SHA256: ${{ steps.history.outputs.history_sha256 }}
+          PREPARED_REMOTE_BRANCH_PRESENT: ${{ steps.prepare.outputs.remote_branch_present }}
+          PREPARED_REMOTE_BRANCH_SHA: ${{ steps.prepare.outputs.remote_branch_sha }}
+          PREPARED_REMOTE_HISTORY_SHA256: ${{ steps.prepare.outputs.remote_branch_history_sha256 }}
+          PREPARED_TARGET_BASE_SHA: ${{ steps.prepare.outputs.target_base_sha }}
+        run: |
+          set -euo pipefail
+          git_with_token() {
+            local basic_token
+            basic_token="$(
+              printf 'x-access-token:%s' "${CODEX_TOOLBOX_SYNC_TOKEN}" |
+                base64 -w 0
+            )"
+            GIT_CONFIG_COUNT=1 \
+              GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${basic_token}" \
+              git "$@"
+          }
+          read_remote_ref() {
+            local reference="$1"
+            local record
+            local expected_record
+            record="$(
+              git_with_token -C "${TARGET_ROOT}" ls-remote --heads origin \
+                "${reference}"
+            )"
+            REMOTE_REF_PRESENT=false
+            REMOTE_REF_SHA=""
+            if [[ -z "${record}" ]]; then
+              return
+            fi
+            REMOTE_REF_SHA="${record%%$'\t'*}"
+            expected_record="$(
+              printf '%s\t%s' "${REMOTE_REF_SHA}" "${reference}"
+            )"
+            if [[ ! "${REMOTE_REF_SHA}" =~ ^[0-9a-f]{40}$ || \
+              "${record}" != "${expected_record}" ]]; then
+              echo "::error title=Ambiguous remote ref::The ${reference} query did not return exactly one canonical lowercase SHA-1 record."
+              exit 1
+            fi
+            REMOTE_REF_PRESENT=true
+          }
+
+          if [[ ! "${DESIRED_HEAD_SHA}" =~ ^[0-9a-f]{40}$ || \
+            ! "${PREPARED_TARGET_BASE_SHA}" =~ ^[0-9a-f]{40}$ || \
+            ! "${DESIRED_HISTORY_SHA256}" =~ ^[0-9a-f]{64}$ || \
+            ! "${PREPARED_REMOTE_HISTORY_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error title=Invalid prepared commit::The desired head, prepared base, or bound history digest is malformed."
+            exit 1
+          fi
+          local_desired_sha="$(
+            git -C "${TARGET_ROOT}" rev-parse --verify \
+              "${DESIRED_HEAD_SHA}^{commit}"
+          )"
+          if [[ "${local_desired_sha}" != "${DESIRED_HEAD_SHA}" ]]; then
+            echo "::error title=Invalid generated commit::The exact desired sync commit is not locally available."
+            exit 1
+          fi
+          read_remote_ref "refs/heads/${TARGET_BASE}"
+          if [[ "${REMOTE_REF_PRESENT}" != "true" || \
+            "${REMOTE_REF_SHA}" != "${PREPARED_TARGET_BASE_SHA}" ]]; then
+            echo "::error title=Toolbox master advanced::The target base changed during generation; rerun against the new base."
+            exit 1
+          fi
+
+          read_remote_ref "refs/heads/${SYNC_BRANCH}"
+          if [[ "${REMOTE_REF_PRESENT}" == "true" && \
+            "${REMOTE_REF_SHA}" == "${DESIRED_HEAD_SHA}" ]]; then
+            echo "The scoped sync branch already points to the generated commit."
+          else
+            case "${PREPARED_REMOTE_BRANCH_PRESENT}" in
+              true)
+                if [[ ! "${PREPARED_REMOTE_BRANCH_SHA}" =~ ^[0-9a-f]{40}$ || \
+                  "${REMOTE_REF_PRESENT}" != "true" || \
+                  "${REMOTE_REF_SHA}" != "${PREPARED_REMOTE_BRANCH_SHA}" ]]; then
+                  echo "::error title=Sync branch advanced::The remote sync branch changed after preparation; refusing to overwrite it."
+                  exit 1
+                fi
+                push_lease="--force-with-lease=refs/heads/${SYNC_BRANCH}:${PREPARED_REMOTE_BRANCH_SHA}"
+                ;;
+              false)
+                if [[ -n "${PREPARED_REMOTE_BRANCH_SHA}" || \
+                  "${REMOTE_REF_PRESENT}" == "true" ]]; then
+                  echo "::error title=Sync branch appeared::The remote sync branch appeared after preparation; refusing to overwrite it."
+                  exit 1
+                fi
+                push_lease="--force-with-lease=refs/heads/${SYNC_BRANCH}:"
+                ;;
+              *)
+                echo "::error title=Invalid prepared branch::The prepared branch presence flag is malformed."
+                exit 1
+                ;;
+            esac
+            git_with_token -C "${TARGET_ROOT}" push "${push_lease}" origin \
+              "${DESIRED_HEAD_SHA}:refs/heads/${SYNC_BRANCH}"
+          fi
+
+          read_remote_ref "refs/heads/${SYNC_BRANCH}"
+          if [[ "${REMOTE_REF_PRESENT}" != "true" || \
+            "${REMOTE_REF_SHA}" != "${DESIRED_HEAD_SHA}" ]]; then
+            echo "::error title=Sync branch verification failed::Remote branch does not match the generated commit."
+            exit 1
+          fi
+
+      - name: Publish or update toolbox sync PR
+        if: steps.commit.outputs.pr_has_changes == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
+          DESIRED_HEAD_SHA: ${{ steps.history.outputs.head_sha }}
+          EXISTING_PR: ${{ steps.existing-pr.outputs.number }}
+          PREPARED_TARGET_BASE_SHA: ${{ steps.prepare.outputs.target_base_sha }}
+        run: |
+          set -euo pipefail
+          pr_body_file="${RUNNER_TEMP}/toolbox-sync-pr.md"
+          short_sha="${CANONICAL_SHA:0:12}"
+          {
+            echo "<!-- codex-personal-sync-toolbox-automation -->"
+            echo
+            echo "Synchronizes the generated \`${MIRROR_NAME}\` mirror from the exact canonical master commit [\`${GITHUB_REPOSITORY}@${CANONICAL_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${CANONICAL_SHA})."
+            echo
+            echo "Generation contract:"
+            echo
+            echo '```text'
+            echo "python3 scripts/sync_canonical_mirrors.py generate --target-root <explicit-toolbox-checkout> --mirror ${MIRROR_NAME} --source-commit ${CANONICAL_SHA}"
+            echo "python3 scripts/sync_canonical_mirrors.py check --target-root <explicit-toolbox-checkout> --mirror ${MIRROR_NAME}"
+            echo '```'
+            echo
+            echo "Scope is limited to the current \`${MIRROR_NAME}\` targets plus clean retired paths proven by the prior committed \`generated-sync-source-lock.json\` receipt. The workflow refuses unrelated branch, working-tree, staged, or PR changes and never writes directly to \`${TARGET_BASE}\`."
+            echo
+            echo "Canonical automation source: \`${GITHUB_WORKFLOW}\` run \`${GITHUB_RUN_ID}\`."
+          } >"${pr_body_file}"
+
+          title="chore(sync): canonical personal sync ${short_sha}"
+          query_sync_prs() {
+            gh pr list \
+              --repo "${TARGET_REPOSITORY}" \
+              --state open \
+              --base "${TARGET_BASE}" \
+              --head "${SYNC_BRANCH}" \
+              --limit 10 \
+              --json number,body,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepositoryOwner,isCrossRepository
+          }
+          require_target_base_sha() {
+            local observed_base_sha
+            observed_base_sha="$(
+              gh api \
+                "repos/${TARGET_REPOSITORY}/git/ref/heads/${TARGET_BASE}" \
+                --jq '.object.sha'
+            )"
+            if [[ ! "${PREPARED_TARGET_BASE_SHA}" =~ ^[0-9a-f]{40}$ || \
+              ! "${observed_base_sha}" =~ ^[0-9a-f]{40}$ || \
+              "${observed_base_sha}" != "${PREPARED_TARGET_BASE_SHA}" ]]; then
+              echo "::error title=Toolbox master advanced::The target base changed after generation; refusing to mutate a sync PR."
+              return 1
+            fi
+          }
+          require_sync_branch_sha() {
+            local observed_head_sha
+            observed_head_sha="$(
+              gh api \
+                "repos/${TARGET_REPOSITORY}/git/ref/heads/${SYNC_BRANCH}" \
+                --jq '.object.sha'
+            )"
+            if [[ ! "${DESIRED_HEAD_SHA}" =~ ^[0-9a-f]{40}$ || \
+              ! "${observed_head_sha}" =~ ^[0-9a-f]{40}$ || \
+              "${observed_head_sha}" != "${DESIRED_HEAD_SHA}" ]]; then
+              echo "::error title=Sync branch advanced::The generated branch changed after publication; refusing to mutate a sync PR."
+              return 1
+            fi
+          }
+          require_owned_sync_pr() {
+            local pull_requests="$1"
+            local expected_number="${2:-}"
+            local count
+            count="$(jq 'length' <<<"${pull_requests}")"
+            if ((count != 1)); then
+              echo "::error title=Sync PR changed::Expected exactly one open scoped sync PR after publication."
+              return 1
+            fi
+            if ! jq -e \
+              --arg owner "${TARGET_OWNER}" \
+              --arg base "${TARGET_BASE}" \
+              --arg base_oid "${PREPARED_TARGET_BASE_SHA}" \
+              --arg head "${SYNC_BRANCH}" \
+              --arg head_oid "${DESIRED_HEAD_SHA}" \
+              --arg expected_number "${expected_number}" \
+              '
+                .[0].state == "OPEN" and
+                .[0].baseRefName == $base and
+                .[0].baseRefOid == $base_oid and
+                .[0].headRefName == $head and
+                .[0].headRefOid == $head_oid and
+                .[0].isCrossRepository == false and
+                .[0].headRepositoryOwner.login == $owner and
+                (.[0].body | contains("<!-- codex-personal-sync-toolbox-automation -->")) and
+                (
+                  $expected_number == "" or
+                  (.[0].number | tostring) == $expected_number
+                )
+              ' <<<"${pull_requests}" >/dev/null; then
+              echo "::error title=Sync PR changed::The live PR does not exactly match the owned repository, lifecycle, base, branch, generated head, owner, and automation marker."
+              return 1
+            fi
+          }
+          report_create_recovery_candidates() {
+            local reason="$1"
+            local candidates
+            local candidate_numbers
+            if candidates="$(query_sync_prs 2>/dev/null)" && \
+              jq -e 'type == "array"' <<<"${candidates}" >/dev/null; then
+              if candidate_numbers="$(
+                jq -r \
+                  --arg owner "${TARGET_OWNER}" \
+                  --arg base "${TARGET_BASE}" \
+                  --arg base_oid "${PREPARED_TARGET_BASE_SHA}" \
+                  --arg head "${SYNC_BRANCH}" \
+                  --arg head_oid "${DESIRED_HEAD_SHA}" \
+                  '
+                    .[] |
+                    select(
+                      (.number | type) == "number" and
+                      .number > 0 and
+                      .number == (.number | floor) and
+                      (.number | tostring | test("^[1-9][0-9]*$")) and
+                      .state == "OPEN" and
+                      .baseRefName == $base and
+                      .baseRefOid == $base_oid and
+                      .headRefName == $head and
+                      .headRefOid == $head_oid and
+                      .isCrossRepository == false and
+                      .headRepositoryOwner.login == $owner and
+                      (.body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
+                    ) |
+                    .number
+                  ' <<<"${candidates}" 2>/dev/null
+              )" && [[ -n "${candidate_numbers}" ]]; then
+                while IFS= read -r candidate_number; do
+                  echo "::error title=Sync PR recovery required::${reason}; inspect candidate ${TARGET_REPOSITORY}#${candidate_number}. The response did not prove request lineage, so automation left it unchanged."
+                done <<<"${candidate_numbers}"
+                return
+              fi
+            fi
+            echo "::error title=Sync PR recovery required::${reason}; inspect open PRs for ${TARGET_REPOSITORY} base=${TARGET_BASE} head=${SYNC_BRANCH}. No exact request-bound candidate was proved, so automation left every PR unchanged."
+          }
+          close_created_pr_after_failed_postcondition() {
+            local created_number="$1"
+            local created_pr
+            local closed_pr
+            local close_status
+            if [[ ! "${created_number}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error title=Sync PR recovery required::A created PR may need manual inspection, but its returned number is invalid."
+              return 1
+            fi
+            if ! created_pr="$(
+              gh pr view "${created_number}" \
+                --repo "${TARGET_REPOSITORY}" \
+                --json number,body,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepositoryOwner,isCrossRepository
+            )"; then
+              echo "::error title=Sync PR recovery required::Could not inspect created PR ${TARGET_REPOSITORY}#${created_number}; preserve it for manual recovery."
+              return 1
+            fi
+            if ! jq -e \
+              --arg number "${created_number}" \
+              --arg owner "${TARGET_OWNER}" \
+              --arg base "${TARGET_BASE}" \
+              --arg base_oid "${PREPARED_TARGET_BASE_SHA}" \
+              --arg head "${SYNC_BRANCH}" \
+              --arg head_oid "${DESIRED_HEAD_SHA}" \
+              '
+                (.number | tostring) == $number and
+                .state == "OPEN" and
+                .baseRefName == $base and
+                .baseRefOid == $base_oid and
+                .headRefName == $head and
+                .headRefOid == $head_oid and
+                .isCrossRepository == false and
+                .headRepositoryOwner.login == $owner and
+                (.body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
+              ' <<<"${created_pr}" >/dev/null; then
+              echo "::error title=Sync PR recovery required::Created PR ${TARGET_REPOSITORY}#${created_number} no longer matches the exact automation identity; preserve it for manual recovery."
+              return 1
+            fi
+            if gh pr close "${created_number}" \
+              --repo "${TARGET_REPOSITORY}"; then
+              close_status=0
+            else
+              close_status=$?
+            fi
+            if ! closed_pr="$(
+              gh pr view "${created_number}" \
+                --repo "${TARGET_REPOSITORY}" \
+                --json number,body,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepositoryOwner,isCrossRepository
+            )" || ! jq -e \
+              --arg number "${created_number}" \
+              --arg owner "${TARGET_OWNER}" \
+              --arg base "${TARGET_BASE}" \
+              --arg base_oid "${PREPARED_TARGET_BASE_SHA}" \
+              --arg head "${SYNC_BRANCH}" \
+              --arg head_oid "${DESIRED_HEAD_SHA}" \
+              '
+                (.number | tostring) == $number and
+                .state == "CLOSED" and
+                .baseRefName == $base and
+                .baseRefOid == $base_oid and
+                .headRefName == $head and
+                .headRefOid == $head_oid and
+                .isCrossRepository == false and
+                .headRepositoryOwner.login == $owner and
+                (.body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
+              ' <<<"${closed_pr}" >/dev/null; then
+              echo "::error title=Sync PR recovery required::Closure of created PR ${TARGET_REPOSITORY}#${created_number} is unverified after gh pr close status ${close_status}; preserve the exact locator for manual recovery."
+              return 1
+            fi
+            if ((close_status != 0)); then
+              echo "::warning title=Sync PR closure response lost::gh pr close returned status ${close_status}, but exact terminal evidence proves ${TARGET_REPOSITORY}#${created_number} is closed."
+            fi
+            echo "::warning title=Rejected created sync PR::Closed ${TARGET_REPOSITORY}#${created_number} because its exact post-publication evidence did not match."
+          }
+
+          before_publish="$(query_sync_prs)"
+          published_pr_number="${EXISTING_PR}"
+          if [[ -n "${EXISTING_PR}" ]]; then
+            require_owned_sync_pr "${before_publish}" "${EXISTING_PR}"
+            require_target_base_sha
+            require_sync_branch_sha
+            gh pr edit "${EXISTING_PR}" \
+              --repo "${TARGET_REPOSITORY}" \
+              --title "${title}" \
+              --body-file "${pr_body_file}"
+          else
+            if [[ "$(jq 'length' <<<"${before_publish}")" != "0" ]]; then
+              echo "::error title=Sync PR appeared::An open sync PR appeared after preparation; refusing to adopt or overwrite it."
+              exit 1
+            fi
+            require_target_base_sha
+            require_sync_branch_sha
+            if created_pr_url="$(
+              gh pr create \
+                --repo "${TARGET_REPOSITORY}" \
+                --base "${TARGET_BASE}" \
+                --head "${SYNC_BRANCH}" \
+                --title "${title}" \
+                --body-file "${pr_body_file}"
+            )"; then
+              created_pr_status=0
+            else
+              created_pr_status=$?
+            fi
+            if ((created_pr_status != 0)); then
+              report_create_recovery_candidates \
+                "gh pr create returned status ${created_pr_status} after the request"
+              exit 1
+            fi
+            expected_pr_url_prefix="https://github.com/${TARGET_REPOSITORY}/pull/"
+            if [[ "${created_pr_url}" != "${expected_pr_url_prefix}"* ]]; then
+              report_create_recovery_candidates \
+                "gh pr create returned an unrecognized response after the request"
+              exit 1
+            fi
+            published_pr_number="${created_pr_url#"${expected_pr_url_prefix}"}"
+            if [[ ! "${published_pr_number}" =~ ^[1-9][0-9]*$ ]]; then
+              report_create_recovery_candidates \
+                "gh pr create did not return one canonical positive PR number"
+              exit 1
+            fi
+          fi
+          post_publish_pr="$(query_sync_prs || true)"
+          if ! require_target_base_sha || \
+            ! require_sync_branch_sha || \
+            ! require_owned_sync_pr \
+              "${post_publish_pr}" "${published_pr_number}"; then
+            if [[ -z "${EXISTING_PR}" ]]; then
+              close_created_pr_after_failed_postcondition \
+                "${published_pr_number}" || true
+            fi
+            exit 1
+          fi
+
+      - name: Close clean owned toolbox sync PR
+        if: steps.commit.outputs.pr_has_changes != 'true' && steps.existing-pr.outputs.number != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
+          DESIRED_HEAD_SHA: ${{ steps.history.outputs.head_sha }}
+          EXISTING_PR: ${{ steps.existing-pr.outputs.number }}
+          PREPARED_TARGET_BASE_SHA: ${{ steps.prepare.outputs.target_base_sha }}
+        run: |
+          set -euo pipefail
+          current_pull_request="$(
+            gh pr view "${EXISTING_PR}" \
+              --repo "${TARGET_REPOSITORY}" \
+              --json number,body,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepositoryOwner,isCrossRepository
+          )"
+          if ! jq -e \
+            --arg number "${EXISTING_PR}" \
+            --arg base "${TARGET_BASE}" \
+            --arg base_oid "${PREPARED_TARGET_BASE_SHA}" \
+            --arg head "${SYNC_BRANCH}" \
+            --arg head_oid "${DESIRED_HEAD_SHA}" \
+            --arg owner "${TARGET_OWNER}" \
+            '
+              (.number | tostring) == $number and
+              .state == "OPEN" and
+              .baseRefName == $base and
+              .baseRefOid == $base_oid and
+              .headRefName == $head and
+              .headRefOid == $head_oid and
+              .isCrossRepository == false and
+              .headRepositoryOwner.login == $owner and
+              (.body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
+            ' <<<"${current_pull_request}" >/dev/null; then
+            echo "::error title=Sync PR changed::The clean PR no longer exactly matches the owned automation scope and generated head."
+            exit 1
+          fi
+          observed_base_sha="$(
+            gh api \
+              "repos/${TARGET_REPOSITORY}/git/ref/heads/${TARGET_BASE}" \
+              --jq '.object.sha'
+          )"
+          if [[ ! "${PREPARED_TARGET_BASE_SHA}" =~ ^[0-9a-f]{40}$ || \
+            ! "${observed_base_sha}" =~ ^[0-9a-f]{40}$ || \
+            "${observed_base_sha}" != "${PREPARED_TARGET_BASE_SHA}" ]]; then
+            echo "::error title=Toolbox master advanced::The target base changed after generation; refusing to close the sync PR."
+            exit 1
+          fi
+          observed_head_sha="$(
+            gh api \
+              "repos/${TARGET_REPOSITORY}/git/ref/heads/${SYNC_BRANCH}" \
+              --jq '.object.sha'
+          )"
+          if [[ ! "${DESIRED_HEAD_SHA}" =~ ^[0-9a-f]{40}$ || \
+            ! "${observed_head_sha}" =~ ^[0-9a-f]{40}$ || \
+            "${observed_head_sha}" != "${DESIRED_HEAD_SHA}" ]]; then
+            echo "::error title=Sync branch advanced::The generated branch changed after publication; refusing to close the sync PR."
+            exit 1
+          fi
+          if gh pr close "${EXISTING_PR}" \
+            --repo "${TARGET_REPOSITORY}"; then
+            close_status=0
+          else
+            close_status=$?
+          fi
+          if ! closed_pull_request="$(
+            gh pr view "${EXISTING_PR}" \
+              --repo "${TARGET_REPOSITORY}" \
+              --json number,body,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepositoryOwner,isCrossRepository
+          )"; then
+            echo "::error title=Sync PR recovery required::Could not verify closure of ${TARGET_REPOSITORY}#${EXISTING_PR}; preserve the exact locator for manual recovery."
+            exit 1
+          fi
+          if ! jq -e \
+            --arg number "${EXISTING_PR}" \
+            --arg base "${TARGET_BASE}" \
+            --arg base_oid "${PREPARED_TARGET_BASE_SHA}" \
+            --arg head "${SYNC_BRANCH}" \
+            --arg head_oid "${DESIRED_HEAD_SHA}" \
+            --arg owner "${TARGET_OWNER}" \
+            '
+              (.number | tostring) == $number and
+              .state == "CLOSED" and
+              .baseRefName == $base and
+              .baseRefOid == $base_oid and
+              .headRefName == $head and
+              .headRefOid == $head_oid and
+              .isCrossRepository == false and
+              .headRepositoryOwner.login == $owner and
+              (.body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
+            ' <<<"${closed_pull_request}" >/dev/null; then
+            echo "::error title=Sync PR recovery required::Closure of ${TARGET_REPOSITORY}#${EXISTING_PR} is unverified after gh pr close status ${close_status}; preserve the exact locator for manual recovery."
+            exit 1
+          fi
+          if ((close_status != 0)); then
+            echo "::warning title=Sync PR closure response lost::gh pr close returned status ${close_status}, but exact terminal evidence proves ${TARGET_REPOSITORY}#${EXISTING_PR} is closed."
+          fi
+
+      - name: Verify and report no toolbox changes
+        if: steps.commit.outputs.pr_has_changes != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
+          BRANCH_NEEDS_UPDATE: ${{ steps.commit.outputs.branch_needs_update }}
+          DESIRED_HEAD_SHA: ${{ steps.history.outputs.head_sha }}
+          EXISTING_PR: ${{ steps.existing-pr.outputs.number }}
+          PREPARED_REMOTE_BRANCH_PRESENT: ${{ steps.prepare.outputs.remote_branch_present }}
+          PREPARED_REMOTE_BRANCH_SHA: ${{ steps.prepare.outputs.remote_branch_sha }}
+          PREPARED_TARGET_BASE_SHA: ${{ steps.prepare.outputs.target_base_sha }}
+        run: |
+          set -euo pipefail
+          git_with_token() {
+            local basic_token
+            basic_token="$(
+              printf 'x-access-token:%s' "${GH_TOKEN}" |
+                base64 -w 0
+            )"
+            GIT_CONFIG_COUNT=1 \
+              GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${basic_token}" \
+              git "$@"
+          }
+          read_remote_ref() {
+            local reference="$1"
+            local record
+            local expected_record
+            record="$(
+              git_with_token -C "${TARGET_ROOT}" ls-remote --heads origin \
+                "${reference}"
+            )"
+            REMOTE_REF_PRESENT=false
+            REMOTE_REF_SHA=""
+            if [[ -z "${record}" ]]; then
+              return
+            fi
+            REMOTE_REF_SHA="${record%%$'\t'*}"
+            expected_record="$(
+              printf '%s\t%s' "${REMOTE_REF_SHA}" "${reference}"
+            )"
+            if [[ ! "${REMOTE_REF_SHA}" =~ ^[0-9a-f]{40}$ || \
+              "${record}" != "${expected_record}" ]]; then
+              echo "::error title=Ambiguous remote ref::The ${reference} query did not return exactly one canonical lowercase SHA-1 record."
+              exit 1
+            fi
+            REMOTE_REF_PRESENT=true
+          }
+
+          if [[ ! "${PREPARED_TARGET_BASE_SHA}" =~ ^[0-9a-f]{40}$ || \
+            ! "${DESIRED_HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Invalid no-op snapshot::The prepared base or desired terminal head is malformed."
+            exit 1
+          fi
+          if [[ "${DESIRED_HEAD_SHA}" != "${PREPARED_TARGET_BASE_SHA}" ]]; then
+            echo "::error title=Invalid no-op snapshot::A generated no-op must retain the exact prepared target base commit."
+            exit 1
+          fi
+          case "${BRANCH_NEEDS_UPDATE}" in
+            true)
+              if [[ "${PREPARED_REMOTE_BRANCH_PRESENT}" != "true" || \
+                ! "${PREPARED_REMOTE_BRANCH_SHA}" =~ ^[0-9a-f]{40}$ || \
+                "${PREPARED_REMOTE_BRANCH_SHA}" == "${DESIRED_HEAD_SHA}" ]]; then
+                echo "::error title=Invalid no-op snapshot::A clean branch update must replace one exact stale prepared sync ref."
+                exit 1
+              fi
+              expected_branch_present=true
+              expected_branch_sha="${DESIRED_HEAD_SHA}"
+              ;;
+            false)
+              case "${PREPARED_REMOTE_BRANCH_PRESENT}" in
+                true)
+                  if [[ ! "${PREPARED_REMOTE_BRANCH_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+                    echo "::error title=Invalid no-op snapshot::The prepared sync branch SHA is malformed."
+                    exit 1
+                  fi
+                  if [[ "${PREPARED_REMOTE_BRANCH_SHA}" != "${DESIRED_HEAD_SHA}" ]]; then
+                    echo "::error title=Invalid no-op snapshot::An unchanged clean sync branch must already equal the desired terminal head."
+                    exit 1
+                  fi
+                  expected_branch_present=true
+                  expected_branch_sha="${PREPARED_REMOTE_BRANCH_SHA}"
+                  ;;
+                false)
+                  if [[ -n "${PREPARED_REMOTE_BRANCH_SHA}" ]]; then
+                    echo "::error title=Invalid no-op snapshot::An absent prepared sync branch must not carry a SHA."
+                    exit 1
+                  fi
+                  expected_branch_present=false
+                  expected_branch_sha=""
+                  ;;
+                *)
+                  echo "::error title=Invalid no-op snapshot::The prepared sync branch presence flag is malformed."
+                  exit 1
+                  ;;
+              esac
+              ;;
+            *)
+              echo "::error title=Invalid no-op snapshot::The branch update flag is malformed."
+              exit 1
+              ;;
+          esac
+
+          read_remote_ref "refs/heads/${TARGET_BASE}"
+          if [[ "${REMOTE_REF_PRESENT}" != "true" || \
+            "${REMOTE_REF_SHA}" != "${PREPARED_TARGET_BASE_SHA}" ]]; then
+            echo "::error title=Toolbox master advanced::The target base changed after no-op preparation; rerun against the live base."
+            exit 1
+          fi
+
+          read_remote_ref "refs/heads/${SYNC_BRANCH}"
+          if [[ "${expected_branch_present}" == "true" ]]; then
+            if [[ "${REMOTE_REF_PRESENT}" != "true" ]]; then
+              echo "::error title=Sync branch disappeared::The expected sync branch disappeared before no-op completion; rerun from a fresh snapshot."
+              exit 1
+            fi
+            if [[ "${REMOTE_REF_SHA}" != "${expected_branch_sha}" ]]; then
+              echo "::error title=Sync branch advanced::The sync branch changed before no-op completion; rerun from a fresh snapshot."
+              exit 1
+            fi
+          elif [[ "${REMOTE_REF_PRESENT}" == "true" ]]; then
+            echo "::error title=Sync branch appeared::The sync branch appeared before no-op completion; rerun from a fresh snapshot."
+            exit 1
+          fi
+
+          if [[ -n "${EXISTING_PR}" ]]; then
+            if [[ ! "${EXISTING_PR}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error title=Invalid no-op snapshot::The prepared sync PR number is malformed."
+              exit 1
+            fi
+            if ! terminal_pull_request="$(
+              gh pr view "${EXISTING_PR}" \
+                --repo "${TARGET_REPOSITORY}" \
+                --json number,body,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepositoryOwner,isCrossRepository
+            )"; then
+              echo "::error title=Sync PR changed::The reconciled sync PR could not be read at terminal verification."
+              exit 1
+            fi
+            if ! jq -e \
+              --arg number "${EXISTING_PR}" \
+              --arg owner "${TARGET_OWNER}" \
+              --arg base "${TARGET_BASE}" \
+              --arg base_oid "${PREPARED_TARGET_BASE_SHA}" \
+              --arg head "${SYNC_BRANCH}" \
+              --arg head_oid "${expected_branch_sha}" \
+              '
+                (.number | tostring) == $number and
+                .state == "CLOSED" and
+                .baseRefName == $base and
+                .baseRefOid == $base_oid and
+                .headRefName == $head and
+                .headRefOid == $head_oid and
+                .isCrossRepository == false and
+                .headRepositoryOwner.login == $owner and
+                (.body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
+              ' <<<"${terminal_pull_request}" >/dev/null; then
+              echo "::error title=Sync PR changed::The reconciled sync PR no longer has the exact closed automation identity."
+              exit 1
+            fi
+          fi
+
+          if ! terminal_pull_requests="$(
+            gh pr list \
+              --repo "${TARGET_REPOSITORY}" \
+              --state open \
+              --base "${TARGET_BASE}" \
+              --head "${SYNC_BRANCH}" \
+              --limit 10 \
+              --json number,body,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepositoryOwner,isCrossRepository
+          )"; then
+            echo "::error title=Sync PR set changed::The matching open sync PR set could not be read at terminal verification."
+            exit 1
+          fi
+          if ! jq -e 'type == "array" and length == 0' \
+            <<<"${terminal_pull_requests}" >/dev/null; then
+            echo "::error title=Sync PR set changed::The matching open sync PR set is not the expected empty terminal set; rerun from a fresh snapshot."
+            exit 1
+          fi
+
+          echo "Toolbox mirror and any owned open sync PR are reconciled with canonical commit ${CANONICAL_SHA}."

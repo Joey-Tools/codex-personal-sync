@@ -1,0 +1,50 @@
+{
+  "canonical_repository": "Joey-Tools/codex-personal-sync",
+  "hash_algorithm": "sha256",
+  "mirrors": {
+    "toolbox": {
+      "files": {
+        "engine": "scripts/codex_personal_sync.py",
+        "engine_tests": "tests/test_codex_personal_sync.py",
+        "manifest_schema": "schema/sync-manifest.schema.json",
+        "reconciliation_safety_tests": "tests/test_personal_sync_reconciliation_safety.py",
+        "release_retention_tests": "tests/test_release_retention.py",
+        "scheduler_doctor_tests": "tests/test_scheduler_doctor.py"
+      },
+      "repository": "Joey-Tools/codex-toolbox"
+    }
+  },
+  "sources": {
+    "engine": {
+      "mode": "0755",
+      "path": "scripts/codex_personal_sync.py",
+      "sha256": "ba433d61f4b5aa8c3e4a17f8365488ca5089c58511e091b32e4bc2ae6b872a8a"
+    },
+    "engine_tests": {
+      "mode": "0644",
+      "path": "tests/test_codex_personal_sync.py",
+      "sha256": "1e8f7a856bbfad79908c619673c1652ad48b4e9eb3617f51d1dac2ed15fbb392"
+    },
+    "manifest_schema": {
+      "mode": "0644",
+      "path": "schema/sync-manifest.schema.json",
+      "sha256": "1050a4290ef79aa8dbd0512b5428e52108b21351e74b16d2788b1841a331b0c2"
+    },
+    "reconciliation_safety_tests": {
+      "mode": "0644",
+      "path": "tests/test_personal_sync_reconciliation_safety.py",
+      "sha256": "1ed909e7ca46286a18cba4b61ba2d5634e0aaa86277f7e790748d9bcebcf88a8"
+    },
+    "release_retention_tests": {
+      "mode": "0644",
+      "path": "tests/test_release_retention.py",
+      "sha256": "bfc9a3be29cb08f6f9defe102ea19b8efc80407ca96382d17772b85075a197b1"
+    },
+    "scheduler_doctor_tests": {
+      "mode": "0644",
+      "path": "tests/test_scheduler_doctor.py",
+      "sha256": "221b14d53262afa3c622722693947a0baf5b4c9c76396679a723cf52d1f7e877"
+    }
+  },
+  "version": 1
+}
