@@ -22,7 +22,10 @@ jobs:
       - name: Compile
         run: python3 -m compileall -q scripts tests
       - name: Run tests
-        run: python3 -m unittest discover -s tests
+        shell: bash
+        run: >-
+          bash scripts/run_ci_tests_with_private_tmp.sh --
+          python3 -m unittest discover -s tests
 
   macos-system-temp-alias:
     name: macOS system temp alias (Python ${{ matrix.python-version }})
