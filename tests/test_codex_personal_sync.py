@@ -59,36 +59,43 @@ def github_release_asset(
 
 
 class FakeDownloadProcess:
-    def __init__(self, payload: bytes, *, returncode: int = 0) -> None:
-        stdout_read_fd, stdout_write_fd = os.pipe()
-        stderr_read_fd, stderr_write_fd = os.pipe()
-        os.write(stdout_write_fd, payload)
-        os.close(stdout_write_fd)
-        os.close(stderr_write_fd)
-        self.stdout = os.fdopen(stdout_read_fd, "rb", buffering=0)
-        self.stderr = os.fdopen(stderr_read_fd, "rb", buffering=0)
-        self.pid = 2_000_000_000
-        self.final_returncode = returncode
-        self.returncode: int | None = None
-        self.terminated = False
-        self.killed = False
+    def __new__(
+        cls,
+        payload: bytes,
+        *,
+        returncode: int = 0,
+    ) -> MODULE._GuardedProcess:
+        del cls
+        return MODULE._spawn_guarded_process(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os,sys;"
+                    "os.write(1,bytes.fromhex(sys.argv[1]));"
+                    "raise SystemExit(int(sys.argv[2]))"
+                ),
+                payload.hex(),
+                str(returncode),
+            ],
+            deadline=time.monotonic() + 5.0,
+            process_label="fake download",
+            unavailable_code="test-unavailable",
+            unavailable_message="test executable unavailable",
+        )
 
-    def poll(self) -> int | None:
-        return self.returncode
 
-    def wait(self, timeout: float | None = None) -> int:
-        del timeout
-        if self.returncode is None:
-            self.returncode = self.final_returncode
-        return self.returncode
+class CloseFailingSelector:
+    def __init__(self, inner, error: BaseException) -> None:
+        self.inner = inner
+        self.error = error
 
-    def terminate(self) -> None:
-        self.terminated = True
-        self.returncode = -15
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
 
-    def kill(self) -> None:
-        self.killed = True
-        self.returncode = -9
+    def close(self) -> None:
+        self.inner.close()
+        raise self.error
 
 
 def snapshot_tree(root: Path) -> tuple[tuple[str, str, int, bytes | str | None], ...]:
@@ -2250,6 +2257,530 @@ class CodexPersonalSyncTests(unittest.TestCase):
             ):
                 MODULE._run_gh(["release", "download", "tag"])
 
+    def test_process_guardian_reports_target_and_remains_live_for_fence(
+        self,
+    ) -> None:
+        process = MODULE._spawn_guarded_process(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os;os.write(1,b'guardian-stdout');"
+                    "os.write(2,b'guardian-stderr')"
+                ),
+            ],
+            deadline=time.monotonic() + 5.0,
+            process_label="test process",
+            unavailable_code="test-unavailable",
+            unavailable_message="test executable unavailable",
+        )
+        stdout = process.stdout.read()
+        stderr = process.stderr.read()
+        status_payload = process.status.read(MODULE.PROCESS_GUARDIAN_STATUS_RECORD.size)
+
+        self.assertEqual(stdout, b"guardian-stdout")
+        self.assertEqual(stderr, b"guardian-stderr")
+        self.assertEqual(
+            len(status_payload), MODULE.PROCESS_GUARDIAN_STATUS_RECORD.size
+        )
+        magic, guardian_pid, target_pid, target_returncode = (
+            MODULE.PROCESS_GUARDIAN_STATUS_RECORD.unpack(status_payload)
+        )
+        self.assertEqual(magic, MODULE.PROCESS_GUARDIAN_STATUS_MAGIC)
+        self.assertEqual(guardian_pid, process.pid)
+        self.assertEqual(target_pid, process.target_pid)
+        self.assertEqual(target_returncode, 0)
+        self.assertIsNone(process.returncode)
+        os.set_blocking(process.status.fileno(), False)
+        with self.assertRaises(BlockingIOError):
+            os.read(process.status.fileno(), 1)
+
+        receipt = MODULE._terminalize_process_group_before_reap(
+            process,
+            deadline=time.monotonic() + 5.0,
+            process_label="test process guardian",
+        )
+        close_failures = MODULE._close_process_supervision_resources(
+            process,
+            None,
+            process_label="test process guardian",
+        )
+
+        self.assertTrue(receipt.complete, receipt.errors)
+        self.assertTrue(receipt.kill_sent)
+        self.assertEqual(receipt.returncode, -9)
+        self.assertEqual(close_failures, [])
+
+    def test_guardian_terminalization_never_touches_group_after_wait(self) -> None:
+        lifecycle: list[str] = []
+        guardian = mock.Mock()
+        guardian.returncode = None
+        process = mock.Mock(pid=12345, returncode=None, guardian=guardian)
+
+        def kill_group(process_group_id, signal_number):
+            self.assertEqual(process_group_id, 12345)
+            self.assertEqual(signal_number, MODULE.signal.SIGKILL)
+            self.assertEqual(lifecycle, [])
+            lifecycle.append("killpg")
+
+        def wait(*, timeout):
+            self.assertGreaterEqual(timeout, 0.0)
+            self.assertEqual(lifecycle, ["killpg"])
+            lifecycle.append("wait")
+            return -MODULE.signal.SIGKILL
+
+        process.wait.side_effect = wait
+        with mock.patch.object(MODULE.os, "killpg", side_effect=kill_group):
+            receipt = MODULE._terminalize_process_group_before_reap(
+                process,
+                deadline=time.monotonic() + 1.0,
+                process_label="test guardian",
+            )
+
+        self.assertTrue(receipt.complete, receipt.errors)
+        self.assertEqual(lifecycle, ["killpg", "wait"])
+        process.wait.assert_called_once()
+
+    def test_guardian_terminalization_rejects_early_exit_and_signal_errors(
+        self,
+    ) -> None:
+        early = mock.Mock(pid=12345, returncode=0)
+        with mock.patch.object(MODULE.os, "killpg") as kill_group:
+            receipt = MODULE._terminalize_process_group_before_reap(
+                early,
+                deadline=time.monotonic() + 1.0,
+                process_label="early guardian",
+            )
+        self.assertFalse(receipt.complete)
+        kill_group.assert_not_called()
+        early.wait.assert_not_called()
+
+        for signal_error in (
+            ProcessLookupError("missing group"),
+            PermissionError("denied group"),
+            OSError("other group failure"),
+        ):
+            with self.subTest(error=type(signal_error).__name__):
+                process = mock.Mock(pid=12345, returncode=None)
+                process.wait.return_value = -MODULE.signal.SIGKILL
+                with mock.patch.object(
+                    MODULE.os,
+                    "killpg",
+                    side_effect=signal_error,
+                ):
+                    receipt = MODULE._terminalize_process_group_before_reap(
+                        process,
+                        deadline=time.monotonic() + 1.0,
+                        process_label="failed guardian",
+                    )
+                self.assertFalse(receipt.complete)
+                process.wait.assert_called_once()
+
+    def test_guardian_status_is_exact_and_identity_bound(self) -> None:
+        process = mock.Mock(pid=12345, target_pid=23456)
+        valid = MODULE.PROCESS_GUARDIAN_STATUS_RECORD.pack(
+            MODULE.PROCESS_GUARDIAN_STATUS_MAGIC,
+            process.pid,
+            process.target_pid,
+            0,
+        )
+        self.assertEqual(
+            MODULE._parse_guardian_status(
+                process,
+                valid,
+                process_label="test process",
+                error_code="test-protocol",
+            ),
+            0,
+        )
+        invalid_payloads = (
+            valid[:-1],
+            valid + b"x",
+            MODULE.PROCESS_GUARDIAN_STATUS_RECORD.pack(
+                b"BADMAGIC",
+                process.pid,
+                process.target_pid,
+                0,
+            ),
+            MODULE.PROCESS_GUARDIAN_STATUS_RECORD.pack(
+                MODULE.PROCESS_GUARDIAN_STATUS_MAGIC,
+                process.pid + 1,
+                process.target_pid,
+                0,
+            ),
+            MODULE.PROCESS_GUARDIAN_STATUS_RECORD.pack(
+                MODULE.PROCESS_GUARDIAN_STATUS_MAGIC,
+                process.pid,
+                process.target_pid + 1,
+                0,
+            ),
+            MODULE.PROCESS_GUARDIAN_STATUS_RECORD.pack(
+                MODULE.PROCESS_GUARDIAN_STATUS_MAGIC,
+                process.pid,
+                process.target_pid,
+                256,
+            ),
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(MODULE.SyncError) as raised:
+                    MODULE._parse_guardian_status(
+                        process,
+                        payload,
+                        process_label="test process",
+                        error_code="test-protocol",
+                    )
+                self.assertEqual(raised.exception.code, "test-protocol")
+
+    def test_guardian_status_writer_eof_is_early_exit(self) -> None:
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)
+        status = os.fdopen(read_fd, "rb", buffering=0)
+        process = mock.Mock(status=status)
+        os.set_blocking(status.fileno(), False)
+        try:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "exited before process-group fencing",
+            ) as raised:
+                MODULE._require_guardian_status_writer_live(
+                    process,
+                    process_label="test process",
+                    error_code="test-protocol",
+                )
+            self.assertEqual(raised.exception.code, "test-protocol")
+        finally:
+            status.close()
+
+    def test_guardian_target_launch_failure_preserves_unavailable_taxonomy(
+        self,
+    ) -> None:
+        guardians: list[subprocess.Popen[bytes]] = []
+        real_popen = subprocess.Popen
+
+        def capture_guardian(args, **kwargs):
+            guardian = real_popen(args, **kwargs)
+            guardians.append(guardian)
+            return guardian
+
+        with (
+            mock.patch.object(
+                MODULE.subprocess,
+                "Popen",
+                side_effect=capture_guardian,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "test executable unavailable",
+            ) as raised,
+        ):
+            MODULE._spawn_guarded_process(
+                ["/definitely/missing/codex-personal-sync-target"],
+                deadline=time.monotonic() + 5.0,
+                process_label="missing target",
+                unavailable_code="test-unavailable",
+                unavailable_message="test executable unavailable",
+            )
+
+        self.assertEqual(raised.exception.code, "test-unavailable")
+        self.assertEqual(len(guardians), 1)
+        self.assertEqual(guardians[0].returncode, -MODULE.signal.SIGKILL)
+        self.assertTrue(guardians[0].stdout.closed)
+        self.assertTrue(guardians[0].stderr.closed)
+
+    def test_guardian_control_descriptors_do_not_reach_target(self) -> None:
+        process = MODULE._spawn_guarded_process(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os;leaks=[];"
+                    'exec("for fd in range(3, 64):\\n'
+                    " try:\\n  os.fstat(fd)\\n  leaks.append(fd)\\n"
+                    ' except OSError:\\n  pass");'
+                    "os.write(1,(','.join(map(str,leaks))).encode())"
+                ),
+            ],
+            deadline=time.monotonic() + 5.0,
+            process_label="descriptor test",
+            unavailable_code="test-unavailable",
+            unavailable_message="test executable unavailable",
+        )
+        self.assertEqual(process.stdout.read(), b"")
+        self.assertEqual(process.stderr.read(), b"")
+        status = process.status.read(MODULE.PROCESS_GUARDIAN_STATUS_RECORD.size)
+        self.assertEqual(len(status), MODULE.PROCESS_GUARDIAN_STATUS_RECORD.size)
+        receipt = MODULE._terminalize_process_group_before_reap(
+            process,
+            deadline=time.monotonic() + 5.0,
+            process_label="descriptor test guardian",
+        )
+        MODULE._close_process_supervision_resources(
+            process,
+            None,
+            process_label="descriptor test guardian",
+        )
+        self.assertTrue(receipt.complete, receipt.errors)
+
+    def test_truncated_guardian_ready_receipt_is_fenced_before_reap(self) -> None:
+        guardians: list[subprocess.Popen[bytes]] = []
+        real_popen = subprocess.Popen
+        truncated_guardian = """
+import os
+import signal
+import sys
+ready_fd = int(sys.argv[1])
+status_fd = int(sys.argv[2])
+os.write(ready_fd, b'x')
+os.close(ready_fd)
+os.close(status_fd)
+os.close(1)
+os.close(2)
+while True:
+    signal.pause()
+"""
+
+        def capture_guardian(args, **kwargs):
+            guardian = real_popen(args, **kwargs)
+            guardians.append(guardian)
+            return guardian
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "PROCESS_GUARDIAN_SOURCE",
+                truncated_guardian,
+            ),
+            mock.patch.object(
+                MODULE.subprocess,
+                "Popen",
+                side_effect=capture_guardian,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "ready receipt is incomplete",
+            ) as raised,
+        ):
+            MODULE._spawn_guarded_process(
+                [sys.executable, "-c", "pass"],
+                deadline=time.monotonic() + 5.0,
+                process_label="truncated guardian",
+                unavailable_code="test-unavailable",
+                unavailable_message="test executable unavailable",
+            )
+
+        self.assertEqual(raised.exception.code, "process-guardian-protocol")
+        self.assertEqual(len(guardians), 1)
+        self.assertEqual(guardians[0].returncode, -MODULE.signal.SIGKILL)
+
+    def test_second_guardian_pipe_failure_closes_first_pipe_pair(self) -> None:
+        real_pipe = os.pipe
+        first_pair: tuple[int, int] | None = None
+        calls = 0
+
+        def fail_second_pipe():
+            nonlocal calls, first_pair
+            calls += 1
+            if calls == 1:
+                first_pair = real_pipe()
+                return first_pair
+            raise OSError("injected second pipe failure")
+
+        with (
+            mock.patch.object(MODULE.os, "pipe", side_effect=fail_second_pipe),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "guardian control pipes",
+            ) as raised,
+        ):
+            MODULE._spawn_guarded_process(
+                [sys.executable, "-c", "pass"],
+                deadline=time.monotonic() + 5.0,
+                process_label="pipe failure",
+                unavailable_code="test-unavailable",
+                unavailable_message="test executable unavailable",
+            )
+
+        self.assertEqual(raised.exception.code, "process-guardian-protocol")
+        self.assertIsNotNone(first_pair)
+        assert first_pair is not None
+        for file_descriptor in first_pair:
+            with self.assertRaises(OSError):
+                os.fstat(file_descriptor)
+
+    def test_ready_reader_owns_fd_across_exception_and_number_reuse(self) -> None:
+        real_reader = MODULE._read_guardian_ready_record
+        reused_fd: int | None = None
+
+        def read_then_reuse(file_descriptor, **kwargs):
+            nonlocal reused_fd
+            real_reader(file_descriptor, **kwargs)
+            reused_fd = os.open("/dev/null", os.O_RDONLY)
+            self.assertEqual(reused_fd, file_descriptor)
+            raise MODULE.SyncError(
+                "injected post-ready failure",
+                code="process-guardian-protocol",
+            )
+
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_read_guardian_ready_record",
+                    side_effect=read_then_reuse,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "injected post-ready failure",
+                ),
+            ):
+                MODULE._spawn_guarded_process(
+                    [sys.executable, "-c", "pass"],
+                    deadline=time.monotonic() + 5.0,
+                    process_label="ready ownership",
+                    unavailable_code="test-unavailable",
+                    unavailable_message="test executable unavailable",
+                )
+            self.assertIsNotNone(reused_fd)
+            assert reused_fd is not None
+            os.fstat(reused_fd)
+        finally:
+            if reused_fd is not None:
+                os.close(reused_fd)
+
+    def test_ready_reader_close_failure_preserves_protocol_primary(self) -> None:
+        read_fd, write_fd = os.pipe()
+        real_selector = MODULE.selectors.DefaultSelector
+        try:
+            with (
+                mock.patch.object(
+                    MODULE.selectors,
+                    "DefaultSelector",
+                    return_value=CloseFailingSelector(
+                        real_selector(),
+                        RuntimeError("injected ready selector close failure"),
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "ready receipt timed out.*ready selector close failure",
+                ) as raised,
+            ):
+                MODULE._read_guardian_ready_record(
+                    read_fd,
+                    deadline=time.monotonic() - 1.0,
+                    process_label="ready close test",
+                )
+            read_fd = -1
+            self.assertEqual(raised.exception.code, "process-guardian-protocol")
+            self.assertIsInstance(raised.exception.__cause__, MODULE.SyncError)
+            self.assertIn(
+                "ready receipt timed out",
+                str(raised.exception.__cause__),
+            )
+        finally:
+            if read_fd >= 0:
+                os.close(read_fd)
+            os.close(write_fd)
+
+    def test_bounded_gh_selector_close_failure_preserves_primary(self) -> None:
+        process = FakeDownloadProcess(b"123456789")
+        real_selector = MODULE.selectors.DefaultSelector
+        selector_calls = 0
+
+        def selector_factory():
+            nonlocal selector_calls
+            selector_calls += 1
+            if selector_calls == 1:
+                return CloseFailingSelector(
+                    real_selector(),
+                    RuntimeError("injected selector close failure"),
+                )
+            return real_selector()
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_spawn_guarded_process",
+                return_value=process,
+            ),
+            mock.patch.object(
+                MODULE.selectors,
+                "DefaultSelector",
+                side_effect=selector_factory,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "stdout exceeds.*selector close failure",
+            ) as raised,
+        ):
+            MODULE._run_bounded_gh_process(
+                ["api", "repos/owner/repo/releases"],
+                deadline=time.monotonic() + 5.0,
+                stdout_limit=8,
+                stderr_limit=8,
+                label="gh metadata command",
+            )
+
+        self.assertEqual(raised.exception.code, "gh-cleanup-inconclusive")
+        self.assertIsInstance(raised.exception.__cause__, MODULE.SyncError)
+        self.assertEqual(raised.exception.__cause__.code, "gh-stdout-limit")
+        self.assertEqual(process.returncode, -MODULE.signal.SIGKILL)
+
+    def test_gh_maps_guardian_spawn_cleanup_failure_to_lane_taxonomy(self) -> None:
+        primary = MODULE.SyncError(
+            "injected guardian cleanup failure",
+            code="process-guardian-cleanup-inconclusive",
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_spawn_guarded_process",
+                side_effect=primary,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "guardian cleanup was inconclusive",
+            ) as raised,
+        ):
+            MODULE._run_bounded_gh_process(
+                ["api", "repos/owner/repo/releases"],
+                deadline=time.monotonic() + 5.0,
+                stdout_limit=8,
+                stderr_limit=8,
+                label="gh metadata command",
+            )
+
+        self.assertEqual(raised.exception.code, "gh-cleanup-inconclusive")
+        self.assertIs(raised.exception.__cause__, primary)
+
+    def test_gh_maps_guardian_operation_deadline_to_lane_taxonomy(self) -> None:
+        primary = MODULE.SyncError(
+            "gh metadata command exceeded its monotonic deadline",
+            code="process-guardian-operation-timeout",
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_spawn_guarded_process",
+                side_effect=primary,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "gh metadata command exceeded its monotonic deadline",
+            ) as raised,
+        ):
+            MODULE._run_bounded_gh_process(
+                ["api", "repos/owner/repo/releases"],
+                deadline=time.monotonic() + 1.0,
+                stdout_limit=8,
+                stderr_limit=8,
+                label="gh metadata command",
+            )
+
+        self.assertEqual(raised.exception.code, "gh-timeout")
+        self.assertIs(raised.exception.__cause__, primary)
+
     def test_run_gh_json_stream_accepts_concatenated_pages(self) -> None:
         completed = subprocess.CompletedProcess(
             args=[],
@@ -2264,30 +2795,32 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertEqual(pages, [[{"tag_name": "one"}], [{"tag_name": "two"}]])
 
     def test_run_gh_metadata_enforces_output_cap_and_reaps_group(self) -> None:
-        real_popen = subprocess.Popen
-        processes: list[subprocess.Popen[bytes]] = []
+        real_spawn = MODULE._spawn_guarded_process
+        processes: list[MODULE._GuardedProcess] = []
 
-        def overflowing_popen(_args, **kwargs):
-            process = real_popen(
+        def overflowing_spawn(_args, **kwargs):
+            process = real_spawn(
                 [
                     sys.executable,
                     "-c",
                     "import os,time;os.write(1,b'123456789');time.sleep(30)",
                 ],
-                **kwargs,
+                deadline=kwargs["deadline"],
+                process_label=kwargs["process_label"],
+                unavailable_code="test-unavailable",
+                unavailable_message="test executable unavailable",
             )
             processes.append(process)
             return process
 
         with (
             mock.patch.object(
-                MODULE.subprocess,
-                "Popen",
-                side_effect=overflowing_popen,
+                MODULE,
+                "_spawn_guarded_process",
+                side_effect=overflowing_spawn,
             ),
             mock.patch.object(MODULE, "MAX_GH_METADATA_STDOUT_BYTES", 8),
             mock.patch.object(MODULE, "GH_OPERATION_TIMEOUT_SECONDS", 1.0),
-            mock.patch.object(MODULE, "GH_TERMINATE_GRACE_SECONDS", 0.05),
             mock.patch.object(MODULE, "GH_CLEANUP_TIMEOUT_SECONDS", 1.0),
             self.assertRaisesRegex(
                 MODULE.SyncError,
@@ -2298,16 +2831,19 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "gh-stdout-limit")
         self.assertEqual(len(processes), 1)
-        self.assertIsNotNone(processes[0].poll())
+        self.assertEqual(processes[0].returncode, -9)
 
     def test_download_release_asset_times_out_and_reaps_stalled_group(self) -> None:
-        real_popen = subprocess.Popen
-        processes: list[subprocess.Popen[bytes]] = []
+        real_spawn = MODULE._spawn_guarded_process
+        processes: list[MODULE._GuardedProcess] = []
 
-        def stalled_popen(_args, **kwargs):
-            process = real_popen(
+        def stalled_spawn(_args, **kwargs):
+            process = real_spawn(
                 [sys.executable, "-c", "import time; time.sleep(30)"],
-                **kwargs,
+                deadline=kwargs["deadline"],
+                process_label=kwargs["process_label"],
+                unavailable_code="test-unavailable",
+                unavailable_message="test executable unavailable",
             )
             processes.append(process)
             return process
@@ -2328,12 +2864,11 @@ class CodexPersonalSyncTests(unittest.TestCase):
         destination = self.root / "stalled-download"
         with (
             mock.patch.object(
-                MODULE.subprocess,
-                "Popen",
-                side_effect=stalled_popen,
+                MODULE,
+                "_spawn_guarded_process",
+                side_effect=stalled_spawn,
             ),
-            mock.patch.object(MODULE, "GH_OPERATION_TIMEOUT_SECONDS", 0.05),
-            mock.patch.object(MODULE, "GH_TERMINATE_GRACE_SECONDS", 0.05),
+            mock.patch.object(MODULE, "GH_OPERATION_TIMEOUT_SECONDS", 1.0),
             mock.patch.object(MODULE, "GH_CLEANUP_TIMEOUT_SECONDS", 1.0),
             self.assertRaisesRegex(
                 MODULE.SyncError,
@@ -2344,23 +2879,23 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "gh-timeout")
         self.assertEqual(len(processes), 1)
-        self.assertIsNotNone(processes[0].poll())
+        self.assertEqual(processes[0].returncode, -9)
         self.assertFalse((destination / assets.archive_name).exists())
         self.assertEqual(list(destination.glob(".*.partial.*")), [])
 
     def test_gh_cleanup_inconclusive_preserves_primary_classification(self) -> None:
         process = FakeDownloadProcess(b"123456789")
         incomplete = MODULE._GhCleanupReceipt(
-            term_sent=True,
             kill_sent=True,
             child_reaped=False,
             stdout_drained=False,
             stderr_drained=True,
-            process_group_gone=False,
+            status_drained=False,
+            process_group_fenced=False,
             errors=("injected cleanup failure",),
         )
         with (
-            mock.patch.object(MODULE.subprocess, "Popen", return_value=process),
+            mock.patch.object(MODULE, "_spawn_guarded_process", return_value=process),
             mock.patch.object(
                 MODULE,
                 "_cleanup_gh_process_group",
@@ -2381,6 +2916,12 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "gh-cleanup-inconclusive")
         self.assertIn("stdout exceeds", str(raised.exception.__cause__))
+        terminalization = MODULE._terminalize_process_group_before_reap(
+            process,
+            deadline=time.monotonic() + 5.0,
+            process_label="test cleanup guardian",
+        )
+        self.assertTrue(terminalization.complete, terminalization.errors)
 
     def test_download_release_assets_streams_api_assets_by_id(self) -> None:
         archive_payload = b"archive-payload"
@@ -2408,7 +2949,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
             return processes.pop(0)
 
         destination = self.root / "downloads"
-        with mock.patch.object(MODULE.subprocess, "Popen", side_effect=fake_popen):
+        with mock.patch.object(
+            MODULE, "_spawn_guarded_process", side_effect=fake_popen
+        ):
             self.download_release_assets("owner/repo", assets, destination)
 
         self.assertEqual(len(calls), 2)
@@ -2469,7 +3012,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             return real_link(source, target, **kwargs)
 
         with (
-            mock.patch.object(MODULE.subprocess, "Popen", return_value=process),
+            mock.patch.object(MODULE, "_spawn_guarded_process", return_value=process),
             mock.patch.object(
                 MODULE.os, "link", side_effect=replace_partial_before_link
             ),
@@ -2535,7 +3078,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             return result
 
         with (
-            mock.patch.object(MODULE.subprocess, "Popen", return_value=process),
+            mock.patch.object(MODULE, "_spawn_guarded_process", return_value=process),
             mock.patch.object(MODULE.os, "link", side_effect=replace_target_after_link),
             self.assertRaisesRegex(
                 MODULE.SyncError,
@@ -2607,7 +3150,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             )
 
         with (
-            mock.patch.object(MODULE.subprocess, "Popen", return_value=process),
+            mock.patch.object(MODULE, "_spawn_guarded_process", return_value=process),
             mock.patch.object(
                 MODULE,
                 "_rename_noreplace_at",
@@ -2659,7 +3202,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             return real_fsync(file_descriptor)
 
         with (
-            mock.patch.object(MODULE.subprocess, "Popen", return_value=process),
+            mock.patch.object(MODULE, "_spawn_guarded_process", return_value=process),
             mock.patch.object(MODULE.os, "fsync", side_effect=fail_directory_fsync),
             mock.patch.object(
                 MODULE,
@@ -2700,11 +3243,11 @@ class CodexPersonalSyncTests(unittest.TestCase):
         )
         destination = self.root / "oversized-download"
 
-        with mock.patch.object(MODULE.subprocess, "Popen", return_value=process):
+        with mock.patch.object(MODULE, "_spawn_guarded_process", return_value=process):
             with self.assertRaisesRegex(MODULE.SyncError, "exceeds its advertised"):
                 self.download_release_assets("owner/repo", assets, destination)
 
-        self.assertTrue(process.terminated)
+        self.assertEqual(process.returncode, -9)
         self.assertFalse((destination / assets.archive_name).exists())
         self.assertEqual(list(destination.glob(".*.partial.*")), [])
 
@@ -2726,7 +3269,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
         )
         destination = self.root / "short-download"
 
-        with mock.patch.object(MODULE.subprocess, "Popen", return_value=process):
+        with mock.patch.object(MODULE, "_spawn_guarded_process", return_value=process):
             with self.assertRaisesRegex(MODULE.SyncError, "size mismatch"):
                 self.download_release_assets("owner/repo", assets, destination)
 
@@ -2750,7 +3293,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
         )
         destination = self.root / "invalid-metadata-download"
 
-        with mock.patch.object(MODULE.subprocess, "Popen") as popen:
+        with mock.patch.object(MODULE, "_spawn_guarded_process") as popen:
             with self.assertRaisesRegex(MODULE.SyncError, "exceeds"):
                 self.download_release_assets("owner/repo", assets, destination)
 

@@ -1027,6 +1027,75 @@ superseded_by:
   runner evidence remains tree-valid for those exact unchanged files. Hosted
   Linux CI, exact-secret admission, and formal named review remain head-bound
   and must be rerun after the portability commit is pushed.
+- The fresh named-single review of signed portability head `9befd7e` found that
+  GitHub and native-scheduler supervision still reaped the direct child before
+  probing or signalling its numeric process group, while cleanup could call
+  `poll()` and later reuse that same number. It also found that an exception
+  from either main selector's `close()` could replace the primary timeout,
+  output-limit, or process-I/O classification. An independent direct-Claude
+  lane confirmed the process-group finding. All head-bound review and admission
+  evidence became stale when this repair began.
+- The repair protects guardian identity, group fencing, protocol integrity,
+  bounded output, and error precedence separately. A fresh isolated Python
+  guardian is launched as a dedicated live session and process-group leader;
+  it launches the requested `gh` or fixed native target in that group, closes
+  its own stdout/stderr writers, uniquely waits for the direct target, and
+  publishes a fixed-size status record while retaining the sole status writer
+  as a liveness capability. Ready and status records bind the exact guardian
+  PID and target PID. The target cannot inherit either control writer. The
+  parent requires ready receipt completion, both output EOFs, an exact status
+  record, and a live-but-quiet status writer before it sends group `SIGKILL`.
+  The nonblocking `EAGAIN` proves only that this liveness capability remains
+  open at that probe boundary; it does not make the probe and `killpg` atomic
+  or prevent an external same-UID process from signalling or escaping the
+  group. Safety instead relies on never reaping the guardian before `killpg`,
+  so its numeric identity cannot be reused, and on failing closed for every
+  signal failure or final result other than exact `-SIGKILL`.
+  `ESRCH`, `EPERM`, early guardian exit, extra/truncated protocol bytes, a
+  non-`SIGKILL` guardian result, or any cleanup/close uncertainty fails closed.
+  The guardian has one final `wait`; there is no numeric PID/PGID operation
+  after it. This removes the need for any PATH-executable trust profile or a
+  racy Darwin process-table exception.
+- Process creation owns all four control-pipe descriptors from `-1`-initialized
+  slots and transfers the ready reader before parsing, so second-pipe failure,
+  parser failure, and descriptor-number reuse cannot leak or double-close an
+  unrelated object. Target-launch failure uses a distinct fixed ready record
+  and retains each lane's unavailable taxonomy. Guardian cleanup uncertainty
+  is mapped to `gh-cleanup-inconclusive` or
+  `scheduler-cleanup-inconclusive`; scheduler `allow_fail` therefore cannot
+  ignore it. Selector and stream close failures are collected as secondary
+  diagnostics, including non-`OSError` exceptions, without replacing the
+  primary cause.
+- The first complete affected-file checkpoint passed 349 tests in 32.286
+  seconds with one expected platform skip. Focused negative tests additionally
+  proved
+  `killpg -> wait` ordering, zero post-wait numeric operations, FIFO-liveness
+  termination of a target descendant that closed stdio, status-writer EOF
+  rejection, target control-FD exclusion, launch/ready protocol cleanup,
+  descriptor reuse safety, lane-specific cleanup taxonomy, and primary-error
+  preservation across selector-close failure.
+- The frozen affected-file suite then passed 356 tests under both runtimes:
+  33.229 seconds under the default Python and 41.220 seconds under macOS system
+  Python 3.9, with one expected platform skip in each run. The first 3.9 run
+  showed that a 50-millisecond operation budget could expire during guardian
+  startup and be misclassified as a ready-protocol timeout. The production
+  bound remains `min(operation deadline, five-second ready cap)`; only the
+  exhausted-operation branch is now mapped back to the existing `gh-timeout`
+  or `scheduler-timeout` lane taxonomy. No runtime, byte, cleanup, or
+  unavailable bound was relaxed. The GitHub stalled-target test now uses a
+  one-second operation budget so it deterministically starts the target; the
+  scheduler 50-millisecond test remains.
+- `refresh-lock` updated all six source records for the frozen bytes. Both
+  supported runtimes verified the lock, whose canonical file SHA-256 is
+  `700cab74025b32e31145dedfac8e5861143056c477b5c9c65bb4d53219a1f52b`;
+  the canonical synchronizer source SHA-256 is
+  `ec92fea5e43b5897aab7d8afbe6b3c54874178537bf0672db8d5b83f8970d361`.
+  The complete source-lock suite passed 184 tests in 588.901 seconds under the
+  default Python with one expected Darwin-variant skip, and 184 tests in
+  636.903 seconds under macOS system Python 3.9 with no skips. Dual-runtime
+  compileall, Ruff format/check, and `git diff --check` also passed. Hosted CI,
+  exact-head admission, and fresh formal review remain head-bound post-push
+  gates rather than evidence for these uncommitted bytes.
 
 ## Installed Host Baseline
 

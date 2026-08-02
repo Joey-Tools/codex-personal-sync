@@ -22,8 +22,10 @@ import plistlib
 import posixpath
 import re
 import selectors
+import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -52,8 +54,103 @@ MAX_ARCHIVE_MEMBER_PATH_BYTES = 4096
 MAX_ARCHIVE_MEMBER_COMPONENT_BYTES = 255
 MAX_ARCHIVE_MEMBER_PATH_DEPTH = 64
 GH_OPERATION_TIMEOUT_SECONDS = 300.0
-GH_TERMINATE_GRACE_SECONDS = 1.0
 GH_CLEANUP_TIMEOUT_SECONDS = 5.0
+PROCESS_GUARDIAN_READY_TIMEOUT_SECONDS = 5.0
+PROCESS_GUARDIAN_READY_MAGIC = b"CPSGRD1R"
+PROCESS_GUARDIAN_LAUNCH_FAILURE_MAGIC = b"CPSGRD1F"
+PROCESS_GUARDIAN_STATUS_MAGIC = b"CPSGRD1S"
+PROCESS_GUARDIAN_READY_RECORD = struct.Struct("!8sqq")
+PROCESS_GUARDIAN_STATUS_RECORD = struct.Struct("!8sqqi")
+PROCESS_GUARDIAN_SOURCE = f"""
+import os
+import signal
+import struct
+import subprocess
+import sys
+
+READY = struct.Struct("!8sqq")
+STATUS = struct.Struct("!8sqqi")
+READY_MAGIC = {PROCESS_GUARDIAN_READY_MAGIC!r}
+FAILURE_MAGIC = {PROCESS_GUARDIAN_LAUNCH_FAILURE_MAGIC!r}
+STATUS_MAGIC = {PROCESS_GUARDIAN_STATUS_MAGIC!r}
+
+def write_record(file_descriptor, payload):
+    offset = 0
+    while offset < len(payload):
+        written = os.write(file_descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError("guardian control pipe made no progress")
+        offset += written
+
+def close_quietly(file_descriptor):
+    try:
+        os.close(file_descriptor)
+    except OSError:
+        pass
+
+def park():
+    while True:
+        signal.pause()
+
+ready_fd = int(sys.argv[1])
+status_fd = int(sys.argv[2])
+target_argv = sys.argv[3:]
+os.set_inheritable(ready_fd, False)
+os.set_inheritable(status_fd, False)
+try:
+    target = subprocess.Popen(
+        target_argv,
+        stdin=subprocess.DEVNULL,
+        close_fds=True,
+    )
+except BaseException as error:
+    try:
+        os.write(2, ("guardian target launch failed: " + str(error)).encode())
+    except BaseException:
+        pass
+    close_quietly(1)
+    close_quietly(2)
+    try:
+        write_record(
+            ready_fd,
+            READY.pack(
+                FAILURE_MAGIC,
+                os.getpid(),
+                int(getattr(error, "errno", 0) or 0),
+            ),
+        )
+    except BaseException:
+        pass
+    close_quietly(ready_fd)
+    close_quietly(status_fd)
+    park()
+
+close_quietly(1)
+close_quietly(2)
+try:
+    write_record(
+        ready_fd,
+        READY.pack(READY_MAGIC, os.getpid(), target.pid),
+    )
+except BaseException:
+    close_quietly(ready_fd)
+    close_quietly(status_fd)
+    park()
+close_quietly(ready_fd)
+
+target_returncode = target.wait()
+write_record(
+    status_fd,
+    STATUS.pack(
+        STATUS_MAGIC,
+        os.getpid(),
+        target.pid,
+        target_returncode,
+    ),
+)
+# Keep the sole status writer open as the guardian liveness capability.
+park()
+"""
 MAX_GH_METADATA_STDOUT_BYTES = 16 * 1024 * 1024
 MAX_GH_STDERR_BYTES = 1024 * 1024
 MAX_TEMP_ARCHIVE_CLEANUP_DEPTH = MAX_ARCHIVE_MEMBER_PATH_DEPTH + 4
@@ -356,22 +453,70 @@ class _GhProcessResult:
 
 @dataclass(frozen=True)
 class _GhCleanupReceipt:
-    term_sent: bool
     kill_sent: bool
     child_reaped: bool
     stdout_drained: bool
     stderr_drained: bool
-    process_group_gone: bool
+    status_drained: bool
+    process_group_fenced: bool
     errors: tuple[str, ...]
 
     @property
     def complete(self) -> bool:
         return (
-            self.child_reaped
+            self.kill_sent
+            and self.child_reaped
             and self.stdout_drained
             and self.stderr_drained
-            and self.process_group_gone
+            and self.status_drained
+            and self.process_group_fenced
+            and not self.errors
         )
+
+
+@dataclass(frozen=True)
+class _ProcessTerminalizationReceipt:
+    kill_sent: bool
+    child_reaped: bool
+    process_group_fenced: bool
+    returncode: int | None
+    errors: tuple[str, ...]
+
+    @property
+    def complete(self) -> bool:
+        return (
+            self.kill_sent
+            and self.child_reaped
+            and self.process_group_fenced
+            and self.returncode == -signal.SIGKILL
+            and not self.errors
+        )
+
+
+@dataclass
+class _GuardedProcess:
+    guardian: subprocess.Popen[bytes]
+    target_pid: int
+    status: Any
+
+    @property
+    def pid(self) -> int:
+        return self.guardian.pid
+
+    @property
+    def stdout(self) -> Any:
+        return self.guardian.stdout
+
+    @property
+    def stderr(self) -> Any:
+        return self.guardian.stderr
+
+    @property
+    def returncode(self) -> int | None:
+        return self.guardian.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.guardian.wait(timeout=timeout)
 
 
 @dataclass(frozen=True)
@@ -16723,86 +16868,481 @@ def _gh_operation_deadline():
         _GH_OPERATION_DEADLINE.reset(token)
 
 
-def _gh_process_group_exists(process: subprocess.Popen[bytes]) -> bool | None:
-    process_id = getattr(process, "pid", None)
-    if isinstance(process_id, bool) or not isinstance(process_id, int):
-        return None
-    try:
-        os.killpg(process_id, 0)
-    except ProcessLookupError:
-        return False
-    except (PermissionError, OSError):
-        return None
-    return True
-
-
-def _signal_gh_process_group(
-    process: subprocess.Popen[bytes],
-    signal_number: int,
+def _read_guardian_ready_record(
+    file_descriptor: int,
     *,
-    process_label: str = "gh",
-) -> tuple[bool, str | None]:
-    process_id = getattr(process, "pid", None)
-    group_error: OSError | None = None
-    if isinstance(process_id, int) and not isinstance(process_id, bool):
-        try:
-            os.killpg(process_id, signal_number)
-            return True, None
-        except ProcessLookupError:
-            pass
-        except OSError as error:
-            group_error = error
+    deadline: float,
+    process_label: str,
+    timeout_code: str = "process-guardian-protocol",
+    timeout_message: str | None = None,
+) -> tuple[bytes, int, int]:
+    selector: selectors.BaseSelector | None = None
+    payload = bytearray()
+    primary: BaseException | None = None
+    close_failures: list[tuple[str, BaseException]] = []
     try:
-        if process.poll() is not None:
-            return False, None
-        if signal_number == signal.SIGTERM:
-            process.terminate()
-        else:
-            process.kill()
-        return True, (
-            f"process-group signal failed; used direct-child fallback: {group_error}"
-            if group_error is not None
-            else None
-        )
-    except OSError as error:
-        detail = f"cannot signal {process_label} process: {error}"
-        if group_error is not None:
-            detail = (
-                f"cannot signal {process_label} process group ({group_error}) "
-                f"or child ({error})"
+        os.set_blocking(file_descriptor, False)
+        selector = selectors.DefaultSelector()
+        selector.register(file_descriptor, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SyncError(
+                    timeout_message
+                    or f"{process_label} guardian ready receipt timed out",
+                    code=timeout_code,
+                )
+            events = selector.select(remaining)
+            if not events:
+                continue
+            try:
+                chunk = os.read(
+                    file_descriptor,
+                    PROCESS_GUARDIAN_READY_RECORD.size + 1 - len(payload),
+                )
+            except BlockingIOError:
+                continue
+            if not chunk:
+                break
+            payload.extend(chunk)
+            if len(payload) > PROCESS_GUARDIAN_READY_RECORD.size:
+                raise SyncError(
+                    f"{process_label} guardian ready receipt exceeds its bound",
+                    code="process-guardian-protocol",
+                )
+    except BaseException as error:
+        primary = error
+    finally:
+        if selector is not None:
+            try:
+                selector.close()
+            except BaseException as error:
+                close_failures.append(
+                    (
+                        f"cannot close {process_label} guardian ready selector: {error}",
+                        error,
+                    )
+                )
+        try:
+            os.close(file_descriptor)
+        except BaseException as error:
+            close_failures.append(
+                (
+                    f"cannot close {process_label} guardian ready descriptor: {error}",
+                    error,
+                )
             )
-        return False, detail
+    if primary is not None:
+        if close_failures:
+            raise SyncError(
+                f"{primary}; {process_label} guardian ready cleanup was "
+                "inconclusive: "
+                + "; ".join(detail for detail, _error in close_failures),
+                code="process-guardian-protocol",
+            ) from primary
+        raise primary
+    if close_failures:
+        raise SyncError(
+            f"{process_label} guardian ready cleanup was inconclusive: "
+            + "; ".join(detail for detail, _error in close_failures),
+            code="process-guardian-protocol",
+        ) from close_failures[0][1]
+    if len(payload) != PROCESS_GUARDIAN_READY_RECORD.size:
+        raise SyncError(
+            f"{process_label} guardian ready receipt is incomplete",
+            code="process-guardian-protocol",
+        )
+    magic, guardian_pid, value = PROCESS_GUARDIAN_READY_RECORD.unpack(payload)
+    if guardian_pid <= 0 or magic not in {
+        PROCESS_GUARDIAN_READY_MAGIC,
+        PROCESS_GUARDIAN_LAUNCH_FAILURE_MAGIC,
+    }:
+        raise SyncError(
+            f"{process_label} guardian ready receipt is invalid",
+            code="process-guardian-protocol",
+        )
+    return magic, guardian_pid, value
 
 
-def _close_gh_process_streams(process: subprocess.Popen[bytes]) -> None:
-    for stream in (process.stdout, process.stderr):
+def _spawn_guarded_process(
+    command: list[str],
+    *,
+    deadline: float,
+    process_label: str,
+    env: dict[str, str] | None = None,
+    unavailable_code: str,
+    unavailable_message: str,
+) -> _GuardedProcess:
+    if not command or any(
+        not isinstance(argument, str) or not argument or "\0" in argument
+        for argument in command
+    ):
+        raise SyncError(
+            f"{process_label} argv is invalid",
+            code=unavailable_code,
+        )
+    executable = command[0]
+    if os.path.sep not in executable:
+        resolved = shutil.which(
+            executable,
+            path=(env if env is not None else os.environ).get("PATH"),
+        )
+        if resolved is None:
+            raise SyncError(unavailable_message, code=unavailable_code)
+        command = [resolved, *command[1:]]
+    elif not os.path.isabs(executable):
+        raise SyncError(
+            f"{process_label} executable must be absolute",
+            code=unavailable_code,
+        )
+    if not sys.executable or not os.path.isabs(sys.executable):
+        raise SyncError(
+            f"{process_label} guardian interpreter is unavailable",
+            code=unavailable_code,
+        )
+
+    ready_read_fd = -1
+    ready_write_fd = -1
+    status_read_fd = -1
+    status_write_fd = -1
+    guardian: subprocess.Popen[bytes] | None = None
+    status_stream: Any | None = None
+    try:
+        try:
+            ready_read_fd, ready_write_fd = os.pipe()
+            status_read_fd, status_write_fd = os.pipe()
+        except OSError as error:
+            raise SyncError(
+                f"cannot create {process_label} guardian control pipes: {error}",
+                code="process-guardian-protocol",
+            ) from error
+        guardian_ready_deadline = (
+            time.monotonic() + PROCESS_GUARDIAN_READY_TIMEOUT_SECONDS
+        )
+        guardian_deadline = min(deadline, guardian_ready_deadline)
+        operation_deadline_limits_ready = deadline <= guardian_ready_deadline
+        guardian = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-S",
+                "-c",
+                PROCESS_GUARDIAN_SOURCE,
+                str(ready_write_fd),
+                str(status_write_fd),
+                *command,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            start_new_session=True,
+            close_fds=True,
+            pass_fds=(ready_write_fd, status_write_fd),
+        )
+        owned_ready_write_fd = ready_write_fd
+        ready_write_fd = -1
+        os.close(owned_ready_write_fd)
+        owned_status_write_fd = status_write_fd
+        status_write_fd = -1
+        os.close(owned_status_write_fd)
+        status_stream = os.fdopen(status_read_fd, "rb", buffering=0)
+        status_read_fd = -1
+        process = _GuardedProcess(
+            guardian=guardian,
+            target_pid=-1,
+            status=status_stream,
+        )
+        owned_ready_read_fd = ready_read_fd
+        ready_read_fd = -1
+        ready_magic, receipt_guardian_pid, ready_value = _read_guardian_ready_record(
+            owned_ready_read_fd,
+            deadline=guardian_deadline,
+            process_label=process_label,
+            timeout_code=(
+                "process-guardian-operation-timeout"
+                if operation_deadline_limits_ready
+                else "process-guardian-protocol"
+            ),
+            timeout_message=(
+                f"{process_label} exceeded its monotonic deadline"
+                if operation_deadline_limits_ready
+                else None
+            ),
+        )
+        if receipt_guardian_pid != process.pid:
+            raise SyncError(
+                f"{process_label} guardian ready receipt changed leader identity",
+                code="process-guardian-protocol",
+            )
+        if ready_magic == PROCESS_GUARDIAN_LAUNCH_FAILURE_MAGIC:
+            suffix = f" (errno {ready_value})" if ready_value > 0 else ""
+            raise SyncError(
+                unavailable_message + suffix,
+                code=unavailable_code,
+            )
+        target_pid = ready_value
+        if target_pid <= 0:
+            raise SyncError(
+                f"{process_label} guardian ready receipt has no target identity",
+                code="process-guardian-protocol",
+            )
+        try:
+            process_group_id = os.getpgid(process.pid)
+            session_id = os.getsid(process.pid)
+        except OSError as error:
+            raise SyncError(
+                f"cannot validate {process_label} guardian identity: {error}",
+                code="process-guardian-protocol",
+            ) from error
+        if process_group_id != process.pid or session_id != process.pid:
+            raise SyncError(
+                f"{process_label} guardian is not its dedicated session leader",
+                code="process-guardian-protocol",
+            )
+        process.target_pid = target_pid
+        return process
+    except BaseException as primary:
+        if guardian is not None:
+            process = _GuardedProcess(
+                guardian=guardian,
+                target_pid=-1,
+                status=status_stream,
+            )
+            receipt = _terminalize_process_group_before_reap(
+                process,
+                deadline=time.monotonic() + GH_CLEANUP_TIMEOUT_SECONDS,
+                process_label=f"{process_label} guardian",
+            )
+            descriptor_failure: BaseException | None = None
+            if process.status is None and status_read_fd >= 0:
+                try:
+                    process.status = os.fdopen(status_read_fd, "rb", buffering=0)
+                    status_read_fd = -1
+                except BaseException as error:
+                    descriptor_failure = error
+            close_failures = _close_process_supervision_resources(
+                process,
+                None,
+                process_label=f"{process_label} guardian spawn",
+            )
+            if not receipt.complete or descriptor_failure is not None or close_failures:
+                details = list(receipt.errors)
+                if descriptor_failure is not None:
+                    details.append(
+                        f"cannot bind guardian status stream: {descriptor_failure}"
+                    )
+                details.extend(detail for detail, _error in close_failures)
+                raise SyncError(
+                    f"{primary}; {process_label} guardian spawn cleanup was "
+                    f"inconclusive: {'; '.join(details) or 'unknown failure'}",
+                    code="process-guardian-cleanup-inconclusive",
+                ) from primary
+        elif isinstance(primary, OSError):
+            raise SyncError(
+                f"{unavailable_message}: {primary}",
+                code=unavailable_code,
+            ) from primary
+        raise
+    finally:
+        for file_descriptor in (
+            ready_read_fd,
+            ready_write_fd,
+            status_read_fd,
+            status_write_fd,
+        ):
+            if file_descriptor >= 0:
+                try:
+                    os.close(file_descriptor)
+                except OSError:
+                    pass
+
+
+def _terminalize_process_group_before_reap(
+    process: _GuardedProcess,
+    *,
+    deadline: float,
+    process_label: str,
+) -> _ProcessTerminalizationReceipt:
+    """Kill the live guardian group before the one final leader reap."""
+    errors: list[str] = []
+    if process.returncode is not None:
+        return _ProcessTerminalizationReceipt(
+            kill_sent=False,
+            child_reaped=True,
+            process_group_fenced=False,
+            returncode=process.returncode,
+            errors=(
+                f"{process_label} leader was already reaped before its "
+                "process group was fenced",
+            ),
+        )
+    process_id = getattr(process, "pid", None)
+    valid_process_id = (
+        isinstance(process_id, int)
+        and not isinstance(process_id, bool)
+        and process_id > 0
+    )
+    kill_sent = False
+    process_group_fenced = False
+    if not valid_process_id:
+        errors.append(f"{process_label} process has no valid process-group identity")
+    else:
+        assert isinstance(process_id, int)
+        try:
+            # start_new_session=True makes the unreaped leader PID the exact PGID.
+            # No numeric PID/PGID operation is permitted after the wait below.
+            os.killpg(process_id, signal.SIGKILL)
+            kill_sent = True
+            process_group_fenced = True
+        except ProcessLookupError as error:
+            errors.append(
+                f"{process_label} live guardian group disappeared before its "
+                f"fence: {error}"
+            )
+        except PermissionError as error:
+            errors.append(f"cannot signal {process_label} process group: {error}")
+        except OSError as error:
+            errors.append(f"cannot signal {process_label} process group: {error}")
+
+    returncode: int | None = None
+    child_reaped = False
+    try:
+        returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        child_reaped = True
+    except subprocess.TimeoutExpired as error:
+        errors.append(f"{process_label} leader was not reaped: {error}")
+    except BaseException as error:
+        errors.append(f"cannot reap {process_label} leader: {error}")
+    return _ProcessTerminalizationReceipt(
+        kill_sent=kill_sent,
+        child_reaped=child_reaped,
+        process_group_fenced=process_group_fenced,
+        returncode=returncode,
+        errors=tuple(errors),
+    )
+
+
+def _terminalization_detail(receipt: _ProcessTerminalizationReceipt) -> str:
+    incomplete: list[str] = []
+    if not receipt.process_group_fenced:
+        incomplete.append("process-group-not-fenced")
+    if not receipt.kill_sent:
+        incomplete.append("process-group-kill-not-sent")
+    if not receipt.child_reaped:
+        incomplete.append("guardian-not-reaped")
+    if receipt.returncode != -signal.SIGKILL:
+        incomplete.append(f"guardian-returncode-{receipt.returncode!r}")
+    incomplete.extend(receipt.errors)
+    return "; ".join(incomplete) or "unknown terminalization failure"
+
+
+def _parse_guardian_status(
+    process: _GuardedProcess,
+    payload: bytes,
+    *,
+    process_label: str,
+    error_code: str,
+) -> int:
+    if len(payload) != PROCESS_GUARDIAN_STATUS_RECORD.size:
+        raise SyncError(
+            f"{process_label} guardian status receipt is incomplete",
+            code=error_code,
+        )
+    magic, guardian_pid, target_pid, target_returncode = (
+        PROCESS_GUARDIAN_STATUS_RECORD.unpack(payload)
+    )
+    if (
+        magic != PROCESS_GUARDIAN_STATUS_MAGIC
+        or guardian_pid != process.pid
+        or target_pid != process.target_pid
+    ):
+        raise SyncError(
+            f"{process_label} guardian status receipt changed process identity",
+            code=error_code,
+        )
+    if not (-(signal.NSIG - 1) <= target_returncode <= 255):
+        raise SyncError(
+            f"{process_label} guardian status has an invalid target return code",
+            code=error_code,
+        )
+    return target_returncode
+
+
+def _require_guardian_status_writer_live(
+    process: _GuardedProcess,
+    *,
+    process_label: str,
+    error_code: str,
+) -> None:
+    try:
+        extra = os.read(process.status.fileno(), 1)
+    except BlockingIOError:
+        return
+    except OSError as error:
+        raise SyncError(
+            f"cannot verify {process_label} guardian liveness: {error}",
+            code=error_code,
+        ) from error
+    if extra:
+        raise SyncError(
+            f"{process_label} guardian status exceeds its bound",
+            code=error_code,
+        )
+    raise SyncError(
+        f"{process_label} guardian exited before process-group fencing",
+        code=error_code,
+    )
+
+
+def _close_process_supervision_resources(
+    process: _GuardedProcess,
+    selector: selectors.BaseSelector | None,
+    *,
+    process_label: str,
+) -> list[tuple[str, BaseException]]:
+    failures: list[tuple[str, BaseException]] = []
+    if selector is not None:
+        try:
+            selector.close()
+        except BaseException as error:
+            failures.append((f"cannot close {process_label} selector: {error}", error))
+    for name, stream in (
+        ("stdout", process.stdout),
+        ("stderr", process.stderr),
+        ("status", process.status),
+    ):
         if stream is None:
             continue
         try:
             stream.close()
-        except (OSError, ValueError):
-            pass
+        except BaseException as error:
+            failures.append(
+                (f"cannot close {process_label} {name} stream: {error}", error)
+            )
+    return failures
 
 
 def _cleanup_gh_process_group(
-    process: subprocess.Popen[bytes],
+    process: _GuardedProcess,
     *,
     process_label: str = "gh",
 ) -> _GhCleanupReceipt:
     cleanup_deadline = time.monotonic() + GH_CLEANUP_TIMEOUT_SECONDS
-    terminate_deadline = min(
-        cleanup_deadline,
-        time.monotonic() + GH_TERMINATE_GRACE_SECONDS,
-    )
     errors: list[str] = []
-    drained = {"stdout": False, "stderr": False}
-    term_sent, term_error = _signal_gh_process_group(
+    drained = {"stdout": False, "stderr": False, "status": False}
+    terminalization = _terminalize_process_group_before_reap(
         process,
-        signal.SIGTERM,
+        deadline=cleanup_deadline,
         process_label=process_label,
     )
-    if term_error is not None:
-        errors.append(term_error)
+    errors.extend(terminalization.errors)
+    if not terminalization.complete:
+        errors.append(
+            f"{process_label} guardian terminalization was inconclusive: "
+            f"{_terminalization_detail(terminalization)}"
+        )
 
     selector: selectors.BaseSelector | None = None
     try:
@@ -16812,6 +17352,7 @@ def _cleanup_gh_process_group(
     streams = {
         "stdout": process.stdout,
         "stderr": process.stderr,
+        "status": process.status,
     }
     for name, stream in streams.items():
         if stream is None:
@@ -16824,29 +17365,21 @@ def _cleanup_gh_process_group(
             selector.register(stream, selectors.EVENT_READ, name)
         except (OSError, ValueError) as error:
             errors.append(f"cannot register {name} cleanup drain: {error}")
-    kill_sent = False
-    child_reaped = False
-    process_group_gone = False
     try:
-        while time.monotonic() < cleanup_deadline:
-            now = time.monotonic()
-            if now >= terminate_deadline and not kill_sent:
-                kill_sent, kill_error = _signal_gh_process_group(
-                    process,
-                    signal.SIGKILL,
-                    process_label=process_label,
-                )
-                if kill_error is not None:
-                    errors.append(kill_error)
-            timeout = min(0.05, max(0.0, cleanup_deadline - now))
-            if selector is not None and selector.get_map():
+        while selector is not None and selector.get_map():
+            remaining = cleanup_deadline - time.monotonic()
+            if remaining <= 0:
+                errors.append(f"{process_label} cleanup pipe drain exceeded deadline")
+                break
+            timeout = min(0.05, remaining)
+            if selector.get_map():
                 try:
                     events = selector.select(timeout)
                 except OSError as error:
                     errors.append(
                         f"cannot drain {process_label} process pipes: {error}"
                     )
-                    events = []
+                    break
                 for key, _mask in events:
                     name = key.data
                     try:
@@ -16867,37 +17400,20 @@ def _cleanup_gh_process_group(
                         selector.unregister(key.fileobj)
                     except (KeyError, OSError, ValueError):
                         pass
-            else:
-                time.sleep(timeout)
-            try:
-                child_reaped = process.poll() is not None
-            except OSError as error:
-                errors.append(f"cannot reap {process_label} process: {error}")
-                child_reaped = False
-            group_state = _gh_process_group_exists(process)
-            selector_drained = selector is None or not selector.get_map()
-            if child_reaped and selector_drained and group_state is False:
-                break
-        try:
-            child_reaped = process.poll() is not None
-        except OSError as error:
-            errors.append(f"cannot confirm {process_label} child reaping: {error}")
-            child_reaped = False
-        process_group_gone = _gh_process_group_exists(process) is False
     finally:
-        if selector is not None:
-            try:
-                selector.close()
-            except (OSError, ValueError) as error:
-                errors.append(f"cannot close {process_label} cleanup selector: {error}")
-        _close_gh_process_streams(process)
+        close_failures = _close_process_supervision_resources(
+            process,
+            selector,
+            process_label=f"{process_label} cleanup",
+        )
+        errors.extend(detail for detail, _error in close_failures)
     return _GhCleanupReceipt(
-        term_sent=term_sent,
-        kill_sent=kill_sent,
-        child_reaped=child_reaped,
+        kill_sent=terminalization.kill_sent,
+        child_reaped=terminalization.child_reaped,
         stdout_drained=drained["stdout"],
         stderr_drained=drained["stderr"],
-        process_group_gone=process_group_gone,
+        status_drained=drained["status"],
+        process_group_fenced=terminalization.process_group_fenced,
         errors=tuple(errors),
     )
 
@@ -16910,14 +17426,16 @@ def _gh_cleanup_detail(receipt: _GhCleanupReceipt) -> str:
         incomplete.append("stdout-not-drained")
     if not receipt.stderr_drained:
         incomplete.append("stderr-not-drained")
-    if not receipt.process_group_gone:
-        incomplete.append("process-group-not-gone")
+    if not receipt.status_drained:
+        incomplete.append("status-not-drained")
+    if not receipt.process_group_fenced:
+        incomplete.append("process-group-not-fenced")
     incomplete.extend(receipt.errors)
     return "; ".join(incomplete) or "unknown cleanup failure"
 
 
 def _raise_gh_failure_after_cleanup(
-    process: subprocess.Popen[bytes],
+    process: _GuardedProcess,
     primary: BaseException,
 ) -> NoReturn:
     try:
@@ -16953,117 +17471,210 @@ def _run_bounded_gh_process(
             f"{label} exceeded its monotonic deadline",
             code="gh-timeout",
         )
-    command = ["gh", *args]
     try:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+        process = _spawn_guarded_process(
+            ["gh", *args],
+            deadline=deadline,
+            process_label=label,
+            unavailable_code="gh-command-unavailable",
+            unavailable_message=(
+                "GitHub CLI `gh` is not available; install it or make sure it is "
+                "on PATH"
+            ),
         )
-    except OSError as error:
-        raise SyncError(
-            "GitHub CLI `gh` is not available; install it or make sure it is on PATH"
-        ) from error
-    if process.stdout is None or process.stderr is None:
+    except SyncError as error:
+        if error.code == "process-guardian-cleanup-inconclusive":
+            raise SyncError(
+                f"{label} guardian cleanup was inconclusive: {error}",
+                code="gh-cleanup-inconclusive",
+            ) from error
+        if error.code == "process-guardian-operation-timeout":
+            raise SyncError(
+                f"{label} exceeded its monotonic deadline",
+                code="gh-timeout",
+            ) from error
+        raise
+    if process.stdout is None or process.stderr is None or process.status is None:
         _raise_gh_failure_after_cleanup(
             process,
             SyncError(
-                f"{label} did not provide bounded stdout/stderr pipes",
+                f"{label} did not provide bounded process pipes",
                 code="gh-process-io",
             ),
         )
 
     selector: selectors.BaseSelector | None = None
-    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    buffers = {
+        "stdout": bytearray(),
+        "stderr": bytearray(),
+        "status": bytearray(),
+    }
     totals = {"stdout": 0, "stderr": 0}
     limits = {"stdout": stdout_limit, "stderr": stderr_limit}
+    result: _GhProcessResult | None = None
+    pending_error: BaseException | None = None
+    pending_cause: BaseException | None = None
+    terminalization_started = False
+    close_failures: list[tuple[str, BaseException]] = []
+    output_eof: set[str] = set()
     try:
-        selector = selectors.DefaultSelector()
-        for name, stream in (
-            ("stdout", process.stdout),
-            ("stderr", process.stderr),
-        ):
-            os.set_blocking(stream.fileno(), False)
-            selector.register(stream, selectors.EVENT_READ, name)
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise SyncError(
-                    f"{label} exceeded its monotonic deadline",
-                    code="gh-timeout",
-                )
-            events = selector.select(remaining)
-            if not events:
-                continue
-            for key, _mask in events:
-                name = key.data
-                try:
-                    chunk = os.read(key.fileobj.fileno(), 64 * 1024)
-                except BlockingIOError:
-                    continue
-                except OSError as error:
-                    raise SyncError(
-                        f"cannot read {label} {name}: {error}",
-                        code="gh-process-io",
-                    ) from error
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                totals[name] += len(chunk)
-                if totals[name] > limits[name]:
-                    if name == "stdout" and stdout_overflow_message is not None:
-                        message = stdout_overflow_message
-                    else:
-                        message = (
-                            f"{label} {name} exceeds the {limits[name]}-byte limit"
-                        )
-                    raise SyncError(message, code=f"gh-{name}-limit")
-                if name == "stdout" and stdout_sink is not None:
-                    stdout_sink(chunk)
-                else:
-                    buffers[name].extend(chunk)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise SyncError(
-                f"{label} exceeded its monotonic deadline",
-                code="gh-timeout",
-            )
         try:
-            returncode = process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired as error:
-            raise SyncError(
-                f"{label} exceeded its monotonic deadline",
-                code="gh-timeout",
-            ) from error
-        group_state = _gh_process_group_exists(process)
-        if group_state is not False:
-            raise SyncError(
-                f"{label} left an unverified process group after child exit",
-                code="gh-process-group-residual",
+            selector = selectors.DefaultSelector()
+            for name, stream in (
+                ("stdout", process.stdout),
+                ("stderr", process.stderr),
+                ("status", process.status),
+            ):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, name)
+            while True:
+                if (
+                    output_eof == {"stdout", "stderr"}
+                    and len(buffers["status"]) == PROCESS_GUARDIAN_STATUS_RECORD.size
+                ):
+                    _require_guardian_status_writer_live(
+                        process,
+                        process_label=label,
+                        error_code="gh-process-io",
+                    )
+                    break
+                if not selector.get_map():
+                    raise SyncError(
+                        f"{label} guardian protocol ended before completion",
+                        code="gh-process-io",
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SyncError(
+                        f"{label} exceeded its monotonic deadline",
+                        code="gh-timeout",
+                    )
+                events = selector.select(remaining)
+                if not events:
+                    continue
+                for key, _mask in events:
+                    name = key.data
+                    maximum_read = 64 * 1024
+                    if name == "status":
+                        maximum_read = (
+                            PROCESS_GUARDIAN_STATUS_RECORD.size
+                            + 1
+                            - len(buffers["status"])
+                        )
+                    try:
+                        chunk = os.read(key.fileobj.fileno(), maximum_read)
+                    except BlockingIOError:
+                        continue
+                    except OSError as error:
+                        raise SyncError(
+                            f"cannot read {label} {name}: {error}",
+                            code="gh-process-io",
+                        ) from error
+                    if not chunk:
+                        if name == "status":
+                            raise SyncError(
+                                f"{label} guardian exited before process-group fencing",
+                                code="gh-process-io",
+                            )
+                        output_eof.add(name)
+                        selector.unregister(key.fileobj)
+                        continue
+                    if name == "status":
+                        buffers["status"].extend(chunk)
+                        if len(buffers["status"]) > (
+                            PROCESS_GUARDIAN_STATUS_RECORD.size
+                        ):
+                            raise SyncError(
+                                f"{label} guardian status exceeds its bound",
+                                code="gh-process-io",
+                            )
+                        continue
+                    totals[name] += len(chunk)
+                    if totals[name] > limits[name]:
+                        if name == "stdout" and stdout_overflow_message is not None:
+                            message = stdout_overflow_message
+                        else:
+                            message = (
+                                f"{label} {name} exceeds the {limits[name]}-byte limit"
+                            )
+                        raise SyncError(message, code=f"gh-{name}-limit")
+                    if name == "stdout" and stdout_sink is not None:
+                        stdout_sink(chunk)
+                    else:
+                        buffers[name].extend(chunk)
+            target_returncode = _parse_guardian_status(
+                process,
+                bytes(buffers["status"]),
+                process_label=label,
+                error_code="gh-process-io",
             )
-        return _GhProcessResult(
-            returncode=returncode,
-            stdout=bytes(buffers["stdout"]),
-            stderr=bytes(buffers["stderr"]),
-        )
-    except SyncError as primary:
-        _raise_gh_failure_after_cleanup(process, primary)
-    except (OSError, ValueError) as error:
-        _raise_gh_failure_after_cleanup(
-            process,
-            SyncError(
+            if process.returncode is not None:
+                raise SyncError(
+                    f"{label} guardian exited before process-group fencing",
+                    code="gh-process-io",
+                )
+            terminalization_started = True
+            terminalization = _terminalize_process_group_before_reap(
+                process,
+                deadline=time.monotonic() + GH_CLEANUP_TIMEOUT_SECONDS,
+                process_label=f"{label} guardian",
+            )
+            if not terminalization.complete:
+                raise SyncError(
+                    f"{label} guardian terminalization was inconclusive: "
+                    f"{_terminalization_detail(terminalization)}",
+                    code="gh-cleanup-inconclusive",
+                )
+            result = _GhProcessResult(
+                returncode=target_returncode,
+                stdout=bytes(buffers["stdout"]),
+                stderr=bytes(buffers["stderr"]),
+            )
+        except SyncError as error:
+            pending_error = error
+        except (OSError, ValueError) as error:
+            pending_error = SyncError(
                 f"{label} bounded process supervision failed: {error}",
                 code="gh-process-io",
-            ),
-        )
-    except BaseException as primary:
-        _raise_gh_failure_after_cleanup(process, primary)
+            )
+            pending_cause = error
+        except BaseException as error:
+            pending_error = error
+        if pending_error is not None and not terminalization_started:
+            cleanup_primary = pending_error
+            try:
+                _raise_gh_failure_after_cleanup(process, cleanup_primary)
+            except BaseException as resolved_error:
+                pending_error = resolved_error
+                if resolved_error is not cleanup_primary:
+                    pending_cause = None
     finally:
-        if selector is not None:
-            selector.close()
-        _close_gh_process_streams(process)
+        close_failures = _close_process_supervision_resources(
+            process,
+            selector,
+            process_label=label,
+        )
+    if close_failures:
+        close_detail = "; ".join(detail for detail, _error in close_failures)
+        if pending_error is not None:
+            raise SyncError(
+                f"{pending_error}; {label} cleanup was inconclusive: {close_detail}",
+                code="gh-cleanup-inconclusive",
+            ) from pending_error
+        raise SyncError(
+            f"{label} cleanup was inconclusive: {close_detail}",
+            code="gh-cleanup-inconclusive",
+        ) from close_failures[0][1]
+    if pending_error is not None:
+        if pending_cause is not None:
+            raise pending_error from pending_cause
+        raise pending_error.with_traceback(pending_error.__traceback__)
+    if result is None:
+        raise SyncError(
+            f"{label} produced no terminal result",
+            code="gh-process-io",
+        )
+    return result
 
 
 def _run_gh_process(args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -21803,7 +22414,7 @@ def _native_scheduler_failure_is_already_absent(
 
 
 def _raise_scheduler_failure_after_cleanup(
-    process: subprocess.Popen[bytes],
+    process: _GuardedProcess,
     primary: BaseException,
 ) -> NoReturn:
     try:
@@ -21839,122 +22450,212 @@ def _run_bounded_scheduler_process(
         )
     deadline = time.monotonic() + timeout_seconds
     try:
-        process = subprocess.Popen(
+        process = _spawn_guarded_process(
             native_args,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            deadline=deadline,
+            process_label="scheduler native command",
             env=_scheduler_native_environment(),
-            start_new_session=True,
+            unavailable_code="scheduler-command-unavailable",
+            unavailable_message="scheduler native command could not start",
         )
-    except OSError as error:
-        raise SyncError(
-            f"scheduler native command could not start: {error}",
-            code="scheduler-command-unavailable",
-        ) from error
-    if process.stdout is None or process.stderr is None:
+    except SyncError as error:
+        if error.code == "process-guardian-cleanup-inconclusive":
+            raise SyncError(
+                f"scheduler guardian cleanup was inconclusive: {error}",
+                code="scheduler-cleanup-inconclusive",
+            ) from error
+        if error.code == "process-guardian-operation-timeout":
+            raise SyncError(
+                "scheduler native command exceeded its monotonic deadline",
+                code="scheduler-timeout",
+            ) from error
+        raise
+    if process.stdout is None or process.stderr is None or process.status is None:
         _raise_scheduler_failure_after_cleanup(
             process,
             SyncError(
-                "scheduler native command did not provide bounded output pipes",
+                "scheduler native command did not provide bounded process pipes",
                 code="scheduler-process-io",
             ),
         )
 
     selector: selectors.BaseSelector | None = None
-    retained = {"stdout": bytearray(), "stderr": bytearray()}
+    retained = {
+        "stdout": bytearray(),
+        "stderr": bytearray(),
+        "status": bytearray(),
+    }
     producer_bytes = {"stdout": 0, "stderr": 0}
     limits = {
         "stdout": MAX_SCHEDULER_NATIVE_STDOUT_BYTES,
         "stderr": MAX_SCHEDULER_NATIVE_STDERR_BYTES,
     }
+    result: subprocess.CompletedProcess[str] | None = None
+    pending_error: BaseException | None = None
+    pending_cause: BaseException | None = None
+    terminalization_started = False
+    close_failures: list[tuple[str, BaseException]] = []
+    output_eof: set[str] = set()
     try:
-        selector = selectors.DefaultSelector()
-        for name, stream in (
-            ("stdout", process.stdout),
-            ("stderr", process.stderr),
-        ):
-            os.set_blocking(stream.fileno(), False)
-            selector.register(stream, selectors.EVENT_READ, name)
-        while selector.get_map():
-            remaining_runtime = deadline - time.monotonic()
-            if remaining_runtime <= 0:
-                raise SyncError(
-                    "scheduler native command exceeded its monotonic deadline",
-                    code="scheduler-timeout",
-                )
-            events = selector.select(remaining_runtime)
-            if not events:
-                continue
-            for key, _mask in events:
-                name = key.data
-                remaining_bytes = limits[name] - producer_bytes[name]
-                try:
-                    chunk = os.read(
-                        key.fileobj.fileno(),
-                        min(64 * 1024, remaining_bytes + 1),
-                    )
-                except BlockingIOError:
-                    continue
-                except OSError as error:
-                    raise SyncError(
-                        f"cannot read scheduler native {name}: {error}",
-                        code="scheduler-process-io",
-                    ) from error
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                producer_bytes[name] += len(chunk)
-                if producer_bytes[name] > limits[name]:
-                    raise SyncError(
-                        "scheduler native command "
-                        f"{name} exceeds the {limits[name]}-byte raw output limit",
-                        code="scheduler-output-limit",
-                    )
-                retained[name].extend(chunk)
-        remaining_runtime = deadline - time.monotonic()
-        if remaining_runtime <= 0:
-            raise SyncError(
-                "scheduler native command exceeded its monotonic deadline",
-                code="scheduler-timeout",
-            )
         try:
-            returncode = process.wait(timeout=remaining_runtime)
-        except subprocess.TimeoutExpired as error:
-            raise SyncError(
-                "scheduler native command exceeded its monotonic deadline",
-                code="scheduler-timeout",
-            ) from error
-        if _gh_process_group_exists(process) is not False:
-            raise SyncError(
-                "scheduler native command left an unverified process group "
-                "after child exit",
-                code="scheduler-process-group-residual",
+            selector = selectors.DefaultSelector()
+            for name, stream in (
+                ("stdout", process.stdout),
+                ("stderr", process.stderr),
+                ("status", process.status),
+            ):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, name)
+            while True:
+                if (
+                    output_eof == {"stdout", "stderr"}
+                    and len(retained["status"]) == PROCESS_GUARDIAN_STATUS_RECORD.size
+                ):
+                    _require_guardian_status_writer_live(
+                        process,
+                        process_label="scheduler native command",
+                        error_code="scheduler-process-io",
+                    )
+                    break
+                if not selector.get_map():
+                    raise SyncError(
+                        "scheduler guardian protocol ended before completion",
+                        code="scheduler-process-io",
+                    )
+                remaining_runtime = deadline - time.monotonic()
+                if remaining_runtime <= 0:
+                    raise SyncError(
+                        "scheduler native command exceeded its monotonic deadline",
+                        code="scheduler-timeout",
+                    )
+                events = selector.select(remaining_runtime)
+                if not events:
+                    continue
+                for key, _mask in events:
+                    name = key.data
+                    maximum_read = 64 * 1024
+                    if name == "status":
+                        maximum_read = (
+                            PROCESS_GUARDIAN_STATUS_RECORD.size
+                            + 1
+                            - len(retained["status"])
+                        )
+                    else:
+                        remaining_bytes = limits[name] - producer_bytes[name]
+                        maximum_read = min(64 * 1024, remaining_bytes + 1)
+                    try:
+                        chunk = os.read(key.fileobj.fileno(), maximum_read)
+                    except BlockingIOError:
+                        continue
+                    except OSError as error:
+                        raise SyncError(
+                            f"cannot read scheduler native {name}: {error}",
+                            code="scheduler-process-io",
+                        ) from error
+                    if not chunk:
+                        if name == "status":
+                            raise SyncError(
+                                "scheduler guardian exited before process-group "
+                                "fencing",
+                                code="scheduler-process-io",
+                            )
+                        output_eof.add(name)
+                        selector.unregister(key.fileobj)
+                        continue
+                    if name == "status":
+                        retained["status"].extend(chunk)
+                        if len(retained["status"]) > (
+                            PROCESS_GUARDIAN_STATUS_RECORD.size
+                        ):
+                            raise SyncError(
+                                "scheduler guardian status exceeds its bound",
+                                code="scheduler-process-io",
+                            )
+                        continue
+                    producer_bytes[name] += len(chunk)
+                    if producer_bytes[name] > limits[name]:
+                        raise SyncError(
+                            "scheduler native command "
+                            f"{name} exceeds the {limits[name]}-byte raw output limit",
+                            code="scheduler-output-limit",
+                        )
+                    retained[name].extend(chunk)
+            target_returncode = _parse_guardian_status(
+                process,
+                bytes(retained["status"]),
+                process_label="scheduler native command",
+                error_code="scheduler-process-io",
             )
-        stdout = bytes(retained["stdout"]).decode("utf-8", errors="replace")
-        stderr = bytes(retained["stderr"]).decode("utf-8", errors="replace")
-        return subprocess.CompletedProcess(
-            args=native_args,
-            returncode=returncode,
-            stdout=stdout,
-            stderr=stderr,
-        )
-    except SyncError as primary:
-        _raise_scheduler_failure_after_cleanup(process, primary)
-    except (OSError, ValueError) as error:
-        _raise_scheduler_failure_after_cleanup(
-            process,
-            SyncError(
+            if process.returncode is not None:
+                raise SyncError(
+                    "scheduler guardian exited before process-group fencing",
+                    code="scheduler-process-io",
+                )
+            terminalization_started = True
+            terminalization = _terminalize_process_group_before_reap(
+                process,
+                deadline=time.monotonic() + GH_CLEANUP_TIMEOUT_SECONDS,
+                process_label="scheduler guardian",
+            )
+            if not terminalization.complete:
+                raise SyncError(
+                    "scheduler guardian terminalization was inconclusive: "
+                    f"{_terminalization_detail(terminalization)}",
+                    code="scheduler-cleanup-inconclusive",
+                )
+            stdout = bytes(retained["stdout"]).decode("utf-8", errors="replace")
+            stderr = bytes(retained["stderr"]).decode("utf-8", errors="replace")
+            result = subprocess.CompletedProcess(
+                args=native_args,
+                returncode=target_returncode,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        except SyncError as error:
+            pending_error = error
+        except (OSError, ValueError) as error:
+            pending_error = SyncError(
                 f"scheduler bounded process supervision failed: {error}",
                 code="scheduler-process-io",
-            ),
-        )
-    except BaseException as primary:
-        _raise_scheduler_failure_after_cleanup(process, primary)
+            )
+            pending_cause = error
+        except BaseException as error:
+            pending_error = error
+        if pending_error is not None and not terminalization_started:
+            cleanup_primary = pending_error
+            try:
+                _raise_scheduler_failure_after_cleanup(process, cleanup_primary)
+            except BaseException as resolved_error:
+                pending_error = resolved_error
+                if resolved_error is not cleanup_primary:
+                    pending_cause = None
     finally:
-        if selector is not None:
-            selector.close()
-        _close_gh_process_streams(process)
+        close_failures = _close_process_supervision_resources(
+            process,
+            selector,
+            process_label="scheduler native command",
+        )
+    if close_failures:
+        close_detail = "; ".join(detail for detail, _error in close_failures)
+        if pending_error is not None:
+            raise SyncError(
+                f"{pending_error}; scheduler cleanup was inconclusive: {close_detail}",
+                code="scheduler-cleanup-inconclusive",
+            ) from pending_error
+        raise SyncError(
+            f"scheduler cleanup was inconclusive: {close_detail}",
+            code="scheduler-cleanup-inconclusive",
+        ) from close_failures[0][1]
+    if pending_error is not None:
+        if pending_cause is not None:
+            raise pending_error from pending_cause
+        raise pending_error.with_traceback(pending_error.__traceback__)
+    if result is None:
+        raise SyncError(
+            "scheduler native command produced no terminal result",
+            code="scheduler-process-io",
+        )
+    return result
 
 
 def _run_native_command(

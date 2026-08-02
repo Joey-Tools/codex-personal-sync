@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -6640,14 +6641,173 @@ class SchedulerDoctorTests(unittest.TestCase):
         self.assertEqual(len(processes), 1)
         self.assertIsNotNone(processes[0].poll())
 
+    def test_scheduler_guardian_fences_descendant_after_target_exit(self) -> None:
+        fifo = self.root / "guardian-liveness.fifo"
+        os.mkfifo(fifo, 0o600)
+        read_fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            completed = MODULE._run_bounded_scheduler_process(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os,subprocess,sys;"
+                        "fd=os.open(sys.argv[1],os.O_WRONLY);"
+                        "os.write(fd,b'R');"
+                        "subprocess.Popen("
+                        "[sys.executable,'-c','import time;time.sleep(30)'],"
+                        "stdin=subprocess.DEVNULL,"
+                        "stdout=subprocess.DEVNULL,"
+                        "stderr=subprocess.DEVNULL,"
+                        "pass_fds=(fd,));"
+                        "os.close(fd)"
+                    ),
+                    str(fifo),
+                ],
+                timeout_seconds=5.0,
+            )
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(os.read(read_fd, 1), b"R")
+            self.assertEqual(os.read(read_fd, 1), b"")
+        finally:
+            os.close(read_fd)
+
+    def test_bounded_scheduler_selector_close_failure_preserves_primary(
+        self,
+    ) -> None:
+        process = MODULE._spawn_guarded_process(
+            [sys.executable, "-c", "import os;os.write(1,b'123456789')"],
+            deadline=time.monotonic() + 5.0,
+            process_label="test scheduler",
+            unavailable_code="test-unavailable",
+            unavailable_message="test executable unavailable",
+        )
+        real_selector = MODULE.selectors.DefaultSelector
+        selector_calls = 0
+
+        class CloseFailingSelector:
+            def __init__(self, inner) -> None:
+                self.inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+            def close(self) -> None:
+                self.inner.close()
+                raise ValueError("injected scheduler selector close failure")
+
+        def selector_factory():
+            nonlocal selector_calls
+            selector_calls += 1
+            if selector_calls == 1:
+                return CloseFailingSelector(real_selector())
+            return real_selector()
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_spawn_guarded_process",
+                return_value=process,
+            ),
+            mock.patch.object(
+                MODULE.selectors,
+                "DefaultSelector",
+                side_effect=selector_factory,
+            ),
+            mock.patch.object(MODULE, "MAX_SCHEDULER_NATIVE_STDOUT_BYTES", 8),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "stdout exceeds.*selector close failure",
+            ) as raised,
+        ):
+            MODULE._run_bounded_scheduler_process(
+                [sys.executable, "-c", "unused"],
+                timeout_seconds=5.0,
+            )
+
+        self.assertEqual(raised.exception.code, "scheduler-cleanup-inconclusive")
+        self.assertIsInstance(raised.exception.__cause__, MODULE.SyncError)
+        self.assertEqual(
+            raised.exception.__cause__.code,
+            "scheduler-output-limit",
+        )
+        self.assertEqual(process.returncode, -MODULE.signal.SIGKILL)
+
+    def test_scheduler_spawn_cleanup_failure_cannot_be_ignored(self) -> None:
+        primary = MODULE.SyncError(
+            "injected guardian cleanup failure",
+            code="process-guardian-cleanup-inconclusive",
+        )
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                MODULE,
+                "_native_scheduler_argv",
+                return_value=[sys.executable, "-c", "pass"],
+            ),
+            mock.patch.object(
+                MODULE,
+                "_spawn_guarded_process",
+                side_effect=primary,
+            ),
+            contextlib.redirect_stdout(output),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "guardian cleanup was inconclusive",
+            ) as raised,
+        ):
+            MODULE._run_native_command(
+                ["systemctl", "--user", "daemon-reload"],
+                dry_run=False,
+                allow_fail=True,
+            )
+
+        self.assertEqual(raised.exception.code, "scheduler-cleanup-inconclusive")
+        self.assertNotIn("ignored failed command", output.getvalue())
+
+    def test_scheduler_maps_guardian_operation_deadline_to_lane_taxonomy(
+        self,
+    ) -> None:
+        primary = MODULE.SyncError(
+            "scheduler native command exceeded its monotonic deadline",
+            code="process-guardian-operation-timeout",
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_spawn_guarded_process",
+                side_effect=primary,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "scheduler native command exceeded its monotonic deadline",
+            ) as raised,
+        ):
+            MODULE._run_bounded_scheduler_process(
+                [sys.executable, "-c", "pass"],
+                timeout_seconds=1.0,
+            )
+
+        self.assertEqual(raised.exception.code, "scheduler-timeout")
+        self.assertIs(raised.exception.__cause__, primary)
+
     def test_bounded_scheduler_process_reaps_child_when_selectors_fail(self) -> None:
         processes: list[subprocess.Popen[bytes]] = []
         real_popen = subprocess.Popen
+        real_selector = MODULE.selectors.DefaultSelector
+        selector_calls = 0
 
         def capture_process(args, **kwargs):
             process = real_popen(args, **kwargs)
             processes.append(process)
             return process
+
+        def fail_after_ready_selector():
+            nonlocal selector_calls
+            selector_calls += 1
+            if selector_calls == 1:
+                return real_selector()
+            raise OSError("simulated selector exhaustion")
 
         with (
             mock.patch.object(
@@ -6658,9 +6818,8 @@ class SchedulerDoctorTests(unittest.TestCase):
             mock.patch.object(
                 MODULE.selectors,
                 "DefaultSelector",
-                side_effect=OSError("simulated selector exhaustion"),
+                side_effect=fail_after_ready_selector,
             ),
-            mock.patch.object(MODULE, "GH_TERMINATE_GRACE_SECONDS", 0.05),
             mock.patch.object(MODULE, "GH_CLEANUP_TIMEOUT_SECONDS", 1.0),
             self.assertRaisesRegex(
                 MODULE.SyncError,
@@ -6674,7 +6833,7 @@ class SchedulerDoctorTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "scheduler-cleanup-inconclusive")
         self.assertEqual(len(processes), 1)
-        self.assertIsNotNone(processes[0].poll())
+        self.assertEqual(processes[0].returncode, -9)
         self.assertTrue(processes[0].stdout.closed)
         self.assertTrue(processes[0].stderr.closed)
 
@@ -6686,12 +6845,12 @@ class SchedulerDoctorTests(unittest.TestCase):
             code="scheduler-output-limit",
         )
         incomplete = MODULE._GhCleanupReceipt(
-            term_sent=True,
             kill_sent=True,
             child_reaped=False,
             stdout_drained=False,
             stderr_drained=True,
-            process_group_gone=False,
+            status_drained=False,
+            process_group_fenced=False,
             errors=("simulated cleanup uncertainty",),
         )
         with (
