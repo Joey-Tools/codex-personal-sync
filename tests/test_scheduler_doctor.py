@@ -37,6 +37,17 @@ PUBLIC_SHA = "1" * 40
 PRIVATE_SHA = "2" * 40
 
 
+def _scheduler_doctor_test_account_home() -> Path:
+    return Path(os.path.realpath(MODULE._mirror_canonical_account_home_directory()))
+
+
+def _scheduler_doctor_test_temporary_directory() -> tempfile.TemporaryDirectory:
+    return tempfile.TemporaryDirectory(
+        prefix="scheduler-doctor.",
+        dir=_scheduler_doctor_test_account_home(),
+    )
+
+
 def snapshot_tree(root: Path) -> tuple[tuple[str, str, int, bytes | str | None], ...]:
     entries: list[tuple[str, str, int, bytes | str | None]] = []
 
@@ -61,9 +72,28 @@ def snapshot_tree(root: Path) -> tuple[tuple[str, str, int, bytes | str | None],
     return tuple(entries)
 
 
+class SchedulerDoctorFixtureTests(unittest.TestCase):
+    def test_temporary_root_ignores_ambient_tmpdir_and_cleans_up(self) -> None:
+        account_home = _scheduler_doctor_test_account_home()
+        system_tmp = Path(os.path.realpath("/tmp"))
+        with mock.patch.dict(os.environ, {"TMPDIR": "/tmp"}):
+            temporary_directory = _scheduler_doctor_test_temporary_directory()
+        root = Path(os.path.realpath(temporary_directory.name))
+
+        try:
+            self.assertEqual(root.parent, account_home)
+            self.assertFalse(root.is_relative_to(system_tmp))
+            (root / "cleanup-probe").write_text("fixture\n", encoding="utf-8")
+        finally:
+            temporary_directory.cleanup()
+
+        self.assertFalse(root.exists())
+        self.assertTrue(account_home.is_dir())
+
+
 class SchedulerDoctorTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmpdir = tempfile.TemporaryDirectory(prefix="scheduler-doctor.")
+        self.tmpdir = _scheduler_doctor_test_temporary_directory()
         self.root = Path(os.path.realpath(self.tmpdir.name))
         self.user_home = self.root / "home"
         self.home = self.user_home / ".codex"
