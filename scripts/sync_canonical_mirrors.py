@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 from dataclasses import dataclass, field, replace
+from enum import Enum
 import fcntl
 import hashlib
 import json
@@ -11,6 +12,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import secrets
+import select
 import selectors
 import signal
 import stat
@@ -18,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Union
+from typing import Any, Callable, Union
 import unicodedata
 
 
@@ -32,6 +34,7 @@ TRANSACTION_TEMP_PATH = PurePosixPath(".generated-sync-transaction.pending")
 TRANSACTION_COMPLETE_PATH = PurePosixPath(".generated-sync-transaction.complete")
 LOCK_VERSION = 1
 RECEIPT_VERSION = 1
+SYNC_HISTORY_RECEIPT_VERSION = 2
 GENERATOR_CONTRACT_VERSION = 2
 RULES_CONTRACT_VERSION = 1
 HASH_ALGORITHM = "sha256"
@@ -5767,53 +5770,558 @@ def _git_environment() -> dict[str, str]:
     }
 
 
-def _terminate_git_process(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
+_REAL_SUBPROCESS_POPEN = subprocess.Popen
+_BOUNDED_PROCESS_SIGNALS = tuple(
+    candidate
+    for candidate in (
+        signal.SIGINT,
+        signal.SIGTERM,
+        getattr(signal, "SIGHUP", None),
+    )
+    if candidate is not None
+)
+
+
+@dataclass
+class _ProcessOwner:
+    process: subprocess.Popen[bytes] | None = None
+    cleanup_deadline: float | None = None
+    cleanup_started: bool = False
+    trusted_exec_profile: _TrustedProcessProfile | None = None
+
+    def begin_cleanup(self) -> float:
+        if self.cleanup_deadline is None:
+            self.cleanup_deadline = time.monotonic() + GIT_CLEANUP_TIMEOUT_SECONDS
+        self.cleanup_started = True
+        return self.cleanup_deadline
+
+
+class _TrustedProcessProfile(Enum):
+    MACOS_XCRUN_LOCATOR = "macos-xcrun-locator"
+    PRIVATE_GIT_SNAPSHOT = "private-git-snapshot"
+
+
+class _OwnedPopen(_REAL_SUBPROCESS_POPEN):
+    def __new__(cls, owner: _ProcessOwner, *args: Any, **kwargs: Any):
+        instance = super().__new__(cls)
+        # Publish before Popen.__init__ can fork. Pure Python cannot recover a
+        # PID from an arbitrarily injected exception in the C-return to
+        # self.pid assignment gap; ordinary errors and supported POSIX signal
+        # paths remain supervised.
+        instance.returncode = None
+        instance.pid = None
+        instance._child_created = False
+        owner.process = instance
+        return instance
+
+    def __init__(
+        self,
+        owner: _ProcessOwner,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        del owner
+        super().__init__(*args, **kwargs)
+
+
+def _owned_popen(
+    owner: _ProcessOwner,
+    *args: Any,
+    **kwargs: Any,
+) -> subprocess.Popen[bytes]:
+    # Existing tests replace subprocess.Popen with a mock factory. Production
+    # always takes the pre-published owner-aware class above.
+    if subprocess.Popen is not _REAL_SUBPROCESS_POPEN:
+        process = subprocess.Popen(*args, **kwargs)
+        owner.process = process
+        return process
+    return _OwnedPopen(owner, *args, **kwargs)
+
+
+def _verify_trusted_same_uid_spawn_kwargs(kwargs: dict[str, Any]) -> None:
+    if kwargs.get("start_new_session") is not True:
+        raise MirrorSyncError("trusted same-UID process requires a new session")
+    forbidden_transitions = (
+        "user",
+        "group",
+        "extra_groups",
+        "preexec_fn",
+    )
+    for name in forbidden_transitions:
+        if kwargs.get(name) is not None:
+            raise MirrorSyncError(
+                f"trusted same-UID process forbids Popen {name} transitions"
+            )
+    if os.getuid() != os.geteuid() or os.getgid() != os.getegid():
+        raise MirrorSyncError(
+            "trusted same-UID process forbids parent credential transitions"
+        )
+
+
+def _owned_macos_git_locator_popen(
+    owner: _ProcessOwner,
+    temporary_directory: str,
+) -> subprocess.Popen[bytes]:
+    environment = _git_environment()
+    environment["TMPDIR"] = temporary_directory
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "env": environment,
+        "start_new_session": True,
+    }
+    _verify_trusted_same_uid_spawn_kwargs(kwargs)
+    owner.trusted_exec_profile = _TrustedProcessProfile.MACOS_XCRUN_LOCATOR
+    return _owned_popen(
+        owner,
+        [MACOS_GIT_LOCATOR_EXECUTABLE.as_posix(), "--find", "git"],
+        **kwargs,
+    )
+
+
+def _owned_private_git_popen(
+    owner: _ProcessOwner,
+    command: list[str],
+    *,
+    control_root: BoundRoot,
+    executable_binding: ControlObjectBinding,
+    **kwargs: Any,
+) -> subprocess.Popen[bytes]:
+    if (
+        executable_binding.path is None
+        or executable_binding.content_digest is None
+        or control_root.git_executable.path is None
+        or control_root.git_executable.content_digest is None
+    ):
+        raise MirrorSyncError(
+            "trusted private Git process requires content-bound executables"
+        )
+    if not command or command[0] != control_root.git_executable.path.as_posix():
+        raise MirrorSyncError(
+            "trusted private Git argv0 does not match its bound source executable"
+        )
+    if kwargs.get("env") != _git_environment():
+        raise MirrorSyncError("trusted private Git requires the closed environment")
+    _verify_trusted_same_uid_spawn_kwargs(kwargs)
+    owner.trusted_exec_profile = _TrustedProcessProfile.PRIVATE_GIT_SNAPSHOT
+    return _owned_popen(
+        owner,
+        command,
+        executable=executable_binding.path.as_posix(),
+        **kwargs,
+    )
+
+
+@dataclass
+class _DeferredProcessSignals:
+    original_handlers: dict[int, Any]
+    received: list[int] = field(default_factory=list)
+
+    def handler(self, signum: int, _frame: Any) -> None:
+        if signum not in self.received:
+            self.received.append(signum)
+
+
+def _install_deferred_process_signal_handlers() -> _DeferredProcessSignals:
+    if not hasattr(signal, "pthread_sigmask"):
+        raise MirrorSyncError(
+            "bounded process launch requires pthread signal-mask support"
+        )
+    signals_to_defer = set(_BOUNDED_PROCESS_SIGNALS)
     try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    except OSError:
-        # Some sandboxes deny killpg even for a new child session. Kill the
-        # direct child as a fail-closed fallback; hooks, prompts, and network
-        # helpers are disabled for this Git profile.
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, signals_to_defer)
+    except OSError as error:
+        raise MirrorSyncError(
+            f"cannot fence bounded process signal-handler installation: {error}"
+        ) from error
+    state = _DeferredProcessSignals(
+        original_handlers={
+            signum: signal.getsignal(signum) for signum in _BOUNDED_PROCESS_SIGNALS
+        }
+    )
+    installed: list[int] = []
+    errors: list[BaseException] = []
+    try:
+        for signum in _BOUNDED_PROCESS_SIGNALS:
+            signal.signal(signum, state.handler)
+            installed.append(signum)
+    except BaseException as error:
+        errors.append(error)
+    if not errors:
         try:
-            process.kill()
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        except BaseException as error:
+            errors.append(error)
+    if errors:
+        # Even when the atomic mask transition itself failed, leave no
+        # orphaned deferred handler behind. Retry the original mask only as a
+        # best-effort rollback and retain every failure in the terminal error.
+        for signum in reversed(installed):
+            try:
+                signal.signal(signum, state.original_handlers[signum])
+            except BaseException as restore_error:
+                errors.append(restore_error)
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        except BaseException as restore_error:
+            errors.append(restore_error)
+        raise MirrorSyncError(
+            "cannot install bounded process deferred signal handlers: "
+            + "; ".join(str(error) for error in errors)
+        ) from errors[0]
+    return state
+
+
+def _restore_deferred_process_signal_handlers(
+    state: _DeferredProcessSignals,
+) -> list[BaseException]:
+    errors: list[BaseException] = []
+    signals_to_defer = set(_BOUNDED_PROCESS_SIGNALS)
+    previous_mask: set[signal.Signals] | None = None
+    try:
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, signals_to_defer)
+    except BaseException as error:
+        errors.append(error)
+    # A failed atomic fence weakens race exclusion but never justifies leaving
+    # process-global handlers installed after the child is terminal.
+    for signum in _BOUNDED_PROCESS_SIGNALS:
+        try:
+            signal.signal(signum, state.original_handlers[signum])
+        except BaseException as error:
+            errors.append(error)
+    if previous_mask is not None:
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        except BaseException as error:
+            errors.append(error)
+            try:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            except BaseException as retry_error:
+                errors.append(retry_error)
+    return errors
+
+
+def _replay_deferred_process_signals(
+    state: _DeferredProcessSignals,
+    *,
+    primary_error: BaseException | None,
+) -> list[BaseException]:
+    errors: list[BaseException] = []
+    for signum in state.received:
+        handler = state.original_handlers[signum]
+        if handler == signal.SIG_IGN:
+            continue
+        if callable(handler):
+            try:
+                handler(signum, None)
+            except BaseException as error:
+                errors.append(error)
+            continue
+        if primary_error is not None:
+            errors.append(
+                MirrorSyncError(
+                    f"deferred signal {signum} has a default action and was not "
+                    "replayed over an existing bounded-process failure"
+                )
+            )
+            continue
+        signal.raise_signal(signum)
+    return errors
+
+
+def _launch_and_collect_bounded_process(
+    launcher: Callable[[_ProcessOwner], subprocess.Popen[bytes]],
+    collector: Callable[
+        [subprocess.Popen[bytes], _ProcessOwner],
+        tuple[int, bytes, bytes],
+    ],
+    *,
+    label: str,
+) -> tuple[int, bytes, bytes]:
+    """Own one child from pre-construction publication through collection.
+
+    Parent-only deferred handlers close the ordinary POSIX signal handoff
+    windows without giving the child a blocked signal mask. The owner is
+    published before Popen.__init__, and one owner-held deadline caps every
+    cleanup path. Arbitrary runtime exception injection in Popen's internal
+    C-return-to-pid-assignment gap is outside this pure-Python guarantee.
+    """
+    signal_state = _install_deferred_process_signal_handlers()
+    owner = _ProcessOwner()
+    result: tuple[int, bytes, bytes] | None = None
+    primary_error: BaseException | None = None
+    cleanup_errors: list[BaseException] = []
+    try:
+        process = launcher(owner)
+        if owner.process is None:
+            owner.process = process
+        elif owner.process is not process:
+            raise MirrorSyncError(
+                f"bounded {label} launcher returned a child it does not own"
+            )
+        result = collector(process, owner)
+    except BaseException as error:
+        primary_error = error
+        cleanup_errors.extend(_cleanup_owned_process(owner))
+
+    restore_errors = _restore_deferred_process_signal_handlers(signal_state)
+    replay_errors = _replay_deferred_process_signals(
+        signal_state,
+        primary_error=primary_error,
+    )
+    secondary_errors = cleanup_errors + restore_errors + replay_errors
+    if primary_error is not None:
+        if secondary_errors:
+            raise MirrorSyncError(
+                f"{primary_error}; bounded {label} terminalization is "
+                "inconclusive: "
+                + "; ".join(
+                    f"{type(error).__name__}: {error}" for error in secondary_errors
+                )
+            ) from primary_error
+        raise primary_error.with_traceback(primary_error.__traceback__)
+    if secondary_errors:
+        if len(secondary_errors) == 1 and not (cleanup_errors or restore_errors):
+            raise secondary_errors[0]
+        raise MirrorSyncError(
+            f"bounded {label} terminalization is inconclusive: "
+            + "; ".join(
+                f"{type(error).__name__}: {error}" for error in secondary_errors
+            )
+        ) from secondary_errors[0]
+    if result is None:
+        raise MirrorSyncError(f"bounded {label} produced no terminal result")
+    return result
+
+
+def _wait_for_git_leader_exit_without_reaping(
+    process: subprocess.Popen[bytes],
+    deadline: float,
+    label: str,
+) -> None:
+    if process.returncode is not None:
+        raise MirrorSyncError(
+            f"bounded {label} leader was reaped before process-group cleanup"
+        )
+    process_id = getattr(process, "pid", None)
+    if (
+        isinstance(process_id, bool)
+        or not isinstance(process_id, int)
+        or process_id <= 0
+    ):
+        raise MirrorSyncError(f"bounded {label} has no valid leader identity")
+    required_waitid = tuple(
+        getattr(os, name, None) for name in ("P_PID", "WEXITED", "WNOHANG", "WNOWAIT")
+    )
+    waitid = getattr(os, "waitid", None)
+    if callable(waitid) and all(isinstance(value, int) for value in required_waitid):
+        id_type, exited_flag, nohang_flag, nowait_flag = required_waitid
+        assert isinstance(id_type, int)
+        assert isinstance(exited_flag, int)
+        assert isinstance(nohang_flag, int)
+        assert isinstance(nowait_flag, int)
+        while True:
+            try:
+                result = waitid(
+                    id_type,
+                    process_id,
+                    exited_flag | nohang_flag | nowait_flag,
+                )
+            except ChildProcessError as error:
+                raise MirrorSyncError(
+                    f"bounded {label} leader was reaped outside its supervisor"
+                ) from error
+            except OSError as error:
+                raise MirrorSyncError(
+                    f"cannot observe bounded {label} leader exit: {error}"
+                ) from error
+            if result is not None and result.si_pid == process_id:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise MirrorSyncError(f"bounded {label} exceeded its deadline")
+            time.sleep(min(0.01, remaining))
+
+    if sys.platform != "darwin" or not hasattr(select, "kqueue"):
+        raise MirrorSyncError(
+            f"bounded {label} requires waitid(WNOWAIT) or Darwin kqueue "
+            "process supervision"
+        )
+    try:
+        queue = select.kqueue()
+    except OSError as error:
+        raise MirrorSyncError(
+            f"cannot create bounded {label} Darwin process observer: {error}"
+        ) from error
+    observed = False
+    observation_error: BaseException | None = None
+    close_error: BaseException | None = None
+    try:
+        try:
+            change = select.kevent(
+                process_id,
+                filter=select.KQ_FILTER_PROC,
+                flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE | select.KQ_EV_ONESHOT,
+                fflags=select.KQ_NOTE_EXIT,
+            )
+            try:
+                queue.control([change], 0, 0)
+            except ProcessLookupError:
+                # The unreaped Popen still reserves the numeric PID. ESRCH
+                # during late registration therefore means this exact leader
+                # already exited; it cannot describe a reused PID.
+                observed = True
+            while not observed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise MirrorSyncError(f"bounded {label} exceeded its deadline")
+                events = queue.control(None, 1, remaining)
+                if not events:
+                    continue
+                event = events[0]
+                event_error = getattr(select, "KQ_EV_ERROR", 0)
+                if (
+                    event.ident != process_id
+                    or event.filter != select.KQ_FILTER_PROC
+                    or not (event.fflags & select.KQ_NOTE_EXIT)
+                    or (event_error and event.flags & event_error)
+                ):
+                    raise MirrorSyncError(
+                        f"bounded {label} received an invalid Darwin exit event"
+                    )
+                observed = True
+        except BaseException as error:
+            observation_error = error
+    finally:
+        try:
+            queue.close()
+        except BaseException as error:
+            close_error = error
+    if observation_error is not None:
+        if close_error is not None:
+            raise MirrorSyncError(
+                f"{observation_error}; cannot close bounded {label} Darwin "
+                f"process observer: {close_error}"
+            ) from observation_error
+        if isinstance(observation_error, MirrorSyncError):
+            raise observation_error
+        raise MirrorSyncError(
+            f"cannot observe bounded {label} Darwin leader exit: {observation_error}"
+        ) from observation_error
+    if close_error is not None:
+        raise MirrorSyncError(
+            f"cannot close bounded {label} Darwin process observer: {close_error}"
+        ) from close_error
+    if not observed:
+        raise MirrorSyncError(f"bounded {label} produced no Darwin exit event")
+
+
+def _terminate_git_process(
+    process: subprocess.Popen[bytes],
+    *,
+    deadline: float | None = None,
+    leader_exit_observed: bool = False,
+    trusted_exec_profile: _TrustedProcessProfile | None = None,
+) -> int:
+    errors: list[str] = []
+    if process.returncode is not None:
+        raise MirrorSyncError(
+            "bounded Git process leader was already reaped before process-group cleanup"
+        )
+    cleanup_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + GIT_CLEANUP_TIMEOUT_SECONDS
+    )
+    process_id = getattr(process, "pid", None)
+    if (
+        isinstance(process_id, bool)
+        or not isinstance(process_id, int)
+        or process_id <= 0
+    ):
+        errors.append("bounded Git process has no valid process-group identity")
+    else:
+        try:
+            # Every caller launches with start_new_session=True. Signal the
+            # process group while its unreaped leader still reserves the exact
+            # numeric PGID. No numeric group operation is allowed after wait.
+            os.killpg(process_id, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        except OSError as error:
-            raise MirrorSyncError(
-                f"cannot terminate bounded Git process: {error}"
-            ) from error
+        except OSError as group_error:
+            # Darwin can report EPERM for an observed-exited zombie leader.
+            # That is not a general absence proof: accept it only for the
+            # fixed same-UID/no-privilege-transition execution profile above.
+            # Every other group-signal failure remains inconclusive; a direct
+            # child fallback would have to poll and can lose the PGID binding.
+            darwin_trusted_zombie_fence_candidate = (
+                sys.platform == "darwin"
+                and leader_exit_observed
+                and trusted_exec_profile
+                in {
+                    _TrustedProcessProfile.MACOS_XCRUN_LOCATOR,
+                    _TrustedProcessProfile.PRIVATE_GIT_SNAPSHOT,
+                }
+                and isinstance(group_error, PermissionError)
+            )
+            if not darwin_trusted_zombie_fence_candidate:
+                errors.append(f"cannot signal bounded Git process group: {group_error}")
+
+    # This is the only reap. After it returns, the leader's numeric PID/PGID
+    # can be reused, so this function performs no poll, kill, or group probe.
+    return_code: int | None = None
     try:
-        process.wait(timeout=GIT_CLEANUP_TIMEOUT_SECONDS)
+        return_code = process.wait(
+            timeout=max(0.0, cleanup_deadline - time.monotonic())
+        )
     except subprocess.TimeoutExpired as error:
+        errors.append(f"bounded Git process leader was not reaped: {error}")
+    except OSError as error:
+        errors.append(f"cannot reap bounded Git process leader: {error}")
+    if errors:
         raise MirrorSyncError(
-            "bounded Git process group did not terminate after SIGKILL"
-        ) from error
+            "bounded Git process cleanup is inconclusive: " + "; ".join(errors)
+        )
+    if return_code is None:
+        raise MirrorSyncError("bounded Git process cleanup produced no return code")
+    return return_code
 
 
-def _drain_and_close_git_process_output(process: subprocess.Popen[bytes]) -> None:
+def _drain_and_close_git_process_output(
+    process: subprocess.Popen[bytes],
+    *,
+    deadline: float | None = None,
+) -> None:
     """Discard bounded pending pipe bytes when a launched process has no caller."""
-    selector = selectors.DefaultSelector()
+    selector: selectors.BaseSelector | None = None
     errors: list[str] = []
     streams = {
-        "stdout": process.stdout,
-        "stderr": process.stderr,
+        "stdout": getattr(process, "stdout", None),
+        "stderr": getattr(process, "stderr", None),
     }
-    for name, stream in streams.items():
-        if stream is None:
-            continue
-        try:
-            os.set_blocking(stream.fileno(), False)
-            selector.register(stream, selectors.EVENT_READ, name)
-        except (OSError, ValueError) as error:
-            errors.append(f"cannot register Git {name} cleanup drain: {error}")
-    deadline = time.monotonic() + GIT_CLEANUP_TIMEOUT_SECONDS
     try:
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
+        try:
+            selector = selectors.DefaultSelector()
+        except (OSError, ValueError) as error:
+            errors.append(f"cannot create Git output cleanup selector: {error}")
+        for name, stream in streams.items():
+            if stream is None:
+                continue
+            if selector is None:
+                continue
+            try:
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, name)
+            except (OSError, ValueError) as error:
+                errors.append(f"cannot register Git {name} cleanup drain: {error}")
+        cleanup_deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + GIT_CLEANUP_TIMEOUT_SECONDS
+        )
+        while selector is not None and selector.get_map():
+            remaining = cleanup_deadline - time.monotonic()
             if remaining <= 0:
                 errors.append("Git output cleanup drain exceeded its deadline")
                 break
@@ -5843,7 +6351,11 @@ def _drain_and_close_git_process_output(process: subprocess.Popen[bytes]) -> Non
                 except (KeyError, OSError, ValueError):
                     pass
     finally:
-        selector.close()
+        if selector is not None:
+            try:
+                selector.close()
+            except (OSError, ValueError) as error:
+                errors.append(f"cannot close Git output cleanup selector: {error}")
         for name, stream in streams.items():
             if stream is None:
                 continue
@@ -5855,21 +6367,58 @@ def _drain_and_close_git_process_output(process: subprocess.Popen[bytes]) -> Non
         raise MirrorSyncError("; ".join(errors))
 
 
+def _owned_process_has_bound_pid(owner: _ProcessOwner) -> bool:
+    process = owner.process
+    if process is None or getattr(process, "returncode", None) is not None:
+        return False
+    process_id = getattr(process, "pid", None)
+    return (
+        not isinstance(process_id, bool)
+        and isinstance(process_id, int)
+        and process_id > 0
+    )
+
+
+def _cleanup_owned_process(
+    owner: _ProcessOwner,
+) -> list[BaseException]:
+    if owner.cleanup_started or not _owned_process_has_bound_pid(owner):
+        return []
+    deadline = owner.begin_cleanup()
+    process = owner.process
+    assert process is not None
+    errors: list[BaseException] = []
+    try:
+        _terminate_git_process(
+            process,
+            deadline=deadline,
+            trusted_exec_profile=owner.trusted_exec_profile,
+        )
+    except BaseException as error:
+        errors.append(error)
+    try:
+        _drain_and_close_git_process_output(process, deadline=deadline)
+    except BaseException as error:
+        errors.append(error)
+    return errors
+
+
 def _collect_bounded_process_output(
     process: subprocess.Popen[bytes],
     operation: OperationBudget | None,
     *,
+    owner: _ProcessOwner | None = None,
     stdout_limit: int,
     stderr_limit: int,
     timeout_seconds: float,
     label: str,
 ) -> tuple[int, bytes, bytes]:
-    if process.stdout is None or process.stderr is None:
-        _terminate_git_process(process)
-        raise MirrorSyncError("bounded Git process pipes were not created")
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
-    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    process_owner = owner if owner is not None else _ProcessOwner(process=process)
+    if process_owner.process is None:
+        process_owner.process = process
+    elif process_owner.process is not process:
+        raise MirrorSyncError("bounded process owner does not match its child")
+    selector: selectors.BaseSelector | None = None
     buffers: dict[str, bytearray] = {
         "stdout": bytearray(),
         "stderr": bytearray(),
@@ -5881,11 +6430,20 @@ def _collect_bounded_process_output(
     deadline = time.monotonic() + timeout_seconds
     if operation is not None:
         deadline = min(deadline, operation.deadline)
+    result: tuple[int, bytes, bytes] | None = None
+    primary_error: BaseException | None = None
+    primary_cause: BaseException | None = None
+    cleanup_error: BaseException | None = None
+    close_errors: list[str] = []
     try:
+        if process.stdout is None or process.stderr is None:
+            raise MirrorSyncError("bounded Git process pipes were not created")
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                _terminate_git_process(process)
                 raise MirrorSyncError(
                     f"bounded {label} exceeded {timeout_seconds} seconds"
                 )
@@ -5902,7 +6460,6 @@ def _collect_bounded_process_output(
                         min(64 * 1024, maximum + 1 - len(current)),
                     )
                 except OSError as error:
-                    _terminate_git_process(process)
                     raise MirrorSyncError(
                         f"cannot read bounded {label} {stream_name}: {error}"
                     ) from error
@@ -5916,36 +6473,92 @@ def _collect_bounded_process_output(
                     label=f"collecting Git {stream_name}",
                 )
                 if len(current) > maximum:
-                    _terminate_git_process(process)
                     raise MirrorSyncError(
                         f"bounded {label} {stream_name} exceeds the "
                         f"{maximum}-byte limit"
                     )
-        remaining = max(0.0, deadline - time.monotonic())
-        try:
-            return_code = process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired as error:
-            _terminate_git_process(process)
-            raise MirrorSyncError(
-                f"bounded {label} exceeded {timeout_seconds} seconds"
-            ) from error
-        return return_code, bytes(buffers["stdout"]), bytes(buffers["stderr"])
-    except BaseException:
-        _terminate_git_process(process)
-        raise
+        _wait_for_git_leader_exit_without_reaping(
+            process,
+            deadline,
+            label,
+        )
+        cleanup_deadline = process_owner.begin_cleanup()
+        return_code = _terminate_git_process(
+            process,
+            deadline=cleanup_deadline,
+            leader_exit_observed=True,
+            trusted_exec_profile=process_owner.trusted_exec_profile,
+        )
+        result = (
+            return_code,
+            bytes(buffers["stdout"]),
+            bytes(buffers["stderr"]),
+        )
+    except BaseException as error:
+        if isinstance(error, (OSError, ValueError)):
+            primary_error = MirrorSyncError(
+                f"cannot supervise bounded {label}: {error}"
+            )
+            primary_cause = error
+        else:
+            primary_error = error
+        if not process_owner.cleanup_started:
+            cleanup_deadline = process_owner.begin_cleanup()
+            try:
+                _terminate_git_process(
+                    process,
+                    deadline=cleanup_deadline,
+                    trusted_exec_profile=process_owner.trusted_exec_profile,
+                )
+            except BaseException as error:
+                cleanup_error = error
     finally:
-        selector.close()
-        process.stdout.close()
-        process.stderr.close()
+        if selector is not None:
+            try:
+                selector.close()
+            except (OSError, ValueError) as error:
+                close_errors.append(f"cannot close bounded {label} selector: {error}")
+        for name, stream in (
+            ("stdout", getattr(process, "stdout", None)),
+            ("stderr", getattr(process, "stderr", None)),
+        ):
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except (OSError, ValueError) as error:
+                close_errors.append(f"cannot close bounded {label} {name}: {error}")
+    if primary_error is not None:
+        cleanup_details = list(close_errors)
+        if cleanup_error is not None:
+            cleanup_details.insert(0, str(cleanup_error))
+        if cleanup_details:
+            raise MirrorSyncError(
+                f"{primary_error}; bounded {label} cleanup is inconclusive: "
+                + "; ".join(cleanup_details)
+            ) from (primary_cause or primary_error)
+        if primary_cause is not None:
+            raise primary_error from primary_cause
+        raise primary_error
+    if close_errors:
+        raise MirrorSyncError(
+            f"bounded {label} cleanup is inconclusive: " + "; ".join(close_errors)
+        )
+    if result is None:
+        raise MirrorSyncError(f"bounded {label} produced no terminal result")
+    return result
 
 
 def _collect_bounded_git_output(
     process: subprocess.Popen[bytes],
     operation: OperationBudget | None = None,
+    *,
+    owner: _ProcessOwner | None = None,
 ) -> tuple[int, bytes, bytes]:
     return _collect_bounded_process_output(
         process,
         operation,
+        owner=owner,
         stdout_limit=MAX_GIT_STDOUT_BYTES,
         stderr_limit=MAX_GIT_STDERR_BYTES,
         timeout_seconds=GIT_TIMEOUT_SECONDS,
@@ -5989,7 +6602,6 @@ def _resolve_macos_git_executable() -> Path:
     except BaseException:
         os.close(locator.fd)
         raise
-    process: subprocess.Popen[bytes] | None = None
     try:
         _revalidate_absolute_control_object(locator)
         _revalidate_absolute_control_object(temporary_directory)
@@ -5997,31 +6609,23 @@ def _resolve_macos_git_executable() -> Path:
             raise MirrorSyncError(
                 "macOS Git locator temporary directory has no absolute path"
             )
-        environment = _git_environment()
-        environment["TMPDIR"] = temporary_directory.path.as_posix()
-        process = subprocess.Popen(
-            [
-                MACOS_GIT_LOCATOR_EXECUTABLE.as_posix(),
-                "--find",
-                "git",
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=environment,
-            start_new_session=True,
-        )
-        return_code, stdout, stderr = _collect_bounded_process_output(
-            process,
-            None,
-            stdout_limit=MAX_GIT_LOCATOR_STDOUT_BYTES,
-            stderr_limit=MAX_GIT_VERSION_STDERR_BYTES,
-            timeout_seconds=GIT_TIMEOUT_SECONDS,
+        return_code, stdout, stderr = _launch_and_collect_bounded_process(
+            lambda owner: _owned_macos_git_locator_popen(
+                owner,
+                temporary_directory.path.as_posix(),
+            ),
+            lambda process, owner: _collect_bounded_process_output(
+                process,
+                None,
+                owner=owner,
+                stdout_limit=MAX_GIT_LOCATOR_STDOUT_BYTES,
+                stderr_limit=MAX_GIT_VERSION_STDERR_BYTES,
+                timeout_seconds=GIT_TIMEOUT_SECONDS,
+                label="macOS Git locator",
+            ),
             label="macOS Git locator",
         )
     except OSError as error:
-        if process is not None:
-            _terminate_git_process(process)
         raise MirrorSyncError(
             f"cannot run bounded macOS Git locator: {error}"
         ) from error
@@ -6105,6 +6709,7 @@ def _bound_git_argv0(root: BoundRoot) -> str:
 def _popen_from_bound_directory(
     command: list[str],
     *,
+    owner: _ProcessOwner,
     directory_fd: int,
     directory_identity: tuple[int, int, int],
     directory_access_policy: tuple[int, int, int],
@@ -6165,21 +6770,34 @@ def _popen_from_bound_directory(
                 f"{directory_label} current-directory access policy changed "
                 "before process launch"
             )
-        process = subprocess.Popen(
-            command,
-            executable=executable_path,
-            **kwargs,
+        trusted_private_git_launch = (
+            executable_binding is not None
+            and control_root is not None
+            and kwargs.get("env") == _git_environment()
+            and kwargs.get("start_new_session") is True
         )
+        if trusted_private_git_launch:
+            assert executable_binding is not None
+            assert control_root is not None
+            process = _owned_private_git_popen(
+                owner,
+                command,
+                control_root=control_root,
+                executable_binding=executable_binding,
+                **kwargs,
+            )
+        else:
+            process = _owned_popen(
+                owner,
+                command,
+                executable=executable_path,
+                **kwargs,
+            )
         if executable_binding is not None:
             assert control_root is not None
-            try:
-                _revalidate_control_object(control_root, executable_binding)
-            except BaseException:
-                _terminate_git_process(process)
-                raise
+            _revalidate_control_object(control_root, executable_binding)
     except BaseException as error:
         primary_error = error
-        raise
     finally:
         cleanup_errors: list[MirrorSyncError] = []
         try:
@@ -6200,9 +6818,14 @@ def _popen_from_bound_directory(
                     f"bounded {directory_label} process launch: {error}"
                 )
             )
-        if cleanup_errors and process is not None:
+        if process is not None and (primary_error is not None or cleanup_errors):
+            process_cleanup_deadline = owner.begin_cleanup()
             try:
-                _terminate_git_process(process)
+                _terminate_git_process(
+                    process,
+                    deadline=process_cleanup_deadline,
+                    trusted_exec_profile=owner.trusted_exec_profile,
+                )
             except BaseException as error:
                 cleanup_errors.append(
                     MirrorSyncError(
@@ -6211,7 +6834,10 @@ def _popen_from_bound_directory(
                     )
                 )
             try:
-                _drain_and_close_git_process_output(process)
+                _drain_and_close_git_process_output(
+                    process,
+                    deadline=process_cleanup_deadline,
+                )
             except BaseException as error:
                 cleanup_errors.append(
                     MirrorSyncError(
@@ -6219,15 +6845,18 @@ def _popen_from_bound_directory(
                         f"parent-directory cleanup failed: {error}"
                     )
                 )
-        if cleanup_errors:
-            if primary_error is not None:
-                for error in cleanup_errors:
-                    print(f"warning: {error}", file=sys.stderr)
-            else:
-                raise MirrorSyncError(
-                    "bounded process launch cleanup failed: "
-                    + "; ".join(str(error) for error in cleanup_errors)
-                ) from cleanup_errors[0]
+        if cleanup_errors and primary_error is None:
+            raise MirrorSyncError(
+                "bounded process launch cleanup failed: "
+                + "; ".join(str(error) for error in cleanup_errors)
+            ) from cleanup_errors[0]
+        if cleanup_errors and primary_error is not None:
+            raise MirrorSyncError(
+                f"{primary_error}; bounded process launch cleanup is "
+                "inconclusive: " + "; ".join(str(error) for error in cleanup_errors)
+            ) from primary_error
+    if primary_error is not None:
+        raise primary_error
     if process is None:
         raise MirrorSyncError(f"cannot start bounded {directory_label} process")
     return process
@@ -6242,34 +6871,36 @@ def _verify_git_capability(bound_root: BoundRoot) -> None:
         "--no-lazy-fetch",
         "--version",
     ]
-    process: subprocess.Popen[bytes] | None = None
     try:
         _revalidate_bound_root(bound_root)
-        process = _popen_from_bound_directory(
-            command,
-            directory_fd=bound_root.fd,
-            directory_identity=bound_root.identity,
-            directory_access_policy=bound_root.access_policy,
-            directory_label="repository root",
-            control_root=bound_root,
-            executable_binding=_bound_private_git_executable(bound_root),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=_git_environment(),
-            start_new_session=True,
-        )
-        return_code, stdout, stderr = _collect_bounded_process_output(
-            process,
-            bound_root.operation,
-            stdout_limit=MAX_GIT_VERSION_STDOUT_BYTES,
-            stderr_limit=MAX_GIT_VERSION_STDERR_BYTES,
-            timeout_seconds=GIT_TIMEOUT_SECONDS,
+        return_code, stdout, stderr = _launch_and_collect_bounded_process(
+            lambda owner: _popen_from_bound_directory(
+                command,
+                owner=owner,
+                directory_fd=bound_root.fd,
+                directory_identity=bound_root.identity,
+                directory_access_policy=bound_root.access_policy,
+                directory_label="repository root",
+                control_root=bound_root,
+                executable_binding=_bound_private_git_executable(bound_root),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_git_environment(),
+                start_new_session=True,
+            ),
+            lambda process, owner: _collect_bounded_process_output(
+                process,
+                bound_root.operation,
+                owner=owner,
+                stdout_limit=MAX_GIT_VERSION_STDOUT_BYTES,
+                stderr_limit=MAX_GIT_VERSION_STDERR_BYTES,
+                timeout_seconds=GIT_TIMEOUT_SECONDS,
+                label="Git capability probe",
+            ),
             label="Git capability probe",
         )
     except OSError as error:
-        if process is not None:
-            _terminate_git_process(process)
         raise MirrorSyncError(
             f"cannot run bounded Git capability probe: {error}"
         ) from error
@@ -6314,30 +6945,32 @@ def _run_private_git_config_process(
         "--null",
         "--list",
     ]
-    process: subprocess.Popen[bytes] | None = None
     try:
         _revalidate_bound_root(bound_root)
-        process = _popen_from_bound_directory(
-            command,
-            directory_fd=bound_root.git_control.private.fd,
-            directory_identity=bound_root.git_control.private.identity,
-            directory_access_policy=bound_root.git_control.private.access_policy,
-            directory_label="private Git control snapshot",
-            control_root=bound_root,
-            executable_binding=_bound_private_git_executable(bound_root),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=_git_environment(),
-            start_new_session=True,
-        )
-        return_code, stdout, stderr = _collect_bounded_git_output(
-            process,
-            bound_root.operation,
+        return_code, stdout, stderr = _launch_and_collect_bounded_process(
+            lambda owner: _popen_from_bound_directory(
+                command,
+                owner=owner,
+                directory_fd=bound_root.git_control.private.fd,
+                directory_identity=bound_root.git_control.private.identity,
+                directory_access_policy=bound_root.git_control.private.access_policy,
+                directory_label="private Git control snapshot",
+                control_root=bound_root,
+                executable_binding=_bound_private_git_executable(bound_root),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_git_environment(),
+                start_new_session=True,
+            ),
+            lambda process, owner: _collect_bounded_git_output(
+                process,
+                bound_root.operation,
+                owner=owner,
+            ),
+            label="private Git config snapshot inspection",
         )
     except OSError as error:
-        if process is not None:
-            _terminate_git_process(process)
         raise MirrorSyncError(
             f"cannot inspect private Git config snapshot: {error}"
         ) from error
@@ -6411,6 +7044,16 @@ def _verify_static_git_profile(bound_root: BoundRoot) -> None:
                 raise MirrorSyncError(
                     "repository-local Git include paths are not allowed"
                 )
+            if key.startswith("fsck."):
+                raise MirrorSyncError(
+                    f"repository-local Git fsck configuration is not allowed: {key}"
+                )
+            if key.startswith("url.") and (
+                key.endswith(".insteadof") or key.endswith(".pushinsteadof")
+            ):
+                raise MirrorSyncError(
+                    f"repository-local Git URL rewriting is not allowed: {key}"
+                )
             if key == "extensions.partialclone" or (
                 key.startswith("remote.")
                 and (key.endswith(".promisor") or key.endswith(".partialclonefilter"))
@@ -6449,7 +7092,6 @@ def _run_private_git_process(
         f"core.hooksPath={os.devnull}",
         *arguments,
     ]
-    process: subprocess.Popen[bytes] | None = None
     stdin_file: Any | None = None
     try:
         _revalidate_bound_root(bound_root)
@@ -6463,27 +7105,30 @@ def _run_private_git_process(
             stdin_file.write(stdin_payload)
             stdin_file.flush()
             stdin_file.seek(0)
-        process = _popen_from_bound_directory(
-            git_command,
-            directory_fd=bound_root.git_control.private.fd,
-            directory_identity=bound_root.git_control.private.identity,
-            directory_access_policy=bound_root.git_control.private.access_policy,
-            directory_label="private Git control snapshot",
-            control_root=bound_root,
-            executable_binding=_bound_private_git_executable(bound_root),
-            stdin=subprocess.DEVNULL if stdin_file is None else stdin_file,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=_git_environment(),
-            start_new_session=True,
-        )
-        return_code, stdout, stderr = _collect_bounded_git_output(
-            process,
-            bound_root.operation,
+        return_code, stdout, stderr = _launch_and_collect_bounded_process(
+            lambda owner: _popen_from_bound_directory(
+                git_command,
+                owner=owner,
+                directory_fd=bound_root.git_control.private.fd,
+                directory_identity=bound_root.git_control.private.identity,
+                directory_access_policy=bound_root.git_control.private.access_policy,
+                directory_label="private Git control snapshot",
+                control_root=bound_root,
+                executable_binding=_bound_private_git_executable(bound_root),
+                stdin=subprocess.DEVNULL if stdin_file is None else stdin_file,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_git_environment(),
+                start_new_session=True,
+            ),
+            lambda process, owner: _collect_bounded_git_output(
+                process,
+                bound_root.operation,
+                owner=owner,
+            ),
+            label="Git verification",
         )
     except OSError as error:
-        if process is not None:
-            _terminate_git_process(process)
         raise MirrorSyncError(
             f"cannot run bounded Git verification: {error}"
         ) from error
@@ -7223,6 +7868,7 @@ def _validate_sync_branch_history_bound(
     target_root: BoundRoot,
     base_sha: str,
     head_sha: str,
+    worktree_head_sha: str,
     allowed_paths: frozenset[bytes],
     allowed_paths_sha256: bytes,
     *,
@@ -7238,11 +7884,15 @@ def _validate_sync_branch_history_bound(
         target_root,
         history_mirror,
     )
-    if _current_commit(target_root) != head_sha:
+    if _current_commit(target_root) != worktree_head_sha:
         raise MirrorSyncError(
-            "sync branch worktree HEAD does not match the exact history head"
+            "sync branch worktree HEAD does not match the exact bound worktree head"
         )
-    for label, value in (("base", base_sha), ("head", head_sha)):
+    for label, value in (
+        ("base", base_sha),
+        ("head", head_sha),
+        ("worktree head", worktree_head_sha),
+    ):
         if GIT_SHA_RE.fullmatch(value) is None:
             raise MirrorSyncError(
                 f"sync branch {label} must be one exact lowercase SHA-1"
@@ -7314,9 +7964,10 @@ def _validate_sync_branch_history_bound(
     digest = hashlib.sha256()
     _sync_history_digest_record(
         digest,
-        b"sync-history-v1",
+        b"sync-history-v2",
         base_sha.encode("ascii"),
         head_sha.encode("ascii"),
+        worktree_head_sha.encode("ascii"),
         merge_base_sha.encode("ascii"),
         allowed_paths_sha256,
     )
@@ -7374,9 +8025,10 @@ def _validate_sync_branch_history_bound(
         initial_index,
     )
     return {
-        "schema_version": 1,
+        "schema_version": SYNC_HISTORY_RECEIPT_VERSION,
         "base_sha": base_sha,
         "head_sha": head_sha,
+        "worktree_head_sha": worktree_head_sha,
         "merge_base_sha": merge_base_sha,
         "commit_count": len(topology),
         "parent_edge_count": parent_edges,
@@ -7398,6 +8050,7 @@ def validate_sync_branch_history(
     *,
     limits: SyncHistoryLimits | None = None,
     require_fresh_head: bool = False,
+    worktree_head_ref: str | None = None,
 ) -> dict[str, object]:
     selected_limits = limits or SyncHistoryLimits()
     allowed_paths, allowed_paths_sha256 = _read_sync_history_allowed_paths(
@@ -7409,10 +8062,12 @@ def validate_sync_branch_history(
     try:
         _ensure_git_control_binding(target)
         initial_head = _current_commit(target)
+        selected_worktree_head = worktree_head_ref or head_sha
         receipt = _validate_sync_branch_history_bound(
             target,
             base_sha,
             head_sha,
+            selected_worktree_head,
             allowed_paths,
             allowed_paths_sha256,
             limits=selected_limits,
@@ -9124,49 +9779,14 @@ def _receipt_file_records(
     return records
 
 
-def _target_head_index_file(
-    target_root: BoundRoot,
-    path: PurePosixPath,
-    head_commit: str,
-) -> tuple[bytes, int] | None:
-    index_entry = _git_index_entry(target_root, path)
-    head_entry = _git_tree_entry(target_root, head_commit, path)
-    if head_entry != index_entry:
-        raise MirrorSyncError(f"target managed index differs from HEAD: {path}")
-    if index_entry is None:
-        return None
-    return (
-        _git_blob_payload(target_root, index_entry.object_id, path),
-        index_entry.mode,
-    )
-
-
-def _prior_receipt_file_records(
+def _validated_prior_receipt_file_records(
     repository_root: BoundRoot,
-    target_root: BoundRoot,
     source_lock: SourceLock,
     mirror: MirrorSpec,
     source_commit: str,
-    *,
-    require_clean_worktree: bool,
+    receipt_payload: bytes,
+    receipt_mode: int,
 ) -> dict[PurePosixPath, dict[str, object]]:
-    head_commit = _current_commit(target_root)
-    if require_clean_worktree:
-        snapshot = _target_clean_snapshot(
-            target_root,
-            RECEIPT_PATH,
-            head_commit,
-        )
-        receipt_file = None if snapshot is None else (snapshot.payload, snapshot.mode)
-    else:
-        receipt_file = _target_head_index_file(
-            target_root,
-            RECEIPT_PATH,
-            head_commit,
-        )
-    if receipt_file is None:
-        return {}
-    receipt_payload, receipt_mode = receipt_file
     if receipt_mode != 0o644:
         raise MirrorSyncError(
             f"prior provenance receipt mode must be 0644, not {receipt_mode:04o}"
@@ -9222,6 +9842,59 @@ def _prior_receipt_file_records(
             "canonical source lock"
         )
     return _receipt_file_records(receipt)
+
+
+def _target_head_index_file(
+    target_root: BoundRoot,
+    path: PurePosixPath,
+    head_commit: str,
+) -> tuple[bytes, int] | None:
+    index_entry = _git_index_entry(target_root, path)
+    head_entry = _git_tree_entry(target_root, head_commit, path)
+    if head_entry != index_entry:
+        raise MirrorSyncError(f"target managed index differs from HEAD: {path}")
+    if index_entry is None:
+        return None
+    return (
+        _git_blob_payload(target_root, index_entry.object_id, path),
+        index_entry.mode,
+    )
+
+
+def _prior_receipt_file_records(
+    repository_root: BoundRoot,
+    target_root: BoundRoot,
+    source_lock: SourceLock,
+    mirror: MirrorSpec,
+    source_commit: str,
+    *,
+    require_clean_worktree: bool,
+) -> dict[PurePosixPath, dict[str, object]]:
+    head_commit = _current_commit(target_root)
+    if require_clean_worktree:
+        snapshot = _target_clean_snapshot(
+            target_root,
+            RECEIPT_PATH,
+            head_commit,
+        )
+        receipt_file = None if snapshot is None else (snapshot.payload, snapshot.mode)
+    else:
+        receipt_file = _target_head_index_file(
+            target_root,
+            RECEIPT_PATH,
+            head_commit,
+        )
+    if receipt_file is None:
+        return {}
+    receipt_payload, receipt_mode = receipt_file
+    return _validated_prior_receipt_file_records(
+        repository_root,
+        source_lock,
+        mirror,
+        source_commit,
+        receipt_payload,
+        receipt_mode,
+    )
 
 
 def _require_receipt_file_parity(
@@ -9386,10 +10059,183 @@ def check_mirror(
         _finish_bound_roots(canonical, target)
 
 
+def _require_exact_commit(
+    repository_root: BoundRoot,
+    commit_sha: str,
+    label: str,
+) -> None:
+    if GIT_SHA_RE.fullmatch(commit_sha) is None:
+        raise MirrorSyncError(f"{label} must be one exact lowercase SHA-1")
+    resolved = _run_git(
+        repository_root,
+        "rev-parse",
+        "--verify",
+        f"{commit_sha}^{{commit}}",
+    )
+    if resolved != commit_sha.encode("ascii") + b"\n":
+        raise MirrorSyncError(f"{label} does not resolve to its exact commit")
+
+
+def _target_commit_tree_entries(
+    target_root: BoundRoot,
+    target_commit: str,
+) -> tuple[bytes, dict[bytes, tuple[bytes, bytes]]]:
+    _require_exact_commit(target_root, target_commit, "target commit")
+    raw_tree = _run_git(
+        target_root,
+        "ls-tree",
+        "--full-tree",
+        "-r",
+        "-z",
+        target_commit,
+    )
+    return raw_tree, _parse_consumer_tracked_entries(
+        target_root,
+        raw_tree,
+        source="target commit",
+    )
+
+
+def _target_commit_prior_receipt_file_records(
+    repository_root: BoundRoot,
+    target_root: BoundRoot,
+    source_lock: SourceLock,
+    mirror: MirrorSpec,
+    source_commit: str,
+    tree_entries: dict[bytes, tuple[bytes, bytes]],
+) -> dict[PurePosixPath, dict[str, object]]:
+    receipt_key = RECEIPT_PATH.as_posix().encode("utf-8")
+    receipt_entry = tree_entries.get(receipt_key)
+    if receipt_entry is None:
+        return {}
+    receipt_mode, raw_receipt_object = receipt_entry
+    if receipt_mode != b"100644":
+        raise MirrorSyncError(
+            "prior provenance receipt in the target commit must have mode 100644"
+        )
+    receipt_object = raw_receipt_object.decode("ascii", errors="strict")
+    receipt_payload = _git_blob_payload(
+        target_root,
+        receipt_object,
+        RECEIPT_PATH,
+    )
+    records = _validated_prior_receipt_file_records(
+        repository_root,
+        source_lock,
+        mirror,
+        source_commit,
+        receipt_payload,
+        0o644,
+    )
+    for path, record in sorted(
+        records.items(),
+        key=lambda item: item[0].as_posix(),
+    ):
+        raw_path = path.as_posix().encode("utf-8")
+        tree_entry = tree_entries.get(raw_path)
+        if tree_entry is None:
+            raise MirrorSyncError(
+                f"prior receipt managed path is missing from target commit: {path}"
+            )
+        raw_mode, raw_object = tree_entry
+        expected_mode = b"100755" if record["mode"] == 0o755 else b"100644"
+        if raw_mode != expected_mode:
+            raise MirrorSyncError(
+                f"prior receipt managed path mode differs in target commit: {path}"
+            )
+        object_id = raw_object.decode("ascii", errors="strict")
+        payload = _git_blob_payload(
+            target_root,
+            object_id,
+            path,
+        )
+        if hashlib.sha256(payload).hexdigest() != record["sha256"]:
+            raise MirrorSyncError(
+                f"prior receipt managed path digest differs in target commit: {path}"
+            )
+    return records
+
+
+def _managed_mirror_paths_at_target_commit(
+    repository_root: BoundRoot,
+    target_root: BoundRoot,
+    source_lock: SourceLock,
+    mirror: MirrorSpec,
+    source_commit: str,
+    target_commit: str,
+) -> list[PurePosixPath]:
+    initial_index = _target_index_snapshot(target_root, mirror)
+    raw_tree, tree_entries = _target_commit_tree_entries(
+        target_root,
+        target_commit,
+    )
+    receipt_records = _target_commit_prior_receipt_file_records(
+        repository_root,
+        target_root,
+        source_lock,
+        mirror,
+        source_commit,
+        tree_entries,
+    )
+    additional_paths = set(receipt_records)
+    managed_targets = set(mirror.files.values()) | additional_paths
+    _validate_target_layout(
+        sorted(managed_targets, key=PurePosixPath.as_posix),
+        mirror.name,
+    )
+    try:
+        tracked_paths = {
+            _validate_relative_path(
+                raw_path.decode("utf-8", errors="strict"),
+                "consumer target commit tracked path",
+            )
+            for raw_path in tree_entries
+        }
+    except UnicodeDecodeError as error:
+        raise MirrorSyncError(
+            "consumer target commit tracked path is not valid UTF-8"
+        ) from error
+    tracked_symlink_paths = {
+        _validate_relative_path(
+            raw_path.decode("utf-8", errors="strict"),
+            "consumer target commit tracked symlink path",
+        )
+        for raw_path, (raw_mode, _raw_object) in tree_entries.items()
+        if raw_mode == b"120000"
+    }
+    _validate_consumer_portable_layout(
+        {RECEIPT_PATH, *managed_targets},
+        tracked_paths,
+        tracked_symlink_paths,
+        mirror.name,
+    )
+    _reject_git_control_targets(
+        target_root,
+        mirror,
+        additional_paths,
+    )
+    _require_same_target_index(
+        target_root,
+        mirror,
+        initial_index,
+        additional_paths,
+    )
+    final_raw_tree, _final_tree_entries = _target_commit_tree_entries(
+        target_root,
+        target_commit,
+    )
+    if final_raw_tree != raw_tree:
+        raise MirrorSyncError(
+            "target commit tree changed during object-only managed-path validation"
+        )
+    return _mirror_managed_paths(mirror, additional_paths)
+
+
 def managed_mirror_paths(
     repository_root: Path,
     target_root: Path,
     mirror_name: str,
+    target_commit: str | None = None,
 ) -> list[PurePosixPath]:
     operation = _new_operation_budget()
     _reject_canonical_target(repository_root, target_root)
@@ -9417,6 +10263,15 @@ def managed_mirror_paths(
             source_lock,
         )
         _verify_target_repository(target, mirror.repository)
+        if target_commit is not None:
+            return _managed_mirror_paths_at_target_commit(
+                canonical,
+                target,
+                source_lock,
+                mirror,
+                source_commit,
+                target_commit,
+            )
         receipt_records = _prior_receipt_file_records(
             canonical,
             target,
@@ -10114,6 +10969,14 @@ def build_parser() -> argparse.ArgumentParser:
                     "sources will be generated"
                 ),
             )
+        elif command == "managed-paths":
+            subparser.add_argument(
+                "--target-commit",
+                help=(
+                    "Read and validate managed paths from this exact committed "
+                    "target tree without checking it out"
+                ),
+            )
     refresh_parser = subparsers.add_parser(
         "refresh-lock",
         help="Refresh canonical source hashes without reading any consumer",
@@ -10145,6 +11008,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--head-ref",
         required=True,
         help="Exact lowercase SHA-1 generated-branch head commit",
+    )
+    history_parser.add_argument(
+        "--worktree-head-ref",
+        help=(
+            "Exact lowercase SHA-1 that the unchanged worktree HEAD/index must "
+            "match; defaults to --head-ref"
+        ),
     )
     history_parser.add_argument(
         "--allowed-paths-file",
@@ -10216,6 +11086,7 @@ def _run(args: argparse.Namespace) -> int:
             REPOSITORY_ROOT,
             args.target_root,
             args.mirror,
+            args.target_commit,
         )
         sys.stdout.buffer.write(
             _canonical_json(
@@ -10243,6 +11114,7 @@ def _run(args: argparse.Namespace) -> int:
             args.allowed_paths_file,
             limits=_sync_history_limits_from_args(args),
             require_fresh_head=args.require_fresh_head,
+            worktree_head_ref=args.worktree_head_ref,
         )
         sys.stdout.buffer.write(_canonical_json(receipt, pretty=True))
     else:

@@ -902,12 +902,26 @@ jobs:
             prepare,
         )
         self.assertNotIn(
+            '--track "origin/${SYNC_BRANCH}"',
+            prepare,
+        )
+        self.assertIn('--target-commit "${target_commit}"', prepare)
+        self.assertIn('--worktree-head-ref "${target_base_sha}"', prepare)
+        self.assertIn("unset CODEX_TOOLBOX_SYNC_TOKEN", prepare)
+        self.assertLess(
+            prepare.index("unset CODEX_TOOLBOX_SYNC_TOKEN"),
+            prepare.index(
+                'require_managed_paths \\\n    "The existing generated branch"'
+            ),
+        )
+        self.assertNotIn(
             'git -C "${TARGET_ROOT}" merge --no-edit',
             prepare,
         )
         history = self._step_run("Validate fresh generated branch history")
         self.assertIn("validate-branch-history", history)
         self.assertIn("--require-fresh-head", history)
+        self.assertIn('--worktree-head-ref "${GENERATED_HEAD_SHA}"', history)
         self.assertIn(".merge_base_sha == $base", history)
         push = self._step_run("Push scoped sync branch")
         self.assertNotIn("awk ", push)
@@ -1867,9 +1881,10 @@ jobs:
                 "import sys\n"
                 "if 'validate-branch-history' in sys.argv:\n"
                 "    print(json.dumps({\n"
-                "        'schema_version': 1,\n"
+                "        'schema_version': 2,\n"
                 "        'base_sha': os.environ['BASE_SHA'],\n"
                 "        'head_sha': os.environ['FETCHED_BRANCH_SHA'],\n"
+                "        'worktree_head_sha': os.environ['BASE_SHA'],\n"
                 "        'profile': 'branch-exclusive',\n"
                 "        'history_sha256': 'd' * 64,\n"
                 "    }))\n"
@@ -2313,6 +2328,90 @@ jobs:
                     "sync-fixture@example.invalid",
                 )
                 run_git(destination, "config", "commit.gpgsign", "false")
+
+            malicious_attributes = seed_root / ".gitattributes"
+            malicious_attributes.write_text(
+                "mirror/** filter=sentinel\n",
+                encoding="utf-8",
+            )
+            malicious_branch_sha = commit_all(
+                seed_root,
+                "add untrusted checkout filter attributes",
+            )
+            run_git(
+                seed_root,
+                "push",
+                (
+                    "--force-with-lease=refs/heads/"
+                    "automation/canonical-personal-sync:"
+                    f"{second_branch_sha}"
+                ),
+                str(remote_root),
+                "HEAD:refs/heads/automation/canonical-personal-sync",
+            )
+            malicious_runner = root / "malicious-runner"
+            clone_master(malicious_runner)
+            smudge_marker = root / "smudge-filter-ran"
+            smudge_helper = root / "smudge-filter"
+            smudge_helper.write_text(
+                "#!/bin/sh\n"
+                f"printf invoked > {shlex.quote(smudge_marker.as_posix())}\n"
+                "cat\n",
+                encoding="utf-8",
+            )
+            smudge_helper.chmod(0o755)
+            run_git(
+                malicious_runner,
+                "config",
+                "filter.sentinel.smudge",
+                smudge_helper.as_posix(),
+            )
+            run_git(
+                malicious_runner,
+                "config",
+                "filter.sentinel.required",
+                "true",
+            )
+            malicious_head_before = run_git(
+                malicious_runner,
+                "rev-parse",
+                "HEAD",
+            )
+            malicious_index_before = run_git(
+                malicious_runner,
+                "ls-files",
+                "--stage",
+                "-z",
+            )
+            rejected_prepare = run_prepare(
+                malicious_runner,
+                root / "malicious-temp",
+                expect_success=False,
+            )
+            self.assertIn(
+                "Out-of-scope toolbox branch",
+                rejected_prepare.stdout + rejected_prepare.stderr,
+            )
+            self.assertFalse(smudge_marker.exists())
+            self.assertEqual(
+                run_git(malicious_runner, "rev-parse", "HEAD"),
+                malicious_head_before,
+            )
+            self.assertEqual(
+                run_git(malicious_runner, "ls-files", "--stage", "-z"),
+                malicious_index_before,
+            )
+            run_git(
+                seed_root,
+                "push",
+                (
+                    "--force-with-lease=refs/heads/"
+                    "automation/canonical-personal-sync:"
+                    f"{malicious_branch_sha}"
+                ),
+                str(remote_root),
+                (f"{second_branch_sha}:refs/heads/automation/canonical-personal-sync"),
+            )
 
             write_lock("mirror/three.py")
             third_canonical = commit_all(
@@ -3025,6 +3124,44 @@ class SyncBranchHistoryValidationTests(unittest.TestCase):
                     expected,
                     rejected.stdout + rejected.stderr,
                 )
+
+    def test_object_range_can_be_validated_from_an_unchanged_base_worktree(
+        self,
+    ) -> None:
+        self._write("generated.txt", "generated\n")
+        head_sha = self._commit("generated branch commit")
+        self._git("switch", "--detach", "-q", self.base_sha)
+        index_before = self._git("ls-files", "--stage", "-z")
+
+        accepted = self._validate(
+            self.base_sha,
+            head_sha,
+            ["generated.txt", "seed.txt"],
+            "--worktree-head-ref",
+            self.base_sha,
+        )
+
+        self.assertEqual(
+            accepted.returncode,
+            0,
+            accepted.stdout + accepted.stderr,
+        )
+        receipt = json.loads(accepted.stdout)
+        self.assertEqual(receipt["schema_version"], 2)
+        self.assertEqual(receipt["worktree_head_sha"], self.base_sha)
+        self.assertEqual(self._git("rev-parse", "HEAD"), self.base_sha)
+        self.assertEqual(self._git("ls-files", "--stage", "-z"), index_before)
+
+        rejected = self._validate(
+            self.base_sha,
+            head_sha,
+            ["generated.txt", "seed.txt"],
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn(
+            "does not match the exact bound worktree head",
+            rejected.stdout + rejected.stderr,
+        )
 
     def test_rejects_private_key_headers_across_transient_history_shapes(
         self,

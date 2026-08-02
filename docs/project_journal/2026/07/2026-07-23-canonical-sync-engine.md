@@ -924,6 +924,65 @@ superseded_by:
   Dual-runtime compileall, Ruff lint/format, actionlint, JSON parsing,
   project-journal validation, source-lock verification, and `git diff --check`
   passed; no repository bytecode cache remains.
+- The fresh named-single review of signed head `bdbd9dc` found two remaining
+  process/control-plane gaps. Repository-local `fsck.*` settings could weaken
+  or externalize the private snapshot's `git fsck --strict` result, and a Git
+  or xcrun leader could exit while a same-session descendant survived the
+  stated deadline. Independent review also proved that `url.*.insteadOf` and
+  `url.*.pushInsteadOf` made origin/push identity ambiguous, and that the
+  token-bearing toolbox prepare step checked out an unvalidated remote branch
+  before its scope/history admission. The prior head's hosted CI and review
+  gate passed, but all head-bound admission/review evidence became stale when
+  this follow-up began.
+- The follow-up rejects every case-folded repository-local `fsck.*`,
+  `url.*.insteadOf`, and `url.*.pushInsteadOf` key from both private `config`
+  and `config.worktree` snapshots before any object query or credential-bearing
+  push. Bounded Git/xcrun supervision now treats leader reaping, a bound
+  process-group `SIGKILL` fence, and independent closure of both parent pipe
+  handles as separate terminal properties. Every numeric PGID operation occurs
+  while the observed leader is still unreaped; the final `wait` is followed by
+  no PID/PGID signal or probe that could hit a reused identity. Darwin `EPERM`
+  is not treated as a general absence proof: it is accepted only after
+  waitid/kqueue observed leader exit and only for the closed xcrun/private-Git
+  profiles, which bind a fixed executable/argv family, closed environment,
+  same real/effective credentials, no credential-transition Popen options,
+  and no repository-selected hooks, filters, aliases, or helpers. The owner is
+  published before `Popen.__init__`, parent-only deferred handlers keep
+  SIGINT/SIGTERM/SIGHUP from interrupting handoff without blocking them in the
+  child, and one owner-held absolute deadline covers every cleanup layer.
+  Selector allocation/registration and every pre-caller `Popen` failure remain
+  inside that cleanup ownership boundary. Signal-handler install/restore paths
+  best-effort roll back both exact handlers and the prior thread mask while
+  preserving the original failure as the explicit cause.
+- Toolbox preparation now validates an existing remote branch by exact commit
+  objects while the worktree remains detached at the trusted base. The
+  version-2 branch-history receipt separately binds `base_sha`, `head_sha`, and
+  `worktree_head_sha`; the credential is unset after the final fetch and before
+  target-tree inspection. A real integration fixture proved that an untrusted
+  `.gitattributes` plus configured smudge sentinel is rejected as out of scope
+  without running the filter or changing HEAD/index, while consecutive
+  unmerged rename/removal recovery still succeeds. Fetching the exact object/ref
+  remains the necessary pre-admission mutation; no untrusted tree is checked
+  out.
+- The completed follow-up source-lock suite ran 183 tests under both Python
+  3.13.0 and system Python 3.9.6, ending `OK` in 654.150 and 688.654 seconds;
+  the Python 3.13 run had the expected no-`waitid` skip. The toolbox automation
+  suite ran all 28 tests under both runtimes and ended `OK` in 201.606 and
+  201.894 seconds. A final source-lock refresh retained the six-source lock
+  byte-for-byte, and both runtimes independently passed `refresh-lock --check`.
+  The unchanged lock SHA-256 is
+  `a9bda725d8031c5ffe103d55edf5bc45015a78ac22703558a38907ab875dc960`;
+  final SHA-256 values are
+  `828dcc4e3a73cdb93a58ff227b8c0298106100f4433dc1c55b11fa10884a12c3`
+  for the generated-mirror controller,
+  `50cc8c4d82326b342b50a5a3971211bb1b6d9355a1186e38a2230044de3381d7`
+  for its source-lock tests,
+  `e2c4e223de460050e019cbc922a9d41f010b1a54f21f6b810cb600b9f78ccd9f`
+  for toolbox automation tests, and
+  `2da352cce0245117c9be992486a521c66b91929776d0a606629522c1c33a38bb`
+  for the workflow. Dual-runtime compileall, Ruff lint/format, actionlint,
+  JSON parsing, project-journal validation, source-lock verification, and
+  `git diff --check` passed before this evidence-only journal update.
 
 ## Installed Host Baseline
 

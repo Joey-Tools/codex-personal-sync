@@ -8,7 +8,9 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import selectors
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -878,6 +880,100 @@ class MirrorGeneratorTests(unittest.TestCase):
                 "toolbox",
             ),
             1,
+        )
+
+    def test_managed_paths_reads_target_commit_without_checkout(self) -> None:
+        base_sha = (
+            self._git(self.target_root, "rev-parse", "HEAD").decode("ascii").strip()
+        )
+        self._generate()
+        generated_sha = self._commit(self.target_root, "generated target commit")
+        (self.target_root / ".gitattributes").write_text(
+            "scripts/engine.py filter=sentinel\n",
+            encoding="utf-8",
+        )
+        target_commit = self._commit(
+            self.target_root,
+            "untrusted target attributes",
+        )
+        self._git(self.target_root, "switch", "--detach", "-q", base_sha)
+        marker = self.root / "smudge-filter-ran"
+        self._git(
+            self.target_root,
+            "config",
+            "filter.sentinel.smudge",
+            f"touch {marker}",
+        )
+        self._git(
+            self.target_root,
+            "config",
+            "filter.sentinel.required",
+            "true",
+        )
+        head_before = self._git(self.target_root, "rev-parse", "HEAD")
+        index_before = self._git(
+            self.target_root,
+            "ls-files",
+            "--stage",
+            "-z",
+        )
+
+        paths = MIRROR_MODULE.managed_mirror_paths(
+            self.canonical_root,
+            self.target_root,
+            "toolbox",
+            target_commit=target_commit,
+        )
+
+        self.assertEqual(
+            [path.as_posix() for path in paths],
+            ["generated-sync-source-lock.json", "scripts/engine.py"],
+        )
+        self.assertFalse(marker.exists())
+        self.assertEqual(self._git(self.target_root, "rev-parse", "HEAD"), head_before)
+        self.assertEqual(
+            self._git(self.target_root, "ls-files", "--stage", "-z"),
+            index_before,
+        )
+        self.assertEqual(
+            self._git(self.target_root, "rev-parse", f"{generated_sha}^{{commit}}"),
+            generated_sha.encode("ascii") + b"\n",
+        )
+
+    def test_managed_paths_target_commit_rejects_receipt_blob_drift(self) -> None:
+        base_sha = (
+            self._git(self.target_root, "rev-parse", "HEAD").decode("ascii").strip()
+        )
+        self._generate()
+        self._commit(self.target_root, "generated target commit")
+        (self.target_root / "scripts" / "engine.py").write_bytes(
+            b"tampered target commit payload\n"
+        )
+        tampered_sha = self._commit(self.target_root, "tamper generated payload")
+        self._git(self.target_root, "switch", "--detach", "-q", base_sha)
+        head_before = self._git(self.target_root, "rev-parse", "HEAD")
+        index_before = self._git(
+            self.target_root,
+            "ls-files",
+            "--stage",
+            "-z",
+        )
+
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "managed path digest differs in target commit",
+        ):
+            MIRROR_MODULE.managed_mirror_paths(
+                self.canonical_root,
+                self.target_root,
+                "toolbox",
+                target_commit=tampered_sha,
+            )
+
+        self.assertEqual(self._git(self.target_root, "rev-parse", "HEAD"), head_before)
+        self.assertEqual(
+            self._git(self.target_root, "ls-files", "--stage", "-z"),
+            index_before,
         )
 
     def test_generate_conditionally_retires_a_removed_receipt_target(self) -> None:
@@ -2530,6 +2626,93 @@ class MirrorGeneratorTests(unittest.TestCase):
                         key,
                     )
 
+    def test_static_git_profile_rejects_fsck_and_url_rewrite_config(
+        self,
+    ) -> None:
+        cases = (
+            ("fsck.missingObject", "ignore", "fsck configuration"),
+            (
+                "fsck.skipList",
+                (self.root / "external-skip-list").as_posix(),
+                "fsck configuration",
+            ),
+            (
+                "url.https://attacker.invalid/.insteadOf",
+                "https://github.com/Joey-Tools/",
+                "URL rewriting",
+            ),
+            (
+                "url.ssh://helper@attacker.invalid/.pushInsteadOf",
+                "https://github.com/Joey-Tools/",
+                "URL rewriting",
+            ),
+        )
+        for key, value, expected in cases:
+            with self.subTest(key=key):
+                self._git(self.canonical_root, "config", key, value)
+                try:
+                    with (
+                        mock.patch.object(
+                            MIRROR_MODULE,
+                            "_run_git_process",
+                        ) as run_git_process,
+                        self.assertRaisesRegex(
+                            MIRROR_MODULE.MirrorSyncError,
+                            expected,
+                        ),
+                    ):
+                        self._generate()
+                    run_git_process.assert_not_called()
+                finally:
+                    self._git(
+                        self.canonical_root,
+                        "config",
+                        "--unset-all",
+                        key,
+                    )
+
+        self._git(
+            self.canonical_root,
+            "config",
+            "extensions.worktreeConfig",
+            "true",
+        )
+        worktree_key = "URL.https://attacker.invalid/.pushInsteadOf"
+        self._git(
+            self.canonical_root,
+            "config",
+            "--worktree",
+            worktree_key,
+            "https://github.com/Joey-Tools/",
+        )
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_run_git_process",
+                ) as run_git_process,
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "URL rewriting",
+                ),
+            ):
+                self._generate()
+            run_git_process.assert_not_called()
+        finally:
+            self._git(
+                self.canonical_root,
+                "config",
+                "--worktree",
+                "--unset-all",
+                worktree_key,
+            )
+            self._git(
+                self.canonical_root,
+                "config",
+                "--unset-all",
+                "extensions.worktreeConfig",
+            )
+
     def test_static_git_profile_rejects_promisor_and_alternate_markers(
         self,
     ) -> None:
@@ -3277,6 +3460,7 @@ class MirrorGeneratorTests(unittest.TestCase):
             ):
                 process = MIRROR_MODULE._popen_from_bound_directory(
                     ["/bin/pwd"],
+                    owner=MIRROR_MODULE._ProcessOwner(),
                     directory_fd=binding.fd,
                     directory_identity=binding.identity,
                     directory_access_policy=binding.access_policy,
@@ -3374,6 +3558,7 @@ class MirrorGeneratorTests(unittest.TestCase):
                             "time.sleep(30)"
                         ),
                     ],
+                    owner=MIRROR_MODULE._ProcessOwner(),
                     directory_fd=binding.fd,
                     directory_identity=binding.identity,
                     directory_access_policy=binding.access_policy,
@@ -3400,6 +3585,186 @@ class MirrorGeneratorTests(unittest.TestCase):
         finally:
             os.close(binding.fd)
 
+    def test_bound_directory_launch_cleans_unhanded_process_group(
+        self,
+    ) -> None:
+        launch_directory = self.root / "post-launch-revalidation-directory"
+        launch_directory.mkdir(mode=0o700)
+        directory_binding = MIRROR_MODULE._bind_absolute_control_object(
+            launch_directory,
+            "post-launch revalidation directory",
+            require_directory=True,
+        )
+        executable_binding = MIRROR_MODULE._bind_absolute_control_object(
+            Path(os.path.realpath(sys.executable)),
+            "post-launch executable",
+            require_directory=False,
+        )
+        control_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        real_revalidate = MIRROR_MODULE._revalidate_control_object
+        real_popen = subprocess.Popen
+        validation_count = 0
+        launched: subprocess.Popen[bytes] | None = None
+
+        def fail_post_launch_revalidation(root, binding):
+            nonlocal validation_count
+            if binding is executable_binding:
+                validation_count += 1
+                if validation_count == 2:
+                    raise MIRROR_MODULE.MirrorSyncError(
+                        "simulated post-launch executable drift"
+                    )
+            return real_revalidate(root, binding)
+
+        def capture_process(command, **kwargs):
+            nonlocal launched
+            launched = real_popen(command, **kwargs)
+            return launched
+
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_revalidate_control_object",
+                    side_effect=fail_post_launch_revalidation,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE.subprocess,
+                    "Popen",
+                    side_effect=capture_process,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "simulated post-launch executable drift",
+                ),
+            ):
+                MIRROR_MODULE._popen_from_bound_directory(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os,time;"
+                            "child=os.fork();"
+                            "time.sleep(5) if child == 0 else time.sleep(5)"
+                        ),
+                    ],
+                    owner=MIRROR_MODULE._ProcessOwner(),
+                    directory_fd=directory_binding.fd,
+                    directory_identity=directory_binding.identity,
+                    directory_access_policy=directory_binding.access_policy,
+                    directory_label=directory_binding.label,
+                    control_root=control_root,
+                    executable_binding=executable_binding,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+
+            self.assertIsNotNone(launched)
+            assert launched is not None
+            with self.assertRaises((ProcessLookupError, PermissionError)):
+                os.killpg(launched.pid, 0)
+            self.assertIsNotNone(launched.poll())
+            assert launched.stdout is not None
+            assert launched.stderr is not None
+            self.assertTrue(launched.stdout.closed)
+            self.assertTrue(launched.stderr.closed)
+        finally:
+            if launched is not None:
+                try:
+                    os.killpg(launched.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                launched.wait(timeout=5)
+                if launched.stdout is not None:
+                    launched.stdout.close()
+                if launched.stderr is not None:
+                    launched.stderr.close()
+            os.close(executable_binding.fd)
+            os.close(directory_binding.fd)
+            MIRROR_MODULE._finish_bound_roots(control_root)
+
+    def test_bound_directory_launch_cleanup_shares_one_deadline(self) -> None:
+        launch_directory = self.root / "shared-cleanup-deadline-directory"
+        launch_directory.mkdir(mode=0o700)
+        directory_binding = MIRROR_MODULE._bind_absolute_control_object(
+            launch_directory,
+            "shared cleanup deadline directory",
+            require_directory=True,
+        )
+        executable_binding = MIRROR_MODULE._bind_absolute_control_object(
+            Path(os.path.realpath(sys.executable)),
+            "shared cleanup deadline executable",
+            require_directory=False,
+        )
+        control_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        launched = mock.Mock()
+        validation_count = 0
+
+        def fail_post_launch_revalidation(root, binding):
+            nonlocal validation_count
+            if binding is executable_binding:
+                validation_count += 1
+                if validation_count == 2:
+                    raise MIRROR_MODULE.MirrorSyncError(
+                        "simulated shared-deadline post-launch drift"
+                    )
+
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_revalidate_control_object",
+                    side_effect=fail_post_launch_revalidation,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE.subprocess,
+                    "Popen",
+                    return_value=launched,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_terminate_git_process",
+                ) as terminate,
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_drain_and_close_git_process_output",
+                ) as drain,
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "simulated shared-deadline post-launch drift",
+                ),
+            ):
+                MIRROR_MODULE._popen_from_bound_directory(
+                    [sys.executable, "-c", "pass"],
+                    owner=MIRROR_MODULE._ProcessOwner(),
+                    directory_fd=directory_binding.fd,
+                    directory_identity=directory_binding.identity,
+                    directory_access_policy=directory_binding.access_policy,
+                    directory_label=directory_binding.label,
+                    control_root=control_root,
+                    executable_binding=executable_binding,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+
+            terminate.assert_called_once_with(
+                launched,
+                deadline=terminate.call_args.kwargs["deadline"],
+                trusted_exec_profile=None,
+            )
+            drain.assert_called_once_with(
+                launched,
+                deadline=terminate.call_args.kwargs["deadline"],
+            )
+        finally:
+            os.close(executable_binding.fd)
+            os.close(directory_binding.fd)
+            MIRROR_MODULE._finish_bound_roots(control_root)
+
     def test_bound_directory_launch_rejects_access_policy_change(self) -> None:
         launch_directory = self.root / "launch-directory"
         launch_directory.mkdir(mode=0o700)
@@ -3416,6 +3781,7 @@ class MirrorGeneratorTests(unittest.TestCase):
             ):
                 MIRROR_MODULE._popen_from_bound_directory(
                     [MIRROR_MODULE.GIT_EXECUTABLE.as_posix(), "--version"],
+                    owner=MIRROR_MODULE._ProcessOwner(),
                     directory_fd=binding.fd,
                     directory_identity=binding.identity,
                     directory_access_policy=binding.access_policy,
@@ -3628,7 +3994,11 @@ class MirrorGeneratorTests(unittest.TestCase):
 
     def test_git_output_collector_enforces_limits_and_reaps(self) -> None:
         output_process = subprocess.Popen(
-            ["/usr/bin/printf", "123456789"],
+            [
+                sys.executable,
+                "-c",
+                "import os,time;os.write(1,b'123456789');time.sleep(30)",
+            ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -3645,7 +4015,10 @@ class MirrorGeneratorTests(unittest.TestCase):
                 "stdout exceeds",
             ),
         ):
-            MIRROR_MODULE._collect_bounded_git_output(output_process)
+            MIRROR_MODULE._collect_bounded_git_output(
+                output_process,
+                owner=MIRROR_MODULE._ProcessOwner(process=output_process),
+            )
         self.assertIsNotNone(output_process.poll())
 
         timeout_process = subprocess.Popen(
@@ -3666,8 +4039,920 @@ class MirrorGeneratorTests(unittest.TestCase):
                 "exceeded",
             ),
         ):
-            MIRROR_MODULE._collect_bounded_git_output(timeout_process)
+            MIRROR_MODULE._collect_bounded_git_output(
+                timeout_process,
+                owner=MIRROR_MODULE._ProcessOwner(process=timeout_process),
+            )
         self.assertIsNotNone(timeout_process.poll())
+
+    def test_git_output_collector_terminates_leader_first_exit_groups(self) -> None:
+        programs = (
+            (
+                "inherited-pipe-timeout",
+                (
+                    "import os,time;"
+                    "child=os.fork();"
+                    "time.sleep(5) if child == 0 else os._exit(0)"
+                ),
+                "exceeded",
+                0.05,
+                True,
+            ),
+            (
+                "closed-pipe-residual-group",
+                (
+                    "import os,time;"
+                    "child=os.fork();"
+                    "(os.close(1),os.close(2),time.sleep(5)) "
+                    "if child == 0 else os._exit(0)"
+                ),
+                None,
+                2.0,
+                False,
+            ),
+        )
+        for name, program, expected, timeout_seconds, should_fail in programs:
+            with self.subTest(name=name):
+                process = subprocess.Popen(
+                    [sys.executable, "-c", program],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+                try:
+                    if should_fail:
+                        assert expected is not None
+                        with self.assertRaisesRegex(
+                            MIRROR_MODULE.MirrorSyncError,
+                            expected,
+                        ):
+                            MIRROR_MODULE._collect_bounded_process_output(
+                                process,
+                                None,
+                                stdout_limit=1024,
+                                stderr_limit=1024,
+                                timeout_seconds=timeout_seconds,
+                                label="leader-first-exit fixture",
+                            )
+                    else:
+                        result = MIRROR_MODULE._collect_bounded_process_output(
+                            process,
+                            None,
+                            stdout_limit=1024,
+                            stderr_limit=1024,
+                            timeout_seconds=timeout_seconds,
+                            label="leader-first-exit fixture",
+                        )
+                        self.assertEqual(result, (0, b"", b""))
+                    with self.assertRaises((ProcessLookupError, PermissionError)):
+                        os.killpg(process.pid, 0)
+                    self.assertIsNotNone(process.poll())
+                    assert process.stdout is not None
+                    assert process.stderr is not None
+                    self.assertTrue(process.stdout.closed)
+                    self.assertTrue(process.stderr.closed)
+                finally:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    process.wait(timeout=5)
+                    if process.stdout is not None:
+                        process.stdout.close()
+                    if process.stderr is not None:
+                        process.stderr.close()
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and not hasattr(os, "waitid"),
+        "requires the Darwin Python without waitid(WNOWAIT)",
+    )
+    def test_git_output_collector_uses_darwin_kqueue_without_waitid(self) -> None:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os,time;"
+                    "child=os.fork();"
+                    "(os.close(1),os.close(2),time.sleep(5)) "
+                    "if child == 0 else os._exit(0)"
+                ),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            result = MIRROR_MODULE._collect_bounded_process_output(
+                process,
+                None,
+                stdout_limit=1024,
+                stderr_limit=1024,
+                timeout_seconds=2,
+                label="Darwin kqueue fixture",
+            )
+            self.assertEqual(result, (0, b"", b""))
+            with self.assertRaises((ProcessLookupError, PermissionError)):
+                os.killpg(process.pid, 0)
+            self.assertIsNotNone(process.poll())
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            process.wait(timeout=5)
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+
+    def test_bounded_process_defers_keyboard_interrupt_until_collection(
+        self,
+    ) -> None:
+        if not hasattr(signal, "pthread_sigmask"):
+            self.skipTest("requires pthread signal-mask support")
+        original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        if signal.SIGINT in original_mask:
+            self.skipTest("SIGINT is already blocked by the test runner")
+        launched: subprocess.Popen[bytes] | None = None
+        lifecycle: list[str] = []
+
+        def launch_then_interrupt(
+            owner: object,
+        ) -> subprocess.Popen[bytes]:
+            nonlocal launched
+            launched = MIRROR_MODULE._owned_popen(
+                owner,
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os,time;child=os.fork();"
+                        "(os.close(1),os.close(2),time.sleep(5)) "
+                        "if child == 0 else time.sleep(0.05)"
+                    ),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            lifecycle.append("launched")
+            signal.raise_signal(signal.SIGINT)
+            lifecycle.append("interrupt-pending")
+            return launched
+
+        def collect(
+            process: subprocess.Popen[bytes],
+            owner: object,
+        ) -> tuple[int, bytes, bytes]:
+            lifecycle.append("collecting")
+            result = MIRROR_MODULE._collect_bounded_process_output(
+                process,
+                None,
+                owner=owner,
+                stdout_limit=1024,
+                stderr_limit=1024,
+                timeout_seconds=2,
+                label="deferred KeyboardInterrupt fixture",
+            )
+            lifecycle.append("collected")
+            return result
+
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                MIRROR_MODULE._launch_and_collect_bounded_process(
+                    launch_then_interrupt,
+                    collect,
+                    label="deferred KeyboardInterrupt fixture",
+                )
+            self.assertEqual(
+                lifecycle,
+                ["launched", "interrupt-pending", "collecting", "collected"],
+            )
+            self.assertIsNotNone(launched)
+            assert launched is not None
+            with self.assertRaises((ProcessLookupError, PermissionError)):
+                os.killpg(launched.pid, 0)
+            self.assertIsNotNone(launched.poll())
+            assert launched.stdout is not None
+            assert launched.stderr is not None
+            self.assertTrue(launched.stdout.closed)
+            self.assertTrue(launched.stderr.closed)
+        finally:
+            if launched is not None:
+                try:
+                    os.killpg(launched.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                launched.wait(timeout=5)
+                if launched.stdout is not None:
+                    launched.stdout.close()
+                if launched.stderr is not None:
+                    launched.stderr.close()
+
+    def test_bounded_process_child_inherits_no_deferred_signal_mask(self) -> None:
+        child_mask: tuple[int, bytes, bytes] | None = None
+
+        def launch(owner: object) -> subprocess.Popen[bytes]:
+            return MIRROR_MODULE._owned_popen(
+                owner,
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os,signal,time;"
+                        "blocked=signal.pthread_sigmask(signal.SIG_BLOCK,set());"
+                        "selected=sorted(int(item) for item in blocked "
+                        "if int(item) in (1,2,15));"
+                        "print(','.join(str(item) for item in selected),flush=True);"
+                        "child=os.fork();"
+                        "(os.close(1),os.close(2),time.sleep(5)) "
+                        "if child == 0 else os._exit(0)"
+                    ),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+
+        def collect(
+            process: subprocess.Popen[bytes],
+            owner: object,
+        ) -> tuple[int, bytes, bytes]:
+            return MIRROR_MODULE._collect_bounded_process_output(
+                process,
+                None,
+                owner=owner,
+                stdout_limit=1024,
+                stderr_limit=1024,
+                timeout_seconds=2,
+                label="child signal-mask fixture",
+            )
+
+        child_mask = MIRROR_MODULE._launch_and_collect_bounded_process(
+            launch,
+            collect,
+            label="child signal-mask fixture",
+        )
+        self.assertEqual(child_mask, (0, b"\n", b""))
+
+    def test_owned_popen_cleans_post_init_base_exception(self) -> None:
+        class InjectedAfterInit(BaseException):
+            pass
+
+        real_init = MIRROR_MODULE._REAL_SUBPROCESS_POPEN.__init__
+        launched: subprocess.Popen[bytes] | None = None
+
+        def initialize_then_raise(process, *args, **kwargs):
+            nonlocal launched
+            real_init(process, *args, **kwargs)
+            launched = process
+            raise InjectedAfterInit("injected after Popen.__init__")
+
+        def launch(owner: object) -> subprocess.Popen[bytes]:
+            return MIRROR_MODULE._owned_popen(
+                owner,
+                [sys.executable, "-c", "import time;time.sleep(30)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE._REAL_SUBPROCESS_POPEN,
+                    "__init__",
+                    new=initialize_then_raise,
+                ),
+                self.assertRaisesRegex(
+                    InjectedAfterInit,
+                    "injected after Popen.__init__",
+                ),
+            ):
+                MIRROR_MODULE._launch_and_collect_bounded_process(
+                    launch,
+                    mock.Mock(),
+                    label="post-init BaseException fixture",
+                )
+            self.assertIsNotNone(launched)
+            assert launched is not None
+            with self.assertRaises((ProcessLookupError, PermissionError)):
+                os.killpg(launched.pid, 0)
+            self.assertIsNotNone(launched.returncode)
+        finally:
+            if launched is not None:
+                try:
+                    os.killpg(launched.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                launched.wait(timeout=5)
+                if launched.stdout is not None:
+                    launched.stdout.close()
+                if launched.stderr is not None:
+                    launched.stderr.close()
+
+    def test_owned_popen_cleans_launcher_post_spawn_base_exception(self) -> None:
+        class InjectedAfterSpawn(BaseException):
+            pass
+
+        launched: subprocess.Popen[bytes] | None = None
+
+        def launch(owner: object) -> subprocess.Popen[bytes]:
+            nonlocal launched
+            launched = MIRROR_MODULE._owned_popen(
+                owner,
+                [sys.executable, "-c", "import time;time.sleep(30)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            raise InjectedAfterSpawn("injected after owned spawn")
+
+        try:
+            with self.assertRaisesRegex(
+                InjectedAfterSpawn,
+                "injected after owned spawn",
+            ):
+                MIRROR_MODULE._launch_and_collect_bounded_process(
+                    launch,
+                    mock.Mock(),
+                    label="post-spawn BaseException fixture",
+                )
+            self.assertIsNotNone(launched)
+            assert launched is not None
+            with self.assertRaises((ProcessLookupError, PermissionError)):
+                os.killpg(launched.pid, 0)
+            self.assertIsNotNone(launched.returncode)
+        finally:
+            if launched is not None:
+                try:
+                    os.killpg(launched.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                launched.wait(timeout=5)
+                if launched.stdout is not None:
+                    launched.stdout.close()
+                if launched.stderr is not None:
+                    launched.stderr.close()
+
+    def test_git_output_collector_cleans_group_when_selector_setup_fails(
+        self,
+    ) -> None:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os,time;"
+                    "child=os.fork();"
+                    "time.sleep(5) if child == 0 else os._exit(0)"
+                ),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        time.sleep(0.05)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE.selectors,
+                    "DefaultSelector",
+                    side_effect=OSError("simulated selector setup failure"),
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "cannot supervise.*simulated selector setup failure",
+                ) as raised,
+            ):
+                MIRROR_MODULE._collect_bounded_process_output(
+                    process,
+                    None,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    timeout_seconds=1,
+                    label="selector setup fixture",
+                )
+            self.assertIsInstance(raised.exception.__cause__, OSError)
+            with self.assertRaises((ProcessLookupError, PermissionError)):
+                os.killpg(process.pid, 0)
+            assert process.stdout is not None
+            assert process.stderr is not None
+            self.assertTrue(process.stdout.closed)
+            self.assertTrue(process.stderr.closed)
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            process.wait(timeout=5)
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+
+    def test_git_output_collector_closes_partial_selector_setup(self) -> None:
+        class FailSecondRegister:
+            def __init__(self) -> None:
+                self.inner = selectors.DefaultSelector()
+                self.register_count = 0
+                self.closed = False
+
+            def register(self, *args, **kwargs):
+                self.register_count += 1
+                if self.register_count == 2:
+                    raise ValueError("simulated second register failure")
+                return self.inner.register(*args, **kwargs)
+
+            def get_map(self):
+                return self.inner.get_map()
+
+            def select(self, *args, **kwargs):
+                return self.inner.select(*args, **kwargs)
+
+            def unregister(self, *args, **kwargs):
+                return self.inner.unregister(*args, **kwargs)
+
+            def close(self) -> None:
+                self.closed = True
+                self.inner.close()
+
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os,time;"
+                    "child=os.fork();"
+                    "time.sleep(5) if child == 0 else os._exit(0)"
+                ),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        time.sleep(0.05)
+        selector = FailSecondRegister()
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE.selectors,
+                    "DefaultSelector",
+                    return_value=selector,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "cannot supervise.*simulated second register failure",
+                ),
+            ):
+                MIRROR_MODULE._collect_bounded_process_output(
+                    process,
+                    None,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    timeout_seconds=1,
+                    label="partial selector fixture",
+                )
+            self.assertTrue(selector.closed)
+            with self.assertRaises((ProcessLookupError, PermissionError)):
+                os.killpg(process.pid, 0)
+            assert process.stdout is not None
+            assert process.stderr is not None
+            self.assertTrue(process.stdout.closed)
+            self.assertTrue(process.stderr.closed)
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            process.wait(timeout=5)
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+
+    def test_git_cleanup_never_signals_an_already_reaped_group(self) -> None:
+        process = mock.Mock()
+        process.returncode = 0
+        process.pid = 424242
+        with (
+            mock.patch.object(MIRROR_MODULE.os, "killpg") as kill_group,
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "already reaped",
+            ),
+        ):
+            MIRROR_MODULE._terminate_git_process(process)
+        kill_group.assert_not_called()
+
+    def test_git_cleanup_never_touches_group_after_wait(self) -> None:
+        process = mock.Mock()
+        process.returncode = None
+        process.pid = 424242
+        lifecycle: list[str] = []
+
+        def wait_once(*, timeout):
+            self.assertGreaterEqual(timeout, 0)
+            lifecycle.append("wait")
+            process.returncode = -signal.SIGKILL
+            return process.returncode
+
+        process.wait.side_effect = wait_once
+
+        def signal_group(process_group, signum):
+            self.assertEqual(process_group, process.pid)
+            self.assertEqual(signum, signal.SIGKILL)
+            lifecycle.append("killpg")
+
+        with mock.patch.object(
+            MIRROR_MODULE.os,
+            "killpg",
+            side_effect=signal_group,
+        ) as kill_group:
+            return_code = MIRROR_MODULE._terminate_git_process(process)
+
+        self.assertEqual(return_code, -signal.SIGKILL)
+        self.assertEqual(lifecycle, ["killpg", "wait"])
+        kill_group.assert_called_once()
+        process.wait.assert_called_once()
+        process.poll.assert_not_called()
+
+    def test_git_cleanup_uses_narrow_darwin_eperm_contract(self) -> None:
+        def make_process():
+            process = mock.Mock()
+            process.returncode = None
+            process.pid = 424242
+
+            def wait_once(*, timeout):
+                self.assertGreaterEqual(timeout, 0)
+                process.returncode = 0
+                return 0
+
+            process.wait.side_effect = wait_once
+            return process
+
+        rejected_profiles = (
+            (
+                "linux",
+                MIRROR_MODULE._TrustedProcessProfile.PRIVATE_GIT_SNAPSHOT,
+            ),
+            ("darwin", None),
+        )
+        for platform, trusted_profile in rejected_profiles:
+            with self.subTest(
+                platform=platform,
+                trusted_profile=trusted_profile,
+            ):
+                process = make_process()
+                with (
+                    mock.patch.object(MIRROR_MODULE.sys, "platform", platform),
+                    mock.patch.object(
+                        MIRROR_MODULE.os,
+                        "killpg",
+                        side_effect=PermissionError("simulated EPERM"),
+                    ),
+                    self.assertRaisesRegex(
+                        MIRROR_MODULE.MirrorSyncError,
+                        "cannot signal.*EPERM",
+                    ),
+                ):
+                    MIRROR_MODULE._terminate_git_process(
+                        process,
+                        leader_exit_observed=True,
+                        trusted_exec_profile=trusted_profile,
+                    )
+                process.wait.assert_called_once()
+                process.poll.assert_not_called()
+
+        accepted = make_process()
+        with (
+            mock.patch.object(MIRROR_MODULE.sys, "platform", "darwin"),
+            mock.patch.object(
+                MIRROR_MODULE.os,
+                "killpg",
+                side_effect=PermissionError("simulated EPERM"),
+            ),
+        ):
+            return_code = MIRROR_MODULE._terminate_git_process(
+                accepted,
+                leader_exit_observed=True,
+                trusted_exec_profile=(
+                    MIRROR_MODULE._TrustedProcessProfile.PRIVATE_GIT_SNAPSHOT
+                ),
+            )
+        self.assertEqual(return_code, 0)
+        accepted.wait.assert_called_once()
+        accepted.poll.assert_not_called()
+
+    def test_bounded_process_cleanup_uses_one_owner_deadline(self) -> None:
+        process = mock.Mock()
+        process.returncode = None
+        process.pid = 424242
+        process.stdout = mock.Mock()
+        process.stderr = mock.Mock()
+
+        def launch(owner):
+            owner.process = process
+            return process
+
+        def collect(child, owner):
+            return MIRROR_MODULE._collect_bounded_process_output(
+                child,
+                None,
+                owner=owner,
+                stdout_limit=1024,
+                stderr_limit=1024,
+                timeout_seconds=30,
+                label="single owner deadline fixture",
+            )
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE.time,
+                "monotonic",
+                return_value=100.0,
+            ),
+            mock.patch.object(
+                MIRROR_MODULE.selectors,
+                "DefaultSelector",
+                side_effect=OSError("simulated selector failure"),
+            ),
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_terminate_git_process",
+                side_effect=MIRROR_MODULE.MirrorSyncError(
+                    "simulated terminalization failure"
+                ),
+            ) as terminate,
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "simulated selector failure.*simulated terminalization failure",
+            ),
+        ):
+            MIRROR_MODULE._launch_and_collect_bounded_process(
+                launch,
+                collect,
+                label="single owner deadline fixture",
+            )
+
+        terminate.assert_called_once_with(
+            process,
+            deadline=100.0 + MIRROR_MODULE.GIT_CLEANUP_TIMEOUT_SECONDS,
+            trusted_exec_profile=None,
+        )
+
+    def test_bounded_process_primary_survives_restore_failure(self) -> None:
+        class PrimaryFailure(BaseException):
+            pass
+
+        primary = PrimaryFailure("primary launcher failure")
+        real_restore = MIRROR_MODULE._restore_deferred_process_signal_handlers
+
+        def launch(_owner):
+            signal.raise_signal(signal.SIGINT)
+            raise primary
+
+        def restore_with_failure(state):
+            errors = real_restore(state)
+            errors.append(OSError("simulated handler restore failure"))
+            return errors
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE,
+                "_restore_deferred_process_signal_handlers",
+                side_effect=restore_with_failure,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "primary launcher failure.*handler restore failure",
+            ) as raised,
+        ):
+            MIRROR_MODULE._launch_and_collect_bounded_process(
+                launch,
+                mock.Mock(),
+                label="primary and restore failure fixture",
+            )
+        self.assertIs(raised.exception.__cause__, primary)
+
+    def test_restore_mask_fence_failure_still_restores_handlers(self) -> None:
+        state = MIRROR_MODULE._install_deferred_process_signal_handlers()
+        with mock.patch.object(
+            MIRROR_MODULE.signal,
+            "pthread_sigmask",
+            side_effect=OSError("simulated restore mask fence failure"),
+        ):
+            errors = MIRROR_MODULE._restore_deferred_process_signal_handlers(state)
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(str(errors[0]), "restore mask fence failure")
+        for signum, original_handler in state.original_handlers.items():
+            self.assertEqual(signal.getsignal(signum), original_handler)
+
+    def test_restore_unmask_failure_retries_exact_parent_mask(self) -> None:
+        state = MIRROR_MODULE._install_deferred_process_signal_handlers()
+        real_sigmask = signal.pthread_sigmask
+        original_mask = real_sigmask(signal.SIG_BLOCK, set())
+        call_count = 0
+
+        def fail_first_unmask(how, mask):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise OSError("simulated restore unmask failure")
+            return real_sigmask(how, mask)
+
+        with mock.patch.object(
+            MIRROR_MODULE.signal,
+            "pthread_sigmask",
+            side_effect=fail_first_unmask,
+        ):
+            errors = MIRROR_MODULE._restore_deferred_process_signal_handlers(state)
+
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(str(errors[0]), "restore unmask failure")
+        self.assertEqual(
+            real_sigmask(signal.SIG_BLOCK, set()),
+            original_mask,
+        )
+        for signum, original_handler in state.original_handlers.items():
+            self.assertEqual(signal.getsignal(signum), original_handler)
+
+    def test_install_unmask_failure_rolls_back_handlers_and_mask(self) -> None:
+        original_handlers = {
+            signum: signal.getsignal(signum)
+            for signum in MIRROR_MODULE._BOUNDED_PROCESS_SIGNALS
+        }
+        real_sigmask = signal.pthread_sigmask
+        original_mask = real_sigmask(signal.SIG_BLOCK, set())
+        call_count = 0
+
+        def fail_first_unmask(how, mask):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise OSError("simulated install unmask failure")
+            return real_sigmask(how, mask)
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE.signal,
+                "pthread_sigmask",
+                side_effect=fail_first_unmask,
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "install unmask failure",
+            ),
+        ):
+            MIRROR_MODULE._install_deferred_process_signal_handlers()
+
+        self.assertEqual(
+            real_sigmask(signal.SIG_BLOCK, set()),
+            original_mask,
+        )
+        for signum, original_handler in original_handlers.items():
+            self.assertEqual(signal.getsignal(signum), original_handler)
+
+    def test_trusted_process_profiles_reject_credential_transitions(self) -> None:
+        transitions = {
+            "user": 1234,
+            "group": 1234,
+            "extra_groups": [1234],
+            "preexec_fn": lambda: None,
+        }
+        for name, value in transitions.items():
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    f"forbids Popen {name} transitions",
+                ),
+            ):
+                MIRROR_MODULE._verify_trusted_same_uid_spawn_kwargs(
+                    {
+                        "start_new_session": True,
+                        name: value,
+                    }
+                )
+
+    def test_darwin_kqueue_observer_validates_lifecycle(self) -> None:
+        process = mock.Mock()
+        process.returncode = None
+        process.pid = 424242
+        valid_event = mock.Mock()
+        valid_event.ident = process.pid
+        valid_event.filter = MIRROR_MODULE.select.KQ_FILTER_PROC
+        valid_event.fflags = MIRROR_MODULE.select.KQ_NOTE_EXIT
+        valid_event.flags = 0
+
+        def run_with_queue(queue):
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE.os,
+                    "waitid",
+                    None,
+                    create=True,
+                ),
+                mock.patch.object(MIRROR_MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MIRROR_MODULE.select,
+                    "kqueue",
+                    return_value=queue,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE.select,
+                    "kevent",
+                    return_value=mock.Mock(),
+                ),
+            ):
+                MIRROR_MODULE._wait_for_git_leader_exit_without_reaping(
+                    process,
+                    time.monotonic() + 1,
+                    "mock kqueue fixture",
+                )
+
+        late_queue = mock.Mock()
+        late_queue.control.side_effect = ProcessLookupError("late ESRCH")
+        run_with_queue(late_queue)
+        late_queue.close.assert_called_once()
+
+        valid_queue = mock.Mock()
+        valid_queue.control.side_effect = [[], [valid_event]]
+        run_with_queue(valid_queue)
+        valid_queue.close.assert_called_once()
+
+        invalid_event = mock.Mock()
+        invalid_event.ident = process.pid + 1
+        invalid_event.filter = MIRROR_MODULE.select.KQ_FILTER_PROC
+        invalid_event.fflags = MIRROR_MODULE.select.KQ_NOTE_EXIT
+        invalid_event.flags = 0
+        invalid_queue = mock.Mock()
+        invalid_queue.control.side_effect = [[], [invalid_event]]
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "invalid Darwin exit event",
+        ):
+            run_with_queue(invalid_queue)
+        invalid_queue.close.assert_called_once()
+
+        registration_queue = mock.Mock()
+        registration_queue.control.side_effect = OSError(
+            "simulated kqueue registration failure"
+        )
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "registration failure",
+        ) as raised:
+            run_with_queue(registration_queue)
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        registration_queue.close.assert_called_once()
+
+        failing_queue = mock.Mock()
+        failing_queue.control.side_effect = [
+            [],
+            OSError("simulated kqueue control failure"),
+        ]
+        failing_queue.close.side_effect = OSError("simulated kqueue close failure")
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "control failure.*close failure",
+        ) as raised:
+            run_with_queue(failing_queue)
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+
+        with (
+            mock.patch.object(
+                MIRROR_MODULE.os,
+                "waitid",
+                None,
+                create=True,
+            ),
+            mock.patch.object(MIRROR_MODULE.sys, "platform", "darwin"),
+            mock.patch.object(
+                MIRROR_MODULE.select,
+                "kqueue",
+                side_effect=OSError("simulated kqueue creation failure"),
+            ),
+            self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "create.*kqueue creation failure",
+            ) as raised,
+        ):
+            MIRROR_MODULE._wait_for_git_leader_exit_without_reaping(
+                process,
+                time.monotonic() + 1,
+                "mock kqueue fixture",
+            )
+        self.assertIsInstance(raised.exception.__cause__, OSError)
 
     def test_source_and_operation_budgets_are_shared_and_bounded(self) -> None:
         self.assertEqual(
@@ -4683,11 +5968,16 @@ class MirrorGeneratorTests(unittest.TestCase):
             )
             real_collect = MIRROR_MODULE._collect_bounded_git_output
 
-            def swap_live_index_while_child_runs(process, operation=None):
+            def swap_live_index_while_child_runs(
+                process,
+                operation=None,
+                *,
+                owner=None,
+            ):
                 os.rename(index_path, saved_index)
                 index_path.write_bytes(b"transient malicious index\n")
                 try:
-                    return real_collect(process, operation)
+                    return real_collect(process, operation, owner=owner)
                 finally:
                     index_path.unlink()
                     os.rename(saved_index, index_path)
@@ -4773,8 +6063,13 @@ class MirrorGeneratorTests(unittest.TestCase):
             original_index = private_index.read_bytes()
             real_collect = MIRROR_MODULE._collect_bounded_git_output
 
-            def mutate_private_index_after_child(process, operation=None):
-                result = real_collect(process, operation)
+            def mutate_private_index_after_child(
+                process,
+                operation=None,
+                *,
+                owner=None,
+            ):
+                result = real_collect(process, operation, owner=owner)
                 private_index.write_bytes(b"post-child private drift\n")
                 return result
 
@@ -4821,12 +6116,17 @@ class MirrorGeneratorTests(unittest.TestCase):
             original_mode = stat.S_IMODE(object_path.stat().st_mode)
             real_collect = MIRROR_MODULE._collect_bounded_git_output
 
-            def tamper_while_child_runs(process, operation=None):
+            def tamper_while_child_runs(
+                process,
+                operation=None,
+                *,
+                owner=None,
+            ):
                 object_path.chmod(0o644)
                 mutated = bytes([original[0] ^ 0x01]) + original[1:]
                 object_path.write_bytes(mutated)
                 try:
-                    return real_collect(process, operation)
+                    return real_collect(process, operation, owner=owner)
                 finally:
                     object_path.write_bytes(original)
                     object_path.chmod(original_mode)
@@ -4872,12 +6172,17 @@ class MirrorGeneratorTests(unittest.TestCase):
             original_mode = stat.S_IMODE(pack_path.stat().st_mode)
             real_collect = MIRROR_MODULE._collect_bounded_git_output
 
-            def tamper_while_child_runs(process, operation=None):
+            def tamper_while_child_runs(
+                process,
+                operation=None,
+                *,
+                owner=None,
+            ):
                 pack_path.chmod(0o644)
                 mutated = bytes([original[0] ^ 0x01]) + original[1:]
                 pack_path.write_bytes(mutated)
                 try:
-                    return real_collect(process, operation)
+                    return real_collect(process, operation, owner=owner)
                 finally:
                     pack_path.write_bytes(original)
                     pack_path.chmod(original_mode)

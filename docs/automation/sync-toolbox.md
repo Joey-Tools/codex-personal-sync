@@ -62,18 +62,24 @@ administrators must provision and rotate the secret outside this workflow.
 - Before switching to the automation branch, the target is detached at the
   freshly fetched target-base SHA. The canonical `managed-paths` command first
   validates that base's prior committed receipt. When an automation branch
-  exists, the workflow fetches its exact prepared SHA, switches to it, and runs
-  `managed-paths` again before inspecting its diff. Only the sorted union of
-  those two independently proven lists becomes the allowlist: current toolbox
-  targets, the receipt, and clean receipt-bound paths from the base or unmerged
-  generated branch that the new mapping retires. The old branch is inspected
-  but never merged into the new generated branch. Each prior receipt must
-  byte-match a deterministic reconstruction from its reachable canonical
-  source-lock commit. Receipt digests plus target `HEAD`/stage-0
-  index/worktree parity must all agree; a consumer edit, arbitrary branch path,
-  or forged/inconsistent receipt fails before generation. This preserves
-  consecutive rename/removal runs on one not-yet-merged sync PR while
-  republishing a bounded fresh branch instead of retaining arbitrary history.
+  exists, the workflow fetches its exact prepared SHA but never checks that
+  branch out. `managed-paths --target-commit <sha>` reads the branch tree and
+  receipt through bounded object-only Git commands, validates every
+  receipt-bound blob mode and digest, and proves that the detached base
+  worktree HEAD/index stayed unchanged. The credential is removed from the
+  step environment immediately after the last authenticated fetch, before any
+  untrusted branch object is inspected. Object-only diff/scope validation and
+  the version-2 history receipt bind the independent object range plus the
+  still-detached trusted worktree head. Only after all branch history, scope,
+  topology, blob, and receipt checks pass is a fresh local automation branch
+  created from the trusted target base. Only the sorted union of the base and
+  target-commit lists becomes the allowlist: current toolbox targets, the
+  receipt, and receipt-bound paths from the base or unmerged generated branch
+  that the new mapping retires. Each prior receipt must byte-match a
+  deterministic reconstruction from its reachable canonical source-lock
+  commit. This prevents branch-controlled attributes, filters, hooks, or large
+  checkout payloads from running before admission while preserving consecutive
+  rename/removal runs on one not-yet-merged sync PR.
 - Existing branch history is checked edge-by-edge without rename collapsing;
   add-then-delete, rename-out-and-back, side-merge, and transient-secret
   sequences cannot hide behind a clean net diff. High-confidence private-key
@@ -127,6 +133,11 @@ administrators must provision and rotate the secret outside this workflow.
   output, a fetch/ref
   mismatch, ambiguous or unowned pull requests, missing credentials, or a
   moving target base/branch. It does not repair or overwrite those states.
+- Fetching a prepared automation head necessarily writes its objects and the
+  exact remote-tracking ref before branch admission. The workflow binds that
+  ref to the preceding `ls-remote` result, keeps the worktree detached at the
+  trusted base, removes the credential before object inspection, and performs
+  no checkout of the untrusted head.
 - GitHub does not offer this workflow an atomic "mutate only if base ref still
   equals this OID" PR operation. The immediate precondition checks and
   post-create/edit validation narrow and detect base movement, but they do not
