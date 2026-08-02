@@ -3,7 +3,7 @@ id: 20260723-canonical-sync-engine
 title: Canonical Sync Engine
 status: active
 created: 2026-07-23
-updated: 2026-08-01
+updated: 2026-08-02
 branch: codex/canonical-sync-engine
 pr:
 supersedes: []
@@ -16,13 +16,14 @@ superseded_by:
 
 - Delivery status: `delivery_gate_in_progress`.
 - The workstream is consolidating personal sync ownership in `Joey-Tools/codex-personal-sync` and hardening mirror generation, scheduler observability, active-skill auditing, reconciliation, and release retention.
-- PR #5 remains the canonical delivery vehicle. The append-only pushed head is
-  signed `0e32a526c04e658745006ea4a7e2bbbf25006c58`; the current uncommitted
-  follow-up closes its formal named-single P2 finding without rewriting signed
-  history, merging the PR, generating a consumer, or mutating a host
-  scheduler. Source-lock refresh and verification use a task-private control
-  root because production admission remains blocked by retained legacy
-  recovery evidence.
+- PR #5 squash-landed as canonical commit
+  `6d078594d547598db037ce358c89c8a8ac58c881`, with tree
+  `70dc2c727e91036e9d155ec17dbed643eef26990`.
+- PR #6 carries the scheduler-doctor fixture follow-up and its official source
+  lock refresh. The signed evidence checkpoint is
+  `c157628d461df693eb4cbab7a7cb76000b019255`, with tree
+  `9e7a82e08d8796c2a260dc81d9457b96ac9c3a01` and source-lock SHA-256
+  `eaa104c4fdb5ef92cdf0cfd297424cee3d6eb319776cbf48a937d0e2d76c9634`.
 
 ## Scope
 
@@ -1166,6 +1167,14 @@ superseded_by:
   `80a7d51804d91b96bae6a2ec3c352fc92fc70cac19640bec992d3b32809f601a`.
   Hosted CI, exact-head admission, and formal PR review remain head-bound
   post-push gates and are not claimed for these uncommitted bytes.
+- PR #6 checkpoint `c157628d461df693eb4cbab7a7cb76000b019255`
+  updates only `sync-source-lock.json` after the fixture source commit. Its
+  official BL-host refresh and `refresh-lock --check` verified all six sources;
+  the complete source-lock suite passed 230/230 tests, and the direct
+  `TMPDIR=/tmp` scheduler-doctor suite passed 150/150 tests. The resulting lock
+  SHA-256 is
+  `eaa104c4fdb5ef92cdf0cfd297424cee3d6eb319776cbf48a937d0e2d76c9634`.
+  Current-head hosted CI, admission, and formal review remain head-bound gates.
 
 ## Installed Host Baseline
 
@@ -1206,10 +1215,12 @@ configuration.
 
 ## Next Steps
 
-- Complete exact-current-head admission, named review, and CI for canonical PR
-  #5 before it leaves draft state; do not merge it from this workstream.
-- After the canonical change merges, generate and validate the declared
-  toolbox mirror, publish its exact immutable public release, and bridge that
-  receipt-bound release into the separately owned private-overlay workstream.
+- Complete exact-current-head CI, admission, and formal review for canonical PR
+  #6. Before landing it through the repository's squash merge, prove that the
+  squash candidate tree equals the reviewed and admitted PR-head tree.
+- Use the resulting landed canonical commit to generate and validate toolbox PR
+  #20, then bind `T` (the landed toolbox commit and immutable public release)
+  into `B` (the private-overlay release baseline). Do not generate either
+  consumer from a pre-landing PR head.
 - Provision `CODEX_TOOLBOX_SYNC_TOKEN` separately only if the repository owner
   wants the sync-PR workflow to become operational.
