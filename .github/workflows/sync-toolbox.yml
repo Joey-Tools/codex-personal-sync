@@ -1035,7 +1035,183 @@ jobs:
             echo "::warning title=Sync PR closure response lost::gh pr close returned status ${close_status}, but exact terminal evidence proves ${TARGET_REPOSITORY}#${EXISTING_PR} is closed."
           fi
 
-      - name: Report no toolbox changes
+      - name: Verify and report no toolbox changes
         if: steps.commit.outputs.pr_has_changes != 'true'
         shell: bash
-        run: echo "Toolbox mirror and any owned open sync PR are reconciled with canonical commit ${CANONICAL_SHA}."
+        env:
+          GH_TOKEN: ${{ secrets.CODEX_TOOLBOX_SYNC_TOKEN }}
+          BRANCH_NEEDS_UPDATE: ${{ steps.commit.outputs.branch_needs_update }}
+          DESIRED_HEAD_SHA: ${{ steps.history.outputs.head_sha }}
+          EXISTING_PR: ${{ steps.existing-pr.outputs.number }}
+          PREPARED_REMOTE_BRANCH_PRESENT: ${{ steps.prepare.outputs.remote_branch_present }}
+          PREPARED_REMOTE_BRANCH_SHA: ${{ steps.prepare.outputs.remote_branch_sha }}
+          PREPARED_TARGET_BASE_SHA: ${{ steps.prepare.outputs.target_base_sha }}
+        run: |
+          set -euo pipefail
+          git_with_token() {
+            local basic_token
+            basic_token="$(
+              printf 'x-access-token:%s' "${GH_TOKEN}" |
+                base64 -w 0
+            )"
+            GIT_CONFIG_COUNT=1 \
+              GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${basic_token}" \
+              git "$@"
+          }
+          read_remote_ref() {
+            local reference="$1"
+            local record
+            local expected_record
+            record="$(
+              git_with_token -C "${TARGET_ROOT}" ls-remote --heads origin \
+                "${reference}"
+            )"
+            REMOTE_REF_PRESENT=false
+            REMOTE_REF_SHA=""
+            if [[ -z "${record}" ]]; then
+              return
+            fi
+            REMOTE_REF_SHA="${record%%$'\t'*}"
+            expected_record="$(
+              printf '%s\t%s' "${REMOTE_REF_SHA}" "${reference}"
+            )"
+            if [[ ! "${REMOTE_REF_SHA}" =~ ^[0-9a-f]{40}$ || \
+              "${record}" != "${expected_record}" ]]; then
+              echo "::error title=Ambiguous remote ref::The ${reference} query did not return exactly one canonical lowercase SHA-1 record."
+              exit 1
+            fi
+            REMOTE_REF_PRESENT=true
+          }
+
+          if [[ ! "${PREPARED_TARGET_BASE_SHA}" =~ ^[0-9a-f]{40}$ || \
+            ! "${DESIRED_HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Invalid no-op snapshot::The prepared base or desired terminal head is malformed."
+            exit 1
+          fi
+          if [[ "${DESIRED_HEAD_SHA}" != "${PREPARED_TARGET_BASE_SHA}" ]]; then
+            echo "::error title=Invalid no-op snapshot::A generated no-op must retain the exact prepared target base commit."
+            exit 1
+          fi
+          case "${BRANCH_NEEDS_UPDATE}" in
+            true)
+              if [[ "${PREPARED_REMOTE_BRANCH_PRESENT}" != "true" || \
+                ! "${PREPARED_REMOTE_BRANCH_SHA}" =~ ^[0-9a-f]{40}$ || \
+                "${PREPARED_REMOTE_BRANCH_SHA}" == "${DESIRED_HEAD_SHA}" ]]; then
+                echo "::error title=Invalid no-op snapshot::A clean branch update must replace one exact stale prepared sync ref."
+                exit 1
+              fi
+              expected_branch_present=true
+              expected_branch_sha="${DESIRED_HEAD_SHA}"
+              ;;
+            false)
+              case "${PREPARED_REMOTE_BRANCH_PRESENT}" in
+                true)
+                  if [[ ! "${PREPARED_REMOTE_BRANCH_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+                    echo "::error title=Invalid no-op snapshot::The prepared sync branch SHA is malformed."
+                    exit 1
+                  fi
+                  if [[ "${PREPARED_REMOTE_BRANCH_SHA}" != "${DESIRED_HEAD_SHA}" ]]; then
+                    echo "::error title=Invalid no-op snapshot::An unchanged clean sync branch must already equal the desired terminal head."
+                    exit 1
+                  fi
+                  expected_branch_present=true
+                  expected_branch_sha="${PREPARED_REMOTE_BRANCH_SHA}"
+                  ;;
+                false)
+                  if [[ -n "${PREPARED_REMOTE_BRANCH_SHA}" ]]; then
+                    echo "::error title=Invalid no-op snapshot::An absent prepared sync branch must not carry a SHA."
+                    exit 1
+                  fi
+                  expected_branch_present=false
+                  expected_branch_sha=""
+                  ;;
+                *)
+                  echo "::error title=Invalid no-op snapshot::The prepared sync branch presence flag is malformed."
+                  exit 1
+                  ;;
+              esac
+              ;;
+            *)
+              echo "::error title=Invalid no-op snapshot::The branch update flag is malformed."
+              exit 1
+              ;;
+          esac
+
+          read_remote_ref "refs/heads/${TARGET_BASE}"
+          if [[ "${REMOTE_REF_PRESENT}" != "true" || \
+            "${REMOTE_REF_SHA}" != "${PREPARED_TARGET_BASE_SHA}" ]]; then
+            echo "::error title=Toolbox master advanced::The target base changed after no-op preparation; rerun against the live base."
+            exit 1
+          fi
+
+          read_remote_ref "refs/heads/${SYNC_BRANCH}"
+          if [[ "${expected_branch_present}" == "true" ]]; then
+            if [[ "${REMOTE_REF_PRESENT}" != "true" ]]; then
+              echo "::error title=Sync branch disappeared::The expected sync branch disappeared before no-op completion; rerun from a fresh snapshot."
+              exit 1
+            fi
+            if [[ "${REMOTE_REF_SHA}" != "${expected_branch_sha}" ]]; then
+              echo "::error title=Sync branch advanced::The sync branch changed before no-op completion; rerun from a fresh snapshot."
+              exit 1
+            fi
+          elif [[ "${REMOTE_REF_PRESENT}" == "true" ]]; then
+            echo "::error title=Sync branch appeared::The sync branch appeared before no-op completion; rerun from a fresh snapshot."
+            exit 1
+          fi
+
+          if [[ -n "${EXISTING_PR}" ]]; then
+            if [[ ! "${EXISTING_PR}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error title=Invalid no-op snapshot::The prepared sync PR number is malformed."
+              exit 1
+            fi
+            if ! terminal_pull_request="$(
+              gh pr view "${EXISTING_PR}" \
+                --repo "${TARGET_REPOSITORY}" \
+                --json number,body,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepositoryOwner,isCrossRepository
+            )"; then
+              echo "::error title=Sync PR changed::The reconciled sync PR could not be read at terminal verification."
+              exit 1
+            fi
+            if ! jq -e \
+              --arg number "${EXISTING_PR}" \
+              --arg owner "${TARGET_OWNER}" \
+              --arg base "${TARGET_BASE}" \
+              --arg base_oid "${PREPARED_TARGET_BASE_SHA}" \
+              --arg head "${SYNC_BRANCH}" \
+              --arg head_oid "${expected_branch_sha}" \
+              '
+                (.number | tostring) == $number and
+                .state == "CLOSED" and
+                .baseRefName == $base and
+                .baseRefOid == $base_oid and
+                .headRefName == $head and
+                .headRefOid == $head_oid and
+                .isCrossRepository == false and
+                .headRepositoryOwner.login == $owner and
+                (.body | contains("<!-- codex-personal-sync-toolbox-automation -->"))
+              ' <<<"${terminal_pull_request}" >/dev/null; then
+              echo "::error title=Sync PR changed::The reconciled sync PR no longer has the exact closed automation identity."
+              exit 1
+            fi
+          fi
+
+          if ! terminal_pull_requests="$(
+            gh pr list \
+              --repo "${TARGET_REPOSITORY}" \
+              --state open \
+              --base "${TARGET_BASE}" \
+              --head "${SYNC_BRANCH}" \
+              --limit 10 \
+              --json number,body,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepositoryOwner,isCrossRepository
+          )"; then
+            echo "::error title=Sync PR set changed::The matching open sync PR set could not be read at terminal verification."
+            exit 1
+          fi
+          if ! jq -e 'type == "array" and length == 0' \
+            <<<"${terminal_pull_requests}" >/dev/null; then
+            echo "::error title=Sync PR set changed::The matching open sync PR set is not the expected empty terminal set; rerun from a fresh snapshot."
+            exit 1
+          fi
+
+          echo "Toolbox mirror and any owned open sync PR are reconciled with canonical commit ${CANONICAL_SHA}."

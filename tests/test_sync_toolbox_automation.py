@@ -2998,6 +2998,293 @@ jobs:
                             completed.stdout + completed.stderr,
                         )
 
+    def test_noop_success_revalidates_exact_terminal_remote_state(self) -> None:
+        jq = shutil.which("jq")
+        if jq is None:
+            self.skipTest("jq is unavailable")
+        terminal_step = self._step_run("Verify and report no toolbox changes")
+        success_message = "Toolbox mirror and any owned open sync PR are reconciled"
+        self.assertLess(
+            terminal_step.index('read_remote_ref "refs/heads/${TARGET_BASE}"'),
+            terminal_step.index(success_message),
+        )
+        self.assertLess(
+            terminal_step.index('read_remote_ref "refs/heads/${SYNC_BRANCH}"'),
+            terminal_step.index(success_message),
+        )
+        self.assertLess(
+            terminal_step.index("gh pr list"),
+            terminal_step.index(success_message),
+        )
+
+        with tempfile.TemporaryDirectory(
+            prefix="sync-toolbox-noop-terminal."
+        ) as temporary_directory:
+            root = Path(temporary_directory)
+            target_root = root / "toolbox"
+            target_root.mkdir()
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                "#!/usr/bin/python3\n"
+                "import os\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "args = sys.argv[1:]\n"
+                "log = Path(os.environ['FAKE_GIT_LOG'])\n"
+                "with log.open('a', encoding='utf-8') as stream:\n"
+                "    stream.write(' '.join(args) + '\\n')\n"
+                "if 'ls-remote' not in args:\n"
+                "    raise SystemExit('unexpected git command')\n"
+                "reference = args[-1]\n"
+                "if reference == f\"refs/heads/{os.environ['TARGET_BASE']}\":\n"
+                "    present = True\n"
+                "    sha = os.environ['LIVE_BASE_SHA']\n"
+                "elif reference == f\"refs/heads/{os.environ['SYNC_BRANCH']}\":\n"
+                "    present = os.environ['LIVE_BRANCH_PRESENT'] == 'true'\n"
+                "    sha = os.environ['LIVE_BRANCH_SHA']\n"
+                "else:\n"
+                "    raise SystemExit('unexpected remote ref')\n"
+                "if present:\n"
+                "    print(f'{sha}\\t{reference}')\n",
+                encoding="utf-8",
+            )
+            fake_git.chmod(0o755)
+            fake_gh = fake_bin / "gh"
+            fake_gh.write_text(
+                "#!/usr/bin/python3\n"
+                "import os\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "args = sys.argv[1:]\n"
+                "log = Path(os.environ['FAKE_GH_LOG'])\n"
+                "with log.open('a', encoding='utf-8') as stream:\n"
+                "    stream.write(' '.join(args) + '\\n')\n"
+                "if args[:2] == ['pr', 'list']:\n"
+                "    print(os.environ['PR_LIST_PAYLOAD'])\n"
+                "elif args[:2] == ['pr', 'view']:\n"
+                "    if os.environ['PR_VIEW_FAILURE'] == 'true':\n"
+                "        raise SystemExit(1)\n"
+                "    print(os.environ['PR_VIEW_PAYLOAD'])\n"
+                "else:\n"
+                "    raise SystemExit('unexpected gh command')\n",
+                encoding="utf-8",
+            )
+            fake_gh.chmod(0o755)
+            fake_base64 = fake_bin / "base64"
+            fake_base64.write_text("#!/bin/sh\ncat\n", encoding="utf-8")
+            fake_base64.chmod(0o755)
+
+            base_sha = "1" * 40
+            stale_branch_sha = "2" * 40
+            drift_sha = "3" * 40
+            marker = "<!-- codex-personal-sync-toolbox-automation -->\n"
+
+            def pull_request_payload(
+                *,
+                state: str,
+                head_sha: str,
+                owner: str = "Joey-Tools",
+                body: str = marker,
+            ) -> dict[str, object]:
+                return {
+                    "number": 17,
+                    "body": body,
+                    "state": state,
+                    "baseRefName": "master",
+                    "baseRefOid": base_sha,
+                    "headRefName": "automation/canonical-personal-sync",
+                    "headRefOid": head_sha,
+                    "headRepositoryOwner": {"login": owner},
+                    "isCrossRepository": False,
+                }
+
+            cases = (
+                {
+                    "name": "stable absent branch",
+                    "prepared_present": "false",
+                    "prepared_sha": "",
+                    "live_present": "false",
+                    "expected_failure": False,
+                },
+                {
+                    "name": "stable existing branch",
+                    "prepared_present": "true",
+                    "prepared_sha": base_sha,
+                    "live_present": "true",
+                    "live_sha": base_sha,
+                    "expected_failure": False,
+                },
+                {
+                    "name": "clean stale branch updated and PR closed",
+                    "prepared_present": "true",
+                    "prepared_sha": stale_branch_sha,
+                    "branch_needs_update": "true",
+                    "live_present": "true",
+                    "live_sha": base_sha,
+                    "existing_pr": "17",
+                    "expected_failure": False,
+                },
+                {
+                    "name": "master drift",
+                    "prepared_present": "false",
+                    "prepared_sha": "",
+                    "live_base_sha": drift_sha,
+                    "live_present": "false",
+                    "message": "Toolbox master advanced",
+                },
+                {
+                    "name": "branch appeared",
+                    "prepared_present": "false",
+                    "prepared_sha": "",
+                    "live_present": "true",
+                    "live_sha": drift_sha,
+                    "message": "Sync branch appeared",
+                },
+                {
+                    "name": "branch disappeared",
+                    "prepared_present": "true",
+                    "prepared_sha": base_sha,
+                    "live_present": "false",
+                    "message": "Sync branch disappeared",
+                },
+                {
+                    "name": "branch SHA drift",
+                    "prepared_present": "true",
+                    "prepared_sha": base_sha,
+                    "live_present": "true",
+                    "live_sha": drift_sha,
+                    "message": "Sync branch advanced",
+                },
+                {
+                    "name": "matching PR appeared",
+                    "prepared_present": "true",
+                    "prepared_sha": base_sha,
+                    "live_present": "true",
+                    "live_sha": base_sha,
+                    "pr_list": [pull_request_payload(state="OPEN", head_sha=base_sha)],
+                    "message": "Sync PR set changed",
+                },
+                {
+                    "name": "matching PR identity drift",
+                    "prepared_present": "true",
+                    "prepared_sha": base_sha,
+                    "live_present": "true",
+                    "live_sha": base_sha,
+                    "pr_list": [
+                        pull_request_payload(
+                            state="OPEN",
+                            head_sha=base_sha,
+                            owner="someone-else",
+                            body="ordinary pull request\n",
+                        )
+                    ],
+                    "message": "Sync PR set changed",
+                },
+                {
+                    "name": "reconciled PR disappeared",
+                    "prepared_present": "true",
+                    "prepared_sha": base_sha,
+                    "live_present": "true",
+                    "live_sha": base_sha,
+                    "existing_pr": "17",
+                    "pr_view_failure": "true",
+                    "message": "Sync PR changed",
+                },
+                {
+                    "name": "reconciled PR identity drift",
+                    "prepared_present": "true",
+                    "prepared_sha": base_sha,
+                    "live_present": "true",
+                    "live_sha": base_sha,
+                    "existing_pr": "17",
+                    "pr_view": pull_request_payload(
+                        state="CLOSED",
+                        head_sha=base_sha,
+                        owner="someone-else",
+                    ),
+                    "message": "Sync PR changed",
+                },
+            )
+            for case in cases:
+                name = str(case["name"])
+                with self.subTest(name=name):
+                    git_log = root / f"git-{name.replace(' ', '-')}"
+                    gh_log = root / f"gh-{name.replace(' ', '-')}"
+                    branch_needs_update = str(case.get("branch_needs_update", "false"))
+                    expected_branch_sha = (
+                        base_sha
+                        if branch_needs_update == "true"
+                        else str(case["prepared_sha"])
+                    )
+                    environment = {
+                        **os.environ,
+                        "BRANCH_NEEDS_UPDATE": branch_needs_update,
+                        "CANONICAL_SHA": "4" * 40,
+                        "DESIRED_HEAD_SHA": base_sha,
+                        "EXISTING_PR": str(case.get("existing_pr", "")),
+                        "FAKE_GH_LOG": str(gh_log),
+                        "FAKE_GIT_LOG": str(git_log),
+                        "GH_TOKEN": SYNTHETIC_ACCESS_TOKEN,
+                        "LIVE_BASE_SHA": str(case.get("live_base_sha", base_sha)),
+                        "LIVE_BRANCH_PRESENT": str(case["live_present"]),
+                        "LIVE_BRANCH_SHA": str(case.get("live_sha", "")),
+                        "PATH": f"{fake_bin}:{Path(jq).parent}:/usr/bin:/bin",
+                        "PREPARED_REMOTE_BRANCH_PRESENT": str(case["prepared_present"]),
+                        "PREPARED_REMOTE_BRANCH_SHA": str(case["prepared_sha"]),
+                        "PREPARED_TARGET_BASE_SHA": base_sha,
+                        "PR_LIST_PAYLOAD": json.dumps(case.get("pr_list", [])),
+                        "PR_VIEW_FAILURE": str(case.get("pr_view_failure", "false")),
+                        "PR_VIEW_PAYLOAD": json.dumps(
+                            case.get(
+                                "pr_view",
+                                pull_request_payload(
+                                    state="CLOSED",
+                                    head_sha=expected_branch_sha,
+                                ),
+                            )
+                        ),
+                        "SYNC_BRANCH": "automation/canonical-personal-sync",
+                        "TARGET_BASE": "master",
+                        "TARGET_OWNER": "Joey-Tools",
+                        "TARGET_REPOSITORY": "Joey-Tools/codex-toolbox",
+                        "TARGET_ROOT": str(target_root),
+                    }
+                    completed = subprocess.run(
+                        [
+                            "/bin/bash",
+                            "-euo",
+                            "pipefail",
+                            "-c",
+                            terminal_step,
+                        ],
+                        cwd=REPOSITORY_ROOT,
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=30,
+                    )
+                    output = completed.stdout + completed.stderr
+                    expected_failure = bool(case.get("expected_failure", True))
+                    if expected_failure:
+                        self.assertNotEqual(completed.returncode, 0)
+                        self.assertNotIn(success_message, output)
+                        self.assertIn(str(case["message"]), output)
+                    else:
+                        self.assertEqual(completed.returncode, 0, output)
+                        self.assertIn(success_message, output)
+                    git_commands = git_log.read_text(encoding="utf-8")
+                    gh_commands = (
+                        gh_log.read_text(encoding="utf-8") if gh_log.exists() else ""
+                    )
+                    self.assertNotIn(" push ", f" {git_commands} ")
+                    self.assertNotRegex(
+                        gh_commands,
+                        r"(?m)^pr (?:close|create|edit)\b",
+                    )
+
     def test_documented_secret_interface_is_least_privilege_and_explicit(
         self,
     ) -> None:
