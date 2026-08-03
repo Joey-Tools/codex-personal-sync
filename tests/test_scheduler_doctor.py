@@ -847,6 +847,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             original_open = os.open
             injected = False
             replaced = False
+            concurrent_lock_descriptor = -1
 
             def replace_concurrent_lock(
                 path: str | bytes,
@@ -855,16 +856,16 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                 *,
                 dir_fd: int | None = None,
             ) -> int:
+                nonlocal concurrent_lock_descriptor
                 nonlocal injected
                 nonlocal replaced
                 if path == _SCHEDULER_DOCTOR_TEST_LOCK_NAME and flags & os.O_EXCL:
-                    descriptor = original_open(
+                    concurrent_lock_descriptor = original_open(
                         path,
                         flags,
                         mode,
                         dir_fd=dir_fd,
                     )
-                    os.close(descriptor)
                     injected = True
                     raise OSError(errno.EEXIST, "concurrent fixture lease")
                 if path == _SCHEDULER_DOCTOR_TEST_LOCK_NAME and injected:
@@ -890,7 +891,11 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                         namespace_fd,
                     )
             finally:
-                os.close(namespace_fd)
+                try:
+                    if concurrent_lock_descriptor >= 0:
+                        os.close(concurrent_lock_descriptor)
+                finally:
+                    os.close(namespace_fd)
 
             self.assertTrue(injected)
             self.assertTrue(replaced)
