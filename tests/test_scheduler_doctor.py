@@ -46,6 +46,7 @@ _SCHEDULER_DOCTOR_TEST_EXPECTED_ANCHOR_ENV = (
 )
 _SCHEDULER_DOCTOR_TEST_LOCK_NAME = ".session.lock"
 _SCHEDULER_DOCTOR_TEST_SESSION_PREFIX = "session."
+_SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT = 1024
 _SCHEDULER_DOCTOR_TEST_SESSION: tempfile.TemporaryDirectory | None = None
 _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD: int | None = None
 
@@ -368,9 +369,15 @@ def _validate_scheduler_doctor_session_lease(
 
 
 def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
-    entries = sorted(namespace.iterdir(), key=lambda path: path.name)
-    if len(entries) > 1024:
-        raise RuntimeError("too many scheduler-doctor fixture namespace entries")
+    entries: list[Path] = []
+    with os.scandir(namespace) as iterator:
+        for entry in iterator:
+            if len(entries) == _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT:
+                raise RuntimeError(
+                    "too many scheduler-doctor fixture namespace entries"
+                )
+            entries.append(namespace / entry.name)
+    entries.sort(key=lambda path: path.name)
     for entry in entries:
         if entry.name == _SCHEDULER_DOCTOR_TEST_LOCK_NAME:
             continue
@@ -510,6 +517,118 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         _sweep_stale_scheduler_doctor_sessions(namespace)
 
         self.assertFalse(stale_path.exists())
+
+    def test_stale_session_sweep_accepts_exact_entry_limit(self) -> None:
+        class TrackedScandir:
+            def __init__(self, names: list[str]) -> None:
+                self._names = iter(names)
+                self.read_count = 0
+                self.closed = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback) -> None:
+                self.close()
+
+            def __iter__(self):
+                return self
+
+            def __next__(self) -> Path:
+                name = next(self._names)
+                self.read_count += 1
+                return Path(name)
+
+            def close(self) -> None:
+                self.closed = True
+
+        names = [
+            f"session.{index:04d}"
+            for index in reversed(
+                range(_SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT)
+            )
+        ]
+        iterator = TrackedScandir(names)
+        namespace = Path("/bounded-scheduler-doctor-fixture")
+        with (
+            mock.patch.object(os, "scandir", return_value=iterator),
+            mock.patch(
+                f"{__name__}._validate_owner_private_directory"
+            ) as validate,
+            mock.patch.object(shutil, "rmtree") as rmtree,
+        ):
+            _sweep_stale_scheduler_doctor_sessions(namespace)
+
+        self.assertTrue(iterator.closed)
+        self.assertEqual(
+            iterator.read_count,
+            _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT,
+        )
+        self.assertEqual(
+            validate.call_count,
+            _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT,
+        )
+        self.assertEqual(
+            rmtree.call_count,
+            _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT,
+        )
+        self.assertEqual(
+            [call.args[0].name for call in rmtree.call_args_list],
+            sorted(names),
+        )
+
+    def test_stale_session_sweep_stops_at_limit_plus_one(self) -> None:
+        class TrackedScandir:
+            def __init__(self, names: list[str]) -> None:
+                self._names = iter(names)
+                self.read_count = 0
+                self.closed = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback) -> None:
+                self.close()
+
+            def __iter__(self):
+                return self
+
+            def __next__(self) -> Path:
+                name = next(self._names)
+                self.read_count += 1
+                return Path(name)
+
+            def close(self) -> None:
+                self.closed = True
+
+        names = [
+            f"session.{index:04d}"
+            for index in range(
+                _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT + 32
+            )
+        ]
+        iterator = TrackedScandir(names)
+        namespace = Path("/bounded-scheduler-doctor-fixture")
+        with (
+            mock.patch.object(os, "scandir", return_value=iterator),
+            mock.patch(
+                f"{__name__}._validate_owner_private_directory"
+            ) as validate,
+            mock.patch.object(shutil, "rmtree") as rmtree,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "too many scheduler-doctor fixture namespace entries",
+            ),
+        ):
+            _sweep_stale_scheduler_doctor_sessions(namespace)
+
+        self.assertTrue(iterator.closed)
+        self.assertEqual(
+            iterator.read_count,
+            _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT + 1,
+        )
+        validate.assert_not_called()
+        rmtree.assert_not_called()
 
     def test_shared_temp_checkout_falls_back_to_safe_anchor(self) -> None:
         with _scheduler_doctor_test_temporary_directory() as fallback_directory:
