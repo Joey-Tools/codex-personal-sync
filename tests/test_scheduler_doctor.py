@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from datetime import datetime, timedelta, timezone
+import fcntl
 import importlib.util
 import io
 import json
@@ -37,14 +38,130 @@ PUBLIC_SHA = "1" * 40
 PRIVATE_SHA = "2" * 40
 
 
-def _scheduler_doctor_test_account_home() -> Path:
-    return Path(os.path.realpath(MODULE._mirror_canonical_account_home_directory()))
+_SCHEDULER_DOCTOR_TEST_NAMESPACE = REPO_ROOT / ".codex-test-tmp" / "scheduler-doctor"
+_SCHEDULER_DOCTOR_TEST_LOCK_NAME = ".session.lock"
+_SCHEDULER_DOCTOR_TEST_SESSION_PREFIX = "session."
+_SCHEDULER_DOCTOR_TEST_SESSION: tempfile.TemporaryDirectory | None = None
+_SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD: int | None = None
+
+
+def _validate_owner_private_directory(path: Path) -> os.stat_result:
+    metadata = path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or path.is_symlink():
+        raise RuntimeError(f"test fixture path is not a real directory: {path}")
+    if metadata.st_uid != os.geteuid():
+        raise RuntimeError(f"test fixture path is not owned by the current uid: {path}")
+    if stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise RuntimeError(f"test fixture path is not mode 0700: {path}")
+    return metadata
+
+
+def _ensure_scheduler_doctor_test_namespace() -> Path:
+    parent = _SCHEDULER_DOCTOR_TEST_NAMESPACE.parent
+    for path in (parent, _SCHEDULER_DOCTOR_TEST_NAMESPACE):
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        _validate_owner_private_directory(path)
+    return _SCHEDULER_DOCTOR_TEST_NAMESPACE
+
+
+def _validate_scheduler_doctor_session_lease(
+    path: Path,
+    descriptor: int,
+) -> os.stat_result:
+    descriptor_metadata = os.fstat(descriptor)
+    path_metadata = path.lstat()
+    if not stat.S_ISREG(descriptor_metadata.st_mode):
+        raise RuntimeError(f"test fixture lease is not regular: {path}")
+    if descriptor_metadata.st_nlink != 1:
+        raise RuntimeError(f"test fixture lease link count is not one: {path}")
+    if descriptor_metadata.st_uid != os.geteuid():
+        raise RuntimeError(f"test fixture lease has the wrong owner: {path}")
+    if stat.S_IMODE(descriptor_metadata.st_mode) != 0o600:
+        raise RuntimeError(f"test fixture lease is not mode 0600: {path}")
+    if (descriptor_metadata.st_dev, descriptor_metadata.st_ino) != (
+        path_metadata.st_dev,
+        path_metadata.st_ino,
+    ):
+        raise RuntimeError(f"test fixture lease identity changed: {path}")
+    return descriptor_metadata
+
+
+def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
+    entries = sorted(namespace.iterdir(), key=lambda path: path.name)
+    if len(entries) > 1024:
+        raise RuntimeError("too many scheduler-doctor fixture namespace entries")
+    for entry in entries:
+        if entry.name == _SCHEDULER_DOCTOR_TEST_LOCK_NAME:
+            continue
+        if not entry.name.startswith(_SCHEDULER_DOCTOR_TEST_SESSION_PREFIX):
+            raise RuntimeError(f"unexpected scheduler-doctor fixture entry: {entry}")
+        _validate_owner_private_directory(entry)
+        shutil.rmtree(entry)
+
+
+def _scheduler_doctor_test_session_directory() -> Path:
+    global _SCHEDULER_DOCTOR_TEST_SESSION
+    global _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD
+
+    if _SCHEDULER_DOCTOR_TEST_SESSION is not None:
+        return Path(_SCHEDULER_DOCTOR_TEST_SESSION.name)
+
+    namespace = _ensure_scheduler_doctor_test_namespace()
+    lease_path = namespace / _SCHEDULER_DOCTOR_TEST_LOCK_NAME
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(lease_path, flags, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        _validate_scheduler_doctor_session_lease(lease_path, descriptor)
+        _sweep_stale_scheduler_doctor_sessions(namespace)
+        session = tempfile.TemporaryDirectory(
+            prefix=_SCHEDULER_DOCTOR_TEST_SESSION_PREFIX,
+            dir=namespace,
+        )
+        _validate_owner_private_directory(Path(session.name))
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+    _SCHEDULER_DOCTOR_TEST_SESSION = session
+    _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD = descriptor
+    return Path(session.name)
+
+
+def _cleanup_scheduler_doctor_test_session() -> None:
+    global _SCHEDULER_DOCTOR_TEST_SESSION
+    global _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD
+
+    session = _SCHEDULER_DOCTOR_TEST_SESSION
+    descriptor = _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD
+    if session is None:
+        return
+    if descriptor is None:
+        raise RuntimeError("scheduler-doctor fixture session custody is incomplete")
+    try:
+        _validate_owner_private_directory(Path(session.name))
+        session.cleanup()
+    finally:
+        os.close(descriptor)
+        _SCHEDULER_DOCTOR_TEST_SESSION = None
+        _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD = None
+
+
+def tearDownModule() -> None:
+    _cleanup_scheduler_doctor_test_session()
 
 
 def _scheduler_doctor_test_temporary_directory() -> tempfile.TemporaryDirectory:
     return tempfile.TemporaryDirectory(
         prefix="scheduler-doctor.",
-        dir=_scheduler_doctor_test_account_home(),
+        dir=_scheduler_doctor_test_session_directory(),
     )
 
 
@@ -74,14 +191,19 @@ def snapshot_tree(root: Path) -> tuple[tuple[str, str, int, bytes | str | None],
 
 class SchedulerDoctorFixtureTests(unittest.TestCase):
     def test_temporary_root_ignores_ambient_tmpdir_and_cleans_up(self) -> None:
-        account_home = _scheduler_doctor_test_account_home()
+        account_home = Path(
+            os.path.realpath(MODULE._mirror_canonical_account_home_directory())
+        )
+        session_root = _scheduler_doctor_test_session_directory()
         system_tmp = Path(os.path.realpath("/tmp"))
         with mock.patch.dict(os.environ, {"TMPDIR": "/tmp"}):
             temporary_directory = _scheduler_doctor_test_temporary_directory()
         root = Path(os.path.realpath(temporary_directory.name))
 
         try:
-            self.assertEqual(root.parent, account_home)
+            self.assertEqual(root.parent, session_root)
+            self.assertNotEqual(root.parent, account_home)
+            self.assertTrue(root.is_relative_to(REPO_ROOT))
             self.assertFalse(root.is_relative_to(system_tmp))
             (root / "cleanup-probe").write_text("fixture\n", encoding="utf-8")
         finally:
@@ -90,10 +212,33 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         self.assertFalse(root.exists())
         self.assertTrue(account_home.is_dir())
 
+    def test_stale_session_is_swept_before_reuse(self) -> None:
+        session_root = _scheduler_doctor_test_session_directory()
+        namespace = session_root / "sweep-fixture"
+        namespace.mkdir(mode=0o700)
+        stale_path = namespace / "session.stale"
+        stale_path.mkdir(mode=0o700)
+        (stale_path / "residue").write_text("stale\n", encoding="utf-8")
+
+        _sweep_stale_scheduler_doctor_sessions(namespace)
+
+        self.assertFalse(stale_path.exists())
+
+    def test_namespace_lease_serializes_parallel_sweeps(self) -> None:
+        _scheduler_doctor_test_session_directory()
+        lease_path = _SCHEDULER_DOCTOR_TEST_NAMESPACE / _SCHEDULER_DOCTOR_TEST_LOCK_NAME
+        descriptor = os.open(lease_path, os.O_RDWR)
+        try:
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(descriptor)
+
 
 class SchedulerDoctorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmpdir = _scheduler_doctor_test_temporary_directory()
+        self.addCleanup(self.tmpdir.cleanup)
         self.root = Path(os.path.realpath(self.tmpdir.name))
         self.user_home = self.root / "home"
         self.home = self.user_home / ".codex"
@@ -104,6 +249,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             return_value=self.user_home,
         )
         self.path_home_patch.start()
+        self.addCleanup(self.path_home_patch.stop)
         self.host_mirror_private_control_parent = MODULE.MIRROR_PRIVATE_CONTROL_PARENT
         self.host_mirror_private_control_root_specs = (
             MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS
@@ -118,6 +264,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             self.mirror_private_control_parent,
         )
         self.mirror_private_control_parent_patch.start()
+        self.addCleanup(self.mirror_private_control_parent_patch.stop)
         self.mirror_private_control_root_specs_patch = mock.patch.object(
             MODULE,
             "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
@@ -132,12 +279,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             ),
         )
         self.mirror_private_control_root_specs_patch.start()
-
-    def tearDown(self) -> None:
-        self.mirror_private_control_root_specs_patch.stop()
-        self.mirror_private_control_parent_patch.stop()
-        self.path_home_patch.stop()
-        self.tmpdir.cleanup()
+        self.addCleanup(self.mirror_private_control_root_specs_patch.stop)
 
     def write_runner(self) -> Path:
         runner = self.home / "bin" / "codex-personal-sync"
