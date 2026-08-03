@@ -203,9 +203,46 @@ def _probe_scheduler_doctor_test_namespace_lock(
                     dir_fd=namespace_fd,
                 )
             except OSError as error:
-                if error.errno in {errno.EACCES, errno.EPERM, errno.EROFS}:
+                if error.errno == errno.EEXIST:
+                    try:
+                        metadata = os.stat(
+                            _SCHEDULER_DOCTOR_TEST_LOCK_NAME,
+                            dir_fd=namespace_fd,
+                            follow_symlinks=False,
+                        )
+                    except OSError as existing_error:
+                        if existing_error.errno in {
+                            errno.EACCES,
+                            errno.EPERM,
+                            errno.EROFS,
+                        }:
+                            raise _SchedulerDoctorTestCandidateUnavailable(
+                                existing_error
+                            ) from existing_error
+                        raise
+                    expected_identity = _scheduler_doctor_test_object_identity(
+                        metadata
+                    )
+                    try:
+                        descriptor = os.open(
+                            _SCHEDULER_DOCTOR_TEST_LOCK_NAME,
+                            flags,
+                            dir_fd=namespace_fd,
+                        )
+                    except OSError as existing_error:
+                        if existing_error.errno in {
+                            errno.EACCES,
+                            errno.EPERM,
+                            errno.EROFS,
+                        }:
+                            raise _SchedulerDoctorTestCandidateUnavailable(
+                                existing_error
+                            ) from existing_error
+                        raise
+                elif error.errno in {errno.EACCES, errno.EPERM, errno.EROFS}:
                     raise _SchedulerDoctorTestCandidateUnavailable(error) from error
-                raise
+                else:
+                    raise
         else:
             expected_identity = _scheduler_doctor_test_object_identity(metadata)
             try:
@@ -372,6 +409,8 @@ def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
     entries: list[Path] = []
     with os.scandir(namespace) as iterator:
         for entry in iterator:
+            if entry.name == _SCHEDULER_DOCTOR_TEST_LOCK_NAME:
+                continue
             if len(entries) == _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT:
                 raise RuntimeError(
                     "too many scheduler-doctor fixture namespace entries"
@@ -379,8 +418,6 @@ def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
             entries.append(namespace / entry.name)
     entries.sort(key=lambda path: path.name)
     for entry in entries:
-        if entry.name == _SCHEDULER_DOCTOR_TEST_LOCK_NAME:
-            continue
         if not entry.name.startswith(_SCHEDULER_DOCTOR_TEST_SESSION_PREFIX):
             raise RuntimeError(f"unexpected scheduler-doctor fixture entry: {entry}")
         _validate_owner_private_directory(entry)
@@ -548,6 +585,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                 range(_SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT)
             )
         ]
+        names.append(_SCHEDULER_DOCTOR_TEST_LOCK_NAME)
         iterator = TrackedScandir(names)
         namespace = Path("/bounded-scheduler-doctor-fixture")
         with (
@@ -562,7 +600,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         self.assertTrue(iterator.closed)
         self.assertEqual(
             iterator.read_count,
-            _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT,
+            _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT + 1,
         )
         self.assertEqual(
             validate.call_count,
@@ -573,8 +611,15 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT,
         )
         self.assertEqual(
-            [call.args[0].name for call in rmtree.call_args_list],
-            sorted(names),
+            [call.args[0] for call in rmtree.call_args_list],
+            sorted(
+                (
+                    namespace / name
+                    for name in names
+                    if name != _SCHEDULER_DOCTOR_TEST_LOCK_NAME
+                ),
+                key=lambda path: path.name,
+            ),
         )
 
     def test_stale_session_sweep_stops_at_limit_plus_one(self) -> None:
@@ -601,7 +646,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             def close(self) -> None:
                 self.closed = True
 
-        names = [
+        names = [_SCHEDULER_DOCTOR_TEST_LOCK_NAME] + [
             f"session.{index:04d}"
             for index in range(
                 _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT + 32
@@ -625,7 +670,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         self.assertTrue(iterator.closed)
         self.assertEqual(
             iterator.read_count,
-            _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT + 1,
+            _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT + 2,
         )
         validate.assert_not_called()
         rmtree.assert_not_called()
@@ -735,6 +780,123 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                 self.assertTrue(rejected)
                 self.assertTrue(namespace.is_relative_to(second))
                 self.assertFalse((first / ".codex-test-tmp").exists())
+
+    def test_lock_probe_reopens_after_concurrent_creation(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory)
+            namespace_fd = os.open(
+                namespace,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            original_open = os.open
+            injected = False
+            reopened_descriptor = -1
+
+            def create_concurrent_lock(
+                path: str | bytes,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal injected
+                nonlocal reopened_descriptor
+                if (
+                    path == _SCHEDULER_DOCTOR_TEST_LOCK_NAME
+                    and flags & os.O_EXCL
+                    and not injected
+                ):
+                    injected = True
+                    descriptor = original_open(
+                        path,
+                        flags,
+                        mode,
+                        dir_fd=dir_fd,
+                    )
+                    os.close(descriptor)
+                    raise OSError(errno.EEXIST, "concurrent fixture lease")
+                descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+                if path == _SCHEDULER_DOCTOR_TEST_LOCK_NAME and injected:
+                    reopened_descriptor = descriptor
+                return descriptor
+
+            try:
+                with mock.patch.object(os, "open", new=create_concurrent_lock):
+                    _probe_scheduler_doctor_test_namespace_lock(
+                        namespace,
+                        namespace_fd,
+                    )
+            finally:
+                os.close(namespace_fd)
+
+            self.assertTrue(injected)
+            metadata = (namespace / _SCHEDULER_DOCTOR_TEST_LOCK_NAME).lstat()
+            self.assertTrue(stat.S_ISREG(metadata.st_mode))
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            with self.assertRaises(OSError) as raised:
+                os.fstat(reopened_descriptor)
+            self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    def test_lock_probe_rejects_replacement_after_concurrent_creation(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory)
+            namespace_fd = os.open(
+                namespace,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            original_open = os.open
+            injected = False
+            replaced = False
+
+            def replace_concurrent_lock(
+                path: str | bytes,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal injected
+                nonlocal replaced
+                if path == _SCHEDULER_DOCTOR_TEST_LOCK_NAME and flags & os.O_EXCL:
+                    descriptor = original_open(
+                        path,
+                        flags,
+                        mode,
+                        dir_fd=dir_fd,
+                    )
+                    os.close(descriptor)
+                    injected = True
+                    raise OSError(errno.EEXIST, "concurrent fixture lease")
+                if path == _SCHEDULER_DOCTOR_TEST_LOCK_NAME and injected:
+                    lock_path = namespace / _SCHEDULER_DOCTOR_TEST_LOCK_NAME
+                    lock_path.unlink()
+                    descriptor = original_open(
+                        path,
+                        os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=dir_fd,
+                    )
+                    os.close(descriptor)
+                    replaced = True
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            try:
+                with (
+                    mock.patch.object(os, "open", new=replace_concurrent_lock),
+                    self.assertRaisesRegex(RuntimeError, "changed while opening"),
+                ):
+                    _probe_scheduler_doctor_test_namespace_lock(
+                        namespace,
+                        namespace_fd,
+                    )
+            finally:
+                os.close(namespace_fd)
+
+            self.assertTrue(injected)
+            self.assertTrue(replaced)
+            self.assertTrue(
+                (namespace / _SCHEDULER_DOCTOR_TEST_LOCK_NAME).is_file()
+            )
 
     def test_real_tmp_checkout_uses_unique_explicit_safe_anchor(self) -> None:
         with _scheduler_doctor_test_temporary_directory() as anchor_directory:
