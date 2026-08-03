@@ -20,10 +20,11 @@ superseded_by:
   `6d078594d547598db037ce358c89c8a8ac58c881`, with tree
   `70dc2c727e91036e9d155ec17dbed643eef26990`.
 - PR #6 carries the scheduler-doctor fixture follow-up and its official source
-  lock refresh. The signed evidence checkpoint is
-  `c157628d461df693eb4cbab7a7cb76000b019255`, with tree
-  `9e7a82e08d8796c2a260dc81d9457b96ac9c3a01` and source-lock SHA-256
-  `eaa104c4fdb5ef92cdf0cfd297424cee3d6eb319776cbf48a937d0e2d76c9634`.
+  lock refresh. The final signed fixture implementation head is
+  `d5f7c194db7902a1d41a0aa4cc7b239c45823670`, with tree
+  `6fe17ecac0a5a8648c1ceb423c86aadf25b3bc5a`; the verified BL-generated
+  source-lock SHA-256 is
+  `5d248e53641c642a447a399dbb5297a7d3295b3aeb5e37137b9b4241a39e6251`.
 
 ## Scope
 
@@ -1200,6 +1201,37 @@ superseded_by:
   `5dc260c4be55ccf76fed0819a123c21b22cec392df72d94eb86522dd82882833`.
   Merge, release, and all final current-head admission/review gates remain
   outstanding.
+- The final fixture hardening is frozen at signed implementation head
+  `d5f7c194db7902a1d41a0aa4cc7b239c45823670`, tree
+  `6fe17ecac0a5a8648c1ceb423c86aadf25b3bc5a`, with sole parent
+  `e10a275b6956707f7efc2e6f5cd8d6589bf9ad58`. It carries the trusted anchor
+  and namespace descriptors through lease probing, allocation, stale-session
+  sweep, and cleanup; permits candidate fallback only for exact stable policy
+  or permission failures; and fails closed on identity drift, unreadability,
+  secondary cleanup failure, or descriptor-close uncertainty. Tracked tests
+  cover real Darwin `/tmp` copied checkouts, partial `EROFS` cleanup,
+  permission fallback, bounded descriptor cleanup, and exact explicit-anchor
+  selection. The owner host passed 160/160 scheduler-doctor tests under uv
+  Python 3.13 and macOS system Python 3.9, plus `git diff --check` and an
+  independent read-only audit with no findings.
+- A fresh full BL custody clone independently matched the exact head, tree,
+  sole parent, changed blob, and GitHub provider-valid signature. Its initial
+  stock `refresh-lock` invocation failed closed because the owner-private clone
+  umask materialized the Git-declared `100755` engine as physical mode `0700`.
+  After restoring only Git-declared tracked regular-file modes
+  (`100644 -> 0644`, `100755 -> 0755`), the same stock command refreshed all
+  six sources and `refresh-lock --check` verified them. The complete
+  source-lock suite passed 230/230 tests in 347.957 seconds with one expected
+  platform skip; the direct `TMPDIR=/tmp` scheduler-doctor suite passed
+  160/160 tests in 3.679 seconds. A separate two-test smoke used a unique
+  trusted explicit anchor and a checkout physically nested beneath Darwin
+  `/tmp -> /private/tmp`; it passed 2/2 tests, left only the expected
+  single-link mode-`0600` `.session.lock`, leaked no copied checkout or session
+  directory, and the task anchor was then removed by identity-checked,
+  bottom-up cleanup. The refreshed `sync-source-lock.json` SHA-256 is
+  `5d248e53641c642a447a399dbb5297a7d3295b3aeb5e37137b9b4241a39e6251`.
+  Merge, release, installed-state changes, and final current-head review or
+  admission gates are not claimed by this checkpoint.
 
 ## Installed Host Baseline
 
