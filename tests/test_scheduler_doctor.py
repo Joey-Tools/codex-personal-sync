@@ -38,7 +38,7 @@ PUBLIC_SHA = "1" * 40
 PRIVATE_SHA = "2" * 40
 
 
-_SCHEDULER_DOCTOR_TEST_NAMESPACE = REPO_ROOT / ".codex-test-tmp" / "scheduler-doctor"
+_SCHEDULER_DOCTOR_TEST_NAMESPACE: Path | None = None
 _SCHEDULER_DOCTOR_TEST_LOCK_NAME = ".session.lock"
 _SCHEDULER_DOCTOR_TEST_SESSION_PREFIX = "session."
 _SCHEDULER_DOCTOR_TEST_SESSION: tempfile.TemporaryDirectory | None = None
@@ -47,7 +47,7 @@ _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD: int | None = None
 
 def _validate_owner_private_directory(path: Path) -> os.stat_result:
     metadata = path.lstat()
-    if not stat.S_ISDIR(metadata.st_mode) or path.is_symlink():
+    if not stat.S_ISDIR(metadata.st_mode):
         raise RuntimeError(f"test fixture path is not a real directory: {path}")
     if metadata.st_uid != os.geteuid():
         raise RuntimeError(f"test fixture path is not owned by the current uid: {path}")
@@ -56,14 +56,82 @@ def _validate_owner_private_directory(path: Path) -> os.stat_result:
     return metadata
 
 
-def _ensure_scheduler_doctor_test_namespace() -> Path:
-    parent = _SCHEDULER_DOCTOR_TEST_NAMESPACE.parent
-    for path in (parent, _SCHEDULER_DOCTOR_TEST_NAMESPACE):
+def _scheduler_doctor_test_namespace_candidates() -> tuple[Path, ...]:
+    candidates = [REPO_ROOT]
+    candidates.append(MODULE._mirror_canonical_account_home_directory())
+
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if not candidate.is_absolute():
+            continue
+        resolved = Path(os.path.realpath(candidate))
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(resolved)
+    return tuple(unique)
+
+
+def _validate_trusted_scheduler_doctor_test_root(path: Path) -> None:
+    descriptor, _identity, _access_policy = (
+        MODULE._bind_mirror_trusted_account_home(path)
+    )
+    os.close(descriptor)
+
+
+def _select_scheduler_doctor_test_namespace(
+    candidates: tuple[Path, ...] | None = None,
+) -> Path:
+    failures: list[str] = []
+    selected_candidates = (
+        _scheduler_doctor_test_namespace_candidates()
+        if candidates is None
+        else candidates
+    )
+    for candidate in selected_candidates:
+        candidate = Path(os.path.realpath(candidate))
         try:
-            path.mkdir(mode=0o700)
-        except FileExistsError:
-            pass
-        _validate_owner_private_directory(path)
+            _validate_trusted_scheduler_doctor_test_root(candidate)
+        except (OSError, RuntimeError, MODULE.SyncError) as error:
+            failures.append(f"{candidate}: {error}")
+            continue
+
+        parent = candidate / ".codex-test-tmp"
+        namespace = parent / "scheduler-doctor"
+        unavailable = False
+        for path in (parent, namespace):
+            try:
+                path.mkdir(mode=0o700)
+            except FileExistsError:
+                _validate_owner_private_directory(path)
+            except OSError as error:
+                failures.append(f"{candidate}: cannot create {path}: {error}")
+                unavailable = True
+                break
+            else:
+                _validate_owner_private_directory(path)
+        if unavailable:
+            continue
+        _validate_trusted_scheduler_doctor_test_root(namespace)
+        return namespace
+    detail = "; ".join(failures) if failures else "no absolute candidates"
+    raise RuntimeError(
+        "cannot select an owner-private scheduler-doctor test namespace: " + detail
+    )
+
+
+def _ensure_scheduler_doctor_test_namespace() -> Path:
+    global _SCHEDULER_DOCTOR_TEST_NAMESPACE
+
+    if _SCHEDULER_DOCTOR_TEST_NAMESPACE is None:
+        _SCHEDULER_DOCTOR_TEST_NAMESPACE = (
+            _select_scheduler_doctor_test_namespace()
+        )
+    _validate_owner_private_directory(_SCHEDULER_DOCTOR_TEST_NAMESPACE)
+    _validate_trusted_scheduler_doctor_test_root(
+        _SCHEDULER_DOCTOR_TEST_NAMESPACE
+    )
     return _SCHEDULER_DOCTOR_TEST_NAMESPACE
 
 
@@ -203,8 +271,10 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         try:
             self.assertEqual(root.parent, session_root)
             self.assertNotEqual(root.parent, account_home)
-            self.assertTrue(root.is_relative_to(REPO_ROOT))
             self.assertFalse(root.is_relative_to(system_tmp))
+            self.assertEqual(session_root.parent.name, "scheduler-doctor")
+            self.assertEqual(session_root.parent.parent.name, ".codex-test-tmp")
+            _validate_trusted_scheduler_doctor_test_root(session_root)
             (root / "cleanup-probe").write_text("fixture\n", encoding="utf-8")
         finally:
             temporary_directory.cleanup()
@@ -224,9 +294,47 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
 
         self.assertFalse(stale_path.exists())
 
+    def test_shared_temp_checkout_falls_back_to_safe_anchor(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as fallback_directory:
+            fallback = Path(fallback_directory)
+            namespace = _select_scheduler_doctor_test_namespace(
+                (Path("/tmp"), fallback)
+            )
+
+            self.assertTrue(namespace.is_relative_to(fallback))
+            _validate_trusted_scheduler_doctor_test_root(namespace)
+
+    def test_all_unsafe_candidates_report_a_clear_error(self) -> None:
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "cannot select an owner-private scheduler-doctor test namespace",
+        ):
+            _select_scheduler_doctor_test_namespace((Path("/tmp"),))
+
+    def test_existing_namespace_symlink_fails_closed(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as fallback_directory:
+            fallback = Path(fallback_directory)
+            parent = fallback / ".codex-test-tmp"
+            parent.mkdir(mode=0o700)
+            target = fallback / "target"
+            target.mkdir(mode=0o700)
+            (parent / "scheduler-doctor").symlink_to(
+                target,
+                target_is_directory=True,
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "test fixture path is not a real directory",
+            ):
+                _select_scheduler_doctor_test_namespace((fallback,))
+
     def test_namespace_lease_serializes_parallel_sweeps(self) -> None:
         _scheduler_doctor_test_session_directory()
-        lease_path = _SCHEDULER_DOCTOR_TEST_NAMESPACE / _SCHEDULER_DOCTOR_TEST_LOCK_NAME
+        lease_path = (
+            _ensure_scheduler_doctor_test_namespace()
+            / _SCHEDULER_DOCTOR_TEST_LOCK_NAME
+        )
         descriptor = os.open(lease_path, os.O_RDWR)
         try:
             with self.assertRaises(BlockingIOError):
