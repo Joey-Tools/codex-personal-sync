@@ -1302,6 +1302,42 @@ superseded_by:
   scheduler workstream remains active: after P lands, generator provenance
   must bind the actual squash-landed P identity before producing T/B and
   propagating the downstream private and scheduler state.
+- The final test-only stabilization is preserved as historical pre-squash
+  evidence at signed head `591cec395f7406660e59c82b64c38a16757aead7`,
+  tree `646f088834722f003064a9d48472a3181702ae07`, with sole parent
+  `7ee54f08de744146d72b56e265265797d26e835f`. Its only changed path is
+  `tests/test_scheduler_doctor.py`, blob
+  `3defcdb445342f394e69ea65d4eee6a12e0a9a18`, with SHA-256
+  `6a0cc99989b77823a7edd764ce693031b60b865f1d1656d591a3544fb7ca7b10`.
+  The replacement regression now keeps the concurrently created lock
+  descriptor open across unlink and replacement creation, preventing
+  immediate inode reuse, and a nested `finally` closes the namespace
+  descriptor even if closing the held descriptor fails. Production and
+  fixture behavior are otherwise unchanged. On the owner host, both complete
+  scheduler-doctor suites passed 164/164 under uv Python 3.13 and macOS system
+  Python 3.9, with the exact regression, Ruff E4/E7/E9/F, `py_compile`, and
+  `git diff --check` clean.
+- A new full BL custody clone matched the exact signed head, tree, sole parent,
+  changed blob, unique PR merge base, and GitHub provider-valid signature;
+  strict full fsck found no shallow, promisor, alternate, bitmap, or missing
+  object dependency. The clone began under owner-private `umask 077`; the
+  first source-lock suite correctly rejected Git-tracked mode drift and is
+  non-counting. Restoring 16 tracked regular files to their exact Git-declared
+  physical modes changed no bytes. Stock `refresh-lock` then refreshed all six
+  records, stock `refresh-lock --check` verified them, and the counting source-
+  lock suite passed 230/230 in 356.429 seconds with one expected platform skip
+  under standard `umask 022`. The exact regression passed 1/1, complete
+  scheduler-doctor suites passed 164/164 under uv Python 3.13.13 and 164/164
+  under macOS system Python 3.9.6, and the explicit trusted-anchor copied-
+  checkout smoke passed 2/2 under Darwin `/tmp -> /private/tmp`. Ruff
+  E4/E7/E9/F, both-runtime `py_compile`, and `git diff --check` were clean; the
+  owner-private namespace retained only its expected single-link mode-`0600`
+  `.session.lock`. The refreshed `sync-source-lock.json` SHA-256 is
+  `5ef9f974db8129eb204c16ebd308e92fbc5005b79c77577e29e3d5cd5ccc227c`.
+  The PR #6 scheduler-doctor fixture and final source-lock substage are
+  complete in target-branch semantics. Head `591cec395f7406660e59c82b64c38a16757aead7`
+  remains historical validation evidence only; downstream generation must
+  bind the actual squash-landed canonical `P` identity.
 
 ## Installed Host Baseline
 
@@ -1342,9 +1378,6 @@ configuration.
 
 ## Next Steps
 
-- Complete exact-current-head CI, admission, and formal review for canonical PR
-  #6. Before landing it through the repository's squash merge, prove that the
-  squash candidate tree equals the reviewed and admitted PR-head tree.
 - Treat the resulting landed canonical commit as `P`. Generate and validate
   toolbox PR #20 from exact `P`, freeze its reviewed head as `T`, then require
   the squash-landed toolbox commit `B` to have the same root tree as `T` and
