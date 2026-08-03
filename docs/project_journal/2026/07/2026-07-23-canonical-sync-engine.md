@@ -3,7 +3,7 @@ id: 20260723-canonical-sync-engine
 title: Canonical Sync Engine
 status: active
 created: 2026-07-23
-updated: 2026-08-02
+updated: 2026-08-03
 branch: codex/canonical-sync-engine
 pr:
 supersedes: []
@@ -813,10 +813,16 @@ superseded_by:
   and 636.144 seconds with Xcode Python 3.9.6. The focused repository-lock and
   documented credential-interface selections passed in both runtimes; JSON
   parsing, targeted Ruff lint/format, and `git diff --check` also passed.
-- The final ordinary ownership merge preserves signed safety head
+- The final pre-landing ordinary ownership merge preserved signed safety head
   `39c7e63358196b055f583f8827ec7db57875bff8` as its first parent and signed
   toolbox-only ownership commit `4136b174a3faba3d98206d1a5192de1fe423bff3`
-  as its second parent without rebasing or rewriting either line. The merged
+  as its second parent without rebasing or rewriting either line. That parent
+  structure is historical candidate evidence, not a landed provenance gate:
+  PR #5 later squash-landed as `6d078594d547598db037ce358c89c8a8ac58c881`,
+  whose tree `70dc2c727e91036e9d155ec17dbed643eef26990` equals the reviewed PR head
+  `15d3e6bec0d95233665a50678b75cd883c060da4` tree exactly. Downstream
+  consumers bind the landed commit and tree-equivalence proof rather than
+  requiring the candidate's parent chain. The merged candidate
   lock has exactly one `toolbox` mirror. Two task-private refreshes were
   byte-identical, `refresh-lock --check` verified all six sources, and the
   resulting `sync-source-lock.json` SHA-256 is
@@ -1218,9 +1224,11 @@ configuration.
 - Complete exact-current-head CI, admission, and formal review for canonical PR
   #6. Before landing it through the repository's squash merge, prove that the
   squash candidate tree equals the reviewed and admitted PR-head tree.
-- Use the resulting landed canonical commit to generate and validate toolbox PR
-  #20, then bind `T` (the landed toolbox commit and immutable public release)
-  into `B` (the private-overlay release baseline). Do not generate either
-  consumer from a pre-landing PR head.
+- Treat the resulting landed canonical commit as `P`. Generate and validate
+  toolbox PR #20 from exact `P`, freeze its reviewed head as `T`, then require
+  the squash-landed toolbox commit `B` to have the same root tree as `T` and
+  publish the immutable public release at exact `B`. The private overlay must
+  pin `base_release.sha = B`; it consumes neither pre-landing `P` nor
+  pre-landing `T` directly.
 - Provision `CODEX_TOOLBOX_SYNC_TOKEN` separately only if the repository owner
   wants the sync-PR workflow to become operational.
