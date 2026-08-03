@@ -1260,6 +1260,48 @@ superseded_by:
   expected stale-lock precondition before downstream tests. Merge, release,
   installed-state changes, and final current-head admission or review gates
   are not claimed by this checkpoint.
+- The PR #6 scheduler-doctor fixture hardening substage is complete. The two
+  applicable fixture findings were fixed at signed implementation head
+  `9fd850cb5d2aec2f463585fd237f0016dd71434e`,
+  tree `76d0b026d86d42a4e9a97534432dafd8d8fb130e`, with sole parent
+  `b1309d3742155bbd3a40458a3ed463fa63e6f6c6`. Its scheduler-doctor test blob
+  is `a3f44375b0f83a37eef6498c3a3bc317e6d50c67`, with SHA-256
+  `c302eba7a7da7a14fd5443d8552e60165093398deb40196d5b1ae41b177f6734`.
+  A probe that loses the exclusive `.session.lock` create race now performs
+  one no-follow reopen, binds fallback name identity to the opened descriptor,
+  and fails closed on replacement without deleting the concurrent winner's
+  lock. The bounded stale-session sweep now excludes the exact persistent lock
+  before applying the 1024-session limit: 1024 sessions plus the lock succeed,
+  while the 1025th session stops the scan after 1026 physical entries and
+  before any partial deletion. Four focused tests bind those properties. On
+  the owner host, both complete scheduler-doctor suites passed 164/164 under
+  uv Python 3.13 and macOS system Python 3.9, with Ruff, `py_compile`, and
+  `git diff --check` clean. Its one stock lock-refresh attempt changed no
+  tracked bytes and correctly stopped at `legacy-shared-v0` state
+  `legacy-recovery-pending`; this checkpoint neither repairs nor removes that
+  retained host evidence. This exact implementation identity is historical
+  review evidence, not the future canonical release identity.
+- A fresh full BL custody clone matched the exact implementation head, tree,
+  sole parent, changed blob, unique PR merge base, and GitHub provider-valid
+  signature; full strict fsck found no missing, promisor, alternate, or bitmap
+  dependency. Standard `umask 022` materialized the six locked sources at
+  their Git-declared modes, so no mode repair was needed. The unmodified stock
+  `refresh-lock` refreshed all six records and stock `refresh-lock --check`
+  verified them. The complete source-lock suite passed 230/230 tests in
+  333.131 seconds with one expected platform skip through the repository's
+  private-TMPDIR wrapper. The four focused fixture tests passed 4/4; complete
+  scheduler-doctor suites passed 164/164 under uv Python 3.13.13 and 164/164
+  under macOS system Python 3.9.6. A separate checkout physically nested under
+  Darwin `/tmp -> /private/tmp` passed the two-test explicit-anchor smoke in
+  0.302 seconds; the owner-private namespace retained only the expected
+  single-link mode-`0600` `.session.lock`, with no copied checkout or
+  `session.*` residue. The refreshed `sync-source-lock.json` SHA-256 is
+  `20d1d611ddecfae5397d3b547b85750e6805f446dfb38b18bdef203e43baa322`.
+  The fixture fixes, final source lock, and their validation are complete for
+  the target-branch state. The wider canonical-to-toolbox-to-private-to-
+  scheduler workstream remains active: after P lands, generator provenance
+  must bind the actual squash-landed P identity before producing T/B and
+  propagating the downstream private and scheduler state.
 
 ## Installed Host Baseline
 
