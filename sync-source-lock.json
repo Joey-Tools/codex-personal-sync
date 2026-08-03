@@ -43,7 +43,7 @@
     "scheduler_doctor_tests": {
       "mode": "0644",
       "path": "tests/test_scheduler_doctor.py",
-      "sha256": "975e201a3505c5b4d979d4f1e2ee65221edc20d65f2ccc8eda8986c31c714d94"
+      "sha256": "a92f40c644641417e82135407e1d537a4f1f6dea9fa61831b46734d4e72a5925"
     }
   },
   "version": 1

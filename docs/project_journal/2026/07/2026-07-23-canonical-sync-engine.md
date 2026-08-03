@@ -20,11 +20,11 @@ superseded_by:
   `6d078594d547598db037ce358c89c8a8ac58c881`, with tree
   `70dc2c727e91036e9d155ec17dbed643eef26990`.
 - PR #6 carries the scheduler-doctor fixture follow-up and its official source
-  lock refresh. The final signed fixture implementation head is
-  `d5f7c194db7902a1d41a0aa4cc7b239c45823670`, with tree
-  `6fe17ecac0a5a8648c1ceb423c86aadf25b3bc5a`; the verified BL-generated
+  lock refresh. The current signed bounded-sweep implementation head is
+  `0ad62f4aae4594d5367e945e52fb2fa2f287f09b`, with tree
+  `c774502d7acd2837b9d32bac0a493dade34e1494`; the verified BL-generated
   source-lock SHA-256 is
-  `5d248e53641c642a447a399dbb5297a7d3295b3aeb5e37137b9b4241a39e6251`.
+  `3dc052aceb912f0ff2c951c5af81b2a3a620a31edcc4a08a19d425d0ff5731ed`.
 
 ## Scope
 
@@ -1232,6 +1232,34 @@ superseded_by:
   `5d248e53641c642a447a399dbb5297a7d3295b3aeb5e37137b9b4241a39e6251`.
   Merge, release, installed-state changes, and final current-head review or
   admission gates are not claimed by this checkpoint.
+- The stale-session sweep bound is frozen at signed implementation head
+  `0ad62f4aae4594d5367e945e52fb2fa2f287f09b`, tree
+  `c774502d7acd2837b9d32bac0a493dade34e1494`, with sole parent
+  `46feb5e2b1a68dd19488ebe0a11ec24acc359253`. Its scheduler-doctor test blob is
+  `a06ace9f9530957f746a28f4f2f2fc6bedc4a874`, with SHA-256
+  `a92f40c644641417e82135407e1d537a4f1f6dea9fa61831b46734d4e72a5925`.
+  The fixture uses a context-managed `os.scandir`, reads at most the declared
+  1024-entry bound plus one overflow item, raises before append or deletion on
+  item 1025, closes the iterator on every path, and sorts only the bounded
+  collection. Exact-1024 and 1025-item tests bind both properties.
+- A fresh full BL custody clone matched the head, tree, parent, changed blob,
+  unique PR merge base, and GitHub provider-valid signature; full strict fsck
+  covered all 810 local objects with no missing, promisor, alternate, or bitmap
+  dependency. After restoring only Git-declared tracked regular-file modes
+  narrowed by the clone's owner-private umask, stock `refresh-lock` refreshed
+  all six sources and `refresh-lock --check` verified them. The complete
+  source-lock suite passed 230/230 tests in 349.259 seconds with one expected
+  platform skip. With `TMPDIR=/tmp` and a unique trusted explicit anchor, the
+  scheduler-doctor suite passed 162/162 tests in 3.945 seconds. A separate
+  checkout physically nested beneath Darwin `/tmp -> /private/tmp` passed the
+  two-test explicit-anchor smoke in 0.315 seconds; the anchor retained only the
+  expected single-link mode-`0600` `.session.lock` and no session directory.
+  The refreshed `sync-source-lock.json` SHA-256 is
+  `3dc052aceb912f0ff2c951c5af81b2a3a620a31edcc4a08a19d425d0ff5731ed`.
+  Exact-head macOS Python 3.13 and 3.9 CI jobs passed; Linux stopped at the
+  expected stale-lock precondition before downstream tests. Merge, release,
+  installed-state changes, and final current-head admission or review gates
+  are not claimed by this checkpoint.
 
 ## Installed Host Baseline
 
