@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from datetime import datetime, timedelta, timezone
+import errno
 import fcntl
 import importlib.util
 import io
@@ -39,10 +40,20 @@ PRIVATE_SHA = "2" * 40
 
 
 _SCHEDULER_DOCTOR_TEST_NAMESPACE: Path | None = None
+_SCHEDULER_DOCTOR_TEST_ANCHOR_ENV = "CODEX_SCHEDULER_DOCTOR_TEST_ANCHOR"
+_SCHEDULER_DOCTOR_TEST_EXPECTED_ANCHOR_ENV = (
+    "CODEX_SCHEDULER_DOCTOR_TEST_EXPECTED_ANCHOR"
+)
 _SCHEDULER_DOCTOR_TEST_LOCK_NAME = ".session.lock"
 _SCHEDULER_DOCTOR_TEST_SESSION_PREFIX = "session."
 _SCHEDULER_DOCTOR_TEST_SESSION: tempfile.TemporaryDirectory | None = None
 _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD: int | None = None
+
+
+class _SchedulerDoctorTestCandidateUnavailable(RuntimeError):
+    def __init__(self, error: OSError) -> None:
+        super().__init__(str(error))
+        self.error = error
 
 
 def _validate_owner_private_directory(path: Path) -> os.stat_result:
@@ -57,8 +68,20 @@ def _validate_owner_private_directory(path: Path) -> os.stat_result:
 
 
 def _scheduler_doctor_test_namespace_candidates() -> tuple[Path, ...]:
-    candidates = [REPO_ROOT]
-    candidates.append(MODULE._mirror_canonical_account_home_directory())
+    candidates: list[Path] = []
+    configured_anchor = os.environ.get(_SCHEDULER_DOCTOR_TEST_ANCHOR_ENV)
+    if configured_anchor:
+        override = Path(configured_anchor)
+        if not override.is_absolute():
+            raise RuntimeError(
+                f"{_SCHEDULER_DOCTOR_TEST_ANCHOR_ENV} must be absolute"
+            )
+        candidates.append(override)
+    candidates.append(REPO_ROOT)
+    try:
+        candidates.append(MODULE._mirror_canonical_account_home_directory())
+    except RuntimeError:
+        pass
 
     unique: list[Path] = []
     seen: set[Path] = set()
@@ -80,9 +103,150 @@ def _validate_trusted_scheduler_doctor_test_root(path: Path) -> None:
     os.close(descriptor)
 
 
+def _scheduler_doctor_test_object_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int]:
+    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+
+def _scheduler_doctor_test_anchor_is_stably_unsuitable(
+    error: MODULE.SyncError,
+    candidate: Path,
+) -> bool:
+    messages = {
+        "canonical account home must be owned by the current uid and not "
+        "group/world writable",
+        "canonical account home exceeds its ancestor limit",
+    }
+    current = Path("/")
+    for component in candidate.parts[1:]:
+        current /= component
+        messages.add(
+            "canonical account-home ancestors must be root/current-owned and "
+            f"not group/world writable: {current}"
+        )
+    return str(error) in messages
+
+
+def _cleanup_scheduler_doctor_candidate_allocation(
+    created: list[tuple[Path, tuple[int, int, int] | None]],
+) -> None:
+    for path, expected_identity in reversed(created):
+        if expected_identity is None:
+            raise RuntimeError(
+                f"scheduler-doctor fixture allocation identity is unavailable; "
+                f"retained for inspection: {path}"
+            )
+        metadata = path.lstat()
+        if _scheduler_doctor_test_object_identity(metadata) != expected_identity:
+            raise RuntimeError(
+                f"scheduler-doctor fixture allocation changed before cleanup: {path}"
+            )
+        _validate_owner_private_directory(path)
+        path.rmdir()
+        if path.exists() or path.is_symlink():
+            raise RuntimeError(
+                f"scheduler-doctor fixture allocation cleanup failed: {path}"
+            )
+
+
+def _close_scheduler_doctor_candidate_descriptors(
+    descriptors: tuple[int, ...],
+) -> list[str]:
+    failures: list[str] = []
+    for descriptor in descriptors:
+        if descriptor < 0:
+            continue
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            failures.append(f"descriptor close failed: {error}")
+    return failures
+
+
+def _close_and_cleanup_scheduler_doctor_candidate(
+    primary: BaseException,
+    descriptors: tuple[int, ...],
+    created: list[tuple[Path, tuple[int, int, int] | None]],
+) -> None:
+    secondary = _close_scheduler_doctor_candidate_descriptors(descriptors)
+    try:
+        _cleanup_scheduler_doctor_candidate_allocation(created)
+    except BaseException as error:
+        secondary.append(f"allocation cleanup failed: {error}")
+    if secondary:
+        raise RuntimeError(f"{primary}; {'; '.join(secondary)}") from primary
+
+
+def _probe_scheduler_doctor_test_namespace_lock(
+    namespace: Path,
+    namespace_fd: int,
+) -> None:
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    expected_identity: tuple[int, int, int] | None = None
+    try:
+        try:
+            metadata = os.stat(
+                _SCHEDULER_DOCTOR_TEST_LOCK_NAME,
+                dir_fd=namespace_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            try:
+                descriptor = os.open(
+                    _SCHEDULER_DOCTOR_TEST_LOCK_NAME,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=namespace_fd,
+                )
+            except OSError as error:
+                if error.errno in {errno.EACCES, errno.EPERM, errno.EROFS}:
+                    raise _SchedulerDoctorTestCandidateUnavailable(error) from error
+                raise
+        else:
+            expected_identity = _scheduler_doctor_test_object_identity(metadata)
+            try:
+                descriptor = os.open(
+                    _SCHEDULER_DOCTOR_TEST_LOCK_NAME,
+                    flags,
+                    dir_fd=namespace_fd,
+                )
+            except OSError as error:
+                if error.errno in {errno.EACCES, errno.EPERM, errno.EROFS}:
+                    raise _SchedulerDoctorTestCandidateUnavailable(error) from error
+                raise
+        descriptor_metadata = _validate_scheduler_doctor_session_lease(
+            namespace / _SCHEDULER_DOCTOR_TEST_LOCK_NAME,
+            descriptor,
+            parent_fd=namespace_fd,
+        )
+        identity = _scheduler_doctor_test_object_identity(descriptor_metadata)
+        if expected_identity is not None and expected_identity != identity:
+            raise RuntimeError(f"test fixture lease changed while opening: {namespace}")
+    except BaseException as primary:
+        secondary: list[str] = []
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                secondary.append(str(error))
+        if secondary:
+            raise RuntimeError(f"{primary}; {'; '.join(secondary)}") from primary
+        raise
+    try:
+        os.close(descriptor)
+    except OSError as error:
+        raise RuntimeError(f"cannot close fixture lease probe: {error}") from error
+
+
 def _select_scheduler_doctor_test_namespace(
     candidates: tuple[Path, ...] | None = None,
 ) -> Path:
+    # This test-only fixture guarantees an owner-private namespace and assumes
+    # cooperative same-UID users obey flock. It cannot atomically prevent a
+    # malicious same-UID replace-at-unlink race and does not claim to do so.
     failures: list[str] = []
     selected_candidates = (
         _scheduler_doctor_test_namespace_candidates()
@@ -91,29 +255,69 @@ def _select_scheduler_doctor_test_namespace(
     )
     for candidate in selected_candidates:
         candidate = Path(os.path.realpath(candidate))
+        candidate_fd = -1
+        namespace_fd = -1
+        created: list[tuple[Path, tuple[int, int, int] | None]] = []
         try:
-            _validate_trusted_scheduler_doctor_test_root(candidate)
-        except (OSError, RuntimeError, MODULE.SyncError) as error:
+            candidate_fd, _identity, _access_policy = (
+                MODULE._bind_mirror_trusted_account_home(candidate)
+            )
+        except MODULE.SyncError as error:
+            if not _scheduler_doctor_test_anchor_is_stably_unsuitable(
+                error,
+                candidate,
+            ):
+                raise
             failures.append(f"{candidate}: {error}")
             continue
 
         parent = candidate / ".codex-test-tmp"
         namespace = parent / "scheduler-doctor"
-        unavailable = False
-        for path in (parent, namespace):
-            try:
-                path.mkdir(mode=0o700)
-            except FileExistsError:
-                _validate_owner_private_directory(path)
-            except OSError as error:
-                failures.append(f"{candidate}: cannot create {path}: {error}")
-                unavailable = True
-                break
-            else:
-                _validate_owner_private_directory(path)
-        if unavailable:
+        try:
+            for path in (parent, namespace):
+                try:
+                    path.mkdir(mode=0o700)
+                except FileExistsError:
+                    _validate_owner_private_directory(path)
+                except OSError as error:
+                    if error.errno in {errno.EACCES, errno.EPERM, errno.EROFS}:
+                        raise _SchedulerDoctorTestCandidateUnavailable(error) from error
+                    raise
+                else:
+                    created.append((path, None))
+                    metadata = path.lstat()
+                    created[-1] = (
+                        path,
+                        _scheduler_doctor_test_object_identity(metadata),
+                    )
+                    _validate_owner_private_directory(path)
+            namespace_fd, _identity, _access_policy = (
+                MODULE._bind_mirror_trusted_account_home(namespace)
+            )
+            _probe_scheduler_doctor_test_namespace_lock(namespace, namespace_fd)
+        except _SchedulerDoctorTestCandidateUnavailable as unavailable:
+            _close_and_cleanup_scheduler_doctor_candidate(
+                unavailable.error,
+                (namespace_fd, candidate_fd),
+                created,
+            )
+            failures.append(f"{candidate}: {unavailable.error}")
             continue
-        _validate_trusted_scheduler_doctor_test_root(namespace)
+        except BaseException as error:
+            _close_and_cleanup_scheduler_doctor_candidate(
+                error,
+                (namespace_fd, candidate_fd),
+                created,
+            )
+            raise
+        close_failures = _close_scheduler_doctor_candidate_descriptors(
+            (namespace_fd, candidate_fd)
+        )
+        if close_failures:
+            raise RuntimeError(
+                "cannot close scheduler-doctor namespace probe: "
+                + "; ".join(close_failures)
+            )
         return namespace
     detail = "; ".join(failures) if failures else "no absolute candidates"
     raise RuntimeError(
@@ -138,9 +342,15 @@ def _ensure_scheduler_doctor_test_namespace() -> Path:
 def _validate_scheduler_doctor_session_lease(
     path: Path,
     descriptor: int,
+    *,
+    parent_fd: int | None = None,
 ) -> os.stat_result:
     descriptor_metadata = os.fstat(descriptor)
-    path_metadata = path.lstat()
+    path_metadata = (
+        path.lstat()
+        if parent_fd is None
+        else os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+    )
     if not stat.S_ISREG(descriptor_metadata.st_mode):
         raise RuntimeError(f"test fixture lease is not regular: {path}")
     if descriptor_metadata.st_nlink != 1:
@@ -264,6 +474,13 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         )
         session_root = _scheduler_doctor_test_session_directory()
         system_tmp = Path(os.path.realpath("/tmp"))
+        expected_anchor = os.environ.get(
+            _SCHEDULER_DOCTOR_TEST_EXPECTED_ANCHOR_ENV
+        )
+        if expected_anchor:
+            self.assertTrue(
+                session_root.is_relative_to(Path(os.path.realpath(expected_anchor)))
+            )
         with mock.patch.dict(os.environ, {"TMPDIR": "/tmp"}):
             temporary_directory = _scheduler_doctor_test_temporary_directory()
         root = Path(os.path.realpath(temporary_directory.name))
@@ -310,6 +527,133 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             "cannot select an owner-private scheduler-doctor test namespace",
         ):
             _select_scheduler_doctor_test_namespace((Path("/tmp"),))
+
+    def test_anchor_override_must_be_absolute_and_precedes_fallbacks(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {_SCHEDULER_DOCTOR_TEST_ANCHOR_ENV: "relative-anchor"},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "must be absolute"):
+                _scheduler_doctor_test_namespace_candidates()
+
+        with _scheduler_doctor_test_temporary_directory() as anchor_directory:
+            anchor = Path(anchor_directory)
+            with mock.patch.dict(
+                os.environ,
+                {_SCHEDULER_DOCTOR_TEST_ANCHOR_ENV: os.fspath(anchor)},
+            ):
+                candidates = _scheduler_doctor_test_namespace_candidates()
+                namespace = _select_scheduler_doctor_test_namespace()
+            self.assertEqual(candidates[0], Path(os.path.realpath(anchor)))
+            self.assertTrue(namespace.is_relative_to(anchor))
+
+    def test_stable_fallback_is_exact_and_rejects_secondary_or_drift(self) -> None:
+        candidate = Path("/fixture")
+        stable = MODULE.SyncError(
+            "canonical account-home ancestors must be root/current-owned and "
+            "not group/world writable: /fixture"
+        )
+        secondary = MODULE.SyncError(f"{stable}; secondary cleanup failed")
+        drift = MODULE.SyncError(
+            "canonical account-home ancestor changed while binding it: /fixture"
+        )
+
+        self.assertTrue(
+            _scheduler_doctor_test_anchor_is_stably_unsuitable(stable, candidate)
+        )
+        self.assertFalse(
+            _scheduler_doctor_test_anchor_is_stably_unsuitable(secondary, candidate)
+        )
+        self.assertFalse(
+            _scheduler_doctor_test_anchor_is_stably_unsuitable(drift, candidate)
+        )
+
+    def test_partial_allocation_is_removed_before_candidate_fallback(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as first_directory:
+            with _scheduler_doctor_test_temporary_directory() as second_directory:
+                first = Path(first_directory)
+                second = Path(second_directory)
+                blocked = first / ".codex-test-tmp" / "scheduler-doctor"
+                original_mkdir = Path.mkdir
+
+                def reject_namespace(path: Path, *args: object, **kwargs: object) -> None:
+                    if path == blocked:
+                        raise OSError(errno.EROFS, "read-only test namespace")
+                    original_mkdir(path, *args, **kwargs)
+
+                with mock.patch.object(Path, "mkdir", new=reject_namespace):
+                    namespace = _select_scheduler_doctor_test_namespace(
+                        (first, second)
+                    )
+                self.assertTrue(namespace.is_relative_to(second))
+                self.assertFalse((first / ".codex-test-tmp").exists())
+
+    def test_lock_open_eperm_removes_partial_candidate_and_falls_back(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as first_directory:
+            with _scheduler_doctor_test_temporary_directory() as second_directory:
+                first = Path(first_directory)
+                second = Path(second_directory)
+                original_open = os.open
+                rejected = False
+
+                def reject_first_lock(
+                    path: str | bytes,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal rejected
+                    if path == _SCHEDULER_DOCTOR_TEST_LOCK_NAME and not rejected:
+                        rejected = True
+                        raise OSError(errno.EPERM, "restricted test lease")
+                    return original_open(path, flags, mode, dir_fd=dir_fd)
+
+                with mock.patch.object(os, "open", new=reject_first_lock):
+                    namespace = _select_scheduler_doctor_test_namespace(
+                        (first, second)
+                    )
+                self.assertTrue(rejected)
+                self.assertTrue(namespace.is_relative_to(second))
+                self.assertFalse((first / ".codex-test-tmp").exists())
+
+    def test_real_tmp_checkout_uses_unique_explicit_safe_anchor(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as anchor_directory:
+            with tempfile.TemporaryDirectory(
+                prefix="scheduler-doctor-checkout.",
+                dir="/tmp",
+            ) as checkout_directory:
+                checkout = Path(checkout_directory)
+                (checkout / "scripts").mkdir()
+                (checkout / "tests").mkdir()
+                shutil.copy2(SCRIPT_PATH, checkout / "scripts" / SCRIPT_PATH.name)
+                shutil.copy2(Path(__file__), checkout / "tests" / Path(__file__).name)
+                environment = os.environ.copy()
+                environment["TMPDIR"] = "/tmp"
+                environment[_SCHEDULER_DOCTOR_TEST_ANCHOR_ENV] = anchor_directory
+                environment[_SCHEDULER_DOCTOR_TEST_EXPECTED_ANCHOR_ENV] = (
+                    anchor_directory
+                )
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "unittest",
+                        "tests.test_scheduler_doctor.SchedulerDoctorFixtureTests."
+                        "test_temporary_root_ignores_ambient_tmpdir_and_cleans_up",
+                    ],
+                    cwd=checkout,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=False,
+                )
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
 
     def test_existing_namespace_symlink_fails_closed(self) -> None:
         with _scheduler_doctor_test_temporary_directory() as fallback_directory:
