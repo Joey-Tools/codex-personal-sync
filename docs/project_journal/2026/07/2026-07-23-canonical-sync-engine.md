@@ -1181,6 +1181,25 @@ superseded_by:
   SHA-256 is
   `eaa104c4fdb5ef92cdf0cfd297424cee3d6eb319776cbf48a937d0e2d76c9634`.
   Current-head hosted CI, admission, and formal review remain head-bound gates.
+- The formal direct-Claude review of PR #6 head `888ecf2c4e6635864883e009ff7940be037a4f6c`
+  found that scheduler-doctor fixtures rooted directly in the real account home
+  could leave residue after abnormal termination and couple the suite to host
+  home-directory policy. Signed follow-up
+  `c04e8f222c312fb0ea542cd8747c5bbd00e5bb59` replaces those roots with one
+  repository-local, owner-private suite session namespace, an exclusive
+  persistent lease, stale-session cleanup, and per-test `addCleanup`; no test
+  root uses the real passwd home. The owner host passed the complete
+  scheduler-doctor suite 152/152 under Python 3.13 and macOS system Python 3.9,
+  plus Ruff and `git diff --check`. Its one official `refresh-lock` attempt
+  correctly stopped at `legacy-recovery-pending` without bypassing or mutating
+  the retained legacy evidence. On BL, the stock `refresh-lock` and
+  `refresh-lock --check` commands verified all six sources; the complete
+  source-lock suite passed 230 tests with one expected platform skip, and the
+  direct `TMPDIR=/tmp` scheduler-doctor suite passed 152/152 tests. The
+  refreshed `sync-source-lock.json` SHA-256 is
+  `5dc260c4be55ccf76fed0819a123c21b22cec392df72d94eb86522dd82882833`.
+  Merge, release, and all final current-head admission/review gates remain
+  outstanding.
 
 ## Installed Host Baseline
 
