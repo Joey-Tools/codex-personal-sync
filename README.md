@@ -322,8 +322,9 @@ run.
 
 Migration removes the precisely audited legacy `gui/$UID` job before
 bootstrapping the canonical `user/$UID` job. Status and uninstall inspect both
-domains so a stale GUI registration cannot hide a second instance. Linux keeps
-the existing per-user systemd behavior.
+domains for the canonical label and every managed legacy label, so a stale
+registration cannot hide a second instance. Linux keeps the existing per-user
+systemd behavior.
 
 Use explicit arguments only for an intentional target change or a first
 installation. For example:

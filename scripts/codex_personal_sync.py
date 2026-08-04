@@ -23883,6 +23883,7 @@ def _scheduler_daemon_enabled(
             completed: subprocess.CompletedProcess[str],
             *,
             domain_kind: str,
+            label: str,
         ) -> SchedulerDaemonQuery:
             raw_evidence = completed.stdout + "\n" + completed.stderr
             evidence = raw_evidence.strip().casefold()
@@ -23896,12 +23897,12 @@ def _scheduler_daemon_enabled(
             ):
                 return SchedulerDaemonQuery(
                     "unavailable",
-                    f"launchd {domain_kind} domain query was denied",
+                    f"launchd {domain_kind} domain query for {label} was denied",
                 )
             if completed.stderr.strip() and completed.returncode == 0:
                 return SchedulerDaemonQuery(
                     "unavailable",
-                    f"launchd {domain_kind} domain query returned "
+                    f"launchd {domain_kind} domain query for {label} returned "
                     "contradictory error output",
                 )
             if completed.returncode == 0:
@@ -23917,7 +23918,7 @@ def _scheduler_daemon_enabled(
                 )
                 or _launchd_quoted_not_loaded_evidence(
                     raw_evidence,
-                    label=LAUNCHD_LABEL,
+                    label=label,
                     uid=str(os.getuid()),
                     domain_kind=domain_kind,
                 )
@@ -23928,51 +23929,87 @@ def _scheduler_daemon_enabled(
             ):
                 return SchedulerDaemonQuery(
                     "disabled",
-                    f"launchd reports that the scheduler service is not loaded "
-                    f"in the {domain_kind} domain",
+                    f"launchd reports that scheduler service {label} is not "
+                    f"loaded in the {domain_kind} domain",
                 )
             return SchedulerDaemonQuery(
                 "unavailable",
-                f"launchd {domain_kind} domain query failed without explicit "
-                "not-loaded evidence",
+                f"launchd {domain_kind} domain query for {label} failed "
+                "without explicit not-loaded evidence",
             )
 
-        domain_queries: dict[str, SchedulerDaemonQuery] = {}
-        for domain_kind in (
-            MACOS_BACKGROUND_LAUNCHD_DOMAIN,
-            MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
-        ):
-            completed = run_query(
-                [
-                    "launchctl",
-                    "print",
-                    f"{_macos_launchd_domain(domain_kind)}/{LAUNCHD_LABEL}",
-                ],
-                description=f"{domain_kind} domain query",
-            )
-            if isinstance(completed, SchedulerDaemonQuery):
-                domain_queries[domain_kind] = completed
-            else:
-                domain_queries[domain_kind] = classify_launchd_query(
-                    completed,
-                    domain_kind=domain_kind,
+        launchd_queries: dict[tuple[str, str], SchedulerDaemonQuery] = {}
+        for label in (LAUNCHD_LABEL, *LEGACY_LAUNCHD_LABELS):
+            for domain_kind in (
+                MACOS_BACKGROUND_LAUNCHD_DOMAIN,
+                MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
+            ):
+                completed = run_query(
+                    [
+                        "launchctl",
+                        "print",
+                        f"{_macos_launchd_domain(domain_kind)}/{label}",
+                    ],
+                    description=f"{domain_kind} domain query for {label}",
                 )
+                if isinstance(completed, SchedulerDaemonQuery):
+                    launchd_queries[(label, domain_kind)] = completed
+                else:
+                    launchd_queries[(label, domain_kind)] = classify_launchd_query(
+                        completed,
+                        domain_kind=domain_kind,
+                        label=label,
+                    )
 
         unavailable = next(
             (
                 query
-                for query in domain_queries.values()
+                for query in launchd_queries.values()
                 if query.classification == "unavailable"
             ),
             None,
         )
         if unavailable is not None:
             return unavailable
+        domain_queries = {
+            domain_kind: launchd_queries[(LAUNCHD_LABEL, domain_kind)]
+            for domain_kind in (
+                MACOS_BACKGROUND_LAUNCHD_DOMAIN,
+                MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
+            )
+        }
         enabled_domains = tuple(
             domain_kind
             for domain_kind, query in domain_queries.items()
             if query.classification == "enabled"
         )
+        loaded_legacy_services = tuple(
+            (label, domain_kind)
+            for label in LEGACY_LAUNCHD_LABELS
+            for domain_kind in (
+                MACOS_BACKGROUND_LAUNCHD_DOMAIN,
+                MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
+            )
+            if launchd_queries[(label, domain_kind)].classification == "enabled"
+        )
+        if loaded_legacy_services:
+            loaded = ", ".join(
+                f"{label} in the {domain_kind} domain"
+                for label, domain_kind in loaded_legacy_services
+            )
+            if (
+                config_audit is not None
+                and config_audit.config is None
+                and not enabled_domains
+            ):
+                return SchedulerDaemonQuery(
+                    "enabled",
+                    f"launchd reports loaded legacy scheduler orphans: {loaded}",
+                )
+            return SchedulerDaemonQuery(
+                "unavailable",
+                f"launchd reports loaded legacy scheduler services: {loaded}",
+            )
         if not enabled_domains:
             return SchedulerDaemonQuery(
                 "disabled",

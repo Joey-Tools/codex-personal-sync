@@ -256,6 +256,32 @@ class SchedulerDoctorTests(unittest.TestCase):
             )
         raise AssertionError(f"unsupported launchd state: {state}")
 
+    def launchd_query_matrix(
+        self,
+        canonical_user_state: str,
+        canonical_gui_state: str,
+        *,
+        legacy_overrides: dict[tuple[str, str], str] | None = None,
+    ) -> list[subprocess.CompletedProcess[str]]:
+        overrides = legacy_overrides or {}
+        results = [
+            self.launchd_query_result("user", canonical_user_state),
+            self.launchd_query_result("gui", canonical_gui_state),
+        ]
+        for label in MODULE.LEGACY_LAUNCHD_LABELS:
+            for domain in (
+                MODULE.MACOS_BACKGROUND_LAUNCHD_DOMAIN,
+                MODULE.MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
+            ):
+                results.append(
+                    self.launchd_query_result(
+                        domain,
+                        overrides.get((label, domain), "disabled"),
+                        label=label,
+                    )
+                )
+        return results
+
     def test_macos_scheduler_config_parses_private_run_scheduled(self) -> None:
         runner = self.home / "bin" / "runner with spaces"
         paths = MODULE._scheduler_paths("macos", self.home)
@@ -7184,7 +7210,10 @@ class SchedulerDoctorTests(unittest.TestCase):
                 MODULE.SchedulerPaths(platform="macos")
             )
 
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(
+            run.call_count,
+            2 * (1 + len(MODULE.LEGACY_LAUNCHD_LABELS)),
+        )
         self.assertEqual(query.classification, "unavailable")
         self.assertIn("output exceeded its byte limit", query.reason or "")
         self.assertNotIn(payload, query.reason or "")
@@ -7437,20 +7466,11 @@ class SchedulerDoctorTests(unittest.TestCase):
                 results = [completed]
                 if platform_name == "macos":
                     if enable_returncode == 0:
-                        results = [
-                            self.launchd_query_result("user", "enabled"),
-                            self.launchd_query_result("gui", "disabled"),
-                        ]
+                        results = self.launchd_query_matrix("enabled", "disabled")
                     elif "not permitted" in enable_stderr.casefold():
-                        results = [
-                            self.launchd_query_result("user", "denied"),
-                            self.launchd_query_result("gui", "disabled"),
-                        ]
+                        results = self.launchd_query_matrix("denied", "disabled")
                     else:
-                        results = [
-                            self.launchd_query_result("user", "disabled"),
-                            self.launchd_query_result("gui", "disabled"),
-                        ]
+                        results = self.launchd_query_matrix("disabled", "disabled")
                 else:
                     results.append(
                         subprocess.CompletedProcess(
@@ -7482,13 +7502,16 @@ class SchedulerDoctorTests(unittest.TestCase):
                             [
                                 "launchctl",
                                 "print",
-                                f"user/{os.getuid()}/{MODULE.LAUNCHD_LABEL}",
-                            ],
-                            [
-                                "launchctl",
-                                "print",
-                                f"gui/{os.getuid()}/{MODULE.LAUNCHD_LABEL}",
-                            ],
+                                f"{domain}/{os.getuid()}/{label}",
+                            ]
+                            for label in (
+                                MODULE.LAUNCHD_LABEL,
+                                *MODULE.LEGACY_LAUNCHD_LABELS,
+                            )
+                            for domain in (
+                                MODULE.MACOS_BACKGROUND_LAUNCHD_DOMAIN,
+                                MODULE.MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
+                            )
                         ],
                     )
                 self.assertEqual(query.classification, classification)
@@ -7622,10 +7645,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             reason,
         ) in cases:
             with self.subTest(case=label):
-                results = [
-                    self.launchd_query_result("user", user_state),
-                    self.launchd_query_result("gui", gui_state),
-                ]
+                results = self.launchd_query_matrix(user_state, gui_state)
                 with (
                     mock.patch.object(
                         MODULE,
@@ -7647,17 +7667,142 @@ class SchedulerDoctorTests(unittest.TestCase):
                         config_audit=audit,
                     )
 
-                self.assertEqual(run.call_count, 2)
+                self.assertEqual(
+                    run.call_count,
+                    2 * (1 + len(MODULE.LEGACY_LAUNCHD_LABELS)),
+                )
                 self.assertEqual(
                     [call.args[0][2] for call in run.call_args_list],
                     [
-                        f"user/{os.getuid()}/{MODULE.LAUNCHD_LABEL}",
-                        f"gui/{os.getuid()}/{MODULE.LAUNCHD_LABEL}",
+                        f"{domain}/{os.getuid()}/{label}"
+                        for label in (
+                            MODULE.LAUNCHD_LABEL,
+                            *MODULE.LEGACY_LAUNCHD_LABELS,
+                        )
+                        for domain in (
+                            MODULE.MACOS_BACKGROUND_LAUNCHD_DOMAIN,
+                            MODULE.MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
+                        )
                     ],
                 )
                 self.assertEqual(query.classification, expected_classification)
                 if reason is not None:
                     self.assertIn(reason, query.reason or "")
+
+    def test_macos_daemon_query_rejects_loaded_legacy_services(self) -> None:
+        legacy_label = MODULE.LEGACY_LAUNCHD_LABELS[0]
+        absent_audit = MODULE.SchedulerConfigAudit(
+            config=None,
+            snapshots=(),
+        )
+        cases = (
+            ("duplicate", None, "enabled", "disabled", "unavailable"),
+            ("unbound", None, "disabled", "disabled", "unavailable"),
+            ("orphan", absent_audit, "disabled", "disabled", "enabled"),
+        )
+        for (
+            case,
+            config_audit,
+            canonical_user_state,
+            canonical_gui_state,
+            expected_classification,
+        ) in cases:
+            for legacy_domain in (
+                MODULE.MACOS_BACKGROUND_LAUNCHD_DOMAIN,
+                MODULE.MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
+            ):
+                with self.subTest(case=case, legacy_domain=legacy_domain):
+                    results = self.launchd_query_matrix(
+                        canonical_user_state,
+                        canonical_gui_state,
+                        legacy_overrides={(legacy_label, legacy_domain): "enabled"},
+                    )
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_native_scheduler_argv",
+                            side_effect=lambda args: args,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_run_bounded_scheduler_process",
+                            side_effect=results,
+                        ) as run,
+                        mock.patch.object(
+                            MODULE,
+                            "_revalidate_scheduler_status_audit",
+                        ),
+                    ):
+                        query = MODULE._scheduler_daemon_enabled(
+                            MODULE.SchedulerPaths(platform="macos"),
+                            config_audit=config_audit,
+                        )
+
+                    self.assertEqual(
+                        run.call_count,
+                        2 * (1 + len(MODULE.LEGACY_LAUNCHD_LABELS)),
+                    )
+                    self.assertEqual(
+                        query.classification,
+                        expected_classification,
+                    )
+                    self.assertIn("legacy scheduler", query.reason or "")
+                    self.assertIn(legacy_label, query.reason or "")
+                    self.assertIn(legacy_domain, query.reason or "")
+
+    def test_macos_legacy_only_daemon_is_reported_as_orphan_active(self) -> None:
+        case_user_home = self.root / "legacy-orphan-status" / "home"
+        case_user_home.mkdir(parents=True)
+        case_home = case_user_home / ".codex"
+        legacy_label = MODULE.LEGACY_LAUNCHD_LABELS[0]
+
+        def query_launchd(
+            args: list[str],
+            **_kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            domain, _uid, label = args[2].split("/", 2)
+            state = (
+                "enabled"
+                if label == legacy_label
+                and domain == MODULE.MACOS_BACKGROUND_LAUNCHD_DOMAIN
+                else "disabled"
+            )
+            return self.launchd_query_result(domain, state, label=label)
+
+        with (
+            mock.patch.object(MODULE.Path, "home", return_value=case_user_home),
+            mock.patch.object(
+                MODULE,
+                "_native_scheduler_argv",
+                side_effect=lambda args: args,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_run_bounded_scheduler_process",
+                side_effect=query_launchd,
+            ),
+            mock.patch.object(MODULE, "audit_active_skills", return_value=[]),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            report = MODULE.scheduler_report(case_home, "macos")
+            _doctor_report, issues = MODULE.doctor(
+                case_home,
+                "macos",
+                json_output=False,
+            )
+            paths = MODULE._scheduler_paths("macos", case_home)
+
+        self.assertFalse(report.installed)
+        self.assertTrue(report.enabled)
+        self.assertEqual(report.failure_code, "scheduler-orphan-active")
+        assert report.daemon_query is not None
+        self.assertEqual(report.daemon_query.classification, "enabled")
+        self.assertIn("legacy scheduler orphan", report.daemon_query.reason or "")
+        self.assertIn(
+            "scheduler-orphan-active",
+            {issue.code for issue in issues},
+        )
+        self.assertFalse(MODULE._scheduler_config_parent(paths).exists())
 
     def test_macos_daemon_query_rejects_mixed_absence_and_denial(self) -> None:
         for evidence, expected_classification, expected_reason in (
@@ -7718,6 +7863,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                 results = [
                     self.launchd_query_result("user", "disabled"),
                     completed,
+                    *self.launchd_query_matrix("disabled", "disabled")[2:],
                 ]
                 with (
                     mock.patch.object(
@@ -7734,7 +7880,10 @@ class SchedulerDoctorTests(unittest.TestCase):
                     query = MODULE._scheduler_daemon_enabled(
                         MODULE.SchedulerPaths(platform="macos")
                     )
-                self.assertEqual(run.call_count, 2)
+                self.assertEqual(
+                    run.call_count,
+                    2 * (1 + len(MODULE.LEGACY_LAUNCHD_LABELS)),
+                )
                 self.assertEqual(
                     query.classification,
                     expected_classification,
@@ -8353,12 +8502,19 @@ class SchedulerDoctorTests(unittest.TestCase):
                             metadata.st_mtime_ns + 1_000_000,
                         ),
                     )
-                    if (
-                        platform_name == "macos"
-                        and len(args) > 2
-                        and args[2].startswith("gui/")
-                    ):
-                        return self.launchd_query_result("gui", "disabled")
+                    if platform_name == "macos" and len(args) > 2:
+                        domain, _uid, label = args[2].split("/", 2)
+                        state = (
+                            "enabled"
+                            if domain == MODULE.MACOS_BACKGROUND_LAUNCHD_DOMAIN
+                            and label == MODULE.LAUNCHD_LABEL
+                            else "disabled"
+                        )
+                        return self.launchd_query_result(
+                            domain,
+                            state,
+                            label=label,
+                        )
                     return subprocess.CompletedProcess(
                         args,
                         0,

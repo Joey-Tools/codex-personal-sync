@@ -23,7 +23,7 @@ superseded_by:
 
 - Bare `install-scheduler` 保留已审计的 mode、repo、base repo、owner 和 interval，并把可识别的 legacy GUI 配置迁移为 Background 配置。
 - Activation 先精确清理 `gui/$UID` residue，再在 `user/$UID` bootstrap 和 enable canonical job；任何未知、权限或超时结果仍 fail closed。
-- `status-scheduler`、`doctor` 和 uninstall 同时检查 user 与 GUI domain，避免 stale GUI registration 形成未报告的双实例。
+- `status-scheduler`、`doctor` 和 uninstall 同时检查 canonical 与全部 managed legacy label 的 user/GUI domain 矩阵，避免 stale registration 形成未报告的双实例。
 - 现有 descriptor binding、transaction marker、exact-output parser 与 conditional-removal 安全边界继续覆盖 migration 和 cleanup。
 
 ## Operational Boundary
