@@ -7737,13 +7737,18 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                         )
                         if not isinstance(path, int):
                             name = Path(os.fsdecode(path)).name
+                            opened_role: str | None = None
                             if name == _SCHEDULER_DOCTOR_TEST_LOCK_NAME:
-                                opened["module-lease"] = descriptor
+                                opened_role = "module-lease"
                             elif (
                                 name
                                 == _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME
                             ):
-                                opened["liveness"] = descriptor
+                                opened_role = "liveness"
+                            if opened_role is not None:
+                                opened[opened_role] = descriptor
+                                if opened_role == role:
+                                    close_attempts.clear()
                         return descriptor
 
                     def fail_selected_close(descriptor: int) -> None:
