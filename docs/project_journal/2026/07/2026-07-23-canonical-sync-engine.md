@@ -3,7 +3,7 @@ id: 20260723-canonical-sync-engine
 title: Canonical Sync Engine
 status: active
 created: 2026-07-23
-updated: 2026-08-03
+updated: 2026-08-04
 branch: codex/canonical-sync-engine
 pr:
 supersedes: []
@@ -19,12 +19,14 @@ superseded_by:
 - PR #5 squash-landed as canonical commit
   `6d078594d547598db037ce358c89c8a8ac58c881`, with tree
   `70dc2c727e91036e9d155ec17dbed643eef26990`.
-- PR #6 carries the scheduler-doctor fixture follow-up and its official source
-  lock refresh. The current signed bounded-sweep implementation head is
-  `0ad62f4aae4594d5367e945e52fb2fa2f287f09b`, with tree
-  `c774502d7acd2837b9d32bac0a493dade34e1494`; the verified BL-generated
+- The PR #6 scheduler-doctor fixture and source-lock substage is complete for
+  the target-branch state. Its final pre-squash implementation evidence is
+  signed head `793a690a2454d0c761e6a08ffdc84999db78dcd6`, tree
+  `c5bb627c65b62916e266f1f6c650e90d6b4eeb8e`; the verified BL-generated
   source-lock SHA-256 is
-  `3dc052aceb912f0ff2c951c5af81b2a3a620a31edcc4a08a19d425d0ff5731ed`.
+  `73bd88706d65a79569c0b2e05061590aac73345b48faa7aab29a5168a524db66`.
+  These pre-squash identities remain historical evidence only. Downstream
+  generation must bind the actual squash-landed canonical `P` identity.
 
 ## Scope
 
@@ -1338,6 +1340,39 @@ superseded_by:
   complete in target-branch semantics. Head `591cec395f7406660e59c82b64c38a16757aead7`
   remains historical validation evidence only; downstream generation must
   bind the actual squash-landed canonical `P` identity.
+- The final PR #6 remediation is preserved as historical pre-squash evidence
+  at signed implementation head
+  `793a690a2454d0c761e6a08ffdc84999db78dcd6`, tree
+  `c5bb627c65b62916e266f1f6c650e90d6b4eeb8e`, with sole parent
+  `34ba9b4210adf15a80e838252e528b3211f01d7b` and signing fingerprint
+  `EFBBC913F49A5F6E0AF0D248F70246143DC28F32`. Its only implementation path is
+  `tests/test_scheduler_doctor.py`, blob
+  `5e87b7f6ef36d84ea7d4a51f133658958c9c9296`, with SHA-256
+  `8510855b4a4141ad3cf6a2d24cf3414770f9c8eca5de41229127494300fdd49e`.
+  The fixture no longer resolves or writes the real passwd account home;
+  module-lease acquisition uses nonblocking `flock` under a monotonic timeout;
+  stale-session planning and descriptor-relative deletion share explicit
+  entry, depth, and deadline budgets while binding object identity and the
+  owner-private access policy; and the journal summary now points at the final
+  fixture and lock evidence rather than an intermediate checkpoint. On the
+  owner host, the exact tree passed 25/25 focused fixture tests, 174/174 full
+  scheduler-doctor tests under uv Python 3.13 and 174/174 under macOS system
+  Python 3.9, plus Ruff E4/E7/E9/F, `py_compile`, and `git diff --check`.
+  A fresh full BL custody clone independently matched the head, tree, parent,
+  branch, unique PR merge base, object closure, and GitHub provider-valid
+  signature. The unmodified stock `refresh-lock` refreshed all six sources and
+  stock `refresh-lock --check` verified them. Under standard `umask 022`, the
+  complete canonical source-lock suite passed 230/230 in 345.369 seconds with
+  one expected platform skip, the focused fixture class passed 25/25, and the
+  full scheduler-doctor suite passed 174/174 under uv Python 3.13.13. The
+  explicit owner-private test anchor retained only the expected regular,
+  single-link mode-`0600` `.session.lock` and no `session.*` directory. The
+  refreshed `sync-source-lock.json` SHA-256 is
+  `73bd88706d65a79569c0b2e05061590aac73345b48faa7aab29a5168a524db66`.
+  The fixture fixes, source lock, and their validation are complete for the
+  target-branch state. All listed heads remain historical validation evidence;
+  after squash landing, toolbox generation must bind the actual canonical `P`
+  identity before producing `T`/`B` or propagating private and scheduler state.
 
 ## Installed Host Baseline
 
