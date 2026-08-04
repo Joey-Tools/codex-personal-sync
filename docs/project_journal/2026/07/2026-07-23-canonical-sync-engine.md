@@ -20,11 +20,14 @@ superseded_by:
   `6d078594d547598db037ce358c89c8a8ac58c881`, with tree
   `70dc2c727e91036e9d155ec17dbed643eef26990`.
 - The PR #6 scheduler-doctor fixture and source-lock substage is complete for
-  the target-branch state. Its latest pre-squash implementation evidence is
-  signed head `aec928f939b1b99c368edc1796c74feaf814722c`, tree
-  `398fca352b8b9e2cf2136add853964e0ae141187`; the verified BL-generated
-  source-lock SHA-256 is
-  `343d9fac510b9e010b54fca25dc798acb2e0d468fecb9518b1f0a0cd17f680c8`.
+  the target-branch state. Its latest signed pre-squash implementation evidence
+  is head `cc7e932676416aa7f0f29eecafdc5a8469a96252`, tree
+  `871eac3a1b891cfa2322891d816c83f318621c31`, with sole parent
+  `a02fa93ff87ed27c0b7f573cd900f16db1545b31`. That signed merge checkpoint
+  joins feature parent `85f66dbc42550a96fd10d5f2857bc9ae19e7a3de` and canonical
+  `master` `867be02c2831b343501eac8c9e6ff325fae68369`. The verified
+  BL-generated source-lock SHA-256 is
+  `cfc050e042dffd5727d8b9904adfaacbebb6c06455a03394b33f4eda1260d765`.
   These pre-squash identities remain historical evidence only. Downstream
   generation must bind the actual squash-landed canonical `P` identity.
 
@@ -1783,6 +1786,43 @@ superseded_by:
   `git diff --check` passed. The refreshed `sync-source-lock.json` SHA-256 is
   `343d9fac510b9e010b54fca25dc798acb2e0d468fecb9518b1f0a0cd17f680c8`.
   The implementation and append-only source-lock/journal identities remain
+  historical evidence only. Downstream generation must bind the actual
+  squash-landed canonical `P` before producing `T`/`B` or propagating private
+  and scheduler state.
+- The superseding PR #6 merged-master source-lock checkpoint is complete for
+  the target-branch state. Historical pre-squash evidence is signed head
+  `cc7e932676416aa7f0f29eecafdc5a8469a96252`, tree
+  `871eac3a1b891cfa2322891d816c83f318621c31`, with sole parent
+  `a02fa93ff87ed27c0b7f573cd900f16db1545b31`; that signed merge checkpoint has
+  tree `4d59ecbd6d5b77c388d642d41a98c08f1c82bf1c` and parents
+  `85f66dbc42550a96fd10d5f2857bc9ae19e7a3de` and canonical `master`
+  `867be02c2831b343501eac8c9e6ff325fae68369`. GitHub reported PR #6 open,
+  unmerged, and exact-head, and reported the `cc7e932` provider signature
+  valid. A fresh full HTTPS BL custody clone matched every identity and the
+  changed `tests/test_scheduler_doctor.py` blob
+  `67e15a00c520e039d7624e6f4510b8f3a4e3bb8d`, SHA-256
+  `07a310e903a0c93645b96c803fde469d1874459a12d6e9bc243a0318664ea0f0`.
+  The source was non-shallow and non-promisor with no alternate, bitmap,
+  replace ref, or lazy-fetch dependency; strict full `fsck` passed all 1,060
+  objects and 106 commit-graph commits. The checkout matched 23 Git-declared
+  `0644` files and one `0755` file under standard physical modes. Unmodified
+  stock `refresh-lock` refreshed six sources and stock `refresh-lock --check`
+  verified them. The canonical source-lock suite passed 230/230 in 334.135
+  seconds with one expected platform skip. The descriptor-generation close
+  accounting regression passed 100 consecutive repetitions under Python
+  3.13.13 and macOS system Python 3.9.6 in 0.378 and 0.526 seconds. The 14
+  cleanup-quarantine regressions passed 14/14 in 1.032 and 0.641 seconds; the
+  ten merged-master LaunchAgent regressions passed 10/10 in 0.147 and 0.199
+  seconds. The full scheduler-doctor suite passed 261/261 in 5.905 and 6.497
+  seconds, and the full personal-sync suite passed 228/228 in 11.326 and
+  15.078 seconds, with one expected platform skip per full suite and runtime.
+  The owner-private scheduler-doctor namespace ended with only its regular,
+  single-link, mode-`0600` `.session.lock`. All nine tracked Python files
+  passed `py_compile` under both runtimes; JSON parsing, `git diff --check`,
+  and project-journal validation passed. The refreshed
+  `sync-source-lock.json` SHA-256 is
+  `cfc050e042dffd5727d8b9904adfaacbebb6c06455a03394b33f4eda1260d765`.
+  These implementation and append-only source-lock/journal identities remain
   historical evidence only. Downstream generation must bind the actual
   squash-landed canonical `P` before producing `T`/`B` or propagating private
   and scheduler state.
