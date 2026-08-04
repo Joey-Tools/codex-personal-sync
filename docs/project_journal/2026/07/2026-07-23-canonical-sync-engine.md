@@ -21,10 +21,10 @@ superseded_by:
   `70dc2c727e91036e9d155ec17dbed643eef26990`.
 - The PR #6 scheduler-doctor fixture and source-lock substage is complete for
   the target-branch state. Its latest pre-squash implementation evidence is
-  signed head `c39f0f6e57d4059323fbc0076707f7be53688922`, tree
-  `ff179f9484ea0d34576e7d5fa0eea26bad717b5b`; the verified BL-generated
+  signed head `09c4d648f0c2bd4befad5c3f73cf6e504c3d767d`, tree
+  `a31fc531c5f14b9422e2742b02351ea740f57516`; the verified BL-generated
   source-lock SHA-256 is
-  `4695d2c0f3985b4b5014a6e560c03525c8dc927b449b985866964ec379c57641`.
+  `6aa52db04ad49f128e68683728b7b47c022cd292b3860bf6e4147ec027ed6298`.
   These pre-squash identities remain historical evidence only. Downstream
   generation must bind the actual squash-landed canonical `P` identity.
 
@@ -1407,6 +1407,53 @@ superseded_by:
   target-branch state; downstream generation still binds only the actual
   squash-landed canonical `P` identity before producing `T`/`B` or propagating
   private and scheduler state.
+- The stable platform-namespace remediation is preserved as historical
+  pre-squash evidence at signed implementation head
+  `09c4d648f0c2bd4befad5c3f73cf6e504c3d767d`, tree
+  `a31fc531c5f14b9422e2742b02351ea740f57516`, with sole parent
+  `2a2ceca80e31e867f29d71679856db6015f75076` and signing fingerprint
+  `EFBBC913F49A5F6E0AF0D248F70246143DC28F32`. Its implementation changes are
+  `.gitignore`, blob `3b7b62fe65629bf3dcdb07e8f9903efe41f0a95f` with SHA-256
+  `67efa32b243fbba8989679f2e657c2411e5d66b5437e097171249b5f8dd0789f`,
+  and `tests/test_scheduler_doctor.py`, blob
+  `889ef6b7c3f22821ee354a603933bed00cdd514b` with SHA-256
+  `84a2fb9a483099d6ca445af79b872e6a50348ec1f1cc1fbbcd9e72b1344a49bb`.
+  The fixture now selects an explicit anchor, a stable scoped Darwin/Linux
+  platform parent, or the repository root; it uses the stable
+  `<candidate>/.codex-tmp/scheduler-doctor` namespace, leaves only its safe
+  mode-`0600` lease, and independently resets the session, descriptors, and
+  module globals. Descriptor-relative stale recovery remains bounded by entry,
+  depth, and deadline budgets. Canonical keeps both `/.codex-test-tmp/` for
+  legacy residue and `/.codex-tmp/` for the stable namespace. The toolbox
+  generated surface remains six source files plus its receipt: `.gitignore` is
+  consumer-owned and is not added to the mapping. The mapping digest remains
+  `3e26648dd65526e759089c5acf5a9f429f3df0f5adc8dbe94b3856954b801ece`
+  and the file-set digest remains
+  `c280b934568b6bc8df0c993b91d3e2e051970a8395870bf0419fc475556af7ad`.
+  A fresh full BL custody clone independently matched the branch, head, tree,
+  parent, unique PR merge base, complete object closure, provider signature,
+  and local `GOODSIG`/`VALIDSIG`. Unmodified stock `refresh-lock` refreshed all
+  six sources and stock `refresh-lock --check` verified them after restoring
+  only the Git-declared physical modes in the owner-private checkout. Under
+  standard `umask 022`, the complete canonical source-lock suite passed
+  230/230 in 350.163 seconds with one expected platform skip.
+  `SchedulerDoctorFixtureTests` passed 40/40 under uv Python 3.13.13 in 0.653
+  seconds and macOS system Python 3.9.6 in 0.454 seconds; the full
+  scheduler-doctor suite passed 189/189 in 4.182 and 5.184 seconds
+  respectively. The two real `TMPDIR=/tmp` copied-checkout cases passed 2/2
+  under each runtime in 0.621 and 0.435 seconds, with no retained
+  `scheduler-doctor-checkout.*`; the explicit owner-private test namespace
+  contained only its regular, single-link mode-`0600` `.session.lock` and no
+  `session.*`. Both runtimes passed `py_compile`, and frozen-range plus
+  working-tree `git diff --check` passed. The owner-side Ruff E4/E7/E9/F gate
+  was clean; BL had no installed Ruff executable and did not install one.
+  The refreshed `sync-source-lock.json` SHA-256 is
+  `6aa52db04ad49f128e68683728b7b47c022cd292b3860bf6e4147ec027ed6298`.
+  The fixture behavior, source lock, and validation are complete for the
+  target-branch state. Both the implementation head and its append-only
+  validation commit are historical pre-squash evidence only; downstream
+  generation must bind the actual squash-landed canonical `P` before producing
+  `T`/`B` or propagating private and scheduler state.
 
 ## Installed Host Baseline
 
