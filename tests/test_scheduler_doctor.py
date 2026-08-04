@@ -59,6 +59,10 @@ _SCHEDULER_DOCTOR_TEST_LIVENESS_REGISTRY_ENV = (
 )
 _SCHEDULER_DOCTOR_TEST_SESSION_PREFIX = "session."
 _SCHEDULER_DOCTOR_TEST_STAGING_PREFIX = ".session-staging."
+_SCHEDULER_DOCTOR_TEST_DELETE_PREFIX = ".delete.scheduler-session."
+_SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME = "payload"
+_SCHEDULER_DOCTOR_TEST_DELETE_NONCE_BYTES = 16
+_SCHEDULER_DOCTOR_TEST_DELETE_CREATE_ATTEMPTS = 32
 _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT = 1024
 _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_ENTRY_LIMIT = 10_000
 _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_DEPTH_LIMIT = 64
@@ -84,6 +88,18 @@ class _SchedulerDoctorTestCandidateUnavailable(RuntimeError):
     def __init__(self, error: OSError) -> None:
         super().__init__(str(error))
         self.error = error
+
+
+class _SchedulerDoctorDeleteQuarantineFailure(RuntimeError):
+    def __init__(self, retained_path: Path | None, reason: str) -> None:
+        super().__init__(reason)
+        self.retained_path = retained_path
+
+
+class _SchedulerDoctorQuarantineTransitionFailure(RuntimeError):
+    def __init__(self, retained_name: str, reason: str) -> None:
+        super().__init__(reason)
+        self.retained_name = retained_name
 
 
 @dataclass(frozen=True)
@@ -123,6 +139,25 @@ class _SchedulerDoctorStaleSessionCandidate:
     busy: bool
     plans: tuple[_SchedulerDoctorStaleEntryPlan, ...] | None
     staging: bool
+
+
+@dataclass(frozen=True)
+class _SchedulerDoctorDeleteQuarantineCandidate:
+    name: str
+    identity: tuple[int, int, int]
+    payload_identity: tuple[int, int, int] | None
+    liveness_identity: tuple[int, int, int] | None
+    liveness_present: bool
+    busy: bool
+    plans: tuple[_SchedulerDoctorStaleEntryPlan, ...] | None
+
+
+@dataclass(frozen=True)
+class _SchedulerDoctorDeleteQuarantineBinding:
+    name: str
+    identity: tuple[int, int, int]
+    descriptor: int
+    payload_identity: tuple[int, int, int] | None
 
 
 @dataclass(frozen=True)
@@ -1836,6 +1871,7 @@ def _bounded_scheduler_doctor_stale_session_names(
             if not (
                 name.startswith(_SCHEDULER_DOCTOR_TEST_SESSION_PREFIX)
                 or name.startswith(_SCHEDULER_DOCTOR_TEST_STAGING_PREFIX)
+                or name.startswith(_SCHEDULER_DOCTOR_TEST_DELETE_PREFIX)
             ):
                 raise RuntimeError(
                     f"unexpected scheduler-doctor fixture entry: {name}"
@@ -2238,6 +2274,7 @@ def _plan_scheduler_doctor_session_contents(
     budget: _SchedulerDoctorStaleCleanupBudget,
     *,
     root_mount_identity: tuple[int, int | None],
+    child_depth: int = 2,
 ) -> tuple[_SchedulerDoctorStaleEntryPlan, ...]:
     child_names: list[str] = []
     marker_seen = False
@@ -2255,7 +2292,10 @@ def _plan_scheduler_doctor_session_contents(
                     )
                 marker_seen = True
                 continue
-            _reserve_scheduler_doctor_stale_cleanup_entry(budget, depth=2)
+            _reserve_scheduler_doctor_stale_cleanup_entry(
+                budget,
+                depth=child_depth,
+            )
             child_names.append(child_name)
     if not marker_seen:
         raise RuntimeError(
@@ -2267,7 +2307,7 @@ def _plan_scheduler_doctor_session_contents(
             session_fd,
             child_name,
             budget,
-            depth=2,
+            depth=child_depth,
             root_mount_identity=root_mount_identity,
             reserved=True,
         )
@@ -2275,7 +2315,12 @@ def _plan_scheduler_doctor_session_contents(
     )
     expected_names = tuple(
         sorted(
-            child_names + [_SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME],
+            child_names
+            + (
+                [_SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME]
+                if marker_seen
+                else []
+            ),
             key=os.fsencode,
         )
     )
@@ -2285,6 +2330,706 @@ def _plan_scheduler_doctor_session_contents(
         deadline=budget.deadline,
     )
     return plans
+
+
+def _validate_scheduler_doctor_delete_quarantine_binding(
+    namespace_fd: int,
+    namespace_mount_identity: tuple[int, int | None],
+    quarantine: _SchedulerDoctorDeleteQuarantineBinding,
+    expected_names: tuple[str, ...],
+    *,
+    deadline: float,
+) -> None:
+    descriptor_metadata = os.fstat(quarantine.descriptor)
+    named_metadata = os.stat(
+        quarantine.name,
+        dir_fd=namespace_fd,
+        follow_symlinks=False,
+    )
+    if (
+        _scheduler_doctor_test_object_identity(descriptor_metadata)
+        != quarantine.identity
+        or _scheduler_doctor_test_object_identity(named_metadata)
+        != quarantine.identity
+        or not _scheduler_doctor_metadata_is_owner_private_directory(
+            descriptor_metadata
+        )
+        or not _scheduler_doctor_metadata_is_owner_private_directory(
+            named_metadata
+        )
+        or _scheduler_doctor_stale_directory_mount_identity(
+            quarantine.descriptor
+        )
+        != namespace_mount_identity
+    ):
+        raise RuntimeError("scheduler-doctor delete quarantine changed")
+    _revalidate_scheduler_doctor_stale_directory_names(
+        quarantine.descriptor,
+        expected_names,
+        deadline=deadline,
+    )
+
+
+def _validate_scheduler_doctor_delete_payload_binding(
+    quarantine_fd: int,
+    payload_fd: int,
+    payload_identity: tuple[int, int, int],
+    namespace_mount_identity: tuple[int, int | None],
+) -> None:
+    descriptor_metadata = os.fstat(payload_fd)
+    named_metadata = os.stat(
+        _SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME,
+        dir_fd=quarantine_fd,
+        follow_symlinks=False,
+    )
+    if (
+        _scheduler_doctor_test_object_identity(descriptor_metadata)
+        != payload_identity
+        or _scheduler_doctor_test_object_identity(named_metadata)
+        != payload_identity
+        or not _scheduler_doctor_metadata_is_owner_private_directory(
+            descriptor_metadata
+        )
+        or not _scheduler_doctor_metadata_is_owner_private_directory(
+            named_metadata
+        )
+        or _scheduler_doctor_stale_directory_mount_identity(payload_fd)
+        != namespace_mount_identity
+    ):
+        raise RuntimeError(
+            "scheduler-doctor delete quarantine payload changed"
+        )
+
+
+def _create_scheduler_doctor_delete_quarantine(
+    namespace_fd: int,
+    namespace_mount_identity: tuple[int, int | None],
+) -> _SchedulerDoctorDeleteQuarantineBinding:
+    for _attempt in range(_SCHEDULER_DOCTOR_TEST_DELETE_CREATE_ATTEMPTS):
+        name = (
+            _SCHEDULER_DOCTOR_TEST_DELETE_PREFIX
+            + os.urandom(_SCHEDULER_DOCTOR_TEST_DELETE_NONCE_BYTES).hex()
+        )
+        try:
+            os.mkdir(name, 0o700, dir_fd=namespace_fd)
+        except FileExistsError:
+            continue
+
+        descriptor = -1
+        binding: _SchedulerDoctorDeleteQuarantineBinding | None = None
+        try:
+            metadata = os.stat(
+                name,
+                dir_fd=namespace_fd,
+                follow_symlinks=False,
+            )
+            identity = _scheduler_doctor_test_object_identity(metadata)
+            if not _scheduler_doctor_metadata_is_owner_private_directory(metadata):
+                raise RuntimeError(
+                    "scheduler-doctor delete quarantine is not an owner-private "
+                    f"directory: {name}"
+                )
+            descriptor = _open_scheduler_doctor_stale_directory(
+                namespace_fd,
+                name,
+                identity,
+                expected_mount_identity=namespace_mount_identity,
+                require_owner_private_directory=True,
+            )
+            binding = _SchedulerDoctorDeleteQuarantineBinding(
+                name=name,
+                identity=identity,
+                descriptor=descriptor,
+                payload_identity=None,
+            )
+            _validate_scheduler_doctor_delete_quarantine_binding(
+                namespace_fd,
+                namespace_mount_identity,
+                binding,
+                (),
+                deadline=(
+                    time.monotonic()
+                    + _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_TIMEOUT_SECONDS
+                ),
+            )
+            return binding
+        except BaseException as error:
+            cleanup_failure: BaseException | None = None
+            if binding is None:
+                cleanup_failure = RuntimeError(
+                    "delete quarantine binding is unavailable"
+                )
+            else:
+                try:
+                    _validate_scheduler_doctor_delete_quarantine_binding(
+                        namespace_fd,
+                        namespace_mount_identity,
+                        binding,
+                        (),
+                        deadline=(
+                            time.monotonic()
+                            + _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_TIMEOUT_SECONDS
+                        ),
+                    )
+                    os.rmdir(name, dir_fd=namespace_fd)
+                except BaseException as cleanup_error:
+                    cleanup_failure = cleanup_error
+            close_failures = _close_scheduler_doctor_candidate_descriptors(
+                (descriptor,)
+            )
+            retained = False
+            try:
+                os.stat(
+                    name,
+                    dir_fd=namespace_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            except OSError:
+                retained = True
+            else:
+                retained = True
+            detail = "; ".join(close_failures)
+            if cleanup_failure is not None:
+                detail = (
+                    f"{detail}; " if detail else ""
+                ) + f"empty quarantine cleanup failed: {cleanup_failure}"
+            message = f"{error}; {detail}" if detail else str(error)
+            if retained:
+                raise _SchedulerDoctorQuarantineTransitionFailure(
+                    name,
+                    message,
+                ) from error
+            if close_failures or cleanup_failure is not None:
+                raise RuntimeError(message) from error
+            raise
+    raise RuntimeError(
+        "cannot allocate scheduler-doctor delete quarantine after bounded "
+        "nonce retries"
+    )
+
+
+def _remove_empty_scheduler_doctor_delete_quarantine(
+    namespace_fd: int,
+    namespace_mount_identity: tuple[int, int | None],
+    quarantine: _SchedulerDoctorDeleteQuarantineBinding,
+    *,
+    deadline: float,
+) -> None:
+    _validate_scheduler_doctor_delete_quarantine_binding(
+        namespace_fd,
+        namespace_mount_identity,
+        quarantine,
+        (),
+        deadline=deadline,
+    )
+    os.rmdir(quarantine.name, dir_fd=namespace_fd)
+
+
+def _quarantine_scheduler_doctor_session(
+    namespace_fd: int,
+    namespace_mount_identity: tuple[int, int | None],
+    source_name: str,
+    source_fd: int,
+    source_identity: tuple[int, int, int],
+    *,
+    deadline: float,
+) -> _SchedulerDoctorDeleteQuarantineBinding:
+    quarantine = _create_scheduler_doctor_delete_quarantine(
+        namespace_fd,
+        namespace_mount_identity,
+    )
+    renamed = False
+    retained_quarantine = False
+    try:
+        _validate_scheduler_doctor_delete_quarantine_binding(
+            namespace_fd,
+            namespace_mount_identity,
+            quarantine,
+            (),
+            deadline=deadline,
+        )
+        source_descriptor_metadata = os.fstat(source_fd)
+        source_named_metadata = os.stat(
+            source_name,
+            dir_fd=namespace_fd,
+            follow_symlinks=False,
+        )
+        if (
+            _scheduler_doctor_test_object_identity(source_descriptor_metadata)
+            != source_identity
+            or _scheduler_doctor_test_object_identity(source_named_metadata)
+            != source_identity
+            or not _scheduler_doctor_metadata_is_owner_private_directory(
+                source_descriptor_metadata
+            )
+            or not _scheduler_doctor_metadata_is_owner_private_directory(
+                source_named_metadata
+            )
+            or _scheduler_doctor_stale_directory_mount_identity(source_fd)
+            != namespace_mount_identity
+        ):
+            raise RuntimeError(
+                "scheduler-doctor session changed before quarantine rename"
+            )
+        try:
+            os.stat(
+                _SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME,
+                dir_fd=quarantine.descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise RuntimeError(
+                "scheduler-doctor delete quarantine payload already exists"
+            )
+        _validate_scheduler_doctor_delete_quarantine_binding(
+            namespace_fd,
+            namespace_mount_identity,
+            quarantine,
+            (),
+            deadline=deadline,
+        )
+        try:
+            os.rename(
+                source_name,
+                _SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME,
+                src_dir_fd=namespace_fd,
+                dst_dir_fd=quarantine.descriptor,
+            )
+            renamed = True
+        except BaseException as error:
+            try:
+                _remove_empty_scheduler_doctor_delete_quarantine(
+                    namespace_fd,
+                    namespace_mount_identity,
+                    quarantine,
+                    deadline=deadline,
+                )
+            except BaseException as cleanup_error:
+                retained_quarantine = True
+                raise RuntimeError(
+                    f"{error}; empty quarantine cleanup failed: {cleanup_error}"
+                ) from error
+            raise
+
+        try:
+            os.stat(
+                source_name,
+                dir_fd=namespace_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise RuntimeError(
+                "cannot prove scheduler-doctor source namespace was released"
+            ) from error
+        else:
+            raise RuntimeError(
+                "scheduler-doctor source namespace remained after quarantine rename"
+            )
+
+        renamed_quarantine = _SchedulerDoctorDeleteQuarantineBinding(
+            name=quarantine.name,
+            identity=quarantine.identity,
+            descriptor=quarantine.descriptor,
+            payload_identity=source_identity,
+        )
+        _validate_scheduler_doctor_delete_quarantine_binding(
+            namespace_fd,
+            namespace_mount_identity,
+            renamed_quarantine,
+            (_SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME,),
+            deadline=deadline,
+        )
+        _validate_scheduler_doctor_delete_payload_binding(
+            quarantine.descriptor,
+            source_fd,
+            source_identity,
+            namespace_mount_identity,
+        )
+        return renamed_quarantine
+    except BaseException as error:
+        close_failures = _close_scheduler_doctor_candidate_descriptors(
+            (quarantine.descriptor,)
+        )
+        message = str(error)
+        if close_failures:
+            message += "; " + "; ".join(close_failures)
+        if renamed or retained_quarantine:
+            raise _SchedulerDoctorQuarantineTransitionFailure(
+                quarantine.name,
+                message,
+            ) from error
+        if close_failures:
+            raise RuntimeError(message) from error
+        raise
+
+
+def _classify_scheduler_doctor_delete_quarantine(
+    namespace_fd: int,
+    namespace_mount_identity: tuple[int, int | None],
+    name: str,
+    budget: _SchedulerDoctorStaleCleanupBudget,
+) -> _SchedulerDoctorDeleteQuarantineCandidate:
+    _reserve_scheduler_doctor_stale_cleanup_entry(budget, depth=1)
+    metadata = os.stat(name, dir_fd=namespace_fd, follow_symlinks=False)
+    identity = _scheduler_doctor_test_object_identity(metadata)
+    if not _scheduler_doctor_metadata_is_owner_private_directory(metadata):
+        raise RuntimeError(
+            "scheduler-doctor delete quarantine is not an owner-private "
+            f"directory: {name}"
+        )
+    quarantine_fd = _open_scheduler_doctor_stale_directory(
+        namespace_fd,
+        name,
+        identity,
+        expected_mount_identity=namespace_mount_identity,
+        require_owner_private_directory=True,
+    )
+    payload_fd = -1
+    liveness_fd = -1
+    primary: BaseException | None = None
+    try:
+        quarantine = _SchedulerDoctorDeleteQuarantineBinding(
+            name=name,
+            identity=identity,
+            descriptor=quarantine_fd,
+            payload_identity=None,
+        )
+        try:
+            payload_metadata = os.stat(
+                _SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME,
+                dir_fd=quarantine_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            _validate_scheduler_doctor_delete_quarantine_binding(
+                namespace_fd,
+                namespace_mount_identity,
+                quarantine,
+                (),
+                deadline=budget.deadline,
+            )
+            return _SchedulerDoctorDeleteQuarantineCandidate(
+                name=name,
+                identity=identity,
+                payload_identity=None,
+                liveness_identity=None,
+                liveness_present=False,
+                busy=False,
+                plans=(),
+            )
+        _validate_scheduler_doctor_delete_quarantine_binding(
+            namespace_fd,
+            namespace_mount_identity,
+            quarantine,
+            (_SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME,),
+            deadline=budget.deadline,
+        )
+        _reserve_scheduler_doctor_stale_cleanup_entry(budget, depth=2)
+        payload_identity = _scheduler_doctor_test_object_identity(payload_metadata)
+        if not _scheduler_doctor_metadata_is_owner_private_directory(
+            payload_metadata
+        ):
+            raise RuntimeError(
+                "scheduler-doctor delete quarantine payload is not owner-private"
+            )
+        payload_fd = _open_scheduler_doctor_stale_directory(
+            quarantine_fd,
+            _SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME,
+            payload_identity,
+            expected_mount_identity=namespace_mount_identity,
+            require_owner_private_directory=True,
+        )
+        _validate_scheduler_doctor_delete_payload_binding(
+            quarantine_fd,
+            payload_fd,
+            payload_identity,
+            namespace_mount_identity,
+        )
+        with os.scandir(payload_fd) as iterator:
+            if time.monotonic() >= budget.deadline:
+                raise RuntimeError(
+                    "scheduler-doctor stale-session cleanup planning timed out"
+                )
+            first_payload_entry = next(iterator, None)
+        if (
+            first_payload_entry is not None
+            and not isinstance(first_payload_entry.name, str)
+        ):
+            raise RuntimeError(
+                "scheduler-doctor delete quarantine payload name is not text"
+            )
+        liveness_present = first_payload_entry is not None
+        liveness_identity: tuple[int, int, int] | None = None
+        busy = False
+        plans: tuple[_SchedulerDoctorStaleEntryPlan, ...] | None = None
+        if liveness_present:
+            try:
+                liveness_fd, liveness_identity = (
+                    _open_scheduler_doctor_liveness_descriptor(
+                        Path(_SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME),
+                        payload_fd,
+                        expected_mount_identity=namespace_mount_identity,
+                    )
+                )
+            except FileNotFoundError as error:
+                raise RuntimeError(
+                    "scheduler-doctor markerless delete quarantine payload is "
+                    "not empty"
+                ) from error
+            busy = _scheduler_doctor_liveness_is_busy(liveness_fd)
+        if not busy and liveness_present:
+            plans = _plan_scheduler_doctor_session_contents(
+                payload_fd,
+                budget,
+                root_mount_identity=namespace_mount_identity,
+                child_depth=3,
+            )
+            assert liveness_identity is not None
+            _validate_scheduler_doctor_liveness_descriptor(
+                Path(_SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME),
+                liveness_fd,
+                parent_fd=payload_fd,
+                expected_mount_identity=namespace_mount_identity,
+                expected_identity=liveness_identity,
+            )
+        elif not busy:
+            plans = ()
+        _validate_scheduler_doctor_delete_quarantine_binding(
+            namespace_fd,
+            namespace_mount_identity,
+            quarantine,
+            (_SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME,),
+            deadline=budget.deadline,
+        )
+        return _SchedulerDoctorDeleteQuarantineCandidate(
+            name=name,
+            identity=identity,
+            payload_identity=payload_identity,
+            liveness_identity=liveness_identity,
+            liveness_present=liveness_present,
+            busy=busy,
+            plans=plans,
+        )
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        close_failures = _close_scheduler_doctor_candidate_descriptors(
+            (liveness_fd, payload_fd, quarantine_fd)
+        )
+        if close_failures:
+            message = "; ".join(close_failures)
+            if primary is not None:
+                raise RuntimeError(f"{primary}; {message}") from primary
+            raise RuntimeError(message)
+
+
+def _delete_scheduler_doctor_quarantine_payload(
+    namespace_fd: int,
+    namespace_mount_identity: tuple[int, int | None],
+    candidate: _SchedulerDoctorDeleteQuarantineCandidate,
+    *,
+    deadline: float,
+    quarantine_descriptor: int | None = None,
+    payload_descriptor: int | None = None,
+    liveness_descriptor: int | None = None,
+) -> bool:
+    quarantine_fd = -1
+    payload_fd = -1
+    liveness_fd = -1
+    owned_descriptors: list[int] = []
+    if quarantine_descriptor is None:
+        quarantine_fd = _open_scheduler_doctor_stale_directory(
+            namespace_fd,
+            candidate.name,
+            candidate.identity,
+            expected_mount_identity=namespace_mount_identity,
+            require_owner_private_directory=True,
+        )
+        owned_descriptors.append(quarantine_fd)
+    else:
+        quarantine_fd = quarantine_descriptor
+    quarantine = _SchedulerDoctorDeleteQuarantineBinding(
+        name=candidate.name,
+        identity=candidate.identity,
+        descriptor=quarantine_fd,
+        payload_identity=candidate.payload_identity,
+    )
+    primary: BaseException | None = None
+    delete_complete = False
+    try:
+        if candidate.payload_identity is None:
+            _validate_scheduler_doctor_delete_quarantine_binding(
+                namespace_fd,
+                namespace_mount_identity,
+                quarantine,
+                (),
+                deadline=deadline,
+            )
+        else:
+            if candidate.plans is None:
+                if candidate.busy:
+                    return False
+                raise RuntimeError(
+                    "scheduler-doctor delete quarantine plan is unavailable"
+                )
+            _validate_scheduler_doctor_delete_quarantine_binding(
+                namespace_fd,
+                namespace_mount_identity,
+                quarantine,
+                (_SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME,),
+                deadline=deadline,
+            )
+            if payload_descriptor is None:
+                payload_fd = _open_scheduler_doctor_stale_directory(
+                    quarantine_fd,
+                    _SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME,
+                    candidate.payload_identity,
+                    expected_mount_identity=namespace_mount_identity,
+                    require_owner_private_directory=True,
+                )
+                owned_descriptors.append(payload_fd)
+            else:
+                payload_fd = payload_descriptor
+            _validate_scheduler_doctor_delete_payload_binding(
+                quarantine_fd,
+                payload_fd,
+                candidate.payload_identity,
+                namespace_mount_identity,
+            )
+            if candidate.liveness_present:
+                if candidate.liveness_identity is None:
+                    raise RuntimeError(
+                        "scheduler-doctor delete quarantine liveness plan is invalid"
+                    )
+                if liveness_descriptor is None:
+                    liveness_fd, liveness_identity = (
+                        _open_scheduler_doctor_liveness_descriptor(
+                            Path(_SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME),
+                            payload_fd,
+                            expected_mount_identity=namespace_mount_identity,
+                            expected_identity=candidate.liveness_identity,
+                        )
+                    )
+                    owned_descriptors.append(liveness_fd)
+                else:
+                    liveness_fd = liveness_descriptor
+                    liveness_identity = candidate.liveness_identity
+                if _scheduler_doctor_liveness_is_busy(liveness_fd):
+                    return False
+                _validate_scheduler_doctor_liveness_descriptor(
+                    Path(_SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME),
+                    liveness_fd,
+                    parent_fd=payload_fd,
+                    expected_mount_identity=namespace_mount_identity,
+                    expected_identity=liveness_identity,
+                )
+            expected_names = tuple(
+                sorted(
+                    [plan.name for plan in candidate.plans]
+                    + (
+                        [_SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME]
+                        if candidate.liveness_present
+                        else []
+                    ),
+                    key=os.fsencode,
+                )
+            )
+            _revalidate_scheduler_doctor_stale_directory_names(
+                payload_fd,
+                expected_names,
+                deadline=deadline,
+            )
+            for plan in candidate.plans:
+                _revalidate_scheduler_doctor_stale_entry_plan(
+                    payload_fd,
+                    plan,
+                    deadline=deadline,
+                    root_mount_identity=namespace_mount_identity,
+                )
+            _validate_scheduler_doctor_delete_quarantine_binding(
+                namespace_fd,
+                namespace_mount_identity,
+                quarantine,
+                (_SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME,),
+                deadline=deadline,
+            )
+            _validate_scheduler_doctor_delete_payload_binding(
+                quarantine_fd,
+                payload_fd,
+                candidate.payload_identity,
+                namespace_mount_identity,
+            )
+            for plan in candidate.plans:
+                _apply_scheduler_doctor_stale_entry_plan(
+                    payload_fd,
+                    plan,
+                    deadline=deadline,
+                    root_mount_identity=namespace_mount_identity,
+                )
+            if candidate.liveness_present:
+                assert candidate.liveness_identity is not None
+                _validate_scheduler_doctor_liveness_descriptor(
+                    Path(_SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME),
+                    liveness_fd,
+                    parent_fd=payload_fd,
+                    expected_mount_identity=namespace_mount_identity,
+                    expected_identity=candidate.liveness_identity,
+                )
+                os.unlink(
+                    _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME,
+                    dir_fd=payload_fd,
+                )
+            _revalidate_scheduler_doctor_stale_directory_names(
+                payload_fd,
+                (),
+                deadline=deadline,
+            )
+            _validate_scheduler_doctor_delete_payload_binding(
+                quarantine_fd,
+                payload_fd,
+                candidate.payload_identity,
+                namespace_mount_identity,
+            )
+            os.rmdir(
+                _SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME,
+                dir_fd=quarantine_fd,
+            )
+            _validate_scheduler_doctor_delete_quarantine_binding(
+                namespace_fd,
+                namespace_mount_identity,
+                quarantine,
+                (),
+                deadline=deadline,
+            )
+        _validate_scheduler_doctor_delete_quarantine_binding(
+            namespace_fd,
+            namespace_mount_identity,
+            quarantine,
+            (),
+            deadline=deadline,
+        )
+        os.rmdir(candidate.name, dir_fd=namespace_fd)
+        delete_complete = True
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        close_failures = _close_scheduler_doctor_candidate_descriptors(
+            tuple(reversed(owned_descriptors))
+        )
+        if close_failures:
+            message = "; ".join(close_failures)
+            if primary is not None:
+                raise RuntimeError(f"{primary}; {message}") from primary
+            raise RuntimeError(message)
+    return delete_complete
 
 
 def _delete_scheduler_doctor_stale_session(
@@ -2306,6 +3051,8 @@ def _delete_scheduler_doctor_stale_session(
         require_owner_private_directory=True,
     )
     liveness_fd = -1
+    quarantine: _SchedulerDoctorDeleteQuarantineBinding | None = None
+    delete_result = False
     primary: BaseException | None = None
     try:
         if candidate.liveness_identity is None:
@@ -2342,105 +3089,117 @@ def _delete_scheduler_doctor_stale_session(
                     "scheduler-doctor staging directory changed: "
                     f"{candidate.name}"
                 )
-            os.rmdir(candidate.name, dir_fd=namespace_fd)
-            return True
-        liveness_fd, liveness_identity = (
-            _open_scheduler_doctor_liveness_descriptor(
-                Path(candidate.name),
+            quarantine = _quarantine_scheduler_doctor_session(
+                namespace_fd,
+                namespace_mount_identity,
+                candidate.name,
                 session_fd,
+                candidate.identity,
+                deadline=deadline,
+            )
+            delete_result = _delete_scheduler_doctor_quarantine_payload(
+                namespace_fd,
+                namespace_mount_identity,
+                _SchedulerDoctorDeleteQuarantineCandidate(
+                    name=quarantine.name,
+                    identity=quarantine.identity,
+                    payload_identity=quarantine.payload_identity,
+                    liveness_identity=None,
+                    liveness_present=False,
+                    busy=False,
+                    plans=candidate.plans,
+                ),
+                deadline=deadline,
+                quarantine_descriptor=quarantine.descriptor,
+                payload_descriptor=session_fd,
+            )
+        else:
+            liveness_fd, liveness_identity = (
+                _open_scheduler_doctor_liveness_descriptor(
+                    Path(candidate.name),
+                    session_fd,
+                    expected_mount_identity=namespace_mount_identity,
+                    expected_identity=candidate.liveness_identity,
+                )
+            )
+            if _scheduler_doctor_liveness_is_busy(liveness_fd):
+                return False
+            expected_names = tuple(
+                sorted(
+                    [plan.name for plan in candidate.plans]
+                    + [_SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME],
+                    key=os.fsencode,
+                )
+            )
+            _revalidate_scheduler_doctor_stale_directory_names(
+                session_fd,
+                expected_names,
+                deadline=deadline,
+            )
+            if (
+                _scheduler_doctor_stale_directory_mount_identity(session_fd)
+                != namespace_mount_identity
+            ):
+                raise RuntimeError(
+                    "scheduler-doctor stale-session directory crosses a mount "
+                    f"boundary: {candidate.name}"
+                )
+            for plan in candidate.plans:
+                _revalidate_scheduler_doctor_stale_entry_plan(
+                    session_fd,
+                    plan,
+                    deadline=deadline,
+                    root_mount_identity=namespace_mount_identity,
+                )
+            _validate_scheduler_doctor_liveness_descriptor(
+                Path(_SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME),
+                liveness_fd,
+                parent_fd=session_fd,
                 expected_mount_identity=namespace_mount_identity,
-                expected_identity=candidate.liveness_identity,
+                expected_identity=liveness_identity,
             )
-        )
-        if _scheduler_doctor_liveness_is_busy(liveness_fd):
-            return False
-        expected_names = tuple(
-            sorted(
-                [plan.name for plan in candidate.plans]
-                + [_SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME],
-                key=os.fsencode,
-            )
-        )
-        _revalidate_scheduler_doctor_stale_directory_names(
-            session_fd,
-            expected_names,
-            deadline=deadline,
-        )
-        if (
-            _scheduler_doctor_stale_directory_mount_identity(session_fd)
-            != namespace_mount_identity
-        ):
-            raise RuntimeError(
-                "scheduler-doctor stale-session directory crosses a mount "
-                f"boundary: {candidate.name}"
-            )
-        for plan in candidate.plans:
-            _revalidate_scheduler_doctor_stale_entry_plan(
+            quarantine = _quarantine_scheduler_doctor_session(
+                namespace_fd,
+                namespace_mount_identity,
+                candidate.name,
                 session_fd,
-                plan,
+                candidate.identity,
                 deadline=deadline,
-                root_mount_identity=namespace_mount_identity,
             )
-        _validate_scheduler_doctor_liveness_descriptor(
-            Path(_SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME),
-            liveness_fd,
-            parent_fd=session_fd,
-            expected_mount_identity=namespace_mount_identity,
-            expected_identity=liveness_identity,
-        )
-        for plan in candidate.plans:
-            _apply_scheduler_doctor_stale_entry_plan(
-                session_fd,
-                plan,
+            delete_result = _delete_scheduler_doctor_quarantine_payload(
+                namespace_fd,
+                namespace_mount_identity,
+                _SchedulerDoctorDeleteQuarantineCandidate(
+                    name=quarantine.name,
+                    identity=quarantine.identity,
+                    payload_identity=quarantine.payload_identity,
+                    liveness_identity=candidate.liveness_identity,
+                    liveness_present=True,
+                    busy=False,
+                    plans=candidate.plans,
+                ),
                 deadline=deadline,
-                root_mount_identity=namespace_mount_identity,
+                quarantine_descriptor=quarantine.descriptor,
+                payload_descriptor=session_fd,
+                liveness_descriptor=liveness_fd,
             )
-        _validate_scheduler_doctor_liveness_descriptor(
-            Path(_SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME),
-            liveness_fd,
-            parent_fd=session_fd,
-            expected_mount_identity=namespace_mount_identity,
-            expected_identity=liveness_identity,
-        )
-        os.unlink(
-            _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME,
-            dir_fd=session_fd,
-        )
-        with os.scandir(session_fd) as iterator:
-            unexpected = next(iterator, None)
-        if unexpected is not None:
-            raise RuntimeError(
-                "scheduler-doctor stale-session directory changed during cleanup: "
-                f"{candidate.name}"
-            )
-        metadata = os.stat(
-            candidate.name,
-            dir_fd=namespace_fd,
-            follow_symlinks=False,
-        )
-        if (
-            _scheduler_doctor_test_object_identity(metadata)
-            != candidate.identity
-            or not _scheduler_doctor_metadata_is_owner_private_directory(metadata)
-        ):
-            raise RuntimeError(
-                "scheduler-doctor stale-session directory changed: "
-                f"{candidate.name}"
-            )
-        os.rmdir(candidate.name, dir_fd=namespace_fd)
     except BaseException as error:
         primary = error
         raise
     finally:
         close_failures = _close_scheduler_doctor_candidate_descriptors(
-            (liveness_fd, session_fd)
+            (
+                liveness_fd,
+                session_fd,
+                quarantine.descriptor if quarantine is not None else -1,
+            )
         )
         if close_failures:
             message = "; ".join(close_failures)
             if primary is not None:
                 raise RuntimeError(f"{primary}; {message}") from primary
             raise RuntimeError(message)
-    return True
+    return delete_result
 
 
 def _classify_scheduler_doctor_stale_session(
@@ -2607,15 +3366,29 @@ def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
             remaining_entries=_SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_ENTRY_LIMIT,
             depth_limit=_SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_DEPTH_LIMIT,
         )
-        candidates = tuple(
-            _classify_scheduler_doctor_stale_session(
-                namespace_fd,
-                namespace_mount_identity,
-                name,
-                budget,
-            )
-            for name in session_names
-        )
+        session_candidates: list[_SchedulerDoctorStaleSessionCandidate] = []
+        quarantine_candidates: list[
+            _SchedulerDoctorDeleteQuarantineCandidate
+        ] = []
+        for name in session_names:
+            if name.startswith(_SCHEDULER_DOCTOR_TEST_DELETE_PREFIX):
+                quarantine_candidates.append(
+                    _classify_scheduler_doctor_delete_quarantine(
+                        namespace_fd,
+                        namespace_mount_identity,
+                        name,
+                        budget,
+                    )
+                )
+            else:
+                session_candidates.append(
+                    _classify_scheduler_doctor_stale_session(
+                        namespace_fd,
+                        namespace_mount_identity,
+                        name,
+                        budget,
+                    )
+                )
         if (
             _bounded_scheduler_doctor_stale_session_names(
                 namespace_fd,
@@ -2646,7 +3419,18 @@ def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
                 "scheduler-doctor fixture namespace changed during cleanup planning"
             )
         retained: set[str] = set()
-        for candidate in candidates:
+        for candidate in quarantine_candidates:
+            if candidate.busy:
+                retained.add(candidate.name)
+                continue
+            if not _delete_scheduler_doctor_quarantine_payload(
+                namespace_fd,
+                namespace_mount_identity,
+                candidate,
+                deadline=deadline,
+            ):
+                retained.add(candidate.name)
+        for candidate in session_candidates:
             if candidate.busy:
                 retained.add(candidate.name)
                 continue
@@ -2689,6 +3473,71 @@ def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
         os.close(namespace_fd)
 
 
+def _resolve_scheduler_doctor_initialization_session_path(
+    namespace: Path,
+    namespace_descriptor: int,
+    session_descriptor: int,
+    expected_mount_identity: tuple[int, int | None],
+    expected_identity: tuple[int, int, int],
+    staging_name: str,
+    final_name: str,
+) -> Path:
+    descriptor_metadata = os.fstat(session_descriptor)
+    if (
+        _scheduler_doctor_test_object_identity(descriptor_metadata)
+        != expected_identity
+        or not _scheduler_doctor_metadata_is_owner_private_directory(
+            descriptor_metadata
+        )
+        or _scheduler_doctor_stale_directory_mount_identity(session_descriptor)
+        != expected_mount_identity
+    ):
+        raise RuntimeError(
+            "scheduler-doctor initialization session descriptor changed"
+        )
+    matches: list[str] = []
+    for name in (staging_name, final_name):
+        try:
+            metadata = os.stat(
+                name,
+                dir_fd=namespace_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise RuntimeError(
+                "scheduler-doctor initialization session name is unreadable: "
+                f"{name}"
+            ) from error
+        if (
+            _scheduler_doctor_test_object_identity(metadata) != expected_identity
+            or not _scheduler_doctor_metadata_is_owner_private_directory(metadata)
+        ):
+            raise RuntimeError(
+                "scheduler-doctor initialization session name changed: "
+                f"{name}"
+            )
+        candidate_descriptor = _open_scheduler_doctor_stale_directory(
+            namespace_descriptor,
+            name,
+            expected_identity,
+            expected_mount_identity=expected_mount_identity,
+            require_owner_private_directory=True,
+        )
+        close_failures = _close_scheduler_doctor_candidate_descriptors(
+            (candidate_descriptor,)
+        )
+        if close_failures:
+            raise RuntimeError("; ".join(close_failures))
+        matches.append(name)
+    if len(matches) != 1:
+        raise RuntimeError(
+            "scheduler-doctor initialization session publication is ambiguous"
+        )
+    return namespace / matches[0]
+
+
 def _cleanup_scheduler_doctor_initialization_path(
     path: Path,
     namespace_descriptor: int,
@@ -2726,7 +3575,8 @@ def _cleanup_scheduler_doctor_initialization_path(
         raise RuntimeError(
             "scheduler-doctor initialization path changed before rollback"
         )
-    if expected_liveness_identity is None:
+    liveness_present = expected_liveness_identity is not None
+    if not liveness_present:
         with os.scandir(session_descriptor) as iterator:
             unexpected = next(iterator, None)
         if unexpected is not None:
@@ -2753,26 +3603,83 @@ def _cleanup_scheduler_doctor_initialization_path(
                 + _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_TIMEOUT_SECONDS
             ),
         )
-        os.unlink(
-            _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME,
-            dir_fd=session_descriptor,
-        )
-    with os.scandir(session_descriptor) as iterator:
-        unexpected = next(iterator, None)
-    if unexpected is not None:
-        raise RuntimeError(
-            "scheduler-doctor initialization path retained unexpected entries"
-        )
-    metadata = os.stat(
-        path.name,
-        dir_fd=namespace_descriptor,
-        follow_symlinks=False,
+        if _scheduler_doctor_liveness_is_busy(liveness_descriptor):
+            raise RuntimeError(
+                "scheduler-doctor initialization path is still held by a child"
+            )
+    deadline = (
+        time.monotonic()
+        + _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_TIMEOUT_SECONDS
     )
-    if _scheduler_doctor_test_object_identity(metadata) != expected_identity:
-        raise RuntimeError(
-            "scheduler-doctor initialization path changed during rollback"
+    quarantine: _SchedulerDoctorDeleteQuarantineBinding | None = None
+    try:
+        quarantine = _quarantine_scheduler_doctor_session(
+            namespace_descriptor,
+            expected_mount_identity,
+            path.name,
+            session_descriptor,
+            expected_identity,
+            deadline=deadline,
         )
-    os.rmdir(path.name, dir_fd=namespace_descriptor)
+        deleted = _delete_scheduler_doctor_quarantine_payload(
+            namespace_descriptor,
+            expected_mount_identity,
+            _SchedulerDoctorDeleteQuarantineCandidate(
+                name=quarantine.name,
+                identity=quarantine.identity,
+                payload_identity=quarantine.payload_identity,
+                liveness_identity=expected_liveness_identity,
+                liveness_present=liveness_present,
+                busy=False,
+                plans=(),
+            ),
+            deadline=deadline,
+            quarantine_descriptor=quarantine.descriptor,
+            payload_descriptor=session_descriptor,
+            liveness_descriptor=(
+                liveness_descriptor if liveness_present else None
+            ),
+        )
+        if not deleted:
+            raise RuntimeError(
+                "scheduler-doctor initialization path remained busy after "
+                "quarantine"
+            )
+    except BaseException as error:
+        close_failures = _close_scheduler_doctor_candidate_descriptors(
+            (quarantine.descriptor,) if quarantine is not None else ()
+        )
+        message = str(error)
+        if close_failures:
+            message += "; " + "; ".join(close_failures)
+        retained_name = (
+            quarantine.name
+            if quarantine is not None
+            else (
+                error.retained_name
+                if isinstance(
+                    error,
+                    _SchedulerDoctorQuarantineTransitionFailure,
+                )
+                else None
+            )
+        )
+        if retained_name is not None:
+            raise _SchedulerDoctorDeleteQuarantineFailure(
+                path.parent / retained_name,
+                message,
+            ) from error
+        if close_failures:
+            raise RuntimeError(message) from error
+        raise
+    close_failures = _close_scheduler_doctor_candidate_descriptors(
+        (quarantine.descriptor,)
+    )
+    if close_failures:
+        raise _SchedulerDoctorDeleteQuarantineFailure(
+            None,
+            "; ".join(close_failures),
+        )
 
 
 def _scheduler_doctor_test_session_directory() -> Path:
@@ -2883,12 +3790,34 @@ def _scheduler_doctor_test_session_directory() -> Path:
             raise RuntimeError(
                 "scheduler-doctor published session path already exists"
             )
-        os.rename(
-            session_path.name,
-            final_name,
-            src_dir_fd=namespace_descriptor,
-            dst_dir_fd=namespace_descriptor,
-        )
+        staging_name = session_path.name
+        try:
+            os.rename(
+                staging_name,
+                final_name,
+                src_dir_fd=namespace_descriptor,
+                dst_dir_fd=namespace_descriptor,
+            )
+        except BaseException as rename_error:
+            try:
+                session_path = (
+                    _resolve_scheduler_doctor_initialization_session_path(
+                        namespace,
+                        namespace_descriptor,
+                        session_descriptor,
+                        namespace_mount_identity,
+                        session_identity,
+                        staging_name,
+                        final_name,
+                    )
+                )
+            except BaseException as locator_error:
+                session_path = None
+                raise RuntimeError(
+                    f"{rename_error}; initialization publication locator "
+                    f"failed: {locator_error}"
+                ) from rename_error
+            raise
         session_path = namespace / final_name
         session_binding = _SchedulerDoctorActiveSessionBinding(
             path=session_path,
@@ -2954,9 +3883,17 @@ def _scheduler_doctor_test_session_directory() -> Path:
                     )
                 except BaseException as cleanup_error:
                     message = f"{error}; rollback cleanup failed: {cleanup_error}"
+                    cleanup_retained_path = (
+                        cleanup_error.retained_path
+                        if isinstance(
+                            cleanup_error,
+                            _SchedulerDoctorDeleteQuarantineFailure,
+                        )
+                        else session_path
+                    )
                     _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
                         _SchedulerDoctorSessionCleanupFailure(
-                            retained_path=session_path,
+                            retained_path=cleanup_retained_path,
                             reason=message,
                             abandoned_custody=tuple(
                                 _SchedulerDoctorAbandonedDescriptorCustody(
@@ -2970,6 +3907,7 @@ def _scheduler_doctor_test_session_directory() -> Path:
                         )
                     )
                     raise RuntimeError(message) from error
+                retained_path = None
             close_failures, abandoned = (
                 _close_scheduler_doctor_cleanup_custody(
                     tuple(rollback_custody)
@@ -3123,59 +4061,72 @@ def _remove_bound_scheduler_doctor_active_session(
             root_mount_identity=binding.namespace_mount_identity,
         )
     _validate_scheduler_doctor_active_session_binding(probe_binding)
-    for plan in plans:
-        _apply_scheduler_doctor_stale_entry_plan(
-            binding.descriptor,
-            plan,
-            deadline=deadline,
-            root_mount_identity=binding.namespace_mount_identity,
-        )
-    _validate_scheduler_doctor_liveness_descriptor(
-        binding.path / _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME,
-        liveness_probe,
-        parent_fd=binding.descriptor,
-        expected_mount_identity=binding.mount_identity,
-        expected_identity=binding.liveness_identity,
-    )
-    os.unlink(
-        _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME,
-        dir_fd=binding.descriptor,
-    )
-    with os.scandir(binding.descriptor) as iterator:
-        unexpected = next(iterator, None)
-    if unexpected is not None:
-        raise RuntimeError(
-            "scheduler-doctor active session changed during cleanup"
-        )
-    named_session_metadata = os.stat(
-        binding.path.name,
-        dir_fd=binding.namespace_descriptor,
-        follow_symlinks=False,
-    )
-    if (
-        _scheduler_doctor_test_object_identity(named_session_metadata)
-        != binding.identity
-        or not _scheduler_doctor_metadata_is_owner_private_directory(
-            named_session_metadata
-        )
-    ):
-        raise RuntimeError(
-            "scheduler-doctor active session object changed during cleanup"
-        )
-    os.rmdir(binding.path.name, dir_fd=binding.namespace_descriptor)
+    quarantine: _SchedulerDoctorDeleteQuarantineBinding | None = None
     try:
-        os.stat(
+        quarantine = _quarantine_scheduler_doctor_session(
+            binding.namespace_descriptor,
+            binding.namespace_mount_identity,
             binding.path.name,
-            dir_fd=binding.namespace_descriptor,
-            follow_symlinks=False,
+            binding.descriptor,
+            binding.identity,
+            deadline=deadline,
         )
-    except FileNotFoundError:
-        return
-    except OSError as error:
-        raise RuntimeError(
-            "cannot verify scheduler-doctor active-session cleanup"
-        ) from error
-    raise RuntimeError("scheduler-doctor active session cleanup retained its root")
+        deleted = _delete_scheduler_doctor_quarantine_payload(
+            binding.namespace_descriptor,
+            binding.namespace_mount_identity,
+            _SchedulerDoctorDeleteQuarantineCandidate(
+                name=quarantine.name,
+                identity=quarantine.identity,
+                payload_identity=quarantine.payload_identity,
+                liveness_identity=binding.liveness_identity,
+                liveness_present=True,
+                busy=False,
+                plans=plans,
+            ),
+            deadline=deadline,
+            quarantine_descriptor=quarantine.descriptor,
+            payload_descriptor=binding.descriptor,
+            liveness_descriptor=liveness_probe,
+        )
+        if not deleted:
+            raise RuntimeError(
+                "scheduler-doctor active session remained busy after quarantine"
+            )
+    except BaseException as error:
+        close_failures = _close_scheduler_doctor_candidate_descriptors(
+            (quarantine.descriptor,) if quarantine is not None else ()
+        )
+        message = str(error)
+        if close_failures:
+            message += "; " + "; ".join(close_failures)
+        retained_name = (
+            quarantine.name
+            if quarantine is not None
+            else (
+                error.retained_name
+                if isinstance(
+                    error,
+                    _SchedulerDoctorQuarantineTransitionFailure,
+                )
+                else None
+            )
+        )
+        if retained_name is not None:
+            raise _SchedulerDoctorDeleteQuarantineFailure(
+                binding.namespace_path / retained_name,
+                message,
+            ) from error
+        if close_failures:
+            raise RuntimeError(message) from error
+        raise
+    close_failures = _close_scheduler_doctor_candidate_descriptors(
+        (quarantine.descriptor,)
+    )
+    if close_failures:
+        raise _SchedulerDoctorDeleteQuarantineFailure(
+            None,
+            "; ".join(close_failures),
+        )
 
 
 def _close_scheduler_doctor_cleanup_custody(
@@ -3413,9 +4364,14 @@ def _cleanup_scheduler_doctor_test_session() -> None:
         primary = error
 
     if primary is not None:
+        retained_path = (
+            primary.retained_path
+            if isinstance(primary, _SchedulerDoctorDeleteQuarantineFailure)
+            else binding.path
+        )
         _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
             _SchedulerDoctorSessionCleanupFailure(
-                retained_path=binding.path,
+                retained_path=retained_path,
                 reason=str(primary),
                 abandoned_custody=retained_probe_custody,
             )
@@ -3438,136 +4394,12 @@ def _cleanup_scheduler_doctor_test_session() -> None:
         message = "; ".join(close_failures)
         _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
             _SchedulerDoctorSessionCleanupFailure(
-                retained_path=binding.path,
+                retained_path=None,
                 reason=message,
                 abandoned_custody=abandoned,
             )
         )
         raise RuntimeError(message)
-    _SCHEDULER_DOCTOR_TEST_SESSION = None
-    _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD = None
-    _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = None
-
-
-def _reset_retained_scheduler_doctor_cleanup_failure_for_test() -> None:
-    global _SCHEDULER_DOCTOR_TEST_SESSION
-    global _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD
-    global _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
-
-    failure = _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
-    if failure is None:
-        return
-    if any(
-        custody.state != "retained-open"
-        for custody in failure.abandoned_custody
-    ):
-        raise RuntimeError(
-            "test reset refuses close-uncertain scheduler-doctor custody"
-        )
-    ordered: list[_SchedulerDoctorAbandonedDescriptorCustody] = []
-    identities: dict[int, tuple[int, int, int]] = {}
-    for custody in failure.abandoned_custody:
-        if custody.identity is None:
-            raise RuntimeError(
-                "test reset refuses scheduler-doctor custody without identity"
-            )
-        prior = identities.get(custody.descriptor)
-        if prior is not None:
-            if prior != custody.identity:
-                raise RuntimeError(
-                    "test reset refuses conflicting scheduler-doctor custody"
-                )
-            continue
-        identities[custody.descriptor] = custody.identity
-        ordered.append(custody)
-    ordered.sort(key=lambda custody: custody.role == "module-lease")
-    for index, custody in enumerate(ordered):
-        try:
-            observed = _scheduler_doctor_test_object_identity(
-                os.fstat(custody.descriptor)
-            )
-        except OSError as error:
-            message = (
-                f"test reset cannot revalidate {custody.role} descriptor"
-            )
-            _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
-                _SchedulerDoctorSessionCleanupFailure(
-                    retained_path=failure.retained_path,
-                    reason=message,
-                    abandoned_custody=(
-                        _SchedulerDoctorAbandonedDescriptorCustody(
-                            role=custody.role,
-                            descriptor=custody.descriptor,
-                            identity=custody.identity,
-                            state="revalidation-uncertain",
-                        ),
-                        *ordered[index + 1 :],
-                    ),
-                )
-            )
-            raise RuntimeError(message) from error
-        if observed != custody.identity:
-            message = (
-                f"test reset refuses reused {custody.role} descriptor"
-            )
-            _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
-                _SchedulerDoctorSessionCleanupFailure(
-                    retained_path=failure.retained_path,
-                    reason=message,
-                    abandoned_custody=(
-                        _SchedulerDoctorAbandonedDescriptorCustody(
-                            role=custody.role,
-                            descriptor=custody.descriptor,
-                            identity=custody.identity,
-                            state="identity-mismatch",
-                        ),
-                        *ordered[index + 1 :],
-                    ),
-                )
-            )
-            raise RuntimeError(message)
-        _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
-            _SchedulerDoctorSessionCleanupFailure(
-                retained_path=failure.retained_path,
-                reason=f"test reset closing {custody.role} descriptor",
-                abandoned_custody=(
-                    _SchedulerDoctorAbandonedDescriptorCustody(
-                        role=custody.role,
-                        descriptor=custody.descriptor,
-                        identity=custody.identity,
-                        state="close-uncertain",
-                    ),
-                    *ordered[index + 1 :],
-                ),
-            )
-        )
-        try:
-            os.close(custody.descriptor)
-        except OSError as error:
-            message = f"test reset {custody.role} descriptor close failed"
-            _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
-                _SchedulerDoctorSessionCleanupFailure(
-                    retained_path=failure.retained_path,
-                    reason=message,
-                    abandoned_custody=(
-                        _SchedulerDoctorAbandonedDescriptorCustody(
-                            role=custody.role,
-                            descriptor=custody.descriptor,
-                            identity=custody.identity,
-                            state="close-uncertain",
-                        ),
-                        *ordered[index + 1 :],
-                    ),
-                )
-            )
-            raise RuntimeError(message) from error
-        _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
-            _SchedulerDoctorSessionCleanupFailure(
-                retained_path=failure.retained_path,
-                reason="test reset in progress",
-                abandoned_custody=tuple(ordered[index + 1 :]),
-            )
-        )
     _SCHEDULER_DOCTOR_TEST_SESSION = None
     _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD = None
     _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = None
@@ -4775,6 +5607,498 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                 _sweep_stale_scheduler_doctor_sessions(namespace)
             self.assertTrue(clean.is_dir())
             self.assertTrue((unsafe / "unexpected").is_file())
+
+    def test_delete_quarantine_nonce_collision_retries_atomically(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            first_nonce = b"a" * _SCHEDULER_DOCTOR_TEST_DELETE_NONCE_BYTES
+            second_nonce = b"b" * _SCHEDULER_DOCTOR_TEST_DELETE_NONCE_BYTES
+            collision = namespace / (
+                _SCHEDULER_DOCTOR_TEST_DELETE_PREFIX + first_nonce.hex()
+            )
+            collision.mkdir(mode=0o700)
+            namespace_fd, _identity, _policy = (
+                _bind_scheduler_doctor_test_root(namespace)
+            )
+            quarantine: _SchedulerDoctorDeleteQuarantineBinding | None = None
+            try:
+                mount_identity = _scheduler_doctor_stale_directory_mount_identity(
+                    namespace_fd
+                )
+                with mock.patch.object(
+                    os,
+                    "urandom",
+                    side_effect=(first_nonce, second_nonce),
+                ):
+                    quarantine = _create_scheduler_doctor_delete_quarantine(
+                        namespace_fd,
+                        mount_identity,
+                    )
+                self.assertEqual(
+                    quarantine.name,
+                    _SCHEDULER_DOCTOR_TEST_DELETE_PREFIX + second_nonce.hex(),
+                )
+                self.assertEqual(
+                    stat.S_IMODE((namespace / quarantine.name).lstat().st_mode),
+                    0o700,
+                )
+            finally:
+                if quarantine is not None:
+                    os.close(quarantine.descriptor)
+                    (namespace / quarantine.name).rmdir()
+                os.close(namespace_fd)
+
+    def test_post_mkdir_validation_replacement_is_not_removed(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            nonce = b"r" * _SCHEDULER_DOCTOR_TEST_DELETE_NONCE_BYTES
+            quarantine_name = (
+                _SCHEDULER_DOCTOR_TEST_DELETE_PREFIX + nonce.hex()
+            )
+            quarantine = namespace / quarantine_name
+            moved_quarantine = namespace / f"{quarantine_name}.moved"
+            replacement_marker = quarantine / "replacement"
+            namespace_fd, _identity, _policy = (
+                _bind_scheduler_doctor_test_root(namespace)
+            )
+            original_validate = (
+                _validate_scheduler_doctor_delete_quarantine_binding
+            )
+            replaced = False
+
+            def replace_before_first_validation(
+                passed_namespace_fd: int,
+                mount_identity: tuple[int, int | None],
+                binding: _SchedulerDoctorDeleteQuarantineBinding,
+                expected_names: tuple[str, ...],
+                *,
+                deadline: float,
+            ) -> None:
+                nonlocal replaced
+                if not replaced:
+                    replaced = True
+                    quarantine.rename(moved_quarantine)
+                    quarantine.mkdir(mode=0o700)
+                    replacement_marker.write_text(
+                        "retain\n",
+                        encoding="utf-8",
+                    )
+                    raise RuntimeError(
+                        "injected post-mkdir validation failure"
+                    )
+                original_validate(
+                    passed_namespace_fd,
+                    mount_identity,
+                    binding,
+                    expected_names,
+                    deadline=deadline,
+                )
+
+            try:
+                mount_identity = _scheduler_doctor_stale_directory_mount_identity(
+                    namespace_fd
+                )
+                with (
+                    mock.patch.object(os, "urandom", return_value=nonce),
+                    mock.patch(
+                        f"{__name__}._validate_scheduler_doctor_delete_quarantine_binding",
+                        side_effect=replace_before_first_validation,
+                    ),
+                    self.assertRaises(
+                        _SchedulerDoctorQuarantineTransitionFailure
+                    ) as raised,
+                ):
+                    _create_scheduler_doctor_delete_quarantine(
+                        namespace_fd,
+                        mount_identity,
+                    )
+                self.assertEqual(raised.exception.retained_name, quarantine_name)
+                self.assertTrue(moved_quarantine.is_dir())
+                self.assertEqual(
+                    replacement_marker.read_text(encoding="utf-8"),
+                    "retain\n",
+                )
+            finally:
+                os.close(namespace_fd)
+
+    def test_quarantine_rename_failure_preserves_source_and_cleans_placeholder(
+        self,
+    ) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            source = namespace / "session.source"
+            source.mkdir(mode=0o700)
+            namespace_fd, _identity, _policy = (
+                _bind_scheduler_doctor_test_root(namespace)
+            )
+            mount_identity = _scheduler_doctor_stale_directory_mount_identity(
+                namespace_fd
+            )
+            source_identity = _scheduler_doctor_test_object_identity(
+                source.lstat()
+            )
+            source_fd = _open_scheduler_doctor_stale_directory(
+                namespace_fd,
+                source.name,
+                source_identity,
+                expected_mount_identity=mount_identity,
+                require_owner_private_directory=True,
+            )
+            try:
+                with (
+                    mock.patch.object(
+                        os,
+                        "rename",
+                        side_effect=OSError(errno.EXDEV, "injected cross-device"),
+                    ) as rename,
+                    self.assertRaises(OSError) as raised,
+                ):
+                    _quarantine_scheduler_doctor_session(
+                        namespace_fd,
+                        mount_identity,
+                        source.name,
+                        source_fd,
+                        source_identity,
+                        deadline=time.monotonic() + 5.0,
+                    )
+                self.assertEqual(raised.exception.errno, errno.EXDEV)
+                self.assertEqual(rename.call_count, 1)
+                self.assertTrue(source.is_dir())
+                self.assertFalse(
+                    any(
+                        child.name.startswith(
+                            _SCHEDULER_DOCTOR_TEST_DELETE_PREFIX
+                        )
+                        for child in namespace.iterdir()
+                    )
+                )
+            finally:
+                os.close(source_fd)
+                os.close(namespace_fd)
+
+    def test_post_rename_validation_failure_reports_retained_quarantine(
+        self,
+    ) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            source = namespace / "session.source"
+            source.mkdir(mode=0o700)
+            namespace_fd, _identity, _policy = (
+                _bind_scheduler_doctor_test_root(namespace)
+            )
+            mount_identity = _scheduler_doctor_stale_directory_mount_identity(
+                namespace_fd
+            )
+            source_identity = _scheduler_doctor_test_object_identity(
+                source.lstat()
+            )
+            source_fd = _open_scheduler_doctor_stale_directory(
+                namespace_fd,
+                source.name,
+                source_identity,
+                expected_mount_identity=mount_identity,
+                require_owner_private_directory=True,
+            )
+            original_stat = os.stat
+            source_stat_calls = 0
+
+            def fail_post_rename_source_stat(
+                path: os.PathLike[str] | str | int,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                nonlocal source_stat_calls
+                if (
+                    path == source.name
+                    and kwargs.get("dir_fd") == namespace_fd
+                    and kwargs.get("follow_symlinks") is False
+                ):
+                    source_stat_calls += 1
+                    if source_stat_calls == 2:
+                        raise PermissionError(
+                            errno.EACCES,
+                            "injected post-rename source revalidation failure",
+                        )
+                return original_stat(path, *args, **kwargs)
+
+            retained: Path | None = None
+            try:
+                with (
+                    mock.patch.object(
+                        os,
+                        "stat",
+                        side_effect=fail_post_rename_source_stat,
+                    ),
+                    self.assertRaises(
+                        _SchedulerDoctorQuarantineTransitionFailure
+                    ) as raised,
+                ):
+                    _quarantine_scheduler_doctor_session(
+                        namespace_fd,
+                        mount_identity,
+                        source.name,
+                        source_fd,
+                        source_identity,
+                        deadline=time.monotonic() + 5.0,
+                    )
+                retained = namespace / raised.exception.retained_name
+                self.assertFalse(source.exists())
+                self.assertTrue(
+                    (
+                        retained
+                        / _SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME
+                    ).is_dir()
+                )
+            finally:
+                os.close(source_fd)
+                os.close(namespace_fd)
+
+            _sweep_stale_scheduler_doctor_sessions(namespace)
+            assert retained is not None
+            self.assertFalse(retained.exists())
+
+    def test_stale_sweep_recovers_empty_delete_placeholder(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            quarantine = namespace / (
+                _SCHEDULER_DOCTOR_TEST_DELETE_PREFIX + "after-mkdir"
+            )
+            quarantine.mkdir(mode=0o700)
+
+            _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertFalse(quarantine.exists())
+
+    def test_stale_sweep_recovers_payload_after_quarantine_rename(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            quarantine = namespace / (
+                _SCHEDULER_DOCTOR_TEST_DELETE_PREFIX + "after-rename"
+            )
+            quarantine.mkdir(mode=0o700)
+            payload = quarantine / _SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME
+            payload.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(payload)
+            (payload / "residue").write_text("remove\n", encoding="utf-8")
+
+            _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertFalse(quarantine.exists())
+
+    def test_quarantine_delete_failure_is_recovered_by_next_sweep(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            stale = namespace / "session.stale"
+            stale.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(stale)
+            (stale / "residue").write_text("remove\n", encoding="utf-8")
+
+            with (
+                mock.patch(
+                    f"{__name__}._apply_scheduler_doctor_stale_entry_plan",
+                    side_effect=RuntimeError("injected quarantine delete failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "injected quarantine"),
+            ):
+                _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertFalse(stale.exists())
+            quarantines = tuple(
+                child
+                for child in namespace.iterdir()
+                if child.name.startswith(_SCHEDULER_DOCTOR_TEST_DELETE_PREFIX)
+            )
+            self.assertEqual(len(quarantines), 1)
+            self.assertTrue(
+                (
+                    quarantines[0]
+                    / _SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME
+                    / "residue"
+                ).is_file()
+            )
+
+            _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertFalse(quarantines[0].exists())
+
+    def test_quarantine_policy_drift_fails_before_payload_mutation(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            source = namespace / "session.source"
+            source.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(source)
+            namespace_fd, _identity, _policy = (
+                _bind_scheduler_doctor_test_root(namespace)
+            )
+            mount_identity = _scheduler_doctor_stale_directory_mount_identity(
+                namespace_fd
+            )
+            source_identity = _scheduler_doctor_test_object_identity(
+                source.lstat()
+            )
+            source_fd = _open_scheduler_doctor_stale_directory(
+                namespace_fd,
+                source.name,
+                source_identity,
+                expected_mount_identity=mount_identity,
+                require_owner_private_directory=True,
+            )
+            liveness_fd, liveness_identity = (
+                _open_scheduler_doctor_liveness_descriptor(
+                    source,
+                    source_fd,
+                    expected_mount_identity=mount_identity,
+                )
+            )
+            self.assertFalse(_scheduler_doctor_liveness_is_busy(liveness_fd))
+            quarantine: _SchedulerDoctorDeleteQuarantineBinding | None = None
+            quarantine_path: Path | None = None
+            try:
+                quarantine = _quarantine_scheduler_doctor_session(
+                    namespace_fd,
+                    mount_identity,
+                    source.name,
+                    source_fd,
+                    source_identity,
+                    deadline=time.monotonic() + 5.0,
+                )
+                quarantine_path = namespace / quarantine.name
+                quarantine_path.chmod(0o750)
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "delete quarantine changed",
+                ):
+                    _delete_scheduler_doctor_quarantine_payload(
+                        namespace_fd,
+                        mount_identity,
+                        _SchedulerDoctorDeleteQuarantineCandidate(
+                            name=quarantine.name,
+                            identity=quarantine.identity,
+                            payload_identity=quarantine.payload_identity,
+                            liveness_identity=liveness_identity,
+                            liveness_present=True,
+                            busy=False,
+                            plans=(),
+                        ),
+                        deadline=time.monotonic() + 5.0,
+                        quarantine_descriptor=quarantine.descriptor,
+                        payload_descriptor=source_fd,
+                        liveness_descriptor=liveness_fd,
+                    )
+                self.assertTrue(
+                    (
+                        quarantine_path
+                        / _SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME
+                        / _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME
+                    ).is_file()
+                )
+            finally:
+                os.close(liveness_fd)
+                os.close(source_fd)
+                if quarantine is not None:
+                    os.close(quarantine.descriptor)
+                os.close(namespace_fd)
+
+            assert quarantine_path is not None
+            quarantine_path.chmod(0o700)
+            _sweep_stale_scheduler_doctor_sessions(namespace)
+            self.assertFalse(quarantine_path.exists())
+
+    def test_delete_quarantine_inventory_limit_precedes_mutation(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            quarantine = namespace / (
+                _SCHEDULER_DOCTOR_TEST_DELETE_PREFIX + "bounded-payload"
+            )
+            quarantine.mkdir(mode=0o700)
+            payload = quarantine / _SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME
+            payload.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(payload)
+            first = payload / "first"
+            second = payload / "second"
+            first.write_text("first\n", encoding="utf-8")
+            second.write_text("second\n", encoding="utf-8")
+
+            with (
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_ENTRY_LIMIT",
+                    3,
+                ),
+                self.assertRaisesRegex(RuntimeError, "entry limit exceeded"),
+            ):
+                _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertEqual(first.read_text(encoding="utf-8"), "first\n")
+            self.assertEqual(second.read_text(encoding="utf-8"), "second\n")
+
+    def test_markerless_delete_payload_must_be_empty(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            quarantine = namespace / (
+                _SCHEDULER_DOCTOR_TEST_DELETE_PREFIX + "markerless-nonempty"
+            )
+            quarantine.mkdir(mode=0o700)
+            payload = quarantine / _SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME
+            payload.mkdir(mode=0o700)
+            residue = payload / "unproved"
+            residue.write_text("keep\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "markerless delete quarantine payload is not empty",
+            ):
+                _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertEqual(residue.read_text(encoding="utf-8"), "keep\n")
+
+    def test_stale_sweep_recovers_empty_markerless_payload(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            quarantine = namespace / (
+                _SCHEDULER_DOCTOR_TEST_DELETE_PREFIX + "markerless-empty"
+            )
+            quarantine.mkdir(mode=0o700)
+            payload = quarantine / _SCHEDULER_DOCTOR_TEST_DELETE_PAYLOAD_NAME
+            payload.mkdir(mode=0o700)
+
+            _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertFalse(quarantine.exists())
+
+    def test_delete_quarantine_symlink_fails_before_sibling_mutation(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            root = Path(directory)
+            namespace = root / "namespace"
+            namespace.mkdir(mode=0o700)
+            external = root / "external"
+            external.mkdir(mode=0o700)
+            quarantine = namespace / (
+                _SCHEDULER_DOCTOR_TEST_DELETE_PREFIX + "symlink"
+            )
+            quarantine.symlink_to(external, target_is_directory=True)
+            stale = namespace / "session.stale"
+            stale.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(stale)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "delete quarantine is not an owner-private directory",
+            ):
+                _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertTrue(stale.is_dir())
+            self.assertTrue(external.is_dir())
 
     def test_stale_sweep_missing_liveness_aborts_before_sibling_deletion(
         self,
@@ -6313,7 +7637,41 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                 {_SCHEDULER_DOCTOR_TEST_LOCK_NAME},
             )
 
-            retained_path: Path | None = None
+    def test_initialization_rollback_resolves_rename_after_effect(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            original_rename = os.rename
+            publication_failed = False
+
+            def rename_then_fail(
+                source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                destination: (
+                    str | bytes | os.PathLike[str] | os.PathLike[bytes]
+                ),
+                *,
+                src_dir_fd: int | None = None,
+                dst_dir_fd: int | None = None,
+            ) -> None:
+                nonlocal publication_failed
+                original_rename(
+                    source,
+                    destination,
+                    src_dir_fd=src_dir_fd,
+                    dst_dir_fd=dst_dir_fd,
+                )
+                if (
+                    not publication_failed
+                    and os.fsdecode(source).startswith(
+                        _SCHEDULER_DOCTOR_TEST_STAGING_PREFIX
+                    )
+                    and os.fsdecode(destination).startswith(
+                        _SCHEDULER_DOCTOR_TEST_SESSION_PREFIX
+                    )
+                ):
+                    publication_failed = True
+                    raise RuntimeError("injected publish rename after effect")
+
             with (
                 mock.patch(
                     f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION",
@@ -6331,41 +7689,19 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                     f"{__name__}._ensure_scheduler_doctor_test_namespace",
                     return_value=namespace,
                 ),
-                mock.patch(
-                    f"{__name__}._validate_scheduler_doctor_liveness_descriptor",
-                    side_effect=RuntimeError(
-                        "injected marker validation failure"
-                    ),
+                mock.patch.object(os, "rename", side_effect=rename_then_fail),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "injected publish rename after effect",
                 ),
             ):
-                with self.assertRaisesRegex(
-                    RuntimeError,
-                    "rollback cleanup failed",
-                ):
-                    _scheduler_doctor_test_session_directory()
-                failure = _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
-                assert failure is not None
-                retained_path = failure.retained_path
-                _reset_retained_scheduler_doctor_cleanup_failure_for_test()
-            assert retained_path is not None
-            self.assertTrue(
-                retained_path.name.startswith(
-                    _SCHEDULER_DOCTOR_TEST_STAGING_PREFIX
-                )
+                _scheduler_doctor_test_session_directory()
+            self.assertTrue(publication_failed)
+            self.assertIsNone(_SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE)
+            self.assertEqual(
+                {child.name for child in namespace.iterdir()},
+                {_SCHEDULER_DOCTOR_TEST_LOCK_NAME},
             )
-            self.assertFalse(
-                any(
-                    child.name.startswith(
-                        _SCHEDULER_DOCTOR_TEST_SESSION_PREFIX
-                    )
-                    for child in namespace.iterdir()
-                )
-            )
-            marker = (
-                retained_path / _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME
-            )
-            marker.unlink()
-            retained_path.rmdir()
 
     def test_initialization_rollback_close_uncertainty_installs_fence(
         self,
@@ -6838,113 +8174,111 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         finally:
             _scheduler_doctor_test_session_directory()
 
-    def test_module_cleanup_rejects_replaced_active_session(self) -> None:
-        global _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
-
-        session = _scheduler_doctor_test_session_directory()
-        retained = session.with_name(session.name + ".original")
-        replacement_probe = session / "replacement-probe"
-
-        session.rename(retained)
-        session.mkdir(mode=0o700)
-        replacement_probe.write_text("replacement\n", encoding="utf-8")
-        try:
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "active session object changed",
-            ):
-                _cleanup_scheduler_doctor_test_session()
-            self.assertEqual(
-                replacement_probe.read_text(encoding="utf-8"),
-                "replacement\n",
-            )
-            self.assertTrue(retained.is_dir())
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "cleanup previously failed",
-            ):
-                _scheduler_doctor_test_session_directory()
-            self.assertTrue(replacement_probe.is_file())
-        finally:
-            _reset_retained_scheduler_doctor_cleanup_failure_for_test()
-            if replacement_probe.exists():
-                replacement_probe.unlink()
-            if session.exists():
-                session.rmdir()
-            if retained.exists():
-                (
-                    retained / _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME
-                ).unlink()
-                retained.rmdir()
-            _scheduler_doctor_test_session_directory()
-
-    def test_module_cleanup_reports_missing_active_session(self) -> None:
-        global _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
-
-        session = _scheduler_doctor_test_session_directory()
-        retained = session.with_name(session.name + ".original")
-
-        session.rename(retained)
-        try:
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "active session is missing",
-            ):
-                _cleanup_scheduler_doctor_test_session()
-            self.assertTrue(retained.is_dir())
-        finally:
-            _reset_retained_scheduler_doctor_cleanup_failure_for_test()
-            if retained.exists():
-                (
-                    retained / _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME
-                ).unlink()
-                retained.rmdir()
-            _scheduler_doctor_test_session_directory()
-
-    def test_module_cleanup_reports_unreadable_active_session(self) -> None:
-        global _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
-
-        session = _scheduler_doctor_test_session_directory()
-        original_stat = os.stat
-
-        def deny_active_session_stat(
-            path: os.PathLike[str] | str | int,
-            *args: object,
-            **kwargs: object,
-        ) -> os.stat_result:
-            if (
-                path == session.name
-                and kwargs.get("dir_fd") is not None
-                and kwargs.get("follow_symlinks") is False
-            ):
-                raise PermissionError(errno.EACCES, "fixture")
-            return original_stat(path, *args, **kwargs)
-
-        try:
+    def test_active_cleanup_identity_failures_fence_in_isolated_processes(
+        self,
+    ) -> None:
+        script = (
+            "import errno, json, sys\n"
+            "from unittest import mock\n"
+            "import tests.test_scheduler_doctor as t\n"
+            "scenario = sys.argv[1]\n"
+            "t.setUpModule()\n"
+            "session = t._scheduler_doctor_test_session_directory()\n"
+            "retained = session.with_name(session.name + '.original')\n"
+            "probe = None\n"
+            "if scenario == 'replaced':\n"
+            "    session.rename(retained)\n"
+            "    session.mkdir(mode=0o700)\n"
+            "    probe = session / 'replacement-probe'\n"
+            "    probe.write_text('replacement\\n', encoding='utf-8')\n"
+            "elif scenario == 'missing':\n"
+            "    session.rename(retained)\n"
+            "elif scenario != 'unreadable':\n"
+            "    raise RuntimeError('unknown scenario')\n"
+            "original_stat = t.os.stat\n"
+            "def deny_active_session_stat(path, *args, **kwargs):\n"
+            "    if (path == session.name and "
+            "kwargs.get('dir_fd') is not None and "
+            "kwargs.get('follow_symlinks') is False):\n"
+            "        raise PermissionError(errno.EACCES, 'fixture')\n"
+            "    return original_stat(path, *args, **kwargs)\n"
+            "try:\n"
+            "    if scenario == 'unreadable':\n"
+            "        with mock.patch.object(t.os, 'stat', "
+            "side_effect=deny_active_session_stat):\n"
+            "            t._cleanup_scheduler_doctor_test_session()\n"
+            "    else:\n"
+            "        t._cleanup_scheduler_doctor_test_session()\n"
+            "except RuntimeError as error:\n"
+            "    failure = t._SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE\n"
+            "    try:\n"
+            "        t._scheduler_doctor_test_session_directory()\n"
+            "    except RuntimeError as fence_error:\n"
+            "        fence = str(fence_error)\n"
+            "    else:\n"
+            "        raise RuntimeError('cleanup failure did not fence reuse')\n"
+            "    print(json.dumps({\n"
+            "        'error': str(error),\n"
+            "        'fence': fence,\n"
+            "        'retained_path': (None if failure is None "
+            "else str(failure.retained_path)),\n"
+            "        'session': str(session),\n"
+            "        'retained': str(retained),\n"
+            "        'probe': (None if probe is None else str(probe)),\n"
+            "    }, sort_keys=True), flush=True)\n"
+            "else:\n"
+            "    raise RuntimeError('cleanup unexpectedly succeeded')\n"
+        )
+        expectations = {
+            "replaced": "active session object changed",
+            "missing": "active session is missing",
+            "unreadable": "active session is unreadable",
+        }
+        for scenario, expected in expectations.items():
             with (
-                mock.patch.object(
-                    os,
-                    "stat",
-                    side_effect=deny_active_session_stat,
-                ),
-                self.assertRaisesRegex(
-                    RuntimeError,
-                    "active session is unreadable",
-                ),
+                self.subTest(scenario=scenario),
+                _scheduler_doctor_test_temporary_directory() as directory,
             ):
-                _cleanup_scheduler_doctor_test_session()
-            self.assertTrue(session.is_dir())
-        finally:
-            _reset_retained_scheduler_doctor_cleanup_failure_for_test()
-            if session.exists():
-                (
-                    session / _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME
-                ).unlink()
-                session.rmdir()
-            _scheduler_doctor_test_session_directory()
+                environment = os.environ.copy()
+                environment[_SCHEDULER_DOCTOR_TEST_ANCHOR_ENV] = directory
+                environment[_SCHEDULER_DOCTOR_TEST_EXPECTED_ANCHOR_ENV] = (
+                    directory
+                )
+                result = subprocess.run(
+                    [sys.executable, "-c", script, scenario],
+                    cwd=REPO_ROOT,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                )
+                payload = json.loads(result.stdout)
+                self.assertIn(expected, payload["error"])
+                self.assertIn("cleanup previously failed", payload["fence"])
+                session = Path(payload["session"])
+                retained = Path(payload["retained"])
+                if scenario == "replaced":
+                    probe = Path(payload["probe"])
+                    self.assertEqual(
+                        probe.read_text(encoding="utf-8"),
+                        "replacement\n",
+                    )
+                    self.assertTrue(retained.is_dir())
+                elif scenario == "missing":
+                    self.assertFalse(session.exists())
+                    self.assertTrue(retained.is_dir())
+                else:
+                    self.assertTrue(session.is_dir())
 
     def test_cleanup_fences_orphaned_lease_descriptor(self) -> None:
         descriptor, writer = os.pipe()
+        descriptor_open = True
         try:
             with (
                 mock.patch(
@@ -6986,155 +8320,15 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                         ),
                     ),
                 )
-                _reset_retained_scheduler_doctor_cleanup_failure_for_test()
+                os.close(descriptor)
+                descriptor_open = False
                 with self.assertRaises(OSError) as raised:
                     os.fstat(descriptor)
                 self.assertEqual(raised.exception.errno, errno.EBADF)
         finally:
+            if descriptor_open:
+                os.close(descriptor)
             os.close(writer)
-
-    def test_cleanup_reset_refuses_reused_descriptor(self) -> None:
-        with _scheduler_doctor_test_temporary_directory() as directory:
-            original_path = Path(directory) / "original"
-            replacement_path = Path(directory) / "replacement"
-            original_path.write_text("original\n", encoding="utf-8")
-            replacement_path.write_text("replacement\n", encoding="utf-8")
-            descriptor = os.open(original_path, os.O_RDONLY)
-            original_identity = _scheduler_doctor_test_object_identity(
-                os.fstat(descriptor)
-            )
-            os.close(descriptor)
-            replacement_source = os.open(replacement_path, os.O_RDONLY)
-            if replacement_source != descriptor:
-                os.dup2(replacement_source, descriptor)
-                os.close(replacement_source)
-            replacement_descriptor = descriptor
-            replacement_identity = _scheduler_doctor_test_object_identity(
-                os.fstat(replacement_descriptor)
-            )
-            failure = _SchedulerDoctorSessionCleanupFailure(
-                retained_path=original_path,
-                reason="fixture",
-                abandoned_custody=(
-                    _SchedulerDoctorAbandonedDescriptorCustody(
-                        "session",
-                        descriptor,
-                        original_identity,
-                        "retained-open",
-                    ),
-                ),
-            )
-            try:
-                with (
-                    mock.patch(
-                        f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION",
-                        None,
-                    ),
-                    mock.patch(
-                        f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD",
-                        None,
-                    ),
-                    mock.patch(
-                        f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE",
-                        failure,
-                    ),
-                ):
-                    with self.assertRaisesRegex(RuntimeError, "refuses reused"):
-                        _reset_retained_scheduler_doctor_cleanup_failure_for_test()
-                    self.assertEqual(
-                        _scheduler_doctor_test_object_identity(
-                            os.fstat(replacement_descriptor)
-                        ),
-                        replacement_identity,
-                    )
-                    with self.assertRaisesRegex(
-                        RuntimeError,
-                        "refuses close-uncertain",
-                    ):
-                        _reset_retained_scheduler_doctor_cleanup_failure_for_test()
-                    os.fstat(replacement_descriptor)
-            finally:
-                os.close(replacement_descriptor)
-
-    def test_cleanup_reset_never_retries_partial_close_uncertainty(self) -> None:
-        with _scheduler_doctor_test_temporary_directory() as directory:
-            paths = (Path(directory) / "first", Path(directory) / "second")
-            for path in paths:
-                path.write_text(path.name + "\n", encoding="utf-8")
-            descriptors = tuple(os.open(path, os.O_RDONLY) for path in paths)
-            custody = tuple(
-                _SchedulerDoctorAbandonedDescriptorCustody(
-                    role,
-                    descriptor,
-                    _scheduler_doctor_test_object_identity(
-                        os.fstat(descriptor)
-                    ),
-                    "retained-open",
-                )
-                for role, descriptor in zip(
-                    ("session", "module-lease"),
-                    descriptors,
-                )
-            )
-            failure = _SchedulerDoctorSessionCleanupFailure(
-                retained_path=Path(directory),
-                reason="fixture",
-                abandoned_custody=custody,
-            )
-            original_close = os.close
-            close_calls: list[int] = []
-
-            def fail_second_close(descriptor: int) -> None:
-                close_calls.append(descriptor)
-                if descriptor == descriptors[1]:
-                    original_close(descriptor)
-                    raise KeyboardInterrupt(
-                        "injected reset close-after-effect failure"
-                    )
-                original_close(descriptor)
-
-            with (
-                mock.patch(
-                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION",
-                    None,
-                ),
-                mock.patch(
-                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD",
-                    None,
-                ),
-                mock.patch(
-                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE",
-                    failure,
-                ),
-                mock.patch.object(
-                    os,
-                    "close",
-                    side_effect=fail_second_close,
-                ),
-            ):
-                with self.assertRaises(KeyboardInterrupt):
-                    _reset_retained_scheduler_doctor_cleanup_failure_for_test()
-                for descriptor in descriptors:
-                    with self.assertRaises(OSError) as raised:
-                        os.fstat(descriptor)
-                    self.assertEqual(raised.exception.errno, errno.EBADF)
-                retained = _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
-                assert retained is not None
-                self.assertEqual(
-                    [item.role for item in retained.abandoned_custody],
-                    ["module-lease"],
-                )
-                self.assertEqual(
-                    retained.abandoned_custody[0].state,
-                    "close-uncertain",
-                )
-                before_retry = list(close_calls)
-                with self.assertRaisesRegex(
-                    RuntimeError,
-                    "refuses close-uncertain",
-                ):
-                    _reset_retained_scheduler_doctor_cleanup_failure_for_test()
-                self.assertEqual(close_calls, before_retry)
 
     def test_session_lease_retries_busy_lock_then_succeeds(self) -> None:
         busy = BlockingIOError(errno.EWOULDBLOCK, "fixture lease is busy")
