@@ -495,10 +495,12 @@ def _bind_scheduler_doctor_test_root(
                     )
                 )
             except MODULE.SyncError as error:
-                raise RuntimeError(
-                    "cannot bind Linux scheduler-doctor sticky fallback "
-                    f"component: {component_path}: {error}"
-                ) from error
+                if index == 0:
+                    raise RuntimeError(
+                        "cannot bind Linux scheduler-doctor sticky fallback "
+                        f"root: {component_path}: {error}"
+                    ) from error
+                raise
             mode, uid, _gid = child_access_policy
             if (
                 uid != effective_uid
@@ -508,15 +510,24 @@ def _bind_scheduler_doctor_test_root(
                 close_failures = _close_scheduler_doctor_candidate_descriptors(
                     (child_fd,)
                 )
-                message = (
-                    "Linux scheduler-doctor sticky fallback component has an "
-                    f"unsafe access policy: {component_path}"
-                )
+                if index == 0:
+                    message = (
+                        "Linux scheduler-doctor sticky fallback root has an "
+                        f"unsafe access policy: {component_path}"
+                    )
+                else:
+                    message = (
+                        "canonical account-home ancestors must be "
+                        "root/current-owned and not group/world writable: "
+                        f"{component_path}"
+                    )
                 if close_failures:
-                    message += "; " + "; ".join(close_failures)
-                raise RuntimeError(
-                    message
-                )
+                    raise RuntimeError(
+                        message + "; " + "; ".join(close_failures)
+                    )
+                if index == 0:
+                    raise RuntimeError(message)
+                raise MODULE.SyncError(message)
             previous_fd = current_fd
             current_fd = -1
             close_failures = _close_scheduler_doctor_candidate_descriptors(
@@ -564,16 +575,18 @@ def _bind_scheduler_doctor_fixture_account_home(
         tuple[int, tuple[int, int, int], tuple[int, int, int]],
     ],
 ) -> tuple[int, tuple[int, int, int], tuple[int, int, int]]:
-    # Keep the production account-home policy unchanged. Only the exact
-    # per-test root selected beneath the receipt-bound Linux sticky fallback
-    # uses the fixture's equivalent descriptor-safe ancestry binder.
+    # Keep the production account-home policy unchanged. Only the per-test
+    # root selected beneath the receipt-bound Linux sticky fallback and its
+    # synthetic descendants use the fixture's equivalent descriptor-safe
+    # ancestry binder.
     path = Path(os.path.abspath(path))
     fixture_root = Path(os.path.abspath(fixture_root))
     fallback = _scheduler_doctor_linux_sticky_fallback_path()
     if (
-        path != fixture_root
+        not (path == fixture_root or path.is_relative_to(fixture_root))
         or not sys.platform.startswith("linux")
-        or not (path == fallback or path.is_relative_to(fallback))
+        or fixture_root == fallback
+        or not fixture_root.is_relative_to(fallback)
     ):
         return production_binder(path)
     return _bind_scheduler_doctor_test_root(path)
@@ -4050,7 +4063,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 MODULE.SyncError,
-                "non-symlink directories",
+                "non-symlink director",
             ):
                 _select_scheduler_doctor_test_namespace((candidate,))
 
@@ -4301,18 +4314,110 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             self.assertTrue(stat.S_ISREG(lock_metadata.st_mode))
             self.assertEqual(stat.S_IMODE(lock_metadata.st_mode), 0o600)
 
-            production_case = SchedulerDoctorTests(
-                "test_fixture_private_control_parent_is_bindable"
-            )
-            production_result = unittest.TestResult()
-            production_case.run(production_result)
-            self.assertTrue(
-                production_result.wasSuccessful(),
-                msg=(
-                    f"errors={production_result.errors!r}; "
-                    f"failures={production_result.failures!r}"
+            for case_type, case_name in (
+                (
+                    SchedulerDoctorFixtureTests,
+                    "test_existing_mode_0755_container_is_accepted",
                 ),
+                (
+                    SchedulerDoctorFixtureTests,
+                    "test_existing_writable_container_fails_closed",
+                ),
+                (
+                    SchedulerDoctorFixtureTests,
+                    "test_existing_container_symlink_fails_closed",
+                ),
+                (
+                    SchedulerDoctorTests,
+                    "test_fixture_private_control_parent_is_bindable",
+                ),
+                (
+                    SchedulerDoctorTests,
+                    "test_mirror_quarantine_terminal_revalidates_primary_absence_anchor",
+                ),
+            ):
+                with self.subTest(case_name=case_name):
+                    production_case = case_type(case_name)
+                    production_result = unittest.TestResult()
+                    production_case.run(production_result)
+                    self.assertTrue(
+                        production_result.wasSuccessful(),
+                        msg=(
+                            f"errors={production_result.errors!r}; "
+                            f"failures={production_result.failures!r}"
+                        ),
+                    )
+
+    def test_linux_sticky_fixture_binder_is_limited_to_fixture_subtree(
+        self,
+    ) -> None:
+        fallback = _scheduler_doctor_linux_sticky_fallback_path()
+        fixture_root = fallback / "fixture-root"
+        fixture_child = fixture_root / "synthetic-account-home"
+        outside = fallback / "unrelated"
+        broad_fallback_child = fallback / "broad-fixture-child"
+        non_sticky_child = Path("/var/lib/fixture-root/synthetic-account-home")
+        fixture_binding = (
+            11,
+            (1, 2, stat.S_IFDIR),
+            (0o700, os.geteuid(), os.getegid()),
+        )
+        production_binding = (
+            12,
+            (1, 3, stat.S_IFDIR),
+            (0o700, os.geteuid(), os.getegid()),
+        )
+        production_binder = mock.Mock(return_value=production_binding)
+
+        with (
+            mock.patch.object(sys, "platform", "linux"),
+            mock.patch(
+                f"{__name__}._bind_scheduler_doctor_test_root",
+                return_value=fixture_binding,
+            ) as fixture_binder,
+        ):
+            self.assertEqual(
+                _bind_scheduler_doctor_fixture_account_home(
+                    fixture_child,
+                    fixture_root=fixture_root,
+                    production_binder=production_binder,
+                ),
+                fixture_binding,
             )
+            self.assertEqual(
+                _bind_scheduler_doctor_fixture_account_home(
+                    outside,
+                    fixture_root=fixture_root,
+                    production_binder=production_binder,
+                ),
+                production_binding,
+            )
+            self.assertEqual(
+                _bind_scheduler_doctor_fixture_account_home(
+                    non_sticky_child,
+                    fixture_root=non_sticky_child.parent,
+                    production_binder=production_binder,
+                ),
+                production_binding,
+            )
+            self.assertEqual(
+                _bind_scheduler_doctor_fixture_account_home(
+                    broad_fallback_child,
+                    fixture_root=fallback,
+                    production_binder=production_binder,
+                ),
+                production_binding,
+            )
+
+        fixture_binder.assert_called_once_with(fixture_child)
+        self.assertEqual(
+            production_binder.call_args_list,
+            [
+                mock.call(outside),
+                mock.call(non_sticky_child),
+                mock.call(broad_fallback_child),
+            ],
+        )
 
     def test_linux_shared_checkout_uses_stable_sticky_fallback(self) -> None:
         with _scheduler_doctor_test_temporary_directory() as directory:
