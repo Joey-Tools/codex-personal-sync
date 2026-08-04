@@ -45,6 +45,8 @@ _SCHEDULER_DOCTOR_TEST_ANCHOR_ENV = "CODEX_SCHEDULER_DOCTOR_TEST_ANCHOR"
 _SCHEDULER_DOCTOR_TEST_EXPECTED_ANCHOR_ENV = (
     "CODEX_SCHEDULER_DOCTOR_TEST_EXPECTED_ANCHOR"
 )
+_SCHEDULER_DOCTOR_TEST_CONTAINER_NAME = ".codex-tmp"
+_SCHEDULER_DOCTOR_TEST_NAMESPACE_NAME = "scheduler-doctor"
 _SCHEDULER_DOCTOR_TEST_LOCK_NAME = ".session.lock"
 _SCHEDULER_DOCTOR_TEST_SESSION_PREFIX = "session."
 _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT = 1024
@@ -56,7 +58,6 @@ _SCHEDULER_DOCTOR_TEST_LEASE_RETRY_SECONDS = 0.05
 _SCHEDULER_DOCTOR_TEST_DARWIN_TEMP_SCAN_ENTRY_LIMIT = 4096
 _SCHEDULER_DOCTOR_TEST_SESSION: tempfile.TemporaryDirectory | None = None
 _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD: int | None = None
-_SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR: tempfile.TemporaryDirectory | None = None
 
 
 class _SchedulerDoctorTestCandidateUnavailable(RuntimeError):
@@ -131,51 +132,6 @@ def _scheduler_doctor_test_platform_anchor_parents() -> tuple[Path, ...]:
                 if resolved == runtime_root or resolved.is_relative_to(runtime_root):
                     candidates.append(resolved)
     return tuple(dict.fromkeys(candidates))
-
-
-def _ensure_scheduler_doctor_test_platform_anchor() -> Path | None:
-    global _SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR
-
-    if _SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR is not None:
-        anchor = Path(_SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR.name)
-        _validate_owner_private_directory(anchor)
-        return anchor
-    for candidate in _scheduler_doctor_test_platform_anchor_parents():
-        parent = Path(os.path.realpath(candidate))
-        if parent != candidate or not _scheduler_doctor_platform_parent_in_scope(
-            parent
-        ):
-            continue
-        descriptor = -1
-        try:
-            descriptor, _identity, _access_policy = (
-                MODULE._bind_mirror_trusted_account_home(parent)
-            )
-        except (MODULE.SyncError, OSError):
-            continue
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-        try:
-            temporary_directory = tempfile.TemporaryDirectory(
-                prefix="codex-scheduler-doctor-anchor.",
-                dir=parent,
-            )
-        except OSError:
-            continue
-        anchor = Path(temporary_directory.name)
-        try:
-            _validate_owner_private_directory(anchor)
-            descriptor, _identity, _access_policy = (
-                MODULE._bind_mirror_trusted_account_home(anchor)
-            )
-            os.close(descriptor)
-        except BaseException:
-            temporary_directory.cleanup()
-            raise
-        _SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR = temporary_directory
-        return anchor
-    return None
 
 
 def _validate_owner_private_directory(path: Path) -> os.stat_result:
@@ -362,10 +318,13 @@ def _scheduler_doctor_test_namespace_candidates() -> tuple[Path, ...]:
                 f"{_SCHEDULER_DOCTOR_TEST_ANCHOR_ENV} must be absolute"
             )
         candidates.append(override)
+    for candidate in _scheduler_doctor_test_platform_anchor_parents():
+        resolved = Path(os.path.realpath(candidate))
+        if resolved == candidate and _scheduler_doctor_platform_parent_in_scope(
+            resolved
+        ):
+            candidates.append(resolved)
     candidates.append(REPO_ROOT)
-    platform_anchor = _ensure_scheduler_doctor_test_platform_anchor()
-    if platform_anchor is not None:
-        candidates.append(platform_anchor)
 
     unique: list[Path] = []
     seen: set[Path] = set()
@@ -592,26 +551,40 @@ def _select_scheduler_doctor_test_namespace(
             failures.append(f"{candidate}: {error}")
             continue
 
-        parent = candidate / ".codex-test-tmp"
-        namespace = parent / "scheduler-doctor"
+        parent = candidate / _SCHEDULER_DOCTOR_TEST_CONTAINER_NAME
+        namespace = parent / _SCHEDULER_DOCTOR_TEST_NAMESPACE_NAME
         try:
-            for path in (parent, namespace):
-                try:
-                    path.mkdir(mode=0o700)
-                except FileExistsError:
-                    _validate_owner_private_directory(path)
-                except OSError as error:
-                    if error.errno in {errno.EACCES, errno.EPERM, errno.EROFS}:
-                        raise _SchedulerDoctorTestCandidateUnavailable(error) from error
-                    raise
-                else:
-                    created.append((path, None))
-                    metadata = path.lstat()
-                    created[-1] = (
-                        path,
-                        _scheduler_doctor_test_object_identity(metadata),
-                    )
-                    _validate_owner_private_directory(path)
+            try:
+                parent.mkdir(mode=0o700)
+            except FileExistsError:
+                _validate_trusted_scheduler_doctor_test_root(parent)
+            except OSError as error:
+                if error.errno in {errno.EACCES, errno.EPERM, errno.EROFS}:
+                    raise _SchedulerDoctorTestCandidateUnavailable(error) from error
+                raise
+            else:
+                created.append((parent, None))
+                metadata = _validate_owner_private_directory(parent)
+                created[-1] = (
+                    parent,
+                    _scheduler_doctor_test_object_identity(metadata),
+                )
+                _validate_trusted_scheduler_doctor_test_root(parent)
+            try:
+                namespace.mkdir(mode=0o700)
+            except FileExistsError:
+                _validate_owner_private_directory(namespace)
+            except OSError as error:
+                if error.errno in {errno.EACCES, errno.EPERM, errno.EROFS}:
+                    raise _SchedulerDoctorTestCandidateUnavailable(error) from error
+                raise
+            else:
+                created.append((namespace, None))
+                metadata = _validate_owner_private_directory(namespace)
+                created[-1] = (
+                    namespace,
+                    _scheduler_doctor_test_object_identity(metadata),
+                )
             namespace_fd, _identity, _access_policy = (
                 MODULE._bind_mirror_trusted_account_home(namespace)
             )
@@ -1209,37 +1182,43 @@ def _cleanup_scheduler_doctor_test_session() -> None:
     session = _SCHEDULER_DOCTOR_TEST_SESSION
     descriptor = _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD
     if session is None:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            finally:
+                _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD = None
+            raise RuntimeError(
+                "scheduler-doctor fixture lease existed without session custody"
+            )
         return
     if descriptor is None:
         raise RuntimeError("scheduler-doctor fixture session custody is incomplete")
+    primary: BaseException | None = None
+    secondary: BaseException | None = None
     try:
         _validate_owner_private_directory(Path(session.name))
         session.cleanup()
-    finally:
+    except BaseException as error:
+        primary = error
+    try:
         os.close(descriptor)
+    except BaseException as error:
+        secondary = error
+    finally:
         _SCHEDULER_DOCTOR_TEST_SESSION = None
         _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD = None
-
-
-def _cleanup_scheduler_doctor_test_platform_anchor() -> None:
-    global _SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR
-
-    temporary_directory = _SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR
-    if temporary_directory is None:
-        return
-    anchor = Path(temporary_directory.name)
-    _validate_owner_private_directory(anchor)
-    temporary_directory.cleanup()
-    if anchor.exists() or anchor.is_symlink():
-        raise RuntimeError(
-            f"scheduler-doctor platform test anchor cleanup failed: {anchor}"
-        )
-    _SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR = None
+    if primary is not None:
+        if secondary is not None:
+            raise RuntimeError(
+                f"{primary}; fixture lease close failed: {secondary}"
+            ) from primary
+        raise primary
+    if secondary is not None:
+        raise RuntimeError(f"fixture lease close failed: {secondary}") from secondary
 
 
 def tearDownModule() -> None:
     _cleanup_scheduler_doctor_test_session()
-    _cleanup_scheduler_doctor_test_platform_anchor()
 
 
 def _scheduler_doctor_test_temporary_directory() -> tempfile.TemporaryDirectory:
@@ -1300,8 +1279,14 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         try:
             self.assertEqual(root.parent, session_root)
             self.assertFalse(root.is_relative_to(system_tmp))
-            self.assertEqual(session_root.parent.name, "scheduler-doctor")
-            self.assertEqual(session_root.parent.parent.name, ".codex-test-tmp")
+            self.assertEqual(
+                session_root.parent.name,
+                _SCHEDULER_DOCTOR_TEST_NAMESPACE_NAME,
+            )
+            self.assertEqual(
+                session_root.parent.parent.name,
+                _SCHEDULER_DOCTOR_TEST_CONTAINER_NAME,
+            )
             _validate_trusted_scheduler_doctor_test_root(session_root)
             (root / "cleanup-probe").write_text("fixture\n", encoding="utf-8")
         finally:
@@ -1317,7 +1302,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         ):
             candidates = _scheduler_doctor_test_namespace_candidates()
 
-        self.assertIn(Path(os.path.realpath(REPO_ROOT)), candidates)
+        self.assertEqual(candidates[-1], Path(os.path.realpath(REPO_ROOT)))
 
     def test_darwin_platform_anchor_parent_uses_fixed_getconf_result(self) -> None:
         result = subprocess.CompletedProcess(
@@ -1447,33 +1432,27 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             ):
                 _bounded_darwin_user_temp_directories()
 
-    def test_platform_anchor_is_unique_and_cleanup_owned(self) -> None:
-        with _scheduler_doctor_test_temporary_directory() as parent_directory:
-            parent = Path(parent_directory)
-            with (
-                mock.patch(
-                    f"{__name__}._scheduler_doctor_test_platform_anchor_parents",
-                    return_value=(parent,),
-                ),
-                mock.patch(
-                    f"{__name__}._SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR",
-                    None,
-                ),
-                mock.patch(
-                    f"{__name__}._scheduler_doctor_platform_parent_in_scope",
-                    return_value=True,
-                ),
-            ):
-                anchor = _ensure_scheduler_doctor_test_platform_anchor()
-                self.assertIsNotNone(anchor)
-                assert anchor is not None
-                self.assertEqual(anchor.parent, parent)
-                self.assertTrue(anchor.name.startswith("codex-scheduler-doctor-anchor."))
-                _validate_owner_private_directory(anchor)
+    def test_platform_parent_is_stable_and_requires_no_random_anchor(self) -> None:
+        parent = Path("/private/var/folders/fixture/T")
+        with (
+            mock.patch(
+                f"{__name__}._scheduler_doctor_test_platform_anchor_parents",
+                return_value=(parent,),
+            ),
+            mock.patch(
+                f"{__name__}._scheduler_doctor_platform_parent_in_scope",
+                return_value=True,
+            ),
+            mock.patch.object(tempfile, "TemporaryDirectory") as temporary,
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            candidates = _scheduler_doctor_test_namespace_candidates()
 
-                _cleanup_scheduler_doctor_test_platform_anchor()
-
-                self.assertFalse(anchor.exists())
+        self.assertEqual(
+            candidates,
+            (parent, Path(os.path.realpath(REPO_ROOT))),
+        )
+        temporary.assert_not_called()
 
     def test_platform_anchor_rejects_resolved_scope_change(self) -> None:
         candidate = Path("/private/var/folders/fixture/T")
@@ -1490,14 +1469,11 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                 else str(path),
             ),
             mock.patch.object(tempfile, "TemporaryDirectory") as temporary,
-            mock.patch(
-                f"{__name__}._SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR",
-                None,
-            ),
+            mock.patch.dict(os.environ, {}, clear=True),
         ):
-            anchor = _ensure_scheduler_doctor_test_platform_anchor()
+            candidates = _scheduler_doctor_test_namespace_candidates()
 
-        self.assertIsNone(anchor)
+        self.assertEqual(candidates, (Path(os.path.realpath(REPO_ROOT)),))
         temporary.assert_not_called()
 
     def test_stale_session_is_swept_before_reuse(self) -> None:
@@ -1796,14 +1772,99 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
 
         with _scheduler_doctor_test_temporary_directory() as anchor_directory:
             anchor = Path(anchor_directory)
-            with mock.patch.dict(
-                os.environ,
-                {_SCHEDULER_DOCTOR_TEST_ANCHOR_ENV: os.fspath(anchor)},
-            ):
-                candidates = _scheduler_doctor_test_namespace_candidates()
-                namespace = _select_scheduler_doctor_test_namespace()
-            self.assertEqual(candidates[0], Path(os.path.realpath(anchor)))
+            with _scheduler_doctor_test_temporary_directory() as platform_directory:
+                platform_parent = Path(platform_directory)
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {_SCHEDULER_DOCTOR_TEST_ANCHOR_ENV: os.fspath(anchor)},
+                    ),
+                    mock.patch(
+                        f"{__name__}._scheduler_doctor_test_platform_anchor_parents",
+                        return_value=(platform_parent,),
+                    ),
+                    mock.patch(
+                        f"{__name__}._scheduler_doctor_platform_parent_in_scope",
+                        return_value=True,
+                    ),
+                ):
+                    candidates = _scheduler_doctor_test_namespace_candidates()
+                    namespace = _select_scheduler_doctor_test_namespace()
+            self.assertEqual(
+                candidates,
+                (
+                    Path(os.path.realpath(anchor)),
+                    Path(os.path.realpath(platform_parent)),
+                    Path(os.path.realpath(REPO_ROOT)),
+                ),
+            )
             self.assertTrue(namespace.is_relative_to(anchor))
+
+    def test_stable_namespace_is_reused_and_sweeps_stale_sessions(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as candidate_directory:
+            candidate = Path(candidate_directory)
+            first = _select_scheduler_doctor_test_namespace((candidate,))
+            stale = first / "session.interrupted"
+            stale.mkdir(mode=0o700)
+            (stale / "residue").write_text("stale\n", encoding="utf-8")
+
+            second = _select_scheduler_doctor_test_namespace((candidate,))
+            lease_path = second / _SCHEDULER_DOCTOR_TEST_LOCK_NAME
+            descriptor = os.open(lease_path, os.O_RDWR)
+            try:
+                _acquire_scheduler_doctor_test_session_lease(descriptor)
+                _validate_scheduler_doctor_session_lease(lease_path, descriptor)
+                _sweep_stale_scheduler_doctor_sessions(second)
+            finally:
+                os.close(descriptor)
+
+            self.assertEqual(first, second)
+            self.assertTrue((second / _SCHEDULER_DOCTOR_TEST_LOCK_NAME).is_file())
+            self.assertFalse(stale.exists())
+
+    def test_existing_mode_0755_container_is_accepted(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as candidate_directory:
+            candidate = Path(candidate_directory)
+            container = candidate / _SCHEDULER_DOCTOR_TEST_CONTAINER_NAME
+            container.mkdir(mode=0o755)
+            container.chmod(0o755)
+
+            namespace = _select_scheduler_doctor_test_namespace((candidate,))
+
+            self.assertEqual(namespace.parent, container)
+            self.assertEqual(stat.S_IMODE(container.lstat().st_mode), 0o755)
+            _validate_owner_private_directory(namespace)
+
+    def test_existing_writable_container_fails_closed(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as candidate_directory:
+            candidate = Path(candidate_directory)
+            container = candidate / _SCHEDULER_DOCTOR_TEST_CONTAINER_NAME
+            container.mkdir(mode=0o700)
+            container.chmod(0o770)
+            try:
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "not group/world writable",
+                ):
+                    _select_scheduler_doctor_test_namespace((candidate,))
+            finally:
+                container.chmod(0o700)
+
+    def test_existing_container_symlink_fails_closed(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as candidate_directory:
+            candidate = Path(candidate_directory)
+            target = candidate / "container-target"
+            target.mkdir(mode=0o700)
+            (candidate / _SCHEDULER_DOCTOR_TEST_CONTAINER_NAME).symlink_to(
+                target,
+                target_is_directory=True,
+            )
+
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "non-symlink directories",
+            ):
+                _select_scheduler_doctor_test_namespace((candidate,))
 
     def test_stable_fallback_is_exact_and_rejects_secondary_or_drift(self) -> None:
         candidate = Path("/fixture")
@@ -1831,7 +1892,11 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             with _scheduler_doctor_test_temporary_directory() as second_directory:
                 first = Path(first_directory)
                 second = Path(second_directory)
-                blocked = first / ".codex-test-tmp" / "scheduler-doctor"
+                blocked = (
+                    first
+                    / _SCHEDULER_DOCTOR_TEST_CONTAINER_NAME
+                    / _SCHEDULER_DOCTOR_TEST_NAMESPACE_NAME
+                )
                 original_mkdir = Path.mkdir
 
                 def reject_namespace(path: Path, *args: object, **kwargs: object) -> None:
@@ -1844,7 +1909,9 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                         (first, second)
                     )
                 self.assertTrue(namespace.is_relative_to(second))
-                self.assertFalse((first / ".codex-test-tmp").exists())
+                self.assertFalse(
+                    (first / _SCHEDULER_DOCTOR_TEST_CONTAINER_NAME).exists()
+                )
 
     def test_lock_open_eperm_removes_partial_candidate_and_falls_back(self) -> None:
         with _scheduler_doctor_test_temporary_directory() as first_directory:
@@ -1873,7 +1940,9 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                     )
                 self.assertTrue(rejected)
                 self.assertTrue(namespace.is_relative_to(second))
-                self.assertFalse((first / ".codex-test-tmp").exists())
+                self.assertFalse(
+                    (first / _SCHEDULER_DOCTOR_TEST_CONTAINER_NAME).exists()
+                )
 
     def test_lock_probe_reopens_after_concurrent_creation(self) -> None:
         with _scheduler_doctor_test_temporary_directory() as directory:
@@ -2053,21 +2122,25 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             environment["TMPDIR"] = "/tmp"
             environment.pop(_SCHEDULER_DOCTOR_TEST_ANCHOR_ENV, None)
             environment.pop(_SCHEDULER_DOCTOR_TEST_EXPECTED_ANCHOR_ENV, None)
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "unittest",
-                    "tests.test_scheduler_doctor.SchedulerDoctorFixtureTests."
-                    "test_temporary_root_ignores_ambient_tmpdir_and_cleans_up",
-                ],
-                cwd=checkout,
-                env=environment,
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
-            )
+            _cleanup_scheduler_doctor_test_session()
+            try:
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "unittest",
+                        "tests.test_scheduler_doctor.SchedulerDoctorFixtureTests."
+                        "test_temporary_root_ignores_ambient_tmpdir_and_cleans_up",
+                    ],
+                    cwd=checkout,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=False,
+                )
+            finally:
+                _scheduler_doctor_test_session_directory()
 
         self.assertEqual(
             result.returncode,
@@ -2078,7 +2151,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
     def test_existing_namespace_symlink_fails_closed(self) -> None:
         with _scheduler_doctor_test_temporary_directory() as fallback_directory:
             fallback = Path(fallback_directory)
-            parent = fallback / ".codex-test-tmp"
+            parent = fallback / _SCHEDULER_DOCTOR_TEST_CONTAINER_NAME
             parent.mkdir(mode=0o700)
             target = fallback / "target"
             target.mkdir(mode=0o700)
@@ -2105,6 +2178,43 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         finally:
             os.close(descriptor)
+
+    def test_module_cleanup_keeps_stable_namespace_and_lock(self) -> None:
+        session = _scheduler_doctor_test_session_directory()
+        namespace = _ensure_scheduler_doctor_test_namespace()
+        lease_path = namespace / _SCHEDULER_DOCTOR_TEST_LOCK_NAME
+
+        try:
+            _cleanup_scheduler_doctor_test_session()
+
+            self.assertFalse(session.exists())
+            self.assertTrue(namespace.is_dir())
+            metadata = lease_path.lstat()
+            self.assertTrue(stat.S_ISREG(metadata.st_mode))
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+        finally:
+            _scheduler_doctor_test_session_directory()
+
+    def test_cleanup_closes_orphaned_lease_descriptor(self) -> None:
+        descriptor, writer = os.pipe()
+        try:
+            with (
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION",
+                    None,
+                ),
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD",
+                    descriptor,
+                ),
+                self.assertRaisesRegex(RuntimeError, "without session custody"),
+            ):
+                _cleanup_scheduler_doctor_test_session()
+            with self.assertRaises(OSError) as raised:
+                os.fstat(descriptor)
+            self.assertEqual(raised.exception.errno, errno.EBADF)
+        finally:
+            os.close(writer)
 
     def test_session_lease_retries_busy_lock_then_succeeds(self) -> None:
         busy = BlockingIOError(errno.EWOULDBLOCK, "fixture lease is busy")
