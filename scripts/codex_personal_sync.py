@@ -22627,6 +22627,21 @@ def _launchd_gui_domain_unavailable_evidence(raw_evidence: str) -> bool:
     )
 
 
+def _launchd_gui_disable_unavailable_evidence(raw_evidence: str) -> bool:
+    evidence = re.sub(r"\s+", " ", raw_evidence.strip())
+    return (
+        re.fullmatch(
+            (
+                r"could not disable service: "
+                r"125: domain does not support specified action[.;]?"
+            ),
+            evidence,
+            flags=re.IGNORECASE,
+        )
+        is not None
+    )
+
+
 def _native_scheduler_failure_is_already_absent(
     args: list[str],
     completed: subprocess.CompletedProcess[str],
@@ -22681,8 +22696,16 @@ def _native_scheduler_failure_is_already_absent(
             or (
                 target is not None
                 and target[2] == MACOS_LEGACY_GUI_LAUNCHD_DOMAIN
-                and _launchd_gui_domain_unavailable_evidence(
-                    completed.stdout + "\n" + completed.stderr
+                and (
+                    _launchd_gui_domain_unavailable_evidence(
+                        completed.stdout + "\n" + completed.stderr
+                    )
+                    or (
+                        args[1] == "disable"
+                        and _launchd_gui_disable_unavailable_evidence(
+                            completed.stdout + "\n" + completed.stderr
+                        )
+                    )
                 )
             )
         )

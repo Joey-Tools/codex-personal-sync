@@ -6635,6 +6635,135 @@ class SchedulerDoctorTests(unittest.TestCase):
                 )
                 self.assertNotIn("removed ", output.getvalue())
 
+    def test_macos_install_and_uninstall_accept_gui_disable_domain_absence(
+        self,
+    ) -> None:
+        uid = os.getuid()
+        gui_domain = f"gui/{uid}"
+        for operation in ("install", "uninstall"):
+            with self.subTest(operation=operation):
+                case_user_home = self.root / f"gui-domain-absent-{operation}" / "home"
+                case_home = case_user_home / ".codex"
+                runner = case_home / "bin" / "codex-personal-sync"
+                runner.parent.mkdir(parents=True)
+                runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                runner.chmod(0o755)
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    paths = MODULE._scheduler_paths("macos", case_home)
+                    if operation == "uninstall":
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            MODULE.install_scheduler(
+                                case_home,
+                                "owner/public-sync",
+                                17,
+                                "macos",
+                                None,
+                                dry_run=False,
+                                enable=False,
+                            )
+
+                native_calls: list[list[str]] = []
+
+                def gui_domain_absent(
+                    args: list[str],
+                    **_kwargs: object,
+                ) -> subprocess.CompletedProcess[str]:
+                    native_calls.append(args)
+                    if (
+                        len(args) == 3
+                        and args[0] == "launchctl"
+                        and args[2].startswith(f"{gui_domain}/")
+                    ):
+                        if args[1] == "bootout":
+                            return subprocess.CompletedProcess(
+                                args,
+                                125,
+                                "",
+                                (
+                                    "Boot-out failed: 125: "
+                                    "Domain does not support specified action"
+                                ),
+                            )
+                        if args[1] == "disable":
+                            return subprocess.CompletedProcess(
+                                args,
+                                125,
+                                "",
+                                (
+                                    "Could not disable service: 125: "
+                                    "Domain does not support specified action"
+                                ),
+                            )
+                    return subprocess.CompletedProcess(args, 0, "", "")
+
+                output = io.StringIO()
+                with (
+                    mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_native_scheduler_argv",
+                        side_effect=lambda args: args,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_run_bounded_scheduler_process",
+                        side_effect=gui_domain_absent,
+                    ),
+                    contextlib.redirect_stdout(output),
+                ):
+                    if operation == "install":
+                        MODULE.install_scheduler(
+                            case_home,
+                            "owner/public-sync",
+                            17,
+                            "macos",
+                            None,
+                            dry_run=False,
+                            enable=True,
+                        )
+                    else:
+                        MODULE.uninstall_scheduler(
+                            case_home,
+                            "macos",
+                            dry_run=False,
+                            disable=True,
+                        )
+
+                gui_disable_targets = [
+                    args[2]
+                    for args in native_calls
+                    if len(args) == 3
+                    and args[:2] == ["launchctl", "disable"]
+                    and args[2].startswith(f"{gui_domain}/")
+                ]
+                self.assertEqual(
+                    len(gui_disable_targets),
+                    1 + len(MODULE.LEGACY_LAUNCHD_LABELS),
+                )
+                self.assertEqual(
+                    output.getvalue().count("ignored already-absent scheduler command"),
+                    2 * (1 + len(MODULE.LEGACY_LAUNCHD_LABELS)),
+                )
+                assert paths.launchd_plist is not None
+                self.assertEqual(
+                    paths.launchd_plist.exists(),
+                    operation == "install",
+                )
+                self.assertFalse(
+                    MODULE._scheduler_activation_transaction_path(paths).exists()
+                )
+                self.assertFalse(
+                    MODULE._scheduler_uninstall_transaction_path(paths).exists()
+                )
+
     def test_uninstall_accepts_only_precise_absence_evidence(self) -> None:
         uid = os.getuid()
         legacy_label = MODULE.LEGACY_LAUNCHD_LABELS[0]
@@ -6683,6 +6812,17 @@ class SchedulerDoctorTests(unittest.TestCase):
                     f"gui/{uid}/{MODULE.LAUNCHD_LABEL}",
                 ],
                 "Could not print domain: 125: Domain does not support specified action",
+            ),
+            (
+                [
+                    "launchctl",
+                    "disable",
+                    f"gui/{uid}/{MODULE.LAUNCHD_LABEL}",
+                ],
+                (
+                    "Could not disable service: 125: "
+                    "Domain does not support specified action"
+                ),
             ),
             (
                 ["launchctl", "bootout", f"gui/{uid}/{legacy_label}"],
@@ -6823,6 +6963,39 @@ class SchedulerDoctorTests(unittest.TestCase):
                     f'Could not find service "{MODULE.LAUNCHD_LABEL}" '
                     f"in domain for user gui: {uid}\n"
                     "additional diagnostic"
+                ),
+            ),
+            (
+                [
+                    "launchctl",
+                    "bootout",
+                    f"gui/{uid}/{MODULE.LAUNCHD_LABEL}",
+                ],
+                (
+                    "Could not disable service: 125: "
+                    "Domain does not support specified action"
+                ),
+            ),
+            (
+                [
+                    "launchctl",
+                    "disable",
+                    f"user/{uid}/{MODULE.LAUNCHD_LABEL}",
+                ],
+                (
+                    "Could not disable service: 125: "
+                    "Domain does not support specified action"
+                ),
+            ),
+            (
+                [
+                    "launchctl",
+                    "disable",
+                    f"gui/{uid}/unmanaged.scheduler",
+                ],
+                (
+                    "Could not disable service: 125: "
+                    "Domain does not support specified action"
                 ),
             ),
             (
