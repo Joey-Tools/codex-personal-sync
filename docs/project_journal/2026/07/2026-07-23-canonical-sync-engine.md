@@ -21,10 +21,10 @@ superseded_by:
   `70dc2c727e91036e9d155ec17dbed643eef26990`.
 - The PR #6 scheduler-doctor fixture and source-lock substage is complete for
   the target-branch state. Its latest pre-squash implementation evidence is
-  signed head `09c4d648f0c2bd4befad5c3f73cf6e504c3d767d`, tree
-  `a31fc531c5f14b9422e2742b02351ea740f57516`; the verified BL-generated
+  signed head `d35d535ca96ab0d105466a1ce6a8c172c722e0de`, tree
+  `cbd65d7c38088b74234d1cb15fd849c68c59686e`; the verified BL-generated
   source-lock SHA-256 is
-  `6aa52db04ad49f128e68683728b7b47c022cd292b3860bf6e4147ec027ed6298`.
+  `96f7380f96cfb156d92e90bf806645a7aea4fc222c50fe771b34dff8587a45fe`.
   These pre-squash identities remain historical evidence only. Downstream
   generation must bind the actual squash-landed canonical `P` identity.
 
@@ -1454,6 +1454,51 @@ superseded_by:
   validation commit are historical pre-squash evidence only; downstream
   generation must bind the actual squash-landed canonical `P` before producing
   `T`/`B` or propagating private and scheduler state.
+- The superseding Linux runtime-candidate and stale-session recovery hardening
+  is preserved as historical pre-squash evidence at signed implementation head
+  `d35d535ca96ab0d105466a1ce6a8c172c722e0de`, tree
+  `cbd65d7c38088b74234d1cb15fd849c68c59686e`, with sole parent
+  `ff2ee79228f945ee9ee8507b8c5a518efdbe8771` and signing fingerprint
+  `EFBBC913F49A5F6E0AF0D248F70246143DC28F32`. Its only implementation path is
+  `tests/test_scheduler_doctor.py`, blob
+  `0b9c9743cff59acfcc6f344cffc7c9ece4189b52`, with SHA-256
+  `311609ecf32d9038f8192340529c357628d797a204ac4dabef5646a2b1420d74`.
+  The fixture now discovers the fixed Linux `/run/user/<euid>` candidate even
+  when `XDG_RUNTIME_DIR` is absent, distinguishes stable initial absence from
+  fatal post-binding drift, and carries exact path, object-identity, and
+  access-policy receipts across selection and use. Re-resolution, symlink,
+  identity, unreadability, or policy drift after binding is fatal without
+  fallback. Stale-session cleanup accepts FIFO and Unix-socket leaves only
+  after current-UID plus device/inode/type revalidation immediately before
+  removal, while device leaves and top-level special roots remain rejected.
+  These changes resolve the current applicable findings `3709330172`,
+  `3709330174`, and `3709330181`. A fresh full BL custody clone independently
+  matched the branch, head, tree, sole parent, unique PR merge base, changed
+  blob, and complete object closure. GitHub reported the exact signature as
+  provider-valid, matching the owner-side `GOODSIG`/`VALIDSIG` fingerprint;
+  the BL keybox did not contain that public key and was not modified.
+  Unmodified stock `refresh-lock` refreshed all six sources and stock
+  `refresh-lock --check` verified them after restoring only the Git-declared
+  physical modes in the owner-private checkout. Under standard `umask 022`,
+  the complete canonical source-lock suite passed 230/230 in 328.391 seconds
+  with one expected platform skip through the repository's private-`TMPDIR`
+  wrapper. `SchedulerDoctorFixtureTests` passed 56/56 under uv Python 3.13.13
+  in 0.669 seconds and macOS system Python 3.9.6 in 0.479 seconds; the full
+  scheduler-doctor suite passed 205/205 in 4.180 and 5.174 seconds
+  respectively. The two real `TMPDIR=/tmp` copied-checkout cases passed 2/2
+  under each runtime in 0.625 and 0.423 seconds. The explicit owner-private
+  test namespace ended with only its regular, single-link, mode-`0600`
+  `.session.lock` and no `session.*`, then passed zero-process/zero-FD checks
+  and was removed. Owner-side Ruff E4/E7/E9/F was clean; BL had no installed
+  Ruff executable and did not install one. Both runtimes passed `py_compile`,
+  frozen-range and working-tree `git diff --check` passed, and project-journal
+  validation passed. The refreshed `sync-source-lock.json` SHA-256 is
+  `96f7380f96cfb156d92e90bf806645a7aea4fc222c50fe771b34dff8587a45fe`.
+  The fixture behavior, source lock, and validation are complete for the
+  target-branch state. Both the implementation head and its append-only
+  source-lock/journal handoff commit are historical pre-squash evidence only;
+  downstream generation must bind the actual squash-landed canonical `P`
+  before producing `T`/`B` or propagating private and scheduler state.
 
 ## Installed Host Baseline
 
