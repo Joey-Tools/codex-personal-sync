@@ -21,10 +21,10 @@ superseded_by:
   `70dc2c727e91036e9d155ec17dbed643eef26990`.
 - The PR #6 scheduler-doctor fixture and source-lock substage is complete for
   the target-branch state. Its latest pre-squash implementation evidence is
-  signed head `3191ddbefd68ece1cb93ecea91fb2121500ee1eb`, tree
-  `bc66257993148b1b01b5ce55414a9d4bfa8c6866`; the verified BL-generated
+  signed head `4826113e52c08e2950604beec9e863d466bf6a4f`, tree
+  `9400b7bd1fa53d99bfd32ef8878e81b9b5ccbf84`; the verified BL-generated
   source-lock SHA-256 is
-  `6d6e27bb39f7f43eea24eea92de6f05f73c7ad7c588de602d31ce046eb922bf3`.
+  `a01ef2e2b11c614b85b49c5745c439ee68bf3a728f9b42a6a91ece7afe73f2db`.
   These pre-squash identities remain historical evidence only. Downstream
   generation must bind the actual squash-landed canonical `P` identity.
 
@@ -1542,6 +1542,50 @@ superseded_by:
   refreshed `sync-source-lock.json` SHA-256 is
   `6d6e27bb39f7f43eea24eea92de6f05f73c7ad7c588de602d31ce046eb922bf3`.
   The implementation and append-only source-lock/journal identities remain
+  historical evidence only. Downstream generation must bind the actual
+  squash-landed canonical `P` before producing `T`/`B` or propagating private
+  and scheduler state.
+- The receipt-bound platform-parent and fixture-binder remediation is complete
+  for the target-branch state. Historical pre-squash implementation evidence
+  is signed head `4826113e52c08e2950604beec9e863d466bf6a4f`, tree
+  `9400b7bd1fa53d99bfd32ef8878e81b9b5ccbf84`, with sole parent
+  `ec90e179ef4dc0510534711fef528428d3ac278e` and expected signer fingerprint
+  `EFBBC913F49A5F6E0AF0D248F70246143DC28F32`. Its only implementation path is
+  `tests/test_scheduler_doctor.py`, blob
+  `237c1552c35b1362f81289e3828c9c0e1fa53bde`, with SHA-256
+  `f9937109f7f5e4224305672a4f56e13efd9474c3c6b59576fea8ba6e6c4fc07d`.
+  Darwin ambient, `getconf`, and bounded-scan candidates now carry a bound
+  path, object-identity receipt, and access-policy receipt into selection and
+  use. A stable initial missing candidate remains eligible for fallback, while
+  unreadability, replacement, binding drift, or access-policy drift fails
+  closed. The Linux fixture adapter applies only to the exact test root below
+  the receipt-bound sticky fallback; every other path still calls the
+  production account-home binder. The copied-checkout subprocess also proves
+  that its production private-control parent remains descriptor-bindable.
+  A fresh full BL custody clone independently matched the PR branch, head,
+  tree, sole parent, unique merge base, changed blob, and complete object
+  closure. GitHub reported the exact signature provider-valid; the BL keybox
+  lacked the signer public key and was not modified. The clone's private
+  `umask` initially narrowed 23 tracked regular files to `0600` / `0700`;
+  restoring only their Git-declared `0644` / `0755` physical modes changed no
+  tracked bytes. Unmodified stock `refresh-lock` refreshed all six sources and
+  stock `refresh-lock --check` verified them. Under standard `umask 022`, the
+  complete canonical source-lock suite passed 230/230 in 369.092 seconds
+  through the repository's private-`TMPDIR` wrapper. The ten exact Darwin,
+  Linux, and candidate-order regressions passed 10/10 under uv Python 3.13.13
+  and macOS system Python 3.9.6 in 0.013 and 0.014 seconds; the three exact
+  Darwin/Linux copied-checkout regressions passed 3/3 in 0.950 and 0.638
+  seconds respectively. `SchedulerDoctorFixtureTests` passed 72/72 in 1.080
+  and 0.705 seconds, and the full scheduler-doctor suite passed 222/222 in
+  4.564 and 5.498 seconds respectively; each fixture/full run had one expected
+  platform skip. The platform test namespace ended with only its regular,
+  single-link, mode-`0600` `.session.lock` and no `session.*`. Both runtimes
+  passed `py_compile` for the generator, engine, source-lock tests, and
+  scheduler-doctor tests. BL had no installed Ruff executable and installed no
+  substitute. JSON parsing, project-journal validation, source-lock recheck,
+  and staged diff checks passed. The refreshed `sync-source-lock.json` SHA-256
+  is `a01ef2e2b11c614b85b49c5745c439ee68bf3a728f9b42a6a91ece7afe73f2db`.
+  The implementation and append-only source-lock/journal identity remain
   historical evidence only. Downstream generation must bind the actual
   squash-landed canonical `P` before producing `T`/`B` or propagating private
   and scheduler state.
