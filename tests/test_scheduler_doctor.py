@@ -65,8 +65,9 @@ _SCHEDULER_DOCTOR_TEST_LINUX_STICKY_TEMP_ROOT = Path("/tmp")
 _SCHEDULER_DOCTOR_TEST_LINUX_STICKY_FALLBACK_PREFIX = (
     ".codex-scheduler-doctor-"
 )
-_SCHEDULER_DOCTOR_TEST_SESSION: tempfile.TemporaryDirectory | None = None
+_SCHEDULER_DOCTOR_TEST_SESSION: _SchedulerDoctorActiveSessionBinding | None = None
 _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD: int | None = None
+_SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE: tuple[Path, str] | None = None
 _SCHEDULER_DOCTOR_TEST_HOST_PLATFORM = sys.platform
 
 
@@ -89,6 +90,18 @@ class _SchedulerDoctorStaleCleanupBudget:
     deadline: float
     remaining_entries: int
     depth_limit: int
+
+
+@dataclass(frozen=True)
+class _SchedulerDoctorActiveSessionBinding:
+    path: Path
+    namespace_path: Path
+    namespace_descriptor: int
+    namespace_identity: tuple[int, int, int]
+    namespace_mount_identity: tuple[int, int | None]
+    descriptor: int
+    identity: tuple[int, int, int]
+    mount_identity: tuple[int, int | None]
 
 
 @dataclass(frozen=True)
@@ -1955,8 +1968,14 @@ def _scheduler_doctor_test_session_directory() -> Path:
     global _SCHEDULER_DOCTOR_TEST_SESSION
     global _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD
 
+    if _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE is not None:
+        retained_path, reason = _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
+        raise RuntimeError(
+            "scheduler-doctor active-session cleanup previously failed; "
+            f"retained for inspection: {retained_path}: {reason}"
+        )
     if _SCHEDULER_DOCTOR_TEST_SESSION is not None:
-        return Path(_SCHEDULER_DOCTOR_TEST_SESSION.name)
+        return _SCHEDULER_DOCTOR_TEST_SESSION.path
 
     namespace = _ensure_scheduler_doctor_test_namespace()
     lease_path = namespace / _SCHEDULER_DOCTOR_TEST_LOCK_NAME
@@ -1965,65 +1984,254 @@ def _scheduler_doctor_test_session_directory() -> Path:
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(lease_path, flags, 0o600)
+    lease_descriptor = os.open(lease_path, flags, 0o600)
+    namespace_descriptor = -1
+    session_descriptor = -1
+    session_path: Path | None = None
     try:
-        _acquire_scheduler_doctor_test_session_lease(descriptor)
-        _validate_scheduler_doctor_session_lease(lease_path, descriptor)
+        _acquire_scheduler_doctor_test_session_lease(lease_descriptor)
+        _validate_scheduler_doctor_session_lease(lease_path, lease_descriptor)
         _sweep_stale_scheduler_doctor_sessions(namespace)
-        session = tempfile.TemporaryDirectory(
-            prefix=_SCHEDULER_DOCTOR_TEST_SESSION_PREFIX,
-            dir=namespace,
+        (
+            namespace_descriptor,
+            namespace_identity,
+            _namespace_access_policy,
+        ) = _bind_scheduler_doctor_test_root(namespace)
+        namespace_mount_identity = (
+            _scheduler_doctor_stale_directory_mount_identity(
+                namespace_descriptor
+            )
         )
-        _validate_owner_private_directory(Path(session.name))
-    except BaseException:
-        os.close(descriptor)
+        session_path = Path(
+            tempfile.mkdtemp(
+                prefix=_SCHEDULER_DOCTOR_TEST_SESSION_PREFIX,
+                dir=namespace,
+            )
+        )
+        session_name = session_path.name
+        session_descriptor = _open_scheduler_doctor_stale_directory(
+            namespace_descriptor,
+            session_name,
+            _scheduler_doctor_test_object_identity(
+                _validate_owner_private_directory(session_path)
+            ),
+            expected_mount_identity=namespace_mount_identity,
+            require_owner_private_directory=True,
+        )
+        session_metadata = os.fstat(session_descriptor)
+        session_binding = _SchedulerDoctorActiveSessionBinding(
+            path=session_path,
+            namespace_path=namespace,
+            namespace_descriptor=namespace_descriptor,
+            namespace_identity=namespace_identity,
+            namespace_mount_identity=namespace_mount_identity,
+            descriptor=session_descriptor,
+            identity=_scheduler_doctor_test_object_identity(session_metadata),
+            mount_identity=_scheduler_doctor_stale_directory_mount_identity(
+                session_descriptor
+            ),
+        )
+        _validate_scheduler_doctor_active_session_binding(session_binding)
+    except BaseException as error:
+        close_failures = _close_scheduler_doctor_candidate_descriptors(
+            (session_descriptor, namespace_descriptor, lease_descriptor)
+        )
+        if close_failures:
+            raise RuntimeError(
+                f"{error}; {'; '.join(close_failures)}"
+            ) from error
         raise
 
-    _SCHEDULER_DOCTOR_TEST_SESSION = session
-    _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD = descriptor
-    return Path(session.name)
+    _SCHEDULER_DOCTOR_TEST_SESSION = session_binding
+    _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD = lease_descriptor
+    return session_binding.path
+
+
+def _validate_scheduler_doctor_active_session_binding(
+    binding: _SchedulerDoctorActiveSessionBinding,
+) -> None:
+    try:
+        named_namespace_metadata = binding.namespace_path.lstat()
+    except FileNotFoundError as error:
+        raise RuntimeError(
+            "scheduler-doctor fixture namespace is missing during active-session "
+            "cleanup"
+        ) from error
+    except OSError as error:
+        raise RuntimeError(
+            "scheduler-doctor fixture namespace is unreadable during "
+            "active-session cleanup"
+        ) from error
+    descriptor_namespace_metadata = os.fstat(binding.namespace_descriptor)
+    if (
+        _scheduler_doctor_test_object_identity(named_namespace_metadata)
+        != binding.namespace_identity
+        or _scheduler_doctor_test_object_identity(descriptor_namespace_metadata)
+        != binding.namespace_identity
+        or not _scheduler_doctor_metadata_is_owner_private_directory(
+            named_namespace_metadata
+        )
+        or not _scheduler_doctor_metadata_is_owner_private_directory(
+            descriptor_namespace_metadata
+        )
+        or _scheduler_doctor_stale_directory_mount_identity(
+            binding.namespace_descriptor
+        )
+        != binding.namespace_mount_identity
+    ):
+        raise RuntimeError(
+            "scheduler-doctor fixture namespace object changed during "
+            "active-session cleanup"
+        )
+
+    try:
+        named_session_metadata = os.stat(
+            binding.path.name,
+            dir_fd=binding.namespace_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as error:
+        raise RuntimeError(
+            "scheduler-doctor active session is missing during cleanup"
+        ) from error
+    except OSError as error:
+        raise RuntimeError(
+            "scheduler-doctor active session is unreadable during cleanup"
+        ) from error
+    descriptor_session_metadata = os.fstat(binding.descriptor)
+    if (
+        _scheduler_doctor_test_object_identity(named_session_metadata)
+        != binding.identity
+        or _scheduler_doctor_test_object_identity(descriptor_session_metadata)
+        != binding.identity
+        or not _scheduler_doctor_metadata_is_owner_private_directory(
+            named_session_metadata
+        )
+        or not _scheduler_doctor_metadata_is_owner_private_directory(
+            descriptor_session_metadata
+        )
+        or _scheduler_doctor_stale_directory_mount_identity(binding.descriptor)
+        != binding.mount_identity
+        or binding.mount_identity != binding.namespace_mount_identity
+    ):
+        raise RuntimeError(
+            "scheduler-doctor active session object changed during cleanup"
+        )
+
+
+def _remove_bound_scheduler_doctor_active_session(
+    binding: _SchedulerDoctorActiveSessionBinding,
+) -> None:
+    # The held module lease serializes cooperative same-UID test processes.
+    # As with stale-session cleanup, this fixture does not claim to defeat a
+    # malicious same-UID rename in the final stat-to-rmdir instruction gap.
+    _validate_scheduler_doctor_active_session_binding(binding)
+    deadline = (
+        time.monotonic()
+        + _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_TIMEOUT_SECONDS
+    )
+    budget = _SchedulerDoctorStaleCleanupBudget(
+        deadline=deadline,
+        remaining_entries=_SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_ENTRY_LIMIT,
+        depth_limit=_SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_DEPTH_LIMIT,
+    )
+    plan = _plan_scheduler_doctor_stale_entry(
+        binding.namespace_descriptor,
+        binding.path.name,
+        budget,
+        depth=1,
+        root_mount_identity=binding.namespace_mount_identity,
+        require_owner_private_directory=True,
+    )
+    if plan.identity != binding.identity:
+        raise RuntimeError(
+            "scheduler-doctor active session object changed during cleanup"
+        )
+    _revalidate_scheduler_doctor_stale_entry_plan(
+        binding.namespace_descriptor,
+        plan,
+        deadline=deadline,
+        root_mount_identity=binding.namespace_mount_identity,
+    )
+    _validate_scheduler_doctor_active_session_binding(binding)
+    _apply_scheduler_doctor_stale_entry_plan(
+        binding.namespace_descriptor,
+        plan,
+        deadline=deadline,
+        root_mount_identity=binding.namespace_mount_identity,
+    )
+    try:
+        os.stat(
+            binding.path.name,
+            dir_fd=binding.namespace_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise RuntimeError(
+            "cannot verify scheduler-doctor active-session cleanup"
+        ) from error
+    raise RuntimeError("scheduler-doctor active session cleanup retained its root")
 
 
 def _cleanup_scheduler_doctor_test_session() -> None:
     global _SCHEDULER_DOCTOR_TEST_SESSION
     global _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD
+    global _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
 
-    session = _SCHEDULER_DOCTOR_TEST_SESSION
-    descriptor = _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD
-    if session is None:
-        if descriptor is not None:
+    binding = _SCHEDULER_DOCTOR_TEST_SESSION
+    lease_descriptor = _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD
+    if binding is None:
+        if lease_descriptor is not None:
             try:
-                os.close(descriptor)
+                os.close(lease_descriptor)
             finally:
                 _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD = None
             raise RuntimeError(
                 "scheduler-doctor fixture lease existed without session custody"
             )
         return
-    if descriptor is None:
-        raise RuntimeError("scheduler-doctor fixture session custody is incomplete")
+    if lease_descriptor is None:
+        close_failures = _close_scheduler_doctor_candidate_descriptors(
+            (binding.descriptor, binding.namespace_descriptor)
+        )
+        _SCHEDULER_DOCTOR_TEST_SESSION = None
+        message = "scheduler-doctor fixture session custody is incomplete"
+        if close_failures:
+            message += "; " + "; ".join(close_failures)
+        _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
+            binding.path,
+            message,
+        )
+        raise RuntimeError(message)
     primary: BaseException | None = None
-    secondary: BaseException | None = None
     try:
-        _validate_owner_private_directory(Path(session.name))
-        session.cleanup()
+        _remove_bound_scheduler_doctor_active_session(binding)
     except BaseException as error:
         primary = error
-    try:
-        os.close(descriptor)
-    except BaseException as error:
-        secondary = error
-    finally:
-        _SCHEDULER_DOCTOR_TEST_SESSION = None
-        _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD = None
+    close_failures = _close_scheduler_doctor_candidate_descriptors(
+        (
+            binding.descriptor,
+            binding.namespace_descriptor,
+            lease_descriptor,
+        )
+    )
+    _SCHEDULER_DOCTOR_TEST_SESSION = None
+    _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD = None
     if primary is not None:
-        if secondary is not None:
+        _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
+            binding.path,
+            str(primary),
+        )
+        if close_failures:
             raise RuntimeError(
-                f"{primary}; fixture lease close failed: {secondary}"
+                f"{primary}; {'; '.join(close_failures)}"
             ) from primary
         raise primary
-    if secondary is not None:
-        raise RuntimeError(f"fixture lease close failed: {secondary}") from secondary
+    _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = None
+    if close_failures:
+        raise RuntimeError("; ".join(close_failures))
 
 
 def tearDownModule() -> None:
@@ -4279,6 +4487,102 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             self.assertTrue(stat.S_ISREG(metadata.st_mode))
             self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
         finally:
+            _scheduler_doctor_test_session_directory()
+
+    def test_module_cleanup_rejects_replaced_active_session(self) -> None:
+        global _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
+
+        session = _scheduler_doctor_test_session_directory()
+        retained = session.with_name(session.name + ".original")
+        replacement_probe = session / "replacement-probe"
+
+        session.rename(retained)
+        session.mkdir(mode=0o700)
+        replacement_probe.write_text("replacement\n", encoding="utf-8")
+        try:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "active session object changed",
+            ):
+                _cleanup_scheduler_doctor_test_session()
+            self.assertEqual(
+                replacement_probe.read_text(encoding="utf-8"),
+                "replacement\n",
+            )
+            self.assertTrue(retained.is_dir())
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "cleanup previously failed",
+            ):
+                _scheduler_doctor_test_session_directory()
+            self.assertTrue(replacement_probe.is_file())
+        finally:
+            if replacement_probe.exists():
+                replacement_probe.unlink()
+            if session.exists():
+                session.rmdir()
+            if retained.exists():
+                retained.rmdir()
+            _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = None
+            _scheduler_doctor_test_session_directory()
+
+    def test_module_cleanup_reports_missing_active_session(self) -> None:
+        global _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
+
+        session = _scheduler_doctor_test_session_directory()
+        retained = session.with_name(session.name + ".original")
+
+        session.rename(retained)
+        try:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "active session is missing",
+            ):
+                _cleanup_scheduler_doctor_test_session()
+            self.assertTrue(retained.is_dir())
+        finally:
+            if retained.exists():
+                retained.rmdir()
+            _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = None
+            _scheduler_doctor_test_session_directory()
+
+    def test_module_cleanup_reports_unreadable_active_session(self) -> None:
+        global _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
+
+        session = _scheduler_doctor_test_session_directory()
+        original_stat = os.stat
+
+        def deny_active_session_stat(
+            path: os.PathLike[str] | str | int,
+            *args: object,
+            **kwargs: object,
+        ) -> os.stat_result:
+            if (
+                path == session.name
+                and kwargs.get("dir_fd") is not None
+                and kwargs.get("follow_symlinks") is False
+            ):
+                raise PermissionError(errno.EACCES, "fixture")
+            return original_stat(path, *args, **kwargs)
+
+        try:
+            with (
+                mock.patch.object(
+                    os,
+                    "stat",
+                    side_effect=deny_active_session_stat,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "active session is unreadable",
+                ),
+            ):
+                _cleanup_scheduler_doctor_test_session()
+            self.assertTrue(session.is_dir())
+        finally:
+            if session.exists():
+                session.rmdir()
+            _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = None
             _scheduler_doctor_test_session_directory()
 
     def test_cleanup_closes_orphaned_lease_descriptor(self) -> None:
