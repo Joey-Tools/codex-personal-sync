@@ -20,11 +20,11 @@ superseded_by:
   `6d078594d547598db037ce358c89c8a8ac58c881`, with tree
   `70dc2c727e91036e9d155ec17dbed643eef26990`.
 - The PR #6 scheduler-doctor fixture and source-lock substage is complete for
-  the target-branch state. Its final pre-squash implementation evidence is
-  signed head `793a690a2454d0c761e6a08ffdc84999db78dcd6`, tree
-  `c5bb627c65b62916e266f1f6c650e90d6b4eeb8e`; the verified BL-generated
+  the target-branch state. Its latest pre-squash implementation evidence is
+  signed head `c39f0f6e57d4059323fbc0076707f7be53688922`, tree
+  `ff179f9484ea0d34576e7d5fa0eea26bad717b5b`; the verified BL-generated
   source-lock SHA-256 is
-  `73bd88706d65a79569c0b2e05061590aac73345b48faa7aab29a5168a524db66`.
+  `4695d2c0f3985b4b5014a6e560c03525c8dc927b449b985866964ec379c57641`.
   These pre-squash identities remain historical evidence only. Downstream
   generation must bind the actual squash-landed canonical `P` identity.
 
@@ -1373,6 +1373,40 @@ superseded_by:
   target-branch state. All listed heads remain historical validation evidence;
   after squash landing, toolbox generation must bind the actual canonical `P`
   identity before producing `T`/`B` or propagating private and scheduler state.
+- The shared-temporary-checkout remediation is preserved as historical
+  pre-squash evidence at signed implementation head
+  `c39f0f6e57d4059323fbc0076707f7be53688922`, tree
+  `ff179f9484ea0d34576e7d5fa0eea26bad717b5b`, with sole parent
+  `aefb480e77d6e445b8e8eb3b7888bb2b3f544525`. Its only implementation path is
+  `tests/test_scheduler_doctor.py`, blob
+  `89cca7bdc776c1ac274a738a07c9774b083eec29`, with SHA-256
+  `242440881564df69154433961c05343eff556a481d04b39eb688803496cbaafe`.
+  A checkout below shared `/tmp` now allocates a cleanup-owned platform anchor
+  without falling back to the account home. Darwin accepts only canonical
+  `/private/var/folders/**` user-temp candidates and Linux only
+  `/run/user/<euid>/**`; the fixed-path Darwin fallback uses descriptor-relative
+  no-follow traversal with one 4,096-entry budget, binds identity and access
+  policy at every component, and sorts only the bounded accepted set. A
+  scan-to-use re-resolution must remain byte/path equal and inside the fixed
+  platform scope before the full ancestry bind and allocation. The existing
+  cooperative-same-UID non-guarantee is unchanged.
+  A fresh full BL custody clone independently matched the branch, head, tree,
+  parent, unique PR merge base, complete object closure, and provider-valid
+  signature. Unmodified stock `refresh-lock` refreshed all six sources and
+  stock `refresh-lock --check` verified them. Under standard `umask 022`, the
+  complete canonical source-lock suite passed 230/230 in 376.149 seconds with
+  one expected platform skip. `SchedulerDoctorFixtureTests` passed 34/34 under
+  uv Python 3.13.13 in 0.640 seconds and macOS system Python 3.9.6 in 0.442
+  seconds; the full scheduler-doctor suite passed 183/183 in 4.269 and 5.360
+  seconds respectively. The two real `TMPDIR=/tmp` copied-checkout cases also
+  passed 2/2 under each runtime in 0.618 and 0.419 seconds, with no retained
+  `scheduler-doctor-checkout.*` directory or cleanup-owned platform anchor.
+  The refreshed `sync-source-lock.json` SHA-256 is
+  `4695d2c0f3985b4b5014a6e560c03525c8dc927b449b985866964ec379c57641`.
+  The fixture behavior, source lock, and validation are complete for the
+  target-branch state; downstream generation still binds only the actual
+  squash-landed canonical `P` identity before producing `T`/`B` or propagating
+  private and scheduler state.
 
 ## Installed Host Baseline
 
