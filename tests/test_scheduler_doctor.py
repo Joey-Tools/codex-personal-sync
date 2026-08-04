@@ -852,6 +852,7 @@ def _scheduler_doctor_test_namespace_candidates(
         | _SchedulerDoctorBoundNamespaceCandidate
         | _SchedulerDoctorLinuxStickyFallbackCandidate
     ] = []
+    linux_sticky_fallback_available = False
     configured_anchor = os.environ.get(_SCHEDULER_DOCTOR_TEST_ANCHOR_ENV)
     if configured_anchor:
         override = Path(configured_anchor)
@@ -865,7 +866,7 @@ def _scheduler_doctor_test_namespace_candidates(
             candidate_entry,
             _SchedulerDoctorLinuxStickyFallbackCandidate,
         ):
-            candidates.append(candidate_entry)
+            linux_sticky_fallback_available = True
             continue
         candidate = (
             candidate_entry.path
@@ -888,6 +889,8 @@ def _scheduler_doctor_test_namespace_candidates(
         ):
             candidates.append(candidate_entry)
     candidates.append(REPO_ROOT)
+    if linux_sticky_fallback_available:
+        candidates.append(_SCHEDULER_DOCTOR_LINUX_STICKY_FALLBACK_CANDIDATE)
 
     unique: list[
         Path
@@ -1171,11 +1174,12 @@ def _select_scheduler_doctor_test_namespace(
         namespace_fd = -1
         created: list[tuple[Path, tuple[int, int, int] | None]] = []
         try:
-            if (
-                expected_binding is not None
-                and _scheduler_doctor_bound_candidate_uses_sticky_root(
-                    expected_binding
+            if expected_binding is None:
+                candidate_fd, candidate_identity, candidate_access_policy = (
+                    _bind_scheduler_doctor_test_root(candidate)
                 )
+            elif _scheduler_doctor_bound_candidate_uses_sticky_root(
+                expected_binding
             ):
                 candidate_fd, candidate_identity, candidate_access_policy = (
                     _scheduler_doctor_rebind_sticky_candidate(
@@ -1974,14 +1978,28 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         self.assertFalse(root.exists())
 
     def test_namespace_candidates_never_resolve_the_account_home(self) -> None:
-        with mock.patch.object(
-            MODULE,
-            "_mirror_canonical_account_home_directory",
-            side_effect=AssertionError("account-home resolver must not run"),
+        with (
+            mock.patch.object(
+                MODULE,
+                "_mirror_canonical_account_home_directory",
+                side_effect=AssertionError("account-home resolver must not run"),
+            ),
+            mock.patch.dict(
+                os.environ,
+                {
+                    _SCHEDULER_DOCTOR_TEST_ANCHOR_ENV: os.fspath(REPO_ROOT),
+                },
+                clear=True,
+            ),
         ):
             candidates = _scheduler_doctor_test_namespace_candidates()
 
-        self.assertEqual(candidates[-1], Path(os.path.realpath(REPO_ROOT)))
+        resolved_repo = Path(os.path.realpath(REPO_ROOT))
+        resolved_candidates = tuple(
+            Path(os.path.realpath(_scheduler_doctor_candidate_path(candidate)))
+            for candidate in candidates
+        )
+        self.assertEqual(resolved_candidates.count(resolved_repo), 1)
 
     def test_darwin_platform_anchor_parent_uses_fixed_getconf_result(self) -> None:
         result = subprocess.CompletedProcess(
@@ -2150,6 +2168,44 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         )
         runtime_probe.assert_called_once_with(runtime_root)
         sticky_fallback.assert_not_called()
+
+    def test_linux_namespace_prefers_safe_repo_before_sticky_fallback(
+        self,
+    ) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            repo_root = Path(directory)
+            with (
+                mock.patch.object(sys, "platform", "linux"),
+                mock.patch(
+                    f"{__name__}.REPO_ROOT",
+                    repo_root,
+                ),
+                mock.patch(
+                    f"{__name__}._scheduler_doctor_test_platform_anchor_parents",
+                    return_value=(
+                        _SCHEDULER_DOCTOR_LINUX_STICKY_FALLBACK_CANDIDATE,
+                    ),
+                ),
+                mock.patch(
+                    f"{__name__}._scheduler_doctor_linux_sticky_fallback_binding",
+                    side_effect=AssertionError(
+                        "sticky fallback must not precede a safe repo root"
+                    ),
+                ) as sticky_fallback,
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                candidates = _scheduler_doctor_test_namespace_candidates()
+                namespace = _select_scheduler_doctor_test_namespace(candidates)
+
+            self.assertEqual(
+                candidates,
+                (
+                    Path(os.path.realpath(repo_root)),
+                    _SCHEDULER_DOCTOR_LINUX_STICKY_FALLBACK_CANDIDATE,
+                ),
+            )
+            self.assertTrue(namespace.is_relative_to(repo_root))
+            sticky_fallback.assert_not_called()
 
     def test_linux_platform_anchor_parent_skips_stale_xdg_runtime(self) -> None:
         runtime_root = Path("/run/user") / str(os.geteuid())
@@ -2629,6 +2685,43 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
 
                 self.assertTrue(namespace.is_relative_to(expected_fallback))
                 self.assertFalse(runtime_container.exists())
+            finally:
+                sticky_root.chmod(0o700)
+
+    def test_linux_explicit_sticky_child_uses_fallback_aware_binding(
+        self,
+    ) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            sticky_root = Path(directory) / "shared-tmp"
+            sticky_root.mkdir(mode=0o700)
+            sticky_root.chmod(0o1777)
+            try:
+                with (
+                    mock.patch.object(sys, "platform", "linux"),
+                    mock.patch(
+                        f"{__name__}."
+                        "_SCHEDULER_DOCTOR_TEST_LINUX_STICKY_TEMP_ROOT",
+                        sticky_root,
+                    ),
+                ):
+                    binding = _scheduler_doctor_linux_sticky_fallback_binding()
+                    assert binding is not None
+                    explicit_child = binding.path / "explicit"
+                    explicit_child.mkdir(mode=0o700)
+                    with mock.patch.object(
+                        MODULE,
+                        "_bind_mirror_trusted_account_home",
+                        side_effect=AssertionError(
+                            "sticky descendants must use the fallback-aware binder"
+                        ),
+                    ) as account_home_binder:
+                        namespace = _select_scheduler_doctor_test_namespace(
+                            (explicit_child,)
+                        )
+                        _validate_trusted_scheduler_doctor_test_root(namespace)
+
+                    self.assertTrue(namespace.is_relative_to(explicit_child))
+                    account_home_binder.assert_not_called()
             finally:
                 sticky_root.chmod(0o700)
 
