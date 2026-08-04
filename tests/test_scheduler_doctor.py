@@ -67,6 +67,7 @@ _SCHEDULER_DOCTOR_TEST_LINUX_STICKY_FALLBACK_PREFIX = (
 )
 _SCHEDULER_DOCTOR_TEST_SESSION: tempfile.TemporaryDirectory | None = None
 _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD: int | None = None
+_SCHEDULER_DOCTOR_TEST_HOST_PLATFORM = sys.platform
 
 
 class _SchedulerDoctorTestCandidateUnavailable(RuntimeError):
@@ -1495,11 +1496,33 @@ def _reserve_scheduler_doctor_stale_cleanup_entry(
     budget.remaining_entries -= 1
 
 
+def _scheduler_doctor_stale_directory_mount_identity(
+    descriptor: int,
+) -> tuple[int, int | None]:
+    try:
+        if sys.platform == _SCHEDULER_DOCTOR_TEST_HOST_PLATFORM:
+            return MODULE._directory_mount_identity(descriptor)
+        # Some fixture regressions emulate another product platform while
+        # still operating on the current host kernel. Mount identity must use
+        # the real kernel interface rather than that behavioral emulation.
+        with mock.patch.object(
+            sys,
+            "platform",
+            _SCHEDULER_DOCTOR_TEST_HOST_PLATFORM,
+        ):
+            return MODULE._directory_mount_identity(descriptor)
+    except (MODULE.SyncError, OSError) as error:
+        raise RuntimeError(
+            "cannot verify scheduler-doctor stale-session mount identity"
+        ) from error
+
+
 def _open_scheduler_doctor_stale_directory(
     parent_fd: int,
     name: str,
     expected_identity: tuple[int, int, int],
     *,
+    expected_mount_identity: tuple[int, int | None],
     require_owner_private_directory: bool = False,
 ) -> int:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
@@ -1527,6 +1550,14 @@ def _open_scheduler_doctor_stale_directory(
             raise RuntimeError(
                 f"scheduler-doctor stale-session directory changed: {name}"
             )
+        if (
+            _scheduler_doctor_stale_directory_mount_identity(descriptor)
+            != expected_mount_identity
+        ):
+            raise RuntimeError(
+                "scheduler-doctor stale-session directory crosses a mount "
+                f"boundary: {name}"
+            )
     except BaseException:
         os.close(descriptor)
         raise
@@ -1552,6 +1583,7 @@ def _plan_scheduler_doctor_stale_entry(
     budget: _SchedulerDoctorStaleCleanupBudget,
     *,
     depth: int,
+    root_mount_identity: tuple[int, int | None],
     reserved: bool = False,
     require_owner_private_directory: bool = False,
 ) -> _SchedulerDoctorStaleEntryPlan:
@@ -1563,6 +1595,11 @@ def _plan_scheduler_doctor_stale_entry(
         )
     metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     identity = _scheduler_doctor_test_object_identity(metadata)
+    if metadata.st_dev != root_mount_identity[0]:
+        raise RuntimeError(
+            "scheduler-doctor stale-session entry crosses a mount boundary: "
+            f"{name}"
+        )
     if metadata.st_uid != os.geteuid():
         raise RuntimeError(
             f"scheduler-doctor stale-session entry has the wrong owner: {name}"
@@ -1591,6 +1628,7 @@ def _plan_scheduler_doctor_stale_entry(
         parent_fd,
         name,
         identity,
+        expected_mount_identity=root_mount_identity,
         require_owner_private_directory=require_owner_private_directory,
     )
     try:
@@ -1614,6 +1652,7 @@ def _plan_scheduler_doctor_stale_entry(
                 child_name,
                 budget,
                 depth=depth + 1,
+                root_mount_identity=root_mount_identity,
                 reserved=True,
             )
             for child_name in child_names
@@ -1635,6 +1674,14 @@ def _plan_scheduler_doctor_stale_entry(
             raise RuntimeError(
                 f"scheduler-doctor stale-session directory changed: {name}"
             )
+        if (
+            _scheduler_doctor_stale_directory_mount_identity(descriptor)
+            != root_mount_identity
+        ):
+            raise RuntimeError(
+                "scheduler-doctor stale-session directory crosses a mount "
+                f"boundary: {name}"
+            )
         return _SchedulerDoctorStaleEntryPlan(
             name,
             identity,
@@ -1650,6 +1697,7 @@ def _revalidate_scheduler_doctor_stale_entry_plan(
     plan: _SchedulerDoctorStaleEntryPlan,
     *,
     deadline: float,
+    root_mount_identity: tuple[int, int | None],
 ) -> None:
     if time.monotonic() >= deadline:
         raise RuntimeError(
@@ -1666,6 +1714,7 @@ def _revalidate_scheduler_doctor_stale_entry_plan(
         parent_fd,
         plan.name,
         plan.identity,
+        expected_mount_identity=root_mount_identity,
         require_owner_private_directory=plan.owner_private_directory,
     )
     try:
@@ -1680,6 +1729,15 @@ def _revalidate_scheduler_doctor_stale_entry_plan(
                 descriptor,
                 child,
                 deadline=deadline,
+                root_mount_identity=root_mount_identity,
+            )
+        if (
+            _scheduler_doctor_stale_directory_mount_identity(descriptor)
+            != root_mount_identity
+        ):
+            raise RuntimeError(
+                "scheduler-doctor stale-session directory crosses a mount "
+                f"boundary: {plan.name}"
             )
     finally:
         os.close(descriptor)
@@ -1690,6 +1748,7 @@ def _apply_scheduler_doctor_stale_entry_plan(
     plan: _SchedulerDoctorStaleEntryPlan,
     *,
     deadline: float,
+    root_mount_identity: tuple[int, int | None],
 ) -> None:
     if time.monotonic() >= deadline:
         raise RuntimeError("scheduler-doctor stale-session cleanup timed out")
@@ -1706,6 +1765,7 @@ def _apply_scheduler_doctor_stale_entry_plan(
         parent_fd,
         plan.name,
         plan.identity,
+        expected_mount_identity=root_mount_identity,
         require_owner_private_directory=plan.owner_private_directory,
     )
     try:
@@ -1714,6 +1774,7 @@ def _apply_scheduler_doctor_stale_entry_plan(
                 descriptor,
                 child,
                 deadline=deadline,
+                root_mount_identity=root_mount_identity,
             )
         if time.monotonic() >= deadline:
             raise RuntimeError("scheduler-doctor stale-session cleanup timed out")
@@ -1728,6 +1789,14 @@ def _apply_scheduler_doctor_stale_entry_plan(
         ):
             raise RuntimeError(
                 f"scheduler-doctor stale-session directory changed: {plan.name}"
+            )
+        if (
+            _scheduler_doctor_stale_directory_mount_identity(descriptor)
+            != root_mount_identity
+        ):
+            raise RuntimeError(
+                "scheduler-doctor stale-session directory crosses a mount "
+                f"boundary: {plan.name}"
             )
         with os.scandir(descriptor) as iterator:
             unexpected = next(iterator, None)
@@ -1750,9 +1819,10 @@ def _apply_scheduler_doctor_stale_entry_plan(
 
 def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
     # The protected property is the identity of every planned name object and
-    # its current-UID ownership, plus the owner-private access policy of the
-    # namespace/session roots. Benign timestamps and nested-file mode changes
-    # are not treated as replacement.
+    # its current-UID ownership, the owner-private access policy of the
+    # namespace/session roots, and confinement to the namespace's exact mount.
+    # Benign timestamps and nested-file mode changes are not treated as
+    # replacement.
     # The module lease serializes cooperative same-UID test processes; this
     # fixture does not claim to defeat a malicious same-UID replace-at-unlink.
     namespace_metadata = _validate_owner_private_directory(namespace)
@@ -1781,6 +1851,9 @@ def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
             raise RuntimeError(
                 "scheduler-doctor fixture namespace changed while opening"
             )
+        namespace_mount_identity = (
+            _scheduler_doctor_stale_directory_mount_identity(namespace_fd)
+        )
         deadline = (
             time.monotonic()
             + _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_TIMEOUT_SECONDS
@@ -1800,6 +1873,7 @@ def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
                 name,
                 budget,
                 depth=1,
+                root_mount_identity=namespace_mount_identity,
                 require_owner_private_directory=True,
             )
             for name in session_names
@@ -1827,6 +1901,8 @@ def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
             or not _scheduler_doctor_metadata_is_owner_private_directory(
                 named_metadata
             )
+            or _scheduler_doctor_stale_directory_mount_identity(namespace_fd)
+            != namespace_mount_identity
         ):
             raise RuntimeError(
                 "scheduler-doctor fixture namespace changed during cleanup planning"
@@ -1836,12 +1912,14 @@ def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
                 namespace_fd,
                 plan,
                 deadline=deadline,
+                root_mount_identity=namespace_mount_identity,
             )
         for plan in plans:
             _apply_scheduler_doctor_stale_entry_plan(
                 namespace_fd,
                 plan,
                 deadline=deadline,
+                root_mount_identity=namespace_mount_identity,
             )
         if _bounded_scheduler_doctor_stale_session_names(
             namespace_fd,
@@ -1863,6 +1941,8 @@ def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
             or not _scheduler_doctor_metadata_is_owner_private_directory(
                 named_metadata
             )
+            or _scheduler_doctor_stale_directory_mount_identity(namespace_fd)
+            != namespace_mount_identity
         ):
             raise RuntimeError(
                 "scheduler-doctor fixture namespace changed during cleanup"
@@ -3208,6 +3288,175 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             self.assertFalse(stale.exists())
             self.assertEqual(marker.read_text(encoding="utf-8"), "keep\n")
 
+    def test_stale_session_sweep_rejects_same_device_mount_boundary(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            stale = namespace / "session.stale"
+            stale.mkdir(mode=0o700)
+            mounted = stale / "mounted"
+            mounted.mkdir(mode=0o700)
+            (mounted / "marker").write_text("keep\n", encoding="utf-8")
+            mounted_identity = _scheduler_doctor_test_object_identity(
+                mounted.lstat()
+            )
+            before = snapshot_tree(namespace)
+
+            def mount_identity(descriptor: int) -> tuple[int, int | None]:
+                metadata = os.fstat(descriptor)
+                mount_id = (
+                    102
+                    if _scheduler_doctor_test_object_identity(metadata)
+                    == mounted_identity
+                    else 101
+                )
+                return metadata.st_dev, mount_id
+
+            with (
+                mock.patch(
+                    f"{__name__}._scheduler_doctor_stale_directory_mount_identity",
+                    side_effect=mount_identity,
+                ),
+                self.assertRaisesRegex(RuntimeError, "crosses a mount boundary"),
+            ):
+                _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertEqual(snapshot_tree(namespace), before)
+
+    def test_stale_session_mount_probe_failure_does_not_delete(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            stale = namespace / "session.stale"
+            stale.mkdir(mode=0o700)
+            (stale / "marker").write_text("keep\n", encoding="utf-8")
+            before = snapshot_tree(namespace)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_directory_mount_identity",
+                    side_effect=MODULE.SyncError("mount identity unavailable"),
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "cannot verify scheduler-doctor stale-session mount identity",
+                ),
+            ):
+                _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertEqual(snapshot_tree(namespace), before)
+
+    def test_stale_session_mount_drift_during_revalidation_does_not_delete(
+        self,
+    ) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            stale = namespace / "session.stale"
+            stale.mkdir(mode=0o700)
+            (stale / "marker").write_text("keep\n", encoding="utf-8")
+            stale_identity = _scheduler_doctor_test_object_identity(stale.lstat())
+            before = snapshot_tree(namespace)
+            revalidating = False
+            real_revalidate = _revalidate_scheduler_doctor_stale_entry_plan
+
+            def mount_identity(descriptor: int) -> tuple[int, int | None]:
+                metadata = os.fstat(descriptor)
+                mount_id = (
+                    102
+                    if revalidating
+                    and _scheduler_doctor_test_object_identity(metadata)
+                    == stale_identity
+                    else 101
+                )
+                return metadata.st_dev, mount_id
+
+            def revalidate_after_mount_drift(
+                parent_fd: int,
+                plan: _SchedulerDoctorStaleEntryPlan,
+                *,
+                deadline: float,
+                root_mount_identity: tuple[int, int | None],
+            ) -> None:
+                nonlocal revalidating
+                revalidating = True
+                real_revalidate(
+                    parent_fd,
+                    plan,
+                    deadline=deadline,
+                    root_mount_identity=root_mount_identity,
+                )
+
+            with (
+                mock.patch(
+                    f"{__name__}._scheduler_doctor_stale_directory_mount_identity",
+                    side_effect=mount_identity,
+                ),
+                mock.patch(
+                    f"{__name__}._revalidate_scheduler_doctor_stale_entry_plan",
+                    side_effect=revalidate_after_mount_drift,
+                ),
+                self.assertRaisesRegex(RuntimeError, "crosses a mount boundary"),
+            ):
+                _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertEqual(snapshot_tree(namespace), before)
+
+    def test_stale_session_mount_drift_before_apply_does_not_delete(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            stale = namespace / "session.stale"
+            stale.mkdir(mode=0o700)
+            (stale / "marker").write_text("keep\n", encoding="utf-8")
+            stale_identity = _scheduler_doctor_test_object_identity(stale.lstat())
+            before = snapshot_tree(namespace)
+            applying = False
+            real_apply = _apply_scheduler_doctor_stale_entry_plan
+
+            def mount_identity(descriptor: int) -> tuple[int, int | None]:
+                metadata = os.fstat(descriptor)
+                mount_id = (
+                    102
+                    if applying
+                    and _scheduler_doctor_test_object_identity(metadata)
+                    == stale_identity
+                    else 101
+                )
+                return metadata.st_dev, mount_id
+
+            def apply_after_mount_drift(
+                parent_fd: int,
+                plan: _SchedulerDoctorStaleEntryPlan,
+                *,
+                deadline: float,
+                root_mount_identity: tuple[int, int | None],
+            ) -> None:
+                nonlocal applying
+                applying = True
+                real_apply(
+                    parent_fd,
+                    plan,
+                    deadline=deadline,
+                    root_mount_identity=root_mount_identity,
+                )
+
+            with (
+                mock.patch(
+                    f"{__name__}._scheduler_doctor_stale_directory_mount_identity",
+                    side_effect=mount_identity,
+                ),
+                mock.patch(
+                    f"{__name__}._apply_scheduler_doctor_stale_entry_plan",
+                    side_effect=apply_after_mount_drift,
+                ),
+                self.assertRaisesRegex(RuntimeError, "crosses a mount boundary"),
+            ):
+                _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertEqual(snapshot_tree(namespace), before)
+
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO support required")
     def test_stale_session_sweep_removes_fifo_leaf(self) -> None:
         with _scheduler_doctor_test_temporary_directory() as directory:
@@ -3336,6 +3585,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                 "device",
                 budget,
                 depth=2,
+                root_mount_identity=(metadata.st_dev, 101),
             )
 
     def test_stale_session_entry_budget_failure_does_not_delete(self) -> None:
