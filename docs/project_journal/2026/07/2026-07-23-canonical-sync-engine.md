@@ -21,10 +21,10 @@ superseded_by:
   `70dc2c727e91036e9d155ec17dbed643eef26990`.
 - The PR #6 scheduler-doctor fixture and source-lock substage is complete for
   the target-branch state. Its latest pre-squash implementation evidence is
-  signed head `b9ac6c52b1104585b9199711628d00d89d388075`, tree
-  `59e4c1d68878d1a82e7b8ad771ae7b8c933c2523`; the verified BL-generated
+  signed head `e712baec0a9187739aa42990aaf8f596c4706546`, tree
+  `87020c1567db20e06a4d7da4c2d46778aba98eb6`; the verified BL-generated
   source-lock SHA-256 is
-  `6723edfba8e2a84caec5ac5431e8b5e0fb1bee326182dbc070e78f683a523cdf`.
+  `f6bcc11d3a1d2aeae60f9402f344ae322b7ad299207b9f3be8416b71ddaf792c`.
   These pre-squash identities remain historical evidence only. Downstream
   generation must bind the actual squash-landed canonical `P` identity.
 
@@ -1630,6 +1630,47 @@ superseded_by:
   and installed no substitute; the owner-side Ruff E4/E7/E9/F gate was clean.
   The refreshed `sync-source-lock.json` SHA-256 is
   `6723edfba8e2a84caec5ac5431e8b5e0fb1bee326182dbc070e78f683a523cdf`.
+  The implementation and append-only source-lock/journal identities remain
+  historical evidence only. Downstream generation must bind the actual
+  squash-landed canonical `P` before producing `T`/`B` or propagating private
+  and scheduler state.
+- The identity-bound active-session cleanup substage is complete for the
+  target-branch state. Historical pre-squash implementation evidence is signed
+  head `e712baec0a9187739aa42990aaf8f596c4706546`, tree
+  `87020c1567db20e06a4d7da4c2d46778aba98eb6`, with sole parent
+  `2cc3381628d3ec2eb5ee4a0b260089c372d2c46b`. GitHub reported the exact
+  signature provider-valid. The only implementation path is
+  `tests/test_scheduler_doctor.py`, blob
+  `bd5034639aa2b383cba3b63d5122bc77139b6240`, with SHA-256
+  `7ae358f4e74c5ce15bf670d5267731d34b02aca05381b1300278ef8412473ef4`.
+  Active module-session cleanup now retains namespace and session descriptors
+  plus exact object-identity and mount-identity receipts through a bounded,
+  descriptor-relative delete. Replacement, missing, and unreadable states are
+  classified distinctly and preserve residue. Any cleanup failure installs a
+  retained failure fence before another fixture session or stale sweep can
+  begin, so unproved custody cannot authorize later deletion.
+  A fresh full BL custody clone independently matched the PR branch, head,
+  tree, sole parent, unique PR merge base, changed blob, and complete object
+  closure. The source was non-shallow and non-promisor with no alternates,
+  bitmap, filter, replace ref, or missing object; strict full `fsck` passed.
+  Restoring only the 23 tracked regular files to their Git-declared `0644` /
+  `0755` physical modes changed no tracked bytes. Unmodified stock
+  `refresh-lock` refreshed all six sources and stock `refresh-lock --check`
+  verified them. Under standard `umask 022`, the complete canonical source-
+  lock suite passed 230/230 in 350.199 seconds with one expected platform skip
+  through the repository's private-`TMPDIR` wrapper. The three replacement,
+  missing, and unreadable active-session regressions passed 3/3 under uv
+  Python 3.13.13 and macOS system Python 3.9.6 in 0.007 seconds per runtime.
+  `SchedulerDoctorFixtureTests` passed 79/79 in 1.023 and 0.724 seconds, and
+  the full scheduler-doctor suite passed 229/229 in 4.539 and 5.424 seconds;
+  each fixture/full run had one expected platform skip. The five copied-
+  checkout gates passed 5/5 in 0.967 and 0.647 seconds with one expected skip
+  per runtime. The explicit owner-private test namespace ended with only its
+  regular, single-link, mode-`0600` `.session.lock` and no `session.*`. Both
+  runtimes passed `py_compile`. BL had no installed Ruff executable and did
+  not install one; the owner-side Ruff E4/E7/E9/F gate was clean. The
+  refreshed `sync-source-lock.json` SHA-256 is
+  `f6bcc11d3a1d2aeae60f9402f344ae322b7ad299207b9f3be8416b71ddaf792c`.
   The implementation and append-only source-lock/journal identities remain
   historical evidence only. Downstream generation must bind the actual
   squash-landed canonical `P` before producing `T`/`B` or propagating private
