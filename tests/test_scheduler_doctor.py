@@ -46,6 +46,9 @@ _SCHEDULER_DOCTOR_TEST_ANCHOR_ENV = "CODEX_SCHEDULER_DOCTOR_TEST_ANCHOR"
 _SCHEDULER_DOCTOR_TEST_EXPECTED_ANCHOR_ENV = (
     "CODEX_SCHEDULER_DOCTOR_TEST_EXPECTED_ANCHOR"
 )
+_SCHEDULER_DOCTOR_TEST_EXPECTED_LINUX_STICKY_ROOT_ENV = (
+    "CODEX_SCHEDULER_DOCTOR_TEST_EXPECTED_LINUX_STICKY_ROOT"
+)
 _SCHEDULER_DOCTOR_TEST_CONTAINER_NAME = ".codex-tmp"
 _SCHEDULER_DOCTOR_TEST_NAMESPACE_NAME = "scheduler-doctor"
 _SCHEDULER_DOCTOR_TEST_LOCK_NAME = ".session.lock"
@@ -57,6 +60,10 @@ _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_TIMEOUT_SECONDS = 30.0
 _SCHEDULER_DOCTOR_TEST_LEASE_TIMEOUT_SECONDS = 60.0
 _SCHEDULER_DOCTOR_TEST_LEASE_RETRY_SECONDS = 0.05
 _SCHEDULER_DOCTOR_TEST_DARWIN_TEMP_SCAN_ENTRY_LIMIT = 4096
+_SCHEDULER_DOCTOR_TEST_LINUX_STICKY_TEMP_ROOT = Path("/tmp")
+_SCHEDULER_DOCTOR_TEST_LINUX_STICKY_FALLBACK_PREFIX = (
+    ".codex-scheduler-doctor-"
+)
 _SCHEDULER_DOCTOR_TEST_SESSION: tempfile.TemporaryDirectory | None = None
 _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD: int | None = None
 
@@ -87,9 +94,450 @@ class _SchedulerDoctorBoundNamespaceCandidate:
     path: Path
     identity: tuple[int, int, int]
     access_policy: tuple[int, int, int]
+    sticky_root_path: Path | None = None
+    sticky_root_identity: tuple[int, int, int] | None = None
+    sticky_root_access_policy: tuple[int, int, int] | None = None
+    effective_uid: int | None = None
 
     def __fspath__(self) -> str:
         return os.fspath(self.path)
+
+
+@dataclass(frozen=True)
+class _SchedulerDoctorLinuxStickyFallbackCandidate:
+    pass
+
+
+_SCHEDULER_DOCTOR_LINUX_STICKY_FALLBACK_CANDIDATE = (
+    _SchedulerDoctorLinuxStickyFallbackCandidate()
+)
+
+
+def _scheduler_doctor_linux_sticky_fallback_path(
+    *,
+    effective_uid: int | None = None,
+) -> Path:
+    selected_uid = os.geteuid() if effective_uid is None else effective_uid
+    return _SCHEDULER_DOCTOR_TEST_LINUX_STICKY_TEMP_ROOT / (
+        _SCHEDULER_DOCTOR_TEST_LINUX_STICKY_FALLBACK_PREFIX
+        + str(selected_uid)
+    )
+
+
+def _scheduler_doctor_candidate_path(
+    candidate: (
+        Path
+        | _SchedulerDoctorBoundNamespaceCandidate
+        | _SchedulerDoctorLinuxStickyFallbackCandidate
+    ),
+) -> Path:
+    if isinstance(candidate, _SchedulerDoctorBoundNamespaceCandidate):
+        return candidate.path
+    if isinstance(candidate, _SchedulerDoctorLinuxStickyFallbackCandidate):
+        return _scheduler_doctor_linux_sticky_fallback_path()
+    return candidate
+
+
+def _scheduler_doctor_linux_sticky_component_policy_is_safe(
+    path: Path,
+    root: Path,
+    access_policy: tuple[int, int, int],
+    effective_uid: int,
+) -> bool:
+    mode, uid, _gid = access_policy
+    if path == Path("/tmp"):
+        return uid == 0 and mode == 0o1777
+    if path == root:
+        return uid == effective_uid and mode == 0o1777
+    return uid in {0, effective_uid} and not mode & 0o022
+
+
+def _scheduler_doctor_linux_sticky_root_binding(
+    root: Path,
+    *,
+    effective_uid: int | None = None,
+) -> tuple[int, tuple[int, int, int], tuple[int, int, int]] | None:
+    selected_uid = os.geteuid() if effective_uid is None else effective_uid
+    root = Path(root)
+    if not root.is_absolute() or root == Path("/"):
+        return None
+    root = Path(os.path.abspath(root))
+    components = root.parts[1:]
+    if not components or len(components) > MODULE.MIRROR_PRIVATE_CONTROL_MAX_ANCESTORS:
+        return None
+
+    current_path = Path("/")
+    current_fd = os.open(current_path, MODULE._source_directory_flags())
+    try:
+        for component in components:
+            component_path = current_path / component
+            try:
+                os.stat(
+                    component,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return None
+            except OSError as error:
+                raise RuntimeError(
+                    "cannot inspect Linux scheduler-doctor sticky root "
+                    f"component: {component_path}: {error}"
+                ) from error
+            try:
+                child_fd, _child_identity, child_access_policy = (
+                    MODULE._bind_mirror_audit_child_directory(
+                        current_fd,
+                        current_path,
+                        component,
+                        "Linux scheduler-doctor sticky-root component",
+                    )
+                )
+            except MODULE.SyncError as error:
+                raise RuntimeError(
+                    "cannot bind Linux scheduler-doctor sticky root "
+                    f"component: {component_path}: {error}"
+                ) from error
+            if not _scheduler_doctor_linux_sticky_component_policy_is_safe(
+                component_path,
+                root,
+                child_access_policy,
+                selected_uid,
+            ):
+                close_failures = _close_scheduler_doctor_candidate_descriptors(
+                    (child_fd,)
+                )
+                message = (
+                    "Linux scheduler-doctor sticky root has an unsafe access "
+                    f"policy: {component_path}"
+                )
+                if close_failures:
+                    message += "; " + "; ".join(close_failures)
+                raise RuntimeError(message)
+            previous_fd = current_fd
+            current_fd = -1
+            close_failures = _close_scheduler_doctor_candidate_descriptors(
+                (previous_fd,)
+            )
+            if close_failures:
+                close_failures.extend(
+                    _close_scheduler_doctor_candidate_descriptors((child_fd,))
+                )
+                raise RuntimeError(
+                    "cannot advance Linux scheduler-doctor sticky-root "
+                    f"binding: {component_path}: {'; '.join(close_failures)}"
+                )
+            current_fd = child_fd
+            current_path = component_path
+        metadata = os.fstat(current_fd)
+        result = (
+            current_fd,
+            MODULE._mirror_object_identity(metadata),
+            MODULE._mirror_access_policy(metadata),
+        )
+        current_fd = -1
+        return result
+    finally:
+        close_failures = _close_scheduler_doctor_candidate_descriptors(
+            (current_fd,)
+        )
+        if close_failures:
+            primary = sys.exc_info()[1]
+            message = "; ".join(close_failures)
+            if primary is not None:
+                raise RuntimeError(f"{primary}; {message}") from primary
+            raise RuntimeError(
+                "cannot close Linux scheduler-doctor sticky-root descriptor: "
+                + message
+            )
+
+
+def _scheduler_doctor_linux_sticky_fallback_binding(
+) -> _SchedulerDoctorBoundNamespaceCandidate | None:
+    effective_uid = os.geteuid()
+    sticky_root = _SCHEDULER_DOCTOR_TEST_LINUX_STICKY_TEMP_ROOT
+    sticky_binding = _scheduler_doctor_linux_sticky_root_binding(
+        sticky_root,
+        effective_uid=effective_uid,
+    )
+    if sticky_binding is None:
+        return None
+    sticky_fd, sticky_identity, sticky_access_policy = sticky_binding
+    fallback = _scheduler_doctor_linux_sticky_fallback_path(
+        effective_uid=effective_uid
+    )
+    fallback_fd = -1
+    try:
+        try:
+            os.mkdir(fallback.name, 0o700, dir_fd=sticky_fd)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EPERM, errno.EROFS}:
+                try:
+                    os.stat(
+                        fallback.name,
+                        dir_fd=sticky_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    return None
+                except OSError as inspect_error:
+                    raise RuntimeError(
+                        "cannot prove the Linux scheduler-doctor sticky "
+                        f"fallback is absent: {fallback}: {inspect_error}"
+                    ) from inspect_error
+                raise RuntimeError(
+                    "Linux scheduler-doctor sticky fallback appeared after "
+                    f"allocation failed: {fallback}"
+                ) from error
+            raise RuntimeError(
+                "cannot create Linux scheduler-doctor sticky fallback: "
+                f"{fallback}: {error}"
+            ) from error
+        try:
+            fallback_fd, fallback_identity, fallback_access_policy = (
+                MODULE._bind_mirror_audit_child_directory(
+                    sticky_fd,
+                    sticky_root,
+                    fallback.name,
+                    "Linux scheduler-doctor sticky fallback",
+                )
+            )
+        except MODULE.SyncError as error:
+            raise RuntimeError(
+                "Linux scheduler-doctor sticky fallback has an unsafe type, "
+                f"owner, or mode: {fallback}"
+            ) from error
+        mode, uid, _gid = fallback_access_policy
+        if uid != effective_uid or mode != 0o700:
+            raise RuntimeError(
+                "Linux scheduler-doctor sticky fallback has an unsafe type, "
+                f"owner, or mode: {fallback}"
+            )
+        return _SchedulerDoctorBoundNamespaceCandidate(
+            fallback,
+            fallback_identity,
+            fallback_access_policy,
+            sticky_root,
+            sticky_identity,
+            sticky_access_policy,
+            effective_uid,
+        )
+    finally:
+        close_failures = _close_scheduler_doctor_candidate_descriptors(
+            (fallback_fd, sticky_fd)
+        )
+        if close_failures:
+            primary = sys.exc_info()[1]
+            message = "; ".join(close_failures)
+            if primary is not None:
+                raise RuntimeError(f"{primary}; {message}") from primary
+            raise RuntimeError(
+                "cannot close Linux scheduler-doctor sticky fallback "
+                f"descriptors: {message}"
+            )
+
+
+def _scheduler_doctor_bound_candidate_uses_sticky_root(
+    candidate: _SchedulerDoctorBoundNamespaceCandidate,
+) -> bool:
+    values = (
+        candidate.sticky_root_path,
+        candidate.sticky_root_identity,
+        candidate.sticky_root_access_policy,
+        candidate.effective_uid,
+    )
+    if all(value is None for value in values):
+        return False
+    if any(value is None for value in values):
+        raise RuntimeError(
+            "Linux scheduler-doctor sticky fallback receipt is incomplete"
+        )
+    assert candidate.sticky_root_path is not None
+    assert candidate.effective_uid is not None
+    if candidate.path != _scheduler_doctor_linux_sticky_fallback_path(
+        effective_uid=candidate.effective_uid
+    ):
+        raise RuntimeError(
+            "Linux scheduler-doctor sticky fallback receipt path is invalid"
+        )
+    return True
+
+
+def _scheduler_doctor_rebind_sticky_candidate(
+    candidate: _SchedulerDoctorBoundNamespaceCandidate,
+) -> tuple[int, tuple[int, int, int], tuple[int, int, int]]:
+    if not _scheduler_doctor_bound_candidate_uses_sticky_root(candidate):
+        raise RuntimeError(
+            "Linux scheduler-doctor sticky fallback receipt is missing"
+        )
+    assert candidate.sticky_root_path is not None
+    assert candidate.sticky_root_identity is not None
+    assert candidate.sticky_root_access_policy is not None
+    assert candidate.effective_uid is not None
+    if os.geteuid() != candidate.effective_uid:
+        raise RuntimeError(
+            "Linux scheduler-doctor effective uid changed after binding"
+        )
+    sticky_binding = _scheduler_doctor_linux_sticky_root_binding(
+        candidate.sticky_root_path,
+        effective_uid=candidate.effective_uid,
+    )
+    if sticky_binding is None:
+        raise RuntimeError(
+            "Linux scheduler-doctor sticky root changed after binding"
+        )
+    sticky_fd, sticky_identity, sticky_access_policy = sticky_binding
+    fallback_fd = -1
+    returned_fd = -1
+    try:
+        if (
+            sticky_identity != candidate.sticky_root_identity
+            or sticky_access_policy != candidate.sticky_root_access_policy
+        ):
+            raise RuntimeError(
+                "Linux scheduler-doctor sticky root changed after binding"
+            )
+        try:
+            fallback_fd, fallback_identity, fallback_access_policy = (
+                MODULE._bind_mirror_audit_child_directory(
+                    sticky_fd,
+                    candidate.sticky_root_path,
+                    candidate.path.name,
+                    "Linux scheduler-doctor sticky fallback",
+                )
+            )
+        except MODULE.SyncError as error:
+            raise RuntimeError(
+                "Linux scheduler-doctor sticky fallback changed after binding"
+            ) from error
+        mode, uid, _gid = fallback_access_policy
+        if (
+            uid != candidate.effective_uid
+            or mode != 0o700
+            or fallback_identity != candidate.identity
+            or fallback_access_policy != candidate.access_policy
+        ):
+            raise RuntimeError(
+                "Linux scheduler-doctor sticky fallback changed after binding"
+            )
+        returned_fd = fallback_fd
+        fallback_fd = -1
+        return returned_fd, candidate.identity, candidate.access_policy
+    finally:
+        close_failures = _close_scheduler_doctor_candidate_descriptors(
+            (fallback_fd, sticky_fd)
+        )
+        if close_failures and returned_fd >= 0:
+            close_failures.extend(
+                _close_scheduler_doctor_candidate_descriptors((returned_fd,))
+            )
+        if close_failures:
+            primary = sys.exc_info()[1]
+            message = "; ".join(close_failures)
+            if primary is not None:
+                raise RuntimeError(f"{primary}; {message}") from primary
+            raise RuntimeError(
+                "cannot close Linux scheduler-doctor sticky fallback "
+                f"descriptors: {message}"
+            )
+
+
+def _bind_scheduler_doctor_test_root(
+    path: Path,
+) -> tuple[int, tuple[int, int, int], tuple[int, int, int]]:
+    effective_uid = os.geteuid()
+    path = Path(os.path.abspath(path))
+    fallback = _scheduler_doctor_linux_sticky_fallback_path(
+        effective_uid=effective_uid
+    )
+    if not sys.platform.startswith("linux") or not (
+        path == fallback or path.is_relative_to(fallback)
+    ):
+        return MODULE._bind_mirror_trusted_account_home(path)
+
+    sticky_root = _SCHEDULER_DOCTOR_TEST_LINUX_STICKY_TEMP_ROOT
+    sticky_binding = _scheduler_doctor_linux_sticky_root_binding(
+        sticky_root,
+        effective_uid=effective_uid,
+    )
+    if sticky_binding is None:
+        raise RuntimeError("Linux scheduler-doctor sticky root is unavailable")
+    current_fd, _sticky_identity, _sticky_access_policy = sticky_binding
+    relative_parts = (fallback.name,) + path.relative_to(fallback).parts
+    current_path = sticky_root
+    try:
+        for index, component in enumerate(relative_parts):
+            component_path = current_path / component
+            try:
+                child_fd, _child_identity, child_access_policy = (
+                    MODULE._bind_mirror_audit_child_directory(
+                        current_fd,
+                        current_path,
+                        component,
+                        "Linux scheduler-doctor sticky fallback component",
+                    )
+                )
+            except MODULE.SyncError as error:
+                raise RuntimeError(
+                    "cannot bind Linux scheduler-doctor sticky fallback "
+                    f"component: {component_path}: {error}"
+                ) from error
+            mode, uid, _gid = child_access_policy
+            if (
+                uid != effective_uid
+                or mode & 0o022
+                or (index == 0 and mode != 0o700)
+            ):
+                close_failures = _close_scheduler_doctor_candidate_descriptors(
+                    (child_fd,)
+                )
+                message = (
+                    "Linux scheduler-doctor sticky fallback component has an "
+                    f"unsafe access policy: {component_path}"
+                )
+                if close_failures:
+                    message += "; " + "; ".join(close_failures)
+                raise RuntimeError(
+                    message
+                )
+            previous_fd = current_fd
+            current_fd = -1
+            close_failures = _close_scheduler_doctor_candidate_descriptors(
+                (previous_fd,)
+            )
+            if close_failures:
+                close_failures.extend(
+                    _close_scheduler_doctor_candidate_descriptors((child_fd,))
+                )
+                raise RuntimeError(
+                    "cannot advance Linux scheduler-doctor sticky fallback "
+                    f"binding: {component_path}: {'; '.join(close_failures)}"
+                )
+            current_fd = child_fd
+            current_path = component_path
+        metadata = os.fstat(current_fd)
+        result = (
+            current_fd,
+            MODULE._mirror_object_identity(metadata),
+            MODULE._mirror_access_policy(metadata),
+        )
+        current_fd = -1
+        return result
+    finally:
+        close_failures = _close_scheduler_doctor_candidate_descriptors(
+            (current_fd,)
+        )
+        if close_failures:
+            primary = sys.exc_info()[1]
+            message = "; ".join(close_failures)
+            if primary is not None:
+                raise RuntimeError(f"{primary}; {message}") from primary
+            raise RuntimeError(
+                "cannot close Linux scheduler-doctor sticky fallback "
+                f"component descriptor: {message}"
+            )
 
 
 def _scheduler_doctor_linux_runtime_parent_binding(
@@ -143,8 +591,17 @@ def _scheduler_doctor_linux_runtime_parent_binding(
 
 
 def _scheduler_doctor_test_platform_anchor_parents(
-) -> tuple[Path | _SchedulerDoctorBoundNamespaceCandidate, ...]:
-    candidates: list[Path | _SchedulerDoctorBoundNamespaceCandidate] = []
+) -> tuple[
+    Path
+    | _SchedulerDoctorBoundNamespaceCandidate
+    | _SchedulerDoctorLinuxStickyFallbackCandidate,
+    ...,
+]:
+    candidates: list[
+        Path
+        | _SchedulerDoctorBoundNamespaceCandidate
+        | _SchedulerDoctorLinuxStickyFallbackCandidate
+    ] = []
     if sys.platform == "darwin":
         darwin_temp_root = Path("/private/var/folders")
         configured_temp = os.environ.get("TMPDIR")
@@ -202,6 +659,7 @@ def _scheduler_doctor_test_platform_anchor_parents(
             binding = _scheduler_doctor_linux_runtime_parent_binding(candidate)
             if binding is not None:
                 candidates.append(binding)
+        candidates.append(_SCHEDULER_DOCTOR_LINUX_STICKY_FALLBACK_CANDIDATE)
     return tuple(dict.fromkeys(candidates))
 
 
@@ -218,10 +676,13 @@ def _validate_owner_private_directory(path: Path) -> os.stat_result:
 
 def _scheduler_doctor_metadata_is_owner_private_directory(
     metadata: os.stat_result,
+    *,
+    effective_uid: int | None = None,
 ) -> bool:
+    selected_uid = os.geteuid() if effective_uid is None else effective_uid
     return (
         stat.S_ISDIR(metadata.st_mode)
-        and metadata.st_uid == os.geteuid()
+        and metadata.st_uid == selected_uid
         and stat.S_IMODE(metadata.st_mode) == 0o700
     )
 
@@ -380,8 +841,17 @@ def _bounded_darwin_user_temp_directories() -> tuple[Path, ...]:
 
 
 def _scheduler_doctor_test_namespace_candidates(
-) -> tuple[Path | _SchedulerDoctorBoundNamespaceCandidate, ...]:
-    candidates: list[Path | _SchedulerDoctorBoundNamespaceCandidate] = []
+) -> tuple[
+    Path
+    | _SchedulerDoctorBoundNamespaceCandidate
+    | _SchedulerDoctorLinuxStickyFallbackCandidate,
+    ...,
+]:
+    candidates: list[
+        Path
+        | _SchedulerDoctorBoundNamespaceCandidate
+        | _SchedulerDoctorLinuxStickyFallbackCandidate
+    ] = []
     configured_anchor = os.environ.get(_SCHEDULER_DOCTOR_TEST_ANCHOR_ENV)
     if configured_anchor:
         override = Path(configured_anchor)
@@ -391,6 +861,12 @@ def _scheduler_doctor_test_namespace_candidates(
             )
         candidates.append(override)
     for candidate_entry in _scheduler_doctor_test_platform_anchor_parents():
+        if isinstance(
+            candidate_entry,
+            _SchedulerDoctorLinuxStickyFallbackCandidate,
+        ):
+            candidates.append(candidate_entry)
+            continue
         candidate = (
             candidate_entry.path
             if isinstance(
@@ -413,9 +889,22 @@ def _scheduler_doctor_test_namespace_candidates(
             candidates.append(candidate_entry)
     candidates.append(REPO_ROOT)
 
-    unique: list[Path | _SchedulerDoctorBoundNamespaceCandidate] = []
+    unique: list[
+        Path
+        | _SchedulerDoctorBoundNamespaceCandidate
+        | _SchedulerDoctorLinuxStickyFallbackCandidate
+    ] = []
     seen: set[Path] = set()
+    sticky_fallback_seen = False
     for candidate_entry in candidates:
+        if isinstance(
+            candidate_entry,
+            _SchedulerDoctorLinuxStickyFallbackCandidate,
+        ):
+            if not sticky_fallback_seen:
+                unique.append(candidate_entry)
+                sticky_fallback_seen = True
+            continue
         candidate = (
             candidate_entry.path
             if isinstance(
@@ -449,8 +938,8 @@ def _scheduler_doctor_test_namespace_candidates(
 
 
 def _validate_trusted_scheduler_doctor_test_root(path: Path) -> None:
-    descriptor, _identity, _access_policy = (
-        MODULE._bind_mirror_trusted_account_home(path)
+    descriptor, _identity, _access_policy = _bind_scheduler_doctor_test_root(
+        path
     )
     os.close(descriptor)
 
@@ -632,7 +1121,9 @@ def _probe_scheduler_doctor_test_namespace_lock(
 
 def _select_scheduler_doctor_test_namespace(
     candidates: tuple[
-        Path | _SchedulerDoctorBoundNamespaceCandidate,
+        Path
+        | _SchedulerDoctorBoundNamespaceCandidate
+        | _SchedulerDoctorLinuxStickyFallbackCandidate,
         ...,
     ]
     | None = None,
@@ -647,6 +1138,17 @@ def _select_scheduler_doctor_test_namespace(
         else candidates
     )
     for candidate_entry in selected_candidates:
+        if isinstance(
+            candidate_entry,
+            _SchedulerDoctorLinuxStickyFallbackCandidate,
+        ):
+            sticky_binding = _scheduler_doctor_linux_sticky_fallback_binding()
+            if sticky_binding is None:
+                failures.append(
+                    "Linux scheduler-doctor sticky fallback is unavailable"
+                )
+                continue
+            candidate_entry = sticky_binding
         expected_binding = (
             candidate_entry
             if isinstance(
@@ -669,9 +1171,21 @@ def _select_scheduler_doctor_test_namespace(
         namespace_fd = -1
         created: list[tuple[Path, tuple[int, int, int] | None]] = []
         try:
-            candidate_fd, candidate_identity, candidate_access_policy = (
-                MODULE._bind_mirror_trusted_account_home(candidate)
-            )
+            if (
+                expected_binding is not None
+                and _scheduler_doctor_bound_candidate_uses_sticky_root(
+                    expected_binding
+                )
+            ):
+                candidate_fd, candidate_identity, candidate_access_policy = (
+                    _scheduler_doctor_rebind_sticky_candidate(
+                        expected_binding
+                    )
+                )
+            else:
+                candidate_fd, candidate_identity, candidate_access_policy = (
+                    MODULE._bind_mirror_trusted_account_home(candidate)
+                )
         except MODULE.SyncError as error:
             if expected_binding is not None:
                 raise RuntimeError(
@@ -733,7 +1247,7 @@ def _select_scheduler_doctor_test_namespace(
                     _scheduler_doctor_test_object_identity(metadata),
                 )
             namespace_fd, _identity, _access_policy = (
-                MODULE._bind_mirror_trusted_account_home(namespace)
+                _bind_scheduler_doctor_test_root(namespace)
             )
             _probe_scheduler_doctor_test_namespace_lock(namespace, namespace_fd)
         except _SchedulerDoctorTestCandidateUnavailable as unavailable:
@@ -1422,7 +1936,11 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             self.assertTrue(
                 any(
                     session_root.is_relative_to(
-                        Path(os.path.realpath(candidate))
+                        Path(
+                            os.path.realpath(
+                                _scheduler_doctor_candidate_path(candidate)
+                            )
+                        )
                     )
                     for candidate in _scheduler_doctor_test_namespace_candidates()
                 )
@@ -1433,7 +1951,13 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
 
         try:
             self.assertEqual(root.parent, session_root)
-            self.assertFalse(root.is_relative_to(system_tmp))
+            sticky_fallback = _scheduler_doctor_linux_sticky_fallback_path()
+            if sys.platform.startswith("linux") and session_root.is_relative_to(
+                sticky_fallback
+            ):
+                self.assertTrue(root.is_relative_to(sticky_fallback))
+            else:
+                self.assertFalse(root.is_relative_to(system_tmp))
             self.assertEqual(
                 session_root.parent.name,
                 _SCHEDULER_DOCTOR_TEST_NAMESPACE_NAME,
@@ -1588,12 +2112,44 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                 f"{__name__}._scheduler_doctor_linux_runtime_parent_binding",
                 return_value=binding,
             ) as probe,
+            mock.patch(
+                f"{__name__}._scheduler_doctor_linux_sticky_fallback_binding",
+            ) as sticky_fallback,
             mock.patch.dict(os.environ, {}, clear=True),
         ):
             candidates = _scheduler_doctor_test_platform_anchor_parents()
 
-        self.assertEqual(candidates, (binding,))
+        self.assertEqual(
+            candidates,
+            (
+                binding,
+                _SCHEDULER_DOCTOR_LINUX_STICKY_FALLBACK_CANDIDATE,
+            ),
+        )
         probe.assert_called_once_with(runtime_root)
+        sticky_fallback.assert_not_called()
+
+    def test_linux_platform_anchor_parent_uses_sticky_fallback(self) -> None:
+        runtime_root = Path("/run/user") / str(os.geteuid())
+        with (
+            mock.patch.object(sys, "platform", "linux"),
+            mock.patch(
+                f"{__name__}._scheduler_doctor_linux_runtime_parent_binding",
+                return_value=None,
+            ) as runtime_probe,
+            mock.patch(
+                f"{__name__}._scheduler_doctor_linux_sticky_fallback_binding",
+            ) as sticky_fallback,
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            candidates = _scheduler_doctor_test_platform_anchor_parents()
+
+        self.assertEqual(
+            candidates,
+            (_SCHEDULER_DOCTOR_LINUX_STICKY_FALLBACK_CANDIDATE,),
+        )
+        runtime_probe.assert_called_once_with(runtime_root)
+        sticky_fallback.assert_not_called()
 
     def test_linux_platform_anchor_parent_skips_stale_xdg_runtime(self) -> None:
         runtime_root = Path("/run/user") / str(os.geteuid())
@@ -1624,7 +2180,13 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         ):
             candidates = _scheduler_doctor_test_platform_anchor_parents()
 
-        self.assertEqual(candidates, (binding,))
+        self.assertEqual(
+            candidates,
+            (
+                binding,
+                _SCHEDULER_DOCTOR_LINUX_STICKY_FALLBACK_CANDIDATE,
+            ),
+        )
         self.assertEqual(
             probe.call_args_list,
             [mock.call(stale_runtime), mock.call(runtime_root)],
@@ -1823,6 +2385,252 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         )
 
         close.assert_called_once_with(42)
+
+    def test_linux_sticky_root_accepts_only_exact_tmp_sticky_ancestor(
+        self,
+    ) -> None:
+        effective_uid = os.geteuid()
+        root = Path("/tmp/nested/sticky-root")
+
+        self.assertTrue(
+            _scheduler_doctor_linux_sticky_component_policy_is_safe(
+                Path("/tmp"),
+                root,
+                (0o1777, 0, 0),
+                effective_uid,
+            )
+        )
+        self.assertFalse(
+            _scheduler_doctor_linux_sticky_component_policy_is_safe(
+                Path("/var/tmp"),
+                root,
+                (0o1777, 0, 0),
+                effective_uid,
+            )
+        )
+
+    def test_linux_sticky_root_disappearance_after_observation_fails_closed(
+        self,
+    ) -> None:
+        with mock.patch.object(os, "stat", side_effect=FileNotFoundError):
+            self.assertIsNone(
+                _scheduler_doctor_linux_sticky_root_binding(Path("/missing"))
+            )
+
+        def disappear_while_binding(*_args, **_kwargs):
+            try:
+                raise FileNotFoundError("replaced after observation")
+            except FileNotFoundError as error:
+                raise MODULE.SyncError("cannot bind synthetic root") from error
+
+        observed = os.stat_result(
+            (stat.S_IFDIR | 0o1777, 1, 1, 1, os.geteuid(), 0, 0, 0, 0, 0)
+        )
+        with (
+            mock.patch.object(os, "stat", return_value=observed),
+            mock.patch.object(
+                MODULE,
+                "_bind_mirror_audit_child_directory",
+                side_effect=disappear_while_binding,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "cannot bind Linux scheduler-doctor sticky root component",
+            ),
+        ):
+            _scheduler_doctor_linux_sticky_root_binding(Path("/synthetic"))
+
+    def test_linux_sticky_fallback_rejects_unsafe_precreation(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            root = Path(directory)
+            sticky_root = root / "shared-tmp"
+            sticky_root.mkdir(mode=0o700)
+            sticky_root.chmod(0o1777)
+            target = root / "foreign-target"
+            target.mkdir(mode=0o700)
+            fallback = sticky_root / (
+                _SCHEDULER_DOCTOR_TEST_LINUX_STICKY_FALLBACK_PREFIX
+                + str(os.geteuid())
+            )
+            try:
+                for kind in ("symlink", "file", "wrong-mode"):
+                    with self.subTest(kind=kind):
+                        if kind == "symlink":
+                            fallback.symlink_to(target, target_is_directory=True)
+                        elif kind == "file":
+                            fallback.write_text("foreign\n", encoding="utf-8")
+                        else:
+                            fallback.mkdir(mode=0o700)
+                            fallback.chmod(0o755)
+                        with (
+                            mock.patch.object(sys, "platform", "linux"),
+                            mock.patch(
+                                f"{__name__}."
+                                "_SCHEDULER_DOCTOR_TEST_LINUX_STICKY_TEMP_ROOT",
+                                sticky_root,
+                            ),
+                            self.assertRaisesRegex(
+                                RuntimeError,
+                                "sticky fallback has an unsafe type, owner, "
+                                "or mode",
+                            ),
+                        ):
+                            _scheduler_doctor_linux_sticky_fallback_binding()
+
+                        self.assertTrue(fallback.exists() or fallback.is_symlink())
+                        if fallback.is_dir() and not fallback.is_symlink():
+                            fallback.chmod(0o700)
+                            fallback.rmdir()
+                        else:
+                            fallback.unlink()
+                self.assertTrue(target.is_dir())
+            finally:
+                sticky_root.chmod(0o700)
+
+    def test_linux_sticky_fallback_rejects_wrong_owner(self) -> None:
+        wrong_owner = os.geteuid() + 1
+        root_read_fd, root_write_fd = os.pipe()
+        child_read_fd, child_write_fd = os.pipe()
+        try:
+            with (
+                mock.patch(
+                    f"{__name__}._scheduler_doctor_linux_sticky_root_binding",
+                    return_value=(
+                        root_read_fd,
+                        (1, 2, stat.S_IFDIR),
+                        (0o1777, 0, 0),
+                    ),
+                ),
+                mock.patch.object(os, "mkdir", side_effect=FileExistsError),
+                mock.patch.object(
+                    MODULE,
+                    "_bind_mirror_audit_child_directory",
+                    return_value=(
+                        child_read_fd,
+                        (1, 3, stat.S_IFDIR),
+                        (0o700, wrong_owner, os.getegid()),
+                    ),
+                ) as bind_child,
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "sticky fallback has an unsafe type, owner, or mode",
+                ),
+            ):
+                _scheduler_doctor_linux_sticky_fallback_binding()
+
+            bind_child.assert_called_once()
+            for descriptor in (root_read_fd, child_read_fd):
+                with self.assertRaises(OSError) as raised:
+                    os.fstat(descriptor)
+                self.assertEqual(raised.exception.errno, errno.EBADF)
+        finally:
+            os.close(root_write_fd)
+            os.close(child_write_fd)
+            for descriptor in (root_read_fd, child_read_fd):
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+
+    def test_linux_sticky_fallback_policy_drift_fails_closed(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            sticky_root = Path(directory) / "shared-tmp"
+            sticky_root.mkdir(mode=0o700)
+            sticky_root.chmod(0o1777)
+            try:
+                with (
+                    mock.patch.object(sys, "platform", "linux"),
+                    mock.patch(
+                        f"{__name__}._SCHEDULER_DOCTOR_TEST_LINUX_STICKY_TEMP_ROOT",
+                        sticky_root,
+                    ),
+                ):
+                    binding = _scheduler_doctor_linux_sticky_fallback_binding()
+                    assert binding is not None
+                    binding.path.chmod(0o750)
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "sticky fallback changed after binding",
+                    ):
+                        _scheduler_doctor_rebind_sticky_candidate(binding)
+                    binding.path.chmod(0o700)
+            finally:
+                sticky_root.chmod(0o700)
+
+    def test_linux_sticky_fallback_replacement_fails_closed(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            sticky_root = Path(directory) / "shared-tmp"
+            sticky_root.mkdir(mode=0o700)
+            sticky_root.chmod(0o1777)
+            try:
+                with (
+                    mock.patch.object(sys, "platform", "linux"),
+                    mock.patch(
+                        f"{__name__}._SCHEDULER_DOCTOR_TEST_LINUX_STICKY_TEMP_ROOT",
+                        sticky_root,
+                    ),
+                ):
+                    binding = _scheduler_doctor_linux_sticky_fallback_binding()
+                    assert binding is not None
+                    replaced = sticky_root / "replaced-fallback"
+                    binding.path.rename(replaced)
+                    binding.path.mkdir(mode=0o700)
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "sticky fallback changed after binding",
+                    ):
+                        _scheduler_doctor_rebind_sticky_candidate(binding)
+            finally:
+                sticky_root.chmod(0o700)
+
+    def test_linux_runtime_allocation_failure_uses_sticky_fallback(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            runtime.mkdir(mode=0o700)
+            sticky_root = root / "shared-tmp"
+            sticky_root.mkdir(mode=0o700)
+            sticky_root.chmod(0o1777)
+            runtime_container = runtime / _SCHEDULER_DOCTOR_TEST_CONTAINER_NAME
+            real_mkdir = Path.mkdir
+
+            def fail_runtime_allocation(
+                path: Path,
+                mode: int = 0o777,
+                parents: bool = False,
+                exist_ok: bool = False,
+            ) -> None:
+                if path == runtime_container:
+                    raise OSError(errno.EROFS, "read-only runtime fixture")
+                real_mkdir(
+                    path,
+                    mode=mode,
+                    parents=parents,
+                    exist_ok=exist_ok,
+                )
+
+            try:
+                with (
+                    mock.patch.object(sys, "platform", "linux"),
+                    mock.patch(
+                        f"{__name__}."
+                        "_SCHEDULER_DOCTOR_TEST_LINUX_STICKY_TEMP_ROOT",
+                        sticky_root,
+                    ),
+                    mock.patch.object(Path, "mkdir", new=fail_runtime_allocation),
+                ):
+                    namespace = _select_scheduler_doctor_test_namespace(
+                        (
+                            runtime,
+                            _SCHEDULER_DOCTOR_LINUX_STICKY_FALLBACK_CANDIDATE,
+                        )
+                    )
+                    expected_fallback = (
+                        _scheduler_doctor_linux_sticky_fallback_path()
+                    )
+
+                self.assertTrue(namespace.is_relative_to(expected_fallback))
+                self.assertFalse(runtime_container.exists())
+            finally:
+                sticky_root.chmod(0o700)
 
     def test_bound_linux_runtime_parent_identity_drift_fails_closed(self) -> None:
         candidate = Path("/run/user/1000")
@@ -2691,6 +3499,99 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             self.assertTrue(
                 (namespace / _SCHEDULER_DOCTOR_TEST_LOCK_NAME).is_file()
             )
+
+    def test_linux_sticky_checkout_subprocess_fixture(self) -> None:
+        configured_root = os.environ.get(
+            _SCHEDULER_DOCTOR_TEST_EXPECTED_LINUX_STICKY_ROOT_ENV
+        )
+        if configured_root is None:
+            self.skipTest("Linux sticky-root subprocess fixture only")
+        sticky_root = Path(os.path.abspath(configured_root))
+        expected_fallback = sticky_root / (
+            _SCHEDULER_DOCTOR_TEST_LINUX_STICKY_FALLBACK_PREFIX
+            + str(os.geteuid())
+        )
+        with (
+            mock.patch.object(sys, "platform", "linux"),
+            mock.patch(
+                f"{__name__}._SCHEDULER_DOCTOR_TEST_LINUX_STICKY_TEMP_ROOT",
+                sticky_root,
+            ),
+            mock.patch(
+                f"{__name__}._scheduler_doctor_linux_runtime_parent_binding",
+                return_value=None,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_canonical_account_home_directory",
+                side_effect=AssertionError("account home must not be resolved"),
+            ),
+        ):
+            namespace = _ensure_scheduler_doctor_test_namespace()
+            self.assertTrue(namespace.is_relative_to(expected_fallback))
+            self.assertFalse(namespace.is_relative_to(REPO_ROOT))
+            stale = namespace / "session.interrupted"
+            stale.mkdir(mode=0o700)
+            (stale / "residue").write_text("stale\n", encoding="utf-8")
+
+            session = _scheduler_doctor_test_session_directory()
+
+            self.assertTrue(session.is_relative_to(namespace))
+            self.assertFalse(stale.exists())
+            _cleanup_scheduler_doctor_test_session()
+            self.assertFalse(session.exists())
+            self.assertTrue(namespace.is_dir())
+            lock_metadata = (
+                namespace / _SCHEDULER_DOCTOR_TEST_LOCK_NAME
+            ).lstat()
+            self.assertTrue(stat.S_ISREG(lock_metadata.st_mode))
+            self.assertEqual(stat.S_IMODE(lock_metadata.st_mode), 0o600)
+
+    def test_linux_shared_checkout_uses_stable_sticky_fallback(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            root = Path(directory)
+            sticky_root = root / "shared-tmp"
+            sticky_root.mkdir(mode=0o700)
+            sticky_root.chmod(0o1777)
+            checkout = sticky_root / "checkout"
+            checkout.mkdir(mode=0o700)
+            (checkout / "scripts").mkdir()
+            (checkout / "tests").mkdir()
+            shutil.copy2(SCRIPT_PATH, checkout / "scripts" / SCRIPT_PATH.name)
+            shutil.copy2(Path(__file__), checkout / "tests" / Path(__file__).name)
+            environment = os.environ.copy()
+            environment["TMPDIR"] = os.fspath(sticky_root)
+            environment.pop("XDG_RUNTIME_DIR", None)
+            environment.pop(_SCHEDULER_DOCTOR_TEST_ANCHOR_ENV, None)
+            environment.pop(_SCHEDULER_DOCTOR_TEST_EXPECTED_ANCHOR_ENV, None)
+            environment[
+                _SCHEDULER_DOCTOR_TEST_EXPECTED_LINUX_STICKY_ROOT_ENV
+            ] = os.fspath(sticky_root)
+            try:
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "unittest",
+                        "tests.test_scheduler_doctor."
+                        "SchedulerDoctorFixtureTests."
+                        "test_linux_sticky_checkout_subprocess_fixture",
+                    ],
+                    cwd=checkout,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=False,
+                )
+            finally:
+                sticky_root.chmod(0o700)
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
 
     def test_real_tmp_checkout_uses_unique_explicit_safe_anchor(self) -> None:
         with _scheduler_doctor_test_temporary_directory() as anchor_directory:
