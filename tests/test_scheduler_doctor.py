@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 import plistlib
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -81,8 +82,69 @@ class _SchedulerDoctorStaleCleanupBudget:
     depth_limit: int
 
 
-def _scheduler_doctor_test_platform_anchor_parents() -> tuple[Path, ...]:
-    candidates: list[Path] = []
+@dataclass(frozen=True)
+class _SchedulerDoctorBoundNamespaceCandidate:
+    path: Path
+    identity: tuple[int, int, int]
+    access_policy: tuple[int, int, int]
+
+    def __fspath__(self) -> str:
+        return os.fspath(self.path)
+
+
+def _scheduler_doctor_linux_runtime_parent_binding(
+    candidate: Path,
+) -> _SchedulerDoctorBoundNamespaceCandidate | None:
+    if not candidate.is_absolute() or candidate == Path("/"):
+        return None
+    components = candidate.parts[1:]
+    if not components or len(components) > MODULE.MIRROR_PRIVATE_CONTROL_MAX_ANCESTORS:
+        return None
+
+    current = Path("/")
+    for index, component in enumerate(components):
+        current /= component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise RuntimeError(
+                "cannot inspect Linux scheduler-doctor runtime parent "
+                f"component: {current}: {error}"
+            ) from error
+        mode, uid, _gid = MODULE._mirror_access_policy(metadata)
+        is_terminal = index == len(components) - 1
+        owner_is_acceptable = (
+            uid == os.geteuid()
+            if is_terminal
+            else uid in {0, os.geteuid()}
+        )
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or not owner_is_acceptable
+            or mode & 0o022
+        ):
+            return None
+
+    descriptor = -1
+    try:
+        descriptor, identity, access_policy = (
+            MODULE._bind_mirror_trusted_account_home(candidate)
+        )
+        return _SchedulerDoctorBoundNamespaceCandidate(
+            candidate,
+            identity,
+            access_policy,
+        )
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _scheduler_doctor_test_platform_anchor_parents(
+) -> tuple[Path | _SchedulerDoctorBoundNamespaceCandidate, ...]:
+    candidates: list[Path | _SchedulerDoctorBoundNamespaceCandidate] = []
     if sys.platform == "darwin":
         darwin_temp_root = Path("/private/var/folders")
         configured_temp = os.environ.get("TMPDIR")
@@ -123,14 +185,23 @@ def _scheduler_doctor_test_platform_anchor_parents() -> tuple[Path, ...]:
         if not candidates:
             candidates.extend(_bounded_darwin_user_temp_directories())
     if sys.platform.startswith("linux"):
+        runtime_root = Path("/run/user") / str(os.geteuid())
+        runtime_candidates: list[Path] = []
         runtime_directory = os.environ.get("XDG_RUNTIME_DIR")
         if runtime_directory:
             candidate = Path(runtime_directory)
             if candidate.is_absolute():
-                resolved = Path(os.path.realpath(candidate))
-                runtime_root = Path("/run/user") / str(os.geteuid())
-                if resolved == runtime_root or resolved.is_relative_to(runtime_root):
-                    candidates.append(resolved)
+                normalized = Path(os.path.abspath(candidate))
+                if candidate == normalized and (
+                    candidate == runtime_root
+                    or candidate.is_relative_to(runtime_root)
+                ):
+                    runtime_candidates.append(candidate)
+        runtime_candidates.append(runtime_root)
+        for candidate in dict.fromkeys(runtime_candidates):
+            binding = _scheduler_doctor_linux_runtime_parent_binding(candidate)
+            if binding is not None:
+                candidates.append(binding)
     return tuple(dict.fromkeys(candidates))
 
 
@@ -308,8 +379,9 @@ def _bounded_darwin_user_temp_directories() -> tuple[Path, ...]:
     return tuple(sorted(candidates, key=os.fsencode))
 
 
-def _scheduler_doctor_test_namespace_candidates() -> tuple[Path, ...]:
-    candidates: list[Path] = []
+def _scheduler_doctor_test_namespace_candidates(
+) -> tuple[Path | _SchedulerDoctorBoundNamespaceCandidate, ...]:
+    candidates: list[Path | _SchedulerDoctorBoundNamespaceCandidate] = []
     configured_anchor = os.environ.get(_SCHEDULER_DOCTOR_TEST_ANCHOR_ENV)
     if configured_anchor:
         override = Path(configured_anchor)
@@ -318,24 +390,61 @@ def _scheduler_doctor_test_namespace_candidates() -> tuple[Path, ...]:
                 f"{_SCHEDULER_DOCTOR_TEST_ANCHOR_ENV} must be absolute"
             )
         candidates.append(override)
-    for candidate in _scheduler_doctor_test_platform_anchor_parents():
+    for candidate_entry in _scheduler_doctor_test_platform_anchor_parents():
+        candidate = (
+            candidate_entry.path
+            if isinstance(
+                candidate_entry,
+                _SchedulerDoctorBoundNamespaceCandidate,
+            )
+            else candidate_entry
+        )
         resolved = Path(os.path.realpath(candidate))
+        if (
+            isinstance(candidate_entry, _SchedulerDoctorBoundNamespaceCandidate)
+            and resolved != candidate
+        ):
+            raise RuntimeError(
+                "Linux scheduler-doctor runtime parent changed after binding"
+            )
         if resolved == candidate and _scheduler_doctor_platform_parent_in_scope(
             resolved
         ):
-            candidates.append(resolved)
+            candidates.append(candidate_entry)
     candidates.append(REPO_ROOT)
 
-    unique: list[Path] = []
+    unique: list[Path | _SchedulerDoctorBoundNamespaceCandidate] = []
     seen: set[Path] = set()
-    for candidate in candidates:
+    for candidate_entry in candidates:
+        candidate = (
+            candidate_entry.path
+            if isinstance(
+                candidate_entry,
+                _SchedulerDoctorBoundNamespaceCandidate,
+            )
+            else candidate_entry
+        )
         if not candidate.is_absolute():
             continue
         resolved = Path(os.path.realpath(candidate))
+        if (
+            isinstance(candidate_entry, _SchedulerDoctorBoundNamespaceCandidate)
+            and resolved != candidate
+        ):
+            raise RuntimeError(
+                "Linux scheduler-doctor runtime parent changed after binding"
+            )
         if resolved in seen:
             continue
         seen.add(resolved)
-        unique.append(resolved)
+        unique.append(
+            candidate_entry
+            if isinstance(
+                candidate_entry,
+                _SchedulerDoctorBoundNamespaceCandidate,
+            )
+            else resolved
+        )
     return tuple(unique)
 
 
@@ -522,7 +631,11 @@ def _probe_scheduler_doctor_test_namespace_lock(
 
 
 def _select_scheduler_doctor_test_namespace(
-    candidates: tuple[Path, ...] | None = None,
+    candidates: tuple[
+        Path | _SchedulerDoctorBoundNamespaceCandidate,
+        ...,
+    ]
+    | None = None,
 ) -> Path:
     # This test-only fixture guarantees an owner-private namespace and assumes
     # cooperative same-UID users obey flock. It cannot atomically prevent a
@@ -533,16 +646,37 @@ def _select_scheduler_doctor_test_namespace(
         if candidates is None
         else candidates
     )
-    for candidate in selected_candidates:
-        candidate = Path(os.path.realpath(candidate))
+    for candidate_entry in selected_candidates:
+        expected_binding = (
+            candidate_entry
+            if isinstance(
+                candidate_entry,
+                _SchedulerDoctorBoundNamespaceCandidate,
+            )
+            else None
+        )
+        requested_candidate = (
+            expected_binding.path
+            if expected_binding is not None
+            else candidate_entry
+        )
+        candidate = Path(os.path.realpath(requested_candidate))
+        if expected_binding is not None and candidate != requested_candidate:
+            raise RuntimeError(
+                "Linux scheduler-doctor runtime parent changed after binding"
+            )
         candidate_fd = -1
         namespace_fd = -1
         created: list[tuple[Path, tuple[int, int, int] | None]] = []
         try:
-            candidate_fd, _identity, _access_policy = (
+            candidate_fd, candidate_identity, candidate_access_policy = (
                 MODULE._bind_mirror_trusted_account_home(candidate)
             )
         except MODULE.SyncError as error:
+            if expected_binding is not None:
+                raise RuntimeError(
+                    "Linux scheduler-doctor runtime parent changed after binding"
+                ) from error
             if not _scheduler_doctor_test_anchor_is_stably_unsuitable(
                 error,
                 candidate,
@@ -550,6 +684,19 @@ def _select_scheduler_doctor_test_namespace(
                 raise
             failures.append(f"{candidate}: {error}")
             continue
+
+        if expected_binding is not None and (
+            candidate_identity != expected_binding.identity
+            or candidate_access_policy != expected_binding.access_policy
+        ):
+            close_failures = _close_scheduler_doctor_candidate_descriptors(
+                (candidate_fd,)
+            )
+            candidate_fd = -1
+            message = "Linux scheduler-doctor runtime parent changed after binding"
+            if close_failures:
+                message += "; " + "; ".join(close_failures)
+            raise RuntimeError(message)
 
         parent = candidate / _SCHEDULER_DOCTOR_TEST_CONTAINER_NAME
         namespace = parent / _SCHEDULER_DOCTOR_TEST_NAMESPACE_NAME
@@ -818,6 +965,8 @@ def _scheduler_doctor_stale_plan_matches(
 ) -> bool:
     if _scheduler_doctor_test_object_identity(metadata) != plan.identity:
         return False
+    if metadata.st_uid != os.geteuid():
+        return False
     if not plan.owner_private_directory:
         return True
     return _scheduler_doctor_metadata_is_owner_private_directory(metadata)
@@ -852,7 +1001,12 @@ def _plan_scheduler_doctor_stale_entry(
             f"scheduler-doctor stale-session root is not an owner-private "
             f"directory: {name}"
         )
-    if stat.S_ISLNK(metadata.st_mode) or stat.S_ISREG(metadata.st_mode):
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISFIFO(metadata.st_mode)
+        or stat.S_ISSOCK(metadata.st_mode)
+    ):
         return _SchedulerDoctorStaleEntryPlan(name, identity, None)
     if not stat.S_ISDIR(metadata.st_mode):
         raise RuntimeError(
@@ -1022,8 +1176,9 @@ def _apply_scheduler_doctor_stale_entry_plan(
 
 def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
     # The protected property is the identity of every planned name object and
-    # the owner-private access policy of the namespace/session roots. Benign
-    # timestamps and nested-file mode changes are not treated as replacement.
+    # its current-UID ownership, plus the owner-private access policy of the
+    # namespace/session roots. Benign timestamps and nested-file mode changes
+    # are not treated as replacement.
     # The module lease serializes cooperative same-UID test processes; this
     # fixture does not claim to defeat a malicious same-UID replace-at-unlink.
     namespace_metadata = _validate_owner_private_directory(namespace)
@@ -1420,6 +1575,347 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         self.assertEqual(candidates, (scanned,))
         scan.assert_called_once_with()
 
+    def test_linux_platform_anchor_parent_uses_fixed_runtime_root(self) -> None:
+        runtime_root = Path("/run/user") / str(os.geteuid())
+        binding = _SchedulerDoctorBoundNamespaceCandidate(
+            runtime_root,
+            (1, 2, stat.S_IFDIR),
+            (0o700, os.geteuid(), os.getegid()),
+        )
+        with (
+            mock.patch.object(sys, "platform", "linux"),
+            mock.patch(
+                f"{__name__}._scheduler_doctor_linux_runtime_parent_binding",
+                return_value=binding,
+            ) as probe,
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            candidates = _scheduler_doctor_test_platform_anchor_parents()
+
+        self.assertEqual(candidates, (binding,))
+        probe.assert_called_once_with(runtime_root)
+
+    def test_linux_platform_anchor_parent_skips_stale_xdg_runtime(self) -> None:
+        runtime_root = Path("/run/user") / str(os.geteuid())
+        stale_runtime = runtime_root / "missing"
+
+        binding = _SchedulerDoctorBoundNamespaceCandidate(
+            runtime_root,
+            (1, 2, stat.S_IFDIR),
+            (0o700, os.geteuid(), os.getegid()),
+        )
+
+        def probe_candidate(
+            candidate: Path,
+        ) -> _SchedulerDoctorBoundNamespaceCandidate | None:
+            return binding if candidate == runtime_root else None
+
+        with (
+            mock.patch.object(sys, "platform", "linux"),
+            mock.patch(
+                f"{__name__}._scheduler_doctor_linux_runtime_parent_binding",
+                side_effect=probe_candidate,
+            ) as probe,
+            mock.patch.dict(
+                os.environ,
+                {"XDG_RUNTIME_DIR": os.fspath(stale_runtime)},
+                clear=True,
+            ),
+        ):
+            candidates = _scheduler_doctor_test_platform_anchor_parents()
+
+        self.assertEqual(candidates, (binding,))
+        self.assertEqual(
+            probe.call_args_list,
+            [mock.call(stale_runtime), mock.call(runtime_root)],
+        )
+
+    def test_linux_runtime_parent_initial_missing_is_unavailable(self) -> None:
+        candidate = Path("/safe/runtime/missing")
+        safe_directory = os.stat_result(
+            (stat.S_IFDIR | 0o755, 1, 1, 1, 0, 0, 0, 0, 0, 0)
+        )
+        with (
+            mock.patch.object(
+                Path,
+                "lstat",
+                side_effect=(
+                    safe_directory,
+                    safe_directory,
+                    FileNotFoundError("missing"),
+                ),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_bind_mirror_trusted_account_home",
+            ) as bind,
+        ):
+            self.assertIsNone(
+                _scheduler_doctor_linux_runtime_parent_binding(candidate)
+            )
+
+        bind.assert_not_called()
+
+    def test_linux_runtime_parent_unreadable_probe_fails_closed(self) -> None:
+        candidate = Path("/safe")
+        with (
+            mock.patch.object(
+                Path,
+                "lstat",
+                side_effect=PermissionError("denied"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_bind_mirror_trusted_account_home",
+            ) as bind,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "cannot inspect Linux scheduler-doctor runtime parent component",
+            ),
+        ):
+            _scheduler_doctor_linux_runtime_parent_binding(candidate)
+
+        bind.assert_not_called()
+
+    def test_linux_runtime_parent_binding_drift_fails_closed(self) -> None:
+        candidate = Path("/safe/runtime")
+        safe_parent = os.stat_result(
+            (stat.S_IFDIR | 0o755, 1, 1, 1, 0, 0, 0, 0, 0, 0)
+        )
+        safe_runtime = os.stat_result(
+            (
+                stat.S_IFDIR | 0o700,
+                2,
+                1,
+                1,
+                os.geteuid(),
+                os.getegid(),
+                0,
+                0,
+                0,
+                0,
+            )
+        )
+        with (
+            mock.patch.object(
+                Path,
+                "lstat",
+                side_effect=(safe_parent, safe_runtime),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_bind_mirror_trusted_account_home",
+                side_effect=MODULE.SyncError("runtime parent changed while binding"),
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "runtime parent changed while binding",
+            ),
+        ):
+            _scheduler_doctor_linux_runtime_parent_binding(candidate)
+
+    def test_linux_runtime_parent_stable_wrong_leaf_owner_is_unavailable(
+        self,
+    ) -> None:
+        candidate = Path("/safe/runtime")
+        root_owned_directory = os.stat_result(
+            (stat.S_IFDIR | 0o755, 1, 1, 1, 0, 0, 0, 0, 0, 0)
+        )
+        with (
+            mock.patch.object(os, "geteuid", return_value=1000),
+            mock.patch.object(
+                Path,
+                "lstat",
+                side_effect=(root_owned_directory, root_owned_directory),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_bind_mirror_trusted_account_home",
+            ) as bind,
+        ):
+            self.assertIsNone(
+                _scheduler_doctor_linux_runtime_parent_binding(candidate)
+            )
+
+        bind.assert_not_called()
+
+    def test_linux_runtime_parent_symlink_leaf_is_unavailable(self) -> None:
+        candidate = Path("/safe/runtime")
+        safe_parent = os.stat_result(
+            (stat.S_IFDIR | 0o755, 1, 1, 1, 0, 0, 0, 0, 0, 0)
+        )
+        symlink_leaf = os.stat_result(
+            (
+                stat.S_IFLNK | 0o700,
+                2,
+                1,
+                1,
+                os.geteuid(),
+                os.getegid(),
+                0,
+                0,
+                0,
+                0,
+            )
+        )
+        with (
+            mock.patch.object(
+                Path,
+                "lstat",
+                side_effect=(safe_parent, symlink_leaf),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_bind_mirror_trusted_account_home",
+            ) as bind,
+        ):
+            self.assertIsNone(
+                _scheduler_doctor_linux_runtime_parent_binding(candidate)
+            )
+
+        bind.assert_not_called()
+
+    def test_linux_runtime_parent_success_closes_bound_descriptor(self) -> None:
+        candidate = Path("/safe/runtime")
+        safe_parent = os.stat_result(
+            (stat.S_IFDIR | 0o755, 1, 1, 1, 0, 0, 0, 0, 0, 0)
+        )
+        safe_runtime = os.stat_result(
+            (
+                stat.S_IFDIR | 0o700,
+                2,
+                1,
+                1,
+                os.geteuid(),
+                os.getegid(),
+                0,
+                0,
+                0,
+                0,
+            )
+        )
+        with (
+            mock.patch.object(
+                Path,
+                "lstat",
+                side_effect=(safe_parent, safe_runtime),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_bind_mirror_trusted_account_home",
+                return_value=(
+                    42,
+                    (1, 2, stat.S_IFDIR),
+                    (0o700, os.geteuid(), 0),
+                ),
+            ),
+            mock.patch.object(os, "close") as close,
+        ):
+            binding = _scheduler_doctor_linux_runtime_parent_binding(candidate)
+
+        self.assertEqual(
+            binding,
+            _SchedulerDoctorBoundNamespaceCandidate(
+                candidate,
+                (1, 2, stat.S_IFDIR),
+                (0o700, os.geteuid(), 0),
+            )
+        )
+
+        close.assert_called_once_with(42)
+
+    def test_bound_linux_runtime_parent_identity_drift_fails_closed(self) -> None:
+        candidate = Path("/run/user/1000")
+        fallback = Path("/safe/fallback")
+        binding = _SchedulerDoctorBoundNamespaceCandidate(
+            candidate,
+            (1, 2, stat.S_IFDIR),
+            (0o700, os.geteuid(), os.getegid()),
+        )
+        with (
+            mock.patch(
+                "os.path.realpath",
+                side_effect=lambda path: os.fspath(path),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_bind_mirror_trusted_account_home",
+                return_value=(
+                    42,
+                    (1, 3, stat.S_IFDIR),
+                    binding.access_policy,
+                ),
+            ) as bind,
+            mock.patch.object(os, "close") as close,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "runtime parent changed after binding",
+            ),
+        ):
+            _select_scheduler_doctor_test_namespace((binding, fallback))
+
+        bind.assert_called_once_with(candidate)
+        close.assert_called_once_with(42)
+
+    def test_bound_linux_runtime_parent_policy_drift_fails_closed(self) -> None:
+        candidate = Path("/run/user/1000")
+        fallback = Path("/safe/fallback")
+        binding = _SchedulerDoctorBoundNamespaceCandidate(
+            candidate,
+            (1, 2, stat.S_IFDIR),
+            (0o700, os.geteuid(), os.getegid()),
+        )
+        with (
+            mock.patch(
+                "os.path.realpath",
+                side_effect=lambda path: os.fspath(path),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_bind_mirror_trusted_account_home",
+                side_effect=(
+                    MODULE.SyncError(
+                        "canonical account home must be owned by the current "
+                        "uid and not group/world writable"
+                    ),
+                    AssertionError("fallback must not be attempted"),
+                ),
+            ) as bind,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "runtime parent changed after binding",
+            ),
+        ):
+            _select_scheduler_doctor_test_namespace((binding, fallback))
+
+        bind.assert_called_once_with(candidate)
+
+    def test_bound_linux_runtime_parent_symlink_drift_fails_closed(self) -> None:
+        candidate = Path("/run/user/1000")
+        escaped = Path("/safe/escaped")
+        binding = _SchedulerDoctorBoundNamespaceCandidate(
+            candidate,
+            (1, 2, stat.S_IFDIR),
+            (0o700, os.geteuid(), os.getegid()),
+        )
+        with (
+            mock.patch(
+                f"{__name__}._scheduler_doctor_test_platform_anchor_parents",
+                return_value=(binding,),
+            ),
+            mock.patch(
+                "os.path.realpath",
+                side_effect=lambda path: os.fspath(escaped)
+                if Path(path) == candidate
+                else os.fspath(path),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "runtime parent changed after binding",
+            ),
+        ):
+            _scheduler_doctor_test_namespace_candidates()
+
     @unittest.skipUnless(sys.platform == "darwin", "Darwin temp layout required")
     def test_darwin_platform_anchor_scan_enforces_global_entry_limit(self) -> None:
         with mock.patch(
@@ -1607,6 +2103,136 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
 
             self.assertFalse(stale.exists())
             self.assertEqual(marker.read_text(encoding="utf-8"), "keep\n")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO support required")
+    def test_stale_session_sweep_removes_fifo_leaf(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            stale = namespace / "session.stale"
+            stale.mkdir(mode=0o700)
+            fifo_path = stale / "fifo"
+            os.mkfifo(fifo_path, mode=0o600)
+
+            _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertFalse(stale.exists())
+
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "Unix sockets required")
+    def test_stale_session_sweep_removes_unix_socket_leaf(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            stale = namespace / "session.stale"
+            stale.mkdir(mode=0o700)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import socket; s = socket.socket(socket.AF_UNIX); "
+                    "s.bind('socket'); s.close()",
+                ],
+                cwd=stale,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertFalse(stale.exists())
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO support required")
+    def test_stale_session_root_must_remain_a_directory(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            stale = namespace / "session.stale"
+            os.mkfifo(stale, mode=0o600)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "stale-session root is not an owner-private directory",
+            ):
+                _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertTrue(stat.S_ISFIFO(stale.lstat().st_mode))
+
+    def test_stale_leaf_owner_drift_does_not_match_plan(self) -> None:
+        original = os.stat_result(
+            (
+                stat.S_IFIFO | 0o600,
+                11,
+                22,
+                1,
+                os.geteuid(),
+                os.getegid(),
+                0,
+                0,
+                0,
+                0,
+            )
+        )
+        changed_owner = os.stat_result(
+            (
+                stat.S_IFIFO | 0o600,
+                11,
+                22,
+                1,
+                os.geteuid() + 1,
+                os.getegid(),
+                0,
+                0,
+                0,
+                0,
+            )
+        )
+        plan = _SchedulerDoctorStaleEntryPlan(
+            "fifo",
+            _scheduler_doctor_test_object_identity(original),
+            None,
+        )
+
+        self.assertFalse(
+            _scheduler_doctor_stale_plan_matches(changed_owner, plan)
+        )
+
+    def test_stale_session_planning_rejects_device_leaf(self) -> None:
+        metadata = os.stat_result(
+            (
+                stat.S_IFCHR | 0o600,
+                11,
+                22,
+                1,
+                os.geteuid(),
+                os.getegid(),
+                0,
+                0,
+                0,
+                0,
+            )
+        )
+        budget = _SchedulerDoctorStaleCleanupBudget(
+            deadline=time.monotonic() + 30.0,
+            remaining_entries=1,
+            depth_limit=2,
+        )
+
+        with (
+            mock.patch.object(os, "stat", return_value=metadata),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "unsupported scheduler-doctor stale-session entry",
+            ),
+        ):
+            _plan_scheduler_doctor_stale_entry(
+                -1,
+                "device",
+                budget,
+                depth=2,
+            )
 
     def test_stale_session_entry_budget_failure_does_not_delete(self) -> None:
         with _scheduler_doctor_test_temporary_directory() as directory:
