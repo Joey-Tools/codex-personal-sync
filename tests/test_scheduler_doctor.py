@@ -53,7 +53,12 @@ _SCHEDULER_DOCTOR_TEST_EXPECTED_LINUX_STICKY_ROOT_ENV = (
 _SCHEDULER_DOCTOR_TEST_CONTAINER_NAME = ".codex-tmp"
 _SCHEDULER_DOCTOR_TEST_NAMESPACE_NAME = "scheduler-doctor"
 _SCHEDULER_DOCTOR_TEST_LOCK_NAME = ".session.lock"
+_SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME = ".liveness.lock"
+_SCHEDULER_DOCTOR_TEST_LIVENESS_REGISTRY_ENV = (
+    "CODEX_SCHEDULER_DOCTOR_TEST_LIVENESS_FDS"
+)
 _SCHEDULER_DOCTOR_TEST_SESSION_PREFIX = "session."
+_SCHEDULER_DOCTOR_TEST_STAGING_PREFIX = ".session-staging."
 _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT = 1024
 _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_ENTRY_LIMIT = 10_000
 _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_DEPTH_LIMIT = 64
@@ -67,8 +72,12 @@ _SCHEDULER_DOCTOR_TEST_LINUX_STICKY_FALLBACK_PREFIX = (
 )
 _SCHEDULER_DOCTOR_TEST_SESSION: _SchedulerDoctorActiveSessionBinding | None = None
 _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD: int | None = None
-_SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE: tuple[Path, str] | None = None
+_SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE: (
+    _SchedulerDoctorSessionCleanupFailure | None
+) = None
 _SCHEDULER_DOCTOR_TEST_HOST_PLATFORM = sys.platform
+_SCHEDULER_DOCTOR_TEST_ORIGINAL_POPEN = subprocess.Popen
+_SCHEDULER_DOCTOR_TEST_POPEN_INSTALLED = False
 
 
 class _SchedulerDoctorTestCandidateUnavailable(RuntimeError):
@@ -102,6 +111,35 @@ class _SchedulerDoctorActiveSessionBinding:
     descriptor: int
     identity: tuple[int, int, int]
     mount_identity: tuple[int, int | None]
+    liveness_descriptor: int
+    liveness_identity: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class _SchedulerDoctorStaleSessionCandidate:
+    name: str
+    identity: tuple[int, int, int]
+    liveness_identity: tuple[int, int, int] | None
+    busy: bool
+    plans: tuple[_SchedulerDoctorStaleEntryPlan, ...] | None
+    staging: bool
+
+
+@dataclass(frozen=True)
+class _SchedulerDoctorAbandonedDescriptorCustody:
+    role: str
+    descriptor: int
+    identity: tuple[int, int, int] | None
+    state: str
+
+
+@dataclass(frozen=True)
+class _SchedulerDoctorSessionCleanupFailure:
+    retained_path: Path | None
+    reason: str
+    abandoned_custody: tuple[
+        _SchedulerDoctorAbandonedDescriptorCustody, ...
+    ] = ()
 
 
 @dataclass(frozen=True)
@@ -1409,6 +1447,340 @@ def _validate_scheduler_doctor_session_lease(
     return descriptor_metadata
 
 
+def _validate_scheduler_doctor_liveness_descriptor(
+    path: Path,
+    descriptor: int,
+    *,
+    parent_fd: int,
+    expected_mount_identity: tuple[int, int | None],
+    expected_identity: tuple[int, int, int] | None = None,
+) -> os.stat_result:
+    descriptor_metadata = os.fstat(descriptor)
+    path_metadata = os.stat(
+        path.name,
+        dir_fd=parent_fd,
+        follow_symlinks=False,
+    )
+    identity = _scheduler_doctor_test_object_identity(descriptor_metadata)
+    if not stat.S_ISREG(descriptor_metadata.st_mode):
+        raise RuntimeError(f"test fixture liveness lease is not regular: {path}")
+    if descriptor_metadata.st_nlink != 1:
+        raise RuntimeError(
+            f"test fixture liveness lease link count is not one: {path}"
+        )
+    if descriptor_metadata.st_uid != os.geteuid():
+        raise RuntimeError(
+            f"test fixture liveness lease has the wrong owner: {path}"
+        )
+    if stat.S_IMODE(descriptor_metadata.st_mode) != 0o600:
+        raise RuntimeError(
+            f"test fixture liveness lease is not mode 0600: {path}"
+        )
+    if identity != _scheduler_doctor_test_object_identity(path_metadata):
+        raise RuntimeError(f"test fixture liveness lease identity changed: {path}")
+    if expected_identity is not None and identity != expected_identity:
+        raise RuntimeError(f"test fixture liveness lease identity changed: {path}")
+    if descriptor_metadata.st_dev != expected_mount_identity[0]:
+        raise RuntimeError(
+            f"test fixture liveness lease crosses a mount boundary: {path}"
+        )
+    return descriptor_metadata
+
+
+def _open_scheduler_doctor_liveness_descriptor(
+    session_path: Path,
+    session_fd: int,
+    *,
+    expected_mount_identity: tuple[int, int | None],
+    create: bool = False,
+    expected_identity: tuple[int, int, int] | None = None,
+) -> tuple[int, tuple[int, int, int]]:
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    if create:
+        flags |= os.O_CREAT | os.O_EXCL
+    descriptor = os.open(
+        _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME,
+        flags,
+        0o600,
+        dir_fd=session_fd,
+    )
+    path = session_path / _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME
+    try:
+        metadata = _validate_scheduler_doctor_liveness_descriptor(
+            path,
+            descriptor,
+            parent_fd=session_fd,
+            expected_mount_identity=expected_mount_identity,
+            expected_identity=expected_identity,
+        )
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, _scheduler_doctor_test_object_identity(metadata)
+
+
+def _create_unlocked_scheduler_doctor_liveness_marker(
+    session_path: Path,
+) -> None:
+    session_metadata = _validate_owner_private_directory(session_path)
+    session_identity = _scheduler_doctor_test_object_identity(session_metadata)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    namespace_fd = os.open(session_path.parent, flags)
+    session_fd = -1
+    try:
+        mount_identity = _scheduler_doctor_stale_directory_mount_identity(
+            namespace_fd
+        )
+        session_fd = _open_scheduler_doctor_stale_directory(
+            namespace_fd,
+            session_path.name,
+            session_identity,
+            expected_mount_identity=mount_identity,
+            require_owner_private_directory=True,
+        )
+        # The helper deliberately leaves an unlocked marker that models a
+        # process which exited cleanly before the next sweep.
+        descriptor, _identity = _open_scheduler_doctor_liveness_descriptor(
+            session_path,
+            session_fd,
+            expected_mount_identity=mount_identity,
+            create=True,
+        )
+        os.close(descriptor)
+    finally:
+        if session_fd >= 0:
+            os.close(session_fd)
+        os.close(namespace_fd)
+
+
+def _scheduler_doctor_liveness_registry_entries() -> tuple[
+    tuple[int, tuple[int, int, int]], ...
+]:
+    entries: dict[int, tuple[int, int, int]] = {}
+    serialized = os.environ.get(
+        _SCHEDULER_DOCTOR_TEST_LIVENESS_REGISTRY_ENV
+    )
+    if serialized is not None:
+        try:
+            payload = json.loads(serialized)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                "scheduler-doctor liveness registry is malformed"
+            ) from error
+        if not isinstance(payload, list):
+            raise RuntimeError("scheduler-doctor liveness registry is malformed")
+        for item in payload:
+            if not isinstance(item, dict) or set(item) != {
+                "fd",
+                "dev",
+                "ino",
+                "type",
+            }:
+                raise RuntimeError(
+                    "scheduler-doctor liveness registry is malformed"
+                )
+            values = tuple(item[key] for key in ("fd", "dev", "ino", "type"))
+            if any(
+                not isinstance(value, int) or isinstance(value, bool)
+                for value in values
+            ):
+                raise RuntimeError(
+                    "scheduler-doctor liveness registry is malformed"
+                )
+            descriptor, device, inode, object_type = values
+            if descriptor < 0 or descriptor in entries:
+                raise RuntimeError(
+                    "scheduler-doctor liveness registry is malformed"
+                )
+            entries[descriptor] = (device, inode, object_type)
+
+    binding = _SCHEDULER_DOCTOR_TEST_SESSION
+    if binding is not None:
+        prior = entries.get(binding.liveness_descriptor)
+        if prior is not None and prior != binding.liveness_identity:
+            raise RuntimeError(
+                "scheduler-doctor liveness registry descriptor collision"
+            )
+        entries[binding.liveness_descriptor] = binding.liveness_identity
+
+    validated: list[tuple[int, tuple[int, int, int]]] = []
+    for descriptor, expected_identity in sorted(entries.items()):
+        try:
+            metadata = os.fstat(descriptor)
+        except OSError as error:
+            raise RuntimeError(
+                "scheduler-doctor inherited liveness descriptor is unavailable"
+            ) from error
+        identity = _scheduler_doctor_test_object_identity(metadata)
+        if (
+            identity != expected_identity
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+        ):
+            raise RuntimeError(
+                "scheduler-doctor inherited liveness descriptor changed"
+            )
+        validated.append((descriptor, identity))
+    return tuple(validated)
+
+
+def _scheduler_doctor_liveness_registry_json(
+    entries: tuple[tuple[int, tuple[int, int, int]], ...],
+) -> str:
+    return json.dumps(
+        [
+            {
+                "fd": descriptor,
+                "dev": identity[0],
+                "ino": identity[1],
+                "type": identity[2],
+            }
+            for descriptor, identity in entries
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _scheduler_doctor_child_protected_custody() -> dict[
+    int, tuple[int, int, int]
+]:
+    if _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE is not None:
+        raise RuntimeError(
+            "scheduler-doctor child launch blocked by retained fixture custody"
+        )
+    protected: dict[int, tuple[int, int, int]] = {}
+
+    def add(
+        role: str,
+        descriptor: int | None,
+        expected_identity: tuple[int, int, int] | None,
+    ) -> None:
+        if descriptor is None:
+            return
+        try:
+            identity = _scheduler_doctor_test_object_identity(
+                os.fstat(descriptor)
+            )
+        except OSError as error:
+            raise RuntimeError(
+                f"scheduler-doctor {role} custody descriptor is unavailable"
+            ) from error
+        if expected_identity is not None and identity != expected_identity:
+            raise RuntimeError(
+                f"scheduler-doctor {role} custody descriptor changed"
+            )
+        prior = protected.get(descriptor)
+        if prior is not None and prior != identity:
+            raise RuntimeError(
+                "scheduler-doctor child custody descriptor collision"
+            )
+        protected[descriptor] = identity
+
+    binding = _SCHEDULER_DOCTOR_TEST_SESSION
+    if binding is not None:
+        add("session", binding.descriptor, binding.identity)
+        add(
+            "namespace",
+            binding.namespace_descriptor,
+            binding.namespace_identity,
+        )
+    add(
+        "module-lease",
+        _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD,
+        None,
+    )
+    return protected
+
+
+def _reject_scheduler_doctor_child_custody(
+    descriptors: tuple[int, ...],
+) -> None:
+    protected = _scheduler_doctor_child_protected_custody()
+    protected_identities = set(protected.values())
+    for descriptor in descriptors:
+        if descriptor in protected:
+            raise RuntimeError(
+                "scheduler-doctor child launch attempted to inherit fixture "
+                "custody descriptors"
+            )
+        try:
+            identity = _scheduler_doctor_test_object_identity(
+                os.fstat(descriptor)
+            )
+        except OSError as error:
+            raise RuntimeError(
+                "scheduler-doctor child descriptor is unavailable"
+            ) from error
+        if identity in protected_identities:
+            raise RuntimeError(
+                "scheduler-doctor child launch attempted to inherit fixture "
+                "custody objects"
+            )
+
+
+def _scheduler_doctor_test_popen(*args: object, **kwargs: object):
+    if kwargs.get("close_fds") is False:
+        raise RuntimeError(
+            "scheduler-doctor child launch requires close_fds=True"
+        )
+    registry = _scheduler_doctor_liveness_registry_entries()
+    inherited = tuple(descriptor for descriptor, _identity in registry)
+    supplied = kwargs.get("pass_fds", ())
+    try:
+        supplied_descriptors = tuple(supplied)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise RuntimeError("scheduler-doctor child pass_fds is invalid") from error
+    if any(
+        not isinstance(descriptor, int)
+        or isinstance(descriptor, bool)
+        or descriptor < 0
+        for descriptor in supplied_descriptors
+    ):
+        raise RuntimeError("scheduler-doctor child pass_fds is invalid")
+
+    _reject_scheduler_doctor_child_custody(inherited)
+
+    environment = kwargs.get("env")
+    child_environment = os.environ.copy() if environment is None else dict(environment)
+    child_environment[_SCHEDULER_DOCTOR_TEST_LIVENESS_REGISTRY_ENV] = (
+        _scheduler_doctor_liveness_registry_json(registry)
+    )
+    kwargs["env"] = child_environment
+    kwargs["close_fds"] = True
+    final_descriptors = tuple(
+        sorted(set(supplied_descriptors + inherited))
+    )
+    _reject_scheduler_doctor_child_custody(final_descriptors)
+    kwargs["pass_fds"] = final_descriptors
+    return _SCHEDULER_DOCTOR_TEST_ORIGINAL_POPEN(*args, **kwargs)
+
+
+def _install_scheduler_doctor_test_popen_wrapper() -> None:
+    global _SCHEDULER_DOCTOR_TEST_POPEN_INSTALLED
+    if _SCHEDULER_DOCTOR_TEST_POPEN_INSTALLED:
+        return
+    if subprocess.Popen is not _SCHEDULER_DOCTOR_TEST_ORIGINAL_POPEN:
+        raise RuntimeError("subprocess.Popen changed before fixture setup")
+    subprocess.Popen = _scheduler_doctor_test_popen  # type: ignore[assignment]
+    _SCHEDULER_DOCTOR_TEST_POPEN_INSTALLED = True
+
+
+def _restore_scheduler_doctor_test_popen_wrapper() -> None:
+    global _SCHEDULER_DOCTOR_TEST_POPEN_INSTALLED
+    if not _SCHEDULER_DOCTOR_TEST_POPEN_INSTALLED:
+        return
+    if subprocess.Popen is not _scheduler_doctor_test_popen:
+        raise RuntimeError("subprocess.Popen changed before fixture teardown")
+    subprocess.Popen = _SCHEDULER_DOCTOR_TEST_ORIGINAL_POPEN
+    _SCHEDULER_DOCTOR_TEST_POPEN_INSTALLED = False
+
+
 def _acquire_scheduler_doctor_test_session_lease(
     descriptor: int,
     *,
@@ -1461,7 +1833,10 @@ def _bounded_scheduler_doctor_stale_session_names(
                 raise RuntimeError(
                     "too many scheduler-doctor fixture namespace entries"
                 )
-            if not name.startswith(_SCHEDULER_DOCTOR_TEST_SESSION_PREFIX):
+            if not (
+                name.startswith(_SCHEDULER_DOCTOR_TEST_SESSION_PREFIX)
+                or name.startswith(_SCHEDULER_DOCTOR_TEST_STAGING_PREFIX)
+            ):
                 raise RuntimeError(
                     f"unexpected scheduler-doctor fixture entry: {name}"
                 )
@@ -1843,6 +2218,339 @@ def _apply_scheduler_doctor_stale_entry_plan(
     os.rmdir(plan.name, dir_fd=parent_fd)
 
 
+def _scheduler_doctor_liveness_is_busy(descriptor: int) -> bool:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        busy_errors = {errno.EACCES, errno.EAGAIN}
+        if hasattr(errno, "EWOULDBLOCK"):
+            busy_errors.add(errno.EWOULDBLOCK)
+        if error.errno in busy_errors:
+            return True
+        raise RuntimeError(
+            "cannot prove scheduler-doctor stale-session liveness"
+        ) from error
+    return False
+
+
+def _plan_scheduler_doctor_session_contents(
+    session_fd: int,
+    budget: _SchedulerDoctorStaleCleanupBudget,
+    *,
+    root_mount_identity: tuple[int, int | None],
+) -> tuple[_SchedulerDoctorStaleEntryPlan, ...]:
+    child_names: list[str] = []
+    marker_seen = False
+    with os.scandir(session_fd) as iterator:
+        for entry in iterator:
+            child_name = entry.name
+            if not isinstance(child_name, str):
+                raise RuntimeError(
+                    "scheduler-doctor stale-session entry name is not text"
+                )
+            if child_name == _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME:
+                if marker_seen:
+                    raise RuntimeError(
+                        "scheduler-doctor stale-session liveness is ambiguous"
+                    )
+                marker_seen = True
+                continue
+            _reserve_scheduler_doctor_stale_cleanup_entry(budget, depth=2)
+            child_names.append(child_name)
+    if not marker_seen:
+        raise RuntimeError(
+            "scheduler-doctor stale-session liveness lease is missing"
+        )
+    child_names.sort(key=os.fsencode)
+    plans = tuple(
+        _plan_scheduler_doctor_stale_entry(
+            session_fd,
+            child_name,
+            budget,
+            depth=2,
+            root_mount_identity=root_mount_identity,
+            reserved=True,
+        )
+        for child_name in child_names
+    )
+    expected_names = tuple(
+        sorted(
+            child_names + [_SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME],
+            key=os.fsencode,
+        )
+    )
+    _revalidate_scheduler_doctor_stale_directory_names(
+        session_fd,
+        expected_names,
+        deadline=budget.deadline,
+    )
+    return plans
+
+
+def _delete_scheduler_doctor_stale_session(
+    namespace_fd: int,
+    namespace_mount_identity: tuple[int, int | None],
+    candidate: _SchedulerDoctorStaleSessionCandidate,
+    *,
+    deadline: float,
+) -> bool:
+    if candidate.plans is None:
+        raise RuntimeError(
+            "scheduler-doctor stale-session cleanup plan is unavailable"
+        )
+    session_fd = _open_scheduler_doctor_stale_directory(
+        namespace_fd,
+        candidate.name,
+        candidate.identity,
+        expected_mount_identity=namespace_mount_identity,
+        require_owner_private_directory=True,
+    )
+    liveness_fd = -1
+    primary: BaseException | None = None
+    try:
+        if candidate.liveness_identity is None:
+            if not candidate.staging or candidate.plans:
+                raise RuntimeError(
+                    "scheduler-doctor stale-session liveness plan is invalid"
+                )
+            _revalidate_scheduler_doctor_stale_directory_names(
+                session_fd,
+                (),
+                deadline=deadline,
+            )
+            if (
+                _scheduler_doctor_stale_directory_mount_identity(session_fd)
+                != namespace_mount_identity
+            ):
+                raise RuntimeError(
+                    "scheduler-doctor staging directory crosses a mount "
+                    f"boundary: {candidate.name}"
+                )
+            metadata = os.stat(
+                candidate.name,
+                dir_fd=namespace_fd,
+                follow_symlinks=False,
+            )
+            if (
+                _scheduler_doctor_test_object_identity(metadata)
+                != candidate.identity
+                or not _scheduler_doctor_metadata_is_owner_private_directory(
+                    metadata
+                )
+            ):
+                raise RuntimeError(
+                    "scheduler-doctor staging directory changed: "
+                    f"{candidate.name}"
+                )
+            os.rmdir(candidate.name, dir_fd=namespace_fd)
+            return True
+        liveness_fd, liveness_identity = (
+            _open_scheduler_doctor_liveness_descriptor(
+                Path(candidate.name),
+                session_fd,
+                expected_mount_identity=namespace_mount_identity,
+                expected_identity=candidate.liveness_identity,
+            )
+        )
+        if _scheduler_doctor_liveness_is_busy(liveness_fd):
+            return False
+        expected_names = tuple(
+            sorted(
+                [plan.name for plan in candidate.plans]
+                + [_SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME],
+                key=os.fsencode,
+            )
+        )
+        _revalidate_scheduler_doctor_stale_directory_names(
+            session_fd,
+            expected_names,
+            deadline=deadline,
+        )
+        if (
+            _scheduler_doctor_stale_directory_mount_identity(session_fd)
+            != namespace_mount_identity
+        ):
+            raise RuntimeError(
+                "scheduler-doctor stale-session directory crosses a mount "
+                f"boundary: {candidate.name}"
+            )
+        for plan in candidate.plans:
+            _revalidate_scheduler_doctor_stale_entry_plan(
+                session_fd,
+                plan,
+                deadline=deadline,
+                root_mount_identity=namespace_mount_identity,
+            )
+        _validate_scheduler_doctor_liveness_descriptor(
+            Path(_SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME),
+            liveness_fd,
+            parent_fd=session_fd,
+            expected_mount_identity=namespace_mount_identity,
+            expected_identity=liveness_identity,
+        )
+        for plan in candidate.plans:
+            _apply_scheduler_doctor_stale_entry_plan(
+                session_fd,
+                plan,
+                deadline=deadline,
+                root_mount_identity=namespace_mount_identity,
+            )
+        _validate_scheduler_doctor_liveness_descriptor(
+            Path(_SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME),
+            liveness_fd,
+            parent_fd=session_fd,
+            expected_mount_identity=namespace_mount_identity,
+            expected_identity=liveness_identity,
+        )
+        os.unlink(
+            _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME,
+            dir_fd=session_fd,
+        )
+        with os.scandir(session_fd) as iterator:
+            unexpected = next(iterator, None)
+        if unexpected is not None:
+            raise RuntimeError(
+                "scheduler-doctor stale-session directory changed during cleanup: "
+                f"{candidate.name}"
+            )
+        metadata = os.stat(
+            candidate.name,
+            dir_fd=namespace_fd,
+            follow_symlinks=False,
+        )
+        if (
+            _scheduler_doctor_test_object_identity(metadata)
+            != candidate.identity
+            or not _scheduler_doctor_metadata_is_owner_private_directory(metadata)
+        ):
+            raise RuntimeError(
+                "scheduler-doctor stale-session directory changed: "
+                f"{candidate.name}"
+            )
+        os.rmdir(candidate.name, dir_fd=namespace_fd)
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        close_failures = _close_scheduler_doctor_candidate_descriptors(
+            (liveness_fd, session_fd)
+        )
+        if close_failures:
+            message = "; ".join(close_failures)
+            if primary is not None:
+                raise RuntimeError(f"{primary}; {message}") from primary
+            raise RuntimeError(message)
+    return True
+
+
+def _classify_scheduler_doctor_stale_session(
+    namespace_fd: int,
+    namespace_mount_identity: tuple[int, int | None],
+    name: str,
+    budget: _SchedulerDoctorStaleCleanupBudget,
+) -> _SchedulerDoctorStaleSessionCandidate:
+    staging = name.startswith(_SCHEDULER_DOCTOR_TEST_STAGING_PREFIX)
+    metadata = os.stat(name, dir_fd=namespace_fd, follow_symlinks=False)
+    identity = _scheduler_doctor_test_object_identity(metadata)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or not _scheduler_doctor_metadata_is_owner_private_directory(metadata)
+    ):
+        raise RuntimeError(
+            "scheduler-doctor stale-session root is not an owner-private "
+            f"directory: {name}"
+        )
+    session_fd = _open_scheduler_doctor_stale_directory(
+        namespace_fd,
+        name,
+        identity,
+        expected_mount_identity=namespace_mount_identity,
+        require_owner_private_directory=True,
+    )
+    liveness_fd = -1
+    primary: BaseException | None = None
+    try:
+        if time.monotonic() >= budget.deadline:
+            raise RuntimeError(
+                "scheduler-doctor stale-session cleanup planning timed out"
+            )
+        with os.scandir(session_fd) as iterator:
+            first_entry = next(iterator, None)
+        if staging and first_entry is None:
+            _reserve_scheduler_doctor_stale_cleanup_entry(budget, depth=1)
+            if (
+                _scheduler_doctor_stale_directory_mount_identity(session_fd)
+                != namespace_mount_identity
+            ):
+                raise RuntimeError(
+                    "scheduler-doctor staging directory crosses a mount "
+                    f"boundary: {name}"
+                )
+            return _SchedulerDoctorStaleSessionCandidate(
+                name,
+                identity,
+                None,
+                False,
+                (),
+                True,
+            )
+        liveness_fd, liveness_identity = (
+            _open_scheduler_doctor_liveness_descriptor(
+            Path(name),
+            session_fd,
+            expected_mount_identity=namespace_mount_identity,
+        )
+        )
+        busy = _scheduler_doctor_liveness_is_busy(liveness_fd)
+        plans: tuple[_SchedulerDoctorStaleEntryPlan, ...] | None = None
+        if not busy:
+            _reserve_scheduler_doctor_stale_cleanup_entry(budget, depth=1)
+            plans = _plan_scheduler_doctor_session_contents(
+                session_fd,
+                budget,
+                root_mount_identity=namespace_mount_identity,
+            )
+            if staging and plans:
+                raise RuntimeError(
+                    "scheduler-doctor staging directory retained unexpected "
+                    f"entries: {name}"
+                )
+            for plan in plans:
+                _revalidate_scheduler_doctor_stale_entry_plan(
+                    session_fd,
+                    plan,
+                    deadline=budget.deadline,
+                    root_mount_identity=namespace_mount_identity,
+                )
+            _validate_scheduler_doctor_liveness_descriptor(
+                Path(_SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME),
+                liveness_fd,
+                parent_fd=session_fd,
+                expected_mount_identity=namespace_mount_identity,
+                expected_identity=liveness_identity,
+            )
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        close_failures = _close_scheduler_doctor_candidate_descriptors(
+            (liveness_fd, session_fd)
+        )
+        if close_failures:
+            message = "; ".join(close_failures)
+            if primary is not None:
+                raise RuntimeError(f"{primary}; {message}") from primary
+            raise RuntimeError(message)
+    return _SchedulerDoctorStaleSessionCandidate(
+        name,
+        identity,
+        liveness_identity,
+        busy,
+        plans,
+        staging,
+    )
+
+
 def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
     # The protected property is the identity of every planned name object and
     # its current-UID ownership, the owner-private access policy of the
@@ -1851,6 +2559,12 @@ def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
     # replacement.
     # The module lease serializes cooperative same-UID test processes; this
     # fixture does not claim to defeat a malicious same-UID replace-at-unlink.
+    if _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE is not None:
+        failure = _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
+        raise RuntimeError(
+            "scheduler-doctor active-session cleanup previously failed; "
+            f"stale sweep blocked for retained path: {failure.retained_path}"
+        )
     namespace_metadata = _validate_owner_private_directory(namespace)
     namespace_identity = _scheduler_doctor_test_object_identity(
         namespace_metadata
@@ -1893,14 +2607,12 @@ def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
             remaining_entries=_SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_ENTRY_LIMIT,
             depth_limit=_SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_DEPTH_LIMIT,
         )
-        plans = tuple(
-            _plan_scheduler_doctor_stale_entry(
+        candidates = tuple(
+            _classify_scheduler_doctor_stale_session(
                 namespace_fd,
+                namespace_mount_identity,
                 name,
                 budget,
-                depth=1,
-                root_mount_identity=namespace_mount_identity,
-                require_owner_private_directory=True,
             )
             for name in session_names
         )
@@ -1933,26 +2645,26 @@ def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
             raise RuntimeError(
                 "scheduler-doctor fixture namespace changed during cleanup planning"
             )
-        for plan in plans:
-            _revalidate_scheduler_doctor_stale_entry_plan(
+        retained: set[str] = set()
+        for candidate in candidates:
+            if candidate.busy:
+                retained.add(candidate.name)
+                continue
+            if not _delete_scheduler_doctor_stale_session(
                 namespace_fd,
-                plan,
+                namespace_mount_identity,
+                candidate,
                 deadline=deadline,
-                root_mount_identity=namespace_mount_identity,
-            )
-        for plan in plans:
-            _apply_scheduler_doctor_stale_entry_plan(
-                namespace_fd,
-                plan,
-                deadline=deadline,
-                root_mount_identity=namespace_mount_identity,
-            )
-        if _bounded_scheduler_doctor_stale_session_names(
+            ):
+                retained.add(candidate.name)
+        remaining = _bounded_scheduler_doctor_stale_session_names(
             namespace_fd,
             deadline=deadline,
-        ):
+        )
+        if set(remaining) != retained or len(remaining) != len(retained):
             raise RuntimeError(
-                "scheduler-doctor fixture namespace retained stale sessions"
+                "scheduler-doctor fixture namespace changed during stale-session "
+                "cleanup"
             )
         descriptor_metadata = os.fstat(namespace_fd)
         named_metadata = namespace.lstat()
@@ -1977,12 +2689,102 @@ def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
         os.close(namespace_fd)
 
 
+def _cleanup_scheduler_doctor_initialization_path(
+    path: Path,
+    namespace_descriptor: int,
+    session_descriptor: int,
+    expected_mount_identity: tuple[int, int | None],
+    expected_identity: tuple[int, int, int] | None,
+    liveness_descriptor: int,
+    expected_liveness_identity: tuple[int, int, int] | None,
+) -> None:
+    if (
+        namespace_descriptor < 0
+        or session_descriptor < 0
+        or expected_identity is None
+    ):
+        raise RuntimeError(
+            "scheduler-doctor initialization descriptor custody is unavailable"
+        )
+    metadata = os.stat(
+        path.name,
+        dir_fd=namespace_descriptor,
+        follow_symlinks=False,
+    )
+    descriptor_metadata = os.fstat(session_descriptor)
+    if (
+        _scheduler_doctor_test_object_identity(metadata) != expected_identity
+        or _scheduler_doctor_test_object_identity(descriptor_metadata)
+        != expected_identity
+        or not _scheduler_doctor_metadata_is_owner_private_directory(metadata)
+        or not _scheduler_doctor_metadata_is_owner_private_directory(
+            descriptor_metadata
+        )
+        or _scheduler_doctor_stale_directory_mount_identity(session_descriptor)
+        != expected_mount_identity
+    ):
+        raise RuntimeError(
+            "scheduler-doctor initialization path changed before rollback"
+        )
+    if expected_liveness_identity is None:
+        with os.scandir(session_descriptor) as iterator:
+            unexpected = next(iterator, None)
+        if unexpected is not None:
+            raise RuntimeError(
+                "scheduler-doctor initialization path retained unproved entries"
+            )
+    else:
+        if liveness_descriptor < 0:
+            raise RuntimeError(
+                "scheduler-doctor initialization liveness custody is unavailable"
+            )
+        _validate_scheduler_doctor_liveness_descriptor(
+            path / _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME,
+            liveness_descriptor,
+            parent_fd=session_descriptor,
+            expected_mount_identity=expected_mount_identity,
+            expected_identity=expected_liveness_identity,
+        )
+        _revalidate_scheduler_doctor_stale_directory_names(
+            session_descriptor,
+            (_SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME,),
+            deadline=(
+                time.monotonic()
+                + _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_TIMEOUT_SECONDS
+            ),
+        )
+        os.unlink(
+            _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME,
+            dir_fd=session_descriptor,
+        )
+    with os.scandir(session_descriptor) as iterator:
+        unexpected = next(iterator, None)
+    if unexpected is not None:
+        raise RuntimeError(
+            "scheduler-doctor initialization path retained unexpected entries"
+        )
+    metadata = os.stat(
+        path.name,
+        dir_fd=namespace_descriptor,
+        follow_symlinks=False,
+    )
+    if _scheduler_doctor_test_object_identity(metadata) != expected_identity:
+        raise RuntimeError(
+            "scheduler-doctor initialization path changed during rollback"
+        )
+    os.rmdir(path.name, dir_fd=namespace_descriptor)
+
+
 def _scheduler_doctor_test_session_directory() -> Path:
     global _SCHEDULER_DOCTOR_TEST_SESSION
     global _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD
+    global _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
 
     if _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE is not None:
-        retained_path, reason = _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
+        retained_path = (
+            _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE.retained_path
+        )
+        reason = _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE.reason
         raise RuntimeError(
             "scheduler-doctor active-session cleanup previously failed; "
             f"retained for inspection: {retained_path}: {reason}"
@@ -2000,9 +2802,14 @@ def _scheduler_doctor_test_session_directory() -> Path:
     lease_descriptor = os.open(lease_path, flags, 0o600)
     namespace_descriptor = -1
     session_descriptor = -1
+    liveness_descriptor = -1
+    lease_acquired = False
     session_path: Path | None = None
+    session_identity: tuple[int, int, int] | None = None
+    liveness_identity: tuple[int, int, int] | None = None
     try:
         _acquire_scheduler_doctor_test_session_lease(lease_descriptor)
+        lease_acquired = True
         _validate_scheduler_doctor_session_lease(lease_path, lease_descriptor)
         _sweep_stale_scheduler_doctor_sessions(namespace)
         (
@@ -2017,7 +2824,7 @@ def _scheduler_doctor_test_session_directory() -> Path:
         )
         session_path = Path(
             tempfile.mkdtemp(
-                prefix=_SCHEDULER_DOCTOR_TEST_SESSION_PREFIX,
+                prefix=_SCHEDULER_DOCTOR_TEST_STAGING_PREFIX,
                 dir=namespace,
             )
         )
@@ -2032,6 +2839,19 @@ def _scheduler_doctor_test_session_directory() -> Path:
             require_owner_private_directory=True,
         )
         session_metadata = os.fstat(session_descriptor)
+        session_identity = _scheduler_doctor_test_object_identity(
+            session_metadata
+        )
+        (
+            liveness_descriptor,
+            liveness_identity,
+        ) = _open_scheduler_doctor_liveness_descriptor(
+            session_path,
+            session_descriptor,
+            expected_mount_identity=namespace_mount_identity,
+            create=True,
+        )
+        fcntl.flock(liveness_descriptor, fcntl.LOCK_SH)
         session_binding = _SchedulerDoctorActiveSessionBinding(
             path=session_path,
             namespace_path=namespace,
@@ -2043,16 +2863,137 @@ def _scheduler_doctor_test_session_directory() -> Path:
             mount_identity=_scheduler_doctor_stale_directory_mount_identity(
                 session_descriptor
             ),
+            liveness_descriptor=liveness_descriptor,
+            liveness_identity=liveness_identity,
+        )
+        _validate_scheduler_doctor_active_session_binding(session_binding)
+        final_name = (
+            _SCHEDULER_DOCTOR_TEST_SESSION_PREFIX
+            + session_path.name[len(_SCHEDULER_DOCTOR_TEST_STAGING_PREFIX) :]
+        )
+        try:
+            os.stat(
+                final_name,
+                dir_fd=namespace_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise RuntimeError(
+                "scheduler-doctor published session path already exists"
+            )
+        os.rename(
+            session_path.name,
+            final_name,
+            src_dir_fd=namespace_descriptor,
+            dst_dir_fd=namespace_descriptor,
+        )
+        session_path = namespace / final_name
+        session_binding = _SchedulerDoctorActiveSessionBinding(
+            path=session_path,
+            namespace_path=namespace,
+            namespace_descriptor=namespace_descriptor,
+            namespace_identity=namespace_identity,
+            namespace_mount_identity=namespace_mount_identity,
+            descriptor=session_descriptor,
+            identity=session_identity,
+            mount_identity=_scheduler_doctor_stale_directory_mount_identity(
+                session_descriptor
+            ),
+            liveness_descriptor=liveness_descriptor,
+            liveness_identity=liveness_identity,
         )
         _validate_scheduler_doctor_active_session_binding(session_binding)
     except BaseException as error:
-        close_failures = _close_scheduler_doctor_candidate_descriptors(
-            (session_descriptor, namespace_descriptor, lease_descriptor)
-        )
-        if close_failures:
-            raise RuntimeError(
-                f"{error}; {'; '.join(close_failures)}"
-            ) from error
+        if lease_acquired:
+            rollback_custody: list[
+                tuple[str, int, tuple[int, int, int] | None]
+            ] = []
+            for role, descriptor in (
+                ("liveness", liveness_descriptor),
+                ("session", session_descriptor),
+                ("namespace", namespace_descriptor),
+                ("module-lease", lease_descriptor),
+            ):
+                if descriptor < 0:
+                    continue
+                try:
+                    identity = _scheduler_doctor_test_object_identity(
+                        os.fstat(descriptor)
+                    )
+                except OSError:
+                    identity = None
+                rollback_custody.append((role, descriptor, identity))
+            retained_path = session_path if session_path is not None else namespace
+            _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
+                _SchedulerDoctorSessionCleanupFailure(
+                    retained_path=retained_path,
+                    reason="initialization rollback in progress",
+                    abandoned_custody=tuple(
+                        _SchedulerDoctorAbandonedDescriptorCustody(
+                            role,
+                            descriptor,
+                            identity,
+                            "retained-open",
+                        )
+                        for role, descriptor, identity in rollback_custody
+                    ),
+                )
+            )
+            if session_path is not None:
+                try:
+                    _cleanup_scheduler_doctor_initialization_path(
+                        session_path,
+                        namespace_descriptor,
+                        session_descriptor,
+                        namespace_mount_identity,
+                        session_identity,
+                        liveness_descriptor,
+                        liveness_identity,
+                    )
+                except BaseException as cleanup_error:
+                    message = f"{error}; rollback cleanup failed: {cleanup_error}"
+                    _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
+                        _SchedulerDoctorSessionCleanupFailure(
+                            retained_path=session_path,
+                            reason=message,
+                            abandoned_custody=tuple(
+                                _SchedulerDoctorAbandonedDescriptorCustody(
+                                    role,
+                                    descriptor,
+                                    identity,
+                                    "retained-open",
+                                )
+                                for role, descriptor, identity in rollback_custody
+                            ),
+                        )
+                    )
+                    raise RuntimeError(message) from error
+            close_failures, abandoned = (
+                _close_scheduler_doctor_cleanup_custody(
+                    tuple(rollback_custody)
+                )
+            )
+            if close_failures:
+                message = f"{error}; {'; '.join(close_failures)}"
+                _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
+                    _SchedulerDoctorSessionCleanupFailure(
+                        retained_path=retained_path,
+                        reason=message,
+                        abandoned_custody=abandoned,
+                    )
+                )
+                raise RuntimeError(message) from error
+            _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = None
+        else:
+            close_failures = _close_scheduler_doctor_candidate_descriptors(
+                (lease_descriptor,)
+            )
+            if close_failures:
+                raise RuntimeError(
+                    f"{error}; {'; '.join(close_failures)}"
+                ) from error
         raise
 
     _SCHEDULER_DOCTOR_TEST_SESSION = session_binding
@@ -2130,15 +3071,35 @@ def _validate_scheduler_doctor_active_session_binding(
         raise RuntimeError(
             "scheduler-doctor active session object changed during cleanup"
         )
+    _validate_scheduler_doctor_liveness_descriptor(
+        binding.path / _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME,
+        binding.liveness_descriptor,
+        parent_fd=binding.descriptor,
+        expected_mount_identity=binding.mount_identity,
+        expected_identity=binding.liveness_identity,
+    )
 
 
 def _remove_bound_scheduler_doctor_active_session(
     binding: _SchedulerDoctorActiveSessionBinding,
+    liveness_probe: int,
 ) -> None:
     # The held module lease serializes cooperative same-UID test processes.
     # As with stale-session cleanup, this fixture does not claim to defeat a
     # malicious same-UID rename in the final stat-to-rmdir instruction gap.
-    _validate_scheduler_doctor_active_session_binding(binding)
+    probe_binding = _SchedulerDoctorActiveSessionBinding(
+        path=binding.path,
+        namespace_path=binding.namespace_path,
+        namespace_descriptor=binding.namespace_descriptor,
+        namespace_identity=binding.namespace_identity,
+        namespace_mount_identity=binding.namespace_mount_identity,
+        descriptor=binding.descriptor,
+        identity=binding.identity,
+        mount_identity=binding.mount_identity,
+        liveness_descriptor=liveness_probe,
+        liveness_identity=binding.liveness_identity,
+    )
+    _validate_scheduler_doctor_active_session_binding(probe_binding)
     deadline = (
         time.monotonic()
         + _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_TIMEOUT_SECONDS
@@ -2148,31 +3109,60 @@ def _remove_bound_scheduler_doctor_active_session(
         remaining_entries=_SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_ENTRY_LIMIT,
         depth_limit=_SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_DEPTH_LIMIT,
     )
-    plan = _plan_scheduler_doctor_stale_entry(
-        binding.namespace_descriptor,
-        binding.path.name,
+    _reserve_scheduler_doctor_stale_cleanup_entry(budget, depth=1)
+    plans = _plan_scheduler_doctor_session_contents(
+        binding.descriptor,
         budget,
-        depth=1,
         root_mount_identity=binding.namespace_mount_identity,
-        require_owner_private_directory=True,
     )
-    if plan.identity != binding.identity:
+    for plan in plans:
+        _revalidate_scheduler_doctor_stale_entry_plan(
+            binding.descriptor,
+            plan,
+            deadline=deadline,
+            root_mount_identity=binding.namespace_mount_identity,
+        )
+    _validate_scheduler_doctor_active_session_binding(probe_binding)
+    for plan in plans:
+        _apply_scheduler_doctor_stale_entry_plan(
+            binding.descriptor,
+            plan,
+            deadline=deadline,
+            root_mount_identity=binding.namespace_mount_identity,
+        )
+    _validate_scheduler_doctor_liveness_descriptor(
+        binding.path / _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME,
+        liveness_probe,
+        parent_fd=binding.descriptor,
+        expected_mount_identity=binding.mount_identity,
+        expected_identity=binding.liveness_identity,
+    )
+    os.unlink(
+        _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME,
+        dir_fd=binding.descriptor,
+    )
+    with os.scandir(binding.descriptor) as iterator:
+        unexpected = next(iterator, None)
+    if unexpected is not None:
+        raise RuntimeError(
+            "scheduler-doctor active session changed during cleanup"
+        )
+    named_session_metadata = os.stat(
+        binding.path.name,
+        dir_fd=binding.namespace_descriptor,
+        follow_symlinks=False,
+    )
+    if (
+        _scheduler_doctor_test_object_identity(named_session_metadata)
+        != binding.identity
+        or not _scheduler_doctor_metadata_is_owner_private_directory(
+            named_session_metadata
+        )
+    ):
         raise RuntimeError(
             "scheduler-doctor active session object changed during cleanup"
         )
-    _revalidate_scheduler_doctor_stale_entry_plan(
-        binding.namespace_descriptor,
-        plan,
-        deadline=deadline,
-        root_mount_identity=binding.namespace_mount_identity,
-    )
-    _validate_scheduler_doctor_active_session_binding(binding)
-    _apply_scheduler_doctor_stale_entry_plan(
-        binding.namespace_descriptor,
-        plan,
-        deadline=deadline,
-        root_mount_identity=binding.namespace_mount_identity,
-    )
+    os.rmdir(binding.path.name, dir_fd=binding.namespace_descriptor)
     try:
         os.stat(
             binding.path.name,
@@ -2188,6 +3178,29 @@ def _remove_bound_scheduler_doctor_active_session(
     raise RuntimeError("scheduler-doctor active session cleanup retained its root")
 
 
+def _close_scheduler_doctor_cleanup_custody(
+    custody: tuple[
+        tuple[str, int, tuple[int, int, int] | None], ...
+    ],
+) -> tuple[list[str], tuple[_SchedulerDoctorAbandonedDescriptorCustody, ...]]:
+    failures: list[str] = []
+    abandoned: list[_SchedulerDoctorAbandonedDescriptorCustody] = []
+    for role, descriptor, identity in custody:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            failures.append(f"{role} descriptor close failed: {error}")
+            abandoned.append(
+                _SchedulerDoctorAbandonedDescriptorCustody(
+                    role=role,
+                    descriptor=descriptor,
+                    identity=identity,
+                    state="close-uncertain",
+                )
+            )
+    return failures, tuple(abandoned)
+
+
 def _cleanup_scheduler_doctor_test_session() -> None:
     global _SCHEDULER_DOCTOR_TEST_SESSION
     global _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD
@@ -2195,60 +3208,380 @@ def _cleanup_scheduler_doctor_test_session() -> None:
 
     binding = _SCHEDULER_DOCTOR_TEST_SESSION
     lease_descriptor = _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD
+    if _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE is not None:
+        failure = _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
+        raise RuntimeError(
+            "scheduler-doctor active-session cleanup previously failed; "
+            f"retained for inspection: {failure.retained_path}: "
+            f"{failure.reason}"
+        )
     if binding is None:
         if lease_descriptor is not None:
             try:
-                os.close(lease_descriptor)
-            finally:
-                _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD = None
-            raise RuntimeError(
+                lease_identity = _scheduler_doctor_test_object_identity(
+                    os.fstat(lease_descriptor)
+                )
+            except OSError:
+                lease_identity = None
+            message = (
                 "scheduler-doctor fixture lease existed without session custody"
             )
+            _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
+                _SchedulerDoctorSessionCleanupFailure(
+                    retained_path=None,
+                    reason=message,
+                    abandoned_custody=(
+                        _SchedulerDoctorAbandonedDescriptorCustody(
+                            "module-lease",
+                            lease_descriptor,
+                            lease_identity,
+                            "retained-open",
+                        ),
+                    ),
+                )
+            )
+            raise RuntimeError(message)
         return
     if lease_descriptor is None:
-        close_failures = _close_scheduler_doctor_candidate_descriptors(
-            (binding.descriptor, binding.namespace_descriptor)
-        )
-        _SCHEDULER_DOCTOR_TEST_SESSION = None
         message = "scheduler-doctor fixture session custody is incomplete"
-        if close_failures:
-            message += "; " + "; ".join(close_failures)
         _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
-            binding.path,
-            message,
+            _SchedulerDoctorSessionCleanupFailure(
+                retained_path=binding.path,
+                reason=message,
+                abandoned_custody=(
+                    _SchedulerDoctorAbandonedDescriptorCustody(
+                        "liveness",
+                        binding.liveness_descriptor,
+                        binding.liveness_identity,
+                        "retained-open",
+                    ),
+                    _SchedulerDoctorAbandonedDescriptorCustody(
+                        "session",
+                        binding.descriptor,
+                        binding.identity,
+                        "retained-open",
+                    ),
+                    _SchedulerDoctorAbandonedDescriptorCustody(
+                        "namespace",
+                        binding.namespace_descriptor,
+                        binding.namespace_identity,
+                        "retained-open",
+                    ),
+                ),
+            )
         )
         raise RuntimeError(message)
-    primary: BaseException | None = None
+
+    module_lease_identity: tuple[int, int, int] | None = None
     try:
-        _remove_bound_scheduler_doctor_active_session(binding)
-    except BaseException as error:
-        primary = error
-    close_failures = _close_scheduler_doctor_candidate_descriptors(
-        (
+        module_lease_identity = _scheduler_doctor_test_object_identity(
+            os.fstat(lease_descriptor)
+        )
+    except OSError:
+        pass
+    retained_custody = (
+        _SchedulerDoctorAbandonedDescriptorCustody(
+            "liveness",
+            binding.liveness_descriptor,
+            binding.liveness_identity,
+            "retained-open",
+        ),
+        _SchedulerDoctorAbandonedDescriptorCustody(
+            "session",
             binding.descriptor,
+            binding.identity,
+            "retained-open",
+        ),
+        _SchedulerDoctorAbandonedDescriptorCustody(
+            "namespace",
             binding.namespace_descriptor,
+            binding.namespace_identity,
+            "retained-open",
+        ),
+        _SchedulerDoctorAbandonedDescriptorCustody(
+            "module-lease",
             lease_descriptor,
+            module_lease_identity,
+            "retained-open",
+        ),
+    )
+    _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
+        _SchedulerDoctorSessionCleanupFailure(
+            retained_path=binding.path,
+            reason="cleanup in progress",
+            abandoned_custody=retained_custody,
         )
     )
-    _SCHEDULER_DOCTOR_TEST_SESSION = None
-    _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD = None
+
+    liveness_probe = -1
+    try:
+        _validate_scheduler_doctor_session_lease(
+            binding.namespace_path / _SCHEDULER_DOCTOR_TEST_LOCK_NAME,
+            lease_descriptor,
+            parent_fd=binding.namespace_descriptor,
+        )
+        _validate_scheduler_doctor_active_session_binding(binding)
+        liveness_probe, _identity = _open_scheduler_doctor_liveness_descriptor(
+            binding.path,
+            binding.descriptor,
+            expected_mount_identity=binding.mount_identity,
+            expected_identity=binding.liveness_identity,
+        )
+    except BaseException as error:
+        _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
+            _SchedulerDoctorSessionCleanupFailure(
+                retained_path=binding.path,
+                reason=str(error),
+                abandoned_custody=retained_custody,
+            )
+        )
+        raise
+
+    try:
+        os.close(binding.liveness_descriptor)
+    except OSError as error:
+        probe_failures, abandoned_probe = (
+            _close_scheduler_doctor_cleanup_custody(
+                (
+                    (
+                        "liveness-probe",
+                        liveness_probe,
+                        binding.liveness_identity,
+                    ),
+                )
+            )
+        )
+        message = f"liveness descriptor close failed: {error}"
+        if probe_failures:
+            message += "; " + "; ".join(probe_failures)
+        uncertain_liveness = _SchedulerDoctorAbandonedDescriptorCustody(
+            "liveness",
+            binding.liveness_descriptor,
+            binding.liveness_identity,
+            "close-uncertain",
+        )
+        _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
+            _SchedulerDoctorSessionCleanupFailure(
+                retained_path=binding.path,
+                reason=message,
+                abandoned_custody=(
+                    uncertain_liveness,
+                    *retained_custody[1:],
+                    *abandoned_probe,
+                ),
+            )
+        )
+        raise RuntimeError(message) from error
+
+    probe_binding = _SchedulerDoctorActiveSessionBinding(
+        path=binding.path,
+        namespace_path=binding.namespace_path,
+        namespace_descriptor=binding.namespace_descriptor,
+        namespace_identity=binding.namespace_identity,
+        namespace_mount_identity=binding.namespace_mount_identity,
+        descriptor=binding.descriptor,
+        identity=binding.identity,
+        mount_identity=binding.mount_identity,
+        liveness_descriptor=liveness_probe,
+        liveness_identity=binding.liveness_identity,
+    )
+    _SCHEDULER_DOCTOR_TEST_SESSION = probe_binding
+    retained_probe_custody = (
+        _SchedulerDoctorAbandonedDescriptorCustody(
+            "liveness-probe",
+            liveness_probe,
+            binding.liveness_identity,
+            "retained-open",
+        ),
+        *retained_custody[1:],
+    )
+    _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
+        _SchedulerDoctorSessionCleanupFailure(
+            retained_path=binding.path,
+            reason="cleanup in progress after liveness transfer",
+            abandoned_custody=retained_probe_custody,
+        )
+    )
+    primary: BaseException | None = None
+    try:
+        if _scheduler_doctor_liveness_is_busy(liveness_probe):
+            raise RuntimeError(
+                "scheduler-doctor active session is still held by a child"
+            )
+        _remove_bound_scheduler_doctor_active_session(binding, liveness_probe)
+    except BaseException as error:
+        primary = error
+
     if primary is not None:
         _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
-            binding.path,
-            str(primary),
+            _SchedulerDoctorSessionCleanupFailure(
+                retained_path=binding.path,
+                reason=str(primary),
+                abandoned_custody=retained_probe_custody,
+            )
         )
-        if close_failures:
-            raise RuntimeError(
-                f"{primary}; {'; '.join(close_failures)}"
-            ) from primary
-        raise primary
-    _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = None
+        raise RuntimeError(str(primary)) from primary
+
+    close_failures, abandoned = _close_scheduler_doctor_cleanup_custody(
+        (
+            ("session", binding.descriptor, binding.identity),
+            (
+                "namespace",
+                binding.namespace_descriptor,
+                binding.namespace_identity,
+            ),
+            ("liveness-probe", liveness_probe, binding.liveness_identity),
+            ("module-lease", lease_descriptor, module_lease_identity),
+        )
+    )
     if close_failures:
-        raise RuntimeError("; ".join(close_failures))
+        message = "; ".join(close_failures)
+        _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
+            _SchedulerDoctorSessionCleanupFailure(
+                retained_path=binding.path,
+                reason=message,
+                abandoned_custody=abandoned,
+            )
+        )
+        raise RuntimeError(message)
+    _SCHEDULER_DOCTOR_TEST_SESSION = None
+    _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD = None
+    _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = None
+
+
+def _reset_retained_scheduler_doctor_cleanup_failure_for_test() -> None:
+    global _SCHEDULER_DOCTOR_TEST_SESSION
+    global _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD
+    global _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
+
+    failure = _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
+    if failure is None:
+        return
+    if any(
+        custody.state != "retained-open"
+        for custody in failure.abandoned_custody
+    ):
+        raise RuntimeError(
+            "test reset refuses close-uncertain scheduler-doctor custody"
+        )
+    ordered: list[_SchedulerDoctorAbandonedDescriptorCustody] = []
+    identities: dict[int, tuple[int, int, int]] = {}
+    for custody in failure.abandoned_custody:
+        if custody.identity is None:
+            raise RuntimeError(
+                "test reset refuses scheduler-doctor custody without identity"
+            )
+        prior = identities.get(custody.descriptor)
+        if prior is not None:
+            if prior != custody.identity:
+                raise RuntimeError(
+                    "test reset refuses conflicting scheduler-doctor custody"
+                )
+            continue
+        identities[custody.descriptor] = custody.identity
+        ordered.append(custody)
+    ordered.sort(key=lambda custody: custody.role == "module-lease")
+    for index, custody in enumerate(ordered):
+        try:
+            observed = _scheduler_doctor_test_object_identity(
+                os.fstat(custody.descriptor)
+            )
+        except OSError as error:
+            message = (
+                f"test reset cannot revalidate {custody.role} descriptor"
+            )
+            _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
+                _SchedulerDoctorSessionCleanupFailure(
+                    retained_path=failure.retained_path,
+                    reason=message,
+                    abandoned_custody=(
+                        _SchedulerDoctorAbandonedDescriptorCustody(
+                            role=custody.role,
+                            descriptor=custody.descriptor,
+                            identity=custody.identity,
+                            state="revalidation-uncertain",
+                        ),
+                        *ordered[index + 1 :],
+                    ),
+                )
+            )
+            raise RuntimeError(message) from error
+        if observed != custody.identity:
+            message = (
+                f"test reset refuses reused {custody.role} descriptor"
+            )
+            _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
+                _SchedulerDoctorSessionCleanupFailure(
+                    retained_path=failure.retained_path,
+                    reason=message,
+                    abandoned_custody=(
+                        _SchedulerDoctorAbandonedDescriptorCustody(
+                            role=custody.role,
+                            descriptor=custody.descriptor,
+                            identity=custody.identity,
+                            state="identity-mismatch",
+                        ),
+                        *ordered[index + 1 :],
+                    ),
+                )
+            )
+            raise RuntimeError(message)
+        _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
+            _SchedulerDoctorSessionCleanupFailure(
+                retained_path=failure.retained_path,
+                reason=f"test reset closing {custody.role} descriptor",
+                abandoned_custody=(
+                    _SchedulerDoctorAbandonedDescriptorCustody(
+                        role=custody.role,
+                        descriptor=custody.descriptor,
+                        identity=custody.identity,
+                        state="close-uncertain",
+                    ),
+                    *ordered[index + 1 :],
+                ),
+            )
+        )
+        try:
+            os.close(custody.descriptor)
+        except OSError as error:
+            message = f"test reset {custody.role} descriptor close failed"
+            _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
+                _SchedulerDoctorSessionCleanupFailure(
+                    retained_path=failure.retained_path,
+                    reason=message,
+                    abandoned_custody=(
+                        _SchedulerDoctorAbandonedDescriptorCustody(
+                            role=custody.role,
+                            descriptor=custody.descriptor,
+                            identity=custody.identity,
+                            state="close-uncertain",
+                        ),
+                        *ordered[index + 1 :],
+                    ),
+                )
+            )
+            raise RuntimeError(message) from error
+        _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = (
+            _SchedulerDoctorSessionCleanupFailure(
+                retained_path=failure.retained_path,
+                reason="test reset in progress",
+                abandoned_custody=tuple(ordered[index + 1 :]),
+            )
+        )
+    _SCHEDULER_DOCTOR_TEST_SESSION = None
+    _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD = None
+    _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = None
+
+
+def setUpModule() -> None:
+    _install_scheduler_doctor_test_popen_wrapper()
 
 
 def tearDownModule() -> None:
-    _cleanup_scheduler_doctor_test_session()
+    try:
+        _cleanup_scheduler_doctor_test_session()
+    finally:
+        _restore_scheduler_doctor_test_popen_wrapper()
 
 
 def _scheduler_doctor_test_temporary_directory() -> tempfile.TemporaryDirectory:
@@ -3383,11 +4716,215 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         namespace.mkdir(mode=0o700)
         stale_path = namespace / "session.stale"
         stale_path.mkdir(mode=0o700)
+        _create_unlocked_scheduler_doctor_liveness_marker(stale_path)
         (stale_path / "residue").write_text("stale\n", encoding="utf-8")
 
         _sweep_stale_scheduler_doctor_sessions(namespace)
 
         self.assertFalse(stale_path.exists())
+
+    def test_stale_sweep_preserves_busy_session_and_removes_unlocked_sibling(
+        self,
+    ) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            busy = namespace / "session.busy"
+            busy.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(busy)
+            stale = namespace / "session.stale"
+            stale.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(stale)
+            marker = busy / _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME
+            descriptor = os.open(marker, os.O_RDWR)
+            fcntl.flock(descriptor, fcntl.LOCK_SH)
+            try:
+                _sweep_stale_scheduler_doctor_sessions(namespace)
+                self.assertTrue(busy.is_dir())
+                self.assertFalse(stale.exists())
+            finally:
+                os.close(descriptor)
+
+            _sweep_stale_scheduler_doctor_sessions(namespace)
+            self.assertFalse(busy.exists())
+
+    def test_stale_sweep_recovers_only_bounded_staging_residue(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            empty = namespace / f"{_SCHEDULER_DOCTOR_TEST_STAGING_PREFIX}empty"
+            empty.mkdir(mode=0o700)
+            marked = namespace / f"{_SCHEDULER_DOCTOR_TEST_STAGING_PREFIX}marked"
+            marked.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(marked)
+
+            _sweep_stale_scheduler_doctor_sessions(namespace)
+            self.assertFalse(empty.exists())
+            self.assertFalse(marked.exists())
+
+            clean = namespace / f"{_SCHEDULER_DOCTOR_TEST_STAGING_PREFIX}clean"
+            clean.mkdir(mode=0o700)
+            unsafe = namespace / f"{_SCHEDULER_DOCTOR_TEST_STAGING_PREFIX}unsafe"
+            unsafe.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(unsafe)
+            (unsafe / "unexpected").write_text("retain\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "staging directory retained unexpected entries",
+            ):
+                _sweep_stale_scheduler_doctor_sessions(namespace)
+            self.assertTrue(clean.is_dir())
+            self.assertTrue((unsafe / "unexpected").is_file())
+
+    def test_stale_sweep_missing_liveness_aborts_before_sibling_deletion(
+        self,
+    ) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            missing = namespace / "session.missing"
+            missing.mkdir(mode=0o700)
+            stale = namespace / "session.stale"
+            stale.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(stale)
+
+            with self.assertRaises(FileNotFoundError):
+                _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertTrue(missing.is_dir())
+            self.assertTrue(stale.is_dir())
+
+    def test_stale_sweep_plans_all_sessions_before_any_deletion(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            clean = namespace / "session.a-clean"
+            clean.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(clean)
+            unsafe = namespace / "session.z-unsafe"
+            unsafe.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(unsafe)
+            (unsafe / "one" / "two").mkdir(parents=True, mode=0o700)
+
+            with (
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_DEPTH_LIMIT",
+                    1,
+                ),
+                self.assertRaisesRegex(RuntimeError, "depth limit exceeded"),
+            ):
+                _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertTrue(clean.is_dir())
+            self.assertTrue((unsafe / "one" / "two").is_dir())
+
+    def test_stale_sweep_rejects_liveness_replacement_after_classification(
+        self,
+    ) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            stale = namespace / "session.stale"
+            stale.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(stale)
+            (stale / "marker").write_text("keep\n", encoding="utf-8")
+            liveness_path = (
+                stale / _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME
+            )
+            held_descriptor = -1
+            inventory_count = 0
+            real_inventory = _bounded_scheduler_doctor_stale_session_names
+
+            def replace_after_classification(
+                path: Path | int,
+                *,
+                deadline: float | None = None,
+            ) -> tuple[str, ...]:
+                nonlocal held_descriptor, inventory_count
+                result = real_inventory(path, deadline=deadline)
+                inventory_count += 1
+                if inventory_count == 2:
+                    held_descriptor = os.open(liveness_path, os.O_RDWR)
+                    fcntl.flock(held_descriptor, fcntl.LOCK_SH)
+                    liveness_path.unlink()
+                    replacement = os.open(
+                        liveness_path,
+                        os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                    )
+                    os.close(replacement)
+                return result
+
+            try:
+                with (
+                    mock.patch(
+                        f"{__name__}._bounded_scheduler_doctor_stale_session_names",
+                        side_effect=replace_after_classification,
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "liveness lease identity changed",
+                    ),
+                ):
+                    _sweep_stale_scheduler_doctor_sessions(namespace)
+                self.assertTrue((stale / "marker").is_file())
+                self.assertTrue(liveness_path.is_file())
+            finally:
+                if held_descriptor >= 0:
+                    os.close(held_descriptor)
+
+    def test_real_child_liveness_holder_blocks_sweep_until_exit(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            busy = namespace / "session.busy"
+            busy.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(busy)
+            marker = busy / _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME
+            descriptor = os.open(marker, os.O_RDWR)
+            fcntl.flock(descriptor, fcntl.LOCK_SH)
+            metadata = os.fstat(descriptor)
+            registry = _scheduler_doctor_liveness_registry_json(
+                (
+                    (
+                        descriptor,
+                        _scheduler_doctor_test_object_identity(metadata),
+                    ),
+                )
+            )
+            environment = os.environ.copy()
+            environment[_SCHEDULER_DOCTOR_TEST_LIVENESS_REGISTRY_ENV] = registry
+            with mock.patch.dict(
+                os.environ,
+                {_SCHEDULER_DOCTOR_TEST_LIVENESS_REGISTRY_ENV: registry},
+            ):
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import sys, time; print('ready', flush=True); time.sleep(30)",
+                    ],
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    text=True,
+                )
+            try:
+                assert process.stdout is not None
+                self.assertEqual(process.stdout.readline().strip(), "ready")
+                os.close(descriptor)
+                descriptor = -1
+                _sweep_stale_scheduler_doctor_sessions(namespace)
+                self.assertTrue(busy.is_dir())
+            finally:
+                process.terminate()
+                process.wait(timeout=10)
+                if process.stdout is not None:
+                    process.stdout.close()
+                if descriptor >= 0:
+                    os.close(descriptor)
+
+            _sweep_stale_scheduler_doctor_sessions(namespace)
+            self.assertFalse(busy.exists())
 
     def test_stale_session_inventory_accepts_exact_entry_limit(self) -> None:
         class TrackedScandir:
@@ -3499,6 +5036,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             marker.write_text("keep\n", encoding="utf-8")
             stale = namespace / "session.stale"
             stale.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(stale)
             nested = stale / "nested"
             nested.mkdir(mode=0o700)
             (nested / "file").write_text("remove\n", encoding="utf-8")
@@ -3515,6 +5053,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             namespace.mkdir(mode=0o700)
             stale = namespace / "session.stale"
             stale.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(stale)
             mounted = stale / "mounted"
             mounted.mkdir(mode=0o700)
             (mounted / "marker").write_text("keep\n", encoding="utf-8")
@@ -3550,6 +5089,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             namespace.mkdir(mode=0o700)
             stale = namespace / "session.stale"
             stale.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(stale)
             (stale / "marker").write_text("keep\n", encoding="utf-8")
             before = snapshot_tree(namespace)
 
@@ -3576,11 +5116,12 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             namespace.mkdir(mode=0o700)
             stale = namespace / "session.stale"
             stale.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(stale)
             (stale / "marker").write_text("keep\n", encoding="utf-8")
             stale_identity = _scheduler_doctor_test_object_identity(stale.lstat())
             before = snapshot_tree(namespace)
             revalidating = False
-            real_revalidate = _revalidate_scheduler_doctor_stale_entry_plan
+            real_plan = _plan_scheduler_doctor_session_contents
 
             def mount_identity(descriptor: int) -> tuple[int, int | None]:
                 metadata = os.fstat(descriptor)
@@ -3593,21 +5134,20 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                 )
                 return metadata.st_dev, mount_id
 
-            def revalidate_after_mount_drift(
-                parent_fd: int,
-                plan: _SchedulerDoctorStaleEntryPlan,
+            def plan_after_mount_drift(
+                session_fd: int,
+                budget: _SchedulerDoctorStaleCleanupBudget,
                 *,
-                deadline: float,
                 root_mount_identity: tuple[int, int | None],
-            ) -> None:
+            ) -> tuple[_SchedulerDoctorStaleEntryPlan, ...]:
                 nonlocal revalidating
-                revalidating = True
-                real_revalidate(
-                    parent_fd,
-                    plan,
-                    deadline=deadline,
+                result = real_plan(
+                    session_fd,
+                    budget,
                     root_mount_identity=root_mount_identity,
                 )
+                revalidating = True
+                return result
 
             with (
                 mock.patch(
@@ -3615,8 +5155,8 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                     side_effect=mount_identity,
                 ),
                 mock.patch(
-                    f"{__name__}._revalidate_scheduler_doctor_stale_entry_plan",
-                    side_effect=revalidate_after_mount_drift,
+                    f"{__name__}._plan_scheduler_doctor_session_contents",
+                    side_effect=plan_after_mount_drift,
                 ),
                 self.assertRaisesRegex(RuntimeError, "crosses a mount boundary"),
             ):
@@ -3630,11 +5170,12 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             namespace.mkdir(mode=0o700)
             stale = namespace / "session.stale"
             stale.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(stale)
             (stale / "marker").write_text("keep\n", encoding="utf-8")
             stale_identity = _scheduler_doctor_test_object_identity(stale.lstat())
             before = snapshot_tree(namespace)
             applying = False
-            real_apply = _apply_scheduler_doctor_stale_entry_plan
+            real_plan = _plan_scheduler_doctor_session_contents
 
             def mount_identity(descriptor: int) -> tuple[int, int | None]:
                 metadata = os.fstat(descriptor)
@@ -3647,21 +5188,20 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                 )
                 return metadata.st_dev, mount_id
 
-            def apply_after_mount_drift(
-                parent_fd: int,
-                plan: _SchedulerDoctorStaleEntryPlan,
+            def plan_before_apply_mount_drift(
+                session_fd: int,
+                budget: _SchedulerDoctorStaleCleanupBudget,
                 *,
-                deadline: float,
                 root_mount_identity: tuple[int, int | None],
-            ) -> None:
+            ) -> tuple[_SchedulerDoctorStaleEntryPlan, ...]:
                 nonlocal applying
-                applying = True
-                real_apply(
-                    parent_fd,
-                    plan,
-                    deadline=deadline,
+                result = real_plan(
+                    session_fd,
+                    budget,
                     root_mount_identity=root_mount_identity,
                 )
+                applying = True
+                return result
 
             with (
                 mock.patch(
@@ -3669,8 +5209,8 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                     side_effect=mount_identity,
                 ),
                 mock.patch(
-                    f"{__name__}._apply_scheduler_doctor_stale_entry_plan",
-                    side_effect=apply_after_mount_drift,
+                    f"{__name__}._plan_scheduler_doctor_session_contents",
+                    side_effect=plan_before_apply_mount_drift,
                 ),
                 self.assertRaisesRegex(RuntimeError, "crosses a mount boundary"),
             ):
@@ -3685,6 +5225,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             namespace.mkdir(mode=0o700)
             stale = namespace / "session.stale"
             stale.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(stale)
             fifo_path = stale / "fifo"
             os.mkfifo(fifo_path, mode=0o600)
 
@@ -3699,6 +5240,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             namespace.mkdir(mode=0o700)
             stale = namespace / "session.stale"
             stale.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(stale)
             result = subprocess.run(
                 [
                     sys.executable,
@@ -3815,6 +5357,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             namespace.mkdir(mode=0o700)
             stale = namespace / "session.stale"
             stale.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(stale)
             (stale / "first").write_text("one\n", encoding="utf-8")
             (stale / "second").write_text("two\n", encoding="utf-8")
             before = snapshot_tree(namespace)
@@ -3836,6 +5379,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             namespace.mkdir(mode=0o700)
             stale = namespace / "session.stale"
             stale.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(stale)
             nested = stale / "one" / "two"
             nested.parent.mkdir(mode=0o700)
             nested.mkdir(mode=0o700)
@@ -3859,6 +5403,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             namespace.mkdir(mode=0o700)
             stale = namespace / "session.stale"
             stale.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(stale)
             (stale / "file").write_text("keep\n", encoding="utf-8")
             before = snapshot_tree(namespace)
 
@@ -3876,6 +5421,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             namespace.mkdir(mode=0o700)
             stale = namespace / "session.stale"
             stale.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(stale)
             (stale / "original").write_text("keep\n", encoding="utf-8")
             displaced = namespace / "displaced"
             real_inventory = _bounded_scheduler_doctor_stale_session_names
@@ -3903,7 +5449,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                     f"{__name__}._bounded_scheduler_doctor_stale_session_names",
                     side_effect=replace_before_apply,
                 ),
-                self.assertRaisesRegex(RuntimeError, "entry changed"),
+                self.assertRaisesRegex(RuntimeError, "changed"),
             ):
                 _sweep_stale_scheduler_doctor_sessions(namespace)
 
@@ -3918,6 +5464,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             namespace.mkdir(mode=0o700)
             stale = namespace / "session.stale"
             stale.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(stale)
             (stale / "original").write_text("keep\n", encoding="utf-8")
             real_inventory = _bounded_scheduler_doctor_stale_session_names
             inventory_count = 0
@@ -3939,7 +5486,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                     f"{__name__}._bounded_scheduler_doctor_stale_session_names",
                     side_effect=change_policy_before_apply,
                 ),
-                self.assertRaisesRegex(RuntimeError, "entry changed"),
+                self.assertRaisesRegex(RuntimeError, "changed"),
             ):
                 _sweep_stale_scheduler_doctor_sessions(namespace)
 
@@ -4007,6 +5554,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             first = _select_scheduler_doctor_test_namespace((candidate,))
             stale = first / "session.interrupted"
             stale.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(stale)
             (stale / "residue").write_text("stale\n", encoding="utf-8")
 
             second = _select_scheduler_doctor_test_namespace((candidate,))
@@ -4299,6 +5847,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             self.assertFalse(namespace.is_relative_to(REPO_ROOT))
             stale = namespace / "session.interrupted"
             stale.mkdir(mode=0o700)
+            _create_unlocked_scheduler_doctor_liveness_marker(stale)
             (stale / "residue").write_text("stale\n", encoding="utf-8")
 
             session = _scheduler_doctor_test_session_directory()
@@ -4569,6 +6118,697 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             ):
                 _select_scheduler_doctor_test_namespace((fallback,))
 
+    def test_popen_wrapper_merges_liveness_and_rejects_custody_fds(self) -> None:
+        _scheduler_doctor_test_session_directory()
+        binding = _SCHEDULER_DOCTOR_TEST_SESSION
+        lease_descriptor = _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD
+        assert binding is not None
+        assert lease_descriptor is not None
+        reader, writer = os.pipe()
+        sentinel = object()
+        try:
+            with mock.patch(
+                f"{__name__}._SCHEDULER_DOCTOR_TEST_ORIGINAL_POPEN",
+                return_value=sentinel,
+            ) as original_popen:
+                result = _scheduler_doctor_test_popen(
+                    ["fixture"],
+                    pass_fds=(reader,),
+                    env={"FIXTURE": "yes"},
+                )
+
+            self.assertIs(result, sentinel)
+            kwargs = original_popen.call_args.kwargs
+            self.assertTrue(kwargs["close_fds"])
+            self.assertIn(reader, kwargs["pass_fds"])
+            self.assertIn(binding.liveness_descriptor, kwargs["pass_fds"])
+            self.assertNotIn(binding.descriptor, kwargs["pass_fds"])
+            self.assertNotIn(binding.namespace_descriptor, kwargs["pass_fds"])
+            self.assertNotIn(lease_descriptor, kwargs["pass_fds"])
+            registry = json.loads(
+                kwargs["env"][_SCHEDULER_DOCTOR_TEST_LIVENESS_REGISTRY_ENV]
+            )
+            self.assertEqual(
+                {entry["fd"] for entry in registry},
+                {binding.liveness_descriptor},
+            )
+            self.assertEqual(kwargs["env"]["FIXTURE"], "yes")
+
+            for protected in (
+                binding.descriptor,
+                binding.namespace_descriptor,
+                lease_descriptor,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "custody descriptors",
+                ):
+                    _scheduler_doctor_test_popen(
+                        ["fixture"],
+                        pass_fds=(protected,),
+                    )
+            with self.assertRaisesRegex(RuntimeError, "close_fds=True"):
+                _scheduler_doctor_test_popen(
+                    ["fixture"],
+                    close_fds=False,
+                )
+        finally:
+            os.close(reader)
+            os.close(writer)
+
+    def test_popen_wrapper_rejects_registry_and_aliased_custody(self) -> None:
+        _scheduler_doctor_test_session_directory()
+        binding = _SCHEDULER_DOCTOR_TEST_SESSION
+        lease_descriptor = _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD
+        assert binding is not None
+        assert lease_descriptor is not None
+        aliases = {
+            "module-lease": os.dup(lease_descriptor),
+            "session": os.dup(binding.descriptor),
+            "namespace": os.dup(binding.namespace_descriptor),
+        }
+        try:
+            for poison_kind, poisoned_descriptor in (
+                ("exact", lease_descriptor),
+                ("alias", aliases["module-lease"]),
+            ):
+                with self.subTest(registry_poison=poison_kind):
+                    poisoned_registry = (
+                        _scheduler_doctor_liveness_registry_json(
+                            (
+                                (
+                                    poisoned_descriptor,
+                                    _scheduler_doctor_test_object_identity(
+                                        os.fstat(poisoned_descriptor)
+                                    ),
+                                ),
+                            )
+                        )
+                    )
+                    with (
+                        mock.patch.dict(
+                            os.environ,
+                            {
+                                _SCHEDULER_DOCTOR_TEST_LIVENESS_REGISTRY_ENV: (
+                                    poisoned_registry
+                                )
+                            },
+                        ),
+                        mock.patch(
+                            f"{__name__}._SCHEDULER_DOCTOR_TEST_ORIGINAL_POPEN"
+                        ) as original_popen,
+                        self.assertRaisesRegex(
+                            RuntimeError,
+                            "custody (descriptors|objects)",
+                        ),
+                    ):
+                        _scheduler_doctor_test_popen(["fixture"])
+                    original_popen.assert_not_called()
+
+            with mock.patch(
+                f"{__name__}._SCHEDULER_DOCTOR_TEST_ORIGINAL_POPEN"
+            ) as original_popen:
+                for role, descriptor in aliases.items():
+                    with (
+                        self.subTest(role=role),
+                        self.assertRaisesRegex(
+                            RuntimeError,
+                            "custody objects",
+                        ),
+                    ):
+                        _scheduler_doctor_test_popen(
+                            ["fixture"],
+                            pass_fds=(descriptor,),
+                        )
+            original_popen.assert_not_called()
+        finally:
+            for descriptor in aliases.values():
+                os.close(descriptor)
+
+    def test_initialization_publishes_only_validated_session(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            with (
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION",
+                    None,
+                ),
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD",
+                    None,
+                ),
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE",
+                    None,
+                ),
+                mock.patch(
+                    f"{__name__}._ensure_scheduler_doctor_test_namespace",
+                    return_value=namespace,
+                ),
+                mock.patch(
+                    f"{__name__}._open_scheduler_doctor_liveness_descriptor",
+                    side_effect=RuntimeError("injected pre-marker failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "pre-marker failure"),
+            ):
+                _scheduler_doctor_test_session_directory()
+            self.assertEqual(
+                {child.name for child in namespace.iterdir()},
+                {_SCHEDULER_DOCTOR_TEST_LOCK_NAME},
+            )
+
+            with (
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION",
+                    None,
+                ),
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD",
+                    None,
+                ),
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE",
+                    None,
+                ),
+                mock.patch(
+                    f"{__name__}._ensure_scheduler_doctor_test_namespace",
+                    return_value=namespace,
+                ),
+                mock.patch(
+                    f"{__name__}._validate_scheduler_doctor_active_session_binding",
+                    side_effect=(
+                        None,
+                        RuntimeError("injected published validation failure"),
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "published validation failure",
+                ),
+            ):
+                _scheduler_doctor_test_session_directory()
+            self.assertEqual(
+                {child.name for child in namespace.iterdir()},
+                {_SCHEDULER_DOCTOR_TEST_LOCK_NAME},
+            )
+
+            retained_path: Path | None = None
+            with (
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION",
+                    None,
+                ),
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD",
+                    None,
+                ),
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE",
+                    None,
+                ),
+                mock.patch(
+                    f"{__name__}._ensure_scheduler_doctor_test_namespace",
+                    return_value=namespace,
+                ),
+                mock.patch(
+                    f"{__name__}._validate_scheduler_doctor_liveness_descriptor",
+                    side_effect=RuntimeError(
+                        "injected marker validation failure"
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "rollback cleanup failed",
+                ):
+                    _scheduler_doctor_test_session_directory()
+                failure = _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
+                assert failure is not None
+                retained_path = failure.retained_path
+                _reset_retained_scheduler_doctor_cleanup_failure_for_test()
+            assert retained_path is not None
+            self.assertTrue(
+                retained_path.name.startswith(
+                    _SCHEDULER_DOCTOR_TEST_STAGING_PREFIX
+                )
+            )
+            self.assertFalse(
+                any(
+                    child.name.startswith(
+                        _SCHEDULER_DOCTOR_TEST_SESSION_PREFIX
+                    )
+                    for child in namespace.iterdir()
+                )
+            )
+            marker = (
+                retained_path / _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME
+            )
+            marker.unlink()
+            retained_path.rmdir()
+
+    def test_initialization_rollback_close_uncertainty_installs_fence(
+        self,
+    ) -> None:
+        original_open = os.open
+        original_close = os.close
+        cases = (
+            ("module-lease", False),
+            ("module-lease", True),
+            ("liveness", False),
+        )
+        for role, after_effect in cases:
+            with self.subTest(role=role, after_effect=after_effect):
+                with _scheduler_doctor_test_temporary_directory() as directory:
+                    namespace = Path(directory) / "namespace"
+                    namespace.mkdir(mode=0o700)
+                    opened: dict[str, int] = {}
+                    close_attempts: list[int] = []
+                    injected = False
+
+                    def observe_open(
+                        path: str | bytes | os.PathLike[str] | int,
+                        flags: int,
+                        mode: int = 0o777,
+                        *,
+                        dir_fd: int | None = None,
+                    ) -> int:
+                        descriptor = original_open(
+                            path,
+                            flags,
+                            mode,
+                            dir_fd=dir_fd,
+                        )
+                        if not isinstance(path, int):
+                            name = Path(os.fsdecode(path)).name
+                            if name == _SCHEDULER_DOCTOR_TEST_LOCK_NAME:
+                                opened["module-lease"] = descriptor
+                            elif (
+                                name
+                                == _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME
+                            ):
+                                opened["liveness"] = descriptor
+                        return descriptor
+
+                    def fail_selected_close(descriptor: int) -> None:
+                        nonlocal injected
+                        close_attempts.append(descriptor)
+                        if descriptor == opened.get(role) and not injected:
+                            injected = True
+                            if after_effect:
+                                original_close(descriptor)
+                            raise OSError(
+                                errno.EIO,
+                                f"injected {role} close failure",
+                            )
+                        original_close(descriptor)
+
+                    try:
+                        with (
+                            mock.patch(
+                                f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION",
+                                None,
+                            ),
+                            mock.patch(
+                                f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD",
+                                None,
+                            ),
+                            mock.patch(
+                                f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE",
+                                None,
+                            ),
+                            mock.patch(
+                                f"{__name__}._ensure_scheduler_doctor_test_namespace",
+                                return_value=namespace,
+                            ) as ensure_namespace,
+                            mock.patch(
+                                f"{__name__}._validate_scheduler_doctor_active_session_binding",
+                                side_effect=RuntimeError(
+                                    "injected initialization failure"
+                                ),
+                            ),
+                            mock.patch.object(
+                                os,
+                                "open",
+                                side_effect=observe_open,
+                            ),
+                            mock.patch.object(
+                                os,
+                                "close",
+                                side_effect=fail_selected_close,
+                            ),
+                        ):
+                            with self.assertRaisesRegex(
+                                RuntimeError,
+                                f"{role} descriptor close failed",
+                            ):
+                                _scheduler_doctor_test_session_directory()
+                            self.assertTrue(injected)
+                            selected = opened[role]
+                            self.assertEqual(close_attempts.count(selected), 1)
+                            failure = (
+                                _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
+                            )
+                            assert failure is not None
+                            self.assertEqual(
+                                [
+                                    custody.role
+                                    for custody in failure.abandoned_custody
+                                ],
+                                [role],
+                            )
+                            self.assertEqual(
+                                failure.abandoned_custody[0].state,
+                                "close-uncertain",
+                            )
+                            ensure_namespace.reset_mock()
+                            with self.assertRaisesRegex(
+                                RuntimeError,
+                                "cleanup previously failed",
+                            ):
+                                _scheduler_doctor_test_session_directory()
+                            ensure_namespace.assert_not_called()
+                            with (
+                                mock.patch(
+                                    f"{__name__}._validate_owner_private_directory"
+                                ) as validate_namespace,
+                                self.assertRaisesRegex(
+                                    RuntimeError,
+                                    "stale sweep blocked",
+                                ),
+                            ):
+                                _sweep_stale_scheduler_doctor_sessions(
+                                    namespace
+                                )
+                            validate_namespace.assert_not_called()
+                    finally:
+                        selected = opened.get(role)
+                        if not after_effect and selected is not None:
+                            original_close(selected)
+                        shutil.rmtree(namespace)
+
+    def test_cleanup_close_uncertainty_installs_sticky_fence(self) -> None:
+        original_close = os.close
+        for after_effect in (False, True):
+            with self.subTest(after_effect=after_effect):
+                with _scheduler_doctor_test_temporary_directory() as directory:
+                    namespace = Path(directory) / "namespace"
+                    namespace.mkdir(mode=0o700)
+                    namespace_metadata = namespace.lstat()
+                    namespace_identity = _scheduler_doctor_test_object_identity(
+                        namespace_metadata
+                    )
+                    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                    flags |= getattr(os, "O_DIRECTORY", 0)
+                    flags |= getattr(os, "O_NOFOLLOW", 0)
+                    namespace_fd = os.open(namespace, flags)
+                    mount_identity = (
+                        _scheduler_doctor_stale_directory_mount_identity(
+                            namespace_fd
+                        )
+                    )
+                    lease_fd = os.open(
+                        namespace / _SCHEDULER_DOCTOR_TEST_LOCK_NAME,
+                        os.O_RDWR | os.O_CREAT,
+                        0o600,
+                    )
+                    fcntl.flock(lease_fd, fcntl.LOCK_EX)
+                    session = namespace / "session.close-failure"
+                    session.mkdir(mode=0o700)
+                    session_identity = _scheduler_doctor_test_object_identity(
+                        session.lstat()
+                    )
+                    session_fd = _open_scheduler_doctor_stale_directory(
+                        namespace_fd,
+                        session.name,
+                        session_identity,
+                        expected_mount_identity=mount_identity,
+                        require_owner_private_directory=True,
+                    )
+                    liveness_fd, liveness_identity = (
+                        _open_scheduler_doctor_liveness_descriptor(
+                            session,
+                            session_fd,
+                            expected_mount_identity=mount_identity,
+                            create=True,
+                        )
+                    )
+                    fcntl.flock(liveness_fd, fcntl.LOCK_SH)
+                    binding = _SchedulerDoctorActiveSessionBinding(
+                        path=session,
+                        namespace_path=namespace,
+                        namespace_descriptor=namespace_fd,
+                        namespace_identity=namespace_identity,
+                        namespace_mount_identity=mount_identity,
+                        descriptor=session_fd,
+                        identity=session_identity,
+                        mount_identity=mount_identity,
+                        liveness_descriptor=liveness_fd,
+                        liveness_identity=liveness_identity,
+                    )
+                    injected = False
+
+                    def fail_liveness_close(descriptor: int) -> None:
+                        nonlocal injected
+                        if descriptor == liveness_fd and not injected:
+                            injected = True
+                            if after_effect:
+                                original_close(descriptor)
+                            raise OSError(errno.EIO, "injected close failure")
+                        original_close(descriptor)
+
+                    try:
+                        with (
+                            mock.patch(
+                                f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION",
+                                binding,
+                            ),
+                            mock.patch(
+                                f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD",
+                                lease_fd,
+                            ),
+                            mock.patch(
+                                f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE",
+                                None,
+                            ),
+                            mock.patch.object(os, "close", side_effect=fail_liveness_close),
+                        ):
+                            with self.assertRaisesRegex(
+                                RuntimeError,
+                                "descriptor close failed",
+                            ):
+                                _cleanup_scheduler_doctor_test_session()
+
+                            self.assertTrue(injected)
+                            self.assertIsNotNone(
+                                _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
+                            )
+                            with (
+                                mock.patch(
+                                    f"{__name__}._ensure_scheduler_doctor_test_namespace"
+                                ) as ensure_namespace,
+                                mock.patch(
+                                    f"{__name__}._sweep_stale_scheduler_doctor_sessions"
+                                ) as sweep,
+                                self.assertRaisesRegex(
+                                    RuntimeError,
+                                    "cleanup previously failed",
+                                ),
+                            ):
+                                _scheduler_doctor_test_session_directory()
+                            ensure_namespace.assert_not_called()
+                            sweep.assert_not_called()
+                            with (
+                                mock.patch(
+                                    f"{__name__}._validate_owner_private_directory"
+                                ) as validate_namespace,
+                                self.assertRaisesRegex(
+                                    RuntimeError,
+                                    "stale sweep blocked",
+                                ),
+                            ):
+                                _sweep_stale_scheduler_doctor_sessions(
+                                    namespace
+                                )
+                            validate_namespace.assert_not_called()
+                            self.assertTrue(session.is_dir())
+                    finally:
+                        if not after_effect:
+                            original_close(liveness_fd)
+                        original_close(session_fd)
+                        original_close(namespace_fd)
+                        original_close(lease_fd)
+                        shutil.rmtree(namespace)
+
+    def test_post_delete_close_uncertainty_keeps_fence_for_every_role(
+        self,
+    ) -> None:
+        original_close = os.close
+        real_remove = _remove_bound_scheduler_doctor_active_session
+        for role in ("session", "namespace", "liveness-probe", "module-lease"):
+            for after_effect in (False, True):
+                with self.subTest(role=role, after_effect=after_effect):
+                    with _scheduler_doctor_test_temporary_directory() as directory:
+                        namespace = Path(directory) / "namespace"
+                        namespace.mkdir(mode=0o700)
+                        namespace_identity = (
+                            _scheduler_doctor_test_object_identity(
+                                namespace.lstat()
+                            )
+                        )
+                        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                        flags |= getattr(os, "O_DIRECTORY", 0)
+                        flags |= getattr(os, "O_NOFOLLOW", 0)
+                        namespace_fd = os.open(namespace, flags)
+                        mount_identity = (
+                            _scheduler_doctor_stale_directory_mount_identity(
+                                namespace_fd
+                            )
+                        )
+                        lease_fd = os.open(
+                            namespace / _SCHEDULER_DOCTOR_TEST_LOCK_NAME,
+                            os.O_RDWR | os.O_CREAT,
+                            0o600,
+                        )
+                        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+                        session = namespace / "session.final-close"
+                        session.mkdir(mode=0o700)
+                        session_identity = (
+                            _scheduler_doctor_test_object_identity(session.lstat())
+                        )
+                        session_fd = _open_scheduler_doctor_stale_directory(
+                            namespace_fd,
+                            session.name,
+                            session_identity,
+                            expected_mount_identity=mount_identity,
+                            require_owner_private_directory=True,
+                        )
+                        liveness_fd, liveness_identity = (
+                            _open_scheduler_doctor_liveness_descriptor(
+                                session,
+                                session_fd,
+                                expected_mount_identity=mount_identity,
+                                create=True,
+                            )
+                        )
+                        fcntl.flock(liveness_fd, fcntl.LOCK_SH)
+                        binding = _SchedulerDoctorActiveSessionBinding(
+                            path=session,
+                            namespace_path=namespace,
+                            namespace_descriptor=namespace_fd,
+                            namespace_identity=namespace_identity,
+                            namespace_mount_identity=mount_identity,
+                            descriptor=session_fd,
+                            identity=session_identity,
+                            mount_identity=mount_identity,
+                            liveness_descriptor=liveness_fd,
+                            liveness_identity=liveness_identity,
+                        )
+                        deletion_complete = False
+                        injected_fd = -1
+
+                        def observe_remove(
+                            observed_binding: _SchedulerDoctorActiveSessionBinding,
+                            probe: int,
+                        ) -> None:
+                            nonlocal deletion_complete
+                            real_remove(observed_binding, probe)
+                            deletion_complete = True
+
+                        def fail_selected_close(descriptor: int) -> None:
+                            nonlocal injected_fd
+                            selected = {
+                                "session": session_fd,
+                                "namespace": namespace_fd,
+                                "module-lease": lease_fd,
+                            }.get(role)
+                            if role == "liveness-probe":
+                                selected = (
+                                    descriptor
+                                    if deletion_complete
+                                    and descriptor
+                                    not in {session_fd, namespace_fd, lease_fd}
+                                    else -1
+                                )
+                            if (
+                                deletion_complete
+                                and injected_fd < 0
+                                and descriptor == selected
+                            ):
+                                injected_fd = descriptor
+                                if after_effect:
+                                    original_close(descriptor)
+                                raise OSError(
+                                    errno.EIO,
+                                    f"injected {role} close failure",
+                                )
+                            original_close(descriptor)
+
+                        try:
+                            with (
+                                mock.patch(
+                                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION",
+                                    binding,
+                                ),
+                                mock.patch(
+                                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD",
+                                    lease_fd,
+                                ),
+                                mock.patch(
+                                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE",
+                                    None,
+                                ),
+                                mock.patch(
+                                    f"{__name__}._remove_bound_scheduler_doctor_active_session",
+                                    side_effect=observe_remove,
+                                ),
+                                mock.patch.object(
+                                    os,
+                                    "close",
+                                    side_effect=fail_selected_close,
+                                ),
+                            ):
+                                with self.assertRaisesRegex(
+                                    RuntimeError,
+                                    f"{role} descriptor close failed",
+                                ):
+                                    _cleanup_scheduler_doctor_test_session()
+                                self.assertFalse(session.exists())
+                                failure = (
+                                    _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
+                                )
+                                assert failure is not None
+                                self.assertEqual(
+                                    [
+                                        item.role
+                                        for item in failure.abandoned_custody
+                                    ],
+                                    [role],
+                                )
+                                self.assertEqual(
+                                    failure.abandoned_custody[0].state,
+                                    "close-uncertain",
+                                )
+                                with (
+                                    mock.patch(
+                                        f"{__name__}._ensure_scheduler_doctor_test_namespace"
+                                    ) as ensure_namespace,
+                                    mock.patch(
+                                        f"{__name__}._sweep_stale_scheduler_doctor_sessions"
+                                    ) as sweep,
+                                    self.assertRaisesRegex(
+                                        RuntimeError,
+                                        "cleanup previously failed",
+                                    ),
+                                ):
+                                    _scheduler_doctor_test_session_directory()
+                                ensure_namespace.assert_not_called()
+                                sweep.assert_not_called()
+                        finally:
+                            if not after_effect and injected_fd >= 0:
+                                original_close(injected_fd)
+                            shutil.rmtree(namespace)
+
     def test_namespace_lease_serializes_parallel_sweeps(self) -> None:
         _scheduler_doctor_test_session_directory()
         lease_path = (
@@ -4626,13 +6866,16 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                 _scheduler_doctor_test_session_directory()
             self.assertTrue(replacement_probe.is_file())
         finally:
+            _reset_retained_scheduler_doctor_cleanup_failure_for_test()
             if replacement_probe.exists():
                 replacement_probe.unlink()
             if session.exists():
                 session.rmdir()
             if retained.exists():
+                (
+                    retained / _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME
+                ).unlink()
                 retained.rmdir()
-            _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = None
             _scheduler_doctor_test_session_directory()
 
     def test_module_cleanup_reports_missing_active_session(self) -> None:
@@ -4650,9 +6893,12 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                 _cleanup_scheduler_doctor_test_session()
             self.assertTrue(retained.is_dir())
         finally:
+            _reset_retained_scheduler_doctor_cleanup_failure_for_test()
             if retained.exists():
+                (
+                    retained / _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME
+                ).unlink()
                 retained.rmdir()
-            _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = None
             _scheduler_doctor_test_session_directory()
 
     def test_module_cleanup_reports_unreadable_active_session(self) -> None:
@@ -4689,12 +6935,15 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                 _cleanup_scheduler_doctor_test_session()
             self.assertTrue(session.is_dir())
         finally:
+            _reset_retained_scheduler_doctor_cleanup_failure_for_test()
             if session.exists():
+                (
+                    session / _SCHEDULER_DOCTOR_TEST_LIVENESS_LOCK_NAME
+                ).unlink()
                 session.rmdir()
-            _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE = None
             _scheduler_doctor_test_session_directory()
 
-    def test_cleanup_closes_orphaned_lease_descriptor(self) -> None:
+    def test_cleanup_fences_orphaned_lease_descriptor(self) -> None:
         descriptor, writer = os.pipe()
         try:
             with (
@@ -4706,14 +6955,186 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                     f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD",
                     descriptor,
                 ),
-                self.assertRaisesRegex(RuntimeError, "without session custody"),
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE",
+                    None,
+                ),
             ):
-                _cleanup_scheduler_doctor_test_session()
-            with self.assertRaises(OSError) as raised:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "without session custody",
+                ):
+                    _cleanup_scheduler_doctor_test_session()
                 os.fstat(descriptor)
-            self.assertEqual(raised.exception.errno, errno.EBADF)
+                failure = _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
+                self.assertIsInstance(
+                    failure,
+                    _SchedulerDoctorSessionCleanupFailure,
+                )
+                assert failure is not None
+                self.assertIsNone(failure.retained_path)
+                self.assertEqual(
+                    failure.abandoned_custody,
+                    (
+                        _SchedulerDoctorAbandonedDescriptorCustody(
+                            "module-lease",
+                            descriptor,
+                            _scheduler_doctor_test_object_identity(
+                                os.fstat(descriptor)
+                            ),
+                            "retained-open",
+                        ),
+                    ),
+                )
+                _reset_retained_scheduler_doctor_cleanup_failure_for_test()
+                with self.assertRaises(OSError) as raised:
+                    os.fstat(descriptor)
+                self.assertEqual(raised.exception.errno, errno.EBADF)
         finally:
             os.close(writer)
+
+    def test_cleanup_reset_refuses_reused_descriptor(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            original_path = Path(directory) / "original"
+            replacement_path = Path(directory) / "replacement"
+            original_path.write_text("original\n", encoding="utf-8")
+            replacement_path.write_text("replacement\n", encoding="utf-8")
+            descriptor = os.open(original_path, os.O_RDONLY)
+            original_identity = _scheduler_doctor_test_object_identity(
+                os.fstat(descriptor)
+            )
+            os.close(descriptor)
+            replacement_source = os.open(replacement_path, os.O_RDONLY)
+            if replacement_source != descriptor:
+                os.dup2(replacement_source, descriptor)
+                os.close(replacement_source)
+            replacement_descriptor = descriptor
+            replacement_identity = _scheduler_doctor_test_object_identity(
+                os.fstat(replacement_descriptor)
+            )
+            failure = _SchedulerDoctorSessionCleanupFailure(
+                retained_path=original_path,
+                reason="fixture",
+                abandoned_custody=(
+                    _SchedulerDoctorAbandonedDescriptorCustody(
+                        "session",
+                        descriptor,
+                        original_identity,
+                        "retained-open",
+                    ),
+                ),
+            )
+            try:
+                with (
+                    mock.patch(
+                        f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION",
+                        None,
+                    ),
+                    mock.patch(
+                        f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD",
+                        None,
+                    ),
+                    mock.patch(
+                        f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE",
+                        failure,
+                    ),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "refuses reused"):
+                        _reset_retained_scheduler_doctor_cleanup_failure_for_test()
+                    self.assertEqual(
+                        _scheduler_doctor_test_object_identity(
+                            os.fstat(replacement_descriptor)
+                        ),
+                        replacement_identity,
+                    )
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "refuses close-uncertain",
+                    ):
+                        _reset_retained_scheduler_doctor_cleanup_failure_for_test()
+                    os.fstat(replacement_descriptor)
+            finally:
+                os.close(replacement_descriptor)
+
+    def test_cleanup_reset_never_retries_partial_close_uncertainty(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            paths = (Path(directory) / "first", Path(directory) / "second")
+            for path in paths:
+                path.write_text(path.name + "\n", encoding="utf-8")
+            descriptors = tuple(os.open(path, os.O_RDONLY) for path in paths)
+            custody = tuple(
+                _SchedulerDoctorAbandonedDescriptorCustody(
+                    role,
+                    descriptor,
+                    _scheduler_doctor_test_object_identity(
+                        os.fstat(descriptor)
+                    ),
+                    "retained-open",
+                )
+                for role, descriptor in zip(
+                    ("session", "module-lease"),
+                    descriptors,
+                )
+            )
+            failure = _SchedulerDoctorSessionCleanupFailure(
+                retained_path=Path(directory),
+                reason="fixture",
+                abandoned_custody=custody,
+            )
+            original_close = os.close
+            close_calls: list[int] = []
+
+            def fail_second_close(descriptor: int) -> None:
+                close_calls.append(descriptor)
+                if descriptor == descriptors[1]:
+                    original_close(descriptor)
+                    raise KeyboardInterrupt(
+                        "injected reset close-after-effect failure"
+                    )
+                original_close(descriptor)
+
+            with (
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION",
+                    None,
+                ),
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD",
+                    None,
+                ),
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE",
+                    failure,
+                ),
+                mock.patch.object(
+                    os,
+                    "close",
+                    side_effect=fail_second_close,
+                ),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    _reset_retained_scheduler_doctor_cleanup_failure_for_test()
+                for descriptor in descriptors:
+                    with self.assertRaises(OSError) as raised:
+                        os.fstat(descriptor)
+                    self.assertEqual(raised.exception.errno, errno.EBADF)
+                retained = _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE
+                assert retained is not None
+                self.assertEqual(
+                    [item.role for item in retained.abandoned_custody],
+                    ["module-lease"],
+                )
+                self.assertEqual(
+                    retained.abandoned_custody[0].state,
+                    "close-uncertain",
+                )
+                before_retry = list(close_calls)
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "refuses close-uncertain",
+                ):
+                    _reset_retained_scheduler_doctor_cleanup_failure_for_test()
+                self.assertEqual(close_calls, before_retry)
 
     def test_session_lease_retries_busy_lock_then_succeeds(self) -> None:
         busy = BlockingIOError(errno.EWOULDBLOCK, "fixture lease is busy")
