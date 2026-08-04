@@ -53,8 +53,10 @@ _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_DEPTH_LIMIT = 64
 _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_TIMEOUT_SECONDS = 30.0
 _SCHEDULER_DOCTOR_TEST_LEASE_TIMEOUT_SECONDS = 60.0
 _SCHEDULER_DOCTOR_TEST_LEASE_RETRY_SECONDS = 0.05
+_SCHEDULER_DOCTOR_TEST_DARWIN_TEMP_SCAN_ENTRY_LIMIT = 4096
 _SCHEDULER_DOCTOR_TEST_SESSION: tempfile.TemporaryDirectory | None = None
 _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD: int | None = None
+_SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR: tempfile.TemporaryDirectory | None = None
 
 
 class _SchedulerDoctorTestCandidateUnavailable(RuntimeError):
@@ -78,6 +80,104 @@ class _SchedulerDoctorStaleCleanupBudget:
     depth_limit: int
 
 
+def _scheduler_doctor_test_platform_anchor_parents() -> tuple[Path, ...]:
+    candidates: list[Path] = []
+    if sys.platform == "darwin":
+        darwin_temp_root = Path("/private/var/folders")
+        configured_temp = os.environ.get("TMPDIR")
+        configured_parent: Path | None = None
+        if configured_temp:
+            candidate = Path(configured_temp)
+            if candidate.is_absolute():
+                resolved = Path(os.path.realpath(candidate))
+                if resolved.is_relative_to(darwin_temp_root):
+                    configured_parent = resolved
+                    candidates.append(resolved)
+        getconf_environment = {
+            "PATH": "/usr/bin:/bin",
+            "LANG": "C",
+            "LC_ALL": "C",
+        }
+        if configured_parent is not None:
+            getconf_environment["TMPDIR"] = str(configured_parent)
+        try:
+            result = subprocess.run(
+                ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"],
+                env=getconf_environment,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        else:
+            output_lines = result.stdout.splitlines()
+            if result.returncode == 0 and len(output_lines) == 1:
+                candidate = Path(output_lines[0])
+                if candidate.is_absolute():
+                    resolved = Path(os.path.realpath(candidate))
+                    if resolved.is_relative_to(darwin_temp_root):
+                        candidates.append(resolved)
+        if not candidates:
+            candidates.extend(_bounded_darwin_user_temp_directories())
+    if sys.platform.startswith("linux"):
+        runtime_directory = os.environ.get("XDG_RUNTIME_DIR")
+        if runtime_directory:
+            candidate = Path(runtime_directory)
+            if candidate.is_absolute():
+                resolved = Path(os.path.realpath(candidate))
+                runtime_root = Path("/run/user") / str(os.geteuid())
+                if resolved == runtime_root or resolved.is_relative_to(runtime_root):
+                    candidates.append(resolved)
+    return tuple(dict.fromkeys(candidates))
+
+
+def _ensure_scheduler_doctor_test_platform_anchor() -> Path | None:
+    global _SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR
+
+    if _SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR is not None:
+        anchor = Path(_SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR.name)
+        _validate_owner_private_directory(anchor)
+        return anchor
+    for candidate in _scheduler_doctor_test_platform_anchor_parents():
+        parent = Path(os.path.realpath(candidate))
+        if parent != candidate or not _scheduler_doctor_platform_parent_in_scope(
+            parent
+        ):
+            continue
+        descriptor = -1
+        try:
+            descriptor, _identity, _access_policy = (
+                MODULE._bind_mirror_trusted_account_home(parent)
+            )
+        except (MODULE.SyncError, OSError):
+            continue
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        try:
+            temporary_directory = tempfile.TemporaryDirectory(
+                prefix="codex-scheduler-doctor-anchor.",
+                dir=parent,
+            )
+        except OSError:
+            continue
+        anchor = Path(temporary_directory.name)
+        try:
+            _validate_owner_private_directory(anchor)
+            descriptor, _identity, _access_policy = (
+                MODULE._bind_mirror_trusted_account_home(anchor)
+            )
+            os.close(descriptor)
+        except BaseException:
+            temporary_directory.cleanup()
+            raise
+        _SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR = temporary_directory
+        return anchor
+    return None
+
+
 def _validate_owner_private_directory(path: Path) -> os.stat_result:
     metadata = path.lstat()
     if not stat.S_ISDIR(metadata.st_mode):
@@ -99,6 +199,159 @@ def _scheduler_doctor_metadata_is_owner_private_directory(
     )
 
 
+def _scheduler_doctor_platform_parent_in_scope(path: Path) -> bool:
+    if sys.platform == "darwin":
+        root = Path("/private/var/folders")
+        return path != root and path.is_relative_to(root)
+    if sys.platform.startswith("linux"):
+        root = Path("/run/user") / str(os.geteuid())
+        return path == root or path.is_relative_to(root)
+    return False
+
+
+def _open_scanned_scheduler_doctor_directory(
+    parent_fd: int,
+    name: str,
+) -> tuple[int, os.stat_result] | None:
+    try:
+        named_metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(named_metadata.st_mode):
+        return None
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            name,
+            MODULE._source_directory_flags(),
+            dir_fd=parent_fd,
+        )
+        descriptor_metadata = os.fstat(descriptor)
+    except OSError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        return None
+    if (
+        MODULE._mirror_object_identity(named_metadata)
+        != MODULE._mirror_object_identity(descriptor_metadata)
+        or MODULE._mirror_access_policy(named_metadata)
+        != MODULE._mirror_access_policy(descriptor_metadata)
+    ):
+        os.close(descriptor)
+        raise RuntimeError(
+            "Darwin user temp directory changed while binding its component"
+        )
+    return descriptor, descriptor_metadata
+
+
+def _bounded_darwin_user_temp_directories() -> tuple[Path, ...]:
+    root = Path("/private/var/folders")
+    try:
+        root_fd = os.open(Path("/"), MODULE._source_directory_flags())
+    except OSError:
+        return ()
+    try:
+        for component in root.parts[1:]:
+            opened_component = _open_scanned_scheduler_doctor_directory(
+                root_fd,
+                component,
+            )
+            if opened_component is None:
+                os.close(root_fd)
+                return ()
+            component_fd, component_metadata = opened_component
+            component_mode, component_uid, _component_gid = (
+                MODULE._mirror_access_policy(component_metadata)
+            )
+            if component_uid not in {0, os.geteuid()} or component_mode & 0o022:
+                os.close(component_fd)
+                os.close(root_fd)
+                return ()
+            os.close(root_fd)
+            root_fd = component_fd
+    except BaseException:
+        os.close(root_fd)
+        raise
+    candidates: list[Path] = []
+    entry_count = 0
+
+    def consume_entry() -> None:
+        nonlocal entry_count
+        entry_count += 1
+        if entry_count > _SCHEDULER_DOCTOR_TEST_DARWIN_TEMP_SCAN_ENTRY_LIMIT:
+            raise RuntimeError(
+                "Darwin user temp directory scan exceeded its entry limit"
+            )
+
+    try:
+        with os.scandir(root_fd) as bucket_entries:
+            for bucket_entry in bucket_entries:
+                consume_entry()
+                opened_bucket = _open_scanned_scheduler_doctor_directory(
+                    root_fd,
+                    bucket_entry.name,
+                )
+                if opened_bucket is None:
+                    continue
+                bucket_fd, bucket_metadata = opened_bucket
+                try:
+                    bucket_mode, bucket_uid, _bucket_gid = (
+                        MODULE._mirror_access_policy(bucket_metadata)
+                    )
+                    if bucket_uid not in {0, os.geteuid()} or bucket_mode & 0o022:
+                        continue
+                    with os.scandir(bucket_fd) as account_entries:
+                        for account_entry in account_entries:
+                            consume_entry()
+                            opened_account = _open_scanned_scheduler_doctor_directory(
+                                bucket_fd,
+                                account_entry.name,
+                            )
+                            if opened_account is None:
+                                continue
+                            account_fd, account_metadata = opened_account
+                            try:
+                                account_mode, account_uid, _account_gid = (
+                                    MODULE._mirror_access_policy(account_metadata)
+                                )
+                                if (
+                                    account_uid != os.geteuid()
+                                    or account_mode & 0o022
+                                ):
+                                    continue
+                                opened_temp = (
+                                    _open_scanned_scheduler_doctor_directory(
+                                        account_fd,
+                                        "T",
+                                    )
+                                )
+                                if opened_temp is None:
+                                    continue
+                                temp_fd, temp_metadata = opened_temp
+                                try:
+                                    if not (
+                                        _scheduler_doctor_metadata_is_owner_private_directory(
+                                            temp_metadata
+                                        )
+                                    ):
+                                        continue
+                                    candidates.append(
+                                        root
+                                        / bucket_entry.name
+                                        / account_entry.name
+                                        / "T"
+                                    )
+                                finally:
+                                    os.close(temp_fd)
+                            finally:
+                                os.close(account_fd)
+                finally:
+                    os.close(bucket_fd)
+    finally:
+        os.close(root_fd)
+    return tuple(sorted(candidates, key=os.fsencode))
+
+
 def _scheduler_doctor_test_namespace_candidates() -> tuple[Path, ...]:
     candidates: list[Path] = []
     configured_anchor = os.environ.get(_SCHEDULER_DOCTOR_TEST_ANCHOR_ENV)
@@ -110,6 +363,9 @@ def _scheduler_doctor_test_namespace_candidates() -> tuple[Path, ...]:
             )
         candidates.append(override)
     candidates.append(REPO_ROOT)
+    platform_anchor = _ensure_scheduler_doctor_test_platform_anchor()
+    if platform_anchor is not None:
+        candidates.append(platform_anchor)
 
     unique: list[Path] = []
     seen: set[Path] = set()
@@ -965,8 +1221,25 @@ def _cleanup_scheduler_doctor_test_session() -> None:
         _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD = None
 
 
+def _cleanup_scheduler_doctor_test_platform_anchor() -> None:
+    global _SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR
+
+    temporary_directory = _SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR
+    if temporary_directory is None:
+        return
+    anchor = Path(temporary_directory.name)
+    _validate_owner_private_directory(anchor)
+    temporary_directory.cleanup()
+    if anchor.exists() or anchor.is_symlink():
+        raise RuntimeError(
+            f"scheduler-doctor platform test anchor cleanup failed: {anchor}"
+        )
+    _SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR = None
+
+
 def tearDownModule() -> None:
     _cleanup_scheduler_doctor_test_session()
+    _cleanup_scheduler_doctor_test_platform_anchor()
 
 
 def _scheduler_doctor_test_temporary_directory() -> tempfile.TemporaryDirectory:
@@ -1013,7 +1286,12 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             )
         else:
             self.assertTrue(
-                session_root.is_relative_to(Path(os.path.realpath(REPO_ROOT)))
+                any(
+                    session_root.is_relative_to(
+                        Path(os.path.realpath(candidate))
+                    )
+                    for candidate in _scheduler_doctor_test_namespace_candidates()
+                )
             )
         with mock.patch.dict(os.environ, {"TMPDIR": "/tmp"}):
             temporary_directory = _scheduler_doctor_test_temporary_directory()
@@ -1040,6 +1318,187 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             candidates = _scheduler_doctor_test_namespace_candidates()
 
         self.assertIn(Path(os.path.realpath(REPO_ROOT)), candidates)
+
+    def test_darwin_platform_anchor_parent_uses_fixed_getconf_result(self) -> None:
+        result = subprocess.CompletedProcess(
+            args=["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"],
+            returncode=0,
+            stdout="/private/var/folders/fixture/T\n",
+            stderr="",
+        )
+        with (
+            mock.patch.object(sys, "platform", "darwin"),
+            mock.patch.object(subprocess, "run", return_value=result) as run,
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            candidates = _scheduler_doctor_test_platform_anchor_parents()
+
+        self.assertEqual(
+            candidates,
+            (Path("/private/var/folders/fixture/T"),),
+        )
+        run.assert_called_once_with(
+            ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"],
+            env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+
+    def test_darwin_platform_anchor_parent_ignores_failed_getconf(self) -> None:
+        result = subprocess.CompletedProcess(
+            args=["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"],
+            returncode=1,
+            stdout="",
+            stderr="unavailable\n",
+        )
+        with (
+            mock.patch.object(sys, "platform", "darwin"),
+            mock.patch.object(subprocess, "run", return_value=result),
+            mock.patch(
+                f"{__name__}._bounded_darwin_user_temp_directories",
+                return_value=(),
+            ),
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            candidates = _scheduler_doctor_test_platform_anchor_parents()
+
+        self.assertEqual(candidates, ())
+
+    def test_darwin_platform_anchor_parent_uses_safe_ambient_tmpdir(self) -> None:
+        result = subprocess.CompletedProcess(
+            args=["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"],
+            returncode=1,
+            stdout="",
+            stderr="unavailable\n",
+        )
+        with (
+            mock.patch.object(sys, "platform", "darwin"),
+            mock.patch.object(subprocess, "run", return_value=result) as run,
+            mock.patch.dict(
+                os.environ,
+                {"TMPDIR": "/private/var/folders/fixture/T"},
+                clear=True,
+            ),
+        ):
+            candidates = _scheduler_doctor_test_platform_anchor_parents()
+
+        self.assertEqual(
+            candidates,
+            (Path("/private/var/folders/fixture/T"),),
+        )
+        self.assertEqual(
+            run.call_args.kwargs["env"]["TMPDIR"],
+            "/private/var/folders/fixture/T",
+        )
+
+    def test_darwin_platform_anchor_parent_rejects_shared_tmpdir(self) -> None:
+        result = subprocess.CompletedProcess(
+            args=["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"],
+            returncode=0,
+            stdout="/tmp\n",
+            stderr="",
+        )
+        with (
+            mock.patch.object(sys, "platform", "darwin"),
+            mock.patch.object(subprocess, "run", return_value=result),
+            mock.patch(
+                f"{__name__}._bounded_darwin_user_temp_directories",
+                return_value=(),
+            ),
+            mock.patch.dict(os.environ, {"TMPDIR": "/tmp"}, clear=True),
+        ):
+            candidates = _scheduler_doctor_test_platform_anchor_parents()
+
+        self.assertEqual(candidates, ())
+
+    def test_darwin_platform_anchor_parent_uses_bounded_scan_fallback(self) -> None:
+        result = subprocess.CompletedProcess(
+            args=["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"],
+            returncode=1,
+            stdout="",
+            stderr="unavailable\n",
+        )
+        scanned = Path("/private/var/folders/fixture/T")
+        with (
+            mock.patch.object(sys, "platform", "darwin"),
+            mock.patch.object(subprocess, "run", return_value=result),
+            mock.patch(
+                f"{__name__}._bounded_darwin_user_temp_directories",
+                return_value=(scanned,),
+            ) as scan,
+            mock.patch.dict(os.environ, {"TMPDIR": "/tmp"}, clear=True),
+        ):
+            candidates = _scheduler_doctor_test_platform_anchor_parents()
+
+        self.assertEqual(candidates, (scanned,))
+        scan.assert_called_once_with()
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin temp layout required")
+    def test_darwin_platform_anchor_scan_enforces_global_entry_limit(self) -> None:
+        with mock.patch(
+            f"{__name__}._SCHEDULER_DOCTOR_TEST_DARWIN_TEMP_SCAN_ENTRY_LIMIT",
+            0,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Darwin user temp directory scan exceeded its entry limit",
+            ):
+                _bounded_darwin_user_temp_directories()
+
+    def test_platform_anchor_is_unique_and_cleanup_owned(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as parent_directory:
+            parent = Path(parent_directory)
+            with (
+                mock.patch(
+                    f"{__name__}._scheduler_doctor_test_platform_anchor_parents",
+                    return_value=(parent,),
+                ),
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR",
+                    None,
+                ),
+                mock.patch(
+                    f"{__name__}._scheduler_doctor_platform_parent_in_scope",
+                    return_value=True,
+                ),
+            ):
+                anchor = _ensure_scheduler_doctor_test_platform_anchor()
+                self.assertIsNotNone(anchor)
+                assert anchor is not None
+                self.assertEqual(anchor.parent, parent)
+                self.assertTrue(anchor.name.startswith("codex-scheduler-doctor-anchor."))
+                _validate_owner_private_directory(anchor)
+
+                _cleanup_scheduler_doctor_test_platform_anchor()
+
+                self.assertFalse(anchor.exists())
+
+    def test_platform_anchor_rejects_resolved_scope_change(self) -> None:
+        candidate = Path("/private/var/folders/fixture/T")
+        escaped = Path("/Users/fixture")
+        with (
+            mock.patch(
+                f"{__name__}._scheduler_doctor_test_platform_anchor_parents",
+                return_value=(candidate,),
+            ),
+            mock.patch(
+                "os.path.realpath",
+                side_effect=lambda path: str(escaped)
+                if Path(path) == candidate
+                else str(path),
+            ),
+            mock.patch.object(tempfile, "TemporaryDirectory") as temporary,
+            mock.patch(
+                f"{__name__}._SCHEDULER_DOCTOR_TEST_PLATFORM_ANCHOR",
+                None,
+            ),
+        ):
+            anchor = _ensure_scheduler_doctor_test_platform_anchor()
+
+        self.assertIsNone(anchor)
+        temporary.assert_not_called()
 
     def test_stale_session_is_swept_before_reuse(self) -> None:
         session_root = _scheduler_doctor_test_session_directory()
@@ -1570,6 +2029,46 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                     timeout=120,
                     check=False,
                 )
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
+    @unittest.skipUnless(
+        sys.platform == "darwin",
+        "Darwin provides the default owner-private user temp directory",
+    )
+    def test_real_tmp_checkout_uses_default_darwin_safe_anchor(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="scheduler-doctor-checkout.",
+            dir="/tmp",
+        ) as checkout_directory:
+            checkout = Path(checkout_directory)
+            (checkout / "scripts").mkdir()
+            (checkout / "tests").mkdir()
+            shutil.copy2(SCRIPT_PATH, checkout / "scripts" / SCRIPT_PATH.name)
+            shutil.copy2(Path(__file__), checkout / "tests" / Path(__file__).name)
+            environment = os.environ.copy()
+            environment["TMPDIR"] = "/tmp"
+            environment.pop(_SCHEDULER_DOCTOR_TEST_ANCHOR_ENV, None)
+            environment.pop(_SCHEDULER_DOCTOR_TEST_EXPECTED_ANCHOR_ENV, None)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "unittest",
+                    "tests.test_scheduler_doctor.SchedulerDoctorFixtureTests."
+                    "test_temporary_root_ignores_ambient_tmpdir_and_cleans_up",
+                ],
+                cwd=checkout,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+
         self.assertEqual(
             result.returncode,
             0,
