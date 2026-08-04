@@ -21,10 +21,10 @@ superseded_by:
   `70dc2c727e91036e9d155ec17dbed643eef26990`.
 - The PR #6 scheduler-doctor fixture and source-lock substage is complete for
   the target-branch state. Its latest pre-squash implementation evidence is
-  signed head `4826113e52c08e2950604beec9e863d466bf6a4f`, tree
-  `9400b7bd1fa53d99bfd32ef8878e81b9b5ccbf84`; the verified BL-generated
+  signed head `b9ac6c52b1104585b9199711628d00d89d388075`, tree
+  `59e4c1d68878d1a82e7b8ad771ae7b8c933c2523`; the verified BL-generated
   source-lock SHA-256 is
-  `a01ef2e2b11c614b85b49c5745c439ee68bf3a728f9b42a6a91ece7afe73f2db`.
+  `6723edfba8e2a84caec5ac5431e8b5e0fb1bee326182dbc070e78f683a523cdf`.
   These pre-squash identities remain historical evidence only. Downstream
   generation must bind the actual squash-landed canonical `P` identity.
 
@@ -1586,6 +1586,51 @@ superseded_by:
   and staged diff checks passed. The refreshed `sync-source-lock.json` SHA-256
   is `a01ef2e2b11c614b85b49c5745c439ee68bf3a728f9b42a6a91ece7afe73f2db`.
   The implementation and append-only source-lock/journal identity remain
+  historical evidence only. Downstream generation must bind the actual
+  squash-landed canonical `P` before producing `T`/`B` or propagating private
+  and scheduler state.
+- The mount-bound stale-session cleanup substage is complete for the target-
+  branch state. Historical pre-squash implementation evidence is signed head
+  `b9ac6c52b1104585b9199711628d00d89d388075`, tree
+  `59e4c1d68878d1a82e7b8ad771ae7b8c933c2523`, with sole parent
+  `778fbd6c1360b5f02c5fb4a54caf091be9bb0c10`. GitHub reported the exact
+  signature provider-valid; the BL keybox lacked the signer public key, so
+  local verification remained `NO_PUBKEY` inconclusive and the user keyring
+  was not modified. The only implementation path is
+  `tests/test_scheduler_doctor.py`, blob
+  `c62a5323d24007b5813adc4fbdd5b33efc6435fb`, with SHA-256
+  `fb72d52f89e466ade6993d2eecac91068f395e7d160d810e43ec63e56a2dbe64`.
+  Stale-session recursive deletion is now confined to the namespace's frozen
+  mount identity: every entry binds `st_dev`, every opened directory also
+  binds the production mount-identity pair, Linux `mnt_id` rejects same-device
+  bind mounts, and Darwin binds `st_dev` plus `f_fsid` under the documented
+  platform limitation. Planning, whole-tree revalidation, apply, and final
+  namespace checks all fail closed and preserve residue when mount identity
+  cannot be proved or drifts. Test-side `sys.platform` emulation continues to
+  resolve mount identity through the real host kernel interface.
+  A fresh full BL custody clone independently matched the PR branch, head,
+  tree, sole parent, unique PR merge base, changed blob, and complete object
+  closure. The repository was non-shallow and non-promisor with no alternates;
+  `git rev-list --objects --missing=print` reported 232 records and zero
+  missing objects, strict full `fsck` passed, and the detached worktree was
+  clean. Restoring only the 23 tracked regular files to their Git-declared
+  `0644` / `0755` physical modes changed no tracked bytes. Unmodified stock
+  `refresh-lock` refreshed all six sources and stock `refresh-lock --check`
+  verified them. Under standard `umask 022`, the complete canonical source-
+  lock suite passed 230/230 in 355.078 seconds with one expected platform skip
+  through the repository's private-`TMPDIR` wrapper. The six mount-focused
+  regressions passed 6/6 under uv Python 3.13.13 and macOS system Python 3.9.6
+  in 0.010 and 0.011 seconds. The three copied-checkout regressions passed 3/3
+  in 1.059 and 0.639 seconds. The full scheduler-doctor suite passed 226/226
+  in 4.661 and 5.576 seconds respectively, with one expected skip per runtime.
+  The explicit owner-private test namespace ended with only its regular,
+  single-link, mode-`0600` `.session.lock` and no `session.*`. Both runtimes
+  passed `py_compile`; JSON parsing, frozen-range and working-tree diff checks,
+  and project-journal validation passed. BL had no installed Ruff executable
+  and installed no substitute; the owner-side Ruff E4/E7/E9/F gate was clean.
+  The refreshed `sync-source-lock.json` SHA-256 is
+  `6723edfba8e2a84caec5ac5431e8b5e0fb1bee326182dbc070e78f683a523cdf`.
+  The implementation and append-only source-lock/journal identities remain
   historical evidence only. Downstream generation must bind the actual
   squash-landed canonical `P` before producing `T`/`B` or propagating private
   and scheduler state.
