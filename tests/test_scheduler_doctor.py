@@ -5144,6 +5144,118 @@ class SchedulerDoctorTests(unittest.TestCase):
                         self.assertFalse(paths.systemd_service.exists())
                         self.assertFalse(paths.systemd_timer.exists())
 
+    def test_macos_uninstall_cleans_managed_orphan_identity_matrix(self) -> None:
+        legacy_label = MODULE.LEGACY_LAUNCHD_LABELS[0]
+        cases = (
+            (
+                "legacy-only",
+                "disabled",
+                "disabled",
+                {
+                    (
+                        legacy_label,
+                        MODULE.MACOS_BACKGROUND_LAUNCHD_DOMAIN,
+                    ): "enabled"
+                },
+                (legacy_label, MODULE.MACOS_BACKGROUND_LAUNCHD_DOMAIN),
+            ),
+            (
+                "mixed-domain",
+                "enabled",
+                "disabled",
+                {
+                    (
+                        legacy_label,
+                        MODULE.MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
+                    ): "enabled"
+                },
+                (legacy_label, MODULE.MACOS_LEGACY_GUI_LAUNCHD_DOMAIN),
+            ),
+        )
+        for (
+            case,
+            canonical_user_state,
+            canonical_gui_state,
+            legacy_overrides,
+            legacy_identity,
+        ) in cases:
+            with self.subTest(case=case):
+                case_user_home = self.root / f"orphan-matrix-{case}" / "home"
+                case_user_home.mkdir(parents=True)
+                case_home = case_user_home / ".codex"
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    paths = MODULE._scheduler_paths("macos", case_home)
+                query_results = (
+                    *self.launchd_query_matrix(
+                        canonical_user_state,
+                        canonical_gui_state,
+                        legacy_overrides=legacy_overrides,
+                    ),
+                    *self.launchd_query_matrix("disabled", "disabled"),
+                )
+                native_calls: list[list[str]] = []
+
+                def capture_native(
+                    args: list[str],
+                    *,
+                    dry_run: bool,
+                    allow_fail: bool | str = False,
+                ) -> None:
+                    self.assertFalse(dry_run)
+                    del allow_fail
+                    native_calls.append(args)
+
+                with (
+                    mock.patch.object(
+                        MODULE.Path,
+                        "home",
+                        return_value=case_user_home,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_native_scheduler_argv",
+                        side_effect=lambda args: args,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_run_bounded_scheduler_process",
+                        side_effect=query_results,
+                    ) as daemon_query,
+                    mock.patch.object(
+                        MODULE,
+                        "_run_native_command",
+                        side_effect=capture_native,
+                    ),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    MODULE.uninstall_scheduler(
+                        case_home,
+                        "macos",
+                        dry_run=False,
+                        disable=True,
+                    )
+
+                query_width = 2 * (1 + len(MODULE.LEGACY_LAUNCHD_LABELS))
+                self.assertEqual(daemon_query.call_count, 2 * query_width)
+                self.assertFalse(
+                    MODULE._scheduler_uninstall_transaction_path(paths).exists()
+                )
+                assert paths.launchd_plist is not None
+                self.assertFalse(paths.launchd_plist.exists())
+                legacy_name, legacy_domain = legacy_identity
+                self.assertIn(
+                    [
+                        "launchctl",
+                        "bootout",
+                        f"{legacy_domain}/{os.getuid()}/{legacy_name}",
+                    ],
+                    native_calls,
+                )
+
     def test_uninstall_orphan_daemon_uncertainty_and_failures_retain_marker(
         self,
     ) -> None:
@@ -7699,6 +7811,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             ("duplicate", None, "enabled", "disabled", "unavailable"),
             ("unbound", None, "disabled", "disabled", "unavailable"),
             ("orphan", absent_audit, "disabled", "disabled", "enabled"),
+            ("mixed-orphan", absent_audit, "enabled", "disabled", "enabled"),
         )
         for (
             case,
@@ -7746,7 +7859,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                         query.classification,
                         expected_classification,
                     )
-                    self.assertIn("legacy scheduler", query.reason or "")
+                    self.assertIn("scheduler", query.reason or "")
                     self.assertIn(legacy_label, query.reason or "")
                     self.assertIn(legacy_domain, query.reason or "")
 
@@ -7797,7 +7910,7 @@ class SchedulerDoctorTests(unittest.TestCase):
         self.assertEqual(report.failure_code, "scheduler-orphan-active")
         assert report.daemon_query is not None
         self.assertEqual(report.daemon_query.classification, "enabled")
-        self.assertIn("legacy scheduler orphan", report.daemon_query.reason or "")
+        self.assertIn("scheduler orphan", report.daemon_query.reason or "")
         self.assertIn(
             "scheduler-orphan-active",
             {issue.code for issue in issues},

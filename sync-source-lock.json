@@ -18,7 +18,7 @@
     "engine": {
       "mode": "0755",
       "path": "scripts/codex_personal_sync.py",
-      "sha256": "d410777c868de4489b6467345ada3096358b3ab1da38129324c6d60890928923"
+      "sha256": "584e93b3079d6e10f896f282c7d04a0adfff993b9e1f882ed08a97bf023d24dc"
     },
     "engine_tests": {
       "mode": "0644",
@@ -43,7 +43,7 @@
     "scheduler_doctor_tests": {
       "mode": "0644",
       "path": "tests/test_scheduler_doctor.py",
-      "sha256": "82936cbbf35c262c2b62f72c65da31e793bac479540d807e29ab80017cbc76e4"
+      "sha256": "df2c5f8e65cbfe18d1c71d1ac4fffaa0fc74300d500424477c89a3c227190751"
     }
   },
   "version": 1

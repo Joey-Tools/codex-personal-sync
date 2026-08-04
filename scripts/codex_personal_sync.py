@@ -23992,20 +23992,25 @@ def _scheduler_daemon_enabled(
             )
             if launchd_queries[(label, domain_kind)].classification == "enabled"
         )
+        if config_audit is not None and config_audit.config is None:
+            loaded_orphans = (
+                *((LAUNCHD_LABEL, domain_kind) for domain_kind in enabled_domains),
+                *loaded_legacy_services,
+            )
+            if loaded_orphans:
+                loaded = ", ".join(
+                    f"{label} in the {domain_kind} domain"
+                    for label, domain_kind in loaded_orphans
+                )
+                return SchedulerDaemonQuery(
+                    "enabled",
+                    f"launchd reports loaded scheduler orphans: {loaded}",
+                )
         if loaded_legacy_services:
             loaded = ", ".join(
                 f"{label} in the {domain_kind} domain"
                 for label, domain_kind in loaded_legacy_services
             )
-            if (
-                config_audit is not None
-                and config_audit.config is None
-                and not enabled_domains
-            ):
-                return SchedulerDaemonQuery(
-                    "enabled",
-                    f"launchd reports loaded legacy scheduler orphans: {loaded}",
-                )
             return SchedulerDaemonQuery(
                 "unavailable",
                 f"launchd reports loaded legacy scheduler services: {loaded}",
@@ -27241,9 +27246,11 @@ def _query_orphan_scheduler_for_uninstall(
     bindings: tuple[SchedulerActivationBinding, ...],
     *,
     require_disabled: bool,
+    config_audit: SchedulerConfigAudit | None = None,
 ) -> SchedulerDaemonQuery:
     query = _scheduler_daemon_enabled(
         paths,
+        config_audit=config_audit,
         activation_bindings=bindings,
     )
     if query.classification not in {
@@ -27371,6 +27378,11 @@ def _uninstall_scheduler_transaction(
             activation_marker_snapshot,
         )
         orphan_cleanup = disable and not snapshots[0].exists
+        orphan_config_audit = (
+            SchedulerConfigAudit(config=None, snapshots=(snapshots[0],))
+            if orphan_cleanup
+            else None
+        )
 
         def uninstall_macos(
             binding: SchedulerActivationBinding | None,
@@ -27387,6 +27399,7 @@ def _uninstall_scheduler_transaction(
                     paths,
                     complete_bindings,
                     require_disabled=False,
+                    config_audit=orphan_config_audit,
                 )
             if disable:
                 for domain_kind in (
@@ -27427,6 +27440,7 @@ def _uninstall_scheduler_transaction(
                     paths,
                     complete_bindings,
                     require_disabled=True,
+                    config_audit=orphan_config_audit,
                 )
             if dry_run:
                 _unlink_file(paths.launchd_plist, dry_run=True)
