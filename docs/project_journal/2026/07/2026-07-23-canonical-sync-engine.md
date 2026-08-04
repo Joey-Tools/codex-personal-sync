@@ -21,10 +21,10 @@ superseded_by:
   `70dc2c727e91036e9d155ec17dbed643eef26990`.
 - The PR #6 scheduler-doctor fixture and source-lock substage is complete for
   the target-branch state. Its latest pre-squash implementation evidence is
-  signed head `e712baec0a9187739aa42990aaf8f596c4706546`, tree
-  `87020c1567db20e06a4d7da4c2d46778aba98eb6`; the verified BL-generated
+  signed head `ae232b2dbe90f9c56f7b4c9cda7c673703e8ee0c`, tree
+  `c1bccc9dbcfaedd18b65df19d43a7a6842c3b5b5`; the verified BL-generated
   source-lock SHA-256 is
-  `f6bcc11d3a1d2aeae60f9402f344ae322b7ad299207b9f3be8416b71ddaf792c`.
+  `e36e65e50f7fbc1134f4b2e14a9e9f2579fa05d6fdf4b678ae5984e54dc53bdb`.
   These pre-squash identities remain historical evidence only. Downstream
   generation must bind the actual squash-landed canonical `P` identity.
 
@@ -1671,6 +1671,45 @@ superseded_by:
   not install one; the owner-side Ruff E4/E7/E9/F gate was clean. The
   refreshed `sync-source-lock.json` SHA-256 is
   `f6bcc11d3a1d2aeae60f9402f344ae322b7ad299207b9f3be8416b71ddaf792c`.
+  The implementation and append-only source-lock/journal identities remain
+  historical evidence only. Downstream generation must bind the actual
+  squash-landed canonical `P` before producing `T`/`B` or propagating private
+  and scheduler state.
+- The receipt-bound Linux sticky-fixture adapter substage is complete for the
+  target-branch state. Historical pre-squash implementation evidence is signed
+  head `ae232b2dbe90f9c56f7b4c9cda7c673703e8ee0c`, tree
+  `c1bccc9dbcfaedd18b65df19d43a7a6842c3b5b5`, with sole parent
+  `390c956e0ba2631f0c5185e8b6c928be14771af6`. GitHub reports the exact
+  signature provider-valid. The only implementation path is
+  `tests/test_scheduler_doctor.py`, blob
+  `1aa7b9df2eca66d6861a3e4e01fe67d238aabce4`, with SHA-256
+  `bfc2fe13fb4a85e4b4414e2b9a18cc58c2fb50118ce702b3b27bfe6091089ee0`.
+  Fallback-root receipt drift remains fatal, while only a strict receipt-bound
+  fixture-root subtree may use the test binder. Siblings, the fallback root
+  itself, non-sticky paths, and production paths continue through the
+  production binder; synthetic child type or access-policy failures preserve
+  their `SyncError` contract. The nested copied-checkout regression covers
+  accepted mode `0755`, rejected mode `0770`, symlink rejection, primary
+  private-control bindability, and primary-quarantine absence revalidation.
+  A fresh full BL custody clone independently matched the PR branch, head,
+  tree, sole parent, unique merge base, changed blob, provider signature, and
+  complete object closure. The source is non-shallow and non-promisor with no
+  alternate, bitmap, filter, or missing object; strict full `fsck` passed.
+  Restoring only Git-declared `0644` / `0755` physical modes after the private
+  checkout's restrictive umask changed no tracked bytes. Unmodified stock
+  `refresh-lock` refreshed all six sources and stock `refresh-lock --check`
+  verified them. Under standard `umask 022`, the complete canonical source-
+  lock suite passed 230/230 in 335.213 seconds with one expected platform skip
+  through the repository's private-`TMPDIR` wrapper. The eight Linux sticky-
+  fallback focused tests passed 8/8 under uv Python 3.13.13 and macOS system
+  Python 3.9.6, with one expected skip per runtime. The two real `/tmp`
+  copied-checkout tests passed 2/2 under each runtime. The full scheduler-
+  doctor suite passed 230/230 in 4.581 and 5.549 seconds respectively, with
+  one expected skip per runtime. Both runtimes passed `py_compile`; JSON
+  parsing and `git diff --check` passed. BL had no installed Ruff executable
+  and installed no substitute; the owner-side Ruff E4/E7/E9/F gate was clean.
+  The refreshed `sync-source-lock.json` SHA-256 is
+  `e36e65e50f7fbc1134f4b2e14a9e9f2579fa05d6fdf4b678ae5984e54dc53bdb`.
   The implementation and append-only source-lock/journal identities remain
   historical evidence only. Downstream generation must bind the actual
   squash-landed canonical `P` before producing `T`/`B` or propagating private
