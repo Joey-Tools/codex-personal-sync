@@ -21722,7 +21722,11 @@ def _load_macos_scheduler_config(
             )
         )
     launchd_domain = next(
-        (domain for expected, domain in accepted_profiles if data == expected),
+        (
+            domain
+            for expected, domain in accepted_profiles
+            if _plist_value_matches_exactly(data, expected)
+        ),
         None,
     )
     if launchd_domain is None:
@@ -21738,6 +21742,21 @@ def _load_macos_scheduler_config(
             f"launchd scheduler config changed during audit: {paths.launchd_plist}"
         )
     return replace(config, launchd_domain=launchd_domain)
+
+
+def _plist_value_matches_exactly(actual: Any, expected: Any) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            _plist_value_matches_exactly(actual[key], expected[key]) for key in expected
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _plist_value_matches_exactly(actual_item, expected_item)
+            for actual_item, expected_item in zip(actual, expected)
+        )
+    return actual == expected
 
 
 def _systemd_drop_in_metadata(

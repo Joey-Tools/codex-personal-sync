@@ -421,6 +421,26 @@ class SchedulerDoctorTests(unittest.TestCase):
                 ):
                     MODULE._load_macos_scheduler_config(paths)
 
+        for field, value in (
+            ("LowPriorityIO", 1),
+            ("ThrottleInterval", 60.0),
+        ):
+            with self.subTest(type_confusion=field):
+                payload = MODULE._launchd_plist(
+                    self.home,
+                    "owner/public-sync",
+                    19,
+                    runner,
+                )
+                payload[field] = value
+                paths.launchd_plist.write_bytes(plistlib.dumps(payload, sort_keys=True))
+
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "unsupported execution semantics",
+                ):
+                    MODULE._load_macos_scheduler_config(paths)
+
     def test_macos_loader_accepts_no_bytecode_legacy_variant_only_for_migration(
         self,
     ) -> None:
