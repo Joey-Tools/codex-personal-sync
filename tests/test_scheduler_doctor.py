@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import errno
 import fcntl
@@ -47,6 +48,11 @@ _SCHEDULER_DOCTOR_TEST_EXPECTED_ANCHOR_ENV = (
 _SCHEDULER_DOCTOR_TEST_LOCK_NAME = ".session.lock"
 _SCHEDULER_DOCTOR_TEST_SESSION_PREFIX = "session."
 _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT = 1024
+_SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_ENTRY_LIMIT = 10_000
+_SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_DEPTH_LIMIT = 64
+_SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_TIMEOUT_SECONDS = 30.0
+_SCHEDULER_DOCTOR_TEST_LEASE_TIMEOUT_SECONDS = 60.0
+_SCHEDULER_DOCTOR_TEST_LEASE_RETRY_SECONDS = 0.05
 _SCHEDULER_DOCTOR_TEST_SESSION: tempfile.TemporaryDirectory | None = None
 _SCHEDULER_DOCTOR_TEST_SESSION_LEASE_FD: int | None = None
 
@@ -55,6 +61,21 @@ class _SchedulerDoctorTestCandidateUnavailable(RuntimeError):
     def __init__(self, error: OSError) -> None:
         super().__init__(str(error))
         self.error = error
+
+
+@dataclass(frozen=True)
+class _SchedulerDoctorStaleEntryPlan:
+    name: str
+    identity: tuple[int, int, int]
+    children: tuple["_SchedulerDoctorStaleEntryPlan", ...] | None
+    owner_private_directory: bool = False
+
+
+@dataclass
+class _SchedulerDoctorStaleCleanupBudget:
+    deadline: float
+    remaining_entries: int
+    depth_limit: int
 
 
 def _validate_owner_private_directory(path: Path) -> os.stat_result:
@@ -68,6 +89,16 @@ def _validate_owner_private_directory(path: Path) -> os.stat_result:
     return metadata
 
 
+def _scheduler_doctor_metadata_is_owner_private_directory(
+    metadata: os.stat_result,
+) -> bool:
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and metadata.st_uid == os.geteuid()
+        and stat.S_IMODE(metadata.st_mode) == 0o700
+    )
+
+
 def _scheduler_doctor_test_namespace_candidates() -> tuple[Path, ...]:
     candidates: list[Path] = []
     configured_anchor = os.environ.get(_SCHEDULER_DOCTOR_TEST_ANCHOR_ENV)
@@ -79,10 +110,6 @@ def _scheduler_doctor_test_namespace_candidates() -> tuple[Path, ...]:
             )
         candidates.append(override)
     candidates.append(REPO_ROOT)
-    try:
-        candidates.append(MODULE._mirror_canonical_account_home_directory())
-    except RuntimeError:
-        pass
 
     unique: list[Path] = []
     seen: set[Path] = set()
@@ -405,23 +432,485 @@ def _validate_scheduler_doctor_session_lease(
     return descriptor_metadata
 
 
-def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
-    entries: list[Path] = []
+def _acquire_scheduler_doctor_test_session_lease(
+    descriptor: int,
+    *,
+    timeout_seconds: float = _SCHEDULER_DOCTOR_TEST_LEASE_TIMEOUT_SECONDS,
+    retry_seconds: float = _SCHEDULER_DOCTOR_TEST_LEASE_RETRY_SECONDS,
+) -> None:
+    if timeout_seconds < 0:
+        raise ValueError("scheduler-doctor fixture lease timeout must be non-negative")
+    if retry_seconds <= 0:
+        raise ValueError("scheduler-doctor fixture lease retry must be positive")
+    deadline = time.monotonic() + timeout_seconds
+    busy_errors = {errno.EACCES, errno.EAGAIN}
+    if hasattr(errno, "EWOULDBLOCK"):
+        busy_errors.add(errno.EWOULDBLOCK)
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as error:
+            if error.errno not in busy_errors:
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    "timed out acquiring scheduler-doctor fixture lease"
+                ) from error
+            time.sleep(min(retry_seconds, remaining))
+
+
+def _bounded_scheduler_doctor_stale_session_names(
+    namespace: Path | int,
+    *,
+    deadline: float | None = None,
+) -> tuple[str, ...]:
+    names: list[str] = []
     with os.scandir(namespace) as iterator:
         for entry in iterator:
-            if entry.name == _SCHEDULER_DOCTOR_TEST_LOCK_NAME:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "scheduler-doctor stale-session cleanup planning timed out"
+                )
+            name = entry.name
+            if not isinstance(name, str):
+                raise RuntimeError(
+                    "scheduler-doctor fixture entry name is not text"
+                )
+            if name == _SCHEDULER_DOCTOR_TEST_LOCK_NAME:
                 continue
-            if len(entries) == _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT:
+            if len(names) == _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT:
                 raise RuntimeError(
                     "too many scheduler-doctor fixture namespace entries"
                 )
-            entries.append(namespace / entry.name)
-    entries.sort(key=lambda path: path.name)
-    for entry in entries:
-        if not entry.name.startswith(_SCHEDULER_DOCTOR_TEST_SESSION_PREFIX):
-            raise RuntimeError(f"unexpected scheduler-doctor fixture entry: {entry}")
-        _validate_owner_private_directory(entry)
-        shutil.rmtree(entry)
+            if not name.startswith(_SCHEDULER_DOCTOR_TEST_SESSION_PREFIX):
+                raise RuntimeError(
+                    f"unexpected scheduler-doctor fixture entry: {name}"
+                )
+            names.append(name)
+    names.sort(key=os.fsencode)
+    return tuple(names)
+
+
+def _revalidate_scheduler_doctor_stale_directory_names(
+    descriptor: int,
+    expected_names: tuple[str, ...],
+    *,
+    deadline: float,
+) -> None:
+    observed: list[str] = []
+    with os.scandir(descriptor) as iterator:
+        for entry in iterator:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "scheduler-doctor stale-session cleanup planning timed out"
+                )
+            if len(observed) == len(expected_names):
+                raise RuntimeError(
+                    "scheduler-doctor stale-session directory changed during "
+                    "cleanup planning"
+                )
+            name = entry.name
+            if not isinstance(name, str):
+                raise RuntimeError(
+                    "scheduler-doctor stale-session entry name is not text"
+                )
+            observed.append(name)
+    observed.sort(key=os.fsencode)
+    if tuple(observed) != expected_names:
+        raise RuntimeError(
+            "scheduler-doctor stale-session directory changed during cleanup "
+            "planning"
+        )
+
+
+def _reserve_scheduler_doctor_stale_cleanup_entry(
+    budget: _SchedulerDoctorStaleCleanupBudget,
+    *,
+    depth: int,
+) -> None:
+    if time.monotonic() >= budget.deadline:
+        raise RuntimeError(
+            "scheduler-doctor stale-session cleanup planning timed out"
+        )
+    if depth > budget.depth_limit:
+        raise RuntimeError(
+            "scheduler-doctor stale-session cleanup depth limit exceeded"
+        )
+    if budget.remaining_entries == 0:
+        raise RuntimeError(
+            "scheduler-doctor stale-session cleanup entry limit exceeded"
+        )
+    budget.remaining_entries -= 1
+
+
+def _open_scheduler_doctor_stale_directory(
+    parent_fd: int,
+    name: str,
+    expected_identity: tuple[int, int, int],
+    *,
+    require_owner_private_directory: bool = False,
+) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        descriptor_metadata = os.fstat(descriptor)
+        named_metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        identity_changed = (
+            _scheduler_doctor_test_object_identity(descriptor_metadata)
+            != expected_identity
+            or _scheduler_doctor_test_object_identity(named_metadata)
+            != expected_identity
+        )
+        access_policy_changed = require_owner_private_directory and (
+            not _scheduler_doctor_metadata_is_owner_private_directory(
+                descriptor_metadata
+            )
+            or not _scheduler_doctor_metadata_is_owner_private_directory(
+                named_metadata
+            )
+        )
+        if identity_changed or access_policy_changed:
+            raise RuntimeError(
+                f"scheduler-doctor stale-session directory changed: {name}"
+            )
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _scheduler_doctor_stale_plan_matches(
+    metadata: os.stat_result,
+    plan: _SchedulerDoctorStaleEntryPlan,
+) -> bool:
+    if _scheduler_doctor_test_object_identity(metadata) != plan.identity:
+        return False
+    if not plan.owner_private_directory:
+        return True
+    return _scheduler_doctor_metadata_is_owner_private_directory(metadata)
+
+
+def _plan_scheduler_doctor_stale_entry(
+    parent_fd: int,
+    name: str,
+    budget: _SchedulerDoctorStaleCleanupBudget,
+    *,
+    depth: int,
+    reserved: bool = False,
+    require_owner_private_directory: bool = False,
+) -> _SchedulerDoctorStaleEntryPlan:
+    if not reserved:
+        _reserve_scheduler_doctor_stale_cleanup_entry(budget, depth=depth)
+    elif time.monotonic() >= budget.deadline:
+        raise RuntimeError(
+            "scheduler-doctor stale-session cleanup planning timed out"
+        )
+    metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    identity = _scheduler_doctor_test_object_identity(metadata)
+    if metadata.st_uid != os.geteuid():
+        raise RuntimeError(
+            f"scheduler-doctor stale-session entry has the wrong owner: {name}"
+        )
+    if require_owner_private_directory and (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise RuntimeError(
+            f"scheduler-doctor stale-session root is not an owner-private "
+            f"directory: {name}"
+        )
+    if stat.S_ISLNK(metadata.st_mode) or stat.S_ISREG(metadata.st_mode):
+        return _SchedulerDoctorStaleEntryPlan(name, identity, None)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError(
+            f"unsupported scheduler-doctor stale-session entry: {name}"
+        )
+
+    descriptor = _open_scheduler_doctor_stale_directory(
+        parent_fd,
+        name,
+        identity,
+        require_owner_private_directory=require_owner_private_directory,
+    )
+    try:
+        child_names: list[str] = []
+        with os.scandir(descriptor) as iterator:
+            for entry in iterator:
+                child_name = entry.name
+                if not isinstance(child_name, str):
+                    raise RuntimeError(
+                        "scheduler-doctor stale-session entry name is not text"
+                    )
+                _reserve_scheduler_doctor_stale_cleanup_entry(
+                    budget,
+                    depth=depth + 1,
+                )
+                child_names.append(child_name)
+        child_names.sort(key=os.fsencode)
+        children = tuple(
+            _plan_scheduler_doctor_stale_entry(
+                descriptor,
+                child_name,
+                budget,
+                depth=depth + 1,
+                reserved=True,
+            )
+            for child_name in child_names
+        )
+        _revalidate_scheduler_doctor_stale_directory_names(
+            descriptor,
+            tuple(child_names),
+            deadline=budget.deadline,
+        )
+        descriptor_metadata = os.fstat(descriptor)
+        if (
+            _scheduler_doctor_test_object_identity(descriptor_metadata)
+            != identity
+            or require_owner_private_directory
+            and not _scheduler_doctor_metadata_is_owner_private_directory(
+                descriptor_metadata
+            )
+        ):
+            raise RuntimeError(
+                f"scheduler-doctor stale-session directory changed: {name}"
+            )
+        return _SchedulerDoctorStaleEntryPlan(
+            name,
+            identity,
+            children,
+            owner_private_directory=require_owner_private_directory,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _revalidate_scheduler_doctor_stale_entry_plan(
+    parent_fd: int,
+    plan: _SchedulerDoctorStaleEntryPlan,
+    *,
+    deadline: float,
+) -> None:
+    if time.monotonic() >= deadline:
+        raise RuntimeError(
+            "scheduler-doctor stale-session cleanup planning timed out"
+        )
+    metadata = os.stat(plan.name, dir_fd=parent_fd, follow_symlinks=False)
+    if not _scheduler_doctor_stale_plan_matches(metadata, plan):
+        raise RuntimeError(
+            f"scheduler-doctor stale-session entry changed: {plan.name}"
+        )
+    if plan.children is None:
+        return
+    descriptor = _open_scheduler_doctor_stale_directory(
+        parent_fd,
+        plan.name,
+        plan.identity,
+        require_owner_private_directory=plan.owner_private_directory,
+    )
+    try:
+        expected_names = tuple(child.name for child in plan.children)
+        _revalidate_scheduler_doctor_stale_directory_names(
+            descriptor,
+            expected_names,
+            deadline=deadline,
+        )
+        for child in plan.children:
+            _revalidate_scheduler_doctor_stale_entry_plan(
+                descriptor,
+                child,
+                deadline=deadline,
+            )
+    finally:
+        os.close(descriptor)
+
+
+def _apply_scheduler_doctor_stale_entry_plan(
+    parent_fd: int,
+    plan: _SchedulerDoctorStaleEntryPlan,
+    *,
+    deadline: float,
+) -> None:
+    if time.monotonic() >= deadline:
+        raise RuntimeError("scheduler-doctor stale-session cleanup timed out")
+    metadata = os.stat(plan.name, dir_fd=parent_fd, follow_symlinks=False)
+    if not _scheduler_doctor_stale_plan_matches(metadata, plan):
+        raise RuntimeError(
+            f"scheduler-doctor stale-session entry changed: {plan.name}"
+        )
+    if plan.children is None:
+        os.unlink(plan.name, dir_fd=parent_fd)
+        return
+
+    descriptor = _open_scheduler_doctor_stale_directory(
+        parent_fd,
+        plan.name,
+        plan.identity,
+        require_owner_private_directory=plan.owner_private_directory,
+    )
+    try:
+        for child in plan.children:
+            _apply_scheduler_doctor_stale_entry_plan(
+                descriptor,
+                child,
+                deadline=deadline,
+            )
+        if time.monotonic() >= deadline:
+            raise RuntimeError("scheduler-doctor stale-session cleanup timed out")
+        descriptor_metadata = os.fstat(descriptor)
+        if (
+            _scheduler_doctor_test_object_identity(descriptor_metadata)
+            != plan.identity
+            or plan.owner_private_directory
+            and not _scheduler_doctor_metadata_is_owner_private_directory(
+                descriptor_metadata
+            )
+        ):
+            raise RuntimeError(
+                f"scheduler-doctor stale-session directory changed: {plan.name}"
+            )
+        with os.scandir(descriptor) as iterator:
+            unexpected = next(iterator, None)
+        if unexpected is not None:
+            raise RuntimeError(
+                "scheduler-doctor stale-session directory changed during cleanup: "
+                f"{plan.name}"
+            )
+    finally:
+        os.close(descriptor)
+    metadata = os.stat(plan.name, dir_fd=parent_fd, follow_symlinks=False)
+    if not _scheduler_doctor_stale_plan_matches(metadata, plan):
+        raise RuntimeError(
+            f"scheduler-doctor stale-session directory changed: {plan.name}"
+        )
+    if time.monotonic() >= deadline:
+        raise RuntimeError("scheduler-doctor stale-session cleanup timed out")
+    os.rmdir(plan.name, dir_fd=parent_fd)
+
+
+def _sweep_stale_scheduler_doctor_sessions(namespace: Path) -> None:
+    # The protected property is the identity of every planned name object and
+    # the owner-private access policy of the namespace/session roots. Benign
+    # timestamps and nested-file mode changes are not treated as replacement.
+    # The module lease serializes cooperative same-UID test processes; this
+    # fixture does not claim to defeat a malicious same-UID replace-at-unlink.
+    namespace_metadata = _validate_owner_private_directory(namespace)
+    namespace_identity = _scheduler_doctor_test_object_identity(
+        namespace_metadata
+    )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    namespace_fd = os.open(namespace, flags)
+    try:
+        descriptor_metadata = os.fstat(namespace_fd)
+        named_metadata = namespace.lstat()
+        if (
+            _scheduler_doctor_test_object_identity(descriptor_metadata)
+            != namespace_identity
+            or _scheduler_doctor_test_object_identity(named_metadata)
+            != namespace_identity
+            or not _scheduler_doctor_metadata_is_owner_private_directory(
+                descriptor_metadata
+            )
+            or not _scheduler_doctor_metadata_is_owner_private_directory(
+                named_metadata
+            )
+        ):
+            raise RuntimeError(
+                "scheduler-doctor fixture namespace changed while opening"
+            )
+        deadline = (
+            time.monotonic()
+            + _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_TIMEOUT_SECONDS
+        )
+        session_names = _bounded_scheduler_doctor_stale_session_names(
+            namespace_fd,
+            deadline=deadline,
+        )
+        budget = _SchedulerDoctorStaleCleanupBudget(
+            deadline=deadline,
+            remaining_entries=_SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_ENTRY_LIMIT,
+            depth_limit=_SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_DEPTH_LIMIT,
+        )
+        plans = tuple(
+            _plan_scheduler_doctor_stale_entry(
+                namespace_fd,
+                name,
+                budget,
+                depth=1,
+                require_owner_private_directory=True,
+            )
+            for name in session_names
+        )
+        if (
+            _bounded_scheduler_doctor_stale_session_names(
+                namespace_fd,
+                deadline=deadline,
+            )
+            != session_names
+        ):
+            raise RuntimeError(
+                "scheduler-doctor fixture namespace changed during cleanup planning"
+            )
+        descriptor_metadata = os.fstat(namespace_fd)
+        named_metadata = namespace.lstat()
+        if (
+            _scheduler_doctor_test_object_identity(descriptor_metadata)
+            != namespace_identity
+            or _scheduler_doctor_test_object_identity(named_metadata)
+            != namespace_identity
+            or not _scheduler_doctor_metadata_is_owner_private_directory(
+                descriptor_metadata
+            )
+            or not _scheduler_doctor_metadata_is_owner_private_directory(
+                named_metadata
+            )
+        ):
+            raise RuntimeError(
+                "scheduler-doctor fixture namespace changed during cleanup planning"
+            )
+        for plan in plans:
+            _revalidate_scheduler_doctor_stale_entry_plan(
+                namespace_fd,
+                plan,
+                deadline=deadline,
+            )
+        for plan in plans:
+            _apply_scheduler_doctor_stale_entry_plan(
+                namespace_fd,
+                plan,
+                deadline=deadline,
+            )
+        if _bounded_scheduler_doctor_stale_session_names(
+            namespace_fd,
+            deadline=deadline,
+        ):
+            raise RuntimeError(
+                "scheduler-doctor fixture namespace retained stale sessions"
+            )
+        descriptor_metadata = os.fstat(namespace_fd)
+        named_metadata = namespace.lstat()
+        if (
+            _scheduler_doctor_test_object_identity(descriptor_metadata)
+            != namespace_identity
+            or _scheduler_doctor_test_object_identity(named_metadata)
+            != namespace_identity
+            or not _scheduler_doctor_metadata_is_owner_private_directory(
+                descriptor_metadata
+            )
+            or not _scheduler_doctor_metadata_is_owner_private_directory(
+                named_metadata
+            )
+        ):
+            raise RuntimeError(
+                "scheduler-doctor fixture namespace changed during cleanup"
+            )
+    finally:
+        os.close(namespace_fd)
 
 
 def _scheduler_doctor_test_session_directory() -> Path:
@@ -440,7 +929,7 @@ def _scheduler_doctor_test_session_directory() -> Path:
         flags |= os.O_NOFOLLOW
     descriptor = os.open(lease_path, flags, 0o600)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        _acquire_scheduler_doctor_test_session_lease(descriptor)
         _validate_scheduler_doctor_session_lease(lease_path, descriptor)
         _sweep_stale_scheduler_doctor_sessions(namespace)
         session = tempfile.TemporaryDirectory(
@@ -513,9 +1002,6 @@ def snapshot_tree(root: Path) -> tuple[tuple[str, str, int, bytes | str | None],
 
 class SchedulerDoctorFixtureTests(unittest.TestCase):
     def test_temporary_root_ignores_ambient_tmpdir_and_cleans_up(self) -> None:
-        account_home = Path(
-            os.path.realpath(MODULE._mirror_canonical_account_home_directory())
-        )
         session_root = _scheduler_doctor_test_session_directory()
         system_tmp = Path(os.path.realpath("/tmp"))
         expected_anchor = os.environ.get(
@@ -525,13 +1011,16 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             self.assertTrue(
                 session_root.is_relative_to(Path(os.path.realpath(expected_anchor)))
             )
+        else:
+            self.assertTrue(
+                session_root.is_relative_to(Path(os.path.realpath(REPO_ROOT)))
+            )
         with mock.patch.dict(os.environ, {"TMPDIR": "/tmp"}):
             temporary_directory = _scheduler_doctor_test_temporary_directory()
         root = Path(os.path.realpath(temporary_directory.name))
 
         try:
             self.assertEqual(root.parent, session_root)
-            self.assertNotEqual(root.parent, account_home)
             self.assertFalse(root.is_relative_to(system_tmp))
             self.assertEqual(session_root.parent.name, "scheduler-doctor")
             self.assertEqual(session_root.parent.parent.name, ".codex-test-tmp")
@@ -541,7 +1030,16 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             temporary_directory.cleanup()
 
         self.assertFalse(root.exists())
-        self.assertTrue(account_home.is_dir())
+
+    def test_namespace_candidates_never_resolve_the_account_home(self) -> None:
+        with mock.patch.object(
+            MODULE,
+            "_mirror_canonical_account_home_directory",
+            side_effect=AssertionError("account-home resolver must not run"),
+        ):
+            candidates = _scheduler_doctor_test_namespace_candidates()
+
+        self.assertIn(Path(os.path.realpath(REPO_ROOT)), candidates)
 
     def test_stale_session_is_swept_before_reuse(self) -> None:
         session_root = _scheduler_doctor_test_session_directory()
@@ -555,7 +1053,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
 
         self.assertFalse(stale_path.exists())
 
-    def test_stale_session_sweep_accepts_exact_entry_limit(self) -> None:
+    def test_stale_session_inventory_accepts_exact_entry_limit(self) -> None:
         class TrackedScandir:
             def __init__(self, names: list[str]) -> None:
                 self._names = iter(names)
@@ -588,14 +1086,8 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         names.append(_SCHEDULER_DOCTOR_TEST_LOCK_NAME)
         iterator = TrackedScandir(names)
         namespace = Path("/bounded-scheduler-doctor-fixture")
-        with (
-            mock.patch.object(os, "scandir", return_value=iterator),
-            mock.patch(
-                f"{__name__}._validate_owner_private_directory"
-            ) as validate,
-            mock.patch.object(shutil, "rmtree") as rmtree,
-        ):
-            _sweep_stale_scheduler_doctor_sessions(namespace)
+        with mock.patch.object(os, "scandir", return_value=iterator):
+            result = _bounded_scheduler_doctor_stale_session_names(namespace)
 
         self.assertTrue(iterator.closed)
         self.assertEqual(
@@ -603,26 +1095,15 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT + 1,
         )
         self.assertEqual(
-            validate.call_count,
+            len(result),
             _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT,
         )
         self.assertEqual(
-            rmtree.call_count,
-            _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT,
-        )
-        self.assertEqual(
-            [call.args[0] for call in rmtree.call_args_list],
-            sorted(
-                (
-                    namespace / name
-                    for name in names
-                    if name != _SCHEDULER_DOCTOR_TEST_LOCK_NAME
-                ),
-                key=lambda path: path.name,
-            ),
+            result,
+            tuple(sorted(names[:-1], key=os.fsencode)),
         )
 
-    def test_stale_session_sweep_stops_at_limit_plus_one(self) -> None:
+    def test_stale_session_inventory_stops_at_limit_plus_one(self) -> None:
         class TrackedScandir:
             def __init__(self, names: list[str]) -> None:
                 self._names = iter(names)
@@ -656,24 +1137,178 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         namespace = Path("/bounded-scheduler-doctor-fixture")
         with (
             mock.patch.object(os, "scandir", return_value=iterator),
-            mock.patch(
-                f"{__name__}._validate_owner_private_directory"
-            ) as validate,
-            mock.patch.object(shutil, "rmtree") as rmtree,
             self.assertRaisesRegex(
                 RuntimeError,
                 "too many scheduler-doctor fixture namespace entries",
             ),
         ):
-            _sweep_stale_scheduler_doctor_sessions(namespace)
+            _bounded_scheduler_doctor_stale_session_names(namespace)
 
         self.assertTrue(iterator.closed)
         self.assertEqual(
             iterator.read_count,
             _SCHEDULER_DOCTOR_TEST_NAMESPACE_ENTRY_LIMIT + 2,
         )
-        validate.assert_not_called()
-        rmtree.assert_not_called()
+
+    def test_stale_session_sweep_removes_nested_entries_without_following_symlinks(
+        self,
+    ) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            root = Path(directory)
+            namespace = root / "namespace"
+            namespace.mkdir(mode=0o700)
+            external = root / "external"
+            external.mkdir(mode=0o700)
+            marker = external / "marker"
+            marker.write_text("keep\n", encoding="utf-8")
+            stale = namespace / "session.stale"
+            stale.mkdir(mode=0o700)
+            nested = stale / "nested"
+            nested.mkdir(mode=0o700)
+            (nested / "file").write_text("remove\n", encoding="utf-8")
+            (stale / "external-link").symlink_to(external, target_is_directory=True)
+
+            _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertFalse(stale.exists())
+            self.assertEqual(marker.read_text(encoding="utf-8"), "keep\n")
+
+    def test_stale_session_entry_budget_failure_does_not_delete(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            stale = namespace / "session.stale"
+            stale.mkdir(mode=0o700)
+            (stale / "first").write_text("one\n", encoding="utf-8")
+            (stale / "second").write_text("two\n", encoding="utf-8")
+            before = snapshot_tree(namespace)
+
+            with (
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_ENTRY_LIMIT",
+                    2,
+                ),
+                self.assertRaisesRegex(RuntimeError, "entry limit exceeded"),
+            ):
+                _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertEqual(snapshot_tree(namespace), before)
+
+    def test_stale_session_depth_budget_failure_does_not_delete(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            stale = namespace / "session.stale"
+            stale.mkdir(mode=0o700)
+            nested = stale / "one" / "two"
+            nested.parent.mkdir(mode=0o700)
+            nested.mkdir(mode=0o700)
+            (nested / "file").write_text("keep\n", encoding="utf-8")
+            before = snapshot_tree(namespace)
+
+            with (
+                mock.patch(
+                    f"{__name__}._SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_DEPTH_LIMIT",
+                    2,
+                ),
+                self.assertRaisesRegex(RuntimeError, "depth limit exceeded"),
+            ):
+                _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertEqual(snapshot_tree(namespace), before)
+
+    def test_stale_session_planning_timeout_does_not_delete(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            stale = namespace / "session.stale"
+            stale.mkdir(mode=0o700)
+            (stale / "file").write_text("keep\n", encoding="utf-8")
+            before = snapshot_tree(namespace)
+
+            with (
+                mock.patch.object(time, "monotonic", side_effect=(0.0, 31.0)),
+                self.assertRaisesRegex(RuntimeError, "planning timed out"),
+            ):
+                _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertEqual(snapshot_tree(namespace), before)
+
+    def test_stale_session_replacement_before_apply_is_preserved(self) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            stale = namespace / "session.stale"
+            stale.mkdir(mode=0o700)
+            (stale / "original").write_text("keep\n", encoding="utf-8")
+            displaced = namespace / "displaced"
+            real_inventory = _bounded_scheduler_doctor_stale_session_names
+            inventory_count = 0
+
+            def replace_before_apply(
+                path: Path | int,
+                *,
+                deadline: float | None = None,
+            ) -> tuple[str, ...]:
+                nonlocal inventory_count
+                result = real_inventory(path, deadline=deadline)
+                inventory_count += 1
+                if inventory_count == 2:
+                    stale.rename(displaced)
+                    stale.mkdir(mode=0o700)
+                    (stale / "replacement").write_text(
+                        "keep\n",
+                        encoding="utf-8",
+                    )
+                return result
+
+            with (
+                mock.patch(
+                    f"{__name__}._bounded_scheduler_doctor_stale_session_names",
+                    side_effect=replace_before_apply,
+                ),
+                self.assertRaisesRegex(RuntimeError, "entry changed"),
+            ):
+                _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertTrue((displaced / "original").is_file())
+            self.assertTrue((stale / "replacement").is_file())
+
+    def test_stale_session_access_policy_drift_before_apply_is_preserved(
+        self,
+    ) -> None:
+        with _scheduler_doctor_test_temporary_directory() as directory:
+            namespace = Path(directory) / "namespace"
+            namespace.mkdir(mode=0o700)
+            stale = namespace / "session.stale"
+            stale.mkdir(mode=0o700)
+            (stale / "original").write_text("keep\n", encoding="utf-8")
+            real_inventory = _bounded_scheduler_doctor_stale_session_names
+            inventory_count = 0
+
+            def change_policy_before_apply(
+                path: Path | int,
+                *,
+                deadline: float | None = None,
+            ) -> tuple[str, ...]:
+                nonlocal inventory_count
+                result = real_inventory(path, deadline=deadline)
+                inventory_count += 1
+                if inventory_count == 2:
+                    stale.chmod(0o755)
+                return result
+
+            with (
+                mock.patch(
+                    f"{__name__}._bounded_scheduler_doctor_stale_session_names",
+                    side_effect=change_policy_before_apply,
+                ),
+                self.assertRaisesRegex(RuntimeError, "entry changed"),
+            ):
+                _sweep_stale_scheduler_doctor_sessions(namespace)
+
+            self.assertTrue((stale / "original").is_file())
+            self.assertEqual(stat.S_IMODE(stale.lstat().st_mode), 0o755)
 
     def test_shared_temp_checkout_falls_back_to_safe_anchor(self) -> None:
         with _scheduler_doctor_test_temporary_directory() as fallback_directory:
@@ -971,6 +1606,58 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         finally:
             os.close(descriptor)
+
+    def test_session_lease_retries_busy_lock_then_succeeds(self) -> None:
+        busy = BlockingIOError(errno.EWOULDBLOCK, "fixture lease is busy")
+        with (
+            mock.patch.object(
+                fcntl,
+                "flock",
+                side_effect=(busy, None),
+            ) as flock,
+            mock.patch.object(time, "monotonic", side_effect=(10.0, 10.0)),
+            mock.patch.object(time, "sleep") as sleep,
+        ):
+            _acquire_scheduler_doctor_test_session_lease(
+                123,
+                timeout_seconds=1.0,
+                retry_seconds=0.05,
+            )
+
+        self.assertEqual(flock.call_count, 2)
+        flock.assert_called_with(123, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        sleep.assert_called_once_with(0.05)
+
+    def test_session_lease_timeout_is_bounded(self) -> None:
+        busy = BlockingIOError(errno.EWOULDBLOCK, "fixture lease is busy")
+        with (
+            mock.patch.object(fcntl, "flock", side_effect=busy) as flock,
+            mock.patch.object(time, "monotonic", side_effect=(10.0, 11.0)),
+            mock.patch.object(time, "sleep") as sleep,
+            self.assertRaisesRegex(RuntimeError, "timed out acquiring"),
+        ):
+            _acquire_scheduler_doctor_test_session_lease(
+                123,
+                timeout_seconds=1.0,
+                retry_seconds=0.05,
+            )
+
+        flock.assert_called_once_with(123, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        sleep.assert_not_called()
+
+    def test_session_lease_propagates_nonbusy_error(self) -> None:
+        failure = OSError(errno.EBADF, "bad fixture descriptor")
+        with (
+            mock.patch.object(fcntl, "flock", side_effect=failure) as flock,
+            mock.patch.object(time, "monotonic", return_value=10.0),
+            mock.patch.object(time, "sleep") as sleep,
+            self.assertRaises(OSError) as raised,
+        ):
+            _acquire_scheduler_doctor_test_session_lease(123)
+
+        self.assertEqual(raised.exception.errno, errno.EBADF)
+        flock.assert_called_once_with(123, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        sleep.assert_not_called()
 
 
 class SchedulerDoctorTests(unittest.TestCase):
