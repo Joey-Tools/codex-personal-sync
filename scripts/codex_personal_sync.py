@@ -269,6 +269,9 @@ SYSTEMD_UNIT = "codex-personal-sync"
 DEFAULT_SCHEDULER_INTERVAL_MINUTES = 60
 MAX_SCHEDULER_INTERVAL_MINUTES = 525_600
 MACOS_SCHEDULER_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+MACOS_BACKGROUND_LAUNCHD_DOMAIN = "user"
+MACOS_LEGACY_GUI_LAUNCHD_DOMAIN = "gui"
+MACOS_BACKGROUND_SESSION_TYPE = "Background"
 LINUX_SCHEDULER_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 SCHEDULER_STATUS_RELATIVE_PATH = Path("state/scheduler-status.json")
 SCHEDULER_STATUS_PUBLICATION_MARKER_NAME = (
@@ -956,6 +959,7 @@ class SchedulerConfig:
     repo: str
     base_repo: str | None
     owner: str | None
+    launchd_domain: str | None = None
 
 
 @dataclass(frozen=True)
@@ -21672,7 +21676,16 @@ def _load_macos_scheduler_config(
         config_paths=(paths.launchd_plist,),
         interval_minutes=interval_seconds // 60,
     )
-    expected = _launchd_plist(
+    expected_background = _launchd_plist(
+        config.home,
+        config.repo,
+        config.interval_minutes,
+        config.runner,
+        mode=config.mode,
+        base_repo=config.base_repo or config.repo,
+        owner=config.owner or PUBLIC_OWNER,
+    )
+    expected_gui = _legacy_gui_launchd_plist(
         config.home,
         config.repo,
         config.interval_minutes,
@@ -21682,8 +21695,37 @@ def _load_macos_scheduler_config(
         owner=config.owner or PUBLIC_OWNER,
     )
     if config.command != "run-scheduled":
-        expected["ProgramArguments"] = data.get("ProgramArguments")
-    if data != expected:
+        expected_background["ProgramArguments"] = data.get("ProgramArguments")
+        expected_gui["ProgramArguments"] = data.get("ProgramArguments")
+    accepted_profiles: list[tuple[dict[str, Any], str]] = [
+        (expected_background, MACOS_BACKGROUND_LAUNCHD_DOMAIN),
+        (expected_gui, MACOS_LEGACY_GUI_LAUNCHD_DOMAIN),
+    ]
+    if config.command != "run-scheduled":
+        # Older published schedulers predate the no-bytecode environment
+        # hardening. Admit only those two otherwise-exact historical profiles
+        # so a bare install-scheduler can repair them in one transaction.
+        accepted_profiles.extend(
+            (
+                (
+                    {
+                        **expected,
+                        "EnvironmentVariables": {
+                            key: value
+                            for key, value in expected["EnvironmentVariables"].items()
+                            if key != "PYTHONDONTWRITEBYTECODE"
+                        },
+                    },
+                    domain,
+                )
+                for expected, domain in tuple(accepted_profiles)
+            )
+        )
+    launchd_domain = next(
+        (domain for expected, domain in accepted_profiles if data == expected),
+        None,
+    )
+    if launchd_domain is None:
         raise SyncError(
             f"launchd scheduler config has unsupported execution semantics: "
             f"{paths.launchd_plist}"
@@ -21695,7 +21737,7 @@ def _load_macos_scheduler_config(
         raise SyncError(
             f"launchd scheduler config changed during audit: {paths.launchd_plist}"
         )
-    return config
+    return replace(config, launchd_domain=launchd_domain)
 
 
 def _systemd_drop_in_metadata(
@@ -22042,6 +22084,15 @@ def _legacy_launchd_plist(paths: SchedulerPaths, label: str) -> Path:
     return paths.launchd_plist.parent / f"{label}.plist"
 
 
+def _macos_launchd_domain(domain_kind: str) -> str:
+    if domain_kind not in {
+        MACOS_BACKGROUND_LAUNCHD_DOMAIN,
+        MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
+    }:
+        raise SyncError(f"unsupported macOS launchd domain: {domain_kind}")
+    return f"{domain_kind}/{os.getuid()}"
+
+
 def _conditionally_remove_bound_scheduler_config(
     binding: SchedulerActivationBinding,
     *,
@@ -22104,7 +22155,6 @@ def _cleanup_legacy_launchd_schedulers(
         return
     if not remove:
         return
-    domain = f"gui/{os.getuid()}"
     labels = tuple(LEGACY_LAUNCHD_LABELS)
 
     def live_bindings(
@@ -22130,23 +22180,24 @@ def _cleanup_legacy_launchd_schedulers(
         complete_bindings: tuple[SchedulerActivationBinding, ...],
     ) -> None:
         if disable:
-            bootout_args = (
-                ["launchctl", "bootout", domain, str(legacy_plist)]
-                if legacy_present
-                else ["launchctl", "bootout", f"{domain}/{label}"]
-            )
-            _run_native_scheduler_action(
-                bootout_args,
-                dry_run=dry_run,
-                allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
-                activation_bindings=live_bindings(complete_bindings),
-            )
-            _run_native_scheduler_action(
-                ["launchctl", "disable", f"{domain}/{label}"],
-                dry_run=dry_run,
-                allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
-                activation_bindings=live_bindings(complete_bindings),
-            )
+            del legacy_present
+            for domain_kind in (
+                MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
+                MACOS_BACKGROUND_LAUNCHD_DOMAIN,
+            ):
+                domain = _macos_launchd_domain(domain_kind)
+                _run_native_scheduler_action(
+                    ["launchctl", "bootout", f"{domain}/{label}"],
+                    dry_run=dry_run,
+                    allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
+                    activation_bindings=live_bindings(complete_bindings),
+                )
+                _run_native_scheduler_action(
+                    ["launchctl", "disable", f"{domain}/{label}"],
+                    dry_run=dry_run,
+                    allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
+                    activation_bindings=live_bindings(complete_bindings),
+                )
         if dry_run:
             _unlink_file(legacy_plist, dry_run=True)
             return
@@ -22251,7 +22302,7 @@ def _scheduler_install_args(
     raise SyncError(f"unsupported scheduler mode: {mode}")
 
 
-def _launchd_plist(
+def _legacy_gui_launchd_plist(
     home: Path,
     repo: str,
     interval_minutes: int,
@@ -22281,6 +22332,44 @@ def _launchd_plist(
             "PYTHONDONTWRITEBYTECODE": "1",
         },
     }
+
+
+def _launchd_plist(
+    home: Path,
+    repo: str,
+    interval_minutes: int,
+    runner: Path,
+    *,
+    mode: str = "public",
+    base_repo: str = DEFAULT_PUBLIC_RELEASE_REPO,
+    owner: str = "private",
+) -> dict[str, Any]:
+    user_home = _codex_user_home(home)
+    payload = _legacy_gui_launchd_plist(
+        home,
+        repo,
+        interval_minutes,
+        runner,
+        mode=mode,
+        base_repo=base_repo,
+        owner=owner,
+    )
+    payload.update(
+        {
+            "LimitLoadToSessionType": MACOS_BACKGROUND_SESSION_TYPE,
+            "LowPriorityIO": True,
+            "ProcessType": MACOS_BACKGROUND_SESSION_TYPE,
+            "ThrottleInterval": 60,
+            "Umask": 0o077,
+            "WorkingDirectory": str(user_home),
+        }
+    )
+    payload["EnvironmentVariables"] = {
+        "HOME": str(user_home),
+        "PATH": MACOS_SCHEDULER_PATH,
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    return payload
 
 
 def _validate_systemd_argument(value: str) -> None:
@@ -22453,14 +22542,22 @@ def _launchd_quoted_not_loaded_evidence(
     *,
     label: str,
     uid: str,
+    domain_kind: str,
 ) -> bool:
     evidence = re.sub(r"\s+", " ", raw_evidence.strip())
     if not evidence:
         return False
+    if domain_kind == MACOS_BACKGROUND_LAUNCHD_DOMAIN:
+        domain_evidence = r"in domain for uid: ([0-9]+)"
+    elif domain_kind == MACOS_LEGACY_GUI_LAUNCHD_DOMAIN:
+        domain_evidence = r"in domain for user gui: ([0-9]+)"
+    else:
+        return False
     matched = re.fullmatch(
         (
             r'(?:bad request\. )?could not find service "([^"]+)" '
-            r"in domain for user gui: ([0-9]+)[.;]?"
+            + domain_evidence
+            + r"[.;]?"
         ),
         evidence,
         flags=re.IGNORECASE,
@@ -22470,26 +22567,45 @@ def _launchd_quoted_not_loaded_evidence(
 
 def _launchctl_expected_not_loaded_target(
     args: list[str],
-) -> tuple[str, str] | None:
+) -> tuple[str, str, str] | None:
     if len(args) < 3 or args[0] != "launchctl":
         return None
     operation = args[1]
     if operation not in {"bootout", "disable"}:
         return None
     uid = str(os.getuid())
-    domain = f"gui/{uid}"
-    for label in (LAUNCHD_LABEL, *LEGACY_LAUNCHD_LABELS):
-        service_target = f"{domain}/{label}"
-        if len(args) == 3 and args[2] == service_target:
-            return label, uid
-        if (
-            operation == "bootout"
-            and len(args) == 4
-            and args[2] == domain
-            and Path(args[3]).name == f"{label}.plist"
-        ):
-            return label, uid
+    for domain_kind in (
+        MACOS_BACKGROUND_LAUNCHD_DOMAIN,
+        MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
+    ):
+        domain = f"{domain_kind}/{uid}"
+        for label in (LAUNCHD_LABEL, *LEGACY_LAUNCHD_LABELS):
+            service_target = f"{domain}/{label}"
+            if len(args) == 3 and args[2] == service_target:
+                return label, uid, domain_kind
+            if (
+                operation == "bootout"
+                and len(args) == 4
+                and args[2] == domain
+                and Path(args[3]).name == f"{label}.plist"
+            ):
+                return label, uid, domain_kind
     return None
+
+
+def _launchd_gui_domain_unavailable_evidence(raw_evidence: str) -> bool:
+    evidence = re.sub(r"\s+", " ", raw_evidence.strip())
+    return (
+        re.fullmatch(
+            (
+                r"(?:could not print domain|(?:boot-out|bootout) failed): "
+                r"125: domain does not support specified action[.;]?"
+            ),
+            evidence,
+            flags=re.IGNORECASE,
+        )
+        is not None
+    )
 
 
 def _native_scheduler_failure_is_already_absent(
@@ -22540,6 +22656,14 @@ def _native_scheduler_failure_is_already_absent(
                     completed.stdout + "\n" + completed.stderr,
                     label=target[0],
                     uid=target[1],
+                    domain_kind=target[2],
+                )
+            )
+            or (
+                target is not None
+                and target[2] == MACOS_LEGACY_GUI_LAUNCHD_DOMAIN
+                and _launchd_gui_domain_unavailable_evidence(
+                    completed.stdout + "\n" + completed.stderr
                 )
             )
         )
@@ -23754,55 +23878,132 @@ def _scheduler_daemon_enabled(
         )
 
     if paths.platform == "macos":
-        completed = run_query(
-            [
-                "launchctl",
-                "print",
-                f"gui/{os.getuid()}/{LAUNCHD_LABEL}",
-            ],
-            description="query",
+
+        def classify_launchd_query(
+            completed: subprocess.CompletedProcess[str],
+            *,
+            domain_kind: str,
+        ) -> SchedulerDaemonQuery:
+            raw_evidence = completed.stdout + "\n" + completed.stderr
+            evidence = raw_evidence.strip().casefold()
+            if any(
+                marker in evidence
+                for marker in (
+                    "operation not permitted",
+                    "permission denied",
+                    "access denied",
+                )
+            ):
+                return SchedulerDaemonQuery(
+                    "unavailable",
+                    f"launchd {domain_kind} domain query was denied",
+                )
+            if completed.stderr.strip() and completed.returncode == 0:
+                return SchedulerDaemonQuery(
+                    "unavailable",
+                    f"launchd {domain_kind} domain query returned "
+                    "contradictory error output",
+                )
+            if completed.returncode == 0:
+                return SchedulerDaemonQuery("enabled")
+            if (
+                any(
+                    re.fullmatch(pattern, evidence) is not None
+                    for pattern in (
+                        r"could not find specified service[.;]?",
+                        r"could not find service in domain[.;]?",
+                        r"service not found in domain[.;]?",
+                    )
+                )
+                or _launchd_quoted_not_loaded_evidence(
+                    raw_evidence,
+                    label=LAUNCHD_LABEL,
+                    uid=str(os.getuid()),
+                    domain_kind=domain_kind,
+                )
+                or (
+                    domain_kind == MACOS_LEGACY_GUI_LAUNCHD_DOMAIN
+                    and _launchd_gui_domain_unavailable_evidence(raw_evidence)
+                )
+            ):
+                return SchedulerDaemonQuery(
+                    "disabled",
+                    f"launchd reports that the scheduler service is not loaded "
+                    f"in the {domain_kind} domain",
+                )
+            return SchedulerDaemonQuery(
+                "unavailable",
+                f"launchd {domain_kind} domain query failed without explicit "
+                "not-loaded evidence",
+            )
+
+        domain_queries: dict[str, SchedulerDaemonQuery] = {}
+        for domain_kind in (
+            MACOS_BACKGROUND_LAUNCHD_DOMAIN,
+            MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
+        ):
+            completed = run_query(
+                [
+                    "launchctl",
+                    "print",
+                    f"{_macos_launchd_domain(domain_kind)}/{LAUNCHD_LABEL}",
+                ],
+                description=f"{domain_kind} domain query",
+            )
+            if isinstance(completed, SchedulerDaemonQuery):
+                domain_queries[domain_kind] = completed
+            else:
+                domain_queries[domain_kind] = classify_launchd_query(
+                    completed,
+                    domain_kind=domain_kind,
+                )
+
+        unavailable = next(
+            (
+                query
+                for query in domain_queries.values()
+                if query.classification == "unavailable"
+            ),
+            None,
         )
-        if isinstance(completed, SchedulerDaemonQuery):
-            return completed
-        evidence = (completed.stdout + "\n" + completed.stderr).strip().casefold()
-        if any(
-            marker in evidence
-            for marker in (
-                "operation not permitted",
-                "permission denied",
-                "access denied",
-            )
-        ):
-            return SchedulerDaemonQuery(
-                "unavailable",
-                "launchd scheduler query was denied",
-            )
-        if completed.stderr.strip() and completed.returncode == 0:
-            return SchedulerDaemonQuery(
-                "unavailable",
-                "launchd scheduler query returned contradictory error output",
-            )
-        if completed.returncode == 0:
-            return SchedulerDaemonQuery("enabled")
-        if any(
-            re.fullmatch(pattern, evidence) is not None
-            for pattern in (
-                r"could not find specified service[.;]?",
-                r"could not find service in domain[.;]?",
-                r"service not found in domain[.;]?",
-            )
-        ) or _launchd_quoted_not_loaded_evidence(
-            completed.stdout + "\n" + completed.stderr,
-            label=LAUNCHD_LABEL,
-            uid=str(os.getuid()),
-        ):
+        if unavailable is not None:
+            return unavailable
+        enabled_domains = tuple(
+            domain_kind
+            for domain_kind, query in domain_queries.items()
+            if query.classification == "enabled"
+        )
+        if not enabled_domains:
             return SchedulerDaemonQuery(
                 "disabled",
-                "launchd reports that the scheduler service is not loaded",
+                "launchd reports that the scheduler service is not loaded in "
+                "either the user or GUI domain",
+            )
+        if len(enabled_domains) != 1:
+            return SchedulerDaemonQuery(
+                "unavailable",
+                "launchd reports duplicate scheduler services in the user and "
+                "GUI domains",
+            )
+        loaded_domain = enabled_domains[0]
+        configured_domain = (
+            config_audit.config.launchd_domain
+            if config_audit is not None and config_audit.config is not None
+            else None
+        )
+        if configured_domain is not None and loaded_domain != configured_domain:
+            return SchedulerDaemonQuery(
+                "unavailable",
+                f"launchd scheduler is loaded in the {loaded_domain} domain but "
+                f"the audited configuration targets {configured_domain}",
             )
         return SchedulerDaemonQuery(
-            "unavailable",
-            "launchd scheduler query failed without explicit not-loaded evidence",
+            "enabled",
+            (
+                "launchd scheduler is loaded in the legacy GUI domain"
+                if loaded_domain == MACOS_LEGACY_GUI_LAUNCHD_DOMAIN
+                else None
+            ),
         )
 
     if paths.platform != "linux":
@@ -26115,6 +26316,10 @@ def _install_scheduler_transaction_with_bindings(
         and existing.repo == repo
         and existing.base_repo == desired_base_repo
         and existing.owner == desired_owner
+        and (
+            selected_platform != "macos"
+            or existing.launchd_domain == MACOS_BACKGROUND_LAUNCHD_DOMAIN
+        )
     )
     if config_matches:
         assert existing is not None
@@ -26180,20 +26385,56 @@ def _install_scheduler_transaction_with_bindings(
                 retained_legacy_bindings=legacy_bindings,
             )
             if enable:
-                domain = f"gui/{os.getuid()}"
+                gui_domain = _macos_launchd_domain(MACOS_LEGACY_GUI_LAUNCHD_DOMAIN)
+                background_domain = _macos_launchd_domain(
+                    MACOS_BACKGROUND_LAUNCHD_DOMAIN
+                )
                 _run_native_scheduler_action(
-                    ["launchctl", "bootout", domain, str(paths.launchd_plist)],
+                    [
+                        "launchctl",
+                        "bootout",
+                        f"{gui_domain}/{LAUNCHD_LABEL}",
+                    ],
                     dry_run=dry_run,
-                    allow_fail=True,
+                    allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
                     activation_bindings=bindings,
                 )
                 _run_native_scheduler_action(
-                    ["launchctl", "bootstrap", domain, str(paths.launchd_plist)],
+                    [
+                        "launchctl",
+                        "disable",
+                        f"{gui_domain}/{LAUNCHD_LABEL}",
+                    ],
+                    dry_run=dry_run,
+                    allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
+                    activation_bindings=bindings,
+                )
+                _run_native_scheduler_action(
+                    [
+                        "launchctl",
+                        "bootout",
+                        f"{background_domain}/{LAUNCHD_LABEL}",
+                    ],
+                    dry_run=dry_run,
+                    allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
+                    activation_bindings=bindings,
+                )
+                _run_native_scheduler_action(
+                    [
+                        "launchctl",
+                        "bootstrap",
+                        background_domain,
+                        str(paths.launchd_plist),
+                    ],
                     dry_run=dry_run,
                     activation_bindings=bindings,
                 )
                 _run_native_scheduler_action(
-                    ["launchctl", "enable", f"{domain}/{LAUNCHD_LABEL}"],
+                    [
+                        "launchctl",
+                        "enable",
+                        f"{background_domain}/{LAUNCHD_LABEL}",
+                    ],
                     dry_run=dry_run,
                     activation_bindings=bindings,
                 )
@@ -27111,29 +27352,31 @@ def _uninstall_scheduler_transaction(
                     require_disabled=False,
                 )
             if disable:
-                domain = f"gui/{os.getuid()}"
-                bootout_args = (
-                    ["launchctl", "bootout", f"{domain}/{LAUNCHD_LABEL}"]
-                    if orphan_cleanup
-                    else [
-                        "launchctl",
-                        "bootout",
-                        domain,
-                        str(paths.launchd_plist),
-                    ]
-                )
-                _run_native_scheduler_action(
-                    bootout_args,
-                    dry_run=dry_run,
-                    allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
-                    activation_bindings=complete_bindings,
-                )
-                _run_native_scheduler_action(
-                    ["launchctl", "disable", f"{domain}/{LAUNCHD_LABEL}"],
-                    dry_run=dry_run,
-                    allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
-                    activation_bindings=complete_bindings,
-                )
+                for domain_kind in (
+                    MACOS_BACKGROUND_LAUNCHD_DOMAIN,
+                    MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
+                ):
+                    domain = _macos_launchd_domain(domain_kind)
+                    _run_native_scheduler_action(
+                        [
+                            "launchctl",
+                            "bootout",
+                            f"{domain}/{LAUNCHD_LABEL}",
+                        ],
+                        dry_run=dry_run,
+                        allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
+                        activation_bindings=complete_bindings,
+                    )
+                    _run_native_scheduler_action(
+                        [
+                            "launchctl",
+                            "disable",
+                            f"{domain}/{LAUNCHD_LABEL}",
+                        ],
+                        dry_run=dry_run,
+                        allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
+                        activation_bindings=complete_bindings,
+                    )
             _cleanup_legacy_launchd_schedulers(
                 paths,
                 dry_run=dry_run,
@@ -31629,7 +31872,16 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
             config.repo if config is not None and config.mode == "private" else None
         ),
         owner=config.owner if config is not None else None,
-        migration_needed=(config is not None and config.command != "run-scheduled"),
+        migration_needed=(
+            config is not None
+            and (
+                config.command != "run-scheduled"
+                or (
+                    config.platform == "macos"
+                    and config.launchd_domain != MACOS_BACKGROUND_LAUNCHD_DOMAIN
+                )
+            )
+        ),
         last_attempt=(
             runtime_state.get("last_attempt")
             if runtime_matches_config and runtime_state is not None
