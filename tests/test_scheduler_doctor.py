@@ -4335,6 +4335,10 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                     SchedulerDoctorTests,
                     "test_mirror_quarantine_terminal_revalidates_primary_absence_anchor",
                 ),
+                (
+                    SchedulerDoctorTests,
+                    "test_mirror_walkers_transfer_fd_before_effectful_close_error",
+                ),
             ):
                 with self.subTest(case_name=case_name):
                     production_case = case_type(case_name)
@@ -4782,6 +4786,7 @@ class SchedulerDoctorTests(unittest.TestCase):
         production_account_home_binder = (
             MODULE._bind_mirror_trusted_account_home
         )
+        self.production_account_home_binder = production_account_home_binder
         self.fixture_account_home_binder_patch = mock.patch.object(
             MODULE,
             "_bind_mirror_trusted_account_home",
@@ -14587,6 +14592,15 @@ class SchedulerDoctorTests(unittest.TestCase):
 
     def test_mirror_walkers_transfer_fd_before_effectful_close_error(self) -> None:
         real_close = MODULE.os.close
+        account_home_candidate = Path("/usr")
+        account_home_metadata = account_home_candidate.lstat()
+        account_home_mode, account_home_uid, _account_home_gid = (
+            MODULE._mirror_access_policy(account_home_metadata)
+        )
+        self.assertTrue(stat.S_ISDIR(account_home_metadata.st_mode))
+        self.assertFalse(stat.S_ISLNK(account_home_metadata.st_mode))
+        self.assertEqual(account_home_uid, 0)
+        self.assertFalse(account_home_mode & 0o022)
 
         def invoke_ancestry() -> None:
             candidate_fd = os.open(
@@ -14605,7 +14619,9 @@ class SchedulerDoctorTests(unittest.TestCase):
         for label, invoke in (
             (
                 "account-home",
-                lambda: MODULE._bind_mirror_trusted_account_home(self.root),
+                lambda: self.production_account_home_binder(
+                    account_home_candidate
+                ),
             ),
             ("ancestry", invoke_ancestry),
         ):
