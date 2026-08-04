@@ -21,10 +21,10 @@ superseded_by:
   `70dc2c727e91036e9d155ec17dbed643eef26990`.
 - The PR #6 scheduler-doctor fixture and source-lock substage is complete for
   the target-branch state. Its latest pre-squash implementation evidence is
-  signed head `b511af84ed5581fa5d9aa27e3afff22c2465acdb`, tree
-  `e5d54a715123f66b5eb98bfc971ed2cfbc2dc813`; the verified BL-generated
+  signed head `aec928f939b1b99c368edc1796c74feaf814722c`, tree
+  `398fca352b8b9e2cf2136add853964e0ae141187`; the verified BL-generated
   source-lock SHA-256 is
-  `c1d9f214f68bdcee8f57443e26b41c761fb905b21c8c312e8c11330a2681e677`.
+  `343d9fac510b9e010b54fca25dc798acb2e0d468fecb9518b1f0a0cd17f680c8`.
   These pre-squash identities remain historical evidence only. Downstream
   generation must bind the actual squash-landed canonical `P` identity.
 
@@ -1747,6 +1747,41 @@ superseded_by:
   no substitute; the owner-side Ruff E4/E7/E9/F gate was clean. The refreshed
   `sync-source-lock.json` SHA-256 is
   `c1d9f214f68bdcee8f57443e26b41c761fb905b21c8c312e8c11330a2681e677`.
+  The implementation and append-only source-lock/journal identities remain
+  historical evidence only. Downstream generation must bind the actual
+  squash-landed canonical `P` before producing `T`/`B` or propagating private
+  and scheduler state.
+- The scheduler-doctor cleanup-quarantine hardening substage is complete for
+  the target-branch state. Historical pre-squash implementation evidence is
+  signed head `aec928f939b1b99c368edc1796c74feaf814722c`, tree
+  `398fca352b8b9e2cf2136add853964e0ae141187`, with sole parent
+  `a7a442a8f9406fa623456334cf0d0850b3edf3b3`. GitHub reports the exact
+  signature provider-valid. A byte-pinned `JoeyTeng.gpg` public-key snapshot
+  with SHA-256
+  `f133da0263f60d75b876f0d6f69d997012272250ded580877d75f19677b6f852`
+  supplied a task-scoped BL keyring; `GOODSIG` and `VALIDSIG` matched signing
+  fingerprint `EFBBC913F49A5F6E0AF0D248F70246143DC28F32`. The only
+  implementation path is `tests/test_scheduler_doctor.py`, blob
+  `94be428c99cf021f0275ea8d1dd95fa41ab939ad`, with SHA-256
+  `7b3bc0c20808dc961b00537c9dfa0f5ef00ee64eba7507b17082434677a12d27`.
+  A fresh full HTTPS BL custody clone independently matched PR #6 head, tree,
+  sole parent, changed blob, signature, and complete object closure. The source
+  was non-shallow and non-promisor with no filter or alternate; lazy fetching
+  was disabled and strict full `fsck` passed all 1,040 objects. Under standard
+  `umask 022`, the checkout matched its 22 Git-declared `0644` paths and one
+  `0755` path. Unmodified stock `refresh-lock` refreshed all six sources and
+  stock `refresh-lock --check` verified them. The complete canonical
+  source-lock suite passed 230/230 in 366.854 seconds with one expected
+  platform skip through the repository's private-`TMPDIR` wrapper. The 14 new
+  cleanup-quarantine regressions passed 14/14 under uv Python 3.13.13 and
+  macOS system Python 3.9.6 in 1.047 and 0.641 seconds. The full
+  scheduler-doctor suite passed 253/253 in 10.738 and 6.201 seconds,
+  respectively, with one expected platform skip per runtime. The explicit
+  owner-private scheduler-doctor namespace ended with only its regular,
+  single-link, mode-`0600` `.session.lock` and no `session.*`. All nine tracked
+  Python files passed `py_compile` under both runtimes; JSON parsing and
+  `git diff --check` passed. The refreshed `sync-source-lock.json` SHA-256 is
+  `343d9fac510b9e010b54fca25dc798acb2e0d468fecb9518b1f0a0cd17f680c8`.
   The implementation and append-only source-lock/journal identities remain
   historical evidence only. Downstream generation must bind the actual
   squash-landed canonical `P` before producing `T`/`B` or propagating private
