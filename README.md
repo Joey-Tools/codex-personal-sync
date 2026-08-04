@@ -305,11 +305,26 @@ can be reconstructed without guessing. A legacy `install` or
 
 A bare repair preserves an existing audited mode, repository, base repository,
 owner, and interval while migrating the command to the stable
-`run-scheduled` entrypoint:
+`run-scheduled` entrypoint. On macOS it also migrates an audited legacy GUI
+LaunchAgent to the canonical per-user Background LaunchAgent:
 
 ```bash
 ~/.codex/bin/codex-personal-sync install-scheduler
 ```
+
+The canonical macOS plist declares `LimitLoadToSessionType=Background` and
+`ProcessType=Background`, fixes `HOME` and `WorkingDirectory` to the account
+home, applies `Umask=077`, and enables `ThrottleInterval=60` and
+`LowPriorityIO`. The job is bootstrapped and enabled in `user/$UID`, so it does
+not depend on an Aqua/GUI login. After a cold boot, the user's first session
+(including an SSH login) is still required before the per-user LaunchAgent can
+run.
+
+Migration removes the precisely audited legacy `gui/$UID` job before
+bootstrapping the canonical `user/$UID` job. Status and uninstall inspect both
+domains for the canonical label and every managed legacy label, so a stale
+registration cannot hide a second instance. Linux keeps the existing per-user
+systemd behavior.
 
 Use explicit arguments only for an intentional target change or a first
 installation. For example:
