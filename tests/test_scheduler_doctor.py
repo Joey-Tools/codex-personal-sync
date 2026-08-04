@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import errno
@@ -540,8 +541,34 @@ def _bind_scheduler_doctor_test_root(
             )
 
 
-def _scheduler_doctor_linux_runtime_parent_binding(
+def _bind_scheduler_doctor_fixture_account_home(
+    path: Path,
+    *,
+    fixture_root: Path,
+    production_binder: Callable[
+        [Path],
+        tuple[int, tuple[int, int, int], tuple[int, int, int]],
+    ],
+) -> tuple[int, tuple[int, int, int], tuple[int, int, int]]:
+    # Keep the production account-home policy unchanged. Only the exact
+    # per-test root selected beneath the receipt-bound Linux sticky fallback
+    # uses the fixture's equivalent descriptor-safe ancestry binder.
+    path = Path(os.path.abspath(path))
+    fixture_root = Path(os.path.abspath(fixture_root))
+    fallback = _scheduler_doctor_linux_sticky_fallback_path()
+    if (
+        path != fixture_root
+        or not sys.platform.startswith("linux")
+        or not (path == fallback or path.is_relative_to(fallback))
+    ):
+        return production_binder(path)
+    return _bind_scheduler_doctor_test_root(path)
+
+
+def _scheduler_doctor_private_platform_parent_binding(
     candidate: Path,
+    *,
+    label: str,
 ) -> _SchedulerDoctorBoundNamespaceCandidate | None:
     if not candidate.is_absolute() or candidate == Path("/"):
         return None
@@ -558,8 +585,7 @@ def _scheduler_doctor_linux_runtime_parent_binding(
             return None
         except OSError as error:
             raise RuntimeError(
-                "cannot inspect Linux scheduler-doctor runtime parent "
-                f"component: {current}: {error}"
+                f"cannot inspect {label} component: {current}: {error}"
             ) from error
         mode, uid, _gid = MODULE._mirror_access_policy(metadata)
         is_terminal = index == len(components) - 1
@@ -590,6 +616,24 @@ def _scheduler_doctor_linux_runtime_parent_binding(
             os.close(descriptor)
 
 
+def _scheduler_doctor_linux_runtime_parent_binding(
+    candidate: Path,
+) -> _SchedulerDoctorBoundNamespaceCandidate | None:
+    return _scheduler_doctor_private_platform_parent_binding(
+        candidate,
+        label="Linux scheduler-doctor runtime parent",
+    )
+
+
+def _scheduler_doctor_darwin_temp_parent(
+    candidate: Path,
+) -> _SchedulerDoctorBoundNamespaceCandidate | None:
+    return _scheduler_doctor_private_platform_parent_binding(
+        candidate,
+        label="Darwin scheduler-doctor temp parent",
+    )
+
+
 def _scheduler_doctor_test_platform_anchor_parents(
 ) -> tuple[
     Path
@@ -605,21 +649,24 @@ def _scheduler_doctor_test_platform_anchor_parents(
     if sys.platform == "darwin":
         darwin_temp_root = Path("/private/var/folders")
         configured_temp = os.environ.get("TMPDIR")
-        configured_parent: Path | None = None
+        configured_parent: _SchedulerDoctorBoundNamespaceCandidate | None = None
         if configured_temp:
             candidate = Path(configured_temp)
             if candidate.is_absolute():
                 resolved = Path(os.path.realpath(candidate))
                 if resolved.is_relative_to(darwin_temp_root):
-                    configured_parent = resolved
-                    candidates.append(resolved)
+                    configured_parent = (
+                        _scheduler_doctor_darwin_temp_parent(resolved)
+                    )
+                    if configured_parent is not None:
+                        candidates.append(configured_parent)
         getconf_environment = {
             "PATH": "/usr/bin:/bin",
             "LANG": "C",
             "LC_ALL": "C",
         }
         if configured_parent is not None:
-            getconf_environment["TMPDIR"] = str(configured_parent)
+            getconf_environment["TMPDIR"] = str(configured_parent.path)
         try:
             result = subprocess.run(
                 ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"],
@@ -638,9 +685,18 @@ def _scheduler_doctor_test_platform_anchor_parents(
                 if candidate.is_absolute():
                     resolved = Path(os.path.realpath(candidate))
                     if resolved.is_relative_to(darwin_temp_root):
-                        candidates.append(resolved)
+                        bound_parent = _scheduler_doctor_darwin_temp_parent(
+                            resolved
+                        )
+                        if bound_parent is not None:
+                            candidates.append(bound_parent)
         if not candidates:
-            candidates.extend(_bounded_darwin_user_temp_directories())
+            for scanned_parent in _bounded_darwin_user_temp_directories():
+                bound_parent = _scheduler_doctor_darwin_temp_parent(
+                    scanned_parent
+                )
+                if bound_parent is not None:
+                    candidates.append(bound_parent)
     if sys.platform.startswith("linux"):
         runtime_root = Path("/run/user") / str(os.geteuid())
         runtime_candidates: list[Path] = []
@@ -882,7 +938,7 @@ def _scheduler_doctor_test_namespace_candidates(
             and resolved != candidate
         ):
             raise RuntimeError(
-                "Linux scheduler-doctor runtime parent changed after binding"
+                "scheduler-doctor platform parent changed after binding"
             )
         if resolved == candidate and _scheduler_doctor_platform_parent_in_scope(
             resolved
@@ -924,7 +980,7 @@ def _scheduler_doctor_test_namespace_candidates(
             and resolved != candidate
         ):
             raise RuntimeError(
-                "Linux scheduler-doctor runtime parent changed after binding"
+                "scheduler-doctor platform parent changed after binding"
             )
         if resolved in seen:
             continue
@@ -1168,7 +1224,7 @@ def _select_scheduler_doctor_test_namespace(
         candidate = Path(os.path.realpath(requested_candidate))
         if expected_binding is not None and candidate != requested_candidate:
             raise RuntimeError(
-                "Linux scheduler-doctor runtime parent changed after binding"
+                "scheduler-doctor platform parent changed after binding"
             )
         candidate_fd = -1
         namespace_fd = -1
@@ -1193,7 +1249,7 @@ def _select_scheduler_doctor_test_namespace(
         except MODULE.SyncError as error:
             if expected_binding is not None:
                 raise RuntimeError(
-                    "Linux scheduler-doctor runtime parent changed after binding"
+                    "scheduler-doctor platform parent changed after binding"
                 ) from error
             if not _scheduler_doctor_test_anchor_is_stably_unsuitable(
                 error,
@@ -1211,7 +1267,7 @@ def _select_scheduler_doctor_test_namespace(
                 (candidate_fd,)
             )
             candidate_fd = -1
-            message = "Linux scheduler-doctor runtime parent changed after binding"
+            message = "scheduler-doctor platform parent changed after binding"
             if close_failures:
                 message += "; " + "; ".join(close_failures)
             raise RuntimeError(message)
@@ -2002,22 +2058,32 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         self.assertEqual(resolved_candidates.count(resolved_repo), 1)
 
     def test_darwin_platform_anchor_parent_uses_fixed_getconf_result(self) -> None:
+        parent = Path("/private/var/folders/fixture/T")
+        binding = _SchedulerDoctorBoundNamespaceCandidate(
+            parent,
+            (1, 2, stat.S_IFDIR),
+            (0o700, os.geteuid(), os.getegid()),
+        )
         result = subprocess.CompletedProcess(
             args=["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"],
             returncode=0,
-            stdout="/private/var/folders/fixture/T\n",
+            stdout=f"{parent}\n",
             stderr="",
         )
         with (
             mock.patch.object(sys, "platform", "darwin"),
             mock.patch.object(subprocess, "run", return_value=result) as run,
+            mock.patch(
+                f"{__name__}._scheduler_doctor_darwin_temp_parent",
+                return_value=binding,
+            ),
             mock.patch.dict(os.environ, {}, clear=True),
         ):
             candidates = _scheduler_doctor_test_platform_anchor_parents()
 
         self.assertEqual(
             candidates,
-            (Path("/private/var/folders/fixture/T"),),
+            (binding,),
         )
         run.assert_called_once_with(
             ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"],
@@ -2049,6 +2115,12 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         self.assertEqual(candidates, ())
 
     def test_darwin_platform_anchor_parent_uses_safe_ambient_tmpdir(self) -> None:
+        parent = Path("/private/var/folders/fixture/T")
+        binding = _SchedulerDoctorBoundNamespaceCandidate(
+            parent,
+            (1, 2, stat.S_IFDIR),
+            (0o700, os.geteuid(), os.getegid()),
+        )
         result = subprocess.CompletedProcess(
             args=["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"],
             returncode=1,
@@ -2058,9 +2130,13 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
         with (
             mock.patch.object(sys, "platform", "darwin"),
             mock.patch.object(subprocess, "run", return_value=result) as run,
+            mock.patch(
+                f"{__name__}._scheduler_doctor_darwin_temp_parent",
+                return_value=binding,
+            ),
             mock.patch.dict(
                 os.environ,
-                {"TMPDIR": "/private/var/folders/fixture/T"},
+                {"TMPDIR": os.fspath(parent)},
                 clear=True,
             ),
         ):
@@ -2068,7 +2144,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
 
         self.assertEqual(
             candidates,
-            (Path("/private/var/folders/fixture/T"),),
+            (binding,),
         )
         self.assertEqual(
             run.call_args.kwargs["env"]["TMPDIR"],
@@ -2103,6 +2179,11 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             stderr="unavailable\n",
         )
         scanned = Path("/private/var/folders/fixture/T")
+        binding = _SchedulerDoctorBoundNamespaceCandidate(
+            scanned,
+            (1, 2, stat.S_IFDIR),
+            (0o700, os.geteuid(), os.getegid()),
+        )
         with (
             mock.patch.object(sys, "platform", "darwin"),
             mock.patch.object(subprocess, "run", return_value=result),
@@ -2110,12 +2191,134 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
                 f"{__name__}._bounded_darwin_user_temp_directories",
                 return_value=(scanned,),
             ) as scan,
+            mock.patch(
+                f"{__name__}._scheduler_doctor_darwin_temp_parent",
+                return_value=binding,
+            ),
             mock.patch.dict(os.environ, {"TMPDIR": "/tmp"}, clear=True),
         ):
             candidates = _scheduler_doctor_test_platform_anchor_parents()
 
-        self.assertEqual(candidates, (scanned,))
+        self.assertEqual(candidates, (binding,))
         scan.assert_called_once_with()
+
+    def test_darwin_platform_anchor_parent_skips_stale_ambient_tmpdir(
+        self,
+    ) -> None:
+        stale = Path("/private/var/folders/fixture/stale/T")
+        getconf_parent = Path("/private/var/folders/fixture/current/T")
+        getconf_binding = _SchedulerDoctorBoundNamespaceCandidate(
+            getconf_parent,
+            (1, 2, stat.S_IFDIR),
+            (0o700, os.geteuid(), os.getegid()),
+        )
+        result = subprocess.CompletedProcess(
+            args=["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"],
+            returncode=0,
+            stdout=f"{getconf_parent}\n",
+            stderr="",
+        )
+
+        def bind_parent(
+            candidate: Path,
+        ) -> _SchedulerDoctorBoundNamespaceCandidate | None:
+            return None if candidate == stale else getconf_binding
+
+        with (
+            mock.patch.object(sys, "platform", "darwin"),
+            mock.patch.object(subprocess, "run", return_value=result) as run,
+            mock.patch(
+                f"{__name__}._scheduler_doctor_darwin_temp_parent",
+                side_effect=bind_parent,
+            ) as bind,
+            mock.patch.dict(
+                os.environ,
+                {"TMPDIR": os.fspath(stale)},
+                clear=True,
+            ),
+        ):
+            candidates = _scheduler_doctor_test_platform_anchor_parents()
+
+        self.assertEqual(candidates, (getconf_binding,))
+        self.assertNotIn("TMPDIR", run.call_args.kwargs["env"])
+        self.assertEqual(
+            bind.call_args_list,
+            [mock.call(stale), mock.call(getconf_parent)],
+        )
+
+    def test_darwin_temp_parent_stable_missing_is_unavailable(self) -> None:
+        candidate = Path("/safe/missing")
+        with (
+            mock.patch.object(Path, "lstat", side_effect=FileNotFoundError()),
+            mock.patch.object(
+                MODULE,
+                "_bind_mirror_trusted_account_home",
+            ) as bind,
+        ):
+            binding = _scheduler_doctor_darwin_temp_parent(candidate)
+
+        self.assertIsNone(binding)
+        bind.assert_not_called()
+
+    def test_darwin_temp_parent_unreadable_probe_fails_closed(self) -> None:
+        candidate = Path("/safe/unreadable")
+        with (
+            mock.patch.object(
+                Path,
+                "lstat",
+                side_effect=PermissionError("denied"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_bind_mirror_trusted_account_home",
+            ) as bind,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "cannot inspect Darwin scheduler-doctor temp parent component",
+            ),
+        ):
+            _scheduler_doctor_darwin_temp_parent(candidate)
+
+        bind.assert_not_called()
+
+    def test_darwin_temp_parent_binding_drift_fails_closed(self) -> None:
+        candidate = Path("/safe/runtime")
+        safe_parent = os.stat_result(
+            (stat.S_IFDIR | 0o755, 1, 1, 1, 0, 0, 0, 0, 0, 0)
+        )
+        safe_runtime = os.stat_result(
+            (
+                stat.S_IFDIR | 0o700,
+                2,
+                1,
+                1,
+                os.geteuid(),
+                os.getegid(),
+                0,
+                0,
+                0,
+                0,
+            )
+        )
+        with (
+            mock.patch.object(
+                Path,
+                "lstat",
+                side_effect=(safe_parent, safe_runtime),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_bind_mirror_trusted_account_home",
+                side_effect=MODULE.SyncError(
+                    "Darwin temp parent changed while binding"
+                ),
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "Darwin temp parent changed while binding",
+            ),
+        ):
+            _scheduler_doctor_darwin_temp_parent(candidate)
 
     def test_linux_platform_anchor_parent_uses_fixed_runtime_root(self) -> None:
         runtime_root = Path("/run/user") / str(os.geteuid())
@@ -2750,7 +2953,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             mock.patch.object(os, "close") as close,
             self.assertRaisesRegex(
                 RuntimeError,
-                "runtime parent changed after binding",
+                "platform parent changed after binding",
             ),
         ):
             _select_scheduler_doctor_test_namespace((binding, fallback))
@@ -2784,7 +2987,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             ) as bind,
             self.assertRaisesRegex(
                 RuntimeError,
-                "runtime parent changed after binding",
+                "platform parent changed after binding",
             ),
         ):
             _select_scheduler_doctor_test_namespace((binding, fallback))
@@ -2812,7 +3015,7 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 RuntimeError,
-                "runtime parent changed after binding",
+                "platform parent changed after binding",
             ),
         ):
             _scheduler_doctor_test_namespace_candidates()
@@ -3640,6 +3843,19 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
             self.assertTrue(stat.S_ISREG(lock_metadata.st_mode))
             self.assertEqual(stat.S_IMODE(lock_metadata.st_mode), 0o600)
 
+            production_case = SchedulerDoctorTests(
+                "test_fixture_private_control_parent_is_bindable"
+            )
+            production_result = unittest.TestResult()
+            production_case.run(production_result)
+            self.assertTrue(
+                production_result.wasSuccessful(),
+                msg=(
+                    f"errors={production_result.errors!r}; "
+                    f"failures={production_result.failures!r}"
+                ),
+            )
+
     def test_linux_shared_checkout_uses_stable_sticky_fallback(self) -> None:
         with _scheduler_doctor_test_temporary_directory() as directory:
             root = Path(directory)
@@ -3904,6 +4120,20 @@ class SchedulerDoctorTests(unittest.TestCase):
         )
         self.path_home_patch.start()
         self.addCleanup(self.path_home_patch.stop)
+        production_account_home_binder = (
+            MODULE._bind_mirror_trusted_account_home
+        )
+        self.fixture_account_home_binder_patch = mock.patch.object(
+            MODULE,
+            "_bind_mirror_trusted_account_home",
+            side_effect=lambda path: _bind_scheduler_doctor_fixture_account_home(
+                path,
+                fixture_root=self.root,
+                production_binder=production_account_home_binder,
+            ),
+        )
+        self.fixture_account_home_binder_patch.start()
+        self.addCleanup(self.fixture_account_home_binder_patch.stop)
         self.host_mirror_private_control_parent = MODULE.MIRROR_PRIVATE_CONTROL_PARENT
         self.host_mirror_private_control_root_specs = (
             MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS
@@ -3934,6 +4164,25 @@ class SchedulerDoctorTests(unittest.TestCase):
         )
         self.mirror_private_control_root_specs_patch.start()
         self.addCleanup(self.mirror_private_control_root_specs_patch.stop)
+
+    def test_fixture_private_control_parent_is_bindable(self) -> None:
+        spec = MODULE.MIRROR_PRIVATE_CONTROL_ROOT_SPECS[0]
+        binding = MODULE._bind_mirror_primary_control_parent(spec)
+        self.assertIsNotNone(binding)
+        assert binding is not None
+        descriptor, identity, access_policy = binding
+        try:
+            metadata = self.mirror_private_control_parent.lstat()
+            self.assertEqual(
+                identity,
+                MODULE._mirror_object_identity(metadata),
+            )
+            self.assertEqual(
+                access_policy,
+                MODULE._mirror_access_policy(metadata),
+            )
+        finally:
+            os.close(descriptor)
 
     def write_runner(self) -> Path:
         runner = self.home / "bin" / "codex-personal-sync"
