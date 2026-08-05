@@ -3,7 +3,7 @@ id: 20260723-canonical-sync-engine
 title: Canonical Sync Engine
 status: active
 created: 2026-07-23
-updated: 2026-08-04
+updated: 2026-08-05
 branch: codex/canonical-sync-engine
 pr:
 supersedes: []
@@ -1826,6 +1826,30 @@ superseded_by:
   historical evidence only. Downstream generation must bind the actual
   squash-landed canonical `P` before producing `T`/`B` or propagating private
   and scheduler state.
+- The persisted scheduler argv contract follow-up is complete for the local
+  target-branch state. `install` now admits exactly `--repo`/`--home`,
+  `install-private` admits exactly `--repo`/`--base-repo`/`--owner`/`--home`,
+  and `run-scheduled` retains its public/private mode semantics across the full
+  five-flag vocabulary. Every repeated flag and command-invalid flag fails
+  closed, and an independent value token beginning with `-` is rejected before
+  it can be misclassified as a flag value. Exact legal legacy commands remain
+  reconstructable as
+  `migration_needed`; legacy `install` or `install-private` commands carrying
+  `--mode` report `scheduler-config-invalid`, and strict status exits `1`.
+  The parser, loader, strict-status, and repository source-lock focused set
+  passed 6/6 under both configured runtimes. The full scheduler-doctor suite
+  passed 265/265 under macOS system Python 3.9.6 in 17.424 seconds with one
+  expected platform skip. The exact CPython 3.13.0 source-lock suite passed
+  230/230 in 784.876 seconds with one expected platform skip, and the final
+  exact-byte CPython 3.13.0 repository discovery passed 1088/1088 in 1277.858
+  seconds with three expected skips. Both configured runtimes passed
+  `py_compile`; Ruff check and `git diff --check` passed. Task-private
+  mode-0700 stock `refresh-lock` and `refresh-lock --check` verified all six
+  locked sources without accessing retained production evidence. Separate
+  production-root stock invocations independently stopped at the existing
+  `legacy-recovery-pending` boundary, and no retained evidence was deleted,
+  moved, or rewritten. The refreshed `sync-source-lock.json` SHA-256 is
+  `129b8feb00f8d1a497eb2b5a0276009bc04350e0665bf627e76fe10ee3eb620c`.
 
 ## Installed Host Baseline
 
