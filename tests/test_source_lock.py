@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import redirect_stderr
+from contextlib import ExitStack, redirect_stderr
 import errno
 import hashlib
 import importlib.util
@@ -11324,6 +11324,46 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
             ),
         )
 
+    def _recovery_module_scope(self, module: object) -> ExitStack:
+        stack = ExitStack()
+        if module is ENGINE_MODULE:
+            stack.enter_context(
+                mock.patch.object(
+                    ENGINE_MODULE,
+                    "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                    self._engine_root_specs(),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    ENGINE_MODULE,
+                    "_mirror_legacy_shared_parent_policy_is_valid",
+                    side_effect=lambda access: access
+                    == (0o700, os.geteuid(), os.getegid()),
+                )
+            )
+        return stack
+
+    def _recovery_module_contract(
+        self,
+        module: object,
+    ) -> tuple[object, str, str, str, type[Exception]]:
+        if module is MIRROR_MODULE:
+            return (
+                self.root_specs[0],
+                MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                MIRROR_MODULE.PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME,
+                MIRROR_MODULE.PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+                MIRROR_MODULE.MirrorSyncError,
+            )
+        return (
+            self._engine_root_specs()[0],
+            ENGINE_MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            ENGINE_MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME,
+            ENGINE_MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+            ENGINE_MODULE.SyncError,
+        )
+
     def test_deterministic_plan_and_execute_preserve_exact_legacy_evidence(
         self,
     ) -> None:
@@ -11405,6 +11445,375 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
             )
         self.assertEqual(engine_result, generator_result)
         self.assertEqual(engine_result["status"], "executed")
+
+    def test_recovery_regular_file_reads_are_bounded_streams(self) -> None:
+        evidence = self.quarantine / ".saved" / "streaming-evidence.bin"
+        payload = (b"0123456789abcdef" * (128 * 1024)) + b"tail"
+        evidence.write_bytes(payload)
+        evidence.chmod(0o600)
+        expected = os.stat(evidence, follow_symlinks=False)
+        parent_fd = os.open(
+            evidence.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            for module in (MIRROR_MODULE, ENGINE_MODULE):
+                with self.subTest(module=module.__name__):
+                    requested_sizes: list[int] = []
+                    real_read = os.read
+
+                    def tracked_read(file_fd: int, size: int) -> bytes:
+                        requested_sizes.append(size)
+                        return real_read(file_fd, size)
+
+                    with mock.patch.object(
+                        module.os,
+                        "read",
+                        side_effect=tracked_read,
+                    ):
+                        size, digest, captured, final_metadata = (
+                            module._pc_recovery_read_file(
+                                parent_fd,
+                                evidence.name,
+                                evidence,
+                                expected,
+                                deadline=time.monotonic() + 30,
+                                payload_limit=None,
+                            )
+                        )
+                    self.assertEqual(size, len(payload))
+                    self.assertEqual(digest, hashlib.sha256(payload).hexdigest())
+                    self.assertIsNone(captured)
+                    self.assertEqual(
+                        module._pc_recovery_identity(final_metadata),
+                        module._pc_recovery_identity(expected),
+                    )
+                    self.assertGreaterEqual(len(requested_sizes), 6)
+                    self.assertLessEqual(max(requested_sizes), 1024 * 1024)
+        finally:
+            os.close(parent_fd)
+
+    def test_primary_parent_binding_failures_do_not_become_absence(self) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            with self.subTest(module=module.__name__):
+                if self.primary_parent.exists():
+                    shutil.rmtree(self.primary_parent)
+                self.primary_parent.mkdir(mode=0o700)
+                (
+                    primary_spec,
+                    _root_id,
+                    _receipt_name,
+                    _marker_name,
+                    error_type,
+                ) = self._recovery_module_contract(module)
+                namespace_name = (
+                    module.PRIVATE_CONTROL_NAMESPACE_NAME
+                    if module is MIRROR_MODULE
+                    else module.MIRROR_PRIVATE_CONTROL_NAMESPACE_NAME
+                )
+                real_stat = os.stat
+                removed = False
+
+                def remove_after_observation(
+                    path: object,
+                    *args: object,
+                    **kwargs: object,
+                ) -> os.stat_result:
+                    nonlocal removed
+                    metadata = real_stat(path, *args, **kwargs)
+                    is_target = path == namespace_name or path == self.primary_parent
+                    if is_target and not removed:
+                        self.primary_parent.rmdir()
+                        removed = True
+                    return metadata
+
+                with (
+                    self._recovery_module_scope(module),
+                    mock.patch.object(
+                        module.os,
+                        "stat",
+                        side_effect=remove_after_observation,
+                    ),
+                ):
+                    with self.assertRaisesRegex(error_type, "cannot bind"):
+                        module._pc_recovery_existing_primary_parent(primary_spec)
+                self.assertTrue(removed)
+                self.assertFalse(self.primary_parent.exists())
+
+                self.primary_parent.mkdir(mode=0o700)
+                removed = False
+                with (
+                    self._recovery_module_scope(module),
+                    mock.patch.object(
+                        module.os,
+                        "stat",
+                        side_effect=remove_after_observation,
+                    ),
+                ):
+                    with self.assertRaisesRegex(error_type, "cannot bind"):
+                        module._pc_recovery_open_or_create_primary_parent(
+                            primary_spec,
+                            "0" * 64,
+                            allow_create=True,
+                        )
+                self.assertTrue(removed)
+                self.assertFalse(self.primary_parent.exists())
+                self.assertFalse(
+                    (
+                        self.account_home
+                        / f".private-control-recovery-parent-{'0' * 64}"
+                    ).exists()
+                )
+
+    def test_previously_bound_primary_parent_cannot_be_recreated(self) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            with self.subTest(module=module.__name__):
+                if self.primary_parent.exists():
+                    shutil.rmtree(self.primary_parent)
+                self.primary_parent.mkdir(mode=0o700)
+                (
+                    primary_spec,
+                    _root_id,
+                    _receipt_name,
+                    _marker_name,
+                    error_type,
+                ) = self._recovery_module_contract(module)
+                with self._recovery_module_scope(module):
+                    binding = module._pc_recovery_existing_primary_parent(primary_spec)
+                    self.assertIsNotNone(binding)
+                    try:
+                        self.primary_parent.rmdir()
+                        with self.assertRaisesRegex(error_type, "disappeared"):
+                            module._pc_recovery_open_or_create_primary_parent(
+                                primary_spec,
+                                "1" * 64,
+                                allow_create=False,
+                            )
+                    finally:
+                        module._pc_recovery_close_bindings((binding,))
+                self.assertFalse(self.primary_parent.exists())
+                self.assertFalse(
+                    (
+                        self.account_home
+                        / f".private-control-recovery-parent-{'1' * 64}"
+                    ).exists()
+                )
+
+    def test_namespace_fsync_after_effect_is_repaired_on_retry(self) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            with self.subTest(module=module.__name__):
+                if self.primary_parent.exists():
+                    shutil.rmtree(self.primary_parent)
+                (
+                    _primary_spec,
+                    root_id,
+                    receipt_name,
+                    marker_name,
+                    error_type,
+                ) = self._recovery_module_contract(module)
+                plan_path = self.root / f"{module.__name__}-namespace-fsync.json"
+                with self._recovery_module_scope(module):
+                    module.plan_private_control_recovery(root_id, plan_path)
+                    real_fsync = os.fsync
+                    home_identity = module._pc_recovery_identity(
+                        os.stat(self.account_home, follow_symlinks=False)
+                    )
+                    injected = False
+
+                    def fail_after_namespace_publish(file_fd: int) -> None:
+                        nonlocal injected
+                        identity = module._pc_recovery_identity(os.fstat(file_fd))
+                        if (
+                            not injected
+                            and self.primary_parent.exists()
+                            and identity == home_identity
+                        ):
+                            injected = True
+                            raise OSError(errno.EIO, "simulated home fsync failure")
+                        real_fsync(file_fd)
+
+                    with mock.patch.object(
+                        module.os,
+                        "fsync",
+                        side_effect=fail_after_namespace_publish,
+                    ):
+                        with self.assertRaisesRegex(error_type, "cannot durably bind"):
+                            module.execute_private_control_recovery(root_id, plan_path)
+                    self.assertTrue(injected)
+                    self.assertTrue(self.primary_parent.is_dir())
+                    self.assertFalse((self.primary_parent / receipt_name).exists())
+                    self.assertFalse((self.primary_parent / marker_name).exists())
+                    namespace_identity = module._pc_recovery_identity(
+                        os.stat(self.primary_parent, follow_symlinks=False)
+                    )
+                    retry_fsyncs = 0
+
+                    def track_home_fsync(file_fd: int) -> None:
+                        nonlocal retry_fsyncs
+                        if (
+                            module._pc_recovery_identity(os.fstat(file_fd))
+                            == home_identity
+                        ):
+                            retry_fsyncs += 1
+                        real_fsync(file_fd)
+
+                    with mock.patch.object(
+                        module.os,
+                        "fsync",
+                        side_effect=track_home_fsync,
+                    ):
+                        result = module.execute_private_control_recovery(
+                            root_id,
+                            plan_path,
+                        )
+                    self.assertEqual(result["status"], "executed")
+                    self.assertGreaterEqual(retry_fsyncs, 1)
+                    self.assertEqual(
+                        module._pc_recovery_identity(
+                            os.stat(self.primary_parent, follow_symlinks=False)
+                        ),
+                        namespace_identity,
+                    )
+
+    def test_marker_fsync_after_effect_is_repaired_on_retry(self) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            with self.subTest(module=module.__name__):
+                if self.primary_parent.exists():
+                    shutil.rmtree(self.primary_parent)
+                (
+                    _primary_spec,
+                    root_id,
+                    receipt_name,
+                    marker_name,
+                    error_type,
+                ) = self._recovery_module_contract(module)
+                plan_path = self.root / f"{module.__name__}-marker-fsync.json"
+                marker_path = self.primary_parent / marker_name
+                with self._recovery_module_scope(module):
+                    module.plan_private_control_recovery(root_id, plan_path)
+                    real_fsync = os.fsync
+                    injected = False
+
+                    def fail_after_marker_publish(file_fd: int) -> None:
+                        nonlocal injected
+                        if marker_path.exists():
+                            parent_identity = module._pc_recovery_identity(
+                                os.stat(self.primary_parent, follow_symlinks=False)
+                            )
+                            if (
+                                not injected
+                                and module._pc_recovery_identity(os.fstat(file_fd))
+                                == parent_identity
+                            ):
+                                injected = True
+                                raise OSError(
+                                    errno.EIO,
+                                    "simulated marker-parent fsync failure",
+                                )
+                        real_fsync(file_fd)
+
+                    with mock.patch.object(
+                        module.os,
+                        "fsync",
+                        side_effect=fail_after_marker_publish,
+                    ):
+                        with self.assertRaisesRegex(error_type, "cannot durably bind"):
+                            module.execute_private_control_recovery(root_id, plan_path)
+                    self.assertTrue(injected)
+                    self.assertTrue((self.primary_parent / receipt_name).is_file())
+                    self.assertTrue(marker_path.is_file())
+                    marker_metadata = os.stat(marker_path, follow_symlinks=False)
+                    marker_payload = marker_path.read_bytes()
+                    parent_identity = module._pc_recovery_identity(
+                        os.stat(self.primary_parent, follow_symlinks=False)
+                    )
+                    retry_fsyncs = 0
+
+                    def track_parent_fsync(file_fd: int) -> None:
+                        nonlocal retry_fsyncs
+                        if (
+                            module._pc_recovery_identity(os.fstat(file_fd))
+                            == parent_identity
+                        ):
+                            retry_fsyncs += 1
+                        real_fsync(file_fd)
+
+                    with mock.patch.object(
+                        module.os,
+                        "fsync",
+                        side_effect=track_parent_fsync,
+                    ):
+                        result = module.execute_private_control_recovery(
+                            root_id,
+                            plan_path,
+                        )
+                    self.assertEqual(result["status"], "executed")
+                    self.assertGreaterEqual(retry_fsyncs, 1)
+                    final_marker = os.stat(marker_path, follow_symlinks=False)
+                    self.assertEqual(
+                        module._pc_recovery_identity(final_marker),
+                        module._pc_recovery_identity(marker_metadata),
+                    )
+                    self.assertEqual(
+                        module._pc_recovery_access(final_marker),
+                        module._pc_recovery_access(marker_metadata),
+                    )
+                    self.assertEqual(marker_path.read_bytes(), marker_payload)
+
+    def test_marker_retry_rejects_identical_content_replacement(self) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            with self.subTest(module=module.__name__):
+                if self.primary_parent.exists():
+                    shutil.rmtree(self.primary_parent)
+                (
+                    _primary_spec,
+                    root_id,
+                    _receipt_name,
+                    marker_name,
+                    error_type,
+                ) = self._recovery_module_contract(module)
+                plan_path = self.root / f"{module.__name__}-marker-replace.json"
+                marker_path = self.primary_parent / marker_name
+                with self._recovery_module_scope(module):
+                    module.plan_private_control_recovery(root_id, plan_path)
+                    module.execute_private_control_recovery(root_id, plan_path)
+                    original_helper = module._pc_recovery_fsync_directory
+                    replaced = False
+
+                    def replace_after_parent_fsync(binding: object) -> None:
+                        nonlocal replaced
+                        original_helper(binding)
+                        if binding.path == self.primary_parent and not replaced:
+                            payload = marker_path.read_bytes()
+                            original_identity = module._pc_recovery_identity(
+                                os.stat(marker_path, follow_symlinks=False)
+                            )
+                            replacement = marker_path.with_name(
+                                f".{marker_path.name}.replacement"
+                            )
+                            replacement.write_bytes(payload)
+                            replacement.chmod(0o400)
+                            os.replace(replacement, marker_path)
+                            replacement_identity = module._pc_recovery_identity(
+                                os.stat(marker_path, follow_symlinks=False)
+                            )
+                            self.assertNotEqual(
+                                replacement_identity,
+                                original_identity,
+                            )
+                            replaced = True
+
+                    with mock.patch.object(
+                        module,
+                        "_pc_recovery_fsync_directory",
+                        side_effect=replace_after_parent_fsync,
+                    ):
+                        with self.assertRaisesRegex(error_type, "changed"):
+                            module.execute_private_control_recovery(
+                                root_id,
+                                plan_path,
+                            )
+                    self.assertTrue(replaced)
 
     def test_receipt_only_crash_is_retryable_and_not_accepted(self) -> None:
         plan_path, _plan = self._plan()
@@ -11606,6 +12015,103 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
         finally:
             if receipts:
                 MIRROR_MODULE._release_legacy_private_control_receipts(receipts)
+            MIRROR_MODULE._close_control_bindings_best_effort(
+                (prebinding.parent, prebinding.home)
+            )
+
+    def test_generator_preflight_verifies_adoption_above_ordinary_cap(self) -> None:
+        existing_count = len(tuple(os.scandir(self.tool_root)))
+        target_count = MIRROR_MODULE.MAX_TOOL_ROOT_ENTRIES + 1
+        for index in range(target_count - existing_count):
+            filler = self.tool_root / f"retained-extra-{index:04d}.bin"
+            filler.write_bytes(f"retained-{index}\n".encode())
+            filler.chmod(0o600)
+        self.assertEqual(len(tuple(os.scandir(self.tool_root))), target_count)
+        plan_path, plan = self._plan("above-ordinary-cap.json")
+        self.assertGreater(
+            plan["inventory"]["entry_count"],
+            MIRROR_MODULE.MAX_TOOL_ROOT_ENTRIES,
+        )
+        MIRROR_MODULE.execute_private_control_recovery(
+            MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            plan_path,
+        )
+        before = self._snapshot()
+        prebinding = MIRROR_MODULE._prebind_existing_primary_private_control_root(
+            self.root_specs[0]
+        )
+        receipts = ()
+        try:
+            with mock.patch.object(
+                MIRROR_MODULE,
+                "_validate_private_control_root_topology",
+            ):
+                states, receipts = (
+                    MIRROR_MODULE._preflight_legacy_private_control_roots_once(
+                        mock.Mock(operation=None),
+                        mock.Mock(),
+                        mock.Mock(),
+                        prebinding,
+                    )
+                )
+            self.assertEqual(states, ("adopted-retained-in-place",))
+            self.assertEqual(receipts[0].state, "adopted-retained-in-place")
+            self.assertEqual(
+                receipts[0].adoption_plan_digest,
+                plan["plan_digest"],
+            )
+            MIRROR_MODULE._revalidate_legacy_private_control_receipts(
+                receipts,
+                operation=None,
+            )
+            self.assertEqual(
+                MIRROR_MODULE._private_control_preallocation_decision(states),
+                (True, None),
+            )
+            self.assertEqual(before, self._snapshot())
+        finally:
+            if receipts:
+                MIRROR_MODULE._release_legacy_private_control_receipts(receipts)
+            MIRROR_MODULE._close_control_bindings_best_effort(
+                (prebinding.parent, prebinding.home)
+            )
+
+    def test_generator_ordinary_cap_still_precedes_stale_recovery(self) -> None:
+        prebinding = MIRROR_MODULE._prebind_existing_primary_private_control_root(
+            self.root_specs[0]
+        )
+        recover = mock.Mock(
+            side_effect=AssertionError("stale recovery ran before the ordinary cap")
+        )
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_validate_private_control_root_topology",
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "MAX_TOOL_ROOT_ENTRIES",
+                    1,
+                ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_recover_stale_private_snapshots",
+                    recover,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "exceeds 1 entries",
+                ):
+                    MIRROR_MODULE._preflight_legacy_private_control_roots_once(
+                        mock.Mock(operation=None),
+                        mock.Mock(),
+                        mock.Mock(),
+                        prebinding,
+                    )
+            recover.assert_not_called()
+        finally:
             MIRROR_MODULE._close_control_bindings_best_effort(
                 (prebinding.parent, prebinding.home)
             )

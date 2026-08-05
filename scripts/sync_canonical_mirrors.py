@@ -323,6 +323,10 @@ class MirrorSyncError(RuntimeError):
     pass
 
 
+class _PrivateControlRecoveryInitialAbsence(MirrorSyncError):
+    pass
+
+
 class MissingPathError(MirrorSyncError):
     pass
 
@@ -522,6 +526,10 @@ def _pc_recovery_bind_child_directory(
 ) -> _PrivateControlRecoveryBinding:
     try:
         path_metadata = os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
+    except FileNotFoundError as error:
+        raise _PrivateControlRecoveryInitialAbsence(
+            f"cannot inspect {label}: {parent.path / name}: {error}"
+        ) from error
     except OSError as error:
         raise MirrorSyncError(
             f"cannot inspect {label}: {parent.path / name}: {error}"
@@ -573,6 +581,18 @@ def _pc_recovery_revalidate_directory(
             raise MirrorSyncError(f"{binding.label} access policy changed")
 
 
+def _pc_recovery_fsync_directory(
+    binding: _PrivateControlRecoveryBinding,
+) -> None:
+    try:
+        os.fsync(binding.fd)
+    except OSError as error:
+        raise MirrorSyncError(
+            f"cannot durably bind {binding.label}: {error}"
+        ) from error
+    _pc_recovery_revalidate_directory(binding)
+
+
 def _pc_recovery_acquire_exclusive(
     binding: _PrivateControlRecoveryBinding,
 ) -> None:
@@ -606,7 +626,8 @@ def _pc_recovery_read_file(
     expected: os.stat_result,
     *,
     deadline: float,
-) -> tuple[bytes, os.stat_result]:
+    payload_limit: int | None,
+) -> tuple[int, str, bytes | None, os.stat_result]:
     try:
         file_fd = os.open(name, _FILE_READ_FLAGS, dir_fd=parent_fd)
     except OSError as error:
@@ -625,28 +646,48 @@ def _pc_recovery_read_file(
                 f"recovery evidence file changed while binding: {path}"
             )
 
-        def read_once() -> bytes:
+        if payload_limit is not None and before.st_size > payload_limit:
+            raise MirrorSyncError(
+                f"recovery evidence payload exceeds its capture limit: {path}"
+            )
+
+        def read_once(*, capture: bool) -> tuple[int, str, bytes | None]:
             _pc_recovery_check_deadline(deadline, f"reading {path}")
             os.lseek(file_fd, 0, os.SEEK_SET)
-            payload = bytearray()
-            while len(payload) <= before.st_size:
+            digest = hashlib.sha256()
+            payload = bytearray() if capture else None
+            size = 0
+            while size <= before.st_size:
                 _pc_recovery_check_deadline(deadline, f"reading {path}")
                 chunk = os.read(
-                    file_fd, min(1024 * 1024, before.st_size + 1 - len(payload))
+                    file_fd,
+                    min(1024 * 1024, before.st_size + 1 - size),
                 )
                 if not chunk:
                     break
-                payload.extend(chunk)
-            if len(payload) != before.st_size:
+                size += len(chunk)
+                digest.update(chunk)
+                if payload is not None:
+                    payload.extend(chunk)
+                    if payload_limit is None or len(payload) > payload_limit:
+                        raise MirrorSyncError(
+                            f"recovery evidence payload exceeds its capture limit: {path}"
+                        )
+            if size != before.st_size:
                 raise MirrorSyncError(f"recovery evidence file size changed: {path}")
-            return bytes(payload)
+            return (
+                size,
+                digest.hexdigest(),
+                bytes(payload) if payload is not None else None,
+            )
 
-        first = read_once()
-        second = read_once()
+        first_size, first_digest, payload = read_once(capture=payload_limit is not None)
+        second_size, second_digest, _second_payload = read_once(capture=False)
         after = os.fstat(file_fd)
         final_path = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if (
-            first != second
+            first_size != second_size
+            or first_digest != second_digest
             or _pc_recovery_identity(after) != _pc_recovery_identity(before)
             or _pc_recovery_access(after) != _pc_recovery_access(before)
             or after.st_size != before.st_size
@@ -657,7 +698,7 @@ def _pc_recovery_read_file(
             raise MirrorSyncError(
                 f"recovery evidence file changed while reading: {path}"
             )
-        return first, after
+        return first_size, first_digest, payload, after
     except OSError as error:
         raise MirrorSyncError(
             f"cannot read recovery evidence file {path}: {error}"
@@ -677,16 +718,21 @@ def _pc_recovery_owner_pairs(
     return result
 
 
+def _pc_recovery_owner_candidate(relative_path: str) -> bool:
+    if "/" in relative_path or not relative_path.endswith(".owner.json"):
+        return False
+    private_name = relative_path[: -len(".owner.json")]
+    return PRIVATE_SNAPSHOT_RE.fullmatch(private_name) is not None
+
+
 def _pc_recovery_decode_owner(
     relative_path: str,
     payload: bytes,
     access: tuple[int, int, int],
 ) -> dict[str, object] | None:
-    if "/" in relative_path or not relative_path.endswith(".owner.json"):
+    if not _pc_recovery_owner_candidate(relative_path):
         return None
     private_name = relative_path[: -len(".owner.json")]
-    if PRIVATE_SNAPSHOT_RE.fullmatch(private_name) is None:
-        return None
     if len(payload) > MAX_PRIVATE_OWNER_RECORD_BYTES:
         raise MirrorSyncError(
             f"legacy owner payload exceeds {MAX_PRIVATE_OWNER_RECORD_BYTES} bytes: "
@@ -865,17 +911,31 @@ def _pc_recovery_scan_directory(
                     raise MirrorSyncError(
                         "private-control recovery manifest exceeds its logical-byte cap"
                     )
-                payload, final_metadata = _pc_recovery_read_file(
+                owner_candidate = segment == "tool-root" and (
+                    _pc_recovery_owner_candidate(relative_path)
+                )
+                if (
+                    owner_candidate
+                    and path_metadata.st_size > MAX_PRIVATE_OWNER_RECORD_BYTES
+                ):
+                    raise MirrorSyncError(
+                        "legacy owner payload exceeds "
+                        f"{MAX_PRIVATE_OWNER_RECORD_BYTES} bytes: {relative_path}"
+                    )
+                size, digest, payload, final_metadata = _pc_recovery_read_file(
                     directory_fd,
                     name,
                     binding.path / relative_path,
                     path_metadata,
                     deadline=deadline,
+                    payload_limit=(
+                        MAX_PRIVATE_OWNER_RECORD_BYTES if owner_candidate else None
+                    ),
                 )
-                state["logical_bytes"] += len(payload)
+                state["logical_bytes"] += size
                 owner = (
                     _pc_recovery_decode_owner(relative_path, payload, access)
-                    if segment == "tool-root"
+                    if owner_candidate and payload is not None
                     else None
                 )
                 record: dict[str, object] = {
@@ -884,8 +944,8 @@ def _pc_recovery_scan_directory(
                     "identity": _pc_recovery_identity_document(identity),
                     "locator": {"path": relative_path, "segment": segment},
                     "owner": owner,
-                    "sha256": hashlib.sha256(payload).hexdigest(),
-                    "size": len(payload),
+                    "sha256": digest,
+                    "size": size,
                     "type": "regular-file",
                 }
                 if _pc_recovery_identity(final_metadata) != identity:
@@ -1051,25 +1111,37 @@ def _pc_recovery_validate_topology(
 def _pc_recovery_existing_primary_parent(
     primary_spec: PrivateControlRootSpec,
 ) -> _PrivateControlRecoveryBinding | None:
+    assert primary_spec.account_home is not None
+    home = _pc_recovery_bind_trusted_home(primary_spec.account_home)
+    binding: _PrivateControlRecoveryBinding | None = None
     try:
-        binding = _pc_recovery_bind_directory(
-            primary_spec.parent_path,
-            f"primary private-control parent [{primary_spec.root_id}]",
-        )
-    except MirrorSyncError as error:
         try:
-            os.stat(primary_spec.parent_path, follow_symlinks=False)
-        except FileNotFoundError:
+            binding = _pc_recovery_bind_child_directory(
+                home,
+                PRIVATE_CONTROL_NAMESPACE_NAME,
+                f"primary private-control parent [{primary_spec.root_id}]",
+            )
+        except _PrivateControlRecoveryInitialAbsence:
+            _pc_recovery_revalidate_directory(home)
+            _pc_recovery_close_bindings((home,))
             return None
-        except OSError:
-            raise error
+        if binding.access[0] != 0o700 or binding.access[1] != os.geteuid():
+            raise MirrorSyncError(
+                "primary private-control parent must be mode 0700 and current-owned"
+            )
+        _pc_recovery_revalidate_directory(home)
+        _pc_recovery_revalidate_directory(binding)
+        _pc_recovery_close_bindings((home,))
+        return binding
+    except BaseException as error:
+        try:
+            _pc_recovery_close_bindings((binding, home))
+        except MirrorSyncError as cleanup_error:
+            raise MirrorSyncError(
+                f"{error}; secondary primary-parent lookup cleanup failure: "
+                f"{cleanup_error}"
+            ) from error
         raise
-    if binding.access[0] != 0o700 or binding.access[1] != os.geteuid():
-        _pc_recovery_close_bindings((binding,))
-        raise MirrorSyncError(
-            "primary private-control parent must be mode 0700 and current-owned"
-        )
-    return binding
 
 
 def _pc_recovery_bind_legacy(
@@ -1851,6 +1923,8 @@ def _pc_recovery_directory_is_empty(directory_fd: int, label: str) -> bool:
 def _pc_recovery_open_or_create_primary_parent(
     primary_spec: PrivateControlRootSpec,
     plan_digest: str,
+    *,
+    allow_create: bool,
 ) -> tuple[_PrivateControlRecoveryBinding, _PrivateControlRecoveryBinding]:
     assert primary_spec.account_home is not None
     home = _pc_recovery_bind_trusted_home(primary_spec.account_home)
@@ -1864,19 +1938,11 @@ def _pc_recovery_open_or_create_primary_parent(
                 PRIVATE_CONTROL_NAMESPACE_NAME,
                 f"primary private-control parent [{primary_spec.root_id}]",
             )
-        except MirrorSyncError as bind_error:
-            try:
-                os.stat(
-                    PRIVATE_CONTROL_NAMESPACE_NAME,
-                    dir_fd=home.fd,
-                    follow_symlinks=False,
+        except _PrivateControlRecoveryInitialAbsence:
+            if not allow_create:
+                raise MirrorSyncError(
+                    "primary private-control parent disappeared after initial binding"
                 )
-            except FileNotFoundError:
-                pass
-            except OSError:
-                raise bind_error
-            else:
-                raise
             try:
                 os.mkdir(temporary_name, 0o700, dir_fd=home.fd)
                 os.fsync(home.fd)
@@ -1908,7 +1974,6 @@ def _pc_recovery_open_or_create_primary_parent(
                     temporary_name,
                     PRIVATE_CONTROL_NAMESPACE_NAME,
                 )
-                os.fsync(home.fd)
             except OSError as error:
                 raise MirrorSyncError(
                     f"cannot publish primary private-control parent: {error}"
@@ -1923,6 +1988,8 @@ def _pc_recovery_open_or_create_primary_parent(
             )
         _pc_recovery_acquire_exclusive(parent)
         _pc_recovery_revalidate_directory(home)
+        _pc_recovery_revalidate_directory(parent)
+        _pc_recovery_fsync_directory(home)
         _pc_recovery_revalidate_directory(parent)
         return home, parent
     except BaseException as error:
@@ -2104,6 +2171,17 @@ def _pc_recovery_publish_document(
         if final_payload != expected:
             _pc_recovery_close_bindings((final_binding,))
             raise MirrorSyncError(f"existing {label} does not match this plan")
+        try:
+            _pc_recovery_fsync_directory(parent)
+            _pc_recovery_revalidate_bound_file(
+                parent,
+                final_name,
+                final_binding,
+                final_payload,
+            )
+        except BaseException:
+            _pc_recovery_close_bindings((final_binding,))
+            raise
         return final_binding, final_payload
 
     pending_binding: _PrivateControlRecoveryBinding | None = None
@@ -2174,11 +2252,11 @@ def _pc_recovery_publish_document(
                 pending_name,
                 final_name,
             )
-            os.fsync(parent.fd)
         except OSError as error:
             raise MirrorSyncError(f"cannot publish {label}: {error}") from error
         pending_binding.path = parent.path / final_name
         pending_binding.label = label
+        _pc_recovery_fsync_directory(parent)
         final_metadata = os.stat(final_name, dir_fd=parent.fd, follow_symlinks=False)
         if (
             _pc_recovery_identity(final_metadata) != pending_binding.identity
@@ -2693,6 +2771,7 @@ def execute_private_control_recovery(
         home, primary_parent = _pc_recovery_open_or_create_primary_parent(
             primary_spec,
             str(plan["plan_digest"]),
+            allow_create=initial_primary_parent is None,
         )
         primary_bindings = (primary_parent, home)
         if initial_primary_parent is not None and (
@@ -2715,21 +2794,54 @@ def execute_private_control_recovery(
             "private-control cutover marker",
         )
         if existing_marker is not None:
-            _pc_recovery_close_bindings((existing_marker[0],))
-            verification = _pc_recovery_verify_adoption_locked(
-                primary_parent,
-                parent,
-                tool,
-                quarantine,
-                expected_plan_digest=str(plan["plan_digest"]),
-            )
-            return _pc_recovery_execution_receipt(
-                verification,
-                primary_parent,
-                parent,
-                tool,
-                quarantine,
-            )
+            existing_marker_binding, existing_marker_payload = existing_marker
+            try:
+                existing_marker_record = _pc_recovery_file_record(
+                    PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+                    existing_marker_binding,
+                    existing_marker_payload,
+                )
+                first_verification = _pc_recovery_verify_adoption_locked(
+                    primary_parent,
+                    parent,
+                    tool,
+                    quarantine,
+                    expected_plan_digest=str(plan["plan_digest"]),
+                )
+                if first_verification["marker"] != existing_marker_record:
+                    raise MirrorSyncError(
+                        "private-control cutover marker changed before durability retry"
+                    )
+                _pc_recovery_fsync_directory(primary_parent)
+                _pc_recovery_revalidate_bound_file(
+                    primary_parent,
+                    PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+                    existing_marker_binding,
+                    existing_marker_payload,
+                )
+                verification = _pc_recovery_verify_adoption_locked(
+                    primary_parent,
+                    parent,
+                    tool,
+                    quarantine,
+                    expected_plan_digest=str(plan["plan_digest"]),
+                )
+                if (
+                    verification != first_verification
+                    or verification["marker"] != existing_marker_record
+                ):
+                    raise MirrorSyncError(
+                        "private-control cutover state changed during durability retry"
+                    )
+                return _pc_recovery_execution_receipt(
+                    verification,
+                    primary_parent,
+                    parent,
+                    tool,
+                    quarantine,
+                )
+            finally:
+                _pc_recovery_close_bindings((existing_marker_binding,))
 
         receipt_pending_name = (
             f".{PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME}.pending-"
@@ -5055,18 +5167,6 @@ def _preflight_legacy_private_control_roots_once(
                         f"{PRIVATE_CONTROL_REASON_INCONCLUSIVE} [{spec.root_id}]: "
                         f"legacy tool root is busy or unleaseable: {error}"
                     ) from error
-                initial_tool_names = _bounded_sorted_directory_names(
-                    tool_root.fd,
-                    maximum_entries=MAX_TOOL_ROOT_ENTRIES,
-                    label=(
-                        f"initial legacy private-control tool root [{spec.root_id}]"
-                    ),
-                    limit_error=(
-                        f"legacy private-control tool root [{spec.root_id}] "
-                        f"exceeds {MAX_TOOL_ROOT_ENTRIES} entries"
-                    ),
-                    operation=root.operation,
-                )
                 if first_quarantine is not None:
                     quarantine = _bind_relative_control_directory(
                         parent,
@@ -5112,6 +5212,18 @@ def _preflight_legacy_private_control_roots_once(
                             f"[{spec.root_id}]: legacy quarantine appeared "
                             "before recovery"
                         )
+                    initial_tool_names = _bounded_sorted_directory_names(
+                        tool_root.fd,
+                        maximum_entries=MAX_TOOL_ROOT_ENTRIES,
+                        label=(
+                            f"initial legacy private-control tool root [{spec.root_id}]"
+                        ),
+                        limit_error=(
+                            f"legacy private-control tool root [{spec.root_id}] "
+                            f"exceeds {MAX_TOOL_ROOT_ENTRIES} entries"
+                        ),
+                        operation=root.operation,
+                    )
                     if initial_tool_names:
                         raise MirrorSyncError(
                             f"{PRIVATE_CONTROL_REASON_LEGACY_PENDING} "
@@ -5292,6 +5404,18 @@ def _preflight_legacy_private_control_roots_once(
                         retain_same_uid_bindings = True
                         continue
                 if quarantine is not None:
+                    _bounded_sorted_directory_names(
+                        tool_root.fd,
+                        maximum_entries=MAX_TOOL_ROOT_ENTRIES,
+                        label=(
+                            f"initial legacy private-control tool root [{spec.root_id}]"
+                        ),
+                        limit_error=(
+                            f"legacy private-control tool root [{spec.root_id}] "
+                            f"exceeds {MAX_TOOL_ROOT_ENTRIES} entries"
+                        ),
+                        operation=root.operation,
+                    )
                     _recover_stale_private_snapshots(
                         root,
                         tool_root,

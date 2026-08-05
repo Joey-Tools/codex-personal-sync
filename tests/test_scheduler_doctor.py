@@ -13,6 +13,7 @@ import os
 from pathlib import Path, PurePosixPath
 import plistlib
 import re
+import selectors
 import shutil
 import socket
 import stat
@@ -69,6 +70,7 @@ _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_DEPTH_LIMIT = 64
 _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_TIMEOUT_SECONDS = 30.0
 _SCHEDULER_DOCTOR_TEST_LEASE_TIMEOUT_SECONDS = 60.0
 _SCHEDULER_DOCTOR_TEST_LEASE_RETRY_SECONDS = 0.05
+_SCHEDULER_DOCTOR_TEST_GUARDIAN_EOF_TIMEOUT_SECONDS = 5.0
 _SCHEDULER_DOCTOR_TEST_DARWIN_TEMP_SCAN_ENTRY_LIMIT = 4096
 _SCHEDULER_DOCTOR_TEST_LINUX_STICKY_TEMP_ROOT = Path("/tmp")
 _SCHEDULER_DOCTOR_TEST_LINUX_STICKY_FALLBACK_PREFIX = (
@@ -82,6 +84,36 @@ _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE: (
 _SCHEDULER_DOCTOR_TEST_HOST_PLATFORM = sys.platform
 _SCHEDULER_DOCTOR_TEST_ORIGINAL_POPEN = subprocess.Popen
 _SCHEDULER_DOCTOR_TEST_POPEN_INSTALLED = False
+
+
+def _wait_for_scheduler_guardian_fifo_eof(
+    read_fd: int,
+    *,
+    deadline: float,
+) -> None:
+    # kqueue does not consistently surface a post-read FIFO writer close as a
+    # fresh event on macOS; select(2) does, while retaining an event-driven
+    # absolute-deadline wait.
+    with selectors.SelectSelector() as selector:
+        selector.register(read_fd, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(
+                    "a launched process still retains the FIFO liveness writer"
+                )
+            events = selector.select(remaining)
+            if not events:
+                continue
+            try:
+                terminal = os.read(read_fd, 1)
+            except BlockingIOError:
+                continue
+            if terminal:
+                raise AssertionError(
+                    "the FIFO liveness channel contained unexpected payload bytes"
+                )
+            return
 
 
 class _SchedulerDoctorTestCandidateUnavailable(RuntimeError):
@@ -9644,6 +9676,132 @@ class SchedulerDoctorTests(unittest.TestCase):
                 self.assertTrue(recovered.enabled)
                 self.assertEqual(recovered.interval_minutes, 31)
 
+    def test_macos_activation_retry_enables_background_label_before_bootstrap(
+        self,
+    ) -> None:
+        self.write_runner()
+        paths = MODULE._scheduler_paths("macos", self.home)
+        assert paths.launchd_plist is not None
+        marker = MODULE._scheduler_activation_transaction_path(paths)
+        uid = os.getuid()
+        gui_target = f"{MODULE.MACOS_LEGACY_GUI_LAUNCHD_DOMAIN}/{uid}"
+        background_target = f"{MODULE.MACOS_BACKGROUND_LAUNCHD_DOMAIN}/{uid}"
+        label = MODULE.LAUNCHD_LABEL
+        failed_calls: list[list[str]] = []
+
+        def fail_bootstrap(
+            args: list[str],
+            *,
+            dry_run: bool,
+            allow_fail: bool | str = False,
+        ) -> None:
+            del dry_run, allow_fail
+            failed_calls.append(args)
+            if args[:2] == ["launchctl", "bootstrap"]:
+                raise MODULE.SyncError("simulated bootstrap failure")
+
+        with (
+            mock.patch.object(MODULE, "LEGACY_LAUNCHD_LABELS", ()),
+            mock.patch.object(
+                MODULE,
+                "_run_native_command",
+                side_effect=fail_bootstrap,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "simulated bootstrap failure",
+            ),
+        ):
+            MODULE.install_scheduler(
+                self.home,
+                "owner/macos-activation-order",
+                31,
+                "macos",
+                None,
+                dry_run=False,
+                enable=True,
+            )
+
+        self.assertEqual(
+            failed_calls,
+            [
+                ["launchctl", "bootout", f"{gui_target}/{label}"],
+                ["launchctl", "disable", f"{gui_target}/{label}"],
+                ["launchctl", "bootout", f"{background_target}/{label}"],
+                ["launchctl", "enable", f"{background_target}/{label}"],
+                [
+                    "launchctl",
+                    "bootstrap",
+                    background_target,
+                    str(paths.launchd_plist),
+                ],
+            ],
+        )
+        self.assertTrue(marker.exists())
+        config_before = (
+            paths.launchd_plist.read_bytes(),
+            paths.launchd_plist.stat().st_dev,
+            paths.launchd_plist.stat().st_ino,
+        )
+        retry_calls: list[list[str]] = []
+
+        def record_retry(
+            args: list[str],
+            *,
+            dry_run: bool,
+            allow_fail: bool | str = False,
+        ) -> None:
+            del dry_run, allow_fail
+            retry_calls.append(args)
+
+        with (
+            mock.patch.object(MODULE, "LEGACY_LAUNCHD_LABELS", ()),
+            mock.patch.object(MODULE, "_write_plist") as write_plist,
+            mock.patch.object(
+                MODULE,
+                "_run_native_command",
+                side_effect=record_retry,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            MODULE.install_scheduler(
+                self.home,
+                "owner/macos-activation-order",
+                None,
+                "macos",
+                None,
+                dry_run=False,
+                enable=True,
+            )
+
+        write_plist.assert_not_called()
+        self.assertEqual(
+            retry_calls,
+            [
+                ["launchctl", "bootout", f"{gui_target}/{label}"],
+                ["launchctl", "disable", f"{gui_target}/{label}"],
+                ["launchctl", "bootout", f"{background_target}/{label}"],
+                ["launchctl", "enable", f"{background_target}/{label}"],
+                [
+                    "launchctl",
+                    "bootstrap",
+                    background_target,
+                    str(paths.launchd_plist),
+                ],
+                ["launchctl", "enable", f"{background_target}/{label}"],
+            ],
+        )
+        self.assertFalse(marker.exists())
+        self.assertEqual(
+            (
+                paths.launchd_plist.read_bytes(),
+                paths.launchd_plist.stat().st_dev,
+                paths.launchd_plist.stat().st_ino,
+            ),
+            config_before,
+        )
+
     def test_invalid_activation_state_fails_closed_and_uninstall_clears_it(
         self,
     ) -> None:
@@ -13044,7 +13202,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                     "",
                     "",
                 )
-                for _ in range(len(MODULE.LEGACY_LAUNCHD_LABELS) * 4 + 3)
+                for _ in range(len(MODULE.LEGACY_LAUNCHD_LABELS) * 4 + 4)
             ),
         ]
         native_calls: list[list[str]] = []
@@ -13090,7 +13248,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             [args[1] for args in native_calls],
             ["bootout", "disable", "bootout", "disable"]
             * len(MODULE.LEGACY_LAUNCHD_LABELS)
-            + ["bootout", "disable", "bootout", "bootstrap", "enable"],
+            + ["bootout", "disable", "bootout", "enable", "bootstrap", "enable"],
         )
         self.assertFalse(legacy.exists())
         with mock.patch.object(
@@ -13113,7 +13271,7 @@ class SchedulerDoctorTests(unittest.TestCase):
         label = MODULE.LEGACY_LAUNCHD_LABELS[0]
         case_index = 0
         for initial_legacy_exists in (False, True):
-            for current_action_offset in range(5):
+            for current_action_offset in range(6):
                 case_index += 1
                 with self.subTest(
                     initial_legacy_exists=initial_legacy_exists,
@@ -13246,7 +13404,7 @@ class SchedulerDoctorTests(unittest.TestCase):
 
         self.assertEqual(
             native_calls,
-            len(MODULE.LEGACY_LAUNCHD_LABELS) * 4 + 5,
+            len(MODULE.LEGACY_LAUNCHD_LABELS) * 4 + 6,
         )
         self.assertIsNotNone(MODULE._load_macos_scheduler_config(paths))
 
@@ -16002,8 +16160,53 @@ class SchedulerDoctorTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0)
             self.assertEqual(os.read(read_fd, 1), b"R")
-            self.assertEqual(os.read(read_fd, 1), b"")
+            _wait_for_scheduler_guardian_fifo_eof(
+                read_fd,
+                deadline=(
+                    time.monotonic()
+                    + _SCHEDULER_DOCTOR_TEST_GUARDIAN_EOF_TIMEOUT_SECONDS
+                ),
+            )
         finally:
+            os.close(read_fd)
+
+    def test_scheduler_guardian_fifo_eof_wait_requires_writer_exit(self) -> None:
+        fifo = self.root / "guardian-liveness-negative-control.fifo"
+        os.mkfifo(fifo, 0o600)
+        read_fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        write_fd = -1
+        writer: subprocess.Popen[bytes] | None = None
+        try:
+            write_fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            writer = subprocess.Popen(
+                [sys.executable, "-c", "import time;time.sleep(30)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                pass_fds=(write_fd,),
+            )
+            os.close(write_fd)
+            write_fd = -1
+            with self.assertRaisesRegex(
+                AssertionError,
+                "still retains the FIFO liveness writer",
+            ):
+                _wait_for_scheduler_guardian_fifo_eof(
+                    read_fd,
+                    deadline=time.monotonic() + 0.01,
+                )
+            writer.kill()
+            writer.wait(timeout=5.0)
+            _wait_for_scheduler_guardian_fifo_eof(
+                read_fd,
+                deadline=time.monotonic() + 1.0,
+            )
+        finally:
+            if write_fd >= 0:
+                os.close(write_fd)
+            if writer is not None and writer.poll() is None:
+                writer.kill()
+                writer.wait(timeout=5.0)
             os.close(read_fd)
 
     def test_bounded_scheduler_selector_close_failure_preserves_primary(
