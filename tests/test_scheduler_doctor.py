@@ -19174,7 +19174,7 @@ class SchedulerDoctorTests(unittest.TestCase):
         ):
             audit = MODULE._mirror_quarantine_audit()
 
-        self.assertNotEqual(audit.classification, "inconclusive")
+        self.assertNotEqual(audit.classification, "inconclusive", audit)
 
     def test_mirror_quarantine_registry_reports_same_uid_legacy_pending(
         self,
@@ -19221,6 +19221,148 @@ class SchedulerDoctorTests(unittest.TestCase):
         self.assertEqual(audit.entry_count, 1)
         self.assertIn("original root", audit.detail)
         self.assertEqual(snapshot_tree(shared_parent), before)
+
+    def test_retained_recovery_transitions_audit_and_strict_doctor(
+        self,
+    ) -> None:
+        shared_parent = self.root / "legacy-retained-parent"
+        shared_parent.mkdir(mode=0o700)
+        tool = shared_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        quarantine = shared_parent / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+        tool.mkdir(mode=0o700)
+        quarantine.mkdir(mode=0o700)
+        evidence = quarantine / "retained-evidence"
+        evidence.write_bytes(b"retained\n")
+        evidence.chmod(0o600)
+        primary_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id=MODULE.MIRROR_PRIVATE_CONTROL_PRIMARY_ROOT_ID,
+            parent_path=self.mirror_private_control_parent,
+            allocate=True,
+            account_home=self.root,
+            shared_parent=False,
+        )
+        legacy_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id=MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        before = snapshot_tree(shared_parent)
+        plan_path = self.root / "legacy-retained-recovery-plan.json"
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                (primary_spec, legacy_spec),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_legacy_shared_parent_policy_is_valid",
+                return_value=True,
+            ),
+        ):
+            pending_audit = MODULE._mirror_quarantine_audit()
+            plan = MODULE.plan_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            result = MODULE.execute_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            adopted_audit = MODULE._mirror_quarantine_audit()
+
+        self.assertEqual(pending_audit.classification, "inconclusive")
+        self.assertEqual(
+            pending_audit.reason_code,
+            MODULE.MIRROR_PRIVATE_CONTROL_REASON_LEGACY_PENDING,
+        )
+        self.assertEqual(plan["disposition"], "adopt-retained-in-place")
+        self.assertEqual(result["status"], "executed")
+        adopted_legacy_audit = next(
+            root_audit
+            for root_audit in adopted_audit.root_audits
+            if root_audit.root_id == MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID
+        )
+        self.assertEqual(
+            adopted_legacy_audit.classification,
+            "adopted-retained-in-place",
+        )
+        self.assertNotIn(
+            adopted_audit.classification,
+            {"saturated", "inconclusive"},
+        )
+        self.assertIsNone(adopted_audit.reason_code)
+        self.assertEqual(snapshot_tree(shared_parent), before)
+        self.assertTrue(
+            (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME
+            ).is_file()
+        )
+        self.assertTrue(
+            (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME
+            ).is_file()
+        )
+
+        def report(audit: MODULE.MirrorQuarantineAudit) -> MODULE.SchedulerReport:
+            return MODULE.SchedulerReport(
+                platform="linux",
+                installed=True,
+                enabled=True,
+                config_paths=(self.root / "scheduler.timer",),
+                interval_minutes=17,
+                runner=self.home / "bin" / "codex-personal-sync",
+                stable_runner=True,
+                mode="public",
+                base_repo="owner/public-sync",
+                private_repo=None,
+                last_attempt=None,
+                recent_success=None,
+                current_releases=(),
+                failure_reason=None,
+                command="run-scheduled",
+                repo="owner/public-sync",
+                owner=MODULE.PUBLIC_OWNER,
+                quarantine_batches=0,
+                mirror_quarantine=audit,
+                daemon_query=MODULE.SchedulerDaemonQuery("enabled"),
+            )
+
+        for audit, expected_status in (
+            (pending_audit, 1),
+            (adopted_audit, 0),
+        ):
+            with (
+                self.subTest(classification=audit.classification),
+                mock.patch.object(
+                    MODULE,
+                    "scheduler_report",
+                    return_value=report(audit),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "audit_active_skills",
+                    return_value=[],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                status = MODULE.main(
+                    [
+                        "doctor",
+                        "--home",
+                        str(self.home),
+                        "--platform",
+                        "linux",
+                        "--strict",
+                    ]
+                )
+            self.assertEqual(status, expected_status)
 
     def test_mirror_primary_alias_matrix_is_rejected_before_child_open(
         self,

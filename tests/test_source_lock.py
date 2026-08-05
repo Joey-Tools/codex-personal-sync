@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr
+import errno
 import hashlib
 import importlib.util
 import io
@@ -11173,6 +11174,673 @@ class RepositorySourceLockTests(unittest.TestCase):
         self.assertEqual(actual, MIRROR_MODULE._source_lock_payload(source_lock))
 
 
+class PrivateControlRetainedRecoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory(
+            prefix="private-control-recovery."
+        )
+        self.root = Path(os.path.realpath(self.temporary_directory.name))
+        self.account_home = self.root / "home"
+        self.account_home.mkdir(mode=0o700)
+        self.legacy_parent = self.root / "legacy-parent"
+        self.legacy_parent.mkdir(mode=0o700)
+        self.tool_root = self.legacy_parent / MIRROR_MODULE.PRIVATE_TOOL_ROOT_NAME
+        self.quarantine = (
+            self.legacy_parent / MIRROR_MODULE.DURABLE_QUARANTINE_ROOT_NAME
+        )
+        self.tool_root.mkdir(mode=0o700)
+        self.quarantine.mkdir(mode=0o700)
+        self.primary_parent = (
+            self.account_home / MIRROR_MODULE.PRIVATE_CONTROL_NAMESPACE_NAME
+        )
+        self.root_specs = (
+            MIRROR_MODULE.PrivateControlRootSpec(
+                root_id=MIRROR_MODULE.PRIVATE_CONTROL_PRIMARY_ROOT_ID,
+                parent_path=self.primary_parent,
+                allocate=True,
+                account_home=self.account_home,
+                shared_parent=False,
+            ),
+            MIRROR_MODULE.PrivateControlRootSpec(
+                root_id=MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                parent_path=self.legacy_parent,
+                allocate=False,
+                account_home=None,
+                shared_parent=True,
+            ),
+        )
+        self.spec_patch = mock.patch.object(
+            MIRROR_MODULE,
+            "PRIVATE_CONTROL_ROOT_SPECS",
+            self.root_specs,
+        )
+        self.policy_patch = mock.patch.object(
+            MIRROR_MODULE,
+            "_legacy_shared_parent_policy_is_valid",
+            side_effect=lambda access: access == (0o700, os.geteuid(), os.getegid()),
+        )
+        self.spec_patch.start()
+        self.policy_patch.start()
+        self.addCleanup(self.spec_patch.stop)
+        self.addCleanup(self.policy_patch.stop)
+        self._populate_legacy_fixture()
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def _populate_legacy_fixture(self) -> None:
+        for index in range(17):
+            private_name = f"sync-canonical-git-control.{1000 + index}.{index:032x}"
+            private_path = self.tool_root / private_name
+            private_path.mkdir(mode=0o700)
+            metadata = os.stat(private_path, follow_symlinks=False)
+            owner = {
+                "owner_gid": os.getegid(),
+                "owner_nonce": f"{index + 100:032x}",
+                "owner_pid": 1000 + index,
+                "owner_uid": os.geteuid(),
+                "phase": "cleanup",
+                "private_identity": [
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    stat.S_IFMT(metadata.st_mode),
+                ],
+                "private_name": private_name,
+                "version": MIRROR_MODULE.PRIVATE_OWNER_RECORD_LEGACY_VERSION,
+            }
+            owner_path = self.tool_root / f"{private_name}.owner.json"
+            owner_path.write_text(
+                json.dumps(owner, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            owner_path.chmod(0o600)
+        saved = self.quarantine / ".saved"
+        saved.mkdir(mode=0o700)
+        nested = saved / "unclassified"
+        nested.mkdir(mode=0o700)
+        payload = nested / "evidence.bin"
+        payload.write_bytes(b"retained evidence\x00\xff")
+        payload.chmod(0o600)
+
+    def _snapshot(self) -> tuple[tuple[object, ...], ...]:
+        records: list[tuple[object, ...]] = []
+        for root, segment in (
+            (self.tool_root, "tool-root"),
+            (self.quarantine, "quarantine"),
+        ):
+            pending = [(root, "")]
+            while pending:
+                directory, parent = pending.pop()
+                for entry in sorted(os.scandir(directory), key=lambda item: item.name):
+                    relative = entry.name if not parent else f"{parent}/{entry.name}"
+                    metadata = entry.stat(follow_symlinks=False)
+                    entry_type = stat.S_IFMT(metadata.st_mode)
+                    digest = None
+                    if stat.S_ISREG(metadata.st_mode):
+                        digest = hashlib.sha256(
+                            Path(entry.path).read_bytes()
+                        ).hexdigest()
+                    elif stat.S_ISDIR(metadata.st_mode):
+                        pending.append((Path(entry.path), relative))
+                    records.append(
+                        (
+                            segment,
+                            relative,
+                            metadata.st_dev,
+                            metadata.st_ino,
+                            entry_type,
+                            stat.S_IMODE(metadata.st_mode),
+                            metadata.st_uid,
+                            metadata.st_gid,
+                            metadata.st_size if stat.S_ISREG(metadata.st_mode) else 0,
+                            digest,
+                        )
+                    )
+        return tuple(sorted(records))
+
+    def _plan(self, name: str = "PLAN.json") -> tuple[Path, dict[str, object]]:
+        path = self.root / name
+        plan = MIRROR_MODULE.plan_private_control_recovery(
+            MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            path,
+        )
+        return path, plan
+
+    def _engine_root_specs(self) -> tuple[object, object]:
+        return (
+            ENGINE_MODULE.MirrorPrivateControlRootSpec(
+                root_id=ENGINE_MODULE.MIRROR_PRIVATE_CONTROL_PRIMARY_ROOT_ID,
+                parent_path=self.primary_parent,
+                allocate=True,
+                account_home=self.account_home,
+                shared_parent=False,
+            ),
+            ENGINE_MODULE.MirrorPrivateControlRootSpec(
+                root_id=ENGINE_MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                parent_path=self.legacy_parent,
+                allocate=False,
+                account_home=None,
+                shared_parent=True,
+            ),
+        )
+
+    def test_deterministic_plan_and_execute_preserve_exact_legacy_evidence(
+        self,
+    ) -> None:
+        before = self._snapshot()
+        first_path, first = self._plan("PLAN-1.json")
+        second_path, second = self._plan("PLAN-2.json")
+        self.assertEqual(first, second)
+        self.assertEqual(first_path.read_bytes(), second_path.read_bytes())
+        self.assertEqual(before, self._snapshot())
+        entries = first["inventory"]["entries"]
+        owners = [entry["owner"] for entry in entries if entry["owner"] is not None]
+        self.assertEqual(len(owners), 17)
+        self.assertTrue(all(owner["private_state"] == "matching" for owner in owners))
+        self.assertIn(
+            ("quarantine", ".saved/unclassified/evidence.bin"),
+            {
+                (entry["locator"]["segment"], entry["locator"]["path"])
+                for entry in entries
+            },
+        )
+
+        executed = MIRROR_MODULE.execute_private_control_recovery(
+            MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            first_path,
+        )
+        self.assertEqual(executed["status"], "executed")
+        self.assertEqual(
+            executed["terminal_whole_registry_revalidation"]["status"],
+            "verified",
+        )
+        self.assertEqual(before, self._snapshot())
+        self.assertTrue(
+            (
+                self.primary_parent
+                / MIRROR_MODULE.PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME
+            ).is_file()
+        )
+        self.assertTrue(
+            (
+                self.primary_parent / MIRROR_MODULE.PRIVATE_CONTROL_RECOVERY_MARKER_NAME
+            ).is_file()
+        )
+        retried = MIRROR_MODULE.execute_private_control_recovery(
+            MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            first_path,
+        )
+        self.assertEqual(executed, retried)
+        self.assertEqual(before, self._snapshot())
+
+    def test_generator_and_runtime_share_plan_and_execute_contract(self) -> None:
+        generator_path, generator_plan = self._plan("generator-PLAN.json")
+        engine_path = self.root / "engine-PLAN.json"
+        with (
+            mock.patch.object(
+                ENGINE_MODULE,
+                "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                self._engine_root_specs(),
+            ),
+            mock.patch.object(
+                ENGINE_MODULE,
+                "_mirror_legacy_shared_parent_policy_is_valid",
+                side_effect=lambda access: access
+                == (0o700, os.geteuid(), os.getegid()),
+            ),
+        ):
+            engine_plan = ENGINE_MODULE.plan_private_control_recovery(
+                ENGINE_MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                engine_path,
+            )
+            self.assertEqual(generator_plan, engine_plan)
+            self.assertEqual(generator_path.read_bytes(), engine_path.read_bytes())
+            engine_result = ENGINE_MODULE.execute_private_control_recovery(
+                ENGINE_MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                generator_path,
+            )
+            generator_result = MIRROR_MODULE.execute_private_control_recovery(
+                MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                engine_path,
+            )
+        self.assertEqual(engine_result, generator_result)
+        self.assertEqual(engine_result["status"], "executed")
+
+    def test_receipt_only_crash_is_retryable_and_not_accepted(self) -> None:
+        plan_path, _plan = self._plan()
+        original_publish = MIRROR_MODULE._pc_recovery_publish_document
+
+        def fail_before_marker(*args: object, **kwargs: object):
+            if args[1] == MIRROR_MODULE.PRIVATE_CONTROL_RECOVERY_MARKER_NAME:
+                raise MIRROR_MODULE.MirrorSyncError("simulated marker crash")
+            return original_publish(*args, **kwargs)
+
+        with mock.patch.object(
+            MIRROR_MODULE,
+            "_pc_recovery_publish_document",
+            side_effect=fail_before_marker,
+        ):
+            with self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "simulated marker crash",
+            ):
+                MIRROR_MODULE.execute_private_control_recovery(
+                    MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                    plan_path,
+                )
+        self.assertTrue(
+            (
+                self.primary_parent
+                / MIRROR_MODULE.PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME
+            ).is_file()
+        )
+        self.assertFalse(
+            (
+                self.primary_parent / MIRROR_MODULE.PRIVATE_CONTROL_RECOVERY_MARKER_NAME
+            ).exists()
+        )
+        executed = MIRROR_MODULE.execute_private_control_recovery(
+            MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            plan_path,
+        )
+        self.assertEqual(executed["status"], "executed")
+
+    def test_partial_pending_receipt_write_is_retryable(self) -> None:
+        plan_path, _plan = self._plan()
+        real_write = os.write
+        injected = False
+
+        def fail_after_partial_write(file_fd: int, payload: bytes) -> int:
+            nonlocal injected
+            if not injected:
+                injected = True
+                real_write(file_fd, payload[: max(1, len(payload) // 2)])
+                raise OSError(errno.EIO, "simulated interrupted receipt write")
+            return real_write(file_fd, payload)
+
+        with mock.patch.object(
+            MIRROR_MODULE.os,
+            "write",
+            side_effect=fail_after_partial_write,
+        ):
+            with self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "cannot write pending primary recovery receipt",
+            ):
+                MIRROR_MODULE.execute_private_control_recovery(
+                    MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                    plan_path,
+                )
+        self.assertFalse(
+            (
+                self.primary_parent
+                / MIRROR_MODULE.PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME
+            ).exists()
+        )
+        self.assertFalse(
+            (
+                self.primary_parent / MIRROR_MODULE.PRIVATE_CONTROL_RECOVERY_MARKER_NAME
+            ).exists()
+        )
+        self.assertEqual(
+            len(
+                tuple(
+                    self.primary_parent.glob(
+                        f".{MIRROR_MODULE.PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME}"
+                        ".pending-*"
+                    )
+                )
+            ),
+            1,
+        )
+        executed = MIRROR_MODULE.execute_private_control_recovery(
+            MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            plan_path,
+        )
+        self.assertEqual(executed["status"], "executed")
+
+    def test_terminal_verification_rejects_in_place_receipt_content_drift(
+        self,
+    ) -> None:
+        plan_path, _plan = self._plan()
+        MIRROR_MODULE.execute_private_control_recovery(
+            MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            plan_path,
+        )
+        receipt_path = (
+            self.primary_parent / MIRROR_MODULE.PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME
+        )
+        original_plan = MIRROR_MODULE._pc_recovery_plan_from_bindings
+        call_count = 0
+
+        def mutate_after_manifest(*args: object, **kwargs: object):
+            nonlocal call_count
+            result = original_plan(*args, **kwargs)
+            call_count += 1
+            if call_count == 2:
+                payload = bytearray(receipt_path.read_bytes())
+                payload[len(payload) // 2] ^= 1
+                receipt_path.chmod(0o600)
+                receipt_path.write_bytes(payload)
+                receipt_path.chmod(0o400)
+            return result
+
+        with mock.patch.object(
+            MIRROR_MODULE,
+            "_pc_recovery_plan_from_bindings",
+            side_effect=mutate_after_manifest,
+        ):
+            with self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "receipt changed during verification",
+            ):
+                MIRROR_MODULE.execute_private_control_recovery(
+                    MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                    plan_path,
+                )
+
+    def test_terminal_verification_rejects_marker_schema_expansion(self) -> None:
+        plan_path, _plan = self._plan()
+        MIRROR_MODULE.execute_private_control_recovery(
+            MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            plan_path,
+        )
+        marker_path = (
+            self.primary_parent / MIRROR_MODULE.PRIVATE_CONTROL_RECOVERY_MARKER_NAME
+        )
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["terminal_registry"]["roots"][0]["future"] = True
+        marker["terminal_registry"]["digest"] = MIRROR_MODULE._pc_recovery_digest(
+            marker["terminal_registry"]["roots"]
+        )
+        marker_path.chmod(0o600)
+        marker_path.write_bytes(
+            MIRROR_MODULE._pc_recovery_json_bytes(marker, pretty=True)
+        )
+        marker_path.chmod(0o400)
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "terminal registry is invalid",
+        ):
+            MIRROR_MODULE.execute_private_control_recovery(
+                MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+
+    def test_generator_preflight_accepts_only_verified_retained_cutover(self) -> None:
+        plan_path, _plan = self._plan()
+        MIRROR_MODULE.execute_private_control_recovery(
+            MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            plan_path,
+        )
+        before = self._snapshot()
+        prebinding = MIRROR_MODULE._prebind_existing_primary_private_control_root(
+            self.root_specs[0]
+        )
+        receipts = ()
+        try:
+            with mock.patch.object(
+                MIRROR_MODULE,
+                "_validate_private_control_root_topology",
+            ):
+                states, receipts = (
+                    MIRROR_MODULE._preflight_legacy_private_control_roots_once(
+                        mock.Mock(operation=None),
+                        mock.Mock(),
+                        mock.Mock(),
+                        prebinding,
+                    )
+                )
+            self.assertEqual(states, ("adopted-retained-in-place",))
+            self.assertEqual(receipts[0].state, "adopted-retained-in-place")
+            self.assertTrue(receipts[0].adoption_plan_digest)
+            MIRROR_MODULE._revalidate_legacy_private_control_receipts(
+                receipts,
+                operation=None,
+            )
+            self.assertEqual(
+                MIRROR_MODULE._private_control_preallocation_decision(states),
+                (True, None),
+            )
+            self.assertEqual(before, self._snapshot())
+        finally:
+            if receipts:
+                MIRROR_MODULE._release_legacy_private_control_receipts(receipts)
+            MIRROR_MODULE._close_control_bindings_best_effort(
+                (prebinding.parent, prebinding.home)
+            )
+
+    def test_execute_rejects_content_and_policy_drift_before_publication(self) -> None:
+        plan_path, _plan = self._plan()
+        evidence = self.quarantine / ".saved" / "unclassified" / "evidence.bin"
+        evidence.write_bytes(b"changed")
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "no longer matches|does not match",
+        ):
+            MIRROR_MODULE.execute_private_control_recovery(
+                MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+        self.assertFalse(self.primary_parent.exists())
+
+    def test_execute_allows_timestamp_only_churn(self) -> None:
+        plan_path, _plan = self._plan()
+        evidence = self.quarantine / ".saved" / "unclassified" / "evidence.bin"
+        future = time.time_ns() + 5_000_000_000
+        os.utime(evidence, ns=(future, future), follow_symlinks=False)
+        os.utime(evidence.parent, ns=(future, future), follow_symlinks=False)
+        executed = MIRROR_MODULE.execute_private_control_recovery(
+            MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            plan_path,
+        )
+        self.assertEqual(executed["status"], "executed")
+
+    def test_execute_rejects_add_remove_rename_and_replacement_drift(self) -> None:
+        scenarios = ("add", "remove", "rename", "replace")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                plan_path, _plan = self._plan(f"{scenario}.json")
+                target = self.quarantine / ".saved" / "unclassified" / "evidence.bin"
+                if scenario == "add":
+                    added = self.quarantine / ".saved" / "added.bin"
+                    added.write_bytes(b"added")
+                    added.chmod(0o600)
+                elif scenario == "remove":
+                    target.unlink()
+                elif scenario == "rename":
+                    target.rename(target.with_name("renamed.bin"))
+                else:
+                    replacement = target.with_name("replacement.bin")
+                    replacement.write_bytes(target.read_bytes())
+                    replacement.chmod(0o600)
+                    target.unlink()
+                    replacement.rename(target)
+                with self.assertRaises(MIRROR_MODULE.MirrorSyncError):
+                    MIRROR_MODULE.execute_private_control_recovery(
+                        MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                        plan_path,
+                    )
+                self.assertFalse(self.primary_parent.exists())
+                # Each subtest owns a fresh fixture shape reconstructed in place.
+                if scenario == "add":
+                    added.unlink()
+                elif scenario == "remove":
+                    target.write_bytes(b"retained evidence\x00\xff")
+                    target.chmod(0o600)
+                elif scenario == "rename":
+                    target.with_name("renamed.bin").rename(target)
+                else:
+                    target.write_bytes(b"retained evidence\x00\xff")
+                    target.chmod(0o600)
+
+    def test_execute_rejects_chmod_and_observed_chown_drift(self) -> None:
+        plan_path, _plan = self._plan("chmod.json")
+        target = self.quarantine / ".saved" / "unclassified" / "evidence.bin"
+        target.chmod(0o640)
+        with self.assertRaises(MIRROR_MODULE.MirrorSyncError):
+            MIRROR_MODULE.execute_private_control_recovery(
+                MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+        target.chmod(0o600)
+
+        chown_plan, _plan = self._plan("chown.json")
+        target_inode = os.stat(target, follow_symlinks=False).st_ino
+        original_access = MIRROR_MODULE._pc_recovery_access
+
+        def changed_group(metadata: os.stat_result) -> tuple[int, int, int]:
+            access = original_access(metadata)
+            if metadata.st_ino == target_inode:
+                return access[0], access[1], access[2] + 1
+            return access
+
+        with mock.patch.object(
+            MIRROR_MODULE,
+            "_pc_recovery_access",
+            side_effect=changed_group,
+        ):
+            with self.assertRaises(MIRROR_MODULE.MirrorSyncError):
+                MIRROR_MODULE.execute_private_control_recovery(
+                    MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                    chown_plan,
+                )
+
+    def test_planning_rejects_busy_writer_and_hardlink_alias(self) -> None:
+        tool_fd = os.open(
+            self.tool_root,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            import fcntl
+
+            fcntl.flock(tool_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "busy",
+            ):
+                self._plan("BUSY.json")
+        finally:
+            fcntl.flock(tool_fd, fcntl.LOCK_UN)
+            os.close(tool_fd)
+
+        source = self.quarantine / ".saved" / "unclassified" / "evidence.bin"
+        alias = source.with_name("evidence-alias.bin")
+        os.link(source, alias)
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "hard-link alias|object alias",
+        ):
+            self._plan("ALIAS.json")
+
+        alias.unlink()
+        external_alias = self.root / "external-evidence-alias.bin"
+        os.link(source, external_alias)
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "hard-link alias",
+        ):
+            self._plan("EXTERNAL-ALIAS.json")
+
+    def test_planning_rejects_cross_filesystem_topology_signal(self) -> None:
+        original_bind = MIRROR_MODULE._pc_recovery_bind_child_directory
+
+        def cross_device(*args: object, **kwargs: object):
+            binding = original_bind(*args, **kwargs)
+            if "quarantine" in binding.label:
+                binding.identity = (
+                    binding.identity[0] + 1,
+                    binding.identity[1],
+                    binding.identity[2],
+                )
+            return binding
+
+        with mock.patch.object(
+            MIRROR_MODULE,
+            "_pc_recovery_bind_child_directory",
+            side_effect=cross_device,
+        ):
+            with self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "cross filesystems",
+            ):
+                self._plan("CROSS-FS.json")
+
+    def test_external_plan_io_rejects_symlink_ancestor_aliases(self) -> None:
+        write_alias = self.root / "write-alias"
+        write_alias.symlink_to(self.quarantine, target_is_directory=True)
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "symlink or non-directory",
+        ):
+            MIRROR_MODULE.plan_private_control_recovery(
+                MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                write_alias / "PLAN.json",
+            )
+        self.assertFalse((self.quarantine / "PLAN.json").exists())
+
+        plan_path, _plan = self._plan("external-plan.json")
+        read_alias = self.root / "read-alias"
+        read_alias.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "symlink or non-directory",
+        ):
+            MIRROR_MODULE.execute_private_control_recovery(
+                MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                read_alias / plan_path.name,
+            )
+        self.assertFalse(self.primary_parent.exists())
+
+    def test_planning_rejects_symlink_special_and_caps(self) -> None:
+        link = self.quarantine / "unsafe-link"
+        link.symlink_to(".saved")
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "symlink/special",
+        ):
+            self._plan()
+        link.unlink()
+        fifo = self.quarantine / "unsafe-fifo"
+        os.mkfifo(fifo, 0o600)
+        with self.assertRaisesRegex(
+            MIRROR_MODULE.MirrorSyncError,
+            "symlink/special",
+        ):
+            self._plan("FIFO.json")
+        fifo.unlink()
+        with mock.patch.object(
+            MIRROR_MODULE,
+            "PRIVATE_CONTROL_RECOVERY_MAX_ENTRIES",
+            1,
+        ):
+            with self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "entry cap",
+            ):
+                self._plan("CAP.json")
+        with mock.patch.object(
+            MIRROR_MODULE,
+            "PRIVATE_CONTROL_RECOVERY_MAX_LOGICAL_BYTES",
+            1,
+        ):
+            with self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "logical-byte cap",
+            ):
+                self._plan("LOGICAL-CAP.json")
+        with mock.patch.object(
+            MIRROR_MODULE,
+            "PRIVATE_CONTROL_RECOVERY_MAX_ALLOCATED_BYTES",
+            1,
+        ):
+            with self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "allocated-byte cap",
+            ):
+                self._plan("ALLOCATED-CAP.json")
+
+
 class MirrorQuarantineContractParityTests(unittest.TestCase):
     def test_owner_record_root_scope_matrix_is_equivalent(self) -> None:
         self.assertEqual(
@@ -11414,6 +12082,7 @@ class MirrorQuarantineContractParityTests(unittest.TestCase):
         allocation_scenarios = (
             ((), (True, None)),
             (("absent",), (True, None)),
+            (("adopted-retained-in-place",), (True, None)),
             (("duplicate", "foreign-unrelated"), (True, None)),
             (("same-uid-empty",), (True, None)),
             (
@@ -11448,6 +12117,84 @@ class MirrorQuarantineContractParityTests(unittest.TestCase):
                     ),
                     expected,
                 )
+
+    def test_retained_recovery_machine_contract_is_equivalent(self) -> None:
+        constant_pairs = (
+            (
+                "PRIVATE_CONTROL_RECOVERY_CONTRACT",
+                "MIRROR_PRIVATE_CONTROL_RECOVERY_CONTRACT",
+            ),
+            (
+                "PRIVATE_CONTROL_RECOVERY_VERSION",
+                "MIRROR_PRIVATE_CONTROL_RECOVERY_VERSION",
+            ),
+            (
+                "PRIVATE_CONTROL_RECOVERY_DISPOSITION",
+                "MIRROR_PRIVATE_CONTROL_RECOVERY_DISPOSITION",
+            ),
+            (
+                "PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME",
+                "MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME",
+            ),
+            (
+                "PRIVATE_CONTROL_RECOVERY_MARKER_NAME",
+                "MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME",
+            ),
+            (
+                "PRIVATE_CONTROL_RECOVERY_LOCK_ORDER",
+                "MIRROR_PRIVATE_CONTROL_RECOVERY_LOCK_ORDER",
+            ),
+            (
+                "PRIVATE_CONTROL_RECOVERY_LOCK_MODE",
+                "MIRROR_PRIVATE_CONTROL_RECOVERY_LOCK_MODE",
+            ),
+            (
+                "PRIVATE_CONTROL_RECOVERY_MAX_ENTRIES",
+                "MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_ENTRIES",
+            ),
+            (
+                "PRIVATE_CONTROL_RECOVERY_MAX_LOGICAL_BYTES",
+                "MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_LOGICAL_BYTES",
+            ),
+            (
+                "PRIVATE_CONTROL_RECOVERY_MAX_ALLOCATED_BYTES",
+                "MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_ALLOCATED_BYTES",
+            ),
+            (
+                "PRIVATE_CONTROL_RECOVERY_MAX_DEPTH",
+                "MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_DEPTH",
+            ),
+            (
+                "PRIVATE_CONTROL_RECOVERY_MAX_PATH_BYTES",
+                "MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PATH_BYTES",
+            ),
+            (
+                "PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES",
+                "MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES",
+            ),
+            (
+                "PRIVATE_CONTROL_RECOVERY_TIMEOUT_SECONDS",
+                "MIRROR_PRIVATE_CONTROL_RECOVERY_TIMEOUT_SECONDS",
+            ),
+        )
+        for generator_name, engine_name in constant_pairs:
+            with self.subTest(generator=generator_name, engine=engine_name):
+                self.assertEqual(
+                    getattr(MIRROR_MODULE, generator_name),
+                    getattr(ENGINE_MODULE, engine_name),
+                )
+        self.assertEqual(
+            MIRROR_MODULE._PRIVATE_CONTROL_RECOVERY_PLAN_FIELDS,
+            ENGINE_MODULE._MIRROR_PRIVATE_CONTROL_RECOVERY_PLAN_FIELDS,
+        )
+        self.assertEqual(
+            MIRROR_MODULE._PRIVATE_CONTROL_RECOVERY_MARKER_FIELDS,
+            ENGINE_MODULE._MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_FIELDS,
+        )
+        self.assertEqual(
+            MIRROR_MODULE._PRIVATE_CONTROL_RECOVERY_PRIMARY_RECEIPT_FIELDS,
+            ENGINE_MODULE._MIRROR_PRIVATE_CONTROL_RECOVERY_PRIMARY_RECEIPT_FIELDS,
+        )
 
     def test_scheduler_probe_matches_generator_recovery_contract(self) -> None:
         self.assertEqual(
