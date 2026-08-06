@@ -1,7 +1,7 @@
 ---
 id: 20260805-legacy-private-control-retained-recovery
 title: Legacy Private-Control Retained Recovery
-status: active
+status: completed
 created: 2026-08-05
 updated: 2026-08-06
 branch: wip/recover-private-control
@@ -17,6 +17,7 @@ superseded_by:
 - 为 registry 中唯一的 `legacy-shared-v0` 增加显式 dry-run/execute recovery，允许在完整证据原地保留的前提下切换到 `primary-home-v1` 分配。
 - Recovery 不 move、copy、rewrite、delete 或 purge legacy tool/quarantine 中的任何对象；物理清理继续属于单独的高风险合同。
 - Generator 与 standalone runtime 保持独立实现，并由 parity tests 绑定为同一份 machine contract。
+- Final repair 还将 recovery document 写入绑定到有界、零进展拒绝的 write-all 合同，并把递归目录终态 path/descriptor revalidation 的 missing、unreadable 与 descriptor failure 分别包装成稳定 domain errors。
 
 ## Protected Properties
 
@@ -160,3 +161,30 @@ superseded_by:
   两个 runtime 的 `py_compile`、Ruff 0.16.1 E4/E7/E9/F 与
   `git diff --check` 通过；superseding signed checkpoint 与 fresh current-head
   named single 尚未完成，因此不作 final review-clean claim。
+- Staging cleanup repair 随后形成签名 checkpoint
+  `10b0ab3285d898cadb6b533335ad16d632a1dd65`，tree
+  `1de01af544dcf867808143d9840543121145e2cf`，其唯一 prior-b4ca
+  fresh-context named single 返回两项 finding。第一项指出 recovery plan 与
+  pending document 的 raw `os.write()` loop 会在零进展时永久循环，并在连续
+  short write 时反复复制 suffix 且绕过 recovery deadline。第二项指出递归
+  evidence scan 返回后的 pathname/descriptor 终态重验证让 `ENOENT`、
+  `EACCES` 或 descriptor `EIO` 越过 `SyncError` / `MirrorSyncError` 边界。
+- Final target-branch repair 在 generator 与 standalone runtime 中对称加入
+  `memoryview`-based write-all helper：每次 syscall 前检查 recovery-local
+  deadline、拒绝 `written <= 0`，且 plan/pending caller 保留原有 contextual
+  domain error。终态目录重验证分别将 pathname missing、其他 pathname lookup
+  failure 与 descriptor failure 包装为 domain errors；原有 object identity
+  `(st_dev, st_ino, type)` 与 access policy `(mode, uid, gid)` mismatch 分类保持
+  不变，mtime/ctime 等 benign metadata 仍不参与 protected property。
+- 三项新增故障注入在 uv Python 3.13 与 macOS system Python 3.9 下各通过
+  3/3，完整 `PrivateControlRetainedRecoveryTests` 在两个 runtime 下各通过
+  48/48。Repository private-`TMPDIR` wrapper 下完整 `tests.test_source_lock`
+  通过 279/279 in 565.529s（1 expected skip），完整 repository discovery 通过
+  1,140/1,140 in 813.382s（3 expected skips）。未修改 stock `refresh-lock`
+  与 `refresh-lock --check` 各覆盖并通过 6 sources；locked engine SHA-256 为
+  `ae87018e9e1f679c1745aaf50a93b899eacd6ce7e782891e4e8adb93178ae835`，
+  `sync-source-lock.json` SHA-256 为
+  `97be8527892c73857cfd3e6c0dcc770805494829925def1c45fde666b1507b06`。
+  双 runtime `py_compile`、Ruff 0.16.1 E4/E7/E9/F、JSON parsing、project-
+  journal validation 与 `git diff --check` 通过；一条独立只读 repair sanity
+  check 未发现 actionable finding。

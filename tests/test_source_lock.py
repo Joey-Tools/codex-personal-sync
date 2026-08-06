@@ -11510,6 +11510,244 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
                 finally:
                     module._pc_recovery_close_bindings((receipt_parent,))
 
+    def test_recovery_directory_final_revalidation_wraps_os_errors(self) -> None:
+        scenarios = (
+            (
+                "missing-path",
+                "path",
+                lambda: FileNotFoundError(
+                    errno.ENOENT,
+                    "simulated terminal path disappearance",
+                ),
+                "is missing during final revalidation",
+                FileNotFoundError,
+            ),
+            (
+                "unreadable-path",
+                "path",
+                lambda: PermissionError(
+                    errno.EACCES,
+                    "simulated terminal path unreadability",
+                ),
+                "cannot revalidate recovery evidence directory path",
+                PermissionError,
+            ),
+            (
+                "failed-descriptor",
+                "descriptor",
+                lambda: OSError(
+                    errno.EIO,
+                    "simulated terminal descriptor failure",
+                ),
+                "cannot revalidate recovery evidence directory descriptor",
+                OSError,
+            ),
+        )
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            (
+                _primary_spec,
+                root_id,
+                _receipt_name,
+                _marker_name,
+                error_type,
+            ) = self._recovery_module_contract(module)
+            for scenario, target, error_factory, expected, cause_type in scenarios:
+                with self.subTest(module=module.__name__, scenario=scenario):
+                    probe = self.quarantine / (
+                        f"{module.__name__}-{scenario}-revalidation"
+                    )
+                    probe.mkdir(mode=0o700)
+                    probe_metadata = os.stat(probe, follow_symlinks=False)
+                    probe_identity = module._pc_recovery_identity(probe_metadata)
+                    real_stat = os.stat
+                    real_fstat = os.fstat
+                    path_calls = 0
+                    descriptor_calls = 0
+
+                    def inject_stat(
+                        path: object,
+                        *args: object,
+                        dir_fd: int | None = None,
+                        follow_symlinks: bool = True,
+                    ) -> os.stat_result:
+                        nonlocal path_calls
+                        metadata = real_stat(
+                            path,
+                            *args,
+                            dir_fd=dir_fd,
+                            follow_symlinks=follow_symlinks,
+                        )
+                        if (
+                            path == probe.name
+                            and dir_fd is not None
+                            and not follow_symlinks
+                        ):
+                            path_calls += 1
+                            if target == "path" and path_calls == 2:
+                                raise error_factory()
+                        return metadata
+
+                    def inject_fstat(file_fd: int) -> os.stat_result:
+                        nonlocal descriptor_calls
+                        metadata = real_fstat(file_fd)
+                        if module._pc_recovery_identity(metadata) == probe_identity:
+                            descriptor_calls += 1
+                            if target == "descriptor" and descriptor_calls == 2:
+                                raise error_factory()
+                        return metadata
+
+                    plan_path = self.root / (
+                        f"{module.__name__}-{scenario}-revalidation-plan.json"
+                    )
+                    with (
+                        self._recovery_module_scope(module),
+                        mock.patch.object(
+                            module.os,
+                            "stat",
+                            side_effect=inject_stat,
+                        ),
+                        mock.patch.object(
+                            module.os,
+                            "fstat",
+                            side_effect=inject_fstat,
+                        ),
+                        self.assertRaisesRegex(error_type, expected) as raised,
+                    ):
+                        module.plan_private_control_recovery(root_id, plan_path)
+                    self.assertIsInstance(raised.exception.__cause__, cause_type)
+                    self.assertEqual(path_calls, 2)
+                    if target == "descriptor":
+                        self.assertEqual(descriptor_calls, 2)
+                    self.assertFalse(plan_path.exists())
+                    probe.rmdir()
+
+    def test_recovery_write_all_times_out_continuous_short_writes(self) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            with self.subTest(module=module.__name__):
+                target = self.root / f"{module.__name__}-short-write.bin"
+                file_fd = os.open(
+                    target,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                real_write = os.write
+                timeout = (
+                    module.PRIVATE_CONTROL_RECOVERY_TIMEOUT_SECONDS
+                    if module is MIRROR_MODULE
+                    else module.MIRROR_PRIVATE_CONTROL_RECOVERY_TIMEOUT_SECONDS
+                )
+                try:
+                    with (
+                        mock.patch.object(
+                            module.time,
+                            "monotonic",
+                            side_effect=(100.0, 100.0, 101.0 + timeout),
+                        ),
+                        mock.patch.object(
+                            module.os,
+                            "write",
+                            side_effect=lambda fd, payload: real_write(
+                                fd,
+                                payload[:1],
+                            ),
+                        ) as write,
+                        self.assertRaisesRegex(
+                            (
+                                MIRROR_MODULE.MirrorSyncError
+                                if module is MIRROR_MODULE
+                                else ENGINE_MODULE.SyncError
+                            ),
+                            "timed out while writing synthetic recovery document",
+                        ),
+                    ):
+                        module._pc_recovery_write_all(
+                            file_fd,
+                            b"ab",
+                            label="writing synthetic recovery document",
+                        )
+                    self.assertEqual(write.call_count, 1)
+                finally:
+                    os.close(file_fd)
+                self.assertEqual(target.read_bytes(), b"a")
+
+    def test_recovery_plan_and_pending_writes_reject_zero_progress(self) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            with self.subTest(module=module.__name__), self._recovery_module_scope(
+                module
+            ):
+                if self.primary_parent.exists():
+                    shutil.rmtree(self.primary_parent)
+                (
+                    _primary_spec,
+                    root_id,
+                    receipt_name,
+                    _marker_name,
+                    error_type,
+                ) = self._recovery_module_contract(module)
+                seed_path = self.root / f"{module.__name__}-zero-seed.json"
+                plan = module.plan_private_control_recovery(root_id, seed_path)
+                seed_path.unlink()
+
+                def assert_zero_progress(invoke: object, expected: str) -> None:
+                    write_calls = 0
+
+                    def zero_then_fail(*_args: object) -> int:
+                        nonlocal write_calls
+                        write_calls += 1
+                        if write_calls > 1:
+                            raise AssertionError(
+                                "zero-progress write loop was retried"
+                            )
+                        return 0
+
+                    with (
+                        mock.patch.object(
+                            module.os,
+                            "write",
+                            side_effect=zero_then_fail,
+                        ),
+                        self.assertRaisesRegex(error_type, expected),
+                    ):
+                        invoke()
+                    self.assertEqual(write_calls, 1)
+
+                plan_path = self.root / f"{module.__name__}-zero-plan.json"
+                assert_zero_progress(
+                    lambda: module._pc_recovery_write_plan(plan_path, plan, ()),
+                    "cannot write recovery plan .*write made no progress",
+                )
+                self.assertEqual(plan_path.read_bytes(), b"")
+                plan_path.unlink()
+
+                self.primary_parent.mkdir(mode=0o700)
+                parent = module._pc_recovery_bind_directory(
+                    self.primary_parent,
+                    "zero-progress pending publication parent",
+                )
+                module._pc_recovery_acquire_exclusive(parent)
+                pending_name = (
+                    f".{receipt_name}.pending-{'a' * 64}-{'b' * 32}"
+                )
+                try:
+                    assert_zero_progress(
+                        lambda: module._pc_recovery_publish_document(
+                            parent,
+                            receipt_name,
+                            pending_name,
+                            "primary recovery receipt",
+                            lambda identity: {"identity": list(identity)},
+                        ),
+                        "cannot write pending primary recovery receipt: "
+                        ".*write made no progress",
+                    )
+                finally:
+                    module._pc_recovery_close_bindings((parent,))
+                self.assertEqual(
+                    (self.primary_parent / pending_name).read_bytes(),
+                    b"",
+                )
+                shutil.rmtree(self.primary_parent)
+
     def test_recovery_json_limits_match_generator_and_runtime(self) -> None:
         self.assertEqual(
             MIRROR_MODULE.MAX_JSON_INTEGER_DIGITS,

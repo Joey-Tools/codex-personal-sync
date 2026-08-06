@@ -966,6 +966,22 @@ def _pc_recovery_check_deadline(deadline: float, label: str) -> None:
         raise SyncError(f"private-control recovery timed out while {label}")
 
 
+def _pc_recovery_write_all(
+    file_fd: int,
+    payload: bytes,
+    *,
+    label: str,
+) -> None:
+    deadline = time.monotonic() + MIRROR_PRIVATE_CONTROL_RECOVERY_TIMEOUT_SECONDS
+    remaining = memoryview(payload)
+    while remaining:
+        _pc_recovery_check_deadline(deadline, label)
+        written = os.write(file_fd, remaining)
+        if written <= 0:
+            raise OSError("private-control recovery write made no progress")
+        remaining = remaining[written:]
+
+
 def _pc_recovery_read_file(
     parent_fd: int,
     name: str,
@@ -1325,12 +1341,29 @@ def _pc_recovery_scan_directory(
                         relative_path,
                         depth + 1,
                     )
-                    final_path = os.stat(
-                        name,
-                        dir_fd=directory_fd,
-                        follow_symlinks=False,
-                    )
-                    final_descriptor = os.fstat(child_fd)
+                    try:
+                        final_path = os.stat(
+                            name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError as error:
+                        raise SyncError(
+                            "recovery evidence directory is missing during "
+                            f"final revalidation: {segment}/{relative_path}"
+                        ) from error
+                    except OSError as error:
+                        raise SyncError(
+                            "cannot revalidate recovery evidence directory path "
+                            f"{segment}/{relative_path}: {error}"
+                        ) from error
+                    try:
+                        final_descriptor = os.fstat(child_fd)
+                    except OSError as error:
+                        raise SyncError(
+                            "cannot revalidate recovery evidence directory "
+                            f"descriptor {segment}/{relative_path}: {error}"
+                        ) from error
                     for metadata in (final_path, final_descriptor):
                         if (
                             _pc_recovery_identity(metadata) != identity
@@ -2073,9 +2106,11 @@ def _pc_recovery_write_plan(
         except OSError as error:
             raise SyncError(f"cannot create recovery plan {path}: {error}") from error
         try:
-            offset = 0
-            while offset < len(payload):
-                offset += os.write(file_fd, payload[offset:])
+            _pc_recovery_write_all(
+                file_fd,
+                payload,
+                label=f"writing recovery plan {path}",
+            )
             os.fchmod(file_fd, 0o600)
             os.fsync(file_fd)
             metadata = os.fstat(file_fd)
@@ -3327,9 +3362,11 @@ def _pc_recovery_publish_document(
                     raise SyncError(f"{label} exceeds its byte cap")
                 if reusable is not None:
                     os.ftruncate(file_fd, 0)
-                offset = 0
-                while offset < len(payload):
-                    offset += os.write(file_fd, payload[offset:])
+                _pc_recovery_write_all(
+                    file_fd,
+                    payload,
+                    label=f"writing pending {label}",
+                )
                 os.fchmod(file_fd, 0o400)
                 assert custody is not None
                 custody.access = (0o400, os.geteuid(), os.getegid())
