@@ -26507,12 +26507,14 @@ def _install_scheduler_transaction_with_bindings(
                     allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
                     activation_bindings=bindings,
                 )
+                # launchd's disabled override is shared across this user's
+                # GUI and background domains. Clear the override left by the
+                # GUI cleanup before asking launchd to bootstrap the user job.
                 _run_native_scheduler_action(
                     [
                         "launchctl",
-                        "bootstrap",
-                        background_domain,
-                        str(paths.launchd_plist),
+                        "enable",
+                        f"{background_domain}/{LAUNCHD_LABEL}",
                     ],
                     dry_run=dry_run,
                     activation_bindings=bindings,
@@ -26520,8 +26522,9 @@ def _install_scheduler_transaction_with_bindings(
                 _run_native_scheduler_action(
                     [
                         "launchctl",
-                        "enable",
-                        f"{background_domain}/{LAUNCHD_LABEL}",
+                        "bootstrap",
+                        background_domain,
+                        str(paths.launchd_plist),
                     ],
                     dry_run=dry_run,
                     activation_bindings=bindings,

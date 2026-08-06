@@ -9516,14 +9516,16 @@ class SchedulerDoctorTests(unittest.TestCase):
 
     def test_activation_failure_persists_marker_until_exact_retry(self) -> None:
         self.write_runner()
-        failure_actions = {
-            "macos": "bootstrap",
-            "linux": "daemon-reload",
-        }
-        for platform_name, failure_action in failure_actions.items():
-            with self.subTest(platform=platform_name):
+        failure_cases = (
+            ("macos", "enable"),
+            ("macos", "bootstrap"),
+            ("linux", "daemon-reload"),
+        )
+        for platform_name, failure_action in failure_cases:
+            with self.subTest(platform=platform_name, action=failure_action):
                 paths = MODULE._scheduler_paths(platform_name, self.home)
                 marker = MODULE._scheduler_activation_transaction_path(paths)
+                native_actions: list[str] = []
 
                 def fail_activation(
                     args: list[str],
@@ -9532,6 +9534,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                     allow_fail: bool | str = False,
                 ) -> None:
                     del dry_run, allow_fail
+                    native_actions.append(args[1])
                     if failure_action in args:
                         raise MODULE.SyncError(f"simulated {failure_action} failure")
 
@@ -9555,6 +9558,13 @@ class SchedulerDoctorTests(unittest.TestCase):
                         None,
                         dry_run=False,
                         enable=True,
+                    )
+                if platform_name == "macos" and failure_action == "enable":
+                    self.assertNotIn("bootstrap", native_actions)
+                elif platform_name == "macos":
+                    self.assertLess(
+                        native_actions.index("enable"),
+                        native_actions.index("bootstrap"),
                     )
                 self.assertTrue(marker.exists())
                 config_paths = tuple(
@@ -12651,12 +12661,17 @@ class SchedulerDoctorTests(unittest.TestCase):
     def test_macos_install_revalidates_bound_plist_at_every_native_boundary(
         self,
     ) -> None:
-        action_names = (
-            "legacy-bootout",
-            "legacy-disable",
-            "current-bootout",
-            "bootstrap",
-            "enable",
+        action_names = tuple(
+            f"legacy-{domain}-{verb}"
+            for _label in MODULE.LEGACY_LAUNCHD_LABELS
+            for domain in ("gui", "user")
+            for verb in ("bootout", "disable")
+        ) + (
+            "current-gui-bootout",
+            "current-gui-disable",
+            "current-user-bootout",
+            "current-user-enable",
+            "current-user-bootstrap",
         )
         mutations = (
             ("replacement", "object identity changed"),
@@ -12701,6 +12716,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                         native_calls += 1
                         if current_call != action_index:
                             return
+                        expected_verb = action_name.rsplit("-", 1)[-1]
+                        self.assertEqual(_args[1], expected_verb)
                         plist = paths.launchd_plist
                         if mutation == "replacement":
                             replacement = plist.with_name(plist.name + ".replacement")
@@ -13090,7 +13107,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             [args[1] for args in native_calls],
             ["bootout", "disable", "bootout", "disable"]
             * len(MODULE.LEGACY_LAUNCHD_LABELS)
-            + ["bootout", "disable", "bootout", "bootstrap", "enable"],
+            + ["bootout", "disable", "bootout", "enable", "bootstrap"],
         )
         self.assertFalse(legacy.exists())
         with mock.patch.object(
