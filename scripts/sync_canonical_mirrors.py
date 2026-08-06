@@ -414,6 +414,16 @@ def _pc_recovery_digest(value: object) -> str:
     return hashlib.sha256(_pc_recovery_json_bytes(value, pretty=False)).hexdigest()
 
 
+def _pc_recovery_canonical_documents_equal(left: object, right: object) -> bool:
+    try:
+        return _pc_recovery_json_bytes(
+            left,
+            pretty=False,
+        ) == _pc_recovery_json_bytes(right, pretty=False)
+    except (TypeError, ValueError):
+        return False
+
+
 def _pc_recovery_identity(metadata: os.stat_result) -> tuple[int, int, int]:
     return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
 
@@ -1447,13 +1457,26 @@ def _pc_recovery_validate_plan_document(
     }
     if (
         plan.get("contract") != PRIVATE_CONTROL_RECOVERY_CONTRACT
-        or plan.get("version") != PRIVATE_CONTROL_RECOVERY_VERSION
+        or type(plan.get("version")) is not int
+        or plan["version"] != PRIVATE_CONTROL_RECOVERY_VERSION
         or plan.get("disposition") != PRIVATE_CONTROL_RECOVERY_DISPOSITION
         or plan.get("primary_root_id") != primary_spec.root_id
-        or plan.get("paths") != _pc_recovery_expected_paths(primary_spec, legacy_spec)
-        or plan.get("caps") != _pc_recovery_caps_document()
-        or plan.get("leases") != expected_leases
-        or plan.get("segment_locator") != expected_segment
+        or not _pc_recovery_canonical_documents_equal(
+            plan.get("paths"),
+            _pc_recovery_expected_paths(primary_spec, legacy_spec),
+        )
+        or not _pc_recovery_canonical_documents_equal(
+            plan.get("caps"),
+            _pc_recovery_caps_document(),
+        )
+        or not _pc_recovery_canonical_documents_equal(
+            plan.get("leases"),
+            expected_leases,
+        )
+        or not _pc_recovery_canonical_documents_equal(
+            plan.get("segment_locator"),
+            expected_segment,
+        )
         or not isinstance(digest, str)
         or re.fullmatch(r"[0-9a-f]{64}", digest) is None
         or digest != _pc_recovery_digest(_pc_recovery_protected_plan(plan))
@@ -1472,8 +1495,32 @@ def _pc_recovery_validate_plan_document(
     }:
         raise MirrorSyncError("private-control recovery inventory schema is invalid")
     entries = inventory.get("entries")
-    if not isinstance(entries, list) or not isinstance(roots, dict):
+    if (
+        not isinstance(entries, list)
+        or not isinstance(roots, dict)
+        or set(roots) != {"parent", "quarantine", "tool_root"}
+        or not all(
+            _pc_recovery_record_document_is_valid(
+                roots.get(role),
+                expected_type=stat.S_IFDIR,
+            )
+            for role in ("parent", "quarantine", "tool_root")
+        )
+    ):
         raise MirrorSyncError("private-control recovery inventory is invalid")
+    tree_digests = inventory.get("tree_digests")
+    if (
+        not isinstance(inventory.get("digest"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", inventory["digest"]) is None
+        or not isinstance(tree_digests, dict)
+        or set(tree_digests) != {"quarantine", "tool_root"}
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in tree_digests.values()
+        )
+    ):
+        raise MirrorSyncError("private-control recovery inventory digests are invalid")
     numeric_limits = (
         (inventory.get("entry_count"), PRIVATE_CONTROL_RECOVERY_MAX_ENTRIES),
         (
@@ -1516,14 +1563,33 @@ def _pc_recovery_validate_plan_document(
         ):
             raise MirrorSyncError("private-control recovery entry locator is invalid")
         locators.append((locator["segment"], locator["path"]))
+        entry_type = entry.get("type")
+        expected_entry_type = (
+            stat.S_IFDIR if entry_type == "directory" else stat.S_IFREG
+        )
         if (
-            entry.get("type") not in {"directory", "regular-file"}
+            entry_type not in {"directory", "regular-file"}
             or type(entry.get("size")) is not int
             or entry["size"] < 0
             or type(entry.get("allocated_bytes")) is not int
             or entry["allocated_bytes"] < 0
             or not isinstance(entry.get("sha256"), str)
             or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None
+            or not _pc_recovery_record_document_is_valid(
+                {
+                    "access": entry.get("access"),
+                    "identity": entry.get("identity"),
+                },
+                expected_type=expected_entry_type,
+            )
+            or not _pc_recovery_owner_document_is_valid(entry.get("owner"))
+            or (
+                entry.get("owner") is not None
+                and (
+                    entry_type != "regular-file"
+                    or locator.get("segment") != "tool-root"
+                )
+            )
         ):
             raise MirrorSyncError("private-control recovery entry fields are invalid")
     if locators != sorted(locators) or len(locators) != len(set(locators)):
@@ -2499,9 +2565,61 @@ def _pc_recovery_validate_primary_receipt(
         raise MirrorSyncError("primary recovery receipt schema is invalid")
     plan = _pc_recovery_validate_plan_document(document.get("plan"))
     expected = _pc_recovery_primary_receipt_document(plan, binding.identity)
-    if document != expected:
+    if not _pc_recovery_canonical_documents_equal(document, expected):
         raise MirrorSyncError("primary recovery receipt does not match its binding")
     return document, plan
+
+
+def _pc_recovery_owner_document_is_valid(owner: object) -> bool:
+    if owner is None:
+        return True
+    if not isinstance(owner, dict):
+        return False
+    version = owner.get("version")
+    root_scope = owner.get("root_scope")
+    fields = set(owner)
+    if type(version) is not int:
+        return False
+    if version == PRIVATE_OWNER_RECORD_LEGACY_VERSION:
+        expected_fields = PRIVATE_OWNER_RECORD_LEGACY_FIELDS | {
+            "private_state",
+            "root_scope",
+        }
+        if fields != expected_fields or root_scope != "accepted-legacy":
+            return False
+    elif version == PRIVATE_OWNER_RECORD_VERSION:
+        expected_fields = PRIVATE_OWNER_RECORD_FIELDS | {
+            "private_state",
+            "root_scope",
+        }
+        if (
+            fields != expected_fields
+            or root_scope != "accepted-current"
+            or owner.get("root_id") != PRIVATE_CONTROL_LEGACY_ROOT_ID
+        ):
+            return False
+    else:
+        return False
+    private_identity = owner.get("private_identity")
+    return bool(
+        type(owner.get("owner_pid")) is int
+        and owner["owner_pid"] > 0
+        and type(owner.get("owner_uid")) is int
+        and owner["owner_uid"] >= 0
+        and type(owner.get("owner_gid")) is int
+        and owner["owner_gid"] >= 0
+        and isinstance(owner.get("owner_nonce"), str)
+        and re.fullmatch(r"[0-9a-f]{32}", owner["owner_nonce"]) is not None
+        and isinstance(owner.get("phase"), str)
+        and owner.get("phase") in PRIVATE_OWNER_RECORD_PHASES
+        and isinstance(owner.get("private_name"), str)
+        and owner["private_name"]
+        and isinstance(private_identity, list)
+        and len(private_identity) == 3
+        and all(type(item) is int and item >= 0 for item in private_identity)
+        and isinstance(owner.get("private_state"), str)
+        and owner.get("private_state") in {"matching", "missing"}
+    )
 
 
 def _pc_recovery_record_document_is_valid(
@@ -2528,7 +2646,37 @@ def _pc_recovery_record_document_is_valid(
         and identity["dev"] >= 0
         and type(identity.get("ino")) is int
         and identity["ino"] >= 0
-        and identity.get("type") == expected_type
+        and type(identity.get("type")) is int
+        and identity["type"] == expected_type
+    )
+
+
+def _pc_recovery_file_record_document_is_valid(record: object) -> bool:
+    if not isinstance(record, dict) or set(record) != {
+        "access",
+        "identity",
+        "name",
+        "path",
+        "sha256",
+        "size",
+    }:
+        return False
+    return bool(
+        _pc_recovery_record_document_is_valid(
+            {
+                "access": record.get("access"),
+                "identity": record.get("identity"),
+            },
+            expected_type=stat.S_IFREG,
+        )
+        and isinstance(record.get("name"), str)
+        and record["name"]
+        and isinstance(record.get("path"), str)
+        and record["path"]
+        and isinstance(record.get("sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is not None
+        and type(record.get("size")) is int
+        and record["size"] >= 0
     )
 
 
@@ -2538,10 +2686,16 @@ def _pc_recovery_validate_marker(
     document = _pc_recovery_load_json(payload, "private-control cutover marker")
     if set(document) != _PRIVATE_CONTROL_RECOVERY_MARKER_FIELDS or (
         document.get("contract") != PRIVATE_CONTROL_RECOVERY_CONTRACT
-        or document.get("version") != PRIVATE_CONTROL_RECOVERY_VERSION
+        or type(document.get("version")) is not int
+        or document["version"] != PRIVATE_CONTROL_RECOVERY_VERSION
         or document.get("disposition") != PRIVATE_CONTROL_RECOVERY_DISPOSITION
         or document.get("root_id") != PRIVATE_CONTROL_LEGACY_ROOT_ID
         or document.get("status") != "committed"
+        or not isinstance(document.get("plan_digest"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", document["plan_digest"]) is None
+        or not _pc_recovery_file_record_document_is_valid(
+            document.get("primary_receipt")
+        )
     ):
         raise MirrorSyncError("private-control cutover marker schema is invalid")
     terminal = document.get("terminal_registry")
@@ -2584,9 +2738,22 @@ def _pc_recovery_validate_marker(
             for child in roots[0]["fixed_children"].values()
         )
         or not isinstance(roots[0].get("primary_receipt"), dict)
+        or not _pc_recovery_file_record_document_is_valid(
+            roots[0].get("primary_receipt")
+        )
         or not isinstance(roots[1].get("inventory"), dict)
         or set(roots[1]["inventory"])
         != {"digest", "entry_count", "logical_bytes", "path_bytes"}
+        or not isinstance(roots[1]["inventory"].get("digest"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", roots[1]["inventory"]["digest"])
+        is None
+        or any(
+            type(roots[1]["inventory"].get(field)) is not int
+            or roots[1]["inventory"][field] < 0
+            for field in ("entry_count", "logical_bytes", "path_bytes")
+        )
+        or not isinstance(terminal.get("digest"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", terminal["digest"]) is None
         or terminal.get("digest") != _pc_recovery_digest(roots)
     ):
         raise MirrorSyncError("cutover marker terminal registry is invalid")
@@ -2638,7 +2805,10 @@ def _pc_recovery_verify_adoption_locked(
             receipt_binding,
             receipt_payload,
         )
-        if marker.get("primary_receipt") != receipt_record:
+        if not _pc_recovery_canonical_documents_equal(
+            marker.get("primary_receipt"),
+            receipt_record,
+        ):
             raise MirrorSyncError(
                 "private-control cutover marker receipt binding changed"
             )
@@ -2659,7 +2829,10 @@ def _pc_recovery_verify_adoption_locked(
             tool,
             quarantine,
         )
-        if _pc_recovery_protected_plan(plan) != _pc_recovery_protected_plan(live_plan):
+        if not _pc_recovery_canonical_documents_equal(
+            _pc_recovery_protected_plan(plan),
+            _pc_recovery_protected_plan(live_plan),
+        ):
             raise MirrorSyncError(
                 "private-control retained evidence no longer matches its receipt"
             )
@@ -2674,16 +2847,30 @@ def _pc_recovery_verify_adoption_locked(
         if (
             roots[0].get("root_id") != plan["primary_root_id"]
             or roots[1].get("root_id") != plan["root_id"]
-            or roots[0].get("parent")
-            != _pc_recovery_record(primary_parent.identity, primary_parent.access)
-            or roots[0].get("primary_receipt") != receipt_record
-            or roots[1].get("parent")
-            != _pc_recovery_record(parent.identity, parent.access)
-            or roots[1].get("tool_root")
-            != _pc_recovery_record(tool.identity, tool.access)
-            or roots[1].get("quarantine")
-            != _pc_recovery_record(quarantine.identity, quarantine.access)
-            or roots[1].get("inventory") != expected_legacy_inventory
+            or not _pc_recovery_canonical_documents_equal(
+                roots[0].get("parent"),
+                _pc_recovery_record(primary_parent.identity, primary_parent.access),
+            )
+            or not _pc_recovery_canonical_documents_equal(
+                roots[0].get("primary_receipt"),
+                receipt_record,
+            )
+            or not _pc_recovery_canonical_documents_equal(
+                roots[1].get("parent"),
+                _pc_recovery_record(parent.identity, parent.access),
+            )
+            or not _pc_recovery_canonical_documents_equal(
+                roots[1].get("tool_root"),
+                _pc_recovery_record(tool.identity, tool.access),
+            )
+            or not _pc_recovery_canonical_documents_equal(
+                roots[1].get("quarantine"),
+                _pc_recovery_record(quarantine.identity, quarantine.access),
+            )
+            or not _pc_recovery_canonical_documents_equal(
+                roots[1].get("inventory"),
+                expected_legacy_inventory,
+            )
         ):
             raise MirrorSyncError(
                 "private-control cutover terminal registry binding is invalid"
@@ -2790,7 +2977,10 @@ def execute_private_control_recovery(
             tool,
             quarantine,
         )
-        if _pc_recovery_protected_plan(plan) != _pc_recovery_protected_plan(live_plan):
+        if not _pc_recovery_canonical_documents_equal(
+            _pc_recovery_protected_plan(plan),
+            _pc_recovery_protected_plan(live_plan),
+        ):
             raise MirrorSyncError(
                 "private-control recovery plan no longer matches retained evidence"
             )
@@ -2834,7 +3024,10 @@ def execute_private_control_recovery(
                     quarantine,
                     expected_plan_digest=str(plan["plan_digest"]),
                 )
-                if first_verification["marker"] != existing_marker_record:
+                if not _pc_recovery_canonical_documents_equal(
+                    first_verification["marker"],
+                    existing_marker_record,
+                ):
                     raise MirrorSyncError(
                         "private-control cutover marker changed before durability retry"
                     )
@@ -2853,8 +3046,14 @@ def execute_private_control_recovery(
                     expected_plan_digest=str(plan["plan_digest"]),
                 )
                 if (
-                    verification != first_verification
-                    or verification["marker"] != existing_marker_record
+                    not _pc_recovery_canonical_documents_equal(
+                        verification,
+                        first_verification,
+                    )
+                    or not _pc_recovery_canonical_documents_equal(
+                        verification["marker"],
+                        existing_marker_record,
+                    )
                 ):
                     raise MirrorSyncError(
                         "private-control cutover state changed during durability retry"
@@ -2893,8 +3092,9 @@ def execute_private_control_recovery(
             tool,
             quarantine,
         )
-        if _pc_recovery_protected_plan(plan) != _pc_recovery_protected_plan(
-            post_receipt_plan
+        if not _pc_recovery_canonical_documents_equal(
+            _pc_recovery_protected_plan(plan),
+            _pc_recovery_protected_plan(post_receipt_plan),
         ):
             raise MirrorSyncError(
                 "private-control retained evidence changed after receipt publication"

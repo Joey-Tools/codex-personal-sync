@@ -11589,6 +11589,191 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
                                         "primary recovery receipt",
                                     )
 
+    def test_recovery_json_numeric_types_match_generator_and_runtime(self) -> None:
+        def value_at(document: object, path: tuple[object, ...]) -> object:
+            current = document
+            for component in path:
+                current = current[component]
+            return current
+
+        def replace_value(
+            document: object,
+            path: tuple[object, ...],
+            value: object,
+        ) -> None:
+            current = document
+            for component in path[:-1]:
+                current = current[component]
+            current[path[-1]] = value
+
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            if self.primary_parent.exists():
+                shutil.rmtree(self.primary_parent)
+            (
+                _primary_spec,
+                root_id,
+                _receipt_name,
+                marker_name,
+                error_type,
+            ) = self._recovery_module_contract(module)
+            plan_path = self.root / f"{module.__name__}-numeric-types.json"
+            with self.subTest(module=module.__name__), self._recovery_module_scope(
+                module
+            ):
+                plan = module.plan_private_control_recovery(root_id, plan_path)
+                module._pc_recovery_validate_plan_document(plan)
+                entries = plan["inventory"]["entries"]
+                owner_index = next(
+                    index
+                    for index, entry in enumerate(entries)
+                    if entry["owner"] is not None
+                )
+                plan_cases = (
+                    ("version-bool", ("version",), True),
+                    (
+                        "caps-integer-float",
+                        ("caps", "max_entries"),
+                        float(plan["caps"]["max_entries"]),
+                    ),
+                    (
+                        "caps-timeout-integer",
+                        ("caps", "timeout_seconds"),
+                        int(plan["caps"]["timeout_seconds"]),
+                    ),
+                    ("lease-order-bool", ("leases", 0, "order"), False),
+                    (
+                        "root-identity-float",
+                        ("roots", "parent", "identity", "type"),
+                        float(plan["roots"]["parent"]["identity"]["type"]),
+                    ),
+                    (
+                        "entry-access-float",
+                        ("inventory", "entries", 0, "access", "uid"),
+                        float(entries[0]["access"]["uid"]),
+                    ),
+                    (
+                        "owner-pid-float",
+                        (
+                            "inventory",
+                            "entries",
+                            owner_index,
+                            "owner",
+                            "owner_pid",
+                        ),
+                        float(entries[owner_index]["owner"]["owner_pid"]),
+                    ),
+                    (
+                        "owner-phase-list",
+                        (
+                            "inventory",
+                            "entries",
+                            owner_index,
+                            "owner",
+                            "phase",
+                        ),
+                        [entries[owner_index]["owner"]["phase"]],
+                    ),
+                    (
+                        "owner-state-object",
+                        (
+                            "inventory",
+                            "entries",
+                            owner_index,
+                            "owner",
+                            "private_state",
+                        ),
+                        {
+                            "value": entries[owner_index]["owner"][
+                                "private_state"
+                            ]
+                        },
+                    ),
+                )
+                for case_name, path, replacement in plan_cases:
+                    with self.subTest(
+                        module=module.__name__,
+                        document="plan",
+                        case=case_name,
+                    ):
+                        candidate = json.loads(json.dumps(plan))
+                        if case_name not in {
+                            "owner-phase-list",
+                            "owner-state-object",
+                        }:
+                            self.assertEqual(value_at(candidate, path), replacement)
+                        replace_value(candidate, path, replacement)
+                        candidate["plan_digest"] = module._pc_recovery_digest(
+                            module._pc_recovery_protected_plan(candidate)
+                        )
+                        with self.assertRaises(error_type):
+                            module._pc_recovery_validate_plan_document(candidate)
+
+                module.execute_private_control_recovery(root_id, plan_path)
+                marker_path = self.primary_parent / marker_name
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                module._pc_recovery_validate_marker(
+                    module._pc_recovery_json_bytes(marker, pretty=True)
+                )
+                marker_cases = (
+                    ("version-bool", ("version",), True),
+                    (
+                        "receipt-size-float",
+                        ("primary_receipt", "size"),
+                        float(marker["primary_receipt"]["size"]),
+                    ),
+                    (
+                        "terminal-identity-float",
+                        (
+                            "terminal_registry",
+                            "roots",
+                            0,
+                            "primary_receipt",
+                            "identity",
+                            "dev",
+                        ),
+                        float(
+                            marker["terminal_registry"]["roots"][0][
+                                "primary_receipt"
+                            ]["identity"]["dev"]
+                        ),
+                    ),
+                    (
+                        "terminal-inventory-float",
+                        (
+                            "terminal_registry",
+                            "roots",
+                            1,
+                            "inventory",
+                            "entry_count",
+                        ),
+                        float(
+                            marker["terminal_registry"]["roots"][1]["inventory"][
+                                "entry_count"
+                            ]
+                        ),
+                    ),
+                )
+                for case_name, path, replacement in marker_cases:
+                    with self.subTest(
+                        module=module.__name__,
+                        document="marker",
+                        case=case_name,
+                    ):
+                        candidate = json.loads(json.dumps(marker))
+                        self.assertEqual(value_at(candidate, path), replacement)
+                        replace_value(candidate, path, replacement)
+                        terminal = candidate["terminal_registry"]
+                        terminal["digest"] = module._pc_recovery_digest(
+                            terminal["roots"]
+                        )
+                        with self.assertRaises(error_type):
+                            module._pc_recovery_validate_marker(
+                                module._pc_recovery_json_bytes(
+                                    candidate,
+                                    pretty=True,
+                                )
+                            )
+
     def test_deterministic_plan_and_execute_preserve_exact_legacy_evidence(
         self,
     ) -> None:
