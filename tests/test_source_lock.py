@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack, redirect_stderr
 import errno
+import fcntl
 import hashlib
 import importlib.util
 import io
@@ -12500,6 +12501,1612 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(executed["status"], "executed")
 
+    def test_repeated_pending_publication_failures_remain_bounded(self) -> None:
+        def pending_snapshot(
+            receipt_name: str,
+            marker_name: str,
+        ) -> tuple[tuple[object, ...], ...]:
+            prefixes = (
+                f".{receipt_name}.pending-",
+                f".{marker_name}.pending-",
+            )
+            records: list[tuple[object, ...]] = []
+            for path in sorted(self.primary_parent.iterdir()):
+                if not path.name.startswith(prefixes):
+                    continue
+                metadata = os.stat(path, follow_symlinks=False)
+                records.append(
+                    (
+                        path.name,
+                        metadata.st_dev,
+                        metadata.st_ino,
+                        stat.S_IFMT(metadata.st_mode),
+                        stat.S_IMODE(metadata.st_mode),
+                        metadata.st_uid,
+                        metadata.st_gid,
+                        metadata.st_nlink,
+                        metadata.st_size,
+                        hashlib.sha256(path.read_bytes()).hexdigest(),
+                    )
+                )
+            return tuple(records)
+
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            with self.subTest(module=module.__name__):
+                if self.primary_parent.exists():
+                    shutil.rmtree(self.primary_parent)
+                self.primary_parent.mkdir(mode=0o700)
+                (
+                    _primary_spec,
+                    root_id,
+                    receipt_name,
+                    marker_name,
+                    error_type,
+                ) = self._recovery_module_contract(module)
+                entry_cap_name = (
+                    "PRIVATE_CONTROL_RECOVERY_MAX_PENDING_ENTRIES"
+                    if module is MIRROR_MODULE
+                    else "MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_ENTRIES"
+                )
+                byte_cap_name = (
+                    "PRIVATE_CONTROL_RECOVERY_MAX_PENDING_BYTES"
+                    if module is MIRROR_MODULE
+                    else "MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_BYTES"
+                )
+                receipt_cap = getattr(
+                    module,
+                    (
+                        "PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES"
+                        if module is MIRROR_MODULE
+                        else "MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES"
+                    ),
+                )
+                plan_path = self.root / f"{module.__name__}-pending-count.json"
+                real_write = os.write
+                write_calls = 0
+
+                def fail_after_partial_write(file_fd: int, payload: bytes) -> int:
+                    nonlocal write_calls
+                    write_calls += 1
+                    real_write(file_fd, payload[:8])
+                    raise OSError(errno.EIO, "simulated repeated write failure")
+
+                with (
+                    self._recovery_module_scope(module),
+                    mock.patch.object(module, entry_cap_name, 1),
+                    mock.patch.object(module, byte_cap_name, 8 * receipt_cap),
+                ):
+                    module.plan_private_control_recovery(root_id, plan_path)
+                    with mock.patch.object(
+                        module.os,
+                        "write",
+                        side_effect=fail_after_partial_write,
+                    ):
+                        for _attempt in range(2):
+                            with self.assertRaisesRegex(
+                                error_type,
+                                "cannot write pending primary recovery receipt",
+                            ):
+                                module.execute_private_control_recovery(
+                                    root_id,
+                                    plan_path,
+                                )
+                            current = pending_snapshot(receipt_name, marker_name)
+                            self.assertEqual(len(current), 1)
+                            if _attempt == 0:
+                                retained = current
+                            else:
+                                self.assertEqual(current, retained)
+                        self.assertEqual(write_calls, 2)
+
+                    retained_path = self.primary_parent / str(retained[0][0])
+                    retained_path.chmod(0o400)
+                    executed = module.execute_private_control_recovery(
+                        root_id,
+                        plan_path,
+                    )
+                    self.assertEqual(executed["status"], "executed")
+                    self.assertEqual(
+                        pending_snapshot(receipt_name, marker_name),
+                        (),
+                    )
+
+                shutil.rmtree(self.primary_parent)
+                self.primary_parent.mkdir(mode=0o700)
+                plan_path = self.root / f"{module.__name__}-pending-entry.json"
+                marker_pending = (
+                    self.primary_parent
+                    / f".{marker_name}.pending-{'0' * 64}-{'1' * 32}"
+                )
+                marker_pending.write_bytes(b"12345678")
+                marker_pending.chmod(0o600)
+                with (
+                    self._recovery_module_scope(module),
+                    mock.patch.object(module, entry_cap_name, 1),
+                    mock.patch.object(module, byte_cap_name, 8 * receipt_cap),
+                ):
+                    module.plan_private_control_recovery(root_id, plan_path)
+                    retained = pending_snapshot(receipt_name, marker_name)
+                    self.assertEqual(len(retained), 1)
+                    with self.assertRaisesRegex(error_type, "entry cap"):
+                        module.execute_private_control_recovery(
+                            root_id,
+                            plan_path,
+                        )
+                    self.assertEqual(
+                        pending_snapshot(receipt_name, marker_name),
+                        retained,
+                    )
+
+                shutil.rmtree(self.primary_parent)
+                self.primary_parent.mkdir(mode=0o700)
+                plan_path = self.root / f"{module.__name__}-pending-bytes.json"
+                marker_pending = (
+                    self.primary_parent
+                    / f".{marker_name}.pending-{'0' * 64}-{'1' * 32}"
+                )
+                marker_pending.write_bytes(b"12345678")
+                marker_pending.chmod(0o600)
+                with (
+                    self._recovery_module_scope(module),
+                    mock.patch.object(module, entry_cap_name, 8),
+                    mock.patch.object(
+                        module,
+                        byte_cap_name,
+                        receipt_cap + 7,
+                    ),
+                ):
+                    module.plan_private_control_recovery(root_id, plan_path)
+                    retained = pending_snapshot(receipt_name, marker_name)
+                    self.assertEqual(len(retained), 1)
+                    with self.assertRaisesRegex(error_type, "aggregate-byte cap"):
+                        module.execute_private_control_recovery(
+                            root_id,
+                            plan_path,
+                        )
+                    self.assertEqual(
+                        pending_snapshot(receipt_name, marker_name),
+                        retained,
+                    )
+
+    def test_pre_cap_same_plan_pending_history_is_drained(self) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            with self.subTest(module=module.__name__):
+                if self.primary_parent.exists():
+                    shutil.rmtree(self.primary_parent)
+                self.primary_parent.mkdir(mode=0o700)
+                (
+                    _primary_spec,
+                    root_id,
+                    receipt_name,
+                    marker_name,
+                    _error_type,
+                ) = self._recovery_module_contract(module)
+                entry_cap_name = (
+                    "PRIVATE_CONTROL_RECOVERY_MAX_PENDING_ENTRIES"
+                    if module is MIRROR_MODULE
+                    else "MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_ENTRIES"
+                )
+                byte_cap_name = (
+                    "PRIVATE_CONTROL_RECOVERY_MAX_PENDING_BYTES"
+                    if module is MIRROR_MODULE
+                    else "MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_BYTES"
+                )
+                receipt_cap_name = (
+                    "PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES"
+                    if module is MIRROR_MODULE
+                    else "MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES"
+                )
+
+                def pending_names() -> tuple[str, ...]:
+                    prefixes = (
+                        f".{receipt_name}.pending-",
+                        f".{marker_name}.pending-",
+                    )
+                    return tuple(
+                        sorted(
+                            path.name
+                            for path in self.primary_parent.iterdir()
+                            if path.name.startswith(prefixes)
+                        )
+                    )
+
+                plan_path = self.root / f"{module.__name__}-pre-cap-entry.json"
+                with (
+                    self._recovery_module_scope(module),
+                    mock.patch.object(module, entry_cap_name, 8),
+                ):
+                    plan = module.plan_private_control_recovery(root_id, plan_path)
+                    for index in range(9):
+                        pending = (
+                            self.primary_parent
+                            / f".{receipt_name}.pending-{plan['plan_digest']}-"
+                            f"{index:032x}"
+                        )
+                        pending.write_bytes(b"partial\n")
+                        pending.chmod(0o600)
+                    self.assertEqual(len(pending_names()), 9)
+                    executed = module.execute_private_control_recovery(
+                        root_id,
+                        plan_path,
+                    )
+                    self.assertEqual(executed["status"], "executed")
+                    self.assertEqual(pending_names(), ())
+
+                shutil.rmtree(self.primary_parent)
+                self.primary_parent.mkdir(mode=0o700)
+                plan_path = self.root / f"{module.__name__}-pre-cap-bytes.json"
+                small_receipt_cap = 1024 * 1024
+                with (
+                    self._recovery_module_scope(module),
+                    mock.patch.object(module, entry_cap_name, 8),
+                    mock.patch.object(module, receipt_cap_name, small_receipt_cap),
+                    mock.patch.object(module, byte_cap_name, small_receipt_cap),
+                ):
+                    plan = module.plan_private_control_recovery(root_id, plan_path)
+                    for index in range(2):
+                        pending = (
+                            self.primary_parent
+                            / f".{receipt_name}.pending-{plan['plan_digest']}-"
+                            f"{index:032x}"
+                        )
+                        pending.write_bytes(b"x" * (600 * 1024))
+                        pending.chmod(0o600)
+                    self.assertGreater(
+                        sum(
+                            path.stat().st_size
+                            for path in self.primary_parent.iterdir()
+                        ),
+                        small_receipt_cap,
+                    )
+                    executed = module.execute_private_control_recovery(
+                        root_id,
+                        plan_path,
+                    )
+                    self.assertEqual(executed["status"], "executed")
+                    self.assertEqual(pending_names(), ())
+
+    def test_pending_writer_close_uncertainty_retains_transaction_fence(
+        self,
+    ) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            for reuse_existing in (False, True):
+                for close_after_effect in (False, True):
+                    with self.subTest(
+                        module=module.__name__,
+                        reuse_existing=reuse_existing,
+                        close_after_effect=close_after_effect,
+                    ):
+                        if self.primary_parent.exists():
+                            shutil.rmtree(self.primary_parent)
+                        self.primary_parent.mkdir(mode=0o700)
+                        (
+                            _primary_spec,
+                            root_id,
+                            receipt_name,
+                            _marker_name,
+                            error_type,
+                        ) = self._recovery_module_contract(module)
+                        plan_path = self.root / (
+                            f"{module.__name__}-pending-close-"
+                            f"{int(reuse_existing)}-{int(close_after_effect)}.json"
+                        )
+                        real_open = os.open
+                        real_close = os.close
+                        injected_fd = -1
+                        injected_close_calls = 0
+                        sentinel_fd = -1
+                        sentinel_identity: tuple[int, int, int] | None = None
+                        expected_reuse_identity: tuple[int, int, int] | None = None
+                        expected_writer_path: Path | None = None
+
+                        def inject_pending_writer_close(file_fd: int) -> None:
+                            nonlocal injected_fd
+                            nonlocal injected_close_calls
+                            nonlocal sentinel_fd
+                            nonlocal sentinel_identity
+                            if injected_fd >= 0 and file_fd == injected_fd:
+                                injected_close_calls += 1
+                                raise AssertionError(
+                                    "close-uncertain descriptor was closed again"
+                                )
+                            flags = fcntl.fcntl(file_fd, fcntl.F_GETFL)
+                            if (
+                                injected_fd < 0
+                                and flags & os.O_ACCMODE == os.O_WRONLY
+                            ):
+                                injected_fd = file_fd
+                                injected_close_calls += 1
+                                matching = tuple(
+                                    custody
+                                    for custody in module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+                                    if custody.fd == file_fd
+                                )
+                                self.assertEqual(len(matching), 1)
+                                self.assertEqual(matching[0].state, "close-uncertain")
+                                if expected_writer_path is None:
+                                    self.assertEqual(
+                                        matching[0].path.parent,
+                                        self.primary_parent,
+                                    )
+                                    self.assertTrue(
+                                        matching[0].path.name.startswith(
+                                            f".{receipt_name}.pending-"
+                                        )
+                                    )
+                                else:
+                                    self.assertEqual(
+                                        matching[0].path,
+                                        expected_writer_path,
+                                    )
+                                if expected_reuse_identity is not None:
+                                    self.assertEqual(
+                                        matching[0].identity,
+                                        expected_reuse_identity,
+                                    )
+                                if close_after_effect:
+                                    real_close(file_fd)
+                                    sentinel_path = self.root / (
+                                        f"{module.__name__}-pending-close-sentinel-"
+                                        f"{int(reuse_existing)}"
+                                    )
+                                    sentinel_path.write_bytes(
+                                        b"unique close-after-effect sentinel\n"
+                                    )
+                                    sentinel_path.chmod(0o600)
+                                    replacement_fd = real_open(
+                                        sentinel_path,
+                                        os.O_RDONLY,
+                                    )
+                                    sentinel_path.unlink()
+                                    if replacement_fd != file_fd:
+                                        os.dup2(replacement_fd, file_fd)
+                                        real_close(replacement_fd)
+                                    sentinel_fd = file_fd
+                                    metadata = os.fstat(sentinel_fd)
+                                    sentinel_identity = (
+                                        metadata.st_dev,
+                                        metadata.st_ino,
+                                        stat.S_IFMT(metadata.st_mode),
+                                    )
+                                raise OSError(
+                                    errno.EIO,
+                                    "simulated pending writer close uncertainty",
+                                )
+                            real_close(file_fd)
+
+                        retained: tuple[object, ...] = ()
+                        custody: tuple[object, ...] = ()
+                        try:
+                            with self._recovery_module_scope(module):
+                                plan = module.plan_private_control_recovery(
+                                    root_id,
+                                    plan_path,
+                                )
+                                if reuse_existing:
+                                    pending = self.primary_parent / (
+                                        f".{receipt_name}.pending-"
+                                        f"{plan['plan_digest']}-{'a' * 32}"
+                                    )
+                                    pending.write_bytes(b"retained partial bytes\n")
+                                    pending.chmod(0o400)
+                                    metadata = pending.stat()
+                                    expected_reuse_identity = (
+                                        metadata.st_dev,
+                                        metadata.st_ino,
+                                        stat.S_IFMT(metadata.st_mode),
+                                    )
+                                    expected_writer_path = pending
+                                with mock.patch.object(
+                                    module.os,
+                                    "close",
+                                    side_effect=inject_pending_writer_close,
+                                ):
+                                    with self.assertRaisesRegex(
+                                        error_type,
+                                        "pending primary recovery receipt descriptor",
+                                    ):
+                                        module.execute_private_control_recovery(
+                                            root_id,
+                                            plan_path,
+                                        )
+                                    custody = tuple(
+                                        module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+                                    )
+                                    retained = tuple(
+                                        module._PC_RECOVERY_RETAINED_CLOSE_FENCE
+                                    )
+                                    self.assertEqual(len(custody), 2)
+                                    writer_custody = tuple(
+                                        item
+                                        for item in custody
+                                        if item.fd == injected_fd
+                                    )
+                                    reader_custody = tuple(
+                                        item
+                                        for item in custody
+                                        if item.fd != injected_fd
+                                    )
+                                    self.assertEqual(len(writer_custody), 1)
+                                    self.assertEqual(len(reader_custody), 1)
+                                    self.assertEqual(
+                                        writer_custody[0].state,
+                                        "close-uncertain",
+                                    )
+                                    self.assertEqual(
+                                        reader_custody[0].state,
+                                        "open",
+                                    )
+                                    self.assertEqual(
+                                        reader_custody[0].path,
+                                        writer_custody[0].path,
+                                    )
+                                    self.assertEqual(
+                                        reader_custody[0].identity,
+                                        writer_custody[0].identity,
+                                    )
+                                    self.assertEqual(injected_close_calls, 1)
+                                    self.assertGreaterEqual(len(retained), 4)
+                                    for binding in retained:
+                                        os.fstat(binding.fd)
+                                    if close_after_effect:
+                                        self.assertEqual(sentinel_fd, injected_fd)
+                                        metadata = os.fstat(sentinel_fd)
+                                        self.assertEqual(
+                                            (
+                                                metadata.st_dev,
+                                                metadata.st_ino,
+                                                stat.S_IFMT(metadata.st_mode),
+                                            ),
+                                            sentinel_identity,
+                                        )
+                                    else:
+                                        flags = fcntl.fcntl(
+                                            injected_fd,
+                                            fcntl.F_GETFL,
+                                        )
+                                        self.assertEqual(
+                                            flags & os.O_ACCMODE,
+                                            os.O_WRONLY,
+                                        )
+                                    with mock.patch.object(
+                                        module.os,
+                                        "open",
+                                        side_effect=AssertionError(
+                                            "close fence gate must precede any open"
+                                        ),
+                                    ):
+                                        with self.assertRaisesRegex(
+                                            error_type,
+                                            "close remains uncertain",
+                                        ):
+                                            module.plan_private_control_recovery(
+                                                root_id,
+                                                self.root / "blocked-plan.json",
+                                            )
+                                        with self.assertRaisesRegex(
+                                            error_type,
+                                            "close remains uncertain",
+                                        ):
+                                            module.execute_private_control_recovery(
+                                                root_id,
+                                                plan_path,
+                                            )
+                                    self.assertEqual(injected_close_calls, 1)
+                                    if close_after_effect:
+                                        metadata = os.fstat(sentinel_fd)
+                                        self.assertEqual(
+                                            (
+                                                metadata.st_dev,
+                                                metadata.st_ino,
+                                                stat.S_IFMT(metadata.st_mode),
+                                            ),
+                                            sentinel_identity,
+                                        )
+                        finally:
+                            module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY = ()
+                            module._PC_RECOVERY_RETAINED_CLOSE_FENCE = ()
+                            if injected_fd >= 0 and not close_after_effect:
+                                real_close(injected_fd)
+                            if sentinel_fd >= 0:
+                                real_close(sentinel_fd)
+                            for item in custody:
+                                if item.fd >= 0 and item.fd != injected_fd:
+                                    real_close(item.fd)
+                            if retained:
+                                module._pc_recovery_close_bindings(retained)
+
+    def test_pending_writer_is_registered_before_first_fstat(self) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            for reuse_existing in (False, True):
+                with self.subTest(
+                    module=module.__name__,
+                    reuse_existing=reuse_existing,
+                ):
+                    if self.primary_parent.exists():
+                        shutil.rmtree(self.primary_parent)
+                    self.primary_parent.mkdir(mode=0o700)
+                    (
+                        _primary_spec,
+                        root_id,
+                        receipt_name,
+                        _marker_name,
+                        _error_type,
+                    ) = self._recovery_module_contract(module)
+                    plan_path = self.root / (
+                        f"{module.__name__}-pending-fstat-"
+                        f"{int(reuse_existing)}.json"
+                    )
+                    real_fstat = os.fstat
+                    injected = False
+                    expected_reuse_identity: tuple[int, int, int] | None = None
+                    expected_writer_path: Path | None = None
+
+                    def interrupt_first_writer_fstat(file_fd: int) -> os.stat_result:
+                        nonlocal injected
+                        flags = fcntl.fcntl(file_fd, fcntl.F_GETFL)
+                        if not injected and flags & os.O_ACCMODE == os.O_WRONLY:
+                            injected = True
+                            custody = tuple(
+                                module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+                            )
+                            matching = tuple(
+                                item for item in custody if item.fd == file_fd
+                            )
+                            self.assertEqual(len(matching), 1)
+                            self.assertEqual(matching[0].state, "open")
+                            if expected_writer_path is None:
+                                self.assertEqual(
+                                    matching[0].path.parent,
+                                    self.primary_parent,
+                                )
+                                self.assertTrue(
+                                    matching[0].path.name.startswith(
+                                        f".{receipt_name}.pending-"
+                                    )
+                                )
+                            else:
+                                self.assertEqual(
+                                    matching[0].path,
+                                    expected_writer_path,
+                                )
+                            if expected_reuse_identity is not None:
+                                self.assertEqual(
+                                    matching[0].identity,
+                                    expected_reuse_identity,
+                                )
+                                read_custody = tuple(
+                                    item
+                                    for item in custody
+                                    if item.path == expected_writer_path
+                                    and item.fd != file_fd
+                                    and item.state == "open"
+                                )
+                                self.assertEqual(len(read_custody), 1)
+                                self.assertEqual(
+                                    read_custody[0].identity,
+                                    expected_reuse_identity,
+                                )
+                            raise KeyboardInterrupt(
+                                "simulated observation failure after writer open"
+                            )
+                        return real_fstat(file_fd)
+
+                    with self._recovery_module_scope(module):
+                        plan = module.plan_private_control_recovery(
+                            root_id,
+                            plan_path,
+                        )
+                        if reuse_existing:
+                            pending = self.primary_parent / (
+                                f".{receipt_name}.pending-"
+                                f"{plan['plan_digest']}-{'b' * 32}"
+                            )
+                            pending.write_bytes(b"retained partial bytes\n")
+                            pending.chmod(0o400)
+                            metadata = pending.stat()
+                            expected_reuse_identity = (
+                                metadata.st_dev,
+                                metadata.st_ino,
+                                stat.S_IFMT(metadata.st_mode),
+                            )
+                            expected_writer_path = pending
+                        with (
+                            mock.patch.object(
+                                module.os,
+                                "fstat",
+                                side_effect=interrupt_first_writer_fstat,
+                            ),
+                            self.assertRaises(KeyboardInterrupt),
+                        ):
+                            module.execute_private_control_recovery(
+                                root_id,
+                                plan_path,
+                            )
+                        self.assertTrue(injected)
+                        self.assertEqual(
+                            module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY,
+                            (),
+                        )
+                        self.assertEqual(module._PC_RECOVERY_RETAINED_CLOSE_FENCE, ())
+
+    def test_pending_reuse_keeps_inode_pinned_through_writer_open(self) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            with self.subTest(module=module.__name__):
+                if self.primary_parent.exists():
+                    shutil.rmtree(self.primary_parent)
+                self.primary_parent.mkdir(mode=0o700)
+                (
+                    _primary_spec,
+                    root_id,
+                    receipt_name,
+                    marker_name,
+                    error_type,
+                ) = self._recovery_module_contract(module)
+                plan_path = self.root / f"{module.__name__}-pending-replace.json"
+                real_open = os.open
+                real_close = os.close
+                replacement_identity: tuple[int, int, int] | None = None
+                injected = False
+
+                with self._recovery_module_scope(module):
+                    plan = module.plan_private_control_recovery(root_id, plan_path)
+                    pending = self.primary_parent / (
+                        f".{receipt_name}.pending-"
+                        f"{plan['plan_digest']}-{'c' * 32}"
+                    )
+                    partial_payload = b"retained partial bytes\n"
+                    replacement_payload = b"replacement must remain untouched\n"
+                    pending.write_bytes(partial_payload)
+                    pending.chmod(0o400)
+                    initial_metadata = pending.stat()
+                    initial_identity = (
+                        initial_metadata.st_dev,
+                        initial_metadata.st_ino,
+                        stat.S_IFMT(initial_metadata.st_mode),
+                    )
+
+                    def replace_before_writer_open(
+                        path: object,
+                        flags: int,
+                        mode: int = 0o777,
+                        *,
+                        dir_fd: int | None = None,
+                    ) -> int:
+                        nonlocal injected
+                        nonlocal replacement_identity
+                        if (
+                            not injected
+                            and path == pending.name
+                            and dir_fd is not None
+                            and flags & os.O_ACCMODE == os.O_WRONLY
+                        ):
+                            injected = True
+                            custodies = tuple(
+                                module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+                            )
+                            read_custody = tuple(
+                                custody
+                                for custody in custodies
+                                if custody.state == "open" and custody.fd >= 0
+                            )
+                            opening_custody = tuple(
+                                custody
+                                for custody in custodies
+                                if custody.state == "opening" and custody.fd < 0
+                            )
+                            self.assertEqual(len(read_custody), 1)
+                            self.assertEqual(len(opening_custody), 1)
+                            pinned = os.fstat(read_custody[0].fd)
+                            self.assertEqual(
+                                (
+                                    pinned.st_dev,
+                                    pinned.st_ino,
+                                    stat.S_IFMT(pinned.st_mode),
+                                ),
+                                initial_identity,
+                            )
+                            pending.unlink()
+                            replacement_fd = real_open(
+                                path,
+                                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                0o600,
+                                dir_fd=dir_fd,
+                            )
+                            try:
+                                os.write(replacement_fd, replacement_payload)
+                                os.fchmod(replacement_fd, 0o600)
+                                replacement = os.fstat(replacement_fd)
+                                replacement_identity = (
+                                    replacement.st_dev,
+                                    replacement.st_ino,
+                                    stat.S_IFMT(replacement.st_mode),
+                                )
+                            finally:
+                                real_close(replacement_fd)
+                            self.assertNotEqual(replacement_identity, initial_identity)
+                        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+                    with (
+                        mock.patch.object(
+                            module.os,
+                            "open",
+                            side_effect=replace_before_writer_open,
+                        ),
+                        self.assertRaisesRegex(error_type, "changed before rewrite"),
+                    ):
+                        module.execute_private_control_recovery(root_id, plan_path)
+                    self.assertTrue(injected)
+                    self.assertNotEqual(replacement_identity, initial_identity)
+                    replacement_metadata = pending.stat()
+                    self.assertEqual(
+                        (
+                            replacement_metadata.st_dev,
+                            replacement_metadata.st_ino,
+                            stat.S_IFMT(replacement_metadata.st_mode),
+                        ),
+                        replacement_identity,
+                    )
+                    self.assertEqual(pending.read_bytes(), replacement_payload)
+                    self.assertEqual(stat.S_IMODE(replacement_metadata.st_mode), 0o600)
+                    self.assertFalse((self.primary_parent / receipt_name).exists())
+                    self.assertFalse((self.primary_parent / marker_name).exists())
+                    self.assertEqual(
+                        module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY,
+                        (),
+                    )
+                    self.assertEqual(module._PC_RECOVERY_RETAINED_CLOSE_FENCE, ())
+
+    def test_pending_open_result_uncertainty_installs_process_fence(self) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            for reuse_existing in (False, True):
+                with self.subTest(
+                    module=module.__name__,
+                    reuse_existing=reuse_existing,
+                ):
+                    if self.primary_parent.exists():
+                        shutil.rmtree(self.primary_parent)
+                    self.primary_parent.mkdir(mode=0o700)
+                    (
+                        _primary_spec,
+                        root_id,
+                        receipt_name,
+                        _marker_name,
+                        error_type,
+                    ) = self._recovery_module_contract(module)
+                    plan_path = self.root / (
+                        f"{module.__name__}-pending-open-result-"
+                        f"{int(reuse_existing)}.json"
+                    )
+                    real_open = os.open
+                    real_close = os.close
+                    leaked_raw_fd = -1
+
+                    def interrupt_after_open_result(
+                        path: object,
+                        flags: int,
+                        mode: int = 0o777,
+                        *,
+                        dir_fd: int | None = None,
+                    ) -> int:
+                        nonlocal leaked_raw_fd
+                        if (
+                            leaked_raw_fd < 0
+                            and dir_fd is not None
+                            and flags & os.O_ACCMODE == os.O_WRONLY
+                        ):
+                            leaked_raw_fd = real_open(
+                                path,
+                                flags,
+                                mode,
+                                dir_fd=dir_fd,
+                            )
+                            raise KeyboardInterrupt(
+                                "simulated async exception after open result"
+                            )
+                        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+                    retained: tuple[object, ...] = ()
+                    try:
+                        with self._recovery_module_scope(module):
+                            plan = module.plan_private_control_recovery(
+                                root_id,
+                                plan_path,
+                            )
+                            if reuse_existing:
+                                pending = self.primary_parent / (
+                                    f".{receipt_name}.pending-"
+                                    f"{plan['plan_digest']}-{'d' * 32}"
+                                )
+                                pending.write_bytes(b"retained partial bytes\n")
+                                pending.chmod(0o400)
+                            with (
+                                mock.patch.object(
+                                    module.os,
+                                    "open",
+                                    side_effect=interrupt_after_open_result,
+                                ),
+                                self.assertRaises(KeyboardInterrupt),
+                            ):
+                                module.execute_private_control_recovery(
+                                    root_id,
+                                    plan_path,
+                                )
+                            self.assertGreaterEqual(leaked_raw_fd, 0)
+                            flags = fcntl.fcntl(leaked_raw_fd, fcntl.F_GETFL)
+                            self.assertEqual(flags & os.O_ACCMODE, os.O_WRONLY)
+                            custody = tuple(
+                                module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+                            )
+                            retained = tuple(
+                                module._PC_RECOVERY_RETAINED_CLOSE_FENCE
+                            )
+                            self.assertEqual(len(custody), 1)
+                            self.assertEqual(custody[0].fd, -1)
+                            self.assertEqual(
+                                custody[0].state,
+                                "open-result-uncertain",
+                            )
+                            self.assertGreaterEqual(len(retained), 4)
+                            with mock.patch.object(
+                                module.os,
+                                "open",
+                                side_effect=AssertionError(
+                                    "open-result fence gate must precede any open"
+                                ),
+                            ):
+                                with self.assertRaisesRegex(
+                                    error_type,
+                                    "close remains uncertain",
+                                ):
+                                    module.plan_private_control_recovery(
+                                        root_id,
+                                        self.root / "blocked-open-result-plan.json",
+                                    )
+                                with self.assertRaisesRegex(
+                                    error_type,
+                                    "close remains uncertain",
+                                ):
+                                    module.execute_private_control_recovery(
+                                        root_id,
+                                        plan_path,
+                                    )
+                            fcntl.fcntl(leaked_raw_fd, fcntl.F_GETFL)
+                    finally:
+                        module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY = ()
+                        module._PC_RECOVERY_RETAINED_CLOSE_FENCE = ()
+                        if leaked_raw_fd >= 0:
+                            real_close(leaked_raw_fd)
+                        if retained:
+                            module._pc_recovery_close_bindings(retained)
+
+    def test_pending_open_oserror_after_effect_installs_process_fence(self) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            with self.subTest(module=module.__name__):
+                if self.primary_parent.exists():
+                    shutil.rmtree(self.primary_parent)
+                self.primary_parent.mkdir(mode=0o700)
+                (
+                    _primary_spec,
+                    root_id,
+                    receipt_name,
+                    _marker_name,
+                    error_type,
+                ) = self._recovery_module_contract(module)
+                real_open = os.open
+                real_close = os.close
+                leaked_raw_fd = -1
+                parent = None
+
+                def fail_after_open_result(
+                    path: object,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal leaked_raw_fd
+                    leaked_raw_fd = real_open(
+                        path,
+                        flags,
+                        mode,
+                        dir_fd=dir_fd,
+                    )
+                    raise OSError(
+                        errno.EIO,
+                        "simulated OSError after open returned a descriptor",
+                    )
+
+                try:
+                    with self._recovery_module_scope(module):
+                        parent = module._pc_recovery_bind_directory(
+                            self.primary_parent,
+                            "test pending publication parent",
+                        )
+                        pending_name = (
+                            f".{receipt_name}.pending-{'f' * 64}-{'0' * 32}"
+                        )
+                        flags = (
+                            os.O_WRONLY
+                            | os.O_CREAT
+                            | os.O_EXCL
+                            | getattr(os, "O_CLOEXEC", 0)
+                            | getattr(os, "O_NOFOLLOW", 0)
+                        )
+                        with (
+                            mock.patch.object(
+                                module.os,
+                                "open",
+                                side_effect=fail_after_open_result,
+                            ),
+                            self.assertRaisesRegex(
+                                OSError,
+                                "after open returned a descriptor",
+                            ),
+                        ):
+                            module._pc_recovery_open_pending_descriptor(
+                                parent,
+                                pending_name,
+                                "primary recovery receipt",
+                                flags,
+                                0o600,
+                                None,
+                                None,
+                            )
+                        self.assertGreaterEqual(leaked_raw_fd, 0)
+                        custody = tuple(
+                            module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+                        )
+                        self.assertEqual(len(custody), 1)
+                        self.assertEqual(custody[0].fd, -1)
+                        self.assertEqual(
+                            custody[0].state,
+                            "open-result-uncertain",
+                        )
+                        with mock.patch.object(
+                            module.os,
+                            "open",
+                            side_effect=AssertionError(
+                                "open-result fence gate must precede any open"
+                            ),
+                        ):
+                            with self.assertRaisesRegex(
+                                error_type,
+                                "close remains uncertain",
+                            ):
+                                module.plan_private_control_recovery(
+                                    root_id,
+                                    self.root / "blocked-oserror-plan.json",
+                                )
+                finally:
+                    module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY = ()
+                    module._PC_RECOVERY_RETAINED_CLOSE_FENCE = ()
+                    if leaked_raw_fd >= 0:
+                        real_close(leaked_raw_fd)
+                    if parent is not None:
+                        module._pc_recovery_close_bindings((parent,))
+
+    def test_pending_writer_reader_handoff_rejects_close_hook_replacement(
+        self,
+    ) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            for reuse_existing in (False, True):
+                with self.subTest(
+                    module=module.__name__,
+                    reuse_existing=reuse_existing,
+                ):
+                    if self.primary_parent.exists():
+                        shutil.rmtree(self.primary_parent)
+                    self.primary_parent.mkdir(mode=0o700)
+                    (
+                        _primary_spec,
+                        root_id,
+                        receipt_name,
+                        marker_name,
+                        error_type,
+                    ) = self._recovery_module_contract(module)
+                    plan_path = self.root / (
+                        f"{module.__name__}-pending-close-replace-"
+                        f"{int(reuse_existing)}.json"
+                    )
+                    real_open = os.open
+                    real_close = os.close
+                    injected = False
+                    expected_writer_path: Path | None = None
+                    replacement_path: Path | None = None
+                    replacement_identity: tuple[int, int, int] | None = None
+                    replacement_payload: bytes | None = None
+
+                    with self._recovery_module_scope(module):
+                        plan = module.plan_private_control_recovery(
+                            root_id,
+                            plan_path,
+                        )
+                        if reuse_existing:
+                            pending = self.primary_parent / (
+                                f".{receipt_name}.pending-"
+                                f"{plan['plan_digest']}-{'1' * 32}"
+                            )
+                            pending.write_bytes(b"retained partial bytes\n")
+                            pending.chmod(0o400)
+                            expected_writer_path = pending
+
+                        def replace_after_writer_close(file_fd: int) -> None:
+                            nonlocal injected
+                            nonlocal replacement_identity
+                            nonlocal replacement_path
+                            nonlocal replacement_payload
+                            flags = fcntl.fcntl(file_fd, fcntl.F_GETFL)
+                            matching = tuple(
+                                item
+                                for item in module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+                                if item.fd == file_fd
+                            )
+                            if (
+                                not injected
+                                and flags & os.O_ACCMODE == os.O_WRONLY
+                                and len(matching) == 1
+                                and matching[0].state == "close-uncertain"
+                            ):
+                                injected = True
+                                writer_path = matching[0].path
+                                replacement_path = writer_path
+                                if expected_writer_path is not None:
+                                    self.assertEqual(
+                                        writer_path,
+                                        expected_writer_path,
+                                    )
+                                real_close(file_fd)
+                                writer_path.unlink()
+                                replacement_fd = real_open(
+                                    writer_path,
+                                    os.O_WRONLY
+                                    | os.O_CREAT
+                                    | os.O_EXCL
+                                    | getattr(os, "O_CLOEXEC", 0)
+                                    | getattr(os, "O_NOFOLLOW", 0),
+                                    0o600,
+                                )
+                                try:
+                                    metadata = os.fstat(replacement_fd)
+                                    replacement_identity = (
+                                        metadata.st_dev,
+                                        metadata.st_ino,
+                                        stat.S_IFMT(metadata.st_mode),
+                                    )
+                                    replacement_payload = module._pc_recovery_json_bytes(
+                                        module._pc_recovery_primary_receipt_document(
+                                            plan,
+                                            replacement_identity,
+                                        ),
+                                        pretty=True,
+                                    )
+                                    offset = 0
+                                    while offset < len(replacement_payload):
+                                        offset += os.write(
+                                            replacement_fd,
+                                            replacement_payload[offset:],
+                                        )
+                                    os.fchmod(replacement_fd, 0o400)
+                                    os.fsync(replacement_fd)
+                                finally:
+                                    real_close(replacement_fd)
+                                return
+                            real_close(file_fd)
+
+                        with (
+                            mock.patch.object(
+                                module.os,
+                                "close",
+                                side_effect=replace_after_writer_close,
+                            ),
+                            self.assertRaises(error_type),
+                        ):
+                            module.execute_private_control_recovery(
+                                root_id,
+                                plan_path,
+                            )
+                        self.assertTrue(injected)
+                        self.assertIsNotNone(replacement_identity)
+                        self.assertIsNotNone(replacement_path)
+                        self.assertIsNotNone(replacement_payload)
+                        replacement_metadata = replacement_path.stat()
+                        self.assertEqual(
+                            (
+                                replacement_metadata.st_dev,
+                                replacement_metadata.st_ino,
+                                stat.S_IFMT(replacement_metadata.st_mode),
+                            ),
+                            replacement_identity,
+                        )
+                        self.assertEqual(
+                            replacement_path.read_bytes(),
+                            replacement_payload,
+                        )
+                        self.assertEqual(
+                            stat.S_IMODE(replacement_metadata.st_mode),
+                            0o400,
+                        )
+                        self.assertFalse(
+                            (self.primary_parent / receipt_name).exists()
+                        )
+                        self.assertFalse(
+                            (self.primary_parent / marker_name).exists()
+                        )
+                        self.assertEqual(
+                            module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY,
+                            (),
+                        )
+                        self.assertEqual(
+                            module._PC_RECOVERY_RETAINED_CLOSE_FENCE,
+                            (),
+                        )
+
+    def test_pending_verifier_close_uncertainty_retains_process_fence(
+        self,
+    ) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            for close_after_effect in (False, True):
+                with self.subTest(
+                    module=module.__name__,
+                    close_after_effect=close_after_effect,
+                ):
+                    if self.primary_parent.exists():
+                        shutil.rmtree(self.primary_parent)
+                    self.primary_parent.mkdir(mode=0o700)
+                    (
+                        _primary_spec,
+                        root_id,
+                        receipt_name,
+                        _marker_name,
+                        error_type,
+                    ) = self._recovery_module_contract(module)
+                    plan_path = self.root / (
+                        f"{module.__name__}-pending-verifier-close-"
+                        f"{int(close_after_effect)}.json"
+                    )
+                    real_open = os.open
+                    real_close = os.close
+                    writer_close_seen = False
+                    verifier_fd = -1
+                    verifier_close_calls = 0
+                    sentinel_fd = -1
+                    sentinel_identity: tuple[int, int, int] | None = None
+                    custody: tuple[object, ...] = ()
+                    retained: tuple[object, ...] = ()
+
+                    def inject_verifier_close(file_fd: int) -> None:
+                        nonlocal writer_close_seen
+                        nonlocal verifier_fd
+                        nonlocal verifier_close_calls
+                        nonlocal sentinel_fd
+                        nonlocal sentinel_identity
+                        matching = tuple(
+                            item
+                            for item in module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+                            if item.fd == file_fd
+                        )
+                        flags = fcntl.fcntl(file_fd, fcntl.F_GETFL)
+                        access_mode = flags & os.O_ACCMODE
+                        if (
+                            not writer_close_seen
+                            and access_mode == os.O_WRONLY
+                            and len(matching) == 1
+                            and matching[0].state == "close-uncertain"
+                        ):
+                            writer_close_seen = True
+                            writer_path = matching[0].path
+                            real_close(file_fd)
+                            writer_path.unlink()
+                            replacement_fd = real_open(
+                                writer_path,
+                                os.O_WRONLY
+                                | os.O_CREAT
+                                | os.O_EXCL
+                                | getattr(os, "O_CLOEXEC", 0)
+                                | getattr(os, "O_NOFOLLOW", 0),
+                                0o600,
+                            )
+                            try:
+                                metadata = os.fstat(replacement_fd)
+                                replacement_identity = (
+                                    metadata.st_dev,
+                                    metadata.st_ino,
+                                    stat.S_IFMT(metadata.st_mode),
+                                )
+                                payload = module._pc_recovery_json_bytes(
+                                    module._pc_recovery_primary_receipt_document(
+                                        plan,
+                                        replacement_identity,
+                                    ),
+                                    pretty=True,
+                                )
+                                offset = 0
+                                while offset < len(payload):
+                                    offset += os.write(
+                                        replacement_fd,
+                                        payload[offset:],
+                                    )
+                                os.fchmod(replacement_fd, 0o400)
+                                os.fsync(replacement_fd)
+                            finally:
+                                real_close(replacement_fd)
+                            return
+                        if (
+                            writer_close_seen
+                            and access_mode == os.O_RDONLY
+                            and len(matching) == 1
+                            and matching[0].state == "close-uncertain"
+                        ):
+                            if verifier_fd >= 0 and file_fd == verifier_fd:
+                                verifier_close_calls += 1
+                                raise AssertionError(
+                                    "close-uncertain verifier was closed again"
+                                )
+                            verifier_fd = file_fd
+                            verifier_close_calls = 1
+                            if close_after_effect:
+                                real_close(file_fd)
+                                sentinel_path = self.root / (
+                                    f"{module.__name__}-verifier-sentinel-"
+                                    f"{int(close_after_effect)}"
+                                )
+                                sentinel_path.write_bytes(
+                                    b"unique verifier close sentinel\n"
+                                )
+                                sentinel_path.chmod(0o600)
+                                replacement_fd = real_open(
+                                    sentinel_path,
+                                    os.O_RDONLY,
+                                )
+                                sentinel_path.unlink()
+                                if replacement_fd != file_fd:
+                                    os.dup2(replacement_fd, file_fd)
+                                    real_close(replacement_fd)
+                                sentinel_fd = file_fd
+                                metadata = os.fstat(sentinel_fd)
+                                sentinel_identity = (
+                                    metadata.st_dev,
+                                    metadata.st_ino,
+                                    stat.S_IFMT(metadata.st_mode),
+                                )
+                            raise OSError(
+                                errno.EIO,
+                                "simulated pending verifier close uncertainty",
+                            )
+                        real_close(file_fd)
+
+                    try:
+                        with self._recovery_module_scope(module):
+                            plan = module.plan_private_control_recovery(
+                                root_id,
+                                plan_path,
+                            )
+                            with mock.patch.object(
+                                module.os,
+                                "close",
+                                side_effect=inject_verifier_close,
+                            ):
+                                with self.assertRaisesRegex(
+                                    error_type,
+                                    "pending .* verifier descriptor",
+                                ):
+                                    module.execute_private_control_recovery(
+                                        root_id,
+                                        plan_path,
+                                    )
+                                custody = tuple(
+                                    module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+                                )
+                                retained = tuple(
+                                    module._PC_RECOVERY_RETAINED_CLOSE_FENCE
+                                )
+                                self.assertTrue(writer_close_seen)
+                                self.assertGreaterEqual(verifier_fd, 0)
+                                self.assertEqual(verifier_close_calls, 1)
+                                self.assertEqual(len(custody), 1)
+                                self.assertEqual(custody[0].fd, verifier_fd)
+                                self.assertEqual(
+                                    custody[0].state,
+                                    "close-uncertain",
+                                )
+                                self.assertGreaterEqual(len(retained), 4)
+                                with mock.patch.object(
+                                    module.os,
+                                    "open",
+                                    side_effect=AssertionError(
+                                        "verifier close fence must precede any open"
+                                    ),
+                                ):
+                                    with self.assertRaisesRegex(
+                                        error_type,
+                                        "close remains uncertain",
+                                    ):
+                                        module.plan_private_control_recovery(
+                                            root_id,
+                                            self.root / "blocked-verifier-plan.json",
+                                        )
+                                    with self.assertRaisesRegex(
+                                        error_type,
+                                        "close remains uncertain",
+                                    ):
+                                        module.execute_private_control_recovery(
+                                            root_id,
+                                            plan_path,
+                                        )
+                                self.assertEqual(verifier_close_calls, 1)
+                                if close_after_effect:
+                                    metadata = os.fstat(sentinel_fd)
+                                    self.assertEqual(
+                                        (
+                                            metadata.st_dev,
+                                            metadata.st_ino,
+                                            stat.S_IFMT(metadata.st_mode),
+                                        ),
+                                        sentinel_identity,
+                                    )
+                    finally:
+                        module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY = ()
+                        module._PC_RECOVERY_RETAINED_CLOSE_FENCE = ()
+                        for binding in retained:
+                            if binding.fd == verifier_fd:
+                                binding.fd = -1
+                        if verifier_fd >= 0 and not close_after_effect:
+                            real_close(verifier_fd)
+                        if sentinel_fd >= 0:
+                            real_close(sentinel_fd)
+                        if retained:
+                            module._pc_recovery_close_bindings(retained)
+
+    def test_pending_reader_custody_survives_rename_failure(self) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            for close_after_effect in (False, True):
+                with self.subTest(
+                    module=module.__name__,
+                    close_after_effect=close_after_effect,
+                ):
+                    if self.primary_parent.exists():
+                        shutil.rmtree(self.primary_parent)
+                    self.primary_parent.mkdir(mode=0o700)
+                    (
+                        _primary_spec,
+                        root_id,
+                        _receipt_name,
+                        _marker_name,
+                        error_type,
+                    ) = self._recovery_module_contract(module)
+                    plan_path = self.root / (
+                        f"{module.__name__}-pending-rename-close-"
+                        f"{int(close_after_effect)}.json"
+                    )
+                    rename_helper = (
+                        "_rename_directory_entry_noreplace"
+                        if module is MIRROR_MODULE
+                        else "_rename_noreplace_at"
+                    )
+                    real_open = os.open
+                    real_close = os.close
+                    verifier_fd = -1
+                    verifier_close_calls = 0
+                    sentinel_fd = -1
+                    sentinel_identity: tuple[int, int, int] | None = None
+                    custody: tuple[object, ...] = ()
+                    retained: tuple[object, ...] = ()
+
+                    def inject_reader_close(file_fd: int) -> None:
+                        nonlocal verifier_fd
+                        nonlocal verifier_close_calls
+                        nonlocal sentinel_fd
+                        nonlocal sentinel_identity
+                        matching = tuple(
+                            item
+                            for item in module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+                            if item.fd == file_fd
+                        )
+                        flags = fcntl.fcntl(file_fd, fcntl.F_GETFL)
+                        if (
+                            flags & os.O_ACCMODE == os.O_RDONLY
+                            and len(matching) == 1
+                            and matching[0].state == "close-uncertain"
+                        ):
+                            if verifier_fd >= 0 and file_fd == verifier_fd:
+                                verifier_close_calls += 1
+                                raise AssertionError(
+                                    "rename-failure reader was closed again"
+                                )
+                            verifier_fd = file_fd
+                            verifier_close_calls = 1
+                            if close_after_effect:
+                                real_close(file_fd)
+                                sentinel_path = self.root / (
+                                    f"{module.__name__}-rename-reader-sentinel-"
+                                    f"{int(close_after_effect)}"
+                                )
+                                sentinel_path.write_bytes(
+                                    b"unique rename reader close sentinel\n"
+                                )
+                                sentinel_path.chmod(0o600)
+                                replacement_fd = real_open(
+                                    sentinel_path,
+                                    os.O_RDONLY,
+                                )
+                                sentinel_path.unlink()
+                                if replacement_fd != file_fd:
+                                    os.dup2(replacement_fd, file_fd)
+                                    real_close(replacement_fd)
+                                sentinel_fd = file_fd
+                                metadata = os.fstat(sentinel_fd)
+                                sentinel_identity = (
+                                    metadata.st_dev,
+                                    metadata.st_ino,
+                                    stat.S_IFMT(metadata.st_mode),
+                                )
+                            raise OSError(
+                                errno.EIO,
+                                "simulated rename-failure reader close uncertainty",
+                            )
+                        real_close(file_fd)
+
+                    try:
+                        with self._recovery_module_scope(module):
+                            module.plan_private_control_recovery(
+                                root_id,
+                                plan_path,
+                            )
+                            with (
+                                mock.patch.object(
+                                    module,
+                                    rename_helper,
+                                    side_effect=OSError(
+                                        errno.EIO,
+                                        "simulated pending publication rename failure",
+                                    ),
+                                ),
+                                mock.patch.object(
+                                    module.os,
+                                    "close",
+                                    side_effect=inject_reader_close,
+                                ),
+                            ):
+                                with self.assertRaisesRegex(
+                                    error_type,
+                                    "pending .* verifier descriptor",
+                                ):
+                                    module.execute_private_control_recovery(
+                                        root_id,
+                                        plan_path,
+                                    )
+                                custody = tuple(
+                                    module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+                                )
+                                retained = tuple(
+                                    module._PC_RECOVERY_RETAINED_CLOSE_FENCE
+                                )
+                                self.assertEqual(verifier_close_calls, 1)
+                                self.assertEqual(len(custody), 1)
+                                self.assertEqual(custody[0].fd, verifier_fd)
+                                self.assertEqual(
+                                    custody[0].state,
+                                    "close-uncertain",
+                                )
+                                self.assertGreaterEqual(len(retained), 4)
+                                with mock.patch.object(
+                                    module.os,
+                                    "open",
+                                    side_effect=AssertionError(
+                                        "rename close fence must precede any open"
+                                    ),
+                                ):
+                                    with self.assertRaisesRegex(
+                                        error_type,
+                                        "close remains uncertain",
+                                    ):
+                                        module.plan_private_control_recovery(
+                                            root_id,
+                                            self.root / "blocked-rename-plan.json",
+                                        )
+                                    with self.assertRaisesRegex(
+                                        error_type,
+                                        "close remains uncertain",
+                                    ):
+                                        module.execute_private_control_recovery(
+                                            root_id,
+                                            plan_path,
+                                        )
+                                self.assertEqual(verifier_close_calls, 1)
+                                if close_after_effect:
+                                    metadata = os.fstat(sentinel_fd)
+                                    self.assertEqual(
+                                        (
+                                            metadata.st_dev,
+                                            metadata.st_ino,
+                                            stat.S_IFMT(metadata.st_mode),
+                                        ),
+                                        sentinel_identity,
+                                    )
+                    finally:
+                        module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY = ()
+                        module._PC_RECOVERY_RETAINED_CLOSE_FENCE = ()
+                        for binding in retained:
+                            if binding.fd == verifier_fd:
+                                binding.fd = -1
+                        if verifier_fd >= 0 and not close_after_effect:
+                            real_close(verifier_fd)
+                        if sentinel_fd >= 0:
+                            real_close(sentinel_fd)
+                        if retained:
+                            module._pc_recovery_close_bindings(retained)
+
+    def test_pending_activation_failure_closes_known_writer(self) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            for reuse_existing in (False, True):
+                with self.subTest(
+                    module=module.__name__,
+                    reuse_existing=reuse_existing,
+                ):
+                    if self.primary_parent.exists():
+                        shutil.rmtree(self.primary_parent)
+                    self.primary_parent.mkdir(mode=0o700)
+                    (
+                        _primary_spec,
+                        root_id,
+                        receipt_name,
+                        _marker_name,
+                        _error_type,
+                    ) = self._recovery_module_contract(module)
+                    plan_path = self.root / (
+                        f"{module.__name__}-pending-activation-"
+                        f"{int(reuse_existing)}.json"
+                    )
+                    real_activate = module._pc_recovery_activate_pending_descriptor
+                    interrupted_fd = -1
+
+                    def interrupt_writer_activation(custody: object, file_fd: int):
+                        nonlocal interrupted_fd
+                        flags = fcntl.fcntl(file_fd, fcntl.F_GETFL)
+                        if (
+                            interrupted_fd < 0
+                            and flags & os.O_ACCMODE == os.O_WRONLY
+                        ):
+                            interrupted_fd = file_fd
+                            raise KeyboardInterrupt(
+                                "simulated activation failure after open"
+                            )
+                        return real_activate(custody, file_fd)
+
+                    with self._recovery_module_scope(module):
+                        plan = module.plan_private_control_recovery(
+                            root_id,
+                            plan_path,
+                        )
+                        if reuse_existing:
+                            pending = self.primary_parent / (
+                                f".{receipt_name}.pending-"
+                                f"{plan['plan_digest']}-{'e' * 32}"
+                            )
+                            pending.write_bytes(b"retained partial bytes\n")
+                            pending.chmod(0o400)
+                        with (
+                            mock.patch.object(
+                                module,
+                                "_pc_recovery_activate_pending_descriptor",
+                                side_effect=interrupt_writer_activation,
+                            ),
+                            self.assertRaises(KeyboardInterrupt),
+                        ):
+                            module.execute_private_control_recovery(
+                                root_id,
+                                plan_path,
+                            )
+                        self.assertGreaterEqual(interrupted_fd, 0)
+                        with self.assertRaises(OSError):
+                            os.fstat(interrupted_fd)
+                        self.assertEqual(
+                            module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY,
+                            (),
+                        )
+                        self.assertEqual(module._PC_RECOVERY_RETAINED_CLOSE_FENCE, ())
+
     def test_terminal_verification_rejects_in_place_receipt_content_drift(
         self,
     ) -> None:
@@ -13269,6 +14876,14 @@ class MirrorQuarantineContractParityTests(unittest.TestCase):
             (
                 "PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES",
                 "MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES",
+            ),
+            (
+                "PRIVATE_CONTROL_RECOVERY_MAX_PENDING_ENTRIES",
+                "MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_ENTRIES",
+            ),
+            (
+                "PRIVATE_CONTROL_RECOVERY_MAX_PENDING_BYTES",
+                "MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_BYTES",
             ),
             (
                 "PRIVATE_CONTROL_RECOVERY_TIMEOUT_SECONDS",

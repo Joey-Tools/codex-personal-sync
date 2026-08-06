@@ -320,6 +320,10 @@ MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_ALLOCATED_BYTES = 1024 * 1024 * 1024
 MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_DEPTH = 256
 MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PATH_BYTES = 4 * 1024 * 1024
 MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES = 64 * 1024 * 1024
+MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_ENTRIES = 8
+MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_BYTES = (
+    8 * MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
+)
 MIRROR_PRIVATE_CONTROL_RECOVERY_TIMEOUT_SECONDS = 300.0
 
 
@@ -533,6 +537,23 @@ class _PrivateControlRecoveryBinding:
     locked: bool = False
 
 
+@dataclass
+class _PrivateControlRecoveryPendingDescriptorCustody:
+    label: str
+    path: Path
+    fd: int
+    parent_identity: tuple[int, int, int]
+    identity: tuple[int, int, int] | None
+    access: tuple[int, int, int] | None
+    state: str = "open"
+
+
+_PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY: tuple[
+    _PrivateControlRecoveryPendingDescriptorCustody, ...
+] = ()
+_PC_RECOVERY_RETAINED_CLOSE_FENCE: tuple[_PrivateControlRecoveryBinding, ...] = ()
+
+
 _MIRROR_PRIVATE_CONTROL_RECOVERY_PLAN_FIELDS = frozenset(
     {
         "caps",
@@ -687,6 +708,132 @@ def _pc_recovery_close_bindings(
         binding.fd = -1
     if errors:
         raise SyncError("; ".join(errors))
+
+
+def _pc_recovery_prepare_pending_descriptor(
+    parent: _PrivateControlRecoveryBinding,
+    name: str,
+    label: str,
+    identity: tuple[int, int, int] | None,
+    access: tuple[int, int, int] | None,
+) -> _PrivateControlRecoveryPendingDescriptorCustody:
+    global _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+    custody = _PrivateControlRecoveryPendingDescriptorCustody(
+        label=label,
+        path=parent.path / name,
+        fd=-1,
+        parent_identity=parent.identity,
+        identity=identity,
+        access=access,
+        state="opening",
+    )
+    _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY += (custody,)
+    return custody
+
+
+def _pc_recovery_activate_pending_descriptor(
+    custody: _PrivateControlRecoveryPendingDescriptorCustody,
+    file_fd: int,
+) -> None:
+    custody.fd = file_fd
+    custody.state = "open"
+
+
+def _pc_recovery_release_pending_descriptor(
+    custody: _PrivateControlRecoveryPendingDescriptorCustody,
+) -> None:
+    global _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+    if custody.fd < 0 or custody.state != "open":
+        raise SyncError(
+            f"pending {custody.label} descriptor cannot be handed off"
+        )
+    custody.state = "handed-off"
+    _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY = tuple(
+        item
+        for item in _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+        if item is not custody
+    )
+
+
+def _pc_recovery_open_pending_descriptor(
+    parent: _PrivateControlRecoveryBinding,
+    name: str,
+    label: str,
+    flags: int,
+    mode: int | None,
+    identity: tuple[int, int, int] | None,
+    access: tuple[int, int, int] | None,
+) -> _PrivateControlRecoveryPendingDescriptorCustody:
+    global _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+    custody = _pc_recovery_prepare_pending_descriptor(
+        parent,
+        name,
+        label,
+        identity,
+        access,
+    )
+    file_fd = -1
+    try:
+        if mode is None:
+            file_fd = os.open(name, flags, dir_fd=parent.fd)
+        else:
+            file_fd = os.open(name, flags, mode, dir_fd=parent.fd)
+        _pc_recovery_activate_pending_descriptor(custody, file_fd)
+        return custody
+    except BaseException:
+        if file_fd < 0:
+            custody.state = "open-result-uncertain"
+        else:
+            custody.fd = file_fd
+            custody.state = "open"
+            _pc_recovery_close_pending_descriptor(custody)
+        raise
+
+
+def _pc_recovery_close_pending_descriptor(
+    custody: _PrivateControlRecoveryPendingDescriptorCustody,
+) -> None:
+    global _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+    custody.state = "close-uncertain"
+    try:
+        os.close(custody.fd)
+    except BaseException as error:
+        if isinstance(error, OSError):
+            raise SyncError(
+                f"cannot close pending {custody.label} descriptor: {error}"
+            ) from error
+        raise
+    custody.state = "closed"
+    _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY = tuple(
+        item
+        for item in _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+        if item is not custody
+    )
+
+
+def _pc_recovery_retain_close_fence(
+    bindings: tuple[_PrivateControlRecoveryBinding | None, ...],
+) -> None:
+    global _PC_RECOVERY_RETAINED_CLOSE_FENCE
+    retained = list(_PC_RECOVERY_RETAINED_CLOSE_FENCE)
+    seen = {id(binding) for binding in retained}
+    for binding in bindings:
+        if binding is None or binding.fd < 0 or id(binding) in seen:
+            continue
+        seen.add(id(binding))
+        retained.append(binding)
+    _PC_RECOVERY_RETAINED_CLOSE_FENCE = tuple(retained)
+
+
+def _pc_recovery_require_no_close_fence() -> None:
+    if (
+        _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+        or _PC_RECOVERY_RETAINED_CLOSE_FENCE
+    ):
+        raise SyncError(
+            "pending recovery descriptor close remains uncertain; "
+            "restart the process before another recovery attempt"
+        )
 
 
 def _pc_recovery_bind_directory(
@@ -1434,6 +1581,8 @@ def _pc_recovery_caps_document() -> dict[str, int | float]:
         "max_depth": MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_DEPTH,
         "max_entries": MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_ENTRIES,
         "max_logical_bytes": MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_LOGICAL_BYTES,
+        "max_pending_bytes": MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_BYTES,
+        "max_pending_entries": MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_ENTRIES,
         "max_path_bytes": MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PATH_BYTES,
         "max_receipt_bytes": MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES,
         "timeout_seconds": MIRROR_PRIVATE_CONTROL_RECOVERY_TIMEOUT_SECONDS,
@@ -2054,6 +2203,7 @@ def plan_private_control_recovery(
     requested_root_id: str,
     output_receipt: Path,
 ) -> dict[str, object]:
+    _pc_recovery_require_no_close_fence()
     output_path = _pc_recovery_external_plan_path(
         output_receipt,
         requested_root_id,
@@ -2185,6 +2335,259 @@ def _pc_recovery_directory_is_empty(directory_fd: int, label: str) -> bool:
     if first != second:
         raise SyncError(f"{label} namespace changed during inspection")
     return not first
+
+
+def _pc_recovery_pending_read_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+
+
+def _pc_recovery_pending_publication_scope(
+    requested_name: str,
+) -> tuple[tuple[str, str], str, str]:
+    prefixes = (
+        f".{MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME}.pending-",
+        f".{MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME}.pending-",
+    )
+    requested_prefix: str | None = None
+    requested_plan_digest: str | None = None
+    for prefix in prefixes:
+        if requested_name.startswith(prefix):
+            suffix = requested_name[len(prefix) :]
+            match = re.fullmatch(r"([0-9a-f]{64})-[0-9a-f]{32}", suffix)
+            if match is not None:
+                requested_prefix = prefix
+                requested_plan_digest = match.group(1)
+            break
+    if requested_prefix is None or requested_plan_digest is None:
+        raise SyncError("pending recovery publication name is invalid")
+    return prefixes, requested_prefix, requested_plan_digest
+
+
+def _pc_recovery_stable_pending_publications(
+    parent: _PrivateControlRecoveryBinding,
+    prefixes: tuple[str, str],
+) -> tuple[tuple[str, tuple[int, int, int], tuple[int, int, int], int], ...]:
+    deadline = time.monotonic() + MIRROR_PRIVATE_CONTROL_RECOVERY_TIMEOUT_SECONDS
+
+    def snapshot() -> tuple[
+        tuple[str, tuple[int, int, int], tuple[int, int, int], int], ...
+    ]:
+        names: list[str] = []
+        scanned_entries = 0
+        try:
+            with os.scandir(parent.fd) as iterator:
+                for entry in iterator:
+                    _pc_recovery_check_deadline(
+                        deadline,
+                        "inventorying pending recovery publications",
+                    )
+                    scanned_entries += 1
+                    if scanned_entries > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_ENTRIES:
+                        raise SyncError(
+                            "pending recovery publication inventory exceeds its "
+                            "scan cap"
+                        )
+                    name = entry.name
+                    if name.startswith(prefixes):
+                        try:
+                            name.encode("utf-8", "strict")
+                        except UnicodeEncodeError as error:
+                            raise SyncError(
+                                "pending recovery publication name is not strict UTF-8"
+                            ) from error
+                        names.append(name)
+        except SyncError:
+            raise
+        except OSError as error:
+            raise SyncError(
+                f"cannot inventory pending recovery publications: {error}"
+            ) from error
+        names.sort()
+        records: list[tuple[str, tuple[int, int, int], tuple[int, int, int], int]] = []
+        for name in names:
+            _pc_recovery_check_deadline(
+                deadline,
+                "inspecting pending recovery publications",
+            )
+            try:
+                metadata = os.stat(
+                    name,
+                    dir_fd=parent.fd,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise SyncError(
+                    f"cannot inspect pending recovery publication {name}: {error}"
+                ) from error
+            identity = _pc_recovery_identity(metadata)
+            access = _pc_recovery_access(metadata)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or access
+                not in {
+                    (0o400, os.geteuid(), os.getegid()),
+                    (0o600, os.geteuid(), os.getegid()),
+                }
+                or metadata.st_size < 0
+                or metadata.st_size > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
+            ):
+                raise SyncError(
+                    f"pending recovery publication policy is invalid: {name}"
+                )
+            records.append((name, identity, access, metadata.st_size))
+        return tuple(records)
+
+    _pc_recovery_revalidate_directory(parent)
+    first = snapshot()
+    second = snapshot()
+    _pc_recovery_revalidate_directory(parent)
+    if first != second:
+        raise SyncError(
+            "pending recovery publication namespace changed during accounting"
+        )
+    return first
+
+
+def _pc_recovery_select_pending_publication(
+    parent: _PrivateControlRecoveryBinding,
+    requested_name: str,
+) -> tuple[
+    str,
+    int,
+    tuple[tuple[int, int, int], tuple[int, int, int], int] | None,
+]:
+    if not parent.locked:
+        raise SyncError(
+            "pending recovery publication accounting requires the parent lease"
+        )
+    if (
+        MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_ENTRIES < 1
+        or MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_BYTES
+        < MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
+    ):
+        raise SyncError("pending recovery publication caps are invalid")
+    prefixes, requested_prefix, requested_plan_digest = (
+        _pc_recovery_pending_publication_scope(requested_name)
+    )
+    first = _pc_recovery_stable_pending_publications(parent, prefixes)
+    logical_bytes = sum(record[3] for record in first)
+    same_plan_prefix = f"{requested_prefix}{requested_plan_digest}-"
+    reusable = [
+        record
+        for record in first
+        if record[0].startswith(same_plan_prefix)
+        and re.fullmatch(r"[0-9a-f]{32}", record[0][len(same_plan_prefix) :])
+        is not None
+    ]
+    if reusable:
+        selected = max(reusable, key=lambda record: (record[3], record[0]))
+        return (
+            selected[0],
+            logical_bytes,
+            (selected[1], selected[2], selected[3]),
+        )
+    if len(first) >= MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_ENTRIES:
+        raise SyncError("pending recovery publication entry cap would be exceeded")
+    if (
+        logical_bytes
+        > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_BYTES
+        - MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
+    ):
+        raise SyncError(
+            "pending recovery publication aggregate-byte cap would be exceeded"
+        )
+    return requested_name, logical_bytes, None
+
+
+def _pc_recovery_remove_superseded_pending_publications(
+    parent: _PrivateControlRecoveryBinding,
+    requested_name: str,
+    label: str,
+) -> None:
+    if not parent.locked:
+        raise SyncError(
+            "pending recovery publication cleanup requires the parent lease"
+        )
+    prefixes, requested_prefix, requested_plan_digest = (
+        _pc_recovery_pending_publication_scope(requested_name)
+    )
+    records = _pc_recovery_stable_pending_publications(parent, prefixes)
+    same_plan_prefix = f"{requested_prefix}{requested_plan_digest}-"
+    targets = tuple(
+        record
+        for record in records
+        if record[0].startswith(same_plan_prefix)
+        and re.fullmatch(r"[0-9a-f]{32}", record[0][len(same_plan_prefix) :])
+        is not None
+    )
+    for name, identity, access, size in targets:
+        file_fd = -1
+        custody: _PrivateControlRecoveryPendingDescriptorCustody | None = None
+        try:
+            try:
+                path_metadata = os.stat(
+                    name,
+                    dir_fd=parent.fd,
+                    follow_symlinks=False,
+                )
+                custody = _pc_recovery_open_pending_descriptor(
+                    parent,
+                    name,
+                    label,
+                    _pc_recovery_pending_read_flags(),
+                    None,
+                    identity,
+                    access,
+                )
+                file_fd = custody.fd
+                descriptor = os.fstat(file_fd)
+            except OSError as error:
+                raise SyncError(
+                    f"cannot bind superseded pending {label} {name}: {error}"
+                ) from error
+            if (
+                _pc_recovery_identity(path_metadata) != identity
+                or _pc_recovery_identity(descriptor) != identity
+                or _pc_recovery_access(path_metadata) != access
+                or _pc_recovery_access(descriptor) != access
+                or path_metadata.st_nlink != 1
+                or descriptor.st_nlink != 1
+                or path_metadata.st_size != size
+                or descriptor.st_size != size
+            ):
+                raise SyncError(f"superseded pending {label} changed: {name}")
+            try:
+                os.unlink(name, dir_fd=parent.fd)
+            except OSError as error:
+                raise SyncError(
+                    f"cannot remove superseded pending {label} {name}: {error}"
+                ) from error
+            try:
+                os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                raise SyncError(
+                    f"cannot verify superseded pending {label} removal {name}: "
+                    f"{error}"
+                ) from error
+            else:
+                raise SyncError(
+                    f"superseded pending {label} was replaced during removal: {name}"
+                )
+        finally:
+            if custody is not None and custody.state == "open":
+                _pc_recovery_close_pending_descriptor(custody)
+    if targets:
+        _pc_recovery_fsync_directory(parent)
+        _pc_recovery_revalidate_directory(parent)
 
 
 def _pc_recovery_open_or_create_primary_parent(
@@ -2416,6 +2819,270 @@ def _pc_recovery_file_record(
     }
 
 
+def _pc_recovery_open_pending_publication_for_reuse(
+    parent: _PrivateControlRecoveryBinding,
+    name: str,
+    expected: tuple[tuple[int, int, int], tuple[int, int, int], int],
+    label: str,
+) -> _PrivateControlRecoveryPendingDescriptorCustody:
+    expected_identity, expected_access, expected_size = expected
+    read_custody: _PrivateControlRecoveryPendingDescriptorCustody | None = None
+    custody: _PrivateControlRecoveryPendingDescriptorCustody | None = None
+    handoff = False
+    try:
+        try:
+            path_metadata = os.stat(
+                name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            read_custody = _pc_recovery_open_pending_descriptor(
+                parent,
+                name,
+                label,
+                _pc_recovery_pending_read_flags(),
+                None,
+                expected_identity,
+                expected_access,
+            )
+            read_fd = read_custody.fd
+            descriptor = os.fstat(read_fd)
+        except OSError as error:
+            raise SyncError(
+                f"cannot bind pending {label} for reuse: {error}"
+            ) from error
+        if (
+            _pc_recovery_identity(path_metadata) != expected_identity
+            or _pc_recovery_identity(descriptor) != expected_identity
+            or _pc_recovery_access(path_metadata) != expected_access
+            or _pc_recovery_access(descriptor) != expected_access
+            or path_metadata.st_nlink != 1
+            or descriptor.st_nlink != 1
+            or path_metadata.st_size != expected_size
+            or descriptor.st_size != expected_size
+        ):
+            raise SyncError(f"pending {label} changed before reuse")
+        if expected_access[0] == 0o400:
+            try:
+                os.fchmod(read_fd, 0o600)
+            except OSError as error:
+                raise SyncError(
+                    f"cannot make pending {label} reusable: {error}"
+                ) from error
+        writable_access = (0o600, os.geteuid(), os.getegid())
+        assert read_custody is not None
+        read_custody.access = writable_access
+        try:
+            descriptor = os.fstat(read_fd)
+            path_metadata = os.stat(
+                name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise SyncError(
+                f"cannot revalidate pending {label} for reuse: {error}"
+            ) from error
+        if (
+            _pc_recovery_identity(path_metadata) != expected_identity
+            or _pc_recovery_identity(descriptor) != expected_identity
+            or _pc_recovery_access(path_metadata) != writable_access
+            or _pc_recovery_access(descriptor) != writable_access
+            or path_metadata.st_nlink != 1
+            or descriptor.st_nlink != 1
+            or path_metadata.st_size != expected_size
+            or descriptor.st_size != expected_size
+        ):
+            raise SyncError(f"pending {label} changed while enabling reuse")
+        flags = (
+            os.O_WRONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        try:
+            custody = _pc_recovery_open_pending_descriptor(
+                parent,
+                name,
+                label,
+                flags,
+                None,
+                expected_identity,
+                writable_access,
+            )
+            file_fd = custody.fd
+            descriptor = os.fstat(file_fd)
+            path_metadata = os.stat(
+                name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            read_descriptor = os.fstat(read_custody.fd)
+        except OSError as error:
+            raise SyncError(
+                f"cannot open pending {label} for reuse: {error}"
+            ) from error
+        if (
+            _pc_recovery_identity(path_metadata) != expected_identity
+            or _pc_recovery_identity(descriptor) != expected_identity
+            or _pc_recovery_identity(read_descriptor) != expected_identity
+            or _pc_recovery_access(path_metadata) != writable_access
+            or _pc_recovery_access(descriptor) != writable_access
+            or _pc_recovery_access(read_descriptor) != writable_access
+            or path_metadata.st_nlink != 1
+            or descriptor.st_nlink != 1
+            or read_descriptor.st_nlink != 1
+            or path_metadata.st_size != expected_size
+            or descriptor.st_size != expected_size
+            or read_descriptor.st_size != expected_size
+        ):
+            raise SyncError(f"pending {label} changed before rewrite")
+        _pc_recovery_close_pending_descriptor(read_custody)
+        handoff = True
+        assert custody is not None
+        return custody
+    finally:
+        if custody is not None and custody.state == "open" and not handoff:
+            _pc_recovery_close_pending_descriptor(custody)
+        if read_custody is not None and read_custody.state == "open":
+            _pc_recovery_close_pending_descriptor(read_custody)
+
+
+def _pc_recovery_handoff_pending_writer_to_reader(
+    parent: _PrivateControlRecoveryBinding,
+    name: str,
+    label: str,
+    custody: _PrivateControlRecoveryPendingDescriptorCustody,
+    expected_payload: bytes,
+) -> tuple[
+    _PrivateControlRecoveryBinding,
+    bytes,
+    _PrivateControlRecoveryPendingDescriptorCustody,
+]:
+    binding: _PrivateControlRecoveryBinding | None = None
+    reader_custody: _PrivateControlRecoveryPendingDescriptorCustody | None = None
+    try:
+        try:
+            path_metadata = os.stat(
+                name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            reader_custody = _pc_recovery_open_pending_descriptor(
+                parent,
+                name,
+                f"{label} verifier",
+                _pc_recovery_pending_read_flags(),
+                None,
+                custody.identity,
+                custody.access,
+            )
+            descriptor = os.fstat(reader_custody.fd)
+        except OSError as error:
+            raise SyncError(f"cannot bind pending {label}: {error}") from error
+        binding = _PrivateControlRecoveryBinding(
+            label=f"pending {label}",
+            path=parent.path / name,
+            fd=reader_custody.fd,
+            identity=_pc_recovery_identity(descriptor),
+            access=_pc_recovery_access(descriptor),
+        )
+        if (
+            custody.identity is None
+            or custody.access is None
+            or binding.identity != custody.identity
+            or binding.access != custody.access
+            or _pc_recovery_identity(path_metadata) != custody.identity
+            or _pc_recovery_access(path_metadata) != custody.access
+            or descriptor.st_nlink != 1
+            or path_metadata.st_nlink != 1
+            or descriptor.st_size != len(expected_payload)
+            or path_metadata.st_size != len(expected_payload)
+        ):
+            raise SyncError(f"pending {label} verifier policy is invalid")
+
+        def read_once() -> bytes:
+            os.lseek(binding.fd, 0, os.SEEK_SET)
+            payload = bytearray()
+            while len(payload) <= MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
+                chunk = os.read(
+                    binding.fd,
+                    min(
+                        1024 * 1024,
+                        MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
+                        + 1
+                        - len(payload),
+                    ),
+                )
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            if len(payload) > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
+                raise SyncError(f"pending {label} exceeds its byte cap")
+            return bytes(payload)
+
+        first = read_once()
+        second = read_once()
+        final_descriptor = os.fstat(binding.fd)
+        final_path = os.stat(
+            name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+        if (
+            first != second
+            or first != expected_payload
+            or _pc_recovery_identity(final_descriptor) != binding.identity
+            or _pc_recovery_access(final_descriptor) != binding.access
+            or final_descriptor.st_nlink != 1
+            or final_descriptor.st_size != len(first)
+            or _pc_recovery_identity(final_path) != binding.identity
+            or _pc_recovery_access(final_path) != binding.access
+            or final_path.st_nlink != 1
+            or final_path.st_size != len(first)
+        ):
+            raise SyncError(f"pending {label} changed while reading it")
+        writer = os.fstat(custody.fd)
+        path_metadata = os.stat(
+            name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+        if (
+            custody.parent_identity != parent.identity
+            or custody.identity is None
+            or custody.access is None
+            or _pc_recovery_identity(writer) != custody.identity
+            or _pc_recovery_access(writer) != custody.access
+            or writer.st_nlink != 1
+            or writer.st_size != len(expected_payload)
+            or _pc_recovery_identity(path_metadata) != custody.identity
+            or _pc_recovery_access(path_metadata) != custody.access
+            or path_metadata.st_nlink != 1
+            or path_metadata.st_size != len(expected_payload)
+            or binding.identity != custody.identity
+            or binding.access != custody.access
+            or first != expected_payload
+        ):
+            raise SyncError(f"pending {label} changed before writer handoff")
+        _pc_recovery_close_pending_descriptor(custody)
+        _pc_recovery_revalidate_bound_file(
+            parent,
+            name,
+            binding,
+            first,
+        )
+        return binding, first, reader_custody
+    except BaseException:
+        if custody.state == "open":
+            _pc_recovery_close_pending_descriptor(custody)
+        if custody.state == "close-uncertain":
+            raise
+        if reader_custody is not None and reader_custody.state == "open":
+            _pc_recovery_close_pending_descriptor(reader_custody)
+        raise
+
+
 def _pc_recovery_publish_document(
     parent: _PrivateControlRecoveryBinding,
     final_name: str,
@@ -2454,12 +3121,18 @@ def _pc_recovery_publish_document(
                 final_binding,
                 final_payload,
             )
+            _pc_recovery_remove_superseded_pending_publications(
+                parent,
+                pending_name,
+                label,
+            )
         except BaseException:
             _pc_recovery_close_bindings((final_binding,))
             raise
         return final_binding, final_payload
 
     pending_binding: _PrivateControlRecoveryBinding | None = None
+    reader_custody: _PrivateControlRecoveryPendingDescriptorCustody | None = None
     try:
         try:
             pending_binding, pending_payload = _pc_recovery_read_bound_file(
@@ -2477,40 +3150,92 @@ def _pc_recovery_publish_document(
             else:
                 raise
         if pending_binding is None:
-            flags = (
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
-            )
-            try:
-                file_fd = os.open(pending_name, flags, 0o600, dir_fd=parent.fd)
-            except OSError as error:
-                raise SyncError(f"cannot create pending {label}: {error}") from error
-            try:
-                metadata = os.fstat(file_fd)
-                identity = _pc_recovery_identity(metadata)
+            (
+                pending_name,
+                _pending_logical_bytes,
+                reusable,
+            ) = _pc_recovery_select_pending_publication(parent, pending_name)
+            identity: tuple[int, int, int] | None = None
+            payload: bytes | None = None
+            custody: _PrivateControlRecoveryPendingDescriptorCustody | None = None
+            if reusable is None:
+                flags = (
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                try:
+                    custody = _pc_recovery_open_pending_descriptor(
+                        parent,
+                        pending_name,
+                        label,
+                        flags,
+                        0o600,
+                        None,
+                        None,
+                    )
+                    file_fd = custody.fd
+                except OSError as error:
+                    raise SyncError(
+                        f"cannot create pending {label}: {error}"
+                    ) from error
+            else:
+                identity = reusable[0]
                 payload = _pc_recovery_json_bytes(
                     document_builder(identity),
                     pretty=True,
                 )
                 if len(payload) > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
+                    raise SyncError(f"reused pending {label} exceeds its byte cap")
+                custody = _pc_recovery_open_pending_publication_for_reuse(
+                    parent,
+                    pending_name,
+                    reusable,
+                    label,
+                )
+                file_fd = custody.fd
+            try:
+                if identity is None:
+                    metadata = os.fstat(file_fd)
+                    identity = _pc_recovery_identity(metadata)
+                    assert custody is not None
+                    custody.identity = identity
+                    custody.access = _pc_recovery_access(metadata)
+                    payload = _pc_recovery_json_bytes(
+                        document_builder(identity),
+                        pretty=True,
+                    )
+                assert payload is not None
+                if (
+                    len(payload)
+                    > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
+                ):
                     raise SyncError(f"{label} exceeds its byte cap")
+                if reusable is not None:
+                    os.ftruncate(file_fd, 0)
                 offset = 0
                 while offset < len(payload):
                     offset += os.write(file_fd, payload[offset:])
                 os.fchmod(file_fd, 0o400)
+                assert custody is not None
+                custody.access = (0o400, os.geteuid(), os.getegid())
                 os.fsync(file_fd)
+                pending_binding, pending_payload, reader_custody = (
+                    _pc_recovery_handoff_pending_writer_to_reader(
+                        parent,
+                        pending_name,
+                        label,
+                        custody,
+                        payload,
+                    )
+                )
             except OSError as error:
                 raise SyncError(f"cannot write pending {label}: {error}") from error
             finally:
-                os.close(file_fd)
-            pending_binding, pending_payload = _pc_recovery_read_bound_file(
-                parent,
-                pending_name,
-                f"pending {label}",
-            )
+                if custody is not None and custody.state == "open":
+                    _pc_recovery_close_pending_descriptor(custody)
         expected_pending = _pc_recovery_json_bytes(
             document_builder(pending_binding.identity),
             pretty=True,
@@ -2528,6 +3253,9 @@ def _pc_recovery_publish_document(
             raise SyncError(f"cannot publish {label}: {error}") from error
         pending_binding.path = parent.path / final_name
         pending_binding.label = label
+        if reader_custody is not None:
+            reader_custody.path = pending_binding.path
+            reader_custody.label = label
         _pc_recovery_fsync_directory(parent)
         final_metadata = os.stat(final_name, dir_fd=parent.fd, follow_symlinks=False)
         if (
@@ -2535,10 +3263,41 @@ def _pc_recovery_publish_document(
             or _pc_recovery_access(final_metadata) != pending_binding.access
         ):
             raise SyncError(f"{label} changed during publication")
+        _pc_recovery_remove_superseded_pending_publications(
+            parent,
+            pending_name,
+            label,
+        )
+        if reader_custody is not None:
+            _pc_recovery_release_pending_descriptor(reader_custody)
         return pending_binding, pending_payload
     except BaseException:
+        other_pending_uncertainty = any(
+            item is not reader_custody
+            for item in _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+        )
+        if (
+            reader_custody is not None
+            and reader_custody.state == "open"
+            and not other_pending_uncertainty
+        ):
+            try:
+                _pc_recovery_close_pending_descriptor(reader_custody)
+            except BaseException:
+                if pending_binding is not None and pending_binding.fd >= 0:
+                    _pc_recovery_retain_close_fence((pending_binding,))
+                    pending_binding = None
+                raise
+            if pending_binding is not None:
+                pending_binding.fd = -1
         if pending_binding is not None and pending_binding.fd >= 0:
-            _pc_recovery_close_bindings((pending_binding,))
+            if (
+                _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+                or _PC_RECOVERY_RETAINED_CLOSE_FENCE
+            ):
+                _pc_recovery_retain_close_fence((pending_binding,))
+            else:
+                _pc_recovery_close_bindings((pending_binding,))
         raise
 
 
@@ -3131,6 +3890,7 @@ def execute_private_control_recovery(
     requested_root_id: str,
     receipt_path: Path,
 ) -> dict[str, object]:
+    _pc_recovery_require_no_close_fence()
     plan = _pc_recovery_read_external_plan(receipt_path, requested_root_id)
     legacy_bindings: tuple[_PrivateControlRecoveryBinding | None, ...] = ()
     primary_bindings: tuple[_PrivateControlRecoveryBinding | None, ...] = ()
@@ -3234,6 +3994,21 @@ def execute_private_control_recovery(
                     raise SyncError(
                         "private-control cutover state changed during durability retry"
                     )
+                for final_name, label in (
+                    (
+                        MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME,
+                        "primary recovery receipt",
+                    ),
+                    (
+                        MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+                        "private-control cutover marker",
+                    ),
+                ):
+                    _pc_recovery_remove_superseded_pending_publications(
+                        primary_parent,
+                        f".{final_name}.pending-{plan['plan_digest']}-{'0' * 32}",
+                        label,
+                    )
                 return _pc_recovery_execution_receipt(
                     verification,
                     primary_parent,
@@ -3332,17 +4107,25 @@ def execute_private_control_recovery(
     finally:
         active_error = sys.exc_info()[1]
         cleanup_errors: list[str] = []
-        for bindings in (
+        cleanup_groups = (
             (marker_binding, receipt_binding),
             primary_bindings,
             legacy_bindings,
+        )
+        if (
+            _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+            or _PC_RECOVERY_RETAINED_CLOSE_FENCE
         ):
-            if not bindings:
-                continue
-            try:
-                _pc_recovery_close_bindings(bindings)
-            except SyncError as error:
-                cleanup_errors.append(str(error))
+            for bindings in cleanup_groups:
+                _pc_recovery_retain_close_fence(bindings)
+        else:
+            for bindings in cleanup_groups:
+                if not bindings:
+                    continue
+                try:
+                    _pc_recovery_close_bindings(bindings)
+                except SyncError as error:
+                    cleanup_errors.append(str(error))
         if cleanup_errors:
             cleanup_detail = "private-control recovery cleanup failed: " + "; ".join(
                 cleanup_errors
