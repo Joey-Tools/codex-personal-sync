@@ -11976,6 +11976,163 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
                     ).exists()
                 )
 
+    def test_primary_parent_publish_failure_cleans_only_exact_empty_staging(
+        self,
+    ) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            with self.subTest(module=module.__name__), self._recovery_module_scope(
+                module
+            ):
+                if self.primary_parent.exists():
+                    shutil.rmtree(self.primary_parent)
+                (
+                    primary_spec,
+                    _root_id,
+                    _receipt_name,
+                    _marker_name,
+                    error_type,
+                ) = self._recovery_module_contract(module)
+                rename_name = (
+                    "_rename_directory_entry_noreplace"
+                    if module is MIRROR_MODULE
+                    else "_rename_noreplace_at"
+                )
+
+                for digit in ("2", "3"):
+                    plan_digest = digit * 64
+                    staging = self.account_home / (
+                        f".private-control-recovery-parent-{plan_digest}"
+                    )
+                    with mock.patch.object(
+                        module,
+                        rename_name,
+                        side_effect=OSError(
+                            errno.EIO,
+                            "simulated rename-before-effect failure",
+                        ),
+                    ):
+                        with self.assertRaisesRegex(
+                            error_type,
+                            "cannot publish primary private-control parent",
+                        ):
+                            module._pc_recovery_open_or_create_primary_parent(
+                                primary_spec,
+                                plan_digest,
+                                allow_create=True,
+                            )
+                    self.assertFalse(staging.exists())
+                    self.assertFalse(self.primary_parent.exists())
+
+                nonempty_digest = "4" * 64
+                nonempty_staging = self.account_home / (
+                    f".private-control-recovery-parent-{nonempty_digest}"
+                )
+
+                def fail_with_nonempty_staging(*_args: object) -> None:
+                    retained = nonempty_staging / "retained-evidence"
+                    retained.write_bytes(b"retain\n")
+                    retained.chmod(0o600)
+                    raise OSError(errno.EIO, "simulated nonempty staging failure")
+
+                with mock.patch.object(
+                    module,
+                    rename_name,
+                    side_effect=fail_with_nonempty_staging,
+                ):
+                    with self.assertRaisesRegex(
+                        error_type,
+                        "secondary staged primary-parent cleanup failure: .*not empty",
+                    ):
+                        module._pc_recovery_open_or_create_primary_parent(
+                            primary_spec,
+                            nonempty_digest,
+                            allow_create=True,
+                        )
+                self.assertEqual(
+                    (nonempty_staging / "retained-evidence").read_bytes(),
+                    b"retain\n",
+                )
+                shutil.rmtree(nonempty_staging)
+
+                replacement_digest = "5" * 64
+                replacement_staging = self.account_home / (
+                    f".private-control-recovery-parent-{replacement_digest}"
+                )
+                held_staging = self.account_home / (
+                    f".held-private-control-recovery-parent-{replacement_digest}"
+                )
+
+                def fail_with_replacement(*_args: object) -> None:
+                    os.rename(replacement_staging, held_staging)
+                    replacement_staging.mkdir(mode=0o700)
+                    raise OSError(errno.EIO, "simulated staging replacement")
+
+                with mock.patch.object(
+                    module,
+                    rename_name,
+                    side_effect=fail_with_replacement,
+                ):
+                    with self.assertRaisesRegex(
+                        error_type,
+                        "secondary staged primary-parent cleanup failure: .*changed",
+                    ):
+                        module._pc_recovery_open_or_create_primary_parent(
+                            primary_spec,
+                            replacement_digest,
+                            allow_create=True,
+                        )
+                self.assertTrue(replacement_staging.is_dir())
+                self.assertTrue(held_staging.is_dir())
+                self.assertNotEqual(
+                    module._pc_recovery_identity(
+                        os.stat(replacement_staging, follow_symlinks=False)
+                    ),
+                    module._pc_recovery_identity(
+                        os.stat(held_staging, follow_symlinks=False)
+                    ),
+                )
+                replacement_staging.rmdir()
+                held_staging.rmdir()
+
+                after_effect_digest = "6" * 64
+                after_effect_staging = self.account_home / (
+                    f".private-control-recovery-parent-{after_effect_digest}"
+                )
+                real_rename = getattr(module, rename_name)
+                published_identity: tuple[int, int, int] | None = None
+
+                def fail_after_rename(*args: object) -> None:
+                    nonlocal published_identity
+                    published_identity = module._pc_recovery_identity(
+                        os.stat(after_effect_staging, follow_symlinks=False)
+                    )
+                    real_rename(*args)
+                    raise OSError(errno.EIO, "simulated rename-after-effect failure")
+
+                with mock.patch.object(
+                    module,
+                    rename_name,
+                    side_effect=fail_after_rename,
+                ):
+                    with self.assertRaisesRegex(
+                        error_type,
+                        "secondary staged primary-parent cleanup failure: .*missing",
+                    ):
+                        module._pc_recovery_open_or_create_primary_parent(
+                            primary_spec,
+                            after_effect_digest,
+                            allow_create=True,
+                        )
+                self.assertIsNotNone(published_identity)
+                self.assertFalse(after_effect_staging.exists())
+                self.assertEqual(
+                    module._pc_recovery_identity(
+                        os.stat(self.primary_parent, follow_symlinks=False)
+                    ),
+                    published_identity,
+                )
+                self.primary_parent.rmdir()
+
     def test_primary_parent_appearance_after_initial_absence_is_not_adopted(
         self,
     ) -> None:

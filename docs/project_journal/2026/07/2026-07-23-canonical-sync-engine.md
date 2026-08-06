@@ -31,13 +31,14 @@ superseded_by:
   These pre-squash identities remain historical evidence only. Downstream
   generation must bind the actual squash-landed canonical `P` identity.
 - The retained private-control recovery follow-up is most recently reviewed at
-  signed checkpoint `e5e3622aeb10cede21c18b328024c1bc0f3fa0e7`, tree
-  `3e83c91267d25946348655d42c305542b59c48fc`. Its formal prior-b4ca
-  fresh-context named single found one P2: a plan could fit the 64-MiB plan cap
-  while its nested pretty primary receipt exceeded the same cap only after
-  primary-parent and pending-inode publication began. The symmetric
-  generator/runtime repair now rejects the worst-case complete receipt before
-  publishing or consuming a plan. These pre-squash identities remain
+  signed checkpoint `cbe52a3f7a1fbdf864c141b2ebbac3513af685de`, tree
+  `b256160731ff465e8ab4ae49e545449a54fa3c8f`. Its formal prior-b4ca
+  fresh-context named single found one P2: a failed primary-parent no-replace
+  publication could leave an exact-empty digest-named staging directory that
+  a later plan digest would never revisit. The symmetric generator/runtime
+  repair now removes only the still-bound, policy-stable, empty staging object;
+  missing, replacement, nonempty, unreadable, or rename-after-effect states
+  remain retained and fail closed. These pre-squash identities remain
   historical evidence only; downstream handoff begins from the actual
   squash-landed canonical `P`.
 
@@ -1927,6 +1928,38 @@ superseded_by:
   `py_compile`; Ruff 0.16.1 E4/E7/E9/F, JSON parsing, project-journal
   validation, and `git diff --check` passed. Formal current-head review, CI,
   and squash-landed tree binding remain outstanding at this checkpoint.
+- Signed checkpoint `cbe52a3f7a1fbdf864c141b2ebbac3513af685de`, tree
+  `b256160731ff465e8ab4ae49e545449a54fa3c8f`, carried the complete-receipt
+  capacity preflight. Its sole prior-b4ca fresh-context named single returned
+  one P2: `_pc_recovery_open_or_create_primary_parent()` closed but did not
+  remove its digest-named staging directory when the no-replace publication
+  failed before effect. If retained evidence then changed the plan digest, the
+  old staging name became unreachable and repeated failures could accumulate
+  directories and consume account-home inodes.
+- The current repair is symmetric in the canonical generator and standalone
+  runtime. On a publication error it keeps the staging descriptor open,
+  revalidates the trusted home plus the named and held staging identities and
+  exact mode/uid/gid policy, proves the directory empty twice, revalidates
+  immediately before a parent-FD-anchored `rmdir`, proves the name absent and
+  the held object unchanged, then fsyncs and revalidates the home. The original
+  publication error still terminates the attempt. Missing, replacement,
+  nonempty, unreadable, removal, or durability uncertainty becomes a secondary
+  cleanup failure and preserves the observable state; rename-after-effect
+  never authorizes deletion of the published primary namespace.
+- The dual-implementation regression proves two successive pre-effect failures
+  with different plan digests leave neither staging name, while nonempty and
+  replacement states remain intact and a simulated rename-after-effect retains
+  the exact published identity. It passed 1/1 under uv Python 3.13 and macOS
+  system Python 3.9; complete `PrivateControlRetainedRecoveryTests` passed
+  45/45 under both runtimes. The private-`TMPDIR` source-lock suite passed
+  276/276 in 563.237 seconds with one expected skip, and full repository
+  discovery passed 1,137/1,137 in 830.495 seconds with three expected skips.
+  Task-private stock refresh/check verified all six sources and removed its
+  control home; the refreshed `sync-source-lock.json` SHA-256 is
+  `55c8c3f02cdb196143fd383a2fcd7e6fb0912c88d04a4fbe285488a6f2effabd`.
+  Both runtimes passed `py_compile`; Ruff 0.16.1 E4/E7/E9/F and
+  `git diff --check` passed. A superseding signed checkpoint and its fresh
+  current-head named single remain outstanding.
 
 ## Installed Host Baseline
 

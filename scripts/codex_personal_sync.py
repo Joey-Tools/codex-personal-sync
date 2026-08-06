@@ -2592,6 +2592,93 @@ def _pc_recovery_remove_superseded_pending_publications(
         _pc_recovery_revalidate_directory(parent)
 
 
+def _pc_recovery_remove_empty_staged_primary_parent(
+    home: _PrivateControlRecoveryBinding,
+    temporary: _PrivateControlRecoveryBinding,
+    temporary_name: str,
+) -> None:
+    expected_path = home.path / temporary_name
+    if temporary.path != expected_path:
+        raise SyncError("staged primary private-control parent cleanup path changed")
+
+    def revalidate_staging() -> None:
+        try:
+            path_metadata = os.stat(
+                temporary_name,
+                dir_fd=home.fd,
+                follow_symlinks=False,
+            )
+            descriptor_metadata = os.fstat(temporary.fd)
+        except FileNotFoundError as error:
+            raise SyncError(
+                "staged primary private-control parent is missing during cleanup"
+            ) from error
+        except OSError as error:
+            raise SyncError(
+                "cannot inspect staged primary private-control parent during "
+                f"cleanup: {error}"
+            ) from error
+        if (
+            _pc_recovery_identity(path_metadata) != temporary.identity
+            or _pc_recovery_identity(descriptor_metadata) != temporary.identity
+            or _pc_recovery_access(path_metadata) != temporary.access
+            or _pc_recovery_access(descriptor_metadata) != temporary.access
+        ):
+            raise SyncError(
+                "staged primary private-control parent changed during cleanup"
+            )
+        if temporary.access[0] != 0o700 or temporary.access[1] != os.geteuid():
+            raise SyncError(
+                "staged primary private-control parent cleanup policy is invalid"
+            )
+
+    _pc_recovery_revalidate_directory(home)
+    revalidate_staging()
+    if not _pc_recovery_directory_is_empty(
+        temporary.fd,
+        "staged primary private-control parent cleanup",
+    ):
+        raise SyncError(
+            "staged primary private-control parent is not empty during cleanup"
+        )
+    revalidate_staging()
+    _pc_recovery_revalidate_directory(home)
+    try:
+        os.rmdir(temporary_name, dir_fd=home.fd)
+    except OSError as error:
+        raise SyncError(
+            f"cannot remove staged primary private-control parent: {error}"
+        ) from error
+    try:
+        os.stat(temporary_name, dir_fd=home.fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise SyncError(
+            "cannot verify staged primary private-control parent removal: "
+            f"{error}"
+        ) from error
+    else:
+        raise SyncError(
+            "staged primary private-control parent was replaced during cleanup"
+        )
+    try:
+        descriptor_metadata = os.fstat(temporary.fd)
+    except OSError as error:
+        raise SyncError(
+            "cannot revalidate removed staged primary private-control parent: "
+            f"{error}"
+        ) from error
+    if (
+        _pc_recovery_identity(descriptor_metadata) != temporary.identity
+        or _pc_recovery_access(descriptor_metadata) != temporary.access
+    ):
+        raise SyncError(
+            "removed staged primary private-control parent changed during cleanup"
+        )
+    _pc_recovery_fsync_directory(home)
+
+
 def _pc_recovery_open_or_create_primary_parent(
     primary_spec: MirrorPrivateControlRootSpec,
     plan_digest: str,
@@ -2646,6 +2733,18 @@ def _pc_recovery_open_or_create_primary_parent(
                     MIRROR_PRIVATE_CONTROL_NAMESPACE_NAME,
                 )
             except OSError as error:
+                try:
+                    _pc_recovery_remove_empty_staged_primary_parent(
+                        home,
+                        temporary,
+                        temporary_name,
+                    )
+                except SyncError as cleanup_error:
+                    raise SyncError(
+                        "cannot publish primary private-control parent: "
+                        f"{error}; secondary staged primary-parent cleanup "
+                        f"failure: {cleanup_error}"
+                    ) from error
                 raise SyncError(
                     f"cannot publish primary private-control parent: {error}"
                 ) from error

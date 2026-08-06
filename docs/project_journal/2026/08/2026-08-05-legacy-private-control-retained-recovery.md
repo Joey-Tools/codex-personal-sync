@@ -35,6 +35,7 @@ superseded_by:
 - 每次新 publication 先提出 plan digest + 随机 nonce 的 pending name；short write、`fchmod` 或 file `fsync` 失败可留下 untrusted pending residue，rename-after-effect 后 parent-directory `fsync` 失败则可能留下 visible fixed name。Retry 在已持有的 primary-parent lease 下合并稳定扫描 receipt/marker history：同 family、同 plan residue 先按 exact object identity、regular-file type、single-link、mode/uid/gid 与 size 重新绑定，再将 mode `0400` 恢复为 `0600`、以新 writer FD 重新绑定同一 inode、truncate 并完整重写；partial content 本身不作为认证信号。只有没有可复用 inode 时才按最多 8 个 pending entries 与 512 MiB aggregate logical bytes 做最坏 64 MiB 预留。Fixed document durable 后，以同样的 bounded identity/access checks 删除该 family/plan 的 superseded pending residue，使旧版 over-cap history 可以单调减量而不是永久阻断。Existing fixed document retry 仍重新 `fsync` containing directory 并复验 exact identity/access/content；existing marker 在 durability repair 前后均执行完整 adoption verification，并绑定最初 retained marker inode。
 - 每次 pending reader/writer `open` 前先登记 `opening` placeholder；`open` 返回后立即绑定 exact FD/path/identity/access，再允许任何 `fstat`、`stat`、read 或 write。Close 前先将 custody 标为 `close-uncertain`，只有一次 `close` 明确成功才移除。Writer 成功关闭后，独立 verifier reader 继续持有并注册 custody，覆盖 content re-read、fixed-name rename、parent-directory `fsync`、最终 identity/access/content verification 与 superseded-residue cleanup；只有完整 publication 成功后才将 FD 转移给 final binding 并显式 release。任意 close-before/after-effect 或并行 residue cleanup 不确定性都保留不可再操作的历史 FD 记录及全部 recovery transaction leases，后续 plan/execute 在任何 open 前要求进程重启；不得对可能已复用的 numeric FD 重试 `fstat` 或 `close`。
 - 初次 marker publication 不再在 final adoption verification 前关闭并丢弃 binding。原 marker descriptor、payload 与 publication record 保留到 verifier 返回之后；fixed name 再按 exact identity/access/bytes 复验，且 `verification["marker"]` 必须与 publication record 完全一致。
+- Primary-parent no-replace publication 若在 effect 前失败，只在 digest-named staging pathname 仍绑定 held descriptor 的 exact identity、mode/uid/gid policy 且目录为空时，才以 trusted-home descriptor 执行 `rmdir` 并 fsync/revalidate home。Missing、replacement、nonempty、unreadable 或 rename-after-effect 状态均保留并以 secondary cleanup failure 停止；不把 staging prefix 当作删除授权。
 - 首次已经观察到 primary namespace 存在后的 bind failure 不再被二次 lookup 降级为 absence；若 earlier prebind 已证明存在，execute 内 lookup 缺失也在任何 staging mutation 前停止。
 - Committed adoption 的完整 recovery-cap verifier 在普通 256-entry stale-recovery gate 之前运行；合法的大 inventory 不会因旧运行时普通 cap 被误拒绝。
 - Receipt-only crash 保持 blocked/retryable；marker 只有在 marker → receipt → current complete manifest 与 whole-registry terminal revalidation 全部通过后才允许 `adopted-retained-in-place`。
@@ -134,3 +135,28 @@ superseded_by:
   worktree 同级、owner-private、task-only `task-primary-home-v1` 中验证 6 sources，
   临时 control home 随后清理。签名 checkpoint 与该新 head 的 fresh named single
   仍待完成，因此不作 final clean claim。
+- Complete-receipt capacity repair 形成签名 checkpoint
+  `cbe52a3f7a1fbdf864c141b2ebbac3513af685de`，tree
+  `b256160731ff465e8ab4ae49e545449a54fa3c8f`。其唯一 prior-b4ca
+  fresh-context named single 返回一项 P2：primary-parent 的 no-replace
+  publication 在 effect 前失败时只关闭 staging descriptor；retained evidence
+  改变 plan digest 后，旧 digest-named empty directory 不再可达，重复失败可无界
+  累积 account-home inode。该 lane 未启动 Claude，也未读取凭据。
+- 当前对称 repair 在 publish-error 分支中保留 staging descriptor，通过 trusted-
+  home descriptor 双端复验 named/held identity 与 exact access policy，双次证明
+  目录为空并在 effect 前再次复验，再执行 parent-anchored `rmdir`、证明 name
+  absent 与 held object 未变，最后 fsync/revalidate home。Missing、replacement、
+  nonempty、unreadable、rmdir 或 durability uncertainty 均保留状态并 secondary-
+  fail；rename-after-effect 不会触碰已发布 primary namespace。
+- 双实现回归覆盖两个不同 plan digest 的连续 rename-before-effect failure、
+  nonempty preservation、replacement preservation 与 rename-after-effect published-
+  identity retention，在 uv Python 3.13 与 macOS system Python 3.9 下各通过 1/1；
+  完整 `PrivateControlRetainedRecoveryTests` 在两个 runtime 下各通过 45/45。
+  Repository private-`TMPDIR` wrapper 下完整 `tests.test_source_lock` 通过
+  276/276 in 563.237s（1 expected skip），完整 repository discovery 通过
+  1,137/1,137 in 830.495s（3 expected skips）。Task-private stock refresh/check
+  各验证 6 sources 并清理 control home；`sync-source-lock.json` SHA-256 为
+  `55c8c3f02cdb196143fd383a2fcd7e6fb0912c88d04a4fbe285488a6f2effabd`。
+  两个 runtime 的 `py_compile`、Ruff 0.16.1 E4/E7/E9/F 与
+  `git diff --check` 通过；superseding signed checkpoint 与 fresh current-head
+  named single 尚未完成，因此不作 final review-clean claim。
