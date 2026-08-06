@@ -14301,6 +14301,13 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
                     MIRROR_MODULE,
                     "_validate_private_control_root_topology",
                 ),
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_pc_recovery_read_bound_file",
+                    side_effect=AssertionError(
+                        "expired operation reached fixed-document I/O"
+                    ),
+                ) as read_bound_file,
                 self.assertRaisesRegex(
                     MIRROR_MODULE.MirrorSyncError,
                     "mirror operation exceeded",
@@ -14312,6 +14319,7 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
                     mock.Mock(),
                     prebinding,
                 )
+            read_bound_file.assert_not_called()
         finally:
             MIRROR_MODULE._close_control_bindings_best_effort(
                 (prebinding.parent, prebinding.home)
@@ -14332,9 +14340,23 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
             for entry in entries
         )
         manifest_read_bytes = 2 * inventory["logical_bytes"]
+        fixed_document_read_bytes = 4 * sum(
+            os.stat(
+                self.primary_parent / name,
+                follow_symlinks=False,
+            ).st_size
+            for name in (
+                MIRROR_MODULE.PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+                MIRROR_MODULE.PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME,
+            )
+        )
         operation = MIRROR_MODULE.OperationBudget(
             deadline=time.monotonic() + 60,
-            remaining_bytes=scan_name_bytes + manifest_read_bytes,
+            remaining_bytes=(
+                scan_name_bytes
+                + manifest_read_bytes
+                + fixed_document_read_bytes
+            ),
             remaining_entries=inventory["entry_count"],
         )
         prebinding = MIRROR_MODULE._prebind_existing_primary_private_control_root(

@@ -2539,7 +2539,10 @@ def _pc_recovery_read_bound_file(
     parent: _PrivateControlRecoveryBinding,
     name: str,
     label: str,
+    *,
+    operation: OperationBudget | None = None,
 ) -> tuple[_PrivateControlRecoveryBinding, bytes]:
+    _operation_checkpoint(operation, f"binding {label}")
     try:
         path_metadata = os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
     except OSError as error:
@@ -2573,9 +2576,11 @@ def _pc_recovery_read_bound_file(
             raise MirrorSyncError(f"{label} identity/access policy is invalid")
 
         def read_once() -> bytes:
+            _operation_checkpoint(operation, f"reading {label}")
             os.lseek(file_fd, 0, os.SEEK_SET)
             payload = bytearray()
             while len(payload) <= PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
+                _operation_checkpoint(operation, f"reading {label}")
                 chunk = os.read(
                     file_fd,
                     min(
@@ -2585,6 +2590,11 @@ def _pc_recovery_read_bound_file(
                 )
                 if not chunk:
                     break
+                _consume_operation_budget(
+                    operation,
+                    byte_count=len(chunk),
+                    label=f"reading {label}",
+                )
                 payload.extend(chunk)
             if len(payload) > PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
                 raise MirrorSyncError(f"{label} exceeds its byte cap")
@@ -2616,11 +2626,15 @@ def _pc_recovery_revalidate_bound_file(
     name: str,
     binding: _PrivateControlRecoveryBinding,
     expected_payload: bytes,
+    *,
+    operation: OperationBudget | None = None,
 ) -> None:
     def read_once() -> bytes:
+        _operation_checkpoint(operation, f"revalidating {binding.label}")
         os.lseek(binding.fd, 0, os.SEEK_SET)
         payload = bytearray()
         while len(payload) <= PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
+            _operation_checkpoint(operation, f"revalidating {binding.label}")
             chunk = os.read(
                 binding.fd,
                 min(
@@ -2630,6 +2644,11 @@ def _pc_recovery_revalidate_bound_file(
             )
             if not chunk:
                 break
+            _consume_operation_budget(
+                operation,
+                byte_count=len(chunk),
+                label=f"revalidating {binding.label}",
+            )
             payload.extend(chunk)
         if len(payload) > PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
             raise MirrorSyncError(f"{binding.label} exceeds its byte cap")
@@ -3186,14 +3205,22 @@ def _pc_recovery_optional_file(
     parent: _PrivateControlRecoveryBinding,
     name: str,
     label: str,
+    *,
+    operation: OperationBudget | None = None,
 ) -> tuple[_PrivateControlRecoveryBinding, bytes] | None:
+    _operation_checkpoint(operation, f"inspecting {label}")
     try:
         os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
     except FileNotFoundError:
         return None
     except OSError as error:
         raise MirrorSyncError(f"cannot inspect {label}: {error}") from error
-    return _pc_recovery_read_bound_file(parent, name, label)
+    return _pc_recovery_read_bound_file(
+        parent,
+        name,
+        label,
+        operation=operation,
+    )
 
 
 def _pc_recovery_primary_child_records(
@@ -3571,16 +3598,22 @@ def _pc_recovery_verify_adoption_locked(
     expected_plan_digest: str | None = None,
     operation: OperationBudget | None = None,
 ) -> dict[str, object]:
+    _operation_checkpoint(
+        operation,
+        "starting private-control adoption verification",
+    )
     marker_result = _pc_recovery_optional_file(
         primary_parent,
         PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
         "private-control cutover marker",
+        operation=operation,
     )
     if marker_result is None:
         receipt_result = _pc_recovery_optional_file(
             primary_parent,
             PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME,
             "primary recovery receipt",
+            operation=operation,
         )
         if receipt_result is not None:
             _pc_recovery_close_bindings((receipt_result[0],))
@@ -3592,11 +3625,16 @@ def _pc_recovery_verify_adoption_locked(
     marker_binding, marker_payload = marker_result
     receipt_binding: _PrivateControlRecoveryBinding | None = None
     try:
+        _operation_checkpoint(
+            operation,
+            "validating private-control cutover marker",
+        )
         marker = _pc_recovery_validate_marker(marker_payload)
         receipt_result = _pc_recovery_optional_file(
             primary_parent,
             PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME,
             "primary recovery receipt",
+            operation=operation,
         )
         if receipt_result is None:
             raise MirrorSyncError(
@@ -3615,6 +3653,10 @@ def _pc_recovery_verify_adoption_locked(
             raise MirrorSyncError(
                 "private-control cutover marker receipt binding changed"
             )
+        _operation_checkpoint(
+            operation,
+            "validating primary recovery receipt",
+        )
         _receipt, plan = _pc_recovery_validate_primary_receipt(
             receipt_payload,
             receipt_binding,
@@ -3686,12 +3728,14 @@ def _pc_recovery_verify_adoption_locked(
             PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
             marker_binding,
             marker_payload,
+            operation=operation,
         )
         _pc_recovery_revalidate_bound_file(
             primary_parent,
             PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME,
             receipt_binding,
             receipt_payload,
+            operation=operation,
         )
         return {
             "marker": _pc_recovery_file_record(

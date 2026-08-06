@@ -102,3 +102,35 @@ superseded_by:
   `d3be60d14495ad4e33bd6150f7b805da0e3aec4fbc4e12c57823a70fc9b44fc2`。
   Final signed checkpoint 与该新 head 的正式 named single 尚未完成，因此不作
   final clean claim。
+- 上述 manifest-budget repair 形成签名 checkpoint
+  `d0589062cff768a34693f0456a95e2360e79e11b`，tree
+  `e79fbabc503ee331bb73011e87a6097a42d83847`。通过 prior-b4ca guard 的
+  pre-status materialize 与完整 7-guidance validate、exact-secret admission、
+  endpoint closure、strict full fsck、local `GOODSIG`/`VALIDSIG` 和 last-moment
+  revalidation 后启动的唯一 fresh-context named single 返回一项 P2：normal
+  generator 已将 live retained manifest 纳入共享 `OperationBudget`，但 adoption
+  verifier 对 fixed cutover marker 与 receipt 的初次绑定和最终复验仍各做双遍
+  read，未检查同一 deadline 或扣减 aggregate byte budget。一次 verify 因此对
+  两份 fixed document 各读四遍，完整 generator transaction 的多次 verify 仍可
+  绕过 operation-wide bound。该 lane 没有启动 Claude 或读取凭据。
+- 当前 repair 给 bound-file read、optional bind 与 revalidation helper 增加默认
+  `None` 的 optional operation 参数，并由 adoption verifier 的全部 marker/
+  receipt 分支透传。每次实际 read chunk 都先检查共享 deadline，再按实际 bytes
+  扣减 aggregate budget；marker/receipt schema decode 前也做 deadline
+  checkpoint。Standalone plan/execute/publication caller 继续省略 operation，保留
+  原有 recovery-local 64 MiB cap 与 timeout 语义。新增 expired-operation 回归要求
+  在任何 fixed-document I/O 前失败；exact-one-verify 回归把
+  `4 * (marker_size + receipt_size)` 纳入精确预算，要求首次 preflight 后 bytes/
+  entries 同时归零、第二次 receipt revalidation 因同一 aggregate budget 拒绝。
+- 两项新回归在 uv Python 3.13.0 与 macOS system Python 3.9.6 下各通过 2/2；
+  完整 `PrivateControlRetainedRecoveryTests` 在两个 runtime 下各通过 42/42。
+  完整 `tests.test_source_lock` 通过 273/273 in 591.956s（1 expected skip），完整
+  `unittest discover -s tests` 通过 1134/1134 in 821.931s（3 expected skips）。
+  一条独立只读 caller-chain 审计复核 normal generator 最多四次 verify 共用同一
+  budget、每次 marker/receipt 四遍读取的完整传播，以及 standalone 兼容边界，
+  未发现漏 caller。最终 uv Python 3.13.0 与 macOS system Python 3.9.6 source
+  compile、Ruff 0.16.1 E4/E7/E9/F、source-lock JSON parsing、project-journal
+  validation 与 `git diff --check` 均通过；未修改 stock `refresh-lock --check` 在
+  worktree 同级、owner-private、task-only `task-primary-home-v1` 中验证 6 sources，
+  临时 control home 随后清理。签名 checkpoint 与该新 head 的 fresh named single
+  仍待完成，因此不作 final clean claim。
