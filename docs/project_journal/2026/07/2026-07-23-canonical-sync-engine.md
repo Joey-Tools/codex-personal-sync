@@ -3,7 +3,7 @@ id: 20260723-canonical-sync-engine
 title: Canonical Sync Engine
 status: active
 created: 2026-07-23
-updated: 2026-08-05
+updated: 2026-08-06
 branch: codex/canonical-sync-engine
 pr:
 supersedes: []
@@ -212,7 +212,7 @@ superseded_by:
   unreadable, symlink, and non-directory states remain fail-closed.
 - The third scheduler follow-up extends that same binding set across macOS
   install: current and every legacy plist are prebound before cleanup and
-  retained through current bootout/bootstrap/enable. Linux uninstall now
+  retained through current bootout/enable/bootstrap. Linux uninstall now
   brackets post-removal daemon reload with both unit absence bindings.
   Missing-parent classification walks from a bound user-home descriptor with
   no-follow component opens, so intermediate symlinks and uncertain identity

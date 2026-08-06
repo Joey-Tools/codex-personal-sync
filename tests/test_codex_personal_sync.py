@@ -7793,8 +7793,8 @@ while True:
             ["/bin/launchctl", "bootout", gui_target],
             ["/bin/launchctl", "disable", gui_target],
             ["/bin/launchctl", "bootout", user_target],
-            ["/bin/launchctl", "bootstrap", user_domain, str(plist_path)],
             ["/bin/launchctl", "enable", user_target],
+            ["/bin/launchctl", "bootstrap", user_domain, str(plist_path)],
         ]
         self.assertEqual(
             [call for call in calls if call in current_identity_calls],
@@ -7803,6 +7803,76 @@ while True:
         self.assertFalse(
             any(call[:2] == ["/bin/launchctl", "kickstart"] for call in calls)
         )
+
+    def test_install_scheduler_clears_gui_disable_before_user_bootstrap(
+        self,
+    ) -> None:
+        home = self.root / "home" / ".codex"
+        write_scheduler_runner(home)
+        uid = os.getuid()
+        gui_target = f"gui/{uid}/{MODULE.LAUNCHD_LABEL}"
+        user_domain = f"user/{uid}"
+        user_target = f"{user_domain}/{MODULE.LAUNCHD_LABEL}"
+        disabled = False
+        calls: list[list[str]] = []
+
+        def run_native(
+            args: list[str],
+            **_kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal disabled
+            calls.append(args)
+            if args[1:] == ["disable", gui_target]:
+                disabled = True
+            elif args[1:] == ["enable", user_target]:
+                disabled = False
+            elif args[1] == "bootstrap" and disabled:
+                return subprocess.CompletedProcess(
+                    args,
+                    5,
+                    "",
+                    "Bootstrap failed: 5: Input/output error",
+                )
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_native_scheduler_argv",
+                side_effect=lambda args: ["/bin/launchctl", *args[1:]],
+            ),
+            mock.patch.object(
+                MODULE,
+                "_run_bounded_scheduler_process",
+                side_effect=run_native,
+            ),
+        ):
+            self.run_quietly(
+                MODULE.install_scheduler,
+                home,
+                "owner/repo",
+                60,
+                "macos",
+                None,
+                dry_run=False,
+                enable=True,
+            )
+
+        prebootstrap_enable = ["/bin/launchctl", "enable", user_target]
+        bootstrap = [
+            "/bin/launchctl",
+            "bootstrap",
+            user_domain,
+            str(
+                self.root
+                / "home"
+                / "Library"
+                / "LaunchAgents"
+                / f"{MODULE.LAUNCHD_LABEL}.plist"
+            ),
+        ]
+        self.assertEqual(calls.count(prebootstrap_enable), 1)
+        self.assertLess(calls.index(prebootstrap_enable), calls.index(bootstrap))
 
     def test_install_scheduler_writes_linux_systemd_units(self) -> None:
         home = self.root / "home" / ".codex"
