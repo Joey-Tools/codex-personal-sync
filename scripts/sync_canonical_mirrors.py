@@ -2888,15 +2888,19 @@ def execute_private_control_recovery(
             f".{PRIVATE_CONTROL_RECOVERY_MARKER_NAME}.pending-"
             f"{plan['plan_digest']}-{secrets.token_hex(16)}"
         )
-        marker_binding, _marker_payload = _pc_recovery_publish_document(
+        marker_binding, marker_payload = _pc_recovery_publish_document(
             primary_parent,
             PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
             marker_pending_name,
             "private-control cutover marker",
             lambda _identity: marker_document,
         )
-        _pc_recovery_close_bindings((marker_binding, receipt_binding))
-        marker_binding = None
+        marker_record = _pc_recovery_file_record(
+            PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+            marker_binding,
+            marker_payload,
+        )
+        _pc_recovery_close_bindings((receipt_binding,))
         receipt_binding = None
 
         verification = _pc_recovery_verify_adoption_locked(
@@ -2906,6 +2910,16 @@ def execute_private_control_recovery(
             quarantine,
             expected_plan_digest=str(plan["plan_digest"]),
         )
+        _pc_recovery_revalidate_bound_file(
+            primary_parent,
+            PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+            marker_binding,
+            marker_payload,
+        )
+        if verification["marker"] != marker_record:
+            raise MirrorSyncError(
+                "private-control cutover marker changed during final verification"
+            )
         return _pc_recovery_execution_receipt(
             verification,
             primary_parent,

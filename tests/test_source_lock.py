@@ -11815,6 +11815,99 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
                             )
                     self.assertTrue(replaced)
 
+    def _assert_initial_marker_replacement_is_rejected(
+        self,
+        *,
+        different_content: bool,
+        restore_original_after_verification: bool,
+    ) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            with self.subTest(module=module.__name__):
+                if self.primary_parent.exists():
+                    shutil.rmtree(self.primary_parent)
+                (
+                    _primary_spec,
+                    root_id,
+                    _receipt_name,
+                    marker_name,
+                    error_type,
+                ) = self._recovery_module_contract(module)
+                variant = "different" if different_content else "same"
+                plan_path = self.root / f"{module.__name__}-initial-{variant}.json"
+                marker_path = self.primary_parent / marker_name
+                held_path = marker_path.with_name(f".{marker_name}.held")
+                replacement_path = marker_path.with_name(
+                    f".{marker_name}.replacement"
+                )
+                with self._recovery_module_scope(module):
+                    module.plan_private_control_recovery(root_id, plan_path)
+                    original_verify = module._pc_recovery_verify_adoption_locked
+                    replaced = False
+                    verification_completed = False
+
+                    def replace_before_verification(
+                        *args: object,
+                        **kwargs: object,
+                    ) -> dict[str, object]:
+                        nonlocal replaced, verification_completed
+                        if not replaced:
+                            payload = marker_path.read_bytes()
+                            original_identity = module._pc_recovery_identity(
+                                os.stat(marker_path, follow_symlinks=False)
+                            )
+                            if restore_original_after_verification:
+                                os.rename(marker_path, held_path)
+                            replacement_path.write_bytes(
+                                payload + (b" " if different_content else b"")
+                            )
+                            replacement_path.chmod(0o400)
+                            os.replace(replacement_path, marker_path)
+                            replacement_identity = module._pc_recovery_identity(
+                                os.stat(marker_path, follow_symlinks=False)
+                            )
+                            self.assertNotEqual(
+                                replacement_identity,
+                                original_identity,
+                            )
+                            replaced = True
+                        try:
+                            result = original_verify(*args, **kwargs)
+                            verification_completed = True
+                            return result
+                        finally:
+                            if (
+                                restore_original_after_verification
+                                and held_path.exists()
+                            ):
+                                os.replace(held_path, marker_path)
+
+                    with mock.patch.object(
+                        module,
+                        "_pc_recovery_verify_adoption_locked",
+                        side_effect=replace_before_verification,
+                    ):
+                        with self.assertRaisesRegex(error_type, "marker changed"):
+                            module.execute_private_control_recovery(
+                                root_id,
+                                plan_path,
+                            )
+                    self.assertTrue(replaced)
+                    self.assertTrue(verification_completed)
+
+    def test_initial_publish_rejects_same_content_marker_replacement(self) -> None:
+        self._assert_initial_marker_replacement_is_rejected(
+            different_content=False,
+            restore_original_after_verification=False,
+        )
+
+    def test_initial_publish_rejects_different_content_marker_replacement(
+        self,
+    ) -> None:
+        self._assert_initial_marker_replacement_is_rejected(
+            different_content=True,
+            restore_original_after_verification=True,
+        )
+
     def test_receipt_only_crash_is_retryable_and_not_accepted(self) -> None:
         plan_path, _plan = self._plan()
         original_publish = MIRROR_MODULE._pc_recovery_publish_document
