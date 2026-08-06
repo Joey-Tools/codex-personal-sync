@@ -31,16 +31,15 @@ superseded_by:
   These pre-squash identities remain historical evidence only. Downstream
   generation must bind the actual squash-landed canonical `P` identity.
 - The retained private-control recovery follow-up is most recently reviewed at
-  signed checkpoint `10b0ab3285d898cadb6b533335ad16d632a1dd65`, tree
-  `1de01af544dcf867808143d9840543121145e2cf`. Its formal prior-b4ca
-  fresh-context named single found that recovery document writes lacked a
-  zero-progress/deadline-safe write-all primitive and that recursive directory
-  terminal revalidation could leak raw pathname/descriptor `OSError` values.
-  The symmetric generator/runtime repair uses bounded `memoryview` writes,
-  rejects zero progress, and preserves distinct missing, unreadable,
-  descriptor-failure, identity, and access-policy classifications. These
-  pre-squash identities remain historical evidence only; downstream handoff
-  begins from the actual squash-landed canonical `P`.
+  signed checkpoint `56da040e9c9cc5d7c485a34e1f707373ca7437c1`, tree
+  `f1089be18fc6ee1e1928d6af1473d3bcc62ed878`. Its sole prior-b4ca
+  fresh-context named single found that root-binding cleanup discarded FD and
+  lease custody when `close()` failed or had an uncertain effect. The current
+  symmetric generator/runtime repair fences the complete transaction before
+  close, makes confirmed close the only lease-release point, and requires a
+  process restart after any uncertain result. These pre-squash identities
+  remain historical evidence only; downstream handoff begins from the actual
+  squash-landed canonical `P`.
 
 ## Scope
 
@@ -2015,6 +2014,37 @@ superseded_by:
   the refreshed `sync-source-lock.json` SHA-256 is
   `0018191ae5e25c7ab1d78f99051a90a7129b18e08c6a15d4ce866868fc04f837`.
   Both runtimes passed `py_compile`; Ruff 0.16.1 E4/E7/E9/F, JSON parsing, and
+  `git diff --check` passed. A superseding signed checkpoint and its fresh
+  current-head named single remain outstanding.
+- Signed checkpoint `56da040e9c9cc5d7c485a34e1f707373ca7437c1`, tree
+  `f1089be18fc6ee1e1928d6af1473d3bcc62ed878`, carried the post-mkdir cleanup
+  repair. Its sole prior-b4ca fresh-context named single returned one P2:
+  root/file binding cleanup unconditionally set `fd = -1` after an uncertain
+  `os.close()`, and locked roots were explicitly unlocked before that close.
+  A before-effect failure therefore released the transaction lease while the
+  descriptor remained live; an after-effect failure could leave the numeric FD
+  referring to an unrelated object, with no process fence blocking retry. The
+  lane did not launch Claude or read credentials.
+- The target-branch repair is symmetric in the generator and standalone
+  runtime. It registers every live owned binding for the complete plan/execute
+  cleanup before the first close syscall, groups aliases of one numeric FD,
+  and removes the explicit unlock. Only a confirmed close marks that group
+  closed, clears its FD, and releases its temporary fence. Any `OSError` or
+  asynchronous uncertainty stops the whole cleanup, leaves the current group
+  close-uncertain and unattempted groups open, preserves the remaining tool,
+  quarantine, and primary-parent leases, and makes all same-process recovery or
+  nested cleanup fail before `open`, `close`, `fstat`, or `flock`.
+- The new matrix covers both implementations, plan/execute, and close before-
+  and after-effect. It passed 1/1 and complete
+  `PrivateControlRetainedRecoveryTests` passed 49/49 under both Python 3.13.0
+  and macOS system Python 3.9.6. The private-`TMPDIR` source-lock suite passed
+  280/280 in 612.410 seconds with one expected skip; full repository discovery
+  passed 1,141/1,141 in 1,357.835 seconds with three expected skips. Unmodified
+  stock refresh/check each verified all six sources. The locked engine SHA-256
+  is `a021db4b8cb14550ca78900d051d381a1091f8547809c3035e73354c78fd83bc`,
+  and the refreshed source-lock SHA-256 is
+  `48f2e8f8492487e965225518a6ccf6e87a9bdd0baca7619d02597ae6c34afb38`.
+  Both runtimes passed source syntax compilation; Ruff 0.13.2 E4/E7/E9/F and
   `git diff --check` passed. A superseding signed checkpoint and its fresh
   current-head named single remain outstanding.
 

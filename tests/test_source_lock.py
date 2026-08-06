@@ -13797,6 +13797,326 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
                             if retained:
                                 module._pc_recovery_close_bindings(retained)
 
+    def test_root_binding_close_uncertainty_retains_transaction_fence(
+        self,
+    ) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            for operation in ("plan", "execute"):
+                for close_after_effect in (False, True):
+                    with self.subTest(
+                        module=module.__name__,
+                        operation=operation,
+                        close_after_effect=close_after_effect,
+                    ):
+                        if self.primary_parent.exists():
+                            shutil.rmtree(self.primary_parent)
+                        module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY = ()
+                        module._PC_RECOVERY_RETAINED_CLOSE_FENCE = ()
+                        (
+                            _primary_spec,
+                            root_id,
+                            _receipt_name,
+                            _marker_name,
+                            error_type,
+                        ) = self._recovery_module_contract(module)
+                        plan_path = self.root / (
+                            f"{module.__name__}-root-close-{operation}-"
+                            f"{int(close_after_effect)}.json"
+                        )
+                        real_bind_legacy = module._pc_recovery_bind_legacy
+                        real_open_primary = (
+                            module._pc_recovery_open_or_create_primary_parent
+                        )
+                        real_open = os.open
+                        real_close = os.close
+                        real_fstat = os.fstat
+                        real_flock = fcntl.flock
+                        captured: dict[str, tuple[object, ...]] = {}
+                        target_binding: object | None = None
+                        injected_fd = -1
+                        injected_close_calls = 0
+                        sentinel_identity: tuple[int, int, int] | None = None
+                        retained: tuple[object, ...] = ()
+                        unlock_fds: list[int] = []
+
+                        def capture_legacy(*args: object, **kwargs: object):
+                            nonlocal target_binding
+                            result = real_bind_legacy(*args, **kwargs)
+                            captured["legacy"] = tuple(
+                                binding
+                                for binding in (
+                                    result[5],
+                                    result[4],
+                                    result[3],
+                                    result[2],
+                                )
+                                if binding is not None
+                            )
+                            if operation == "plan":
+                                target_binding = result[4]
+                            return result
+
+                        def capture_primary(*args: object, **kwargs: object):
+                            nonlocal target_binding
+                            result = real_open_primary(*args, **kwargs)
+                            captured["primary"] = (result[1], result[0])
+                            if operation == "execute":
+                                target_binding = result[1]
+                            return result
+
+                        def expected_roots() -> tuple[object, ...]:
+                            roots = (
+                                *captured.get("primary", ()),
+                                *captured.get("legacy", ()),
+                            )
+                            return tuple(
+                                binding
+                                for index, binding in enumerate(roots)
+                                if id(binding)
+                                not in {id(item) for item in roots[:index]}
+                            )
+
+                        def observe_flock(file_fd: int, flags: int) -> None:
+                            if flags == fcntl.LOCK_UN:
+                                unlock_fds.append(file_fd)
+                            real_flock(file_fd, flags)
+
+                        def inject_root_close(file_fd: int) -> None:
+                            nonlocal injected_fd
+                            nonlocal injected_close_calls
+                            nonlocal sentinel_identity
+                            if (
+                                target_binding is not None
+                                and file_fd == target_binding.fd
+                            ):
+                                if injected_fd >= 0:
+                                    injected_close_calls += 1
+                                    raise AssertionError(
+                                        "close-uncertain root binding was closed again"
+                                    )
+                                injected_fd = file_fd
+                                injected_close_calls = 1
+                                self.assertNotIn(file_fd, unlock_fds)
+                                fence = tuple(
+                                    module._PC_RECOVERY_RETAINED_CLOSE_FENCE
+                                )
+                                expected = expected_roots()
+                                self.assertTrue(expected)
+                                self.assertTrue(
+                                    {id(binding) for binding in expected}
+                                    <= {id(binding) for binding in fence}
+                                )
+                                self.assertTrue(target_binding.locked)
+                                self.assertEqual(
+                                    target_binding.close_state,
+                                    "close-uncertain",
+                                )
+                                if close_after_effect:
+                                    real_close(file_fd)
+                                    sentinel_path = self.root / (
+                                        f"{module.__name__}-root-close-sentinel-"
+                                        f"{operation}"
+                                    )
+                                    sentinel_path.write_bytes(
+                                        b"unique root close-after-effect sentinel\n"
+                                    )
+                                    sentinel_path.chmod(0o600)
+                                    replacement_fd = real_open(
+                                        sentinel_path,
+                                        os.O_RDONLY,
+                                    )
+                                    sentinel_path.unlink()
+                                    if replacement_fd != file_fd:
+                                        os.dup2(replacement_fd, file_fd)
+                                        real_close(replacement_fd)
+                                    metadata = real_fstat(file_fd)
+                                    sentinel_identity = (
+                                        metadata.st_dev,
+                                        metadata.st_ino,
+                                        stat.S_IFMT(metadata.st_mode),
+                                    )
+                                raise OSError(
+                                    errno.EIO,
+                                    "simulated root binding close uncertainty",
+                                )
+                            real_close(file_fd)
+
+                        def assert_lock_contended(binding: object) -> None:
+                            competitor_fd = real_open(
+                                binding.path,
+                                os.O_RDONLY
+                                | getattr(os, "O_DIRECTORY", 0)
+                                | getattr(os, "O_CLOEXEC", 0)
+                                | getattr(os, "O_NOFOLLOW", 0),
+                            )
+                            try:
+                                with self.assertRaises(BlockingIOError):
+                                    real_flock(
+                                        competitor_fd,
+                                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                                    )
+                            finally:
+                                real_close(competitor_fd)
+
+                        try:
+                            with self._recovery_module_scope(module):
+                                if operation == "execute":
+                                    module.plan_private_control_recovery(
+                                        root_id,
+                                        plan_path,
+                                    )
+                                with (
+                                    mock.patch.object(
+                                        module,
+                                        "_pc_recovery_bind_legacy",
+                                        side_effect=capture_legacy,
+                                    ),
+                                    mock.patch.object(
+                                        module,
+                                        "_pc_recovery_open_or_create_primary_parent",
+                                        side_effect=capture_primary,
+                                    ),
+                                    mock.patch.object(
+                                        module.fcntl,
+                                        "flock",
+                                        side_effect=observe_flock,
+                                    ),
+                                    mock.patch.object(
+                                        module.os,
+                                        "close",
+                                        side_effect=inject_root_close,
+                                    ),
+                                    self.assertRaisesRegex(
+                                        error_type,
+                                        "cannot close .*private-control",
+                                    ),
+                                ):
+                                    if operation == "plan":
+                                        module.plan_private_control_recovery(
+                                            root_id,
+                                            plan_path,
+                                        )
+                                    else:
+                                        module.execute_private_control_recovery(
+                                            root_id,
+                                            plan_path,
+                                        )
+
+                                self.assertGreaterEqual(injected_fd, 0)
+                                self.assertEqual(injected_close_calls, 1)
+                                self.assertEqual(
+                                    module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY,
+                                    (),
+                                )
+                                retained = tuple(
+                                    module._PC_RECOVERY_RETAINED_CLOSE_FENCE
+                                )
+                                expected = expected_roots()
+                                self.assertEqual(unlock_fds, [])
+                                self.assertEqual(
+                                    len({id(binding) for binding in retained}),
+                                    len(retained),
+                                )
+                                self.assertTrue(
+                                    {id(binding) for binding in expected}
+                                    <= {id(binding) for binding in retained}
+                                )
+                                for binding in expected:
+                                    metadata = real_fstat(binding.fd)
+                                    identity = (
+                                        metadata.st_dev,
+                                        metadata.st_ino,
+                                        stat.S_IFMT(metadata.st_mode),
+                                    )
+                                    if binding is target_binding and close_after_effect:
+                                        self.assertEqual(identity, sentinel_identity)
+                                        self.assertNotEqual(identity, binding.identity)
+                                    else:
+                                        self.assertEqual(identity, binding.identity)
+                                    if binding is target_binding:
+                                        self.assertEqual(
+                                            binding.close_state,
+                                            "close-uncertain",
+                                        )
+                                    else:
+                                        self.assertEqual(binding.close_state, "open")
+
+                                locked = tuple(
+                                    binding
+                                    for binding in expected
+                                    if binding.locked
+                                    and not (
+                                        binding is target_binding
+                                        and close_after_effect
+                                    )
+                                )
+                                self.assertTrue(locked)
+                                for binding in locked:
+                                    assert_lock_contended(binding)
+
+                                with (
+                                    mock.patch.object(module.os, "stat") as blocked_stat,
+                                    mock.patch.object(module.os, "open") as blocked_open,
+                                    mock.patch.object(module.os, "close") as blocked_close,
+                                    mock.patch.object(module.os, "fstat") as blocked_fstat,
+                                    mock.patch.object(
+                                        module.fcntl,
+                                        "flock",
+                                    ) as blocked_flock,
+                                ):
+                                    for retry in ("plan", "execute"):
+                                        with self.subTest(retry=retry):
+                                            with self.assertRaisesRegex(
+                                                error_type,
+                                                "close remains uncertain",
+                                            ):
+                                                if retry == "plan":
+                                                    module.plan_private_control_recovery(
+                                                        root_id,
+                                                        self.root
+                                                        / "blocked-root-close-plan.json",
+                                                    )
+                                                else:
+                                                    module.execute_private_control_recovery(
+                                                        root_id,
+                                                        plan_path,
+                                                    )
+                                    blocked_stat.assert_not_called()
+                                    blocked_open.assert_not_called()
+                                    blocked_close.assert_not_called()
+                                    blocked_fstat.assert_not_called()
+                                    blocked_flock.assert_not_called()
+                                self.assertEqual(injected_close_calls, 1)
+                                if close_after_effect:
+                                    metadata = real_fstat(injected_fd)
+                                    self.assertEqual(
+                                        (
+                                            metadata.st_dev,
+                                            metadata.st_ino,
+                                            stat.S_IFMT(metadata.st_mode),
+                                        ),
+                                        sentinel_identity,
+                                    )
+                        finally:
+                            module._PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY = ()
+                            module._PC_RECOVERY_RETAINED_CLOSE_FENCE = ()
+                            cleanup_bindings = (
+                                *captured.get("primary", ()),
+                                *captured.get("legacy", ()),
+                                *retained,
+                            )
+                            closed: set[int] = set()
+                            for binding in cleanup_bindings:
+                                if binding.fd < 0 or binding.fd in closed:
+                                    continue
+                                closed.add(binding.fd)
+                                try:
+                                    real_close(binding.fd)
+                                except OSError:
+                                    pass
+                            for binding in cleanup_bindings:
+                                binding.fd = -1
+
     def test_pending_writer_is_registered_before_first_fstat(self) -> None:
         for module in (MIRROR_MODULE, ENGINE_MODULE):
             for reuse_existing in (False, True):

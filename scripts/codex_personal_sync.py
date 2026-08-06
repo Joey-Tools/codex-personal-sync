@@ -535,6 +535,7 @@ class _PrivateControlRecoveryBinding:
     identity: tuple[int, int, int]
     access: tuple[int, int, int]
     locked: bool = False
+    close_state: str = "open"
 
 
 @dataclass
@@ -690,24 +691,40 @@ def _pc_recovery_specs(
 def _pc_recovery_close_bindings(
     bindings: tuple[_PrivateControlRecoveryBinding | None, ...],
 ) -> None:
-    errors: list[str] = []
-    closed: set[int] = set()
+    bindings_by_fd: dict[int, list[_PrivateControlRecoveryBinding]] = {}
     for binding in bindings:
-        if binding is None or binding.fd < 0 or binding.fd in closed:
+        if binding is None or binding.fd < 0:
             continue
-        closed.add(binding.fd)
-        if binding.locked:
-            try:
-                fcntl.flock(binding.fd, fcntl.LOCK_UN)
-            except OSError as error:
-                errors.append(f"cannot unlock {binding.label}: {error}")
+        bindings_by_fd.setdefault(binding.fd, []).append(binding)
+    retained = tuple(
+        binding
+        for same_fd_bindings in bindings_by_fd.values()
+        for binding in same_fd_bindings
+    )
+    if not retained:
+        return
+    if (
+        _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+        or _PC_RECOVERY_RETAINED_CLOSE_FENCE
+    ):
+        _pc_recovery_retain_close_fence(retained)
+        _pc_recovery_require_no_close_fence()
+    _pc_recovery_retain_close_fence(retained)
+    for file_fd, same_fd_bindings in bindings_by_fd.items():
+        binding = same_fd_bindings[0]
+        for item in same_fd_bindings:
+            item.close_state = "close-uncertain"
         try:
-            os.close(binding.fd)
-        except OSError as error:
-            errors.append(f"cannot close {binding.label}: {error}")
-        binding.fd = -1
-    if errors:
-        raise SyncError("; ".join(errors))
+            os.close(file_fd)
+        except BaseException as error:
+            if isinstance(error, OSError):
+                raise SyncError(f"cannot close {binding.label}: {error}") from error
+            raise
+        for item in same_fd_bindings:
+            item.fd = -1
+            item.locked = False
+            item.close_state = "closed"
+        _pc_recovery_release_close_fence(tuple(same_fd_bindings))
 
 
 def _pc_recovery_prepare_pending_descriptor(
@@ -825,13 +842,25 @@ def _pc_recovery_retain_close_fence(
     _PC_RECOVERY_RETAINED_CLOSE_FENCE = tuple(retained)
 
 
+def _pc_recovery_release_close_fence(
+    bindings: tuple[_PrivateControlRecoveryBinding, ...],
+) -> None:
+    global _PC_RECOVERY_RETAINED_CLOSE_FENCE
+    released = {id(binding) for binding in bindings}
+    _PC_RECOVERY_RETAINED_CLOSE_FENCE = tuple(
+        binding
+        for binding in _PC_RECOVERY_RETAINED_CLOSE_FENCE
+        if id(binding) not in released
+    )
+
+
 def _pc_recovery_require_no_close_fence() -> None:
     if (
         _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
         or _PC_RECOVERY_RETAINED_CLOSE_FENCE
     ):
         raise SyncError(
-            "pending recovery descriptor close remains uncertain; "
+            "recovery descriptor close remains uncertain; "
             "restart the process before another recovery attempt"
         )
 
@@ -4330,20 +4359,22 @@ def execute_private_control_recovery(
             primary_bindings,
             legacy_bindings,
         )
+        cleanup_bindings = tuple(
+            binding
+            for bindings in cleanup_groups
+            for binding in bindings
+            if binding is not None
+        )
         if (
             _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
             or _PC_RECOVERY_RETAINED_CLOSE_FENCE
         ):
-            for bindings in cleanup_groups:
-                _pc_recovery_retain_close_fence(bindings)
-        else:
-            for bindings in cleanup_groups:
-                if not bindings:
-                    continue
-                try:
-                    _pc_recovery_close_bindings(bindings)
-                except SyncError as error:
-                    cleanup_errors.append(str(error))
+            _pc_recovery_retain_close_fence(cleanup_bindings)
+        elif cleanup_bindings:
+            try:
+                _pc_recovery_close_bindings(cleanup_bindings)
+            except SyncError as error:
+                cleanup_errors.append(str(error))
         if cleanup_errors:
             cleanup_detail = "private-control recovery cleanup failed: " + "; ".join(
                 cleanup_errors

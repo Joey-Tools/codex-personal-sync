@@ -17,7 +17,7 @@ superseded_by:
 - 为 registry 中唯一的 `legacy-shared-v0` 增加显式 dry-run/execute recovery，允许在完整证据原地保留的前提下切换到 `primary-home-v1` 分配。
 - Recovery 不 move、copy、rewrite、delete 或 purge legacy tool/quarantine 中的任何对象；物理清理继续属于单独的高风险合同。
 - Generator 与 standalone runtime 保持独立实现，并由 parity tests 绑定为同一份 machine contract。
-- Final repair 还将 recovery document 写入绑定到有界、零进展拒绝的 write-all 合同，并把递归目录终态 path/descriptor revalidation 的 missing、unreadable 与 descriptor failure 分别包装成稳定 domain errors。
+- Final repair 还将 recovery document 写入绑定到有界、零进展拒绝的 write-all 合同，把递归目录终态 path/descriptor revalidation 的 missing、unreadable 与 descriptor failure 分别包装成稳定 domain errors，并让所有 root/file binding 的独占 lease 只在 `close()` 明确成功后释放。
 
 ## Protected Properties
 
@@ -35,6 +35,7 @@ superseded_by:
 - Execute 重新扫描并要求 exact protected-plan match，随后先发布 fixed mode-`0400` receipt，再以 fixed marker 作为 commit point。
 - 每次新 publication 先提出 plan digest + 随机 nonce 的 pending name；short write、`fchmod` 或 file `fsync` 失败可留下 untrusted pending residue，rename-after-effect 后 parent-directory `fsync` 失败则可能留下 visible fixed name。Retry 在已持有的 primary-parent lease 下合并稳定扫描 receipt/marker history：同 family、同 plan residue 先按 exact object identity、regular-file type、single-link、mode/uid/gid 与 size 重新绑定，再将 mode `0400` 恢复为 `0600`、以新 writer FD 重新绑定同一 inode、truncate 并完整重写；partial content 本身不作为认证信号。只有没有可复用 inode 时才按最多 8 个 pending entries 与 512 MiB aggregate logical bytes 做最坏 64 MiB 预留。Fixed document durable 后，以同样的 bounded identity/access checks 删除该 family/plan 的 superseded pending residue，使旧版 over-cap history 可以单调减量而不是永久阻断。Existing fixed document retry 仍重新 `fsync` containing directory 并复验 exact identity/access/content；existing marker 在 durability repair 前后均执行完整 adoption verification，并绑定最初 retained marker inode。
 - 每次 pending reader/writer `open` 前先登记 `opening` placeholder；`open` 返回后立即绑定 exact FD/path/identity/access，再允许任何 `fstat`、`stat`、read 或 write。Close 前先将 custody 标为 `close-uncertain`，只有一次 `close` 明确成功才移除。Writer 成功关闭后，独立 verifier reader 继续持有并注册 custody，覆盖 content re-read、fixed-name rename、parent-directory `fsync`、最终 identity/access/content verification 与 superseded-residue cleanup；只有完整 publication 成功后才将 FD 转移给 final binding 并显式 release。任意 close-before/after-effect 或并行 residue cleanup 不确定性都保留不可再操作的历史 FD 记录及全部 recovery transaction leases，后续 plan/execute 在任何 open 前要求进程重启；不得对可能已复用的 numeric FD 重试 `fstat` 或 `close`。
+- Root/file binding cleanup 在第一次 close syscall 前把本次 plan/execute 的全部 live owned bindings 登记到 process-lifetime fence；同一 numeric FD 的 alias 作为一组处理。Locked binding 不再先执行显式 `LOCK_UN`，而由一次明确成功的 `close()` 同时证明 descriptor 与 lease 已释放，随后才将整组标为 `closed`、`fd = -1` 并从 fence 移除。任何 `OSError`、异步异常或 close-after-effect FD-number reuse 都立即停止整批 cleanup；当前组保持 `close-uncertain`，未尝试组保持 `open`，其余 tool/quarantine/primary-parent leases 继续由 held descriptors 保留。同进程后续 plan/execute 或 nested cleanup 在任何 `open`、`close`、`fstat`、`flock` 前要求重启。
 - 初次 marker publication 不再在 final adoption verification 前关闭并丢弃 binding。原 marker descriptor、payload 与 publication record 保留到 verifier 返回之后；fixed name 再按 exact identity/access/bytes 复验，且 `verification["marker"]` 必须与 publication record 完全一致。
 - Primary-parent no-replace publication 若在 effect 前失败，只在 digest-named staging pathname 仍绑定 held descriptor 的 exact identity、mode/uid/gid policy 且目录为空时，才以 trusted-home descriptor 执行 `rmdir` 并 fsync/revalidate home。Missing、replacement、nonempty、unreadable 或 rename-after-effect 状态均保留并以 secondary cleanup failure 停止；不把 staging prefix 当作删除授权。
 - 首次已经观察到 primary namespace 存在后的 bind failure 不再被二次 lookup 降级为 absence；若 earlier prebind 已证明存在，execute 内 lookup 缺失也在任何 staging mutation 前停止。
@@ -214,3 +215,30 @@ superseded_by:
   双 runtime `py_compile`、Ruff 0.16.1 E4/E7/E9/F、JSON parsing 与
   `git diff --check` 已通过；superseding signed checkpoint 与该 exact head 的
   fresh named single 尚待完成，因此不作 final review-clean claim。
+- 上述 post-mkdir repair 形成签名 checkpoint
+  `56da040e9c9cc5d7c485a34e1f707373ca7437c1`，tree
+  `f1089be18fc6ee1e1928d6af1473d3bcc62ed878`。其唯一 prior-b4ca
+  fresh-context named single 返回一项 P2：root binding cleanup 在
+  `os.close()` 结果不确定时仍无条件丢弃 FD custody，且 locked root 先显式
+  `LOCK_UN`，因此 before-effect failure 已释放 lease，after-effect failure 又可把
+  复用后的 numeric FD 当成已清理；同进程 retry 也没有 process fence。该 lane
+  没有启动 Claude，也未读取凭据。
+- 当前对称 repair 将全部 plan/execute owned bindings 在首个 close 前一次性登记，
+  删除显式 unlock，并只在 close 明确成功后清除 exact alias group。任何 close
+  uncertainty 都停止剩余 cleanup、保留未触碰的 tool/quarantine/primary-parent
+  独占 lease，并在两个 recovery 入口及 nested cleanup 的首个 syscall 前要求重启。
+  新回归覆盖 generator/runtime、plan/execute 与 close-before/after-effect 的 8 个
+  组合，精确验证 sentinel FD reuse、无显式 unlock、完整 3/5-root transaction
+  fence、剩余 lease contention、单次 close 和 fail-before-syscall retry。
+- 该回归在 Python 3.13.0 与 macOS system Python 3.9.6 下各通过 1/1；完整
+  `PrivateControlRetainedRecoveryTests` 在两个 runtime 下各通过 49/49。Repository
+  private-`TMPDIR` wrapper 下完整 `tests.test_source_lock` 通过 280/280 in
+  612.410s（1 expected skip），完整 repository discovery 通过 1,141/1,141 in
+  1,357.835s（3 expected skips）。未修改 stock `refresh-lock` 与
+  `refresh-lock --check` 各验证 6 sources；locked engine SHA-256 为
+  `a021db4b8cb14550ca78900d051d381a1091f8547809c3035e73354c78fd83bc`，
+  `sync-source-lock.json` SHA-256 为
+  `48f2e8f8492487e965225518a6ccf6e87a9bdd0baca7619d02597ae6c34afb38`。
+  双 runtime syntax compile、Ruff 0.13.2 E4/E7/E9/F 与 `git diff --check`
+  通过；superseding signed checkpoint 与该 exact head 的 fresh named single 尚待
+  完成，因此不作 final review-clean claim。
