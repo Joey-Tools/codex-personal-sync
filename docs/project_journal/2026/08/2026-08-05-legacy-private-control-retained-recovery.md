@@ -70,3 +70,35 @@ superseded_by:
 - 上述 exact repair 形成签名 checkpoint `e350fa877e3f487a2b95757913f59c9b5612eb3e`，tree `292813658730362785628d65e189a602224843f0`。通过 prior-b4ca guard materialize/first-status validate 并在 last-moment exact revalidation 后启动的唯一 fresh-context named single 返回一项 P2：receipt/marker write、`fchmod` 或 `fsync` 持续失败时，每次随机 nonce retry 都会遗留一个新 pending artifact，而 primary namespace 没有总 entry/byte cap，可无界消耗 inode 与磁盘。该 lane 没有启动 Claude preflight、Claude actual 或读取凭据。
 - 当前未提交 repair 在 generator 与 standalone runtime 中对称新增 parent-lease-bound pending capacity gate、same-plan inode reuse、durable-publication 后的 bounded residue cleanup，以及 pending descriptor custody/process-lifetime close fence。Stable scan 继续以既有 100,000-entry scan cap 限制 enumeration，合并识别两类 pending prefix并执行两次 name/object/access/size snapshot；只有新建 inode 才要求 `existing_count + 1 <= 8` 与 `existing_logical_bytes + 64 MiB <= 512 MiB`。同-plan reuse 在新 writer 打开前后都复验 inode/access/nlink/size，完整重写后才允许 fixed-name publication；writer→verifier handoff 保持 reader custody 直到 fixed document durable、最终 revalidation 与 bounded residue cleanup 全部成功，再显式转移给 final binding。任何 reader/writer 或 residue close/open uncertainty 均保留 process-lifetime fence。旧版 9-entry history 与 aggregate over-cap history 均可在成功 publication 后清空。
 - 新增 old-history drain、fresh/reused writer close-before/after-effect、reader close-before/after-effect、writer→reader replacement、rename failure、numeric-FD sentinel reuse、plan/execute pre-open fence，以及 reader/writer pre-open custody regressions；replacement 回归还精确绑定注入对象的 inode、bytes 与 mode，防止 mutation-before-error 假绿。完整 `PrivateControlRetainedRecoveryTests` 在 uv Python 3.13.0 与 macOS system Python 3.9.6 下各通过 40/40；完整 `tests.test_source_lock` 在 repository private-`TMPDIR` wrapper 下通过 271/271 in 582.266s（1 expected skip），完整 `unittest discover -s tests` 通过 1132/1132 in 829.875s（3 expected skips）。CI 单列的 `macos_system_temp_alias` 8/8 与 `macos_git_locator` 6/6 在两个 runtime 下均通过，repo-wide `compileall -q scripts tests` 也在两个 runtime 下通过。两份实现与测试通过 Python 3.13 `py_compile`、Ruff E4/E7/E9/F 与 `git diff --check`；独立只读状态机审计未发现剩余 P1。最终未修改 stock `refresh-lock` 与 `refresh-lock --check` 在 task-private account-home 中各覆盖并通过 6 sources；locked engine SHA-256 为 `e3aa5e58146ef7150c949860922a220e02bae303fd305d6a1765e55fd6d1f17c`，`sync-source-lock.json` SHA-256 为 `d3be60d14495ad4e33bd6150f7b805da0e3aec4fbc4e12c57823a70fc9b44fc2`。Final signed checkpoint 与新 head 正式 review 尚未完成，因此不作最终 clean claim。
+- 上述 pending-capacity/custody repair 形成签名 checkpoint
+  `0a22012a05e38881630c7fb4af07eaa6a041812e`，tree
+  `25d41556963889694cf0078fb45c5bde767b1e9c`。该 exact head 的唯一
+  fresh-context named single 返回一项 P2：generator 的 adopted legacy
+  manifest 每次另建 300 秒 deadline 和局部计数，未消耗 normal mirror
+  operation 已有的 deadline、entry 与 byte budget；同一 retained root 在一次
+  transaction 中的多次复验因此可能绕过 operation-wide resource bound。
+- 当前 repair 只收紧拥有共享 `OperationBudget` 的 canonical generator normal
+  flow；standalone recovery CLI 没有该外层预算，继续保留原有 recovery-local
+  timeout/caps。Preflight 与所有 terminal receipt revalidation 现在把同一个可变
+  budget 贯穿 adoption verifier、plan、manifest、递归 directory scan 与双遍
+  regular-file read。Effective deadline 取 recovery deadline 与 operation
+  deadline 的较小值；每个实际枚举 name 消耗一个 entry 及其 UTF-8 bytes，每个
+  实际 read chunk 消耗 byte budget，因此重复 manifest 不会重置计量。新增回归
+  分别锁定已过期 operation 在 manifest 前失败，以及恰好一轮 manifest 的
+  entry/name/double-read bytes 在首次 preflight 后归零、第二次 revalidation
+  必须因同一 aggregate budget 失败。
+- 两项新回归 2/2 通过；完整 `PrivateControlRetainedRecoveryTests` 在 uv Python
+  3.13.0 与 macOS system Python 3.9.6 下各通过 42/42。完整
+  `tests.test_source_lock` 通过 273/273 in 595.151s（1 expected skip），完整
+  `unittest discover -s tests` 通过 1134/1134 in 851.869s（3 expected
+  skips）。CI 单列的 `macos_system_temp_alias` 8/8 与 `macos_git_locator` 6/6
+  在两个 runtime 下均通过；Ruff E4/E7/E9/F、双 runtime `py_compile` 与
+  `git diff --check` 通过。一条独立只读预算传播审计复核 normal-flow 四次
+  adoption manifest 共用同一 budget、standalone caller 兼容和两项测试的
+  反事实敏感性，终态 clean。未修改 stock `refresh-lock` 与
+  `refresh-lock --check` 在 task-private account-home 中各覆盖并通过 6
+  sources；locked engine 与 `sync-source-lock.json` SHA-256 仍分别为
+  `e3aa5e58146ef7150c949860922a220e02bae303fd305d6a1765e55fd6d1f17c` 和
+  `d3be60d14495ad4e33bd6150f7b805da0e3aec4fbc4e12c57823a70fc9b44fc2`。
+  Final signed checkpoint 与该新 head 的正式 named single 尚未完成，因此不作
+  final clean claim。

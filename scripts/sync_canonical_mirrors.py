@@ -798,6 +798,7 @@ def _pc_recovery_read_file(
     expected: os.stat_result,
     *,
     deadline: float,
+    operation: OperationBudget | None = None,
     payload_limit: int | None,
 ) -> tuple[int, str, bytes | None, os.stat_result]:
     try:
@@ -824,12 +825,14 @@ def _pc_recovery_read_file(
             )
 
         def read_once(*, capture: bool) -> tuple[int, str, bytes | None]:
+            _operation_checkpoint(operation, f"reading {path}")
             _pc_recovery_check_deadline(deadline, f"reading {path}")
             os.lseek(file_fd, 0, os.SEEK_SET)
             digest = hashlib.sha256()
             payload = bytearray() if capture else None
             size = 0
             while size <= before.st_size:
+                _operation_checkpoint(operation, f"reading {path}")
                 _pc_recovery_check_deadline(deadline, f"reading {path}")
                 chunk = os.read(
                     file_fd,
@@ -838,6 +841,11 @@ def _pc_recovery_read_file(
                 if not chunk:
                     break
                 size += len(chunk)
+                _consume_operation_budget(
+                    operation,
+                    byte_count=len(chunk),
+                    label=f"reading private-control recovery evidence {path}",
+                )
                 digest.update(chunk)
                 if payload is not None:
                     payload.extend(chunk)
@@ -974,6 +982,7 @@ def _pc_recovery_scan_directory(
     segment: str,
     *,
     deadline: float,
+    operation: OperationBudget | None,
     state: dict[str, int],
 ) -> tuple[list[dict[str, object]], str]:
     entries: list[dict[str, object]] = []
@@ -981,6 +990,7 @@ def _pc_recovery_scan_directory(
     def scan(
         directory_fd: int, relative_parent: str, depth: int
     ) -> tuple[list[dict[str, object]], str]:
+        _operation_checkpoint(operation, f"inventorying {binding.path}")
         _pc_recovery_check_deadline(deadline, f"inventorying {binding.path}")
         if depth > PRIVATE_CONTROL_RECOVERY_MAX_DEPTH:
             raise MirrorSyncError(
@@ -992,6 +1002,10 @@ def _pc_recovery_scan_directory(
         try:
             with os.scandir(directory_fd) as iterator:
                 for item in iterator:
+                    _operation_checkpoint(
+                        operation,
+                        f"inventorying {binding.path}",
+                    )
                     _pc_recovery_check_deadline(
                         deadline, f"inventorying {binding.path}"
                     )
@@ -1006,7 +1020,7 @@ def _pc_recovery_scan_directory(
                             f"private-control recovery found an unsafe name: {name!r}"
                         )
                     try:
-                        name.encode("utf-8", "strict")
+                        encoded_name = name.encode("utf-8", "strict")
                     except UnicodeEncodeError as error:
                         raise MirrorSyncError(
                             f"private-control recovery name is not strict UTF-8: {name!r}"
@@ -1019,6 +1033,15 @@ def _pc_recovery_scan_directory(
                             f"{prior!r} and {name!r}"
                         )
                     collisions[collision_key] = name
+                    _consume_operation_budget(
+                        operation,
+                        byte_count=len(encoded_name),
+                        entry_count=1,
+                        label=(
+                            "inventorying private-control recovery evidence "
+                            f"{binding.path}"
+                        ),
+                    )
                     names.append(name)
                     if len(names) > remaining:
                         raise MirrorSyncError(
@@ -1102,6 +1125,7 @@ def _pc_recovery_scan_directory(
                     binding.path / relative_path,
                     path_metadata,
                     deadline=deadline,
+                    operation=operation,
                     payload_limit=(
                         MAX_PRIVATE_OWNER_RECORD_BYTES if owner_candidate else None
                     ),
@@ -1413,8 +1437,13 @@ def _pc_recovery_manifest(
     parent: _PrivateControlRecoveryBinding,
     tool: _PrivateControlRecoveryBinding,
     quarantine: _PrivateControlRecoveryBinding,
+    *,
+    operation: OperationBudget | None = None,
 ) -> dict[str, object]:
+    _operation_checkpoint(operation, "starting private-control recovery manifest")
     deadline = time.monotonic() + PRIVATE_CONTROL_RECOVERY_TIMEOUT_SECONDS
+    if operation is not None:
+        deadline = min(deadline, operation.deadline)
     state = {
         "allocated_bytes": 0,
         "entries": 0,
@@ -1436,12 +1465,14 @@ def _pc_recovery_manifest(
         tool,
         "tool-root",
         deadline=deadline,
+        operation=operation,
         state=state,
     )
     quarantine_entries, quarantine_digest = _pc_recovery_scan_directory(
         quarantine,
         "quarantine",
         deadline=deadline,
+        operation=operation,
         state=state,
     )
     entries = sorted(
@@ -1496,8 +1527,15 @@ def _pc_recovery_plan_from_bindings(
     parent: _PrivateControlRecoveryBinding,
     tool: _PrivateControlRecoveryBinding,
     quarantine: _PrivateControlRecoveryBinding,
+    *,
+    operation: OperationBudget | None = None,
 ) -> dict[str, object]:
-    inventory = _pc_recovery_manifest(parent, tool, quarantine)
+    inventory = _pc_recovery_manifest(
+        parent,
+        tool,
+        quarantine,
+        operation=operation,
+    )
     primary_parent = Path(os.path.abspath(primary_spec.parent_path))
     legacy_parent = Path(os.path.abspath(legacy_spec.parent_path))
     plan: dict[str, object] = {
@@ -3531,6 +3569,7 @@ def _pc_recovery_verify_adoption_locked(
     quarantine: _PrivateControlRecoveryBinding,
     *,
     expected_plan_digest: str | None = None,
+    operation: OperationBudget | None = None,
 ) -> dict[str, object]:
     marker_result = _pc_recovery_optional_file(
         primary_parent,
@@ -3592,6 +3631,7 @@ def _pc_recovery_verify_adoption_locked(
             parent,
             tool,
             quarantine,
+            operation=operation,
         )
         if not _pc_recovery_canonical_documents_equal(
             _pc_recovery_protected_plan(plan),
@@ -6392,6 +6432,7 @@ def _preflight_legacy_private_control_roots_once(
                             recovery_parent,
                             recovery_tool,
                             recovery_quarantine,
+                            operation=root.operation,
                         )
                         final_tool = _legacy_child_metadata(
                             parent.fd,
@@ -6975,6 +7016,7 @@ def _revalidate_legacy_private_control_receipts_once(
                             access=quarantine.access_policy,
                         ),
                         expected_plan_digest=receipt.adoption_plan_digest,
+                        operation=operation,
                     )
                 finally:
                     _pc_recovery_close_bindings((primary_parent,))

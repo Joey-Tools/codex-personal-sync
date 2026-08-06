@@ -12013,9 +12013,15 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
                     parent: object,
                     tool: object,
                     quarantine: object,
+                    **kwargs: object,
                 ) -> dict[str, object]:
                     nonlocal injected, parent_record, sentinel_record
-                    inventory = real_manifest(parent, tool, quarantine)
+                    inventory = real_manifest(
+                        parent,
+                        tool,
+                        quarantine,
+                        **kwargs,
+                    )
                     if not injected:
                         self.primary_parent.mkdir(mode=0o700)
                         sentinel_path = self.primary_parent / sentinel_name
@@ -14268,6 +14274,97 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
                 (True, None),
             )
             self.assertEqual(before, self._snapshot())
+        finally:
+            if receipts:
+                MIRROR_MODULE._release_legacy_private_control_receipts(receipts)
+            MIRROR_MODULE._close_control_bindings_best_effort(
+                (prebinding.parent, prebinding.home)
+            )
+
+    def test_generator_adoption_rejects_expired_operation_budget(self) -> None:
+        plan_path, _plan = self._plan("expired-operation-budget.json")
+        MIRROR_MODULE.execute_private_control_recovery(
+            MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            plan_path,
+        )
+        prebinding = MIRROR_MODULE._prebind_existing_primary_private_control_root(
+            self.root_specs[0]
+        )
+        operation = MIRROR_MODULE.OperationBudget(
+            deadline=time.monotonic() - 1,
+            remaining_bytes=MIRROR_MODULE.MAX_OPERATION_BYTES,
+            remaining_entries=MIRROR_MODULE.MAX_OPERATION_ENTRIES,
+        )
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_validate_private_control_root_topology",
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "mirror operation exceeded",
+                ),
+            ):
+                MIRROR_MODULE._preflight_legacy_private_control_roots_once(
+                    mock.Mock(operation=operation),
+                    mock.Mock(),
+                    mock.Mock(),
+                    prebinding,
+                )
+        finally:
+            MIRROR_MODULE._close_control_bindings_best_effort(
+                (prebinding.parent, prebinding.home)
+            )
+
+    def test_generator_adoption_revalidations_share_operation_budget(self) -> None:
+        plan_path, plan = self._plan("shared-operation-budget.json")
+        MIRROR_MODULE.execute_private_control_recovery(
+            MIRROR_MODULE.PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            plan_path,
+        )
+        inventory = plan["inventory"]
+        self.assertIsInstance(inventory, dict)
+        entries = inventory["entries"]
+        self.assertIsInstance(entries, list)
+        scan_name_bytes = sum(
+            len(os.fsencode(PurePosixPath(entry["locator"]["path"]).name))
+            for entry in entries
+        )
+        manifest_read_bytes = 2 * inventory["logical_bytes"]
+        operation = MIRROR_MODULE.OperationBudget(
+            deadline=time.monotonic() + 60,
+            remaining_bytes=scan_name_bytes + manifest_read_bytes,
+            remaining_entries=inventory["entry_count"],
+        )
+        prebinding = MIRROR_MODULE._prebind_existing_primary_private_control_root(
+            self.root_specs[0]
+        )
+        receipts = ()
+        try:
+            with mock.patch.object(
+                MIRROR_MODULE,
+                "_validate_private_control_root_topology",
+            ):
+                states, receipts = (
+                    MIRROR_MODULE._preflight_legacy_private_control_roots_once(
+                        mock.Mock(operation=operation),
+                        mock.Mock(),
+                        mock.Mock(),
+                        prebinding,
+                    )
+                )
+            self.assertEqual(states, ("adopted-retained-in-place",))
+            self.assertEqual(operation.remaining_bytes, 0)
+            self.assertEqual(operation.remaining_entries, 0)
+            with self.assertRaisesRegex(
+                MIRROR_MODULE.MirrorSyncError,
+                "mirror operation exceeds.*aggregate budget",
+            ):
+                MIRROR_MODULE._revalidate_legacy_private_control_receipts(
+                    receipts,
+                    operation=operation,
+                )
         finally:
             if receipts:
                 MIRROR_MODULE._release_legacy_private_control_receipts(receipts)
