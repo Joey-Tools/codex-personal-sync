@@ -11364,6 +11364,231 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
             ENGINE_MODULE.SyncError,
         )
 
+    def test_recovery_leaf_fifo_swap_is_nonblocking_and_fail_closed(self) -> None:
+        nonblocking_flag = getattr(os, "O_NONBLOCK", 0)
+        nofollow_flag = getattr(os, "O_NOFOLLOW", 0)
+        self.assertNotEqual(nonblocking_flag, 0)
+
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            with self.subTest(module=module.__name__):
+                (
+                    _primary_spec,
+                    root_id,
+                    receipt_name,
+                    _marker_name,
+                    error_type,
+                ) = self._recovery_module_contract(module)
+
+                def assert_fifo_swap_rejected(
+                    target_path: Path,
+                    replacement_mode: int,
+                    invoke: object,
+                    error_pattern: str,
+                ) -> None:
+                    real_open = os.open
+                    injected = False
+
+                    def replace_after_stat(
+                        path: object,
+                        flags: int,
+                        mode: int = 0o777,
+                        *,
+                        dir_fd: int | None = None,
+                    ) -> int:
+                        nonlocal injected
+                        if (
+                            not injected
+                            and dir_fd is not None
+                            and path == target_path.name
+                        ):
+                            target_path.unlink()
+                            os.mkfifo(target_path, replacement_mode)
+                            target_path.chmod(replacement_mode)
+                            injected = True
+                            if flags & nonblocking_flag != nonblocking_flag:
+                                raise AssertionError(
+                                    "test refused a potentially blocking FIFO open"
+                                )
+                            if (
+                                nofollow_flag
+                                and flags & nofollow_flag != nofollow_flag
+                            ):
+                                raise AssertionError(
+                                    "recovery FIFO open omitted O_NOFOLLOW"
+                                )
+                        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+                    with mock.patch.object(
+                        module.os,
+                        "open",
+                        side_effect=replace_after_stat,
+                    ):
+                        with self.assertRaisesRegex(error_type, error_pattern):
+                            invoke()
+                    self.assertTrue(injected)
+
+                with self._recovery_module_scope(module):
+                    plan_path = self.root / f"{module.__name__}-fifo-plan.json"
+                    module.plan_private_control_recovery(root_id, plan_path)
+                    assert_fifo_swap_rejected(
+                        plan_path,
+                        0o600,
+                        lambda: module._pc_recovery_read_external_plan(
+                            plan_path,
+                            root_id,
+                        ),
+                        "changed while binding",
+                    )
+
+                for role, payload_limit in (
+                    ("evidence", None),
+                    (
+                        "owner",
+                        (
+                            module.MAX_PRIVATE_OWNER_RECORD_BYTES
+                            if module is MIRROR_MODULE
+                            else module.MAX_MIRROR_PRIVATE_OWNER_RECORD_BYTES
+                        ),
+                    ),
+                ):
+                    leaf_parent = self.root / f"{module.__name__}-{role}-parent"
+                    leaf_parent.mkdir(mode=0o700)
+                    leaf_name = (
+                        "sync-canonical-git-control.1234."
+                        "0123456789abcdef0123456789abcdef.owner.json"
+                        if role == "owner"
+                        else "evidence.bin"
+                    )
+                    leaf_path = leaf_parent / leaf_name
+                    leaf_path.write_bytes(b"{}\n")
+                    leaf_path.chmod(0o600)
+                    leaf_metadata = os.stat(leaf_path, follow_symlinks=False)
+                    parent_fd = os.open(
+                        leaf_parent,
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                    )
+                    try:
+                        assert_fifo_swap_rejected(
+                            leaf_path,
+                            0o600,
+                            lambda: module._pc_recovery_read_file(
+                                parent_fd,
+                                leaf_name,
+                                leaf_path,
+                                leaf_metadata,
+                                deadline=time.monotonic() + 5,
+                                payload_limit=payload_limit,
+                            ),
+                            "changed while binding",
+                        )
+                    finally:
+                        os.close(parent_fd)
+
+                receipt_parent_path = (
+                    self.root / f"{module.__name__}-receipt-parent"
+                )
+                receipt_parent_path.mkdir(mode=0o700)
+                receipt_path = receipt_parent_path / receipt_name
+                receipt_path.write_bytes(b"{}\n")
+                receipt_path.chmod(0o400)
+                receipt_parent = module._pc_recovery_bind_directory(
+                    receipt_parent_path,
+                    "recovery receipt parent",
+                )
+                try:
+                    assert_fifo_swap_rejected(
+                        receipt_path,
+                        0o400,
+                        lambda: module._pc_recovery_read_bound_file(
+                            receipt_parent,
+                            receipt_name,
+                            "primary recovery receipt",
+                        ),
+                        "identity/access policy is invalid",
+                    )
+                finally:
+                    module._pc_recovery_close_bindings((receipt_parent,))
+
+    def test_recovery_json_limits_match_generator_and_runtime(self) -> None:
+        self.assertEqual(
+            MIRROR_MODULE.MAX_JSON_INTEGER_DIGITS,
+            ENGINE_MODULE.MAX_JSON_INTEGER_DIGITS,
+        )
+        owner_name = (
+            "sync-canonical-git-control.1234."
+            "0123456789abcdef0123456789abcdef.owner.json"
+        )
+        scenarios = (
+            (
+                "oversized-integer",
+                "9" * 65,
+                "JSON integer exceeds 64 digits",
+            ),
+            (
+                "nan",
+                "NaN",
+                "non-standard JSON constant is not allowed: NaN",
+            ),
+            (
+                "positive-infinity",
+                "Infinity",
+                "non-standard JSON constant is not allowed: Infinity",
+            ),
+            (
+                "negative-infinity",
+                "-Infinity",
+                "non-standard JSON constant is not allowed: -Infinity",
+            ),
+        )
+
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            (
+                _primary_spec,
+                root_id,
+                _receipt_name,
+                _marker_name,
+                error_type,
+            ) = self._recovery_module_contract(module)
+            with (
+                self.subTest(module=module.__name__),
+                self._recovery_module_scope(module),
+                mock.patch.object(module, "MAX_JSON_INTEGER_DIGITS", 64),
+            ):
+                for scenario_name, raw_value, expected_error in scenarios:
+                    payload = f'{{"value":{raw_value}}}'.encode("ascii")
+                    for loader in ("owner", "plan", "receipt"):
+                        with self.subTest(
+                            module=module.__name__,
+                            scenario=scenario_name,
+                            loader=loader,
+                        ):
+                            with self.assertRaisesRegex(
+                                error_type,
+                                re.escape(expected_error),
+                            ):
+                                if loader == "owner":
+                                    module._pc_recovery_decode_owner(
+                                        owner_name,
+                                        payload,
+                                        (0o600, os.geteuid(), os.getegid()),
+                                    )
+                                elif loader == "plan":
+                                    plan_path = (
+                                        self.root
+                                        / f"{module.__name__}-{scenario_name}.json"
+                                    )
+                                    plan_path.write_bytes(payload)
+                                    plan_path.chmod(0o600)
+                                    module._pc_recovery_read_external_plan(
+                                        plan_path,
+                                        root_id,
+                                    )
+                                else:
+                                    module._pc_recovery_load_json(
+                                        payload,
+                                        "primary recovery receipt",
+                                    )
+
     def test_deterministic_plan_and_execute_preserve_exact_legacy_evidence(
         self,
     ) -> None:

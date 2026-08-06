@@ -39,6 +39,7 @@ SYNC_HISTORY_RECEIPT_VERSION = 2
 GENERATOR_CONTRACT_VERSION = 2
 RULES_CONTRACT_VERSION = 1
 HASH_ALGORITHM = "sha256"
+MAX_JSON_INTEGER_DIGITS = 4300
 GIT_EXECUTABLE = Path("/usr/bin/git")
 MACOS_GIT_LOCATOR_EXECUTABLE = Path("/usr/bin/xcrun")
 MACOS_GIT_LOCATOR_TEMP_DIRECTORY = Path("/private/tmp")
@@ -301,7 +302,10 @@ _DIRECTORY_FLAGS = (
     | getattr(os, "O_NOFOLLOW", 0)
 )
 _FILE_READ_FLAGS = (
-    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
 )
 _FILE_WRITE_FLAGS = (
     os.O_WRONLY
@@ -321,6 +325,17 @@ _FILE_READ_WRITE_FLAGS = (
 
 class MirrorSyncError(RuntimeError):
     pass
+
+
+def _bounded_json_integer(raw_value: str) -> int:
+    digits = raw_value[1:] if raw_value.startswith("-") else raw_value
+    if len(digits) > MAX_JSON_INTEGER_DIGITS:
+        raise ValueError(f"JSON integer exceeds {MAX_JSON_INTEGER_DIGITS} digits")
+    return int(raw_value)
+
+
+def _reject_json_constant(raw_value: str) -> NoReturn:
+    raise ValueError(f"non-standard JSON constant is not allowed: {raw_value}")
 
 
 class _PrivateControlRecoveryInitialAbsence(MirrorSyncError):
@@ -742,6 +757,8 @@ def _pc_recovery_decode_owner(
         record = json.loads(
             payload.decode("utf-8"),
             object_pairs_hook=_pc_recovery_owner_pairs,
+            parse_int=_bounded_json_integer,
+            parse_constant=_reject_json_constant,
         )
     except (
         UnicodeDecodeError,
@@ -1772,6 +1789,8 @@ def _pc_recovery_read_external_plan(
         raw = json.loads(
             first.decode("utf-8"),
             object_pairs_hook=_pc_recovery_owner_pairs,
+            parse_int=_bounded_json_integer,
+            parse_constant=_reject_json_constant,
         )
     except (
         UnicodeDecodeError,
@@ -2275,6 +2294,8 @@ def _pc_recovery_load_json(payload: bytes, label: str) -> dict[str, object]:
         raw = json.loads(
             payload.decode("utf-8"),
             object_pairs_hook=_pc_recovery_owner_pairs,
+            parse_int=_bounded_json_integer,
+            parse_constant=_reject_json_constant,
         )
     except (
         UnicodeDecodeError,
