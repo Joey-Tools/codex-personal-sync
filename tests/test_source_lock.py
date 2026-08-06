@@ -12236,6 +12236,55 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
                     else "_rename_noreplace_at"
                 )
 
+                post_mkdir_digest = "1" * 64
+                post_mkdir_staging = self.account_home / (
+                    f".private-control-recovery-parent-{post_mkdir_digest}"
+                )
+                home_identity = module._pc_recovery_identity(
+                    os.stat(self.account_home, follow_symlinks=False)
+                )
+                real_fsync = os.fsync
+                real_fstat = os.fstat
+                fsync_calls = 0
+                fsync_injected = False
+
+                def fail_first_post_mkdir_fsync(file_fd: int) -> None:
+                    nonlocal fsync_calls, fsync_injected
+                    fsync_calls += 1
+                    if (
+                        not fsync_injected
+                        and module._pc_recovery_identity(real_fstat(file_fd))
+                        == home_identity
+                        and post_mkdir_staging.is_dir()
+                        and not self.primary_parent.exists()
+                    ):
+                        fsync_injected = True
+                        raise OSError(
+                            errno.EIO,
+                            "simulated post-mkdir durability failure",
+                        )
+                    real_fsync(file_fd)
+
+                with mock.patch.object(
+                    module.os,
+                    "fsync",
+                    side_effect=fail_first_post_mkdir_fsync,
+                ):
+                    with self.assertRaisesRegex(
+                        error_type,
+                        "cannot stage primary private-control parent: .*"
+                        "post-mkdir durability failure",
+                    ):
+                        module._pc_recovery_open_or_create_primary_parent(
+                            primary_spec,
+                            post_mkdir_digest,
+                            allow_create=True,
+                        )
+                self.assertTrue(fsync_injected)
+                self.assertEqual(fsync_calls, 2)
+                self.assertFalse(post_mkdir_staging.exists())
+                self.assertFalse(self.primary_parent.exists())
+
                 for digit in ("2", "3"):
                     plan_digest = digit * 64
                     staging = self.account_home / (

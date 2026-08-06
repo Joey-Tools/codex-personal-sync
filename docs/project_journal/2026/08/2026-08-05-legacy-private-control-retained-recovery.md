@@ -188,3 +188,29 @@ superseded_by:
   双 runtime `py_compile`、Ruff 0.16.1 E4/E7/E9/F、JSON parsing、project-
   journal validation 与 `git diff --check` 通过；一条独立只读 repair sanity
   check 未发现 actionable finding。
+- 上述 repair 形成签名 checkpoint
+  `b34445a3597c19b3081def2048fc9b06f01330ba`，tree
+  `eaa0abcdc27e9b9a0a74524419ce4566ac3f6b37`。其唯一 prior-b4ca
+  fresh-context named single 返回一项 P2：digest-named primary-parent staging
+  在 `mkdir` 成功、随后 containing-home `fsync` 失败时尚未绑定
+  descriptor，空目录会被遗留；证据变化产生新 digest 后，重复失败可无界累积
+  account-home inode。该 lane 未启动 Claude，也未读取凭据。
+- Final repair 在 generator 与 standalone runtime 中保持对称：只记录本次调用
+  是否实际创建 staging，`mkdir` 返回后立即以 trusted-home descriptor 绑定 exact
+  `(st_dev, st_ino, type)` 与 `(mode, uid, gid)`，再执行 containing-home
+  durability `fsync`。若该 `fsync` 失败，只对本次创建且仍绑定 held descriptor、
+  current-UID mode-`0700`、双次证明为空的 exact object 执行 parent-anchored
+  `rmdir`，随后 fsync/revalidate home；pre-existing、replacement、nonempty、
+  unreadable 或 cleanup durability uncertainty 均保留并 secondary-fail。
+- 精确 post-mkdir `fsync` fault injection 在两个 runtime 下各通过 1/1，完整
+  `PrivateControlRetainedRecoveryTests` 各通过 48/48。Repository private-
+  `TMPDIR` wrapper 下完整 `tests.test_source_lock` 通过 279/279 in 566.160s
+  （1 expected skip），完整 repository discovery 通过 1,140/1,140 in
+  810.288s（3 expected skips）。未修改 stock `refresh-lock` 与
+  `refresh-lock --check` 各验证 6 sources；locked engine SHA-256 为
+  `12164e7ed9de0f6f6f2d5a3f4859653736cb849a82bb69bc77669856c86d92c8`，
+  `sync-source-lock.json` SHA-256 为
+  `0018191ae5e25c7ab1d78f99051a90a7129b18e08c6a15d4ce866868fc04f837`。
+  双 runtime `py_compile`、Ruff 0.16.1 E4/E7/E9/F、JSON parsing 与
+  `git diff --check` 已通过；superseding signed checkpoint 与该 exact head 的
+  fresh named single 尚待完成，因此不作 final review-clean claim。

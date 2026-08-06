@@ -1987,6 +1987,36 @@ superseded_by:
   Both runtimes passed `py_compile`; Ruff 0.16.1 E4/E7/E9/F, JSON parsing,
   project-journal validation, and `git diff --check` passed. An independent
   read-only repair sanity check reported no actionable finding.
+- Signed checkpoint `b34445a3597c19b3081def2048fc9b06f01330ba`, tree
+  `eaa0abcdc27e9b9a0a74524419ce4566ac3f6b37`, carried that repair. Its sole
+  prior-b4ca fresh-context named single returned one P2: when digest-named
+  primary-parent staging was created and the immediately following containing-
+  home `fsync` failed, the staging object had not yet been descriptor-bound.
+  The empty directory was retained, and changing evidence could select a new
+  digest on every retry and accumulate account-home inodes without bound. The
+  lane did not launch Claude or read credentials.
+- The final repair is symmetric in the generator and standalone runtime. It
+  records whether the current invocation created staging, binds exact object
+  identity and access policy through the trusted-home descriptor immediately
+  after `mkdir`, and only then performs the containing-home durability
+  `fsync`. On failure, only a current-attempt object still bound to the held
+  descriptor, current-UID mode `0700`, and proven empty twice is removed with
+  parent-anchored `rmdir`, followed by home fsync/revalidation. Pre-existing,
+  replacement, nonempty, unreadable, or cleanup-durability-uncertain state is
+  retained and secondary-fails.
+- The exact post-mkdir `fsync` fault injection passed 1/1 and complete
+  `PrivateControlRetainedRecoveryTests` passed 48/48 under both runtimes. The
+  private-`TMPDIR` source-lock suite passed 279/279 in 566.160 seconds with one
+  expected skip; full repository discovery passed 1,140/1,140 in 810.288
+  seconds with three expected skips. Unmodified stock `refresh-lock` and
+  `refresh-lock --check` each verified all six sources. The locked engine
+  SHA-256 is
+  `12164e7ed9de0f6f6f2d5a3f4859653736cb849a82bb69bc77669856c86d92c8`, and
+  the refreshed `sync-source-lock.json` SHA-256 is
+  `0018191ae5e25c7ab1d78f99051a90a7129b18e08c6a15d4ce866868fc04f837`.
+  Both runtimes passed `py_compile`; Ruff 0.16.1 E4/E7/E9/F, JSON parsing, and
+  `git diff --check` passed. A superseding signed checkpoint and its fresh
+  current-head named single remain outstanding.
 
 ## Installed Host Baseline
 

@@ -2737,20 +2737,41 @@ def _pc_recovery_open_or_create_primary_parent(
                 raise SyncError(
                     "primary private-control parent disappeared after initial binding"
                 )
+            created_temporary = False
             try:
                 os.mkdir(temporary_name, 0o700, dir_fd=home.fd)
-                os.fsync(home.fd)
             except FileExistsError:
                 pass
             except OSError as error:
                 raise SyncError(
                     f"cannot stage primary private-control parent: {error}"
                 ) from error
+            else:
+                created_temporary = True
             temporary = _pc_recovery_bind_child_directory(
                 home,
                 temporary_name,
                 "staged primary private-control parent",
             )
+            if created_temporary:
+                try:
+                    os.fsync(home.fd)
+                except OSError as error:
+                    try:
+                        _pc_recovery_remove_empty_staged_primary_parent(
+                            home,
+                            temporary,
+                            temporary_name,
+                        )
+                    except SyncError as cleanup_error:
+                        raise SyncError(
+                            "cannot stage primary private-control parent: "
+                            f"{error}; secondary staged primary-parent cleanup "
+                            f"failure: {cleanup_error}"
+                        ) from error
+                    raise SyncError(
+                        f"cannot stage primary private-control parent: {error}"
+                    ) from error
             if temporary.access[0] != 0o700 or temporary.access[1] != os.geteuid():
                 raise SyncError(
                     "staged primary private-control parent policy is invalid"
