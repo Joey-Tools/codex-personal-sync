@@ -11790,6 +11790,95 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
                     ).exists()
                 )
 
+    def test_primary_parent_appearance_after_initial_absence_is_not_adopted(
+        self,
+    ) -> None:
+        def identity_and_access(path: Path) -> tuple[int, int, int, int, int, int]:
+            metadata = os.stat(path, follow_symlinks=False)
+            return (
+                metadata.st_dev,
+                metadata.st_ino,
+                stat.S_IFMT(metadata.st_mode),
+                stat.S_IMODE(metadata.st_mode),
+                metadata.st_uid,
+                metadata.st_gid,
+            )
+
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            with self.subTest(module=module.__name__):
+                if self.primary_parent.exists():
+                    shutil.rmtree(self.primary_parent)
+                (
+                    _primary_spec,
+                    root_id,
+                    receipt_name,
+                    marker_name,
+                    error_type,
+                ) = self._recovery_module_contract(module)
+                plan_path = self.root / f"{module.__name__}-appearance-plan.json"
+                sentinel_name = "competing-namespace-sentinel"
+                sentinel_payload = f"{module.__name__} competing namespace\n".encode()
+                real_manifest = module._pc_recovery_manifest
+                injected = False
+                parent_record: tuple[int, int, int, int, int, int] | None = None
+                sentinel_record: tuple[int, int, int, int, int, int] | None = None
+
+                def create_competing_namespace(
+                    parent: object,
+                    tool: object,
+                    quarantine: object,
+                ) -> dict[str, object]:
+                    nonlocal injected, parent_record, sentinel_record
+                    inventory = real_manifest(parent, tool, quarantine)
+                    if not injected:
+                        self.primary_parent.mkdir(mode=0o700)
+                        sentinel_path = self.primary_parent / sentinel_name
+                        sentinel_path.write_bytes(sentinel_payload)
+                        sentinel_path.chmod(0o600)
+                        parent_record = identity_and_access(self.primary_parent)
+                        sentinel_record = identity_and_access(sentinel_path)
+                        injected = True
+                    return inventory
+
+                with self._recovery_module_scope(module):
+                    module.plan_private_control_recovery(root_id, plan_path)
+                    self.assertFalse(self.primary_parent.exists())
+                    with (
+                        mock.patch.object(
+                            module,
+                            "_pc_recovery_manifest",
+                            side_effect=create_competing_namespace,
+                        ),
+                        self.assertRaisesRegex(
+                            error_type,
+                            "appeared after initial absence",
+                        ),
+                    ):
+                        module.execute_private_control_recovery(root_id, plan_path)
+
+                self.assertTrue(injected)
+                self.assertIsNotNone(parent_record)
+                self.assertIsNotNone(sentinel_record)
+                self.assertEqual(
+                    identity_and_access(self.primary_parent),
+                    parent_record,
+                )
+                sentinel_path = self.primary_parent / sentinel_name
+                self.assertEqual(identity_and_access(sentinel_path), sentinel_record)
+                self.assertEqual(sentinel_path.read_bytes(), sentinel_payload)
+                self.assertEqual(
+                    sorted(path.name for path in self.primary_parent.iterdir()),
+                    [sentinel_name],
+                )
+                self.assertFalse((self.primary_parent / receipt_name).exists())
+                self.assertFalse((self.primary_parent / marker_name).exists())
+                self.assertFalse(
+                    any(
+                        path.name.startswith(".private-control-recovery-parent-")
+                        for path in self.account_home.iterdir()
+                    )
+                )
+
     def test_previously_bound_primary_parent_cannot_be_recreated(self) -> None:
         for module in (MIRROR_MODULE, ENGINE_MODULE):
             with self.subTest(module=module.__name__):

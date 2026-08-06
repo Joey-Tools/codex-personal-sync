@@ -2182,6 +2182,11 @@ def _pc_recovery_open_or_create_primary_parent(
             temporary.label = f"primary private-control parent [{primary_spec.root_id}]"
             parent = temporary
             temporary = None
+        else:
+            if allow_create:
+                raise SyncError(
+                    "primary private-control parent appeared after initial absence"
+                )
         if parent.access[0] != 0o700 or parent.access[1] != os.geteuid():
             raise SyncError(
                 "primary private-control parent must be mode 0700 and current uid owned"
