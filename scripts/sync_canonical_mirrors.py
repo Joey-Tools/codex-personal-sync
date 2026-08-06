@@ -3032,7 +3032,7 @@ def _pc_recovery_publish_document(
         if pending_binding is None:
             (
                 pending_name,
-                _pending_logical_bytes,
+                pending_logical_bytes,
                 reusable,
             ) = _pc_recovery_select_pending_publication(parent, pending_name)
             identity: tuple[int, int, int] | None = None
@@ -3070,6 +3070,17 @@ def _pc_recovery_publish_document(
                 if len(payload) > PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
                     raise MirrorSyncError(
                         f"reused pending {label} exceeds its byte cap"
+                    )
+                projected_logical_bytes = (
+                    pending_logical_bytes - reusable[2] + len(payload)
+                )
+                if projected_logical_bytes > max(
+                    PRIVATE_CONTROL_RECOVERY_MAX_PENDING_BYTES,
+                    pending_logical_bytes,
+                ):
+                    raise MirrorSyncError(
+                        "pending recovery publication aggregate-byte cap "
+                        "would be exceeded"
                     )
                 custody = _pc_recovery_open_pending_publication_for_reuse(
                     parent,

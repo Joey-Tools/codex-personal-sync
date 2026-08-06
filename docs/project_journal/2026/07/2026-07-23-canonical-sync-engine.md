@@ -3,7 +3,7 @@ id: 20260723-canonical-sync-engine
 title: Canonical Sync Engine
 status: active
 created: 2026-07-23
-updated: 2026-08-05
+updated: 2026-08-06
 branch: codex/canonical-sync-engine
 pr:
 supersedes: []
@@ -30,6 +30,14 @@ superseded_by:
   `cfc050e042dffd5727d8b9904adfaacbebb6c06455a03394b33f4eda1260d765`.
   These pre-squash identities remain historical evidence only. Downstream
   generation must bind the actual squash-landed canonical `P` identity.
+- The retained private-control recovery follow-up is anchored by signed
+  checkpoint `b341d32d707b6ae22e83ce3c7201dee09456236c`, tree
+  `fa696e861130c33ffd87d1abe16e984aa4609923`. Its formal fresh-context named
+  single found one P2 in reusable pending-publication aggregate accounting.
+  The symmetric generator/runtime repair now rejects projected retained-byte
+  growth before any effectful reuse open. These pre-squash identities remain
+  historical evidence only; downstream handoff begins from the actual
+  squash-landed canonical `P`.
 
 ## Scope
 
@@ -1850,6 +1858,38 @@ superseded_by:
   `legacy-recovery-pending` boundary, and no retained evidence was deleted,
   moved, or rewritten. The refreshed `sync-source-lock.json` SHA-256 is
   `129b8feb00f8d1a497eb2b5a0276009bc04350e0665bf627e76fe10ee3eb620c`.
+- Signed checkpoint `b341d32d707b6ae22e83ce3c7201dee09456236c`,
+  tree `fa696e861130c33ffd87d1abe16e984aa4609923`, completed the fixed-document
+  operation-budget accounting repair. Its formal prior-b4ca fresh-context
+  named single returned one P2: reuse of an existing small pending publication
+  could replace that file with a larger payload without accounting the
+  projected aggregate retained bytes, allowing a failed publication to leave
+  the pending inventory above its aggregate cap.
+- The superseding repair is intentionally symmetric in
+  `scripts/sync_canonical_mirrors.py` and `scripts/codex_personal_sync.py`.
+  After constructing the reusable payload and enforcing its single-file cap,
+  both implementations compute the projected aggregate as the current pending
+  logical bytes minus the reusable file's old size plus the new payload size.
+  They reject an over-cap projection before the effectful reuse open. An
+  inventory within the configured cap therefore cannot cross it; a historical
+  pre-cap inventory already above the cap may only remain unchanged or shrink.
+  Exact-cap reuse remains admissible, and an injected publication failure
+  retains no more than that exact cap.
+- The new projected-growth regression passed 1/1 under uv Python 3.13.0 and
+  macOS system Python 3.9.6. The three-test pending-publication matrix passed
+  3/3 under both runtimes, and complete
+  `PrivateControlRetainedRecoveryTests` passed 43/43 under both runtimes. The
+  first complete repository run exercised 1,135 tests and stopped only on the
+  expected stale source-lock precondition after the engine bytes changed.
+  Task-private stock `refresh-lock` and `refresh-lock --check` then refreshed
+  and verified all six sources; the exact lock-current regression passed 1/1,
+  and the final complete repository suite passed 1,135/1,135 in 860.248
+  seconds with three expected skips. The refreshed `sync-source-lock.json`
+  SHA-256 is
+  `875b37794a2d0233b28d0d8df8d0acd0fa547a19f77b7d254b7a0cf289d94308`.
+  The final signed pre-squash identity remains historical evidence only;
+  downstream generation and deployment are handed off only after the actual
+  squash-landed canonical commit is frozen as `P`.
 
 ## Installed Host Baseline
 

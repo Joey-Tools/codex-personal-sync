@@ -12772,6 +12772,201 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
                     self.assertEqual(executed["status"], "executed")
                     self.assertEqual(pending_names(), ())
 
+    def test_reused_pending_growth_is_accounted_before_mutation(self) -> None:
+        padding = "x" * 4096
+
+        def document_builder(identity):
+            return {
+                "identity": list(identity),
+                "padding": padding,
+            }
+
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            with self.subTest(module=module.__name__):
+                if self.primary_parent.exists():
+                    shutil.rmtree(self.primary_parent)
+                self.primary_parent.mkdir(mode=0o700)
+                (
+                    _primary_spec,
+                    _root_id,
+                    receipt_name,
+                    marker_name,
+                    error_type,
+                ) = self._recovery_module_contract(module)
+                entry_cap_name = (
+                    "PRIVATE_CONTROL_RECOVERY_MAX_PENDING_ENTRIES"
+                    if module is MIRROR_MODULE
+                    else "MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_ENTRIES"
+                )
+                byte_cap_name = (
+                    "PRIVATE_CONTROL_RECOVERY_MAX_PENDING_BYTES"
+                    if module is MIRROR_MODULE
+                    else "MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_BYTES"
+                )
+                receipt_cap_name = (
+                    "PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES"
+                    if module is MIRROR_MODULE
+                    else "MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES"
+                )
+                receipt_cap = 1024 * 1024
+                byte_cap = 2 * receipt_cap
+                plan_digest = "a" * 64
+                receipt_prefix = f".{receipt_name}.pending-"
+                marker_prefix = f".{marker_name}.pending-"
+                reusable_path = self.primary_parent / (
+                    f"{receipt_prefix}{plan_digest}-{'b' * 32}"
+                )
+                other_paths = (
+                    self.primary_parent
+                    / f"{receipt_prefix}{'c' * 64}-{'d' * 32}",
+                    self.primary_parent
+                    / f"{marker_prefix}{'e' * 64}-{'f' * 32}",
+                )
+                reusable_path.write_bytes(b"x")
+                reusable_path.chmod(0o600)
+                other_size = (byte_cap - 1) // 2
+                for path in other_paths:
+                    path.write_bytes(b"y" * other_size)
+                    path.chmod(0o600)
+                requested_name = (
+                    f"{receipt_prefix}{plan_digest}-{'0' * 32}"
+                )
+                before = tuple(
+                    (
+                        path.name,
+                        path.read_bytes(),
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for path in (reusable_path, *other_paths)
+                )
+                self.assertLessEqual(
+                    sum(len(record[1]) for record in before),
+                    byte_cap,
+                )
+
+                parent = None
+                with (
+                    self._recovery_module_scope(module),
+                    mock.patch.object(module, entry_cap_name, 2),
+                    mock.patch.object(module, byte_cap_name, byte_cap),
+                    mock.patch.object(module, receipt_cap_name, receipt_cap),
+                    mock.patch.object(
+                        module,
+                        "_pc_recovery_open_pending_publication_for_reuse",
+                        side_effect=AssertionError(
+                            "over-cap reuse reached effectful open"
+                        ),
+                    ) as open_reuse,
+                ):
+                    parent = module._pc_recovery_bind_directory(
+                        self.primary_parent,
+                        "test pending publication parent",
+                    )
+                    module._pc_recovery_acquire_exclusive(parent)
+                    try:
+                        with self.assertRaisesRegex(
+                            error_type,
+                            "aggregate-byte cap",
+                        ):
+                            module._pc_recovery_publish_document(
+                                parent,
+                                receipt_name,
+                                requested_name,
+                                "primary recovery receipt",
+                                document_builder,
+                            )
+                        open_reuse.assert_not_called()
+                    finally:
+                        module._pc_recovery_close_bindings((parent,))
+                after = tuple(
+                    (
+                        path.name,
+                        path.read_bytes(),
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for path in (reusable_path, *other_paths)
+                )
+                self.assertEqual(after, before)
+
+                shutil.rmtree(self.primary_parent)
+                self.primary_parent.mkdir(mode=0o700)
+                receipt_cap = 1024 * 1024
+                byte_cap = receipt_cap
+                reusable_path = self.primary_parent / (
+                    f"{receipt_prefix}{plan_digest}-{'b' * 32}"
+                )
+                reusable_path.write_bytes(b"x")
+                reusable_path.chmod(0o600)
+                reusable_metadata = reusable_path.stat()
+                reusable_identity = (
+                    reusable_metadata.st_dev,
+                    reusable_metadata.st_ino,
+                    stat.S_IFMT(reusable_metadata.st_mode),
+                )
+                payload = module._pc_recovery_json_bytes(
+                    document_builder(reusable_identity),
+                    pretty=True,
+                )
+                other_path = self.primary_parent / (
+                    f"{marker_prefix}{'e' * 64}-{'f' * 32}"
+                )
+                other_path.write_bytes(b"y" * (byte_cap - len(payload)))
+                other_path.chmod(0o600)
+                parent = None
+                real_fsync = os.fsync
+                injected = False
+
+                def fail_pending_fsync(file_fd: int) -> None:
+                    nonlocal injected
+                    metadata = os.fstat(file_fd)
+                    if stat.S_ISREG(metadata.st_mode) and not injected:
+                        injected = True
+                        raise OSError(
+                            errno.EIO,
+                            "simulated pending publication failure",
+                        )
+                    real_fsync(file_fd)
+
+                with (
+                    self._recovery_module_scope(module),
+                    mock.patch.object(module, entry_cap_name, 2),
+                    mock.patch.object(module, byte_cap_name, byte_cap),
+                    mock.patch.object(module, receipt_cap_name, receipt_cap),
+                    mock.patch.object(
+                        module.os,
+                        "fsync",
+                        side_effect=fail_pending_fsync,
+                    ),
+                ):
+                    parent = module._pc_recovery_bind_directory(
+                        self.primary_parent,
+                        "test pending publication parent",
+                    )
+                    module._pc_recovery_acquire_exclusive(parent)
+                    try:
+                        with self.assertRaisesRegex(
+                            error_type,
+                            "cannot write pending primary recovery receipt",
+                        ):
+                            module._pc_recovery_publish_document(
+                                parent,
+                                receipt_name,
+                                requested_name,
+                                "primary recovery receipt",
+                                document_builder,
+                            )
+                    finally:
+                        module._pc_recovery_close_bindings((parent,))
+                self.assertTrue(injected)
+                self.assertEqual(reusable_path.read_bytes(), payload)
+                self.assertEqual(
+                    sum(
+                        path.stat().st_size
+                        for path in (reusable_path, other_path)
+                    ),
+                    byte_cap,
+                )
+
     def test_pending_writer_close_uncertainty_retains_transaction_fence(
         self,
     ) -> None:
