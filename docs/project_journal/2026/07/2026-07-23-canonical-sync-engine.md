@@ -30,12 +30,14 @@ superseded_by:
   `cfc050e042dffd5727d8b9904adfaacbebb6c06455a03394b33f4eda1260d765`.
   These pre-squash identities remain historical evidence only. Downstream
   generation must bind the actual squash-landed canonical `P` identity.
-- The retained private-control recovery follow-up is anchored by signed
-  checkpoint `b341d32d707b6ae22e83ce3c7201dee09456236c`, tree
-  `fa696e861130c33ffd87d1abe16e984aa4609923`. Its formal fresh-context named
-  single found one P2 in reusable pending-publication aggregate accounting.
-  The symmetric generator/runtime repair now rejects projected retained-byte
-  growth before any effectful reuse open. These pre-squash identities remain
+- The retained private-control recovery follow-up is most recently reviewed at
+  signed checkpoint `e5e3622aeb10cede21c18b328024c1bc0f3fa0e7`, tree
+  `3e83c91267d25946348655d42c305542b59c48fc`. Its formal prior-b4ca
+  fresh-context named single found one P2: a plan could fit the 64-MiB plan cap
+  while its nested pretty primary receipt exceeded the same cap only after
+  primary-parent and pending-inode publication began. The symmetric
+  generator/runtime repair now rejects the worst-case complete receipt before
+  publishing or consuming a plan. These pre-squash identities remain
   historical evidence only; downstream handoff begins from the actual
   squash-landed canonical `P`.
 
@@ -1890,6 +1892,41 @@ superseded_by:
   The final signed pre-squash identity remains historical evidence only;
   downstream generation and deployment are handed off only after the actual
   squash-landed canonical commit is frozen as `P`.
+- Signed checkpoint `e5e3622aeb10cede21c18b328024c1bc0f3fa0e7`, tree
+  `3e83c91267d25946348655d42c305542b59c48fc`, carried the projected reusable-
+  pending accounting repair. Its formal prior-b4ca fresh-context named single
+  returned one P2: dry-run bounded only the pretty plan, while execute embeds
+  that plan inside a newly pretty-serialized primary receipt. A valid plan
+  near the cap could therefore reach primary-parent creation and pending-file
+  allocation before the larger receipt failed its byte cap.
+- The superseding repair is symmetric in `scripts/sync_canonical_mirrors.py`
+  and `scripts/codex_personal_sync.py`. Both the dry-run writer and external-
+  plan validator stream the complete primary-receipt shape through the exact
+  pretty JSON encoder before any plan, primary-parent, or pending-inode
+  publication. The reservation covers the builder-enforced maximum decimal
+  width of the four late-bound `dev`, `ino`, `uid`, and `gid` integers plus the
+  terminal newline; receipt type remains a regular file and mode remains
+  `0400`. The post-publication exact check remains an independent defense.
+  The protected property is full receipt byte capacity before any persistent
+  recovery effect, not merely plan-byte capacity.
+- The new regression exercises both implementations. It proves rejection one
+  byte below the conservative complete-receipt bound before external-plan
+  parent binding, acceptance at the exact bound, builder rejection above the
+  declared late-bound integer width, and an actual self-consistent plan for
+  which `plan_bytes <= cap < primary_receipt_bytes`. Execute rejects that plan
+  during read/validation; mocks prove neither primary-parent nor pending-
+  receipt publication is reached. The focused regression passed 1/1 and
+  complete `PrivateControlRetainedRecoveryTests` passed 44/44 under uv Python
+  3.13 and macOS system Python 3.9. The canonical source-lock suite passed
+  275/275 in 575.269 seconds with one expected platform skip. Unmodified stock
+  `refresh-lock` and `refresh-lock --check` refreshed and verified all six
+  sources. The refreshed `sync-source-lock.json` SHA-256 is
+  `635d9e7072498ae08eca173c637bcea8f0304a24b6caf53d606075689b27522c`.
+  The final complete repository discovery passed 1,136/1,136 tests in 820.547
+  seconds with three expected skips. Both configured runtimes passed
+  `py_compile`; Ruff 0.16.1 E4/E7/E9/F, JSON parsing, project-journal
+  validation, and `git diff --check` passed. Formal current-head review, CI,
+  and squash-landed tree binding remain outstanding at this checkpoint.
 
 ## Installed Host Baseline
 

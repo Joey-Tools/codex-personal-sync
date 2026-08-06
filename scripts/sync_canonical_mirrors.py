@@ -1783,6 +1783,7 @@ def _pc_recovery_validate_plan_document(
         raise MirrorSyncError(
             "private-control recovery entries are not uniquely sorted"
         )
+    _pc_recovery_validate_primary_receipt_capacity(plan)
     return plan
 
 
@@ -1905,6 +1906,7 @@ def _pc_recovery_write_plan(
     payload = _pc_recovery_json_bytes(plan, pretty=True)
     if len(payload) > PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
         raise MirrorSyncError("private-control recovery plan exceeds its byte cap")
+    _pc_recovery_validate_primary_receipt_capacity(plan)
     parent = _pc_recovery_bind_external_plan_parent(path)
     try:
         _pc_recovery_reject_plan_parent_overlap(parent, protected_bindings)
@@ -3358,6 +3360,26 @@ def _pc_recovery_primary_receipt_document(
     receipt_identity: tuple[int, int, int],
 ) -> dict[str, object]:
     paths = plan["paths"]
+    receipt_uid = os.geteuid()
+    receipt_gid = os.getegid()
+    late_bound_limit = (10**MAX_JSON_INTEGER_DIGITS) - 1
+    if (
+        not isinstance(receipt_identity, tuple)
+        or len(receipt_identity) != 3
+        or receipt_identity[2] != stat.S_IFREG
+        or any(
+            type(value) is not int or value < 0 or value > late_bound_limit
+            for value in (
+                receipt_identity[0],
+                receipt_identity[1],
+                receipt_uid,
+                receipt_gid,
+            )
+        )
+    ):
+        raise MirrorSyncError(
+            "primary recovery receipt late-bound identity is unsupported"
+        )
     return {
         "contract": PRIVATE_CONTROL_RECOVERY_CONTRACT,
         "disposition": PRIVATE_CONTROL_RECOVERY_DISPOSITION,
@@ -3367,7 +3389,7 @@ def _pc_recovery_primary_receipt_document(
             "marker_name": PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
             "receipt": {
                 "access": _pc_recovery_access_document(
-                    (0o400, os.geteuid(), os.getegid())
+                    (0o400, receipt_uid, receipt_gid)
                 ),
                 "identity": _pc_recovery_identity_document(receipt_identity),
                 "name": PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME,
@@ -3377,6 +3399,34 @@ def _pc_recovery_primary_receipt_document(
         "root_id": plan["root_id"],
         "version": PRIVATE_CONTROL_RECOVERY_VERSION,
     }
+
+
+def _pc_recovery_validate_primary_receipt_capacity(
+    plan: dict[str, object],
+) -> None:
+    # The receipt identity and access record are not known until publication.
+    # Reserve the builder-enforced digit bound for dev, ino, uid, and gid so a
+    # plan accepted here fits for every later receipt binding.
+    remaining = (
+        PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
+        - 1
+        - (4 * MAX_JSON_INTEGER_DIGITS)
+    )
+    if remaining < 0:
+        raise MirrorSyncError("primary recovery receipt exceeds its byte cap")
+    document = _pc_recovery_primary_receipt_document(
+        plan,
+        (0, 0, stat.S_IFREG),
+    )
+    encoder = json.JSONEncoder(
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+    for chunk in encoder.iterencode(document):
+        remaining -= len(chunk.encode("utf-8"))
+        if remaining < 0:
+            raise MirrorSyncError("primary recovery receipt exceeds its byte cap")
 
 
 def _pc_recovery_marker_document(

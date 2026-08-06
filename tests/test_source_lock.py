@@ -12772,6 +12772,142 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
                     self.assertEqual(executed["status"], "executed")
                     self.assertEqual(pending_names(), ())
 
+    def test_plan_capacity_includes_primary_receipt_before_publication(self) -> None:
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            with self.subTest(module=module.__name__):
+                if self.primary_parent.exists():
+                    shutil.rmtree(self.primary_parent)
+                (
+                    _primary_spec,
+                    root_id,
+                    _receipt_name,
+                    _marker_name,
+                    error_type,
+                ) = self._recovery_module_contract(module)
+                cap_name = (
+                    "PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES"
+                    if module is MIRROR_MODULE
+                    else "MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES"
+                )
+                seed_path = self.root / f"{module.__name__}-receipt-cap-seed.json"
+                with self._recovery_module_scope(module):
+                    plan = module.plan_private_control_recovery(root_id, seed_path)
+                seed_path.unlink()
+
+                baseline_receipt = module._pc_recovery_json_bytes(
+                    module._pc_recovery_primary_receipt_document(
+                        plan,
+                        (0, 0, stat.S_IFREG),
+                    ),
+                    pretty=True,
+                )
+                receipt_upper_bound = len(baseline_receipt) + (
+                    4 * module.MAX_JSON_INTEGER_DIGITS
+                )
+                plan_payload = module._pc_recovery_json_bytes(plan, pretty=True)
+                self.assertLessEqual(len(plan_payload), receipt_upper_bound - 1)
+                with self.assertRaisesRegex(
+                    error_type,
+                    "late-bound identity is unsupported",
+                ):
+                    module._pc_recovery_primary_receipt_document(
+                        plan,
+                        (10**module.MAX_JSON_INTEGER_DIGITS, 0, stat.S_IFREG),
+                    )
+
+                rejected_path = self.root / (
+                    f"{module.__name__}-receipt-cap-rejected.json"
+                )
+                with (
+                    mock.patch.object(module, cap_name, receipt_upper_bound - 1),
+                    mock.patch.object(
+                        module,
+                        "_pc_recovery_bind_external_plan_parent",
+                        side_effect=AssertionError(
+                            "receipt-cap rejection reached plan publication"
+                        ),
+                    ) as bind_parent,
+                    self.assertRaisesRegex(
+                        error_type,
+                        "primary recovery receipt exceeds its byte cap",
+                    ),
+                ):
+                    module._pc_recovery_write_plan(rejected_path, plan, ())
+                bind_parent.assert_not_called()
+                self.assertFalse(rejected_path.exists())
+                self.assertFalse(self.primary_parent.exists())
+
+                exact_path = self.root / f"{module.__name__}-receipt-cap-exact.json"
+                with mock.patch.object(module, cap_name, receipt_upper_bound):
+                    module._pc_recovery_write_plan(exact_path, plan, ())
+                self.assertEqual(exact_path.read_bytes(), plan_payload)
+                self.assertFalse(self.primary_parent.exists())
+
+                unsafe_plan = json.loads(json.dumps(plan))
+                unsafe_cap = len(baseline_receipt) - 1
+                for _attempt in range(8):
+                    unsafe_plan["caps"]["max_receipt_bytes"] = unsafe_cap
+                    unsafe_plan["plan_digest"] = module._pc_recovery_digest(
+                        module._pc_recovery_protected_plan(unsafe_plan)
+                    )
+                    next_receipt_size = len(
+                        module._pc_recovery_json_bytes(
+                            module._pc_recovery_primary_receipt_document(
+                                unsafe_plan,
+                                (0, 0, stat.S_IFREG),
+                            ),
+                            pretty=True,
+                        )
+                    )
+                    next_cap = next_receipt_size - 1
+                    if next_cap == unsafe_cap:
+                        break
+                    unsafe_cap = next_cap
+                else:
+                    self.fail("primary receipt capacity fixture did not stabilize")
+                unsafe_payload = module._pc_recovery_json_bytes(
+                    unsafe_plan,
+                    pretty=True,
+                )
+                self.assertLessEqual(len(unsafe_payload), unsafe_cap)
+                unsafe_receipt = module._pc_recovery_json_bytes(
+                    module._pc_recovery_primary_receipt_document(
+                        unsafe_plan,
+                        (0, 0, stat.S_IFREG),
+                    ),
+                    pretty=True,
+                )
+                self.assertLess(unsafe_cap, len(unsafe_receipt))
+                unsafe_path = self.root / f"{module.__name__}-receipt-cap-unsafe.json"
+                unsafe_path.write_bytes(unsafe_payload)
+                unsafe_path.chmod(0o600)
+                with (
+                    self._recovery_module_scope(module),
+                    mock.patch.object(module, cap_name, unsafe_cap),
+                    mock.patch.object(
+                        module,
+                        "_pc_recovery_open_or_create_primary_parent",
+                        side_effect=AssertionError(
+                            "unsafe plan reached primary-parent publication"
+                        ),
+                    ) as open_primary,
+                    mock.patch.object(
+                        module,
+                        "_pc_recovery_publish_document",
+                        side_effect=AssertionError(
+                            "unsafe plan reached pending receipt publication"
+                        ),
+                    ) as publish_document,
+                    self.assertRaisesRegex(
+                        error_type,
+                        "primary recovery receipt exceeds its byte cap",
+                    ),
+                ):
+                    module.execute_private_control_recovery(root_id, unsafe_path)
+                open_primary.assert_not_called()
+                publish_document.assert_not_called()
+                self.assertFalse(self.primary_parent.exists())
+
     def test_reused_pending_growth_is_accounted_before_mutation(self) -> None:
         padding = "x" * 4096
 
