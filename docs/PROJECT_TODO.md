@@ -1,4 +1,5 @@
 # Project TODO
 
 - [pending] Generate and validate the declared `toolbox` mirror from the verified [`sync-source-lock.json`](../sync-source-lock.json), publish its receipt-bound immutable release, then update the private overlay from that exact toolbox release without editing generated files directly.
+- [pending-high-risk] After the retained-in-place recovery runtime is released, create and independently review an exact `legacy-shared-v0` dry-run plan before any explicit host execution. Code delivery does not itself adopt the host state, and adoption never authorizes physical purge of retained evidence.
 - [blocked-high-risk] Replace the flat private-control quarantine with a separately reviewed segmented-retention contract before production admission. The design must migrate exchange journals to exact version-3 root/segment/evidence locators, preserve legacy-flat recovery without cross-segment name search, bind immutable receipts, and enforce segment plus global entry/logical/allocated-byte ceilings; do not delete or relocate current retained evidence as an interim fix.

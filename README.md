@@ -27,7 +27,8 @@ consumer hosts. Their shared private-control policy is therefore intentionally
 implemented twice, but it is one contract rather than two ownership sources.
 Machine parity tests bind the ordered root registry, schema fields, platform
 paths, reason codes, ancestor cap, ownership classification, shared-parent
-policy, and primary-allocation scenario matrix. A change to that contract must
+policy, primary-allocation scenario matrix, and retained-recovery document,
+publication, lease, and resource-cap constants. A change to that contract must
 update both implementations and the parity matrix in the same commit; an
 independent one-sided edit is unsupported.
 
@@ -164,6 +165,59 @@ same filesystem. Primary children must not overlap the repository, Git admin,
 or Git common roots, while legacy children additionally must not overlap the
 bound primary home, namespace, tool, or quarantine objects. These gates run
 before stale recovery or owner/private-snapshot mutation.
+
+An explicit retained-in-place recovery is the only exception to the legacy
+evidence allocation block. It is limited to the registered
+`legacy-shared-v0` root and never moves, copies, deletes, rewrites, or purges an
+object in that root. Dry-run holds nonblocking exclusive leases in the normal
+tool-root-to-quarantine order, rejects symlinks, special objects, hard-link
+aliases, unsafe access policy, topology overlap, and configured resource caps,
+then records every retained directory and regular file. Regular files use two
+bounded streaming passes to bind size and the SHA-256 of all bytes without
+retaining the file payload in memory; only recognized owner-record candidates
+may capture their separately capped 4 KiB payload for closed-schema decoding.
+Directories bind identity, access policy, and a recursive digest. Recognized
+version-1 and version-2 owner records are linked to their exact retained private
+directory, while unknown `.saved` content remains ordinary bound evidence
+rather than being reclassified or discarded. The external plan is created once
+as mode `0600` through a
+no-follow parent walk and is deterministic for the same complete scan inputs,
+including capacity signals. Allocated-block counts are capacity signals, not
+protected mutation signals.
+
+Review the dry-run plan before execution:
+
+```bash
+python3 scripts/codex_personal_sync.py recover-private-control \
+  --root-id legacy-shared-v0 \
+  --dry-run \
+  --output-receipt /owner-private/recovery/PLAN.json
+
+python3 scripts/codex_personal_sync.py recover-private-control \
+  --root-id legacy-shared-v0 \
+  --execute \
+  --receipt /owner-private/recovery/PLAN.json
+```
+
+Execution reacquires the same exclusive leases and requires an exact protected
+plan match before it creates the primary namespace. It durably publishes the
+fixed primary receipt first and the fixed cutover marker second; marker
+publication is the commit point. A receipt without a marker remains blocked
+and retryable. Each publication attempt uses a nonce-bearing pending name, so
+a short write, `fchmod`, or file `fsync` can leave an untrusted primary-side
+pending artifact. If rename succeeds before its parent-directory `fsync`
+fails, the fixed namespace, receipt, or marker may already be visible. Retry
+does not overwrite it: it reopens the exact binding, re-`fsync`s the containing
+directory, and revalidates identity, access policy, and content. An existing
+marker additionally requires complete verification both before and after that
+durability repair. A marker is accepted only after marker → exact receipt →
+full legacy manifest verification plus a whole-registry terminal revalidation.
+After that verification, new runtimes classify the legacy root as
+`adopted-retained-in-place` and may allocate only in `primary-home-v1`; old
+runtimes, which do not understand the marker, continue to stop at
+`legacy-recovery-pending`. Repeated execution is idempotent. Physical purge of
+the retained legacy tree is deliberately outside this command and still needs
+a separately reviewed deletion contract.
 
 Expected owner-record cleanup moves the exact file into the already retained
 durable quarantine beside its bound private-control parent, on the same
@@ -315,10 +369,11 @@ LaunchAgent to the canonical per-user Background LaunchAgent:
 The canonical macOS plist declares `LimitLoadToSessionType=Background` and
 `ProcessType=Background`, fixes `HOME` and `WorkingDirectory` to the account
 home, applies `Umask=077`, and enables `ThrottleInterval=60` and
-`LowPriorityIO`. The job is bootstrapped and enabled in `user/$UID`, so it does
-not depend on an Aqua/GUI login. After a cold boot, the user's first session
-(including an SSH login) is still required before the per-user LaunchAgent can
-run.
+`LowPriorityIO`. Activation explicitly enables the exact label in `user/$UID`
+before bootstrapping the plist, then repeats the enable operation after
+bootstrap as an idempotent repair. The job therefore does not depend on an
+Aqua/GUI login. After a cold boot, the user's first session (including an SSH
+login) is still required before the per-user LaunchAgent can run.
 
 Migration removes the precisely audited legacy `gui/$UID` job before
 bootstrapping the canonical `user/$UID` job. Status and uninstall inspect both

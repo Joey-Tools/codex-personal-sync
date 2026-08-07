@@ -3,7 +3,7 @@ id: 20260723-canonical-sync-engine
 title: Canonical Sync Engine
 status: active
 created: 2026-07-23
-updated: 2026-08-05
+updated: 2026-08-06
 branch: codex/canonical-sync-engine
 pr:
 supersedes: []
@@ -30,6 +30,16 @@ superseded_by:
   `cfc050e042dffd5727d8b9904adfaacbebb6c06455a03394b33f4eda1260d765`.
   These pre-squash identities remain historical evidence only. Downstream
   generation must bind the actual squash-landed canonical `P` identity.
+- The retained private-control recovery follow-up is most recently reviewed at
+  signed checkpoint `56da040e9c9cc5d7c485a34e1f707373ca7437c1`, tree
+  `f1089be18fc6ee1e1928d6af1473d3bcc62ed878`. Its sole prior-b4ca
+  fresh-context named single found that root-binding cleanup discarded FD and
+  lease custody when `close()` failed or had an uncertain effect. The current
+  symmetric generator/runtime repair fences the complete transaction before
+  close, makes confirmed close the only lease-release point, and requires a
+  process restart after any uncertain result. These pre-squash identities
+  remain historical evidence only; downstream handoff begins from the actual
+  squash-landed canonical `P`.
 
 ## Scope
 
@@ -1850,6 +1860,193 @@ superseded_by:
   `legacy-recovery-pending` boundary, and no retained evidence was deleted,
   moved, or rewritten. The refreshed `sync-source-lock.json` SHA-256 is
   `129b8feb00f8d1a497eb2b5a0276009bc04350e0665bf627e76fe10ee3eb620c`.
+- Signed checkpoint `b341d32d707b6ae22e83ce3c7201dee09456236c`,
+  tree `fa696e861130c33ffd87d1abe16e984aa4609923`, completed the fixed-document
+  operation-budget accounting repair. Its formal prior-b4ca fresh-context
+  named single returned one P2: reuse of an existing small pending publication
+  could replace that file with a larger payload without accounting the
+  projected aggregate retained bytes, allowing a failed publication to leave
+  the pending inventory above its aggregate cap.
+- The superseding repair is intentionally symmetric in
+  `scripts/sync_canonical_mirrors.py` and `scripts/codex_personal_sync.py`.
+  After constructing the reusable payload and enforcing its single-file cap,
+  both implementations compute the projected aggregate as the current pending
+  logical bytes minus the reusable file's old size plus the new payload size.
+  They reject an over-cap projection before the effectful reuse open. An
+  inventory within the configured cap therefore cannot cross it; a historical
+  pre-cap inventory already above the cap may only remain unchanged or shrink.
+  Exact-cap reuse remains admissible, and an injected publication failure
+  retains no more than that exact cap.
+- The new projected-growth regression passed 1/1 under uv Python 3.13.0 and
+  macOS system Python 3.9.6. The three-test pending-publication matrix passed
+  3/3 under both runtimes, and complete
+  `PrivateControlRetainedRecoveryTests` passed 43/43 under both runtimes. The
+  first complete repository run exercised 1,135 tests and stopped only on the
+  expected stale source-lock precondition after the engine bytes changed.
+  Task-private stock `refresh-lock` and `refresh-lock --check` then refreshed
+  and verified all six sources; the exact lock-current regression passed 1/1,
+  and the final complete repository suite passed 1,135/1,135 in 860.248
+  seconds with three expected skips. The refreshed `sync-source-lock.json`
+  SHA-256 is
+  `875b37794a2d0233b28d0d8df8d0acd0fa547a19f77b7d254b7a0cf289d94308`.
+  The final signed pre-squash identity remains historical evidence only;
+  downstream generation and deployment are handed off only after the actual
+  squash-landed canonical commit is frozen as `P`.
+- Signed checkpoint `e5e3622aeb10cede21c18b328024c1bc0f3fa0e7`, tree
+  `3e83c91267d25946348655d42c305542b59c48fc`, carried the projected reusable-
+  pending accounting repair. Its formal prior-b4ca fresh-context named single
+  returned one P2: dry-run bounded only the pretty plan, while execute embeds
+  that plan inside a newly pretty-serialized primary receipt. A valid plan
+  near the cap could therefore reach primary-parent creation and pending-file
+  allocation before the larger receipt failed its byte cap.
+- The superseding repair is symmetric in `scripts/sync_canonical_mirrors.py`
+  and `scripts/codex_personal_sync.py`. Both the dry-run writer and external-
+  plan validator stream the complete primary-receipt shape through the exact
+  pretty JSON encoder before any plan, primary-parent, or pending-inode
+  publication. The reservation covers the builder-enforced maximum decimal
+  width of the four late-bound `dev`, `ino`, `uid`, and `gid` integers plus the
+  terminal newline; receipt type remains a regular file and mode remains
+  `0400`. The post-publication exact check remains an independent defense.
+  The protected property is full receipt byte capacity before any persistent
+  recovery effect, not merely plan-byte capacity.
+- The new regression exercises both implementations. It proves rejection one
+  byte below the conservative complete-receipt bound before external-plan
+  parent binding, acceptance at the exact bound, builder rejection above the
+  declared late-bound integer width, and an actual self-consistent plan for
+  which `plan_bytes <= cap < primary_receipt_bytes`. Execute rejects that plan
+  during read/validation; mocks prove neither primary-parent nor pending-
+  receipt publication is reached. The focused regression passed 1/1 and
+  complete `PrivateControlRetainedRecoveryTests` passed 44/44 under uv Python
+  3.13 and macOS system Python 3.9. The canonical source-lock suite passed
+  275/275 in 575.269 seconds with one expected platform skip. Unmodified stock
+  `refresh-lock` and `refresh-lock --check` refreshed and verified all six
+  sources. The refreshed `sync-source-lock.json` SHA-256 is
+  `635d9e7072498ae08eca173c637bcea8f0304a24b6caf53d606075689b27522c`.
+  The final complete repository discovery passed 1,136/1,136 tests in 820.547
+  seconds with three expected skips. Both configured runtimes passed
+  `py_compile`; Ruff 0.16.1 E4/E7/E9/F, JSON parsing, project-journal
+  validation, and `git diff --check` passed. Formal current-head review, CI,
+  and squash-landed tree binding remain outstanding at this checkpoint.
+- Signed checkpoint `cbe52a3f7a1fbdf864c141b2ebbac3513af685de`, tree
+  `b256160731ff465e8ab4ae49e545449a54fa3c8f`, carried the complete-receipt
+  capacity preflight. Its sole prior-b4ca fresh-context named single returned
+  one P2: `_pc_recovery_open_or_create_primary_parent()` closed but did not
+  remove its digest-named staging directory when the no-replace publication
+  failed before effect. If retained evidence then changed the plan digest, the
+  old staging name became unreachable and repeated failures could accumulate
+  directories and consume account-home inodes.
+- The current repair is symmetric in the canonical generator and standalone
+  runtime. On a publication error it keeps the staging descriptor open,
+  revalidates the trusted home plus the named and held staging identities and
+  exact mode/uid/gid policy, proves the directory empty twice, revalidates
+  immediately before a parent-FD-anchored `rmdir`, proves the name absent and
+  the held object unchanged, then fsyncs and revalidates the home. The original
+  publication error still terminates the attempt. Missing, replacement,
+  nonempty, unreadable, removal, or durability uncertainty becomes a secondary
+  cleanup failure and preserves the observable state; rename-after-effect
+  never authorizes deletion of the published primary namespace.
+- The dual-implementation regression proves two successive pre-effect failures
+  with different plan digests leave neither staging name, while nonempty and
+  replacement states remain intact and a simulated rename-after-effect retains
+  the exact published identity. It passed 1/1 under uv Python 3.13 and macOS
+  system Python 3.9; complete `PrivateControlRetainedRecoveryTests` passed
+  45/45 under both runtimes. The private-`TMPDIR` source-lock suite passed
+  276/276 in 563.237 seconds with one expected skip, and full repository
+  discovery passed 1,137/1,137 in 830.495 seconds with three expected skips.
+  Task-private stock refresh/check verified all six sources and removed its
+  control home; the refreshed `sync-source-lock.json` SHA-256 is
+  `55c8c3f02cdb196143fd383a2fcd7e6fb0912c88d04a4fbe285488a6f2effabd`.
+  Both runtimes passed `py_compile`; Ruff 0.16.1 E4/E7/E9/F and
+  `git diff --check` passed. A superseding signed checkpoint and its fresh
+  current-head named single remain outstanding.
+- Signed checkpoint `10b0ab3285d898cadb6b533335ad16d632a1dd65`, tree
+  `1de01af544dcf867808143d9840543121145e2cf`, carried the bound staging-parent
+  cleanup repair. Its sole prior-b4ca fresh-context named single returned two
+  findings: plan/pending raw-write loops could spin on zero progress or evade
+  the recovery deadline through continuous short writes, and recursive
+  evidence-directory terminal path/descriptor revalidation could leak raw
+  `OSError` instead of the stable recovery domain error contract.
+- The target-branch repair is symmetric in the generator and standalone
+  runtime. A `memoryview` write-all helper checks the recovery-local deadline
+  between syscalls and rejects `written <= 0`; plan and pending callers retain
+  their contextual domain errors. Final directory revalidation separately
+  classifies pathname missing, other pathname lookup failure, and descriptor
+  failure while preserving the existing exact object-identity and access-
+  policy mismatch comparison.
+- Three new fault-injection tests passed 3/3 and complete
+  `PrivateControlRetainedRecoveryTests` passed 48/48 under both uv Python 3.13
+  and macOS system Python 3.9. The private-`TMPDIR` source-lock suite passed
+  279/279 in 565.529 seconds with one expected skip; full repository discovery
+  passed 1,140/1,140 in 813.382 seconds with three expected skips. Unmodified
+  stock `refresh-lock` and `refresh-lock --check` each verified all six sources.
+  The locked engine SHA-256 is
+  `ae87018e9e1f679c1745aaf50a93b899eacd6ce7e782891e4e8adb93178ae835` and the
+  refreshed `sync-source-lock.json` SHA-256 is
+  `97be8527892c73857cfd3e6c0dcc770805494829925def1c45fde666b1507b06`.
+  Both runtimes passed `py_compile`; Ruff 0.16.1 E4/E7/E9/F, JSON parsing,
+  project-journal validation, and `git diff --check` passed. An independent
+  read-only repair sanity check reported no actionable finding.
+- Signed checkpoint `b34445a3597c19b3081def2048fc9b06f01330ba`, tree
+  `eaa0abcdc27e9b9a0a74524419ce4566ac3f6b37`, carried that repair. Its sole
+  prior-b4ca fresh-context named single returned one P2: when digest-named
+  primary-parent staging was created and the immediately following containing-
+  home `fsync` failed, the staging object had not yet been descriptor-bound.
+  The empty directory was retained, and changing evidence could select a new
+  digest on every retry and accumulate account-home inodes without bound. The
+  lane did not launch Claude or read credentials.
+- The final repair is symmetric in the generator and standalone runtime. It
+  records whether the current invocation created staging, binds exact object
+  identity and access policy through the trusted-home descriptor immediately
+  after `mkdir`, and only then performs the containing-home durability
+  `fsync`. On failure, only a current-attempt object still bound to the held
+  descriptor, current-UID mode `0700`, and proven empty twice is removed with
+  parent-anchored `rmdir`, followed by home fsync/revalidation. Pre-existing,
+  replacement, nonempty, unreadable, or cleanup-durability-uncertain state is
+  retained and secondary-fails.
+- The exact post-mkdir `fsync` fault injection passed 1/1 and complete
+  `PrivateControlRetainedRecoveryTests` passed 48/48 under both runtimes. The
+  private-`TMPDIR` source-lock suite passed 279/279 in 566.160 seconds with one
+  expected skip; full repository discovery passed 1,140/1,140 in 810.288
+  seconds with three expected skips. Unmodified stock `refresh-lock` and
+  `refresh-lock --check` each verified all six sources. The locked engine
+  SHA-256 is
+  `12164e7ed9de0f6f6f2d5a3f4859653736cb849a82bb69bc77669856c86d92c8`, and
+  the refreshed `sync-source-lock.json` SHA-256 is
+  `0018191ae5e25c7ab1d78f99051a90a7129b18e08c6a15d4ce866868fc04f837`.
+  Both runtimes passed `py_compile`; Ruff 0.16.1 E4/E7/E9/F, JSON parsing, and
+  `git diff --check` passed. A superseding signed checkpoint and its fresh
+  current-head named single remain outstanding.
+- Signed checkpoint `56da040e9c9cc5d7c485a34e1f707373ca7437c1`, tree
+  `f1089be18fc6ee1e1928d6af1473d3bcc62ed878`, carried the post-mkdir cleanup
+  repair. Its sole prior-b4ca fresh-context named single returned one P2:
+  root/file binding cleanup unconditionally set `fd = -1` after an uncertain
+  `os.close()`, and locked roots were explicitly unlocked before that close.
+  A before-effect failure therefore released the transaction lease while the
+  descriptor remained live; an after-effect failure could leave the numeric FD
+  referring to an unrelated object, with no process fence blocking retry. The
+  lane did not launch Claude or read credentials.
+- The target-branch repair is symmetric in the generator and standalone
+  runtime. It registers every live owned binding for the complete plan/execute
+  cleanup before the first close syscall, groups aliases of one numeric FD,
+  and removes the explicit unlock. Only a confirmed close marks that group
+  closed, clears its FD, and releases its temporary fence. Any `OSError` or
+  asynchronous uncertainty stops the whole cleanup, leaves the current group
+  close-uncertain and unattempted groups open, preserves the remaining tool,
+  quarantine, and primary-parent leases, and makes all same-process recovery or
+  nested cleanup fail before `open`, `close`, `fstat`, or `flock`.
+- The new matrix covers both implementations, plan/execute, and close before-
+  and after-effect. It passed 1/1 and complete
+  `PrivateControlRetainedRecoveryTests` passed 49/49 under both Python 3.13.0
+  and macOS system Python 3.9.6. The private-`TMPDIR` source-lock suite passed
+  280/280 in 612.410 seconds with one expected skip; full repository discovery
+  passed 1,141/1,141 in 1,357.835 seconds with three expected skips. Unmodified
+  stock refresh/check each verified all six sources. The locked engine SHA-256
+  is `a021db4b8cb14550ca78900d051d381a1091f8547809c3035e73354c78fd83bc`,
+  and the refreshed source-lock SHA-256 is
+  `48f2e8f8492487e965225518a6ccf6e87a9bdd0baca7619d02597ae6c34afb38`.
+  Both runtimes passed source syntax compilation; Ruff 0.13.2 E4/E7/E9/F and
+  `git diff --check` passed. A superseding signed checkpoint and its fresh
+  current-head named single remain outstanding.
 
 ## Installed Host Baseline
 

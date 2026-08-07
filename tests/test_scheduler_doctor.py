@@ -13,6 +13,7 @@ import os
 from pathlib import Path, PurePosixPath
 import plistlib
 import re
+import selectors
 import shutil
 import socket
 import stat
@@ -69,6 +70,7 @@ _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_DEPTH_LIMIT = 64
 _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_TIMEOUT_SECONDS = 30.0
 _SCHEDULER_DOCTOR_TEST_LEASE_TIMEOUT_SECONDS = 60.0
 _SCHEDULER_DOCTOR_TEST_LEASE_RETRY_SECONDS = 0.05
+_SCHEDULER_DOCTOR_TEST_GUARDIAN_EOF_TIMEOUT_SECONDS = 5.0
 _SCHEDULER_DOCTOR_TEST_DARWIN_TEMP_SCAN_ENTRY_LIMIT = 4096
 _SCHEDULER_DOCTOR_TEST_LINUX_STICKY_TEMP_ROOT = Path("/tmp")
 _SCHEDULER_DOCTOR_TEST_LINUX_STICKY_FALLBACK_PREFIX = (
@@ -82,6 +84,36 @@ _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE: (
 _SCHEDULER_DOCTOR_TEST_HOST_PLATFORM = sys.platform
 _SCHEDULER_DOCTOR_TEST_ORIGINAL_POPEN = subprocess.Popen
 _SCHEDULER_DOCTOR_TEST_POPEN_INSTALLED = False
+
+
+def _wait_for_scheduler_guardian_fifo_eof(
+    read_fd: int,
+    *,
+    deadline: float,
+) -> None:
+    # kqueue does not consistently surface a post-read FIFO writer close as a
+    # fresh event on macOS; select(2) does, while retaining an event-driven
+    # absolute-deadline wait.
+    with selectors.SelectSelector() as selector:
+        selector.register(read_fd, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(
+                    "a launched process still retains the FIFO liveness writer"
+                )
+            events = selector.select(remaining)
+            if not events:
+                continue
+            try:
+                terminal = os.read(read_fd, 1)
+            except BlockingIOError:
+                continue
+            if terminal:
+                raise AssertionError(
+                    "the FIFO liveness channel contained unexpected payload bytes"
+                )
+            return
 
 
 class _SchedulerDoctorTestCandidateUnavailable(RuntimeError):
@@ -9644,6 +9676,132 @@ class SchedulerDoctorTests(unittest.TestCase):
                 self.assertTrue(recovered.enabled)
                 self.assertEqual(recovered.interval_minutes, 31)
 
+    def test_macos_activation_retry_enables_background_label_before_bootstrap(
+        self,
+    ) -> None:
+        self.write_runner()
+        paths = MODULE._scheduler_paths("macos", self.home)
+        assert paths.launchd_plist is not None
+        marker = MODULE._scheduler_activation_transaction_path(paths)
+        uid = os.getuid()
+        gui_target = f"{MODULE.MACOS_LEGACY_GUI_LAUNCHD_DOMAIN}/{uid}"
+        background_target = f"{MODULE.MACOS_BACKGROUND_LAUNCHD_DOMAIN}/{uid}"
+        label = MODULE.LAUNCHD_LABEL
+        failed_calls: list[list[str]] = []
+
+        def fail_bootstrap(
+            args: list[str],
+            *,
+            dry_run: bool,
+            allow_fail: bool | str = False,
+        ) -> None:
+            del dry_run, allow_fail
+            failed_calls.append(args)
+            if args[:2] == ["launchctl", "bootstrap"]:
+                raise MODULE.SyncError("simulated bootstrap failure")
+
+        with (
+            mock.patch.object(MODULE, "LEGACY_LAUNCHD_LABELS", ()),
+            mock.patch.object(
+                MODULE,
+                "_run_native_command",
+                side_effect=fail_bootstrap,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "simulated bootstrap failure",
+            ),
+        ):
+            MODULE.install_scheduler(
+                self.home,
+                "owner/macos-activation-order",
+                31,
+                "macos",
+                None,
+                dry_run=False,
+                enable=True,
+            )
+
+        self.assertEqual(
+            failed_calls,
+            [
+                ["launchctl", "bootout", f"{gui_target}/{label}"],
+                ["launchctl", "disable", f"{gui_target}/{label}"],
+                ["launchctl", "bootout", f"{background_target}/{label}"],
+                ["launchctl", "enable", f"{background_target}/{label}"],
+                [
+                    "launchctl",
+                    "bootstrap",
+                    background_target,
+                    str(paths.launchd_plist),
+                ],
+            ],
+        )
+        self.assertTrue(marker.exists())
+        config_before = (
+            paths.launchd_plist.read_bytes(),
+            paths.launchd_plist.stat().st_dev,
+            paths.launchd_plist.stat().st_ino,
+        )
+        retry_calls: list[list[str]] = []
+
+        def record_retry(
+            args: list[str],
+            *,
+            dry_run: bool,
+            allow_fail: bool | str = False,
+        ) -> None:
+            del dry_run, allow_fail
+            retry_calls.append(args)
+
+        with (
+            mock.patch.object(MODULE, "LEGACY_LAUNCHD_LABELS", ()),
+            mock.patch.object(MODULE, "_write_plist") as write_plist,
+            mock.patch.object(
+                MODULE,
+                "_run_native_command",
+                side_effect=record_retry,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            MODULE.install_scheduler(
+                self.home,
+                "owner/macos-activation-order",
+                None,
+                "macos",
+                None,
+                dry_run=False,
+                enable=True,
+            )
+
+        write_plist.assert_not_called()
+        self.assertEqual(
+            retry_calls,
+            [
+                ["launchctl", "bootout", f"{gui_target}/{label}"],
+                ["launchctl", "disable", f"{gui_target}/{label}"],
+                ["launchctl", "bootout", f"{background_target}/{label}"],
+                ["launchctl", "enable", f"{background_target}/{label}"],
+                [
+                    "launchctl",
+                    "bootstrap",
+                    background_target,
+                    str(paths.launchd_plist),
+                ],
+                ["launchctl", "enable", f"{background_target}/{label}"],
+            ],
+        )
+        self.assertFalse(marker.exists())
+        self.assertEqual(
+            (
+                paths.launchd_plist.read_bytes(),
+                paths.launchd_plist.stat().st_dev,
+                paths.launchd_plist.stat().st_ino,
+            ),
+            config_before,
+        )
+
     def test_invalid_activation_state_fails_closed_and_uninstall_clears_it(
         self,
     ) -> None:
@@ -13044,7 +13202,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                     "",
                     "",
                 )
-                for _ in range(len(MODULE.LEGACY_LAUNCHD_LABELS) * 4 + 3)
+                for _ in range(len(MODULE.LEGACY_LAUNCHD_LABELS) * 4 + 4)
             ),
         ]
         native_calls: list[list[str]] = []
@@ -13090,7 +13248,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             [args[1] for args in native_calls],
             ["bootout", "disable", "bootout", "disable"]
             * len(MODULE.LEGACY_LAUNCHD_LABELS)
-            + ["bootout", "disable", "bootout", "bootstrap", "enable"],
+            + ["bootout", "disable", "bootout", "enable", "bootstrap", "enable"],
         )
         self.assertFalse(legacy.exists())
         with mock.patch.object(
@@ -13113,7 +13271,7 @@ class SchedulerDoctorTests(unittest.TestCase):
         label = MODULE.LEGACY_LAUNCHD_LABELS[0]
         case_index = 0
         for initial_legacy_exists in (False, True):
-            for current_action_offset in range(5):
+            for current_action_offset in range(6):
                 case_index += 1
                 with self.subTest(
                     initial_legacy_exists=initial_legacy_exists,
@@ -13246,7 +13404,7 @@ class SchedulerDoctorTests(unittest.TestCase):
 
         self.assertEqual(
             native_calls,
-            len(MODULE.LEGACY_LAUNCHD_LABELS) * 4 + 5,
+            len(MODULE.LEGACY_LAUNCHD_LABELS) * 4 + 6,
         )
         self.assertIsNotNone(MODULE._load_macos_scheduler_config(paths))
 
@@ -16002,8 +16160,53 @@ class SchedulerDoctorTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0)
             self.assertEqual(os.read(read_fd, 1), b"R")
-            self.assertEqual(os.read(read_fd, 1), b"")
+            _wait_for_scheduler_guardian_fifo_eof(
+                read_fd,
+                deadline=(
+                    time.monotonic()
+                    + _SCHEDULER_DOCTOR_TEST_GUARDIAN_EOF_TIMEOUT_SECONDS
+                ),
+            )
         finally:
+            os.close(read_fd)
+
+    def test_scheduler_guardian_fifo_eof_wait_requires_writer_exit(self) -> None:
+        fifo = self.root / "guardian-liveness-negative-control.fifo"
+        os.mkfifo(fifo, 0o600)
+        read_fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        write_fd = -1
+        writer: subprocess.Popen[bytes] | None = None
+        try:
+            write_fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            writer = subprocess.Popen(
+                [sys.executable, "-c", "import time;time.sleep(30)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                pass_fds=(write_fd,),
+            )
+            os.close(write_fd)
+            write_fd = -1
+            with self.assertRaisesRegex(
+                AssertionError,
+                "still retains the FIFO liveness writer",
+            ):
+                _wait_for_scheduler_guardian_fifo_eof(
+                    read_fd,
+                    deadline=time.monotonic() + 0.01,
+                )
+            writer.kill()
+            writer.wait(timeout=5.0)
+            _wait_for_scheduler_guardian_fifo_eof(
+                read_fd,
+                deadline=time.monotonic() + 1.0,
+            )
+        finally:
+            if write_fd >= 0:
+                os.close(write_fd)
+            if writer is not None and writer.poll() is None:
+                writer.kill()
+                writer.wait(timeout=5.0)
             os.close(read_fd)
 
     def test_bounded_scheduler_selector_close_failure_preserves_primary(
@@ -19174,7 +19377,7 @@ class SchedulerDoctorTests(unittest.TestCase):
         ):
             audit = MODULE._mirror_quarantine_audit()
 
-        self.assertNotEqual(audit.classification, "inconclusive")
+        self.assertNotEqual(audit.classification, "inconclusive", audit)
 
     def test_mirror_quarantine_registry_reports_same_uid_legacy_pending(
         self,
@@ -19221,6 +19424,148 @@ class SchedulerDoctorTests(unittest.TestCase):
         self.assertEqual(audit.entry_count, 1)
         self.assertIn("original root", audit.detail)
         self.assertEqual(snapshot_tree(shared_parent), before)
+
+    def test_retained_recovery_transitions_audit_and_strict_doctor(
+        self,
+    ) -> None:
+        shared_parent = self.root / "legacy-retained-parent"
+        shared_parent.mkdir(mode=0o700)
+        tool = shared_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        quarantine = shared_parent / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+        tool.mkdir(mode=0o700)
+        quarantine.mkdir(mode=0o700)
+        evidence = quarantine / "retained-evidence"
+        evidence.write_bytes(b"retained\n")
+        evidence.chmod(0o600)
+        primary_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id=MODULE.MIRROR_PRIVATE_CONTROL_PRIMARY_ROOT_ID,
+            parent_path=self.mirror_private_control_parent,
+            allocate=True,
+            account_home=self.root,
+            shared_parent=False,
+        )
+        legacy_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id=MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        before = snapshot_tree(shared_parent)
+        plan_path = self.root / "legacy-retained-recovery-plan.json"
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                (primary_spec, legacy_spec),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_legacy_shared_parent_policy_is_valid",
+                return_value=True,
+            ),
+        ):
+            pending_audit = MODULE._mirror_quarantine_audit()
+            plan = MODULE.plan_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            result = MODULE.execute_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            adopted_audit = MODULE._mirror_quarantine_audit()
+
+        self.assertEqual(pending_audit.classification, "inconclusive")
+        self.assertEqual(
+            pending_audit.reason_code,
+            MODULE.MIRROR_PRIVATE_CONTROL_REASON_LEGACY_PENDING,
+        )
+        self.assertEqual(plan["disposition"], "adopt-retained-in-place")
+        self.assertEqual(result["status"], "executed")
+        adopted_legacy_audit = next(
+            root_audit
+            for root_audit in adopted_audit.root_audits
+            if root_audit.root_id == MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID
+        )
+        self.assertEqual(
+            adopted_legacy_audit.classification,
+            "adopted-retained-in-place",
+        )
+        self.assertNotIn(
+            adopted_audit.classification,
+            {"saturated", "inconclusive"},
+        )
+        self.assertIsNone(adopted_audit.reason_code)
+        self.assertEqual(snapshot_tree(shared_parent), before)
+        self.assertTrue(
+            (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME
+            ).is_file()
+        )
+        self.assertTrue(
+            (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME
+            ).is_file()
+        )
+
+        def report(audit: MODULE.MirrorQuarantineAudit) -> MODULE.SchedulerReport:
+            return MODULE.SchedulerReport(
+                platform="linux",
+                installed=True,
+                enabled=True,
+                config_paths=(self.root / "scheduler.timer",),
+                interval_minutes=17,
+                runner=self.home / "bin" / "codex-personal-sync",
+                stable_runner=True,
+                mode="public",
+                base_repo="owner/public-sync",
+                private_repo=None,
+                last_attempt=None,
+                recent_success=None,
+                current_releases=(),
+                failure_reason=None,
+                command="run-scheduled",
+                repo="owner/public-sync",
+                owner=MODULE.PUBLIC_OWNER,
+                quarantine_batches=0,
+                mirror_quarantine=audit,
+                daemon_query=MODULE.SchedulerDaemonQuery("enabled"),
+            )
+
+        for audit, expected_status in (
+            (pending_audit, 1),
+            (adopted_audit, 0),
+        ):
+            with (
+                self.subTest(classification=audit.classification),
+                mock.patch.object(
+                    MODULE,
+                    "scheduler_report",
+                    return_value=report(audit),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "audit_active_skills",
+                    return_value=[],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                status = MODULE.main(
+                    [
+                        "doctor",
+                        "--home",
+                        str(self.home),
+                        "--platform",
+                        "linux",
+                        "--strict",
+                    ]
+                )
+            self.assertEqual(status, expected_status)
 
     def test_mirror_primary_alias_matrix_is_rejected_before_child_open(
         self,
