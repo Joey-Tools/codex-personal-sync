@@ -19425,6 +19425,526 @@ class SchedulerDoctorTests(unittest.TestCase):
         self.assertIn("original root", audit.detail)
         self.assertEqual(snapshot_tree(shared_parent), before)
 
+    @contextlib.contextmanager
+    def retained_recovery_scope(self, name: str):
+        shared_parent = self.root / f"legacy-retained-parent-{name}"
+        shared_parent.mkdir(mode=0o700)
+        tool = shared_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        quarantine = shared_parent / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+        tool.mkdir(mode=0o700)
+        quarantine.mkdir(mode=0o700)
+        evidence = quarantine / "retained-evidence"
+        evidence.write_bytes(b"retained\n")
+        evidence.chmod(0o600)
+        primary_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id=MODULE.MIRROR_PRIVATE_CONTROL_PRIMARY_ROOT_ID,
+            parent_path=self.mirror_private_control_parent,
+            allocate=True,
+            account_home=self.root,
+            shared_parent=False,
+        )
+        legacy_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id=MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        plan_path = self.root / f"{name}-recovery-plan.json"
+        with (
+            mock.patch.object(
+                MODULE,
+                "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                (primary_spec, legacy_spec),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_legacy_shared_parent_policy_is_valid",
+                return_value=True,
+            ),
+        ):
+            yield {
+                "evidence": evidence,
+                "plan_path": plan_path,
+                "quarantine": quarantine,
+                "shared_parent": shared_parent,
+                "tool": tool,
+            }
+
+    def assert_retained_recovery_unpublished(self) -> None:
+        self.assertFalse(
+            (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME
+            ).exists()
+        )
+        self.assertFalse(
+            (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME
+            ).exists()
+        )
+
+    def test_retained_recovery_rejects_plan_and_evidence_drift(self) -> None:
+        with self.retained_recovery_scope("tampered-plan") as fixture:
+            plan_path = fixture["plan_path"]
+            assert isinstance(plan_path, Path)
+            MODULE.plan_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            tampered = json.loads(plan_path.read_text(encoding="utf-8"))
+            evidence_entry = next(
+                entry
+                for entry in tampered["inventory"]["entries"]
+                if entry["locator"]["path"] == "retained-evidence"
+            )
+            evidence_entry["sha256"] = "0" * 64
+            tampered["plan_digest"] = MODULE._pc_recovery_digest(
+                MODULE._pc_recovery_protected_plan(tampered)
+            )
+            plan_path.write_bytes(
+                MODULE._pc_recovery_json_bytes(tampered, pretty=True)
+            )
+            plan_path.chmod(0o600)
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "plan no longer matches retained evidence",
+            ):
+                MODULE.execute_private_control_recovery(
+                    MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                    plan_path,
+                )
+            self.assert_retained_recovery_unpublished()
+
+        with self.retained_recovery_scope("changed-evidence") as fixture:
+            plan_path = fixture["plan_path"]
+            evidence = fixture["evidence"]
+            assert isinstance(plan_path, Path)
+            assert isinstance(evidence, Path)
+            MODULE.plan_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            original_identity = MODULE._pc_recovery_identity(
+                os.stat(evidence, follow_symlinks=False)
+            )
+            original_access = MODULE._pc_recovery_access(
+                os.stat(evidence, follow_symlinks=False)
+            )
+            evidence.write_bytes(b"changed!\n")
+            changed_metadata = os.stat(evidence, follow_symlinks=False)
+            self.assertEqual(
+                MODULE._pc_recovery_identity(changed_metadata),
+                original_identity,
+            )
+            self.assertEqual(
+                MODULE._pc_recovery_access(changed_metadata),
+                original_access,
+            )
+            self.assertEqual(changed_metadata.st_size, len(b"retained\n"))
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "plan no longer matches retained evidence",
+            ):
+                MODULE.execute_private_control_recovery(
+                    MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                    plan_path,
+                )
+            self.assert_retained_recovery_unpublished()
+
+        with self.retained_recovery_scope("replaced-evidence") as fixture:
+            plan_path = fixture["plan_path"]
+            evidence = fixture["evidence"]
+            assert isinstance(plan_path, Path)
+            assert isinstance(evidence, Path)
+            MODULE.plan_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            original_metadata = os.stat(evidence, follow_symlinks=False)
+            original_identity = MODULE._pc_recovery_identity(original_metadata)
+            original_access = MODULE._pc_recovery_access(original_metadata)
+            replacement = evidence.with_name("replacement-evidence")
+            replacement.write_bytes(evidence.read_bytes())
+            replacement.chmod(0o600)
+            os.replace(replacement, evidence)
+            replacement_metadata = os.stat(evidence, follow_symlinks=False)
+            self.assertNotEqual(
+                MODULE._pc_recovery_identity(replacement_metadata),
+                original_identity,
+            )
+            self.assertEqual(
+                MODULE._pc_recovery_access(replacement_metadata),
+                original_access,
+            )
+            self.assertEqual(evidence.read_bytes(), b"retained\n")
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "plan no longer matches retained evidence",
+            ):
+                MODULE.execute_private_control_recovery(
+                    MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                    plan_path,
+                )
+            self.assert_retained_recovery_unpublished()
+
+    def test_retained_recovery_rejects_a_busy_legacy_lease(self) -> None:
+        with self.retained_recovery_scope("second-busy-lease") as fixture:
+            tool = fixture["tool"]
+            quarantine = fixture["quarantine"]
+            plan_path = fixture["plan_path"]
+            assert isinstance(tool, Path)
+            assert isinstance(quarantine, Path)
+            assert isinstance(plan_path, Path)
+            MODULE.plan_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            quarantine_identity = MODULE._pc_recovery_identity(
+                os.stat(quarantine, follow_symlinks=False)
+            )
+            real_flock = fcntl.flock
+
+            def fail_second_lease(file_fd: int, operation: int) -> None:
+                if (
+                    operation == fcntl.LOCK_EX | fcntl.LOCK_NB
+                    and MODULE._pc_recovery_identity(os.fstat(file_fd))
+                    == quarantine_identity
+                ):
+                    raise BlockingIOError(
+                        errno.EWOULDBLOCK,
+                        "simulated quarantine lock conflict",
+                    )
+                real_flock(file_fd, operation)
+
+            with mock.patch.object(
+                MODULE.fcntl,
+                "flock",
+                side_effect=fail_second_lease,
+            ):
+                with self.assertRaisesRegex(MODULE.SyncError, "busy"):
+                    MODULE.execute_private_control_recovery(
+                        MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                        plan_path,
+                    )
+            self.assertEqual(MODULE._PC_RECOVERY_RETAINED_CLOSE_FENCE, ())
+            tool_fd = os.open(
+                tool,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                fcntl.flock(tool_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                fcntl.flock(tool_fd, fcntl.LOCK_UN)
+                os.close(tool_fd)
+            self.assert_retained_recovery_unpublished()
+
+    def test_retained_recovery_receipt_only_state_is_retryable(self) -> None:
+        with self.retained_recovery_scope("receipt-only") as fixture:
+            plan_path = fixture["plan_path"]
+            assert isinstance(plan_path, Path)
+            MODULE.plan_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            original_publish = MODULE._pc_recovery_publish_document
+
+            def fail_before_marker(*args: object, **kwargs: object):
+                if args[1] == MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME:
+                    raise MODULE.SyncError("simulated marker crash")
+                return original_publish(*args, **kwargs)
+
+            with mock.patch.object(
+                MODULE,
+                "_pc_recovery_publish_document",
+                side_effect=fail_before_marker,
+            ):
+                with self.assertRaisesRegex(MODULE.SyncError, "simulated marker crash"):
+                    MODULE.execute_private_control_recovery(
+                        MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                        plan_path,
+                    )
+            receipt_path = (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME
+            )
+            marker_path = (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME
+            )
+            self.assertTrue(receipt_path.is_file())
+            self.assertFalse(marker_path.exists())
+            receipt_metadata = os.stat(receipt_path, follow_symlinks=False)
+            receipt_payload = receipt_path.read_bytes()
+            blocked = MODULE._mirror_quarantine_audit()
+            self.assertEqual(blocked.classification, "inconclusive")
+            self.assertEqual(
+                blocked.reason_code,
+                MODULE.MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE,
+            )
+            self.assertIn(
+                "receipt exists without its cutover marker",
+                blocked.detail,
+            )
+            result = MODULE.execute_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            self.assertEqual(result["status"], "executed")
+            self.assertTrue(marker_path.is_file())
+            final_receipt = os.stat(receipt_path, follow_symlinks=False)
+            self.assertEqual(
+                MODULE._pc_recovery_identity(final_receipt),
+                MODULE._pc_recovery_identity(receipt_metadata),
+            )
+            self.assertEqual(
+                MODULE._pc_recovery_access(final_receipt),
+                MODULE._pc_recovery_access(receipt_metadata),
+            )
+            self.assertEqual(receipt_path.read_bytes(), receipt_payload)
+            marker = MODULE._pc_recovery_load_json(
+                marker_path.read_bytes(),
+                "test cutover marker",
+            )
+            self.assertEqual(marker["primary_receipt"], result["execute"]["receipt"])
+
+    def test_retained_recovery_partial_pending_receipt_is_retryable(self) -> None:
+        with self.retained_recovery_scope("pending-receipt") as fixture:
+            plan_path = fixture["plan_path"]
+            assert isinstance(plan_path, Path)
+            MODULE.plan_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            real_write = os.write
+            injected = False
+
+            def fail_after_partial_write(file_fd: int, payload: bytes) -> int:
+                nonlocal injected
+                if not injected:
+                    injected = True
+                    real_write(file_fd, payload[: max(1, len(payload) // 2)])
+                    raise OSError(errno.EIO, "simulated interrupted receipt write")
+                return real_write(file_fd, payload)
+
+            with mock.patch.object(
+                MODULE.os,
+                "write",
+                side_effect=fail_after_partial_write,
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "cannot write pending primary recovery receipt",
+                ):
+                    MODULE.execute_private_control_recovery(
+                        MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                        plan_path,
+                    )
+            pending = tuple(
+                self.mirror_private_control_parent.glob(
+                    f".{MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME}"
+                    ".pending-*"
+                )
+            )
+            self.assertTrue(injected)
+            self.assertEqual(len(pending), 1)
+            pending_identity = MODULE._pc_recovery_identity(
+                os.stat(pending[0], follow_symlinks=False)
+            )
+            self.assert_retained_recovery_unpublished()
+            result = MODULE.execute_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            self.assertEqual(result["status"], "executed")
+            receipt_path = (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME
+            )
+            self.assertEqual(
+                MODULE._pc_recovery_identity(
+                    os.stat(receipt_path, follow_symlinks=False)
+                ),
+                pending_identity,
+            )
+            self.assertEqual(
+                tuple(
+                    self.mirror_private_control_parent.glob(
+                        f".{MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME}"
+                        ".pending-*"
+                    )
+                ),
+                (),
+            )
+            self.assertEqual(
+                tuple(
+                    self.mirror_private_control_parent.glob(
+                        f".{MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME}"
+                        ".pending-*"
+                    )
+                ),
+                (),
+            )
+
+    def test_retained_recovery_retry_rejects_receipt_replacement(self) -> None:
+        with self.retained_recovery_scope("receipt-replacement") as fixture:
+            plan_path = fixture["plan_path"]
+            assert isinstance(plan_path, Path)
+            MODULE.plan_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            result = MODULE.execute_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            self.assertEqual(result["status"], "executed")
+            receipt_path = (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME
+            )
+            marker_path = (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME
+            )
+            receipt_payload = receipt_path.read_bytes()
+            receipt_metadata = os.stat(receipt_path, follow_symlinks=False)
+            marker_metadata = os.stat(marker_path, follow_symlinks=False)
+            marker_payload = marker_path.read_bytes()
+            replacement = receipt_path.with_name("replacement-receipt")
+            replacement.write_bytes(receipt_payload)
+            replacement.chmod(0o400)
+            os.replace(replacement, receipt_path)
+            replaced_metadata = os.stat(receipt_path, follow_symlinks=False)
+            self.assertNotEqual(
+                MODULE._pc_recovery_identity(replaced_metadata),
+                MODULE._pc_recovery_identity(receipt_metadata),
+            )
+            self.assertEqual(
+                MODULE._pc_recovery_access(replaced_metadata),
+                MODULE._pc_recovery_access(receipt_metadata),
+            )
+            self.assertEqual(receipt_path.read_bytes(), receipt_payload)
+            blocked = MODULE._mirror_quarantine_audit()
+            self.assertEqual(blocked.classification, "inconclusive")
+            self.assertEqual(
+                blocked.reason_code,
+                MODULE.MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE,
+            )
+            self.assertIn(
+                "cutover marker receipt binding changed",
+                blocked.detail,
+            )
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "marker receipt binding changed",
+            ):
+                MODULE.execute_private_control_recovery(
+                    MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                    plan_path,
+                )
+            final_marker = os.stat(marker_path, follow_symlinks=False)
+            self.assertEqual(
+                MODULE._pc_recovery_identity(final_marker),
+                MODULE._pc_recovery_identity(marker_metadata),
+            )
+            self.assertEqual(marker_path.read_bytes(), marker_payload)
+
+    def test_retained_recovery_marker_durability_retry_preserves_identity(
+        self,
+    ) -> None:
+        with self.retained_recovery_scope("marker-retry") as fixture:
+            plan_path = fixture["plan_path"]
+            assert isinstance(plan_path, Path)
+            MODULE.plan_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            receipt_path = (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME
+            )
+            marker_path = (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME
+            )
+            real_fsync = os.fsync
+            injected = False
+
+            def fail_after_marker_publish(file_fd: int) -> None:
+                nonlocal injected
+                if marker_path.exists():
+                    parent_identity = MODULE._pc_recovery_identity(
+                        os.stat(
+                            self.mirror_private_control_parent,
+                            follow_symlinks=False,
+                        )
+                    )
+                    if (
+                        not injected
+                        and MODULE._pc_recovery_identity(os.fstat(file_fd))
+                        == parent_identity
+                    ):
+                        injected = True
+                        raise OSError(
+                            errno.EIO,
+                            "simulated marker-parent fsync failure",
+                        )
+                real_fsync(file_fd)
+
+            with mock.patch.object(
+                MODULE.os,
+                "fsync",
+                side_effect=fail_after_marker_publish,
+            ):
+                with self.assertRaisesRegex(MODULE.SyncError, "cannot durably bind"):
+                    MODULE.execute_private_control_recovery(
+                        MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                        plan_path,
+                    )
+            self.assertTrue(injected)
+            self.assertTrue(receipt_path.is_file())
+            self.assertTrue(marker_path.is_file())
+            marker_metadata = os.stat(marker_path, follow_symlinks=False)
+            marker_payload = marker_path.read_bytes()
+
+            primary_identity = MODULE._pc_recovery_identity(
+                os.stat(
+                    self.mirror_private_control_parent,
+                    follow_symlinks=False,
+                )
+            )
+            retry_fsyncs = 0
+
+            def track_primary_fsync(file_fd: int) -> None:
+                nonlocal retry_fsyncs
+                if MODULE._pc_recovery_identity(os.fstat(file_fd)) == primary_identity:
+                    retry_fsyncs += 1
+                real_fsync(file_fd)
+
+            with mock.patch.object(
+                MODULE.os,
+                "fsync",
+                side_effect=track_primary_fsync,
+            ):
+                result = MODULE.execute_private_control_recovery(
+                    MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                    plan_path,
+                )
+            self.assertEqual(result["status"], "executed")
+            self.assertGreaterEqual(retry_fsyncs, 1)
+            final_marker = os.stat(marker_path, follow_symlinks=False)
+            self.assertEqual(
+                MODULE._pc_recovery_identity(final_marker),
+                MODULE._pc_recovery_identity(marker_metadata),
+            )
+            self.assertEqual(
+                MODULE._pc_recovery_access(final_marker),
+                MODULE._pc_recovery_access(marker_metadata),
+            )
+            self.assertEqual(marker_path.read_bytes(), marker_payload)
+
     def test_retained_recovery_transitions_audit_and_strict_doctor(
         self,
     ) -> None:
