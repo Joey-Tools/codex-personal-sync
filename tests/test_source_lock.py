@@ -15714,12 +15714,70 @@ class PrivateControlRetainedRecoveryTests(unittest.TestCase):
     def test_planning_rejects_symlink_special_and_caps(self) -> None:
         link = self.quarantine / "unsafe-link"
         link.symlink_to(".saved")
-        with self.assertRaisesRegex(
-            MIRROR_MODULE.MirrorSyncError,
-            "symlink/special",
-        ):
-            self._plan()
+        original_stat = os.stat
+
+        def assert_plan_rejected(
+            module: object,
+            label: str,
+            error_pattern: str,
+        ) -> None:
+            (
+                _primary_spec,
+                root_id,
+                _receipt_name,
+                _marker_name,
+                error_type,
+            ) = self._recovery_module_contract(module)
+            with self._recovery_module_scope(module):
+                with self.assertRaisesRegex(error_type, error_pattern):
+                    module.plan_private_control_recovery(
+                        root_id,
+                        self.root / f"{module.__name__}-{label}.json",
+                    )
+
+        def stat_with_unsafe_symlink_mode(
+            path: object, *args: object, **kwargs: object
+        ) -> os.stat_result:
+            metadata = original_stat(path, *args, **kwargs)
+            if path == link.name and stat.S_ISLNK(metadata.st_mode):
+                fields = list(metadata)
+                fields[0] = stat.S_IFLNK | 0o777
+                return os.stat_result(fields)
+            return metadata
+
+        for module in (MIRROR_MODULE, ENGINE_MODULE):
+            with (
+                self.subTest(module=module.__name__),
+                mock.patch.object(
+                    module.os,
+                    "stat",
+                    side_effect=stat_with_unsafe_symlink_mode,
+                ),
+            ):
+                assert_plan_rejected(module, "SYMLINK", "symlink/special")
         link.unlink()
+        for entry_name, entry_mode, is_directory in (
+            ("unsafe-regular", 0o660, False),
+            ("unsafe-directory", 0o770, True),
+        ):
+            unsafe_entry = self.quarantine / entry_name
+            if is_directory:
+                unsafe_entry.mkdir(mode=entry_mode)
+                unsafe_entry.chmod(entry_mode)
+            else:
+                unsafe_entry.write_bytes(b"unsafe access")
+                unsafe_entry.chmod(entry_mode)
+            for module in (MIRROR_MODULE, ENGINE_MODULE):
+                with self.subTest(module=module.__name__, entry=entry_name):
+                    assert_plan_rejected(
+                        module,
+                        entry_name,
+                        "owner/access policy",
+                    )
+            if is_directory:
+                unsafe_entry.rmdir()
+            else:
+                unsafe_entry.unlink()
         fifo = self.quarantine / "unsafe-fifo"
         os.mkfifo(fifo, 0o600)
         with self.assertRaisesRegex(

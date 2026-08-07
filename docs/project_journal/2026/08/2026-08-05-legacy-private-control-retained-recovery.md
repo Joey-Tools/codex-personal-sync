@@ -3,7 +3,7 @@ id: 20260805-legacy-private-control-retained-recovery
 title: Legacy Private-Control Retained Recovery
 status: completed
 created: 2026-08-05
-updated: 2026-08-06
+updated: 2026-08-07
 branch: wip/recover-private-control
 pr:
 supersedes: []
@@ -242,3 +242,28 @@ superseded_by:
   双 runtime syntax compile、Ruff 0.13.2 E4/E7/E9/F 与 `git diff --check`
   通过；superseding signed checkpoint 与该 exact head 的 fresh named single 尚待
   完成，因此不作 final review-clean claim。
+- Exact signed head `537e9cb0b5588274e63437cc9913527e01a45d3d`、tree
+  `15a273261986ff6a8c8a46f8852c4dc1b93aa65f` 的 prior-b4ca fresh named
+  single 终态为 `No findings.`。GitHub Actions outage 恢复后，current-head
+  provider review 新增一项重复 P2：Linux symlink 的 no-follow metadata 通常带
+  mode `0777`，而 recovery inventory 先检查 access policy、后做 object-type
+  classification，导致 symlink 先被误报为 generic unsafe access，无法到达稳定的
+  `symlink/special` fail-closed contract。
+- Target-branch repair 在 generator 与 standalone runtime 中保持对称：先把
+  no-follow metadata 分类为 regular file、directory 或 rejected special object，
+  只有前两类才进入 owner/mode access-policy gate。Protected object-type property
+  因此先于 type-specific access policy 判定；regular/directory 的 current-UID、
+  non-group/world-writable 约束、missing/unreadable 区分与后续 identity
+  revalidation 均未放宽。跨双实现回归把 symlink mode 显式固定为 `0777` 并仍要求
+  `symlink/special`，同时用 mode `0660` regular file 与 mode `0770` directory
+  证明 access-policy rejection 继续生效。
+- 双 runtime 完整 `PrivateControlRetainedRecoveryTests` 各通过 49/49；精确
+  `RepositorySourceLockTests` 通过 2/2；repository private-`TMPDIR` wrapper 下完整
+  `tests.test_source_lock` 通过 280/280 in 548.750s（1 expected skip）。Task-private
+  root/spec wrapper 中未修改的 stock `refresh-lock` 与 `refresh-lock --check` 各验证
+  6 sources，随后两个 control roots 均经零 open-FD 检查与 protected cleanup 删除。
+  uv Python 3.13.0 与 macOS system Python 3.9.6 repo-wide compile、Ruff 0.13.2
+  E4/E7/E9/F、JSON parsing 与 `git diff --check` 通过。Locked engine SHA-256 为
+  `17fc6661970d2cb461ced3a13567180af2c13bbe25551c167b9376910802f2cf`，
+  `sync-source-lock.json` SHA-256 为
+  `d4a531e9ff0d2e36d6a2e80e67db2b3c2a664bb5634a82a0697a5a5bcc8810d9`。

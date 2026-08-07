@@ -1271,6 +1271,13 @@ def _pc_recovery_scan_directory(
                     f"cannot inspect recovery evidence {relative_path}: {error}"
                 ) from error
             identity = _pc_recovery_identity(path_metadata)
+            is_regular_file = stat.S_ISREG(path_metadata.st_mode)
+            is_directory = stat.S_ISDIR(path_metadata.st_mode)
+            if not is_regular_file and not is_directory:
+                raise SyncError(
+                    "private-control recovery rejects symlink/special evidence: "
+                    f"{segment}/{relative_path}"
+                )
             access = _pc_recovery_access(path_metadata)
             if access[1] != os.geteuid() or access[0] & 0o022:
                 raise SyncError(
@@ -1286,7 +1293,7 @@ def _pc_recovery_scan_directory(
                     "private-control recovery manifest exceeds its allocated-byte cap"
                 )
             state["allocated_bytes"] += allocated
-            if stat.S_ISREG(path_metadata.st_mode):
+            if is_regular_file:
                 if path_metadata.st_nlink != 1:
                     raise SyncError(
                         "private-control recovery rejects a hard-link alias: "
@@ -1342,9 +1349,7 @@ def _pc_recovery_scan_directory(
                     raise SyncError(
                         f"recovery evidence identity changed: {segment}/{relative_path}"
                     )
-            elif stat.S_ISDIR(path_metadata.st_mode) and not stat.S_ISLNK(
-                path_metadata.st_mode
-            ):
+            elif is_directory:
                 child_fd = -1
                 try:
                     child_fd = os.open(
