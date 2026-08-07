@@ -19887,6 +19887,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                         == parent_identity
                     ):
                         injected = True
+                        real_fsync(file_fd)
                         raise OSError(
                             errno.EIO,
                             "simulated marker-parent fsync failure",

@@ -301,3 +301,20 @@ superseded_by:
   `EPERM` 停止；相同 argv 在 direct-local channel 通过。两次非计数 source-lock
   诊断分别证明 dirty pre-commit source 与 inherited `umask 077` fixture mode 会按
   合同 fail closed；计数运行使用 exact committed source 与标准 `umask 022`。
+- Exact `a632111e4ad1552235eac960cc689c45979fd7fe` 的唯一 fresh named
+  single 指出 marker durability regression 在模拟 parent-`fsync` 错误前没有先
+  执行真实 syscall，因此只覆盖 before-effect failure，却被记录为 after-effect
+  retry。Final test correction 在首次命中 marker parent FD 时先调用已绑定的真实
+  `fsync`，再注入一次返回错误；retry 仍要求再次 fsync，并保持 marker 的 exact
+  object identity、content bytes 与 `(mode, uid, gid)` access policy 不变。修复后
+  recovery matrix 在 Python 3.13 与系统 Python 3.9 下各通过 7/7，完整
+  `tests.test_scheduler_doctor` 各通过 274/274（1 expected skip）；标准
+  `umask 022` 与 current-owned repo-private `TMPDIR` 下完整
+  `tests.test_source_lock` 通过 280/280 in 350.927s（1 expected skip）。完整
+  discovery 的 sandbox counting run 除 4 个只因 outer Seatbelt 禁止 HOME 临时目录
+  创建的 `tests.test_ci_private_tmp` selectors 外全部通过；该精确 4-selector module
+  在 direct-local channel 通过 4/4，因此 current bytes 的完整 1,147-test inventory
+  无代码 failure（3 expected skips）。`tests/test_scheduler_doctor.py` SHA-256 为
+  `716ab4dbef9a6c68961f1219c35868973567688e1a1a4a20c5a3bd31d367117b`，
+  `sync-source-lock.json` SHA-256 为
+  `31739dfc730a0d2ac28e9f68084c46eb4e373ce916db707bff546eaedbc447ad`。
