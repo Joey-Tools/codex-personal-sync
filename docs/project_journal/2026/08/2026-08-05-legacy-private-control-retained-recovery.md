@@ -267,3 +267,54 @@ superseded_by:
   `17fc6661970d2cb461ced3a13567180af2c13bbe25551c167b9376910802f2cf`，
   `sync-source-lock.json` SHA-256 为
   `d4a531e9ff0d2e36d6a2e80e67db2b3c2a664bb5634a82a0697a5a5bcc8810d9`。
+- Canonical squash `6c3981236adec55c4b3dc1b8de8891938533034d`
+  首次生成的 toolbox candidate 通过 byte parity、consumer tests、完整本地
+  discovery 与 exact-secret admission，但该 candidate 的唯一 fresh named single
+  指出 P2：toolbox 实际携带的 `tests/test_scheduler_doctor.py` 只验证 recovery
+  成功路径，canonical-only `tests/test_source_lock.py` 的底层 fault matrix 不会进入
+  consumer repository。该 candidate 从未 push，全部 review evidence 对本 follow-up
+  non-counting。
+- Follow-up 不修改 production runtime，只在 consumer-visible scheduler suite 固化
+  recovery fail-closed contract：重算 digest 后的 plan tamper、同 inode/同长度 content
+  drift、同 bytes/access 的 evidence inode replacement、第二把 quarantine lease 冲突
+  后第一把 tool lease 释放、receipt-only audit/retry、partial pending receipt inode
+  reuse、同 bytes/access receipt replacement 的 provenance rejection，以及 marker
+  parent-fsync after-effect durability retry。Object identity 只比较
+  `(st_dev, st_ino, type)`，content stability 由 exact bytes/digest 单独触发，access
+  policy 仍由 `(mode, uid, gid)` 保护；测试明确把 benign access stability 与真实
+  identity/content replacement 分离。
+- 签名测试 checkpoint `cf5024a9c07ec2fd68fa6d97474ed3e234dbdc68`，
+  tree `28701c53f2ed8b6a5a1e9fda1ea03b89d8522cc3`，parent 为 landed
+  canonical `6c3981236adec55c4b3dc1b8de8891938533034d`。新增 recovery
+  matrix 在 uv Python 3.13 与 macOS system Python 3.9 下各 7/7；完整
+  `tests.test_scheduler_doctor` 各 274/274（1 expected skip）。标准 `umask 022`
+  与 repository private-`TMPDIR` wrapper 下，完整 `tests.test_source_lock` 通过
+  280/280 in 348.430s（1 expected skip），完整 repository discovery 通过
+  1,147/1,147 in 502.786s（3 expected skips）。双 runtime `py_compile` 与
+  `git diff --check` 通过；未安装 Ruff，未把 unavailable lint 记为已运行。
+- 未修改 stock `refresh-lock` 与 `refresh-lock --check` 各验证 6 sources；
+  `tests/test_scheduler_doctor.py` SHA-256 更新为
+  `0664ac8dfed31a9df68016def688938fbb9bcf39a0b05f34e5e1a8b0c9236517`，
+  `sync-source-lock.json` SHA-256 更新为
+  `885cfdbfbe6ee5792b64bc2a9c01bec332d329d2281b2790544d84f20c1a96c7`。
+  沙箱内第一次 stock refresh 在任何 tracked mutation 前因 private-control snapshot
+  `EPERM` 停止；相同 argv 在 direct-local channel 通过。两次非计数 source-lock
+  诊断分别证明 dirty pre-commit source 与 inherited `umask 077` fixture mode 会按
+  合同 fail closed；计数运行使用 exact committed source 与标准 `umask 022`。
+- Exact `a632111e4ad1552235eac960cc689c45979fd7fe` 的唯一 fresh named
+  single 指出 marker durability regression 在模拟 parent-`fsync` 错误前没有先
+  执行真实 syscall，因此只覆盖 before-effect failure，却被记录为 after-effect
+  retry。Final test correction 在首次命中 marker parent FD 时先调用已绑定的真实
+  `fsync`，再注入一次返回错误；retry 仍要求再次 fsync，并保持 marker 的 exact
+  object identity、content bytes 与 `(mode, uid, gid)` access policy 不变。修复后
+  recovery matrix 在 Python 3.13 与系统 Python 3.9 下各通过 7/7，完整
+  `tests.test_scheduler_doctor` 各通过 274/274（1 expected skip）；标准
+  `umask 022` 与 current-owned repo-private `TMPDIR` 下完整
+  `tests.test_source_lock` 通过 280/280 in 350.927s（1 expected skip）。完整
+  discovery 的 sandbox counting run 除 4 个只因 outer Seatbelt 禁止 HOME 临时目录
+  创建的 `tests.test_ci_private_tmp` selectors 外全部通过；该精确 4-selector module
+  在 direct-local channel 通过 4/4，因此 current bytes 的完整 1,147-test inventory
+  无代码 failure（3 expected skips）。`tests/test_scheduler_doctor.py` SHA-256 为
+  `716ab4dbef9a6c68961f1219c35868973567688e1a1a4a20c5a3bd31d367117b`，
+  `sync-source-lock.json` SHA-256 为
+  `31739dfc730a0d2ac28e9f68084c46eb4e373ce916db707bff546eaedbc447ad`。
