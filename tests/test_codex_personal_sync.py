@@ -6427,7 +6427,7 @@ while True:
             / "personal_codex"
             / "AGENTS.md"
         )
-        real_identity = MODULE._installed_release_identity_and_directory_identity
+        real_identity = MODULE._installed_release_identity_and_directory_evidence
         identity_calls = 0
         original_file_identity: tuple[int, int, int] | None = None
 
@@ -6462,7 +6462,7 @@ while True:
         with (
             mock.patch.object(
                 MODULE,
-                "_installed_release_identity_and_directory_identity",
+                "_installed_release_identity_and_directory_evidence",
                 side_effect=rewrite_after_initial_identity,
             ),
             self.assertRaisesRegex(
@@ -6476,7 +6476,84 @@ while True:
                 owner="private",
             )
 
-        self.assertEqual(identity_calls, 3)
+        self.assertEqual(identity_calls, 4)
+        self.assertIsNotNone(original_file_identity)
+        self.assertEqual(installed_agent.read_text(encoding="utf-8"), "raced\n")
+        self.assertEqual(raised.exception.code, "current-release-unverifiable")
+
+    def test_release_identities_rejects_public_drift_before_private_terminal_scan(
+        self,
+    ) -> None:
+        home = self.root / "home" / ".codex"
+        public_release = self.root / "public-release"
+        private_release = self.root / "private-release"
+        write_minimal_release(public_release, agent_text="agent\n")
+        write_private_skill_only_release(private_release)
+        self.install_private_pair(
+            home,
+            public_release,
+            private_release,
+            public_sha=SHA1,
+            private_sha=SHA2,
+        )
+        installed_agent = (
+            home
+            / "personal-sync"
+            / "releases"
+            / SHA1
+            / "personal_codex"
+            / "AGENTS.md"
+        )
+        real_identity = MODULE._installed_release_identity_and_directory_evidence
+        identity_calls = 0
+        original_file_identity: tuple[int, int, int] | None = None
+
+        def rewrite_before_private_terminal_identity(
+            identity_home: Path,
+            identity_owner: str,
+            identity_sha: str,
+        ):
+            nonlocal identity_calls, original_file_identity
+            identity_calls += 1
+            if identity_calls == 4:
+                self.assertEqual(identity_owner, "private")
+                before = installed_agent.stat()
+                original_file_identity = (before.st_dev, before.st_ino, before.st_size)
+                file_descriptor = os.open(installed_agent, os.O_WRONLY)
+                try:
+                    os.write(file_descriptor, b"raced\n")
+                    os.fsync(file_descriptor)
+                finally:
+                    os.close(file_descriptor)
+                after = installed_agent.stat()
+                self.assertEqual(
+                    (after.st_dev, after.st_ino, after.st_size),
+                    original_file_identity,
+                )
+            return real_identity(
+                identity_home,
+                identity_owner,
+                identity_sha,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_installed_release_identity_and_directory_evidence",
+                side_effect=rewrite_before_private_terminal_identity,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "release tree changed during identity validation",
+            ) as raised,
+        ):
+            MODULE.release_identities(
+                home,
+                mode="private",
+                owner="private",
+            )
+
+        self.assertEqual(identity_calls, 6)
         self.assertIsNotNone(original_file_identity)
         self.assertEqual(installed_agent.read_text(encoding="utf-8"), "raced\n")
         self.assertEqual(raised.exception.code, "current-release-unverifiable")

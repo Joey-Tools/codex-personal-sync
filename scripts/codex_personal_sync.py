@@ -4582,6 +4582,11 @@ class ManifestData:
 
 ReleaseTreeIdentity = tuple[dict[str, Any], ManifestData, str]
 ReleaseTreeExpectation = tuple[ReleaseTreeIdentity, tuple[int, int]]
+ReleaseTreeDirectoryEvidence = tuple[
+    ReleaseTreeIdentity,
+    tuple[int, int],
+    tuple[int, int, int],
+]
 
 
 @dataclass
@@ -18647,17 +18652,31 @@ def _release_tree_identity_from_directory_fd(
     return identity
 
 
-def _installed_release_identity_and_directory_identity(
+def _release_directory_identity_and_access_policy(
+    directory_fd: int,
+) -> tuple[tuple[int, int], tuple[int, int, int]]:
+    metadata = os.fstat(directory_fd)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise SyncError("bound path is no longer a directory")
+    return (
+        (metadata.st_dev, metadata.st_ino),
+        (stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid),
+    )
+
+
+def _installed_release_identity_and_directory_evidence(
     home: Path,
     owner: str,
     sha: str,
-) -> ReleaseTreeExpectation:
+) -> ReleaseTreeDirectoryEvidence:
     owner = _validate_owner(owner)
     sha = _validate_release_sha(sha, f"installed release SHA for owner {owner}")
     release_root = _releases_root(home, owner) / sha
     release_fd = _open_installed_release_directory_fd(home, owner, sha)
     try:
-        directory_identity = _directory_identity(release_fd)
+        directory_identity, directory_access_policy = (
+            _release_directory_identity_and_access_policy(release_fd)
+        )
         identity = _release_tree_identity_from_directory_fd(
             release_fd,
             release_root,
@@ -18669,11 +18688,28 @@ def _installed_release_identity_and_directory_identity(
             )
         if not _bound_directory_matches(home, release_root, release_fd):
             raise SyncError(f"installed release directory changed: {release_root}")
-        if _directory_identity(release_fd) != directory_identity:
+        terminal_directory_evidence = _release_directory_identity_and_access_policy(
+            release_fd
+        )
+        if terminal_directory_evidence != (
+            directory_identity,
+            directory_access_policy,
+        ):
             raise SyncError(f"installed release directory changed: {release_root}")
-        return identity, directory_identity
+        return identity, directory_identity, directory_access_policy
     finally:
         _close_fd_quietly(release_fd)
+
+
+def _installed_release_identity_and_directory_identity(
+    home: Path,
+    owner: str,
+    sha: str,
+) -> ReleaseTreeExpectation:
+    identity, directory_identity, _directory_access_policy = (
+        _installed_release_identity_and_directory_evidence(home, owner, sha)
+    )
+    return identity, directory_identity
 
 
 def _pending_release_expectations_for_state(
@@ -33091,31 +33127,61 @@ def _capture_scheduler_release_trees(
                 code="current-release-unverifiable",
             )
         initial_shas[release_owner] = sha
-    initial_expectations: dict[str, ReleaseTreeExpectation] = {}
+    initial_expectations: dict[str, ReleaseTreeDirectoryEvidence] = {}
     for release_owner in owners:
         sha = initial_shas[release_owner]
         initial_expectations[release_owner] = (
-            _installed_release_identity_and_directory_identity(
+            _installed_release_identity_and_directory_evidence(
                 home,
                 release_owner,
                 sha,
             )
         )
-    evidence: dict[str, dict[str, str]] = {}
+    terminal_expectations: dict[str, ReleaseTreeDirectoryEvidence] = {}
     for release_owner in owners:
         sha = initial_shas[release_owner]
-        terminal_expectation = _installed_release_identity_and_directory_identity(
-            home,
-            release_owner,
-            sha,
+        terminal_expectations[release_owner] = (
+            _installed_release_identity_and_directory_evidence(
+                home,
+                release_owner,
+                sha,
+            )
         )
-        if terminal_expectation != initial_expectations[release_owner]:
+    for release_owner in owners:
+        sha = initial_shas[release_owner]
+        if terminal_expectations[release_owner] != initial_expectations[release_owner]:
             raise SyncError(
                 "scheduler release tree changed during identity validation: "
                 f"{release_owner}@{sha}",
                 code="current-release-unverifiable",
             )
-        terminal_identity, _directory_identity_value = terminal_expectation
+    validation_expectations: dict[str, ReleaseTreeDirectoryEvidence] = {}
+    for release_owner in owners:
+        sha = initial_shas[release_owner]
+        validation_expectations[release_owner] = (
+            _installed_release_identity_and_directory_evidence(
+                home,
+                release_owner,
+                sha,
+            )
+        )
+    for release_owner in owners:
+        sha = initial_shas[release_owner]
+        if (
+            validation_expectations[release_owner]
+            != terminal_expectations[release_owner]
+        ):
+            raise SyncError(
+                "scheduler release tree changed during identity validation: "
+                f"{release_owner}@{sha}",
+                code="current-release-unverifiable",
+            )
+    evidence: dict[str, dict[str, str]] = {}
+    for release_owner in owners:
+        sha = initial_shas[release_owner]
+        terminal_identity, _directory_identity_value, _directory_access_policy = (
+            terminal_expectations[release_owner]
+        )
         evidence[release_owner] = {
             "sha": sha,
             "tree_sha256": terminal_identity[2],
