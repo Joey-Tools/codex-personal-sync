@@ -359,27 +359,33 @@ can be reconstructed without guessing. A legacy `install` or
 
 A bare repair preserves an existing audited mode, repository, base repository,
 owner, and interval while migrating the command to the stable
-`run-scheduled` entrypoint. On macOS it also migrates an audited legacy GUI
-LaunchAgent to the canonical per-user Background LaunchAgent:
+`run-scheduled` entrypoint. On macOS it also migrates an exact historical
+Background or loose GUI LaunchAgent to the canonical per-user Aqua
+LaunchAgent:
 
 ```bash
 ~/.codex/bin/codex-personal-sync install-scheduler
 ```
 
-The canonical macOS plist declares `LimitLoadToSessionType=Background` and
-`ProcessType=Background`, fixes `HOME` and `WorkingDirectory` to the account
-home, applies `Umask=077`, and enables `ThrottleInterval=60` and
-`LowPriorityIO`. Activation explicitly enables the exact label in `user/$UID`
-before bootstrapping the plist, then repeats the enable operation after
-bootstrap as an idempotent repair. The job therefore does not depend on an
-Aqua/GUI login. After a cold boot, the user's first session (including an SSH
-login) is still required before the per-user LaunchAgent can run.
+The canonical macOS plist declares `LimitLoadToSessionType=Aqua` while keeping
+the hardened `ProcessType=Background`, account-home `HOME` and
+`WorkingDirectory`, `Umask=077`, `ThrottleInterval=60`, and `LowPriorityIO`
+settings. Activation enables and bootstraps the exact label in `gui/$UID`.
+`ProcessType=Background` controls launchd process policy; it does not move the
+job out of the Aqua session.
 
-Migration removes the precisely audited legacy `gui/$UID` job before
-bootstrapping the canonical `user/$UID` job. Status and uninstall inspect both
-domains for the canonical label and every managed legacy label, so a stale
-registration cannot hide a second instance. Linux keeps the existing per-user
-systemd behavior.
+This scheduler is therefore for a Mac with a live GUI login. Do not install it
+on a headless macOS host: a role-aware controller may synchronize such a host,
+but host inventory, role activation, and SSH fanout belong outside this
+canonical repository. Linux keeps the existing per-user systemd behavior.
+
+Migration accepts only exact historical profiles: the hardened Background job
+in `user/$UID` and the earlier loose GUI job in `gui/$UID`. Activation first
+removes or disables the exact Background identity, then replaces the exact GUI
+identity with the hardened Aqua job. Status and uninstall continue to inspect
+both domains for the canonical label and every managed legacy label, so stale
+registration cannot hide a second instance. A healthy macOS scheduler has the
+canonical job loaded only in `gui/$UID`.
 
 Use explicit arguments only for an intentional target change or a first
 installation. For example:
@@ -403,6 +409,23 @@ mirror automation, and retention dry-runs never install, reconfigure, or
 remove a scheduler. Do not blindly reinstall hosts or delete a saturated
 private-control quarantine; use the report evidence and the separately
 reviewed recovery procedure.
+
+To obtain a machine-readable identity for the active immutable releases, use:
+
+```bash
+~/.codex/bin/codex-personal-sync release-identities \
+  --mode private \
+  --owner private \
+  --home ~/.codex \
+  --json
+```
+
+The versioned response reports `sha` and `tree_sha256` for both the public and
+private owners. Public mode reports only the public owner. The command holds
+the installation lock without creating missing state, validates each current
+release manifest and full tree, and rejects a `current` pointer change across
+the validation boundary. It is read-only and does not infer a host role,
+install a scheduler, or perform synchronization.
 
 ## Test
 

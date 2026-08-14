@@ -3,11 +3,11 @@ id: 20260804-macos-background-launchagent
 title: macOS Background LaunchAgent Default
 status: completed
 created: 2026-08-04
-updated: 2026-08-04
+updated: 2026-08-14
 branch: wip/macos-background-launchagent
 pr:
 supersedes: []
-superseded_by:
+superseded_by: 20260814-macos-aqua-release-identity
 ---
 
 # macOS Background LaunchAgent Default

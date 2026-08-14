@@ -637,6 +637,26 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertEqual(install_private_args.base_repo, "ExampleOrg/public-codex")
         self.assertIsNone(scheduler_args.base_repo)
 
+    def test_release_identities_parser_accepts_private_json_query(self) -> None:
+        args = MODULE.build_parser().parse_args(
+            [
+                "release-identities",
+                "--mode",
+                "private",
+                "--owner",
+                "private",
+                "--home",
+                "/tmp/test-codex-home",
+                "--json",
+            ]
+        )
+
+        self.assertEqual(args.command, "release-identities")
+        self.assertEqual(args.mode, "private")
+        self.assertEqual(args.owner, "private")
+        self.assertEqual(args.home, "/tmp/test-codex-home")
+        self.assertIs(args.json, True)
+
     def test_install_private_downloads_public_base_and_overlay(self) -> None:
         public_release = self.root / "public-release"
         private_release = self.root / "private-release"
@@ -6243,6 +6263,202 @@ while True:
         self.assertEqual(issues[0][0], "immutable-release-drift")
         self.assertIn("differs from the last verified", issues[0][3])
 
+    def test_release_identities_reports_exact_private_release_pair(self) -> None:
+        home = self.root / "home" / ".codex"
+        public_release = self.root / "public-release"
+        private_release = self.root / "private-release"
+        write_skill_manifest_release(public_release, skills=("public-base",))
+        write_skill_manifest_release(
+            private_release,
+            owner="private",
+            skills=("private-only",),
+        )
+        self.install_private_pair(
+            home,
+            public_release,
+            private_release,
+            public_sha=SHA1,
+            private_sha=SHA2,
+        )
+        public_tree = MODULE._installed_release_identity(
+            home,
+            MODULE.PUBLIC_OWNER,
+            SHA1,
+        )[2]
+        private_tree = MODULE._installed_release_identity(home, "private", SHA2)[2]
+
+        payload = MODULE.release_identities(
+            home,
+            mode="private",
+            owner="private",
+        )
+
+        self.assertEqual(
+            payload,
+            {
+                "version": 1,
+                "mode": "private",
+                "release_trees": {
+                    "private": {
+                        "sha": SHA2,
+                        "tree_sha256": private_tree,
+                    },
+                    "public": {
+                        "sha": SHA1,
+                        "tree_sha256": public_tree,
+                    },
+                },
+            },
+        )
+
+    def test_release_identities_main_normalizes_public_owner_for_json(self) -> None:
+        release_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_minimal_release(release_root)
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+        public_tree = MODULE._installed_release_identity(
+            home,
+            MODULE.PUBLIC_OWNER,
+            SHA1,
+        )[2]
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            result = MODULE.main(
+                [
+                    "release-identities",
+                    "--mode",
+                    "public",
+                    "--home",
+                    str(home),
+                    "--json",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {
+                "version": 1,
+                "mode": "public",
+                "release_trees": {
+                    "public": {
+                        "sha": SHA1,
+                        "tree_sha256": public_tree,
+                    }
+                },
+            },
+        )
+
+    def test_release_identities_private_mode_rejects_public_owner(self) -> None:
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "private release identity owner must not be public",
+        ):
+            MODULE.release_identities(
+                self.root / "home" / ".codex",
+                mode="private",
+                owner=MODULE.PUBLIC_OWNER,
+            )
+
+    def test_release_identities_rejects_current_pointer_drift(self) -> None:
+        home = self.root / "home" / ".codex"
+        public_release = self.root / "public-release"
+        private_release = self.root / "private-release"
+        write_skill_manifest_release(public_release, skills=("public-base",))
+        write_skill_manifest_release(
+            private_release,
+            owner="private",
+            skills=("private-only",),
+        )
+        self.install_private_pair(
+            home,
+            public_release,
+            private_release,
+            public_sha=SHA1,
+            private_sha=SHA2,
+        )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_current_sha",
+                side_effect=(SHA1, SHA2, SHA1, SHA3),
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "current release changed during identity validation",
+            ) as raised,
+        ):
+            MODULE.release_identities(
+                home,
+                mode="private",
+                owner="private",
+            )
+
+        self.assertEqual(raised.exception.code, "current-release-unverifiable")
+
+    def test_release_identities_missing_current_fails_closed(self) -> None:
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "release identity state is unavailable",
+        ) as raised:
+            MODULE.release_identities(
+                self.root / "home" / ".codex",
+                mode="public",
+                owner="private",
+            )
+
+        self.assertEqual(raised.exception.code, "current-release-unverifiable")
+
+    def test_release_identities_invalid_installed_release_fails_closed(self) -> None:
+        release_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_minimal_release(release_root)
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+        installed_agent = (
+            home
+            / "personal-sync"
+            / "releases"
+            / SHA1
+            / "personal_codex"
+            / "AGENTS.md"
+        )
+        installed_agent.chmod(0o666)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = MODULE.main(
+                [
+                    "release-identities",
+                    "--mode",
+                    "public",
+                    "--home",
+                    str(home),
+                    "--json",
+                ]
+            )
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("release tree entry mode is not sanitized", stderr.getvalue())
+
     def test_install_release_tree_removes_stale_links_after_manifest_shrink(
         self,
     ) -> None:
@@ -7569,7 +7785,7 @@ while True:
                 "PYTHONDONTWRITEBYTECODE": "1",
             },
         )
-        self.assertEqual(payload["LimitLoadToSessionType"], "Background")
+        self.assertEqual(payload["LimitLoadToSessionType"], "Aqua")
         self.assertEqual(payload["ProcessType"], "Background")
         self.assertIs(payload["LowPriorityIO"], True)
         self.assertEqual(payload["ThrottleInterval"], 60)
@@ -7577,7 +7793,45 @@ while True:
         self.assertEqual(payload["WorkingDirectory"], str(self.user_home))
         self.assertIn("codex-personal-sync.out.log", payload["StandardOutPath"])
 
-    def test_bare_install_scheduler_migrates_legacy_gui_plist_to_background(
+    def test_bare_install_scheduler_migrates_exact_legacy_background_to_aqua(
+        self,
+    ) -> None:
+        home = self.user_home / ".codex"
+        runner = write_scheduler_runner(home)
+        paths = MODULE._scheduler_paths("macos", home)
+        assert paths.launchd_plist is not None
+        paths.launchd_plist.parent.mkdir(parents=True)
+        legacy = MODULE._legacy_background_launchd_plist(
+            home,
+            "owner/repo",
+            71,
+            runner,
+        )
+        paths.launchd_plist.write_bytes(plistlib.dumps(legacy, sort_keys=True))
+
+        self.run_quietly(
+            MODULE.install_scheduler,
+            home,
+            None,
+            None,
+            "macos",
+            None,
+            dry_run=False,
+            enable=False,
+        )
+
+        with paths.launchd_plist.open("rb") as file:
+            migrated = plistlib.load(file)
+        self.assertEqual(migrated["LimitLoadToSessionType"], "Aqua")
+        self.assertEqual(migrated["ProcessType"], "Background")
+        self.assertEqual(migrated["WorkingDirectory"], str(self.user_home))
+        self.assertEqual(
+            migrated["EnvironmentVariables"]["HOME"],
+            str(self.user_home),
+        )
+        self.assertEqual(migrated["StartInterval"], 71 * 60)
+
+    def test_bare_install_scheduler_migrates_historical_loose_gui_to_aqua(
         self,
     ) -> None:
         home = self.user_home / ".codex"
@@ -7616,7 +7870,7 @@ while True:
 
         with paths.launchd_plist.open("rb") as file:
             migrated = plistlib.load(file)
-        self.assertEqual(migrated["LimitLoadToSessionType"], "Background")
+        self.assertEqual(migrated["LimitLoadToSessionType"], "Aqua")
         self.assertEqual(migrated["ProcessType"], "Background")
         self.assertEqual(migrated["WorkingDirectory"], str(self.user_home))
         self.assertEqual(
@@ -7631,7 +7885,7 @@ while True:
         paths = MODULE._scheduler_paths("macos", home)
         assert paths.launchd_plist is not None
         paths.launchd_plist.parent.mkdir(parents=True)
-        legacy = MODULE._launchd_plist(
+        legacy = MODULE._legacy_background_launchd_plist(
             home,
             "Joey-Tools/codex-private-workflows",
             73,
@@ -7786,16 +8040,17 @@ while True:
             / f"{MODULE.LAUNCHD_LABEL}.plist"
         )
         uid = os.getuid()
+        gui_domain = f"gui/{uid}"
         gui_target = f"gui/{uid}/{MODULE.LAUNCHD_LABEL}"
         user_domain = f"user/{uid}"
         user_target = f"{user_domain}/{MODULE.LAUNCHD_LABEL}"
         current_identity_calls = [
-            ["/bin/launchctl", "bootout", gui_target],
-            ["/bin/launchctl", "disable", gui_target],
             ["/bin/launchctl", "bootout", user_target],
-            ["/bin/launchctl", "enable", user_target],
-            ["/bin/launchctl", "bootstrap", user_domain, str(plist_path)],
-            ["/bin/launchctl", "enable", user_target],
+            ["/bin/launchctl", "disable", user_target],
+            ["/bin/launchctl", "bootout", gui_target],
+            ["/bin/launchctl", "enable", gui_target],
+            ["/bin/launchctl", "bootstrap", gui_domain, str(plist_path)],
+            ["/bin/launchctl", "enable", gui_target],
         ]
         self.assertEqual(
             [call for call in calls if call in current_identity_calls],
