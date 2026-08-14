@@ -18,12 +18,12 @@
     "engine": {
       "mode": "0755",
       "path": "scripts/codex_personal_sync.py",
-      "sha256": "3b53a45836d4c79a0a0d74dfc02fe0e213b706c6487f2319af7c617c85a5e019"
+      "sha256": "03edddcb18bbf2ac85cab468804f22a29ebe7445d913ab40facd96649d8e7dee"
     },
     "engine_tests": {
       "mode": "0644",
       "path": "tests/test_codex_personal_sync.py",
-      "sha256": "bec7f6362df709abff293ad443cfd634f15860b3694c84b86ed0187edf678283"
+      "sha256": "d3f2706fa9dba46a2c57b600fd84b7423cc91ac7aff0fa37f269fc1bfb1ff83c"
     },
     "manifest_schema": {
       "mode": "0644",

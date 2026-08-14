@@ -33091,17 +33091,34 @@ def _capture_scheduler_release_trees(
                 code="current-release-unverifiable",
             )
         initial_shas[release_owner] = sha
+    initial_expectations: dict[str, ReleaseTreeExpectation] = {}
+    for release_owner in owners:
+        sha = initial_shas[release_owner]
+        initial_expectations[release_owner] = (
+            _installed_release_identity_and_directory_identity(
+                home,
+                release_owner,
+                sha,
+            )
+        )
     evidence: dict[str, dict[str, str]] = {}
     for release_owner in owners:
         sha = initial_shas[release_owner]
-        _payload, _manifest, tree_sha256 = _installed_release_identity(
+        terminal_expectation = _installed_release_identity_and_directory_identity(
             home,
             release_owner,
             sha,
         )
+        if terminal_expectation != initial_expectations[release_owner]:
+            raise SyncError(
+                "scheduler release tree changed during identity validation: "
+                f"{release_owner}@{sha}",
+                code="current-release-unverifiable",
+            )
+        terminal_identity, _directory_identity_value = terminal_expectation
         evidence[release_owner] = {
             "sha": sha,
-            "tree_sha256": tree_sha256,
+            "tree_sha256": terminal_identity[2],
         }
     final_shas = {
         release_owner: _current_sha(home, release_owner)
