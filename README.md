@@ -469,10 +469,24 @@ Every successful Darwin installation retains the complete descriptor chain
 from the synchronization home through each next-current release and
 revalidates that chain's identity and access-policy safety at final admission.
 This includes an exact no-op and a managed-link-only update; an unchanged
-`current` pointer does not bypass the chain gate. Non-Darwin behavior is
-unchanged. An unsafe inherited ACL can therefore block installation or final
-active-inventory admission even when POSIX mode bits look restrictive; have an
-administrator remove the unsafe inherited ACL and retry.
+`current` pointer does not bypass the chain gate. The install directory-chain
+container owns the deduplicated set of unique strict-ancestor descriptors
+across owners. Each release binding's `releases_fd` and `release_fd` remain
+borrowed rather than transferring into that container, and are revalidated
+separately.
+
+After initial chain validation, every non-no-op Darwin install, including a
+managed-link-only update, performs a point-in-time 80-FD `dup` headroom probe
+before pending staging or any publication, `current`, managed-link, or state
+change. Every probe descriptor is closed on both success and failure. An exact
+no-op still validates its chains but skips this mutation-only probe. The probe
+demonstrates capacity only at that instant; it does not claim protection from
+concurrent same-process FD churn. If managed-state prepublication detects ACL
+drift, the stable error remains `current-release-unverifiable`. Non-Darwin
+behavior is unchanged. An unsafe inherited ACL can therefore block
+installation or final active-inventory admission even when POSIX mode bits
+look restrictive; have an administrator remove the unsafe inherited ACL and
+retry.
 
 ## Test
 

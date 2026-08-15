@@ -4617,6 +4617,12 @@ class InstallReleaseBinding:
 
 
 @dataclass(frozen=True)
+class _InstallReleaseDirectoryChains:
+    bindings: tuple[InstallReleaseBinding, ...]
+    ancestors: tuple[_ReleaseIdentityDirectoryBinding, ...]
+
+
+@dataclass(frozen=True)
 class ActiveReleaseExpectation:
     owner: str
     sha: str
@@ -21131,75 +21137,163 @@ def _open_install_release_directory_chains(
     home: Path,
     bindings: dict[str, InstallReleaseBinding],
     expected_owner_uid: int,
-) -> list[
-    tuple[InstallReleaseBinding, list[_ReleaseIdentityDirectoryBinding]]
-]:
-    chains: list[
-        tuple[InstallReleaseBinding, list[_ReleaseIdentityDirectoryBinding]]
-    ] = []
-    try:
-        for owner, binding in sorted(bindings.items()):
-            if (
-                binding.owner != owner
-                or binding.expected_owner_uid != expected_owner_uid
-            ):
-                raise SyncError(
-                    f"install release policy binding mismatch for owner {owner}"
-                )
-            release_root = binding.releases_root / binding.sha
-            directory_bindings = _open_release_identity_directory_chain(
-                home,
-                release_root,
-                expected_owner_uid,
+) -> _InstallReleaseDirectoryChains:
+    for owner, binding in bindings.items():
+        if binding.owner != owner:
+            raise SyncError(
+                f"install release policy binding mismatch for owner {owner}"
             )
-            chains.append((binding, directory_bindings))
-            if (
-                directory_bindings[-1].identity
-                != binding.expected_directory_identity
-            ):
-                raise _release_identity_policy_error(
-                    release_root,
-                    "bound install release object changed",
-                    mismatch=True,
+    ordered_bindings = tuple(binding for _owner, binding in sorted(bindings.items()))
+    expected_ancestor_paths = _install_release_strict_ancestor_paths(
+        home,
+        ordered_bindings,
+        expected_owner_uid,
+    )
+    ancestors: list[_ReleaseIdentityDirectoryBinding] = []
+    ancestors_by_path: dict[Path, _ReleaseIdentityDirectoryBinding] = {}
+    current_path = home
+    try:
+        for current_path in expected_ancestor_paths:
+            if current_path == home:
+                file_descriptor = _bound_sync_home_anchor(home, None)
+            else:
+                parent_binding = ancestors_by_path.get(current_path.parent)
+                if parent_binding is None:
+                    raise SyncError(
+                        "install release ancestor set is not prefix-complete: "
+                        f"{current_path}"
+                    )
+                file_descriptor = os.open(
+                    current_path.name,
+                    _source_directory_flags(),
+                    dir_fd=parent_binding.file_descriptor,
                 )
-        return chains
-    except BaseException:
-        for _binding, directory_bindings in reversed(chains):
-            _close_release_identity_directory_bindings(directory_bindings)
+            try:
+                metadata = _require_release_identity_fd_access_policy(
+                    file_descriptor,
+                    current_path,
+                    expected_owner_uid,
+                )
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise _release_identity_policy_error(
+                        current_path,
+                        "bound install ancestor is not a directory",
+                        mismatch=True,
+                    )
+            except BaseException:
+                _close_fd_quietly(file_descriptor)
+                raise
+            ancestor = _ReleaseIdentityDirectoryBinding(
+                path=current_path,
+                file_descriptor=file_descriptor,
+                identity=(metadata.st_dev, metadata.st_ino),
+            )
+            ancestors.append(ancestor)
+            ancestors_by_path[current_path] = ancestor
+        _require_release_identity_directory_bindings(
+            home,
+            ancestors,
+            expected_owner_uid,
+        )
+        return _InstallReleaseDirectoryChains(
+            bindings=ordered_bindings,
+            ancestors=tuple(ancestors),
+        )
+    except BaseException as error:
+        _close_release_identity_directory_bindings(ancestors)
+        if isinstance(error, OSError):
+            raise _release_identity_policy_error(
+                current_path,
+                f"cannot open install release ancestor: {error}",
+                mismatch=False,
+            ) from error
         raise
+
+
+def _install_release_strict_ancestor_paths(
+    home: Path,
+    bindings: tuple[InstallReleaseBinding, ...],
+    expected_owner_uid: int,
+) -> tuple[Path, ...]:
+    expected_paths = {home}
+    seen_owners: set[str] = set()
+    for binding in bindings:
+        if (
+            binding.owner in seen_owners
+            or binding.expected_owner_uid != expected_owner_uid
+            or binding.releases_root != _releases_root(home, binding.owner)
+        ):
+            raise SyncError(
+                f"install release policy binding mismatch for owner {binding.owner}"
+            )
+        seen_owners.add(binding.owner)
+        release_root = binding.releases_root / binding.sha
+        parts = _directory_parts_beneath(home, release_root)
+        if len(parts) < 2 or parts[-2:] != ("releases", binding.sha):
+            raise SyncError(
+                f"install release path mismatch for owner {binding.owner}"
+            )
+        current_path = home
+        for part in parts[:-2]:
+            current_path /= part
+            expected_paths.add(current_path)
+    return tuple(
+        sorted(
+            expected_paths,
+            key=lambda path: (
+                len(path.relative_to(home).parts),
+                path.relative_to(home).parts,
+            ),
+        )
+    )
 
 
 def _require_install_release_directory_chains(
     home: Path,
-    chains: list[
-        tuple[InstallReleaseBinding, list[_ReleaseIdentityDirectoryBinding]]
-    ],
+    chains: _InstallReleaseDirectoryChains,
     expected_owner_uid: int,
 ) -> None:
-    for binding, directory_bindings in chains:
-        _require_release_identity_directory_bindings(
-            home,
-            directory_bindings,
-            expected_owner_uid,
-        )
-        if (
-            directory_bindings[-1].identity
-            != binding.expected_directory_identity
-        ):
-            raise _release_identity_policy_error(
-                binding.releases_root / binding.sha,
-                "bound install release object changed",
-                mismatch=True,
-            )
+    expected_paths = _install_release_strict_ancestor_paths(
+        home,
+        chains.bindings,
+        expected_owner_uid,
+    )
+    actual_paths = tuple(ancestor.path for ancestor in chains.ancestors)
+    if actual_paths != expected_paths or len(set(actual_paths)) != len(actual_paths):
+        raise SyncError("install release ancestor binding set mismatch")
+    _require_release_identity_directory_bindings(
+        home,
+        list(chains.ancestors),
+        expected_owner_uid,
+    )
+    for binding in chains.bindings:
+        _verify_install_release_canonical_binding(home, binding)
 
 
 def _close_install_release_directory_chains(
-    chains: list[
-        tuple[InstallReleaseBinding, list[_ReleaseIdentityDirectoryBinding]]
-    ],
+    chains: _InstallReleaseDirectoryChains | None,
 ) -> None:
-    for _binding, directory_bindings in reversed(chains):
-        _close_release_identity_directory_bindings(directory_bindings)
+    if chains is None:
+        return
+    _close_release_identity_directory_bindings(list(chains.ancestors))
+
+
+def _probe_install_release_fd_headroom(
+    chains: _InstallReleaseDirectoryChains,
+) -> None:
+    if not chains.ancestors:
+        raise SyncError("install release ancestor binding set is empty")
+    probe_fds: list[int] = []
+    try:
+        for _index in range(MAX_ARCHIVE_MEMBER_PATH_DEPTH + 16):
+            probe_fds.append(os.dup(chains.ancestors[0].file_descriptor))
+    except OSError as error:
+        raise SyncError(
+            "insufficient file descriptor headroom for install transaction"
+        ) from error
+    finally:
+        for file_descriptor in reversed(probe_fds):
+            _close_fd_quietly(file_descriptor)
 
 
 def _verify_install_release_canonical_binding(
@@ -21469,7 +21563,8 @@ def _owner_shas_from_bound_current_releases(
             )
         except SyncError as error:
             raise SyncError(
-                f"current release changed {phase} for owner {owner}"
+                f"current release changed {phase} for owner {owner}",
+                code=error.code,
             ) from error
     return owner_shas
 
@@ -21807,7 +21902,7 @@ def _install_release_set_unlocked(
     link_transaction: ReconcileTransaction | None = None
     state_transaction: ManagedStateFileTransaction | None = None
     state_committed = False
-    install_release_directory_chains = []
+    install_release_directory_chains: _InstallReleaseDirectoryChains | None = None
     try:
         initial_state_snapshot = _bind_managed_state_parent_for_pending_staging(
             home,
@@ -21859,7 +21954,7 @@ def _install_release_set_unlocked(
                             "overlay no-op verification failed with "
                             f"{len(issues)} issue(s)"
                         )
-                if install_release_directory_chains:
+                if install_release_directory_chains is not None:
                     _require_install_release_directory_chains(
                         home,
                         install_release_directory_chains,
@@ -21869,10 +21964,33 @@ def _install_release_set_unlocked(
                 _close_install_release_directory_chains(
                     install_release_directory_chains
                 )
-                install_release_directory_chains = []
+                install_release_directory_chains = None
                 _close_install_release_bindings(held_bindings)
             print("all managed symlinks already point at current")
             return
+        if expected_owner_uid is not None:
+            try:
+                install_release_directory_chains = (
+                    _open_install_release_directory_chains(
+                        home,
+                        next_current_bindings,
+                        expected_owner_uid,
+                    )
+                )
+                _require_install_release_directory_chains(
+                    home,
+                    install_release_directory_chains,
+                    expected_owner_uid,
+                )
+            except (OSError, SyncError) as error:
+                raise SyncError(
+                    "release tree changed before activation; raced release set "
+                    f"was left in place: {error}",
+                    code=error.code if isinstance(error, SyncError) else None,
+                ) from error
+            _probe_install_release_fd_headroom(
+                install_release_directory_chains,
+            )
         pending_batch = _stage_pending_link_batch(
             home,
             [("current", current_actions), ("managed", actions)],
@@ -21898,24 +22016,11 @@ def _install_release_set_unlocked(
             phase="before activation",
             verify_current=False,
         )
-        if expected_owner_uid is not None:
-            install_release_directory_chains = (
-                _open_install_release_directory_chains(
-                    home,
-                    next_current_bindings,
-                    expected_owner_uid,
-                )
-            )
-            _require_install_release_directory_chains(
-                home,
-                install_release_directory_chains,
-                expected_owner_uid,
-            )
         current_transaction = ReconcileTransaction(
             batch_root=pending_batch.batch_root,
             mutations=[],
         )
-        if install_release_directory_chains:
+        if install_release_directory_chains is not None:
             _require_install_release_directory_chains(
                 home,
                 install_release_directory_chains,
@@ -21930,7 +22035,7 @@ def _install_release_set_unlocked(
             batch_root=pending_batch.batch_root,
             transaction=current_transaction,
         )
-        if install_release_directory_chains:
+        if install_release_directory_chains is not None:
             _require_install_release_directory_chains(
                 home,
                 install_release_directory_chains,
@@ -22049,7 +22154,7 @@ def _install_release_set_unlocked(
         _verify_managed_link_snapshots(home, next_state, managed_link_snapshots)
         _verify_committed_pending_link_records(home, pending_batch)
         _verify_published_state_transaction(home, state_transaction)
-        if install_release_directory_chains:
+        if install_release_directory_chains is not None:
             _require_install_release_directory_chains(
                 home,
                 install_release_directory_chains,
@@ -22063,7 +22168,7 @@ def _install_release_set_unlocked(
         _close_install_release_directory_chains(
             install_release_directory_chains
         )
-        install_release_directory_chains = []
+        install_release_directory_chains = None
         if (
             not state_committed
             and pending_batch is not None

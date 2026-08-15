@@ -476,6 +476,32 @@ class CodexPersonalSyncTests(unittest.TestCase):
         finally:
             os.close(release_fd)
 
+    def open_install_release_binding_fixture(
+        self,
+        home: Path,
+        owner: str,
+        sha: str,
+    ) -> MODULE.InstallReleaseBinding:
+        releases_root = MODULE._releases_root(home, owner)
+        release_root = releases_root / sha
+        release_root.mkdir(parents=True)
+        releases_fd = os.open(releases_root, MODULE._source_directory_flags())
+        release_fd = os.open(release_root, MODULE._source_directory_flags())
+        release_metadata = os.fstat(release_fd)
+        return MODULE.InstallReleaseBinding(
+            owner=owner,
+            sha=sha,
+            expected_identity=mock.sentinel.release_identity,
+            expected_directory_identity=(
+                release_metadata.st_dev,
+                release_metadata.st_ino,
+            ),
+            expected_owner_uid=os.geteuid(),
+            releases_root=releases_root,
+            releases_fd=releases_fd,
+            release_fd=release_fd,
+        )
+
     @contextlib.contextmanager
     def capture_reconcile_backups(self):
         events: list[tuple[str, str, str | None, str | None]] = []
@@ -6710,6 +6736,167 @@ while True:
         finally:
             os.close(file_descriptor)
 
+    def test_install_release_directory_chains_deduplicate_owned_ancestors(
+        self,
+    ) -> None:
+        home = self.root / "home" / ".codex"
+        overlay_owners = tuple(f"overlay-{index:02d}" for index in range(30))
+        bindings = {
+            MODULE.PUBLIC_OWNER: self.open_install_release_binding_fixture(
+                home,
+                MODULE.PUBLIC_OWNER,
+                SHA1,
+            ),
+        }
+        bindings.update(
+            {
+                owner: self.open_install_release_binding_fixture(
+                    home,
+                    owner,
+                    SHA2,
+                )
+                for owner in overlay_owners
+            }
+        )
+        chains = None
+        ancestor_fds: tuple[int, ...] = ()
+        try:
+            chains = MODULE._open_install_release_directory_chains(
+                home,
+                bindings,
+                os.geteuid(),
+            )
+            expected_paths = (
+                home,
+                home / "personal-sync",
+                home / "personal-sync" / "overlays",
+                *(
+                    home / "personal-sync" / "overlays" / owner
+                    for owner in overlay_owners
+                ),
+            )
+            self.assertEqual(len(expected_paths), 33)
+            self.assertEqual(
+                tuple(ancestor.path for ancestor in chains.ancestors),
+                expected_paths,
+            )
+            ancestor_fds = tuple(
+                ancestor.file_descriptor for ancestor in chains.ancestors
+            )
+            self.assertEqual(len(set(ancestor_fds)), len(expected_paths))
+            borrowed_fds = {
+                file_descriptor
+                for binding in bindings.values()
+                for file_descriptor in (binding.releases_fd, binding.release_fd)
+            }
+            self.assertTrue(set(ancestor_fds).isdisjoint(borrowed_fds))
+            tampered = MODULE._InstallReleaseDirectoryChains(
+                bindings=chains.bindings,
+                ancestors=chains.ancestors[:-1],
+            )
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "ancestor binding set mismatch",
+            ):
+                MODULE._require_install_release_directory_chains(
+                    home,
+                    tampered,
+                    os.geteuid(),
+                )
+            MODULE._require_install_release_directory_chains(
+                home,
+                chains,
+                os.geteuid(),
+            )
+            MODULE._close_install_release_directory_chains(chains)
+            chains = None
+            for binding in bindings.values():
+                os.fstat(binding.releases_fd)
+                os.fstat(binding.release_fd)
+            for file_descriptor in ancestor_fds:
+                with self.assertRaises(OSError):
+                    os.fstat(file_descriptor)
+        finally:
+            MODULE._close_install_release_directory_chains(chains)
+            MODULE._close_install_release_bindings(list(bindings.values()))
+
+    def test_install_release_directory_chains_revalidate_borrowed_binding(
+        self,
+    ) -> None:
+        home = self.root / "home" / ".codex"
+        binding = self.open_install_release_binding_fixture(
+            home,
+            MODULE.PUBLIC_OWNER,
+            SHA1,
+        )
+        chains = None
+        try:
+            chains = MODULE._open_install_release_directory_chains(
+                home,
+                {MODULE.PUBLIC_OWNER: binding},
+                os.geteuid(),
+            )
+            binding.expected_directory_identity = (-1, -1)
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "canonical release directory identity mismatch",
+            ):
+                MODULE._require_install_release_directory_chains(
+                    home,
+                    chains,
+                    os.geteuid(),
+                )
+        finally:
+            MODULE._close_install_release_directory_chains(chains)
+            MODULE._close_install_release_bindings([binding])
+
+    def test_install_release_fd_headroom_probe_cleans_partial_allocation(
+        self,
+    ) -> None:
+        home = self.root / "home" / ".codex"
+        home.mkdir(parents=True)
+        anchor_fd = os.open(home, MODULE._source_directory_flags())
+        chains = MODULE._InstallReleaseDirectoryChains(
+            bindings=(),
+            ancestors=(
+                MODULE._ReleaseIdentityDirectoryBinding(
+                    path=home,
+                    file_descriptor=anchor_fd,
+                    identity=MODULE._directory_identity(anchor_fd),
+                ),
+            ),
+        )
+        real_dup = os.dup
+        duplicated_fds: list[int] = []
+
+        def fail_after_three_duplicates(file_descriptor: int) -> int:
+            if len(duplicated_fds) == 3:
+                raise OSError(MODULE.errno.EMFILE, "forced descriptor limit")
+            duplicated = real_dup(file_descriptor)
+            duplicated_fds.append(duplicated)
+            return duplicated
+
+        try:
+            with (
+                mock.patch.object(
+                    MODULE.os,
+                    "dup",
+                    side_effect=fail_after_three_duplicates,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "insufficient file descriptor headroom",
+                ),
+            ):
+                MODULE._probe_install_release_fd_headroom(chains)
+            self.assertEqual(len(duplicated_fds), 3)
+            for file_descriptor in duplicated_fds:
+                with self.assertRaises(OSError):
+                    os.fstat(file_descriptor)
+            os.fstat(anchor_fd)
+        finally:
+            os.close(anchor_fd)
+
     def test_repeat_install_non_darwin_does_not_open_acl_directory_chains(
         self,
     ) -> None:
@@ -6747,6 +6934,209 @@ while True:
 
         open_chains.assert_not_called()
         load_api.assert_not_called()
+
+    def test_install_fd_probe_precedes_normal_and_managed_only_staging(
+        self,
+    ) -> None:
+        for scenario in ("normal", "managed-only"):
+            with self.subTest(scenario=scenario):
+                case_root = self.root / scenario
+                source_one = case_root / "release-one"
+                source_two = case_root / "release-two"
+                home = case_root / "home" / ".codex"
+                write_minimal_release(source_one, agent_text="one\n")
+                self.run_quietly(
+                    MODULE.install_release_tree,
+                    source_one,
+                    home,
+                    SHA1,
+                    dry_run=False,
+                )
+                install_source = source_one
+                install_sha = SHA1
+                managed_link = home / "AGENTS.md"
+                if scenario == "normal":
+                    write_minimal_release(source_two, agent_text="two\n")
+                    install_source = source_two
+                    install_sha = SHA2
+                else:
+                    managed_link.unlink()
+
+                def symlink_snapshot(path: Path) -> tuple[object, ...] | None:
+                    if not os.path.lexists(path):
+                        return None
+                    metadata = path.lstat()
+                    return (
+                        metadata.st_dev,
+                        metadata.st_ino,
+                        stat.S_IFMT(metadata.st_mode),
+                        stat.S_IMODE(metadata.st_mode),
+                        metadata.st_uid,
+                        metadata.st_gid,
+                        path.readlink(),
+                    )
+
+                state_path = MODULE._state_path(home)
+
+                def state_snapshot() -> tuple[object, ...]:
+                    metadata = state_path.lstat()
+                    return (
+                        metadata.st_dev,
+                        metadata.st_ino,
+                        stat.S_IFMT(metadata.st_mode),
+                        stat.S_IMODE(metadata.st_mode),
+                        metadata.st_uid,
+                        metadata.st_gid,
+                        state_path.read_bytes(),
+                    )
+
+                def exact_namespace_snapshot(
+                    root: Path,
+                ) -> tuple[tuple[object, ...], ...]:
+                    if not os.path.lexists(root):
+                        return ()
+                    entries: list[tuple[object, ...]] = []
+
+                    def visit(path: Path) -> None:
+                        metadata = path.lstat()
+                        relative = (
+                            "." if path == root else path.relative_to(root).as_posix()
+                        )
+                        payload: bytes | str | None = None
+                        if stat.S_ISLNK(metadata.st_mode):
+                            payload = os.readlink(path)
+                        elif stat.S_ISREG(metadata.st_mode):
+                            payload = path.read_bytes()
+                        entries.append(
+                            (
+                                relative,
+                                stat.S_IFMT(metadata.st_mode),
+                                metadata.st_mode,
+                                metadata.st_dev,
+                                metadata.st_ino,
+                                metadata.st_uid,
+                                metadata.st_gid,
+                                payload,
+                            )
+                        )
+                        if stat.S_ISDIR(metadata.st_mode):
+                            for child in sorted(path.iterdir(), key=lambda item: item.name):
+                                visit(child)
+
+                    visit(root)
+                    return tuple(entries)
+
+                current = home / "personal-sync" / "current"
+                current_metadata = current.lstat()
+                current_snapshot = (
+                    current_metadata.st_dev,
+                    current_metadata.st_ino,
+                    current.readlink(),
+                )
+                managed_link_before = symlink_snapshot(managed_link)
+                state_before = state_snapshot()
+                pending_namespace_paths = (
+                    home / "personal-sync" / MODULE.QUARANTINE_RELATIVE_PATH,
+                    home / "personal-sync" / MODULE.PENDING_CLEANUP_INDEX_RELATIVE_PATH,
+                )
+                pending_namespace_before = tuple(
+                    exact_namespace_snapshot(path) for path in pending_namespace_paths
+                )
+
+                with (
+                    mock.patch.object(MODULE.sys, "platform", "darwin"),
+                    mock.patch.object(
+                        MODULE,
+                        "_require_release_identity_fd_access_policy",
+                        side_effect=lambda file_descriptor, _path, _uid: os.fstat(
+                            file_descriptor
+                        ),
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_probe_install_release_fd_headroom",
+                        side_effect=MODULE.SyncError("forced headroom failure"),
+                    ) as probe,
+                    mock.patch.object(
+                        MODULE,
+                        "_stage_pending_link_batch",
+                        side_effect=AssertionError(
+                            "pending staging must follow the headroom probe"
+                        ),
+                    ) as stage_pending,
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "forced headroom failure",
+                    ),
+                ):
+                    self.run_quietly(
+                        MODULE.install_release_tree,
+                        install_source,
+                        home,
+                        install_sha,
+                        dry_run=False,
+                    )
+
+                probe.assert_called_once()
+                stage_pending.assert_not_called()
+                terminal_current = current.lstat()
+                self.assertEqual(
+                    (
+                        terminal_current.st_dev,
+                        terminal_current.st_ino,
+                        current.readlink(),
+                    ),
+                    current_snapshot,
+                )
+                self.assertEqual(symlink_snapshot(managed_link), managed_link_before)
+                self.assertEqual(state_snapshot(), state_before)
+                self.assertEqual(
+                    tuple(
+                        exact_namespace_snapshot(path)
+                        for path in pending_namespace_paths
+                    ),
+                    pending_namespace_before,
+                )
+                self.assertFalse(
+                    os.path.lexists(MODULE._pending_link_pointer_path(home))
+                )
+
+    def test_exact_noop_install_skips_fd_headroom_probe(self) -> None:
+        source_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_minimal_release(source_root)
+        self.run_quietly(
+            MODULE.install_release_tree,
+            source_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+
+        with (
+            mock.patch.object(MODULE.sys, "platform", "darwin"),
+            mock.patch.object(
+                MODULE,
+                "_require_release_identity_fd_access_policy",
+                side_effect=lambda file_descriptor, _path, _uid: os.fstat(
+                    file_descriptor
+                ),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_probe_install_release_fd_headroom",
+                side_effect=AssertionError("exact no-op must not probe headroom"),
+            ) as probe,
+        ):
+            self.run_quietly(
+                MODULE.install_release_tree,
+                source_root,
+                home,
+                SHA1,
+                dry_run=False,
+            )
+
+        probe.assert_not_called()
 
     def test_release_identity_policy_survives_legacy_identity_wrapper(
         self,
@@ -8250,6 +8640,63 @@ while True:
 
         self.assertEqual(raised.exception.code, "current-release-unverifiable")
         self.assertEqual(stat.S_IMODE(release_root.stat().st_mode), before_mode)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACLs")
+    def test_owner_sha_wrapper_preserves_acl_drift_classification(self) -> None:
+        source_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_minimal_release(source_root)
+        self.run_quietly(
+            MODULE.install_release_tree,
+            source_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+        manifests = MODULE._installed_manifests(home)
+        active = MODULE._capture_active_release_expectations(home, manifests)
+        bindings = MODULE._open_active_release_bindings(
+            home,
+            active,
+            os.geteuid(),
+        )
+        installed_agent = (
+            home
+            / "personal-sync"
+            / "releases"
+            / SHA1
+            / "personal_codex"
+            / "AGENTS.md"
+        )
+        before_mode = stat.S_IMODE(installed_agent.stat().st_mode)
+        try:
+            subprocess.run(
+                [
+                    "/bin/chmod",
+                    "+a",
+                    "everyone allow read",
+                    os.fspath(installed_agent),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "current release changed before test state publication",
+            ) as raised:
+                MODULE._owner_shas_from_bound_current_releases(
+                    home,
+                    manifests,
+                    {MODULE.PUBLIC_OWNER: SHA1},
+                    bindings,
+                    phase="before test state publication",
+                )
+        finally:
+            MODULE._close_install_release_bindings(list(bindings.values()))
+
+        self.assertEqual(raised.exception.code, "current-release-unverifiable")
+        self.assertEqual(stat.S_IMODE(installed_agent.stat().st_mode), before_mode)
 
     @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACLs")
     def test_install_rejects_inheritable_non_owner_acl_before_current(self) -> None:

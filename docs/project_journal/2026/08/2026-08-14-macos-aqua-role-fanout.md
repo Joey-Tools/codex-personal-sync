@@ -31,6 +31,9 @@ superseded_by:
 - A regular file with `ctime`-only drift receives at most one bounded same-bound-FD rehash against its retained `size || SHA-256`, followed by terminal ACL, metadata, settled-`ctime`, and canonical-name binding. The allowance is per retained-FD stage: capture `file_fd` and later reopened verification `entry_fd` are independent, while a second drift within one stage fails before another content read. A directory with `ctime`-only drift is not byte-hashed: its retained parent FD binds exact member names plus each immediate child's exact device, inode, type, mode, size, `mtime`, and `ctime`, recursively at every directory level.
 - Initial snapshot construction performs terminal and stable retained-FD member rescans, including the immediate-child identity check, after visiting each directory's children. Later verification adds a deepest-first postorder directory admission pass so parents are finalized after children. Per-directory scan count is constant and member-count bounded under the existing tree caps; the closure neither retains unbounded FDs nor rehashes files solely for directory `ctime` drift. Existing independent directory signals, including `mtime`, remain enforced, so create-and-remove child churn can still reject revalidation.
 - Every successful Darwin install retains and finally revalidates the full synchronization-home-to-release ancestor descriptor chain for every next-current release, including exact no-op and managed-link-only paths. An empty `current` action set does not bypass admission.
+- The install directory-chain container owns only the deduplicated unique strict-ancestor descriptors across owners. A release binding's `releases_fd` and `release_fd` are borrowed, remain outside that ownership set, and are revalidated separately.
+- After initial chain validation, every non-no-op Darwin install, including a managed-link-only update, completes a point-in-time 80-FD `dup` headroom probe before pending staging or publication, `current`, managed-link, or state changes. All probe FDs close on success or failure. Exact no-op validates its chains but skips the mutation-only probe; the probe does not claim protection from concurrent same-process FD churn.
+- Managed-state prepublication ACL drift preserves the stable `current-release-unverifiable` error code.
 - The canonical repository does not infer host roles or implement SSH fanout. A headless Mac must not install this Aqua scheduler.
 
 ## Boundary
@@ -50,7 +53,7 @@ superseded_by:
 
 - Implementation: `scripts/codex_personal_sync.py`.
 - Operator contract: `README.md` and `docs/ARCHITECTURE.md`.
-- Twelve focused directory-closure and `ctime` revalidation tests passed 12/12 under both the current Python and macOS system Python 3.9.
-- `tests.test_codex_personal_sync` exited zero under both runtimes with 279 tests run and one skipped per run. `tests.test_personal_sync_reconciliation_safety` exited zero under both runtimes with 305 tests per runtime.
+- Eighteen focused FD-ownership, headroom, error-code, directory-closure, and `ctime` revalidation tests passed 18/18 under both the current Python and macOS system Python 3.9.
+- `tests.test_codex_personal_sync` exited zero under both runtimes with 285 tests run and one skipped per run. `tests.test_personal_sync_reconciliation_safety` exited zero under both runtimes with 305 tests per runtime.
 - Source-lock currentness and serialization selectors passed 2/2 under both runtimes. Ruff, built-in compilation under both Python versions, `git diff --check`, and `refresh-lock --check` also passed.
 - Superseded decision: `docs/project_journal/2026/08/2026-08-04-macos-background-launchagent.md`.
