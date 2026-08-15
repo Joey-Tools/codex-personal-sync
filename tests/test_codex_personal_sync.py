@@ -6319,6 +6319,7 @@ while True:
 
         no_acl_api = MODULE._DarwinExtendedAclApi(
             acl_get_fd_np=missing_acl,
+            acl_valid=mock.Mock(return_value=0),
             acl_get_entry=mock.Mock(),
             acl_get_tag_type=mock.Mock(),
             acl_get_qualifier=mock.Mock(),
@@ -6340,6 +6341,7 @@ while True:
 
         unreadable_api = MODULE._DarwinExtendedAclApi(
             acl_get_fd_np=unreadable_acl,
+            acl_valid=mock.Mock(return_value=0),
             acl_get_entry=mock.Mock(),
             acl_get_tag_type=mock.Mock(),
             acl_get_qualifier=mock.Mock(),
@@ -6356,6 +6358,148 @@ while True:
                 unreadable_api,
             )
         self.assertEqual(raised.exception.code, "current-release-unverifiable")
+
+    def test_release_identity_acl_adapter_uses_first_then_next_selectors(
+        self,
+    ) -> None:
+        owner_uuid = bytes(range(16))
+        qualifier_buffer = MODULE.ctypes.create_string_buffer(owner_uuid)
+        entry_tags = (
+            MODULE._DARWIN_ACL_EXTENDED_DENY,
+            MODULE._DARWIN_ACL_EXTENDED_ALLOW,
+        )
+        selectors: list[int] = []
+        freed_pointers: list[int] = []
+
+        def get_acl(_file_descriptor: int, _acl_type: int) -> int:
+            return 41
+
+        def get_entry(_acl_pointer, selector: int, entry_pointer) -> int:
+            selectors.append(selector)
+            entry_index = len(selectors) - 1
+            if entry_index == len(entry_tags):
+                MODULE.ctypes.set_errno(MODULE.errno.EINVAL)
+                return -1
+            entry_pointer._obj.value = 100 + entry_index
+            return 0
+
+        def get_tag_type(entry_pointer, tag_pointer) -> int:
+            tag_pointer._obj.value = entry_tags[entry_pointer.value - 100]
+            return 0
+
+        def get_qualifier(_entry_pointer) -> int:
+            return MODULE.ctypes.addressof(qualifier_buffer)
+
+        def free_pointer(pointer) -> int:
+            pointer_value = (
+                pointer.value
+                if isinstance(pointer, MODULE.ctypes.c_void_p)
+                else pointer
+            )
+            freed_pointers.append(pointer_value)
+            return 0
+
+        api = MODULE._DarwinExtendedAclApi(
+            acl_get_fd_np=get_acl,
+            acl_valid=mock.Mock(return_value=0),
+            acl_get_entry=get_entry,
+            acl_get_tag_type=get_tag_type,
+            acl_get_qualifier=get_qualifier,
+            acl_free=free_pointer,
+            mbr_uid_to_uuid=mock.Mock(),
+        )
+
+        self.assertEqual(
+            MODULE._darwin_extended_acl_entries(
+                10,
+                self.root / "release-entry",
+                api,
+            ),
+            (
+                (MODULE._DARWIN_ACL_EXTENDED_DENY, None),
+                (MODULE._DARWIN_ACL_EXTENDED_ALLOW, owner_uuid),
+            ),
+        )
+        self.assertEqual(
+            selectors,
+            [
+                MODULE._DARWIN_ACL_FIRST_ENTRY,
+                MODULE._DARWIN_ACL_NEXT_ENTRY,
+                MODULE._DARWIN_ACL_NEXT_ENTRY,
+            ],
+        )
+        self.assertEqual(
+            freed_pointers,
+            [MODULE.ctypes.addressof(qualifier_buffer), 41],
+        )
+
+    def test_release_identity_acl_adapter_rejects_first_entry_einval(
+        self,
+    ) -> None:
+        selectors: list[int] = []
+        freed_pointers: list[int] = []
+
+        def get_entry(_acl_pointer, selector: int, _entry_pointer) -> int:
+            selectors.append(selector)
+            MODULE.ctypes.set_errno(MODULE.errno.EINVAL)
+            return -1
+
+        api = MODULE._DarwinExtendedAclApi(
+            acl_get_fd_np=lambda _file_descriptor, _acl_type: 41,
+            acl_valid=mock.Mock(return_value=0),
+            acl_get_entry=get_entry,
+            acl_get_tag_type=mock.Mock(),
+            acl_get_qualifier=mock.Mock(),
+            acl_free=lambda pointer: freed_pointers.append(pointer) or 0,
+            mbr_uid_to_uuid=mock.Mock(),
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "acl_get_entry failed with errno",
+        ) as raised:
+            MODULE._darwin_extended_acl_entries(
+                10,
+                self.root / "release-entry",
+                api,
+            )
+
+        self.assertEqual(raised.exception.code, "current-release-unverifiable")
+        self.assertEqual(selectors, [MODULE._DARWIN_ACL_FIRST_ENTRY])
+        self.assertEqual(freed_pointers, [41])
+
+    def test_release_identity_acl_adapter_rejects_invalid_acl_and_frees(
+        self,
+    ) -> None:
+        freed_pointers: list[int] = []
+
+        def invalid_acl(_acl_pointer) -> int:
+            MODULE.ctypes.set_errno(MODULE.errno.EINVAL)
+            return -1
+
+        api = MODULE._DarwinExtendedAclApi(
+            acl_get_fd_np=lambda _file_descriptor, _acl_type: 41,
+            acl_valid=invalid_acl,
+            acl_get_entry=mock.Mock(),
+            acl_get_tag_type=mock.Mock(),
+            acl_get_qualifier=mock.Mock(),
+            acl_free=lambda pointer: freed_pointers.append(pointer) or 0,
+            mbr_uid_to_uuid=mock.Mock(),
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "acl_valid failed with errno",
+        ) as raised:
+            MODULE._darwin_extended_acl_entries(
+                10,
+                self.root / "release-entry",
+                api,
+            )
+
+        self.assertEqual(raised.exception.code, "current-release-unverifiable")
+        api.acl_get_entry.assert_not_called()
+        self.assertEqual(freed_pointers, [41])
 
     def test_release_identity_acl_non_darwin_does_not_load_symbols(self) -> None:
         release_file = self.root / "release-entry"
@@ -6379,6 +6523,44 @@ while True:
             load_api.assert_not_called()
         finally:
             os.close(file_descriptor)
+
+    def test_repeat_install_non_darwin_does_not_open_acl_directory_chains(
+        self,
+    ) -> None:
+        source_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_minimal_release(source_root)
+        self.run_quietly(
+            MODULE.install_release_tree,
+            source_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+
+        with (
+            mock.patch.object(MODULE.sys, "platform", "linux"),
+            mock.patch.object(
+                MODULE,
+                "_open_install_release_directory_chains",
+                side_effect=AssertionError("Darwin chains must not be opened"),
+            ) as open_chains,
+            mock.patch.object(
+                MODULE,
+                "_load_darwin_extended_acl_api",
+                side_effect=AssertionError("Darwin symbols must not be loaded"),
+            ) as load_api,
+        ):
+            self.run_quietly(
+                MODULE.install_release_tree,
+                source_root,
+                home,
+                SHA1,
+                dry_run=False,
+            )
+
+        open_chains.assert_not_called()
+        load_api.assert_not_called()
 
     def test_release_identity_policy_survives_legacy_identity_wrapper(
         self,
@@ -6607,6 +6789,12 @@ while True:
     ) -> None:
         release_file = self.root / "release-entry"
         release_file.write_bytes(b"entry")
+        subprocess.run(
+            ["/bin/chmod", "-N", os.fspath(release_file)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         before_mode = stat.S_IMODE(release_file.stat().st_mode)
         user_name = pwd.getpwuid(os.geteuid()).pw_name
         subprocess.run(
@@ -6633,6 +6821,23 @@ while True:
         )
         file_descriptor = os.open(release_file, os.O_RDONLY)
         try:
+            api = MODULE._load_darwin_extended_acl_api(release_file)
+            owner_uuid = MODULE._darwin_owner_uuid(
+                os.geteuid(),
+                release_file,
+                api,
+            )
+            self.assertEqual(
+                MODULE._darwin_extended_acl_entries(
+                    file_descriptor,
+                    release_file,
+                    api,
+                ),
+                (
+                    (MODULE._DARWIN_ACL_EXTENDED_DENY, None),
+                    (MODULE._DARWIN_ACL_EXTENDED_ALLOW, owner_uuid),
+                ),
+            )
             MODULE._require_release_identity_fd_access_policy(
                 file_descriptor,
                 release_file,
@@ -6641,6 +6846,69 @@ while True:
         finally:
             os.close(file_descriptor)
 
+        self.assertEqual(stat.S_IMODE(release_file.stat().st_mode), before_mode)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACLs")
+    def test_release_identity_darwin_rejects_later_non_owner_allow(
+        self,
+    ) -> None:
+        release_file = self.root / "release-entry"
+        release_file.write_bytes(b"entry")
+        subprocess.run(
+            ["/bin/chmod", "-N", os.fspath(release_file)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        before_mode = stat.S_IMODE(release_file.stat().st_mode)
+        for acl_entry in (
+            "everyone deny write",
+            "everyone allow read",
+        ):
+            subprocess.run(
+                [
+                    "/bin/chmod",
+                    "+a",
+                    acl_entry,
+                    os.fspath(release_file),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        file_descriptor = os.open(release_file, os.O_RDONLY)
+        try:
+            api = MODULE._load_darwin_extended_acl_api(release_file)
+            owner_uuid = MODULE._darwin_owner_uuid(
+                os.geteuid(),
+                release_file,
+                api,
+            )
+            entries = MODULE._darwin_extended_acl_entries(
+                file_descriptor,
+                release_file,
+                api,
+            )
+            self.assertEqual(
+                entries[0],
+                (MODULE._DARWIN_ACL_EXTENDED_DENY, None),
+            )
+            self.assertEqual(entries[1][0], MODULE._DARWIN_ACL_EXTENDED_ALLOW)
+            self.assertNotEqual(entries[1][1], owner_uuid)
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "grants ALLOW access to a non-owner qualifier",
+            ) as raised:
+                MODULE._require_release_identity_fd_access_policy(
+                    file_descriptor,
+                    release_file,
+                    os.geteuid(),
+                )
+        finally:
+            os.close(file_descriptor)
+
+        self.assertEqual(raised.exception.code, "current-release-unverifiable")
         self.assertEqual(stat.S_IMODE(release_file.stat().st_mode), before_mode)
 
     @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACLs")
@@ -6958,6 +7226,123 @@ while True:
         self.assertEqual(raised.exception.code, "current-release-unverifiable")
         self.assertFalse(os.path.lexists(current_parent / "current"))
         self.assertEqual(stat.S_IMODE(current_parent.stat().st_mode), before_mode)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACLs")
+    def test_repeat_install_rejects_non_owner_acl_on_current_parent(self) -> None:
+        source_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_minimal_release(source_root)
+        self.run_quietly(
+            MODULE.install_release_tree,
+            source_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+        current = home / "personal-sync" / "current"
+        current_metadata = current.lstat()
+        current_snapshot = (
+            current_metadata.st_dev,
+            current_metadata.st_ino,
+            current.readlink(),
+        )
+        current_parent = current.parent
+        before_mode = stat.S_IMODE(current_parent.stat().st_mode)
+        subprocess.run(
+            [
+                "/bin/chmod",
+                "+a",
+                "everyone allow readattr",
+                os.fspath(current_parent),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "grants ALLOW access to a non-owner qualifier",
+        ) as raised:
+            self.run_quietly(
+                MODULE.install_release_tree,
+                source_root,
+                home,
+                SHA1,
+                dry_run=False,
+            )
+
+        terminal_metadata = current.lstat()
+        self.assertEqual(raised.exception.code, "current-release-unverifiable")
+        self.assertEqual(
+            (
+                terminal_metadata.st_dev,
+                terminal_metadata.st_ino,
+                current.readlink(),
+            ),
+            current_snapshot,
+        )
+        self.assertEqual(stat.S_IMODE(current_parent.stat().st_mode), before_mode)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACLs")
+    def test_managed_link_only_install_rejects_non_owner_current_parent_acl(
+        self,
+    ) -> None:
+        source_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_minimal_release(source_root)
+        self.run_quietly(
+            MODULE.install_release_tree,
+            source_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+        current = home / "personal-sync" / "current"
+        current_metadata = current.lstat()
+        current_snapshot = (
+            current_metadata.st_dev,
+            current_metadata.st_ino,
+            current.readlink(),
+        )
+        managed_link = home / "AGENTS.md"
+        managed_link.unlink()
+        current_parent = current.parent
+        subprocess.run(
+            [
+                "/bin/chmod",
+                "+a",
+                "everyone allow readattr",
+                os.fspath(current_parent),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "grants ALLOW access to a non-owner qualifier",
+        ) as raised:
+            self.run_quietly(
+                MODULE.install_release_tree,
+                source_root,
+                home,
+                SHA1,
+                dry_run=False,
+            )
+
+        terminal_metadata = current.lstat()
+        self.assertEqual(raised.exception.code, "current-release-unverifiable")
+        self.assertFalse(os.path.lexists(managed_link))
+        self.assertEqual(
+            (
+                terminal_metadata.st_dev,
+                terminal_metadata.st_ino,
+                current.readlink(),
+            ),
+            current_snapshot,
+        )
 
     @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACLs")
     def test_install_rejects_staged_non_owner_acl_before_publication(self) -> None:

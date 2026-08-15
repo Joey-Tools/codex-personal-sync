@@ -49,6 +49,7 @@ MANIFEST_RELATIVE_PATH = Path("personal_codex/sync-manifest.json")
 MAX_RELEASE_MANIFEST_BYTES = 4 * 1024 * 1024
 _DARWIN_ACL_TYPE_EXTENDED = 0x00000100
 _DARWIN_ACL_FIRST_ENTRY = 0
+_DARWIN_ACL_NEXT_ENTRY = -1
 _DARWIN_ACL_EXTENDED_ALLOW = 1
 _DARWIN_ACL_EXTENDED_DENY = 2
 _DARWIN_UUID_BYTES = 16
@@ -18334,6 +18335,7 @@ class _ReleaseSourceSnapshot:
 @dataclass(frozen=True)
 class _DarwinExtendedAclApi:
     acl_get_fd_np: Any
+    acl_valid: Any
     acl_get_entry: Any
     acl_get_tag_type: Any
     acl_get_qualifier: Any
@@ -18390,6 +18392,7 @@ def _load_darwin_extended_acl_api(display_path: Path) -> _DarwinExtendedAclApi:
     try:
         library = ctypes.CDLL(None, use_errno=True)
         acl_get_fd_np = library.acl_get_fd_np
+        acl_valid = library.acl_valid
         acl_get_entry = library.acl_get_entry
         acl_get_tag_type = library.acl_get_tag_type
         acl_get_qualifier = library.acl_get_qualifier
@@ -18405,6 +18408,8 @@ def _load_darwin_extended_acl_api(display_path: Path) -> _DarwinExtendedAclApi:
     try:
         acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
         acl_get_fd_np.restype = ctypes.c_void_p
+        acl_valid.argtypes = [ctypes.c_void_p]
+        acl_valid.restype = ctypes.c_int
         acl_get_entry.argtypes = [
             ctypes.c_void_p,
             ctypes.c_int,
@@ -18433,6 +18438,7 @@ def _load_darwin_extended_acl_api(display_path: Path) -> _DarwinExtendedAclApi:
         ) from error
     return _DarwinExtendedAclApi(
         acl_get_fd_np=acl_get_fd_np,
+        acl_valid=acl_valid,
         acl_get_entry=acl_get_entry,
         acl_get_tag_type=acl_get_tag_type,
         acl_get_qualifier=acl_get_qualifier,
@@ -18463,6 +18469,14 @@ def _darwin_extended_acl_entries(
 
     entries: list[tuple[int, bytes | None]] = []
     try:
+        ctypes.set_errno(0)
+        if api.acl_valid(acl_pointer) != 0:
+            error_number = ctypes.get_errno()
+            raise _release_identity_policy_error(
+                display_path,
+                f"acl_valid failed with errno {error_number}",
+                mismatch=False,
+            )
         entry_selector = _DARWIN_ACL_FIRST_ENTRY
         while True:
             entry_pointer = ctypes.c_void_p()
@@ -18473,7 +18487,11 @@ def _darwin_extended_acl_entries(
                 ctypes.byref(entry_pointer),
             )
             error_number = ctypes.get_errno()
-            if entry_result == -1 and error_number == errno.EINVAL:
+            if (
+                entry_selector == _DARWIN_ACL_NEXT_ENTRY
+                and entry_result == -1
+                and error_number == errno.EINVAL
+            ):
                 break
             if entry_result != 0 or not entry_pointer.value:
                 raise _release_identity_policy_error(
@@ -18521,13 +18539,13 @@ def _darwin_extended_acl_entries(
                             mismatch=False,
                         )
             entries.append((tag_type.value, qualifier))
-            entry_selector += 1
-            if entry_selector > 128:
+            if len(entries) > 128:
                 raise _release_identity_policy_error(
                     display_path,
                     "extended ACL exceeds the Darwin entry limit",
                     mismatch=False,
                 )
+            entry_selector = _DARWIN_ACL_NEXT_ENTRY
     finally:
         ctypes.set_errno(0)
         if api.acl_free(acl_pointer) != 0:
@@ -21395,6 +21413,7 @@ def _install_release_set_unlocked(
     link_transaction: ReconcileTransaction | None = None
     state_transaction: ManagedStateFileTransaction | None = None
     state_committed = False
+    install_release_directory_chains = []
     try:
         initial_state_snapshot = _bind_managed_state_parent_for_pending_staging(
             home,
@@ -21418,6 +21437,19 @@ def _install_release_set_unlocked(
                     phase="before activation",
                     verify_current=True,
                 )
+                if expected_owner_uid is not None:
+                    install_release_directory_chains = (
+                        _open_install_release_directory_chains(
+                            home,
+                            next_current_bindings,
+                            expected_owner_uid,
+                        )
+                    )
+                    _require_install_release_directory_chains(
+                        home,
+                        install_release_directory_chains,
+                        expected_owner_uid,
+                    )
                 _verify_desired_entries(home, desired_entries)
                 _verify_install_release_identities(
                     home,
@@ -21433,7 +21465,17 @@ def _install_release_set_unlocked(
                             "overlay no-op verification failed with "
                             f"{len(issues)} issue(s)"
                         )
+                if install_release_directory_chains:
+                    _require_install_release_directory_chains(
+                        home,
+                        install_release_directory_chains,
+                        expected_owner_uid,
+                    )
             finally:
+                _close_install_release_directory_chains(
+                    install_release_directory_chains
+                )
+                install_release_directory_chains = []
                 _close_install_release_bindings(held_bindings)
             print("all managed symlinks already point at current")
             return
@@ -21462,43 +21504,43 @@ def _install_release_set_unlocked(
             phase="before activation",
             verify_current=False,
         )
+        if expected_owner_uid is not None:
+            install_release_directory_chains = (
+                _open_install_release_directory_chains(
+                    home,
+                    next_current_bindings,
+                    expected_owner_uid,
+                )
+            )
+            _require_install_release_directory_chains(
+                home,
+                install_release_directory_chains,
+                expected_owner_uid,
+            )
         current_transaction = ReconcileTransaction(
             batch_root=pending_batch.batch_root,
             mutations=[],
         )
-        current_release_directory_chains = []
-        try:
-            if expected_owner_uid is not None and current_actions:
-                current_release_directory_chains = (
-                    _open_install_release_directory_chains(
-                        home,
-                        next_current_bindings,
-                        expected_owner_uid,
-                    )
-                )
-                _require_install_release_directory_chains(
-                    home,
-                    current_release_directory_chains,
-                    expected_owner_uid,
-                )
-            _apply_reconcile_actions(
+        if install_release_directory_chains:
+            _require_install_release_directory_chains(
                 home,
-                current_actions,
-                dry_run=False,
-                pending_batch=pending_batch,
-                pending_scope="current",
-                batch_root=pending_batch.batch_root,
-                transaction=current_transaction,
+                install_release_directory_chains,
+                expected_owner_uid,
             )
-            if current_release_directory_chains:
-                _require_install_release_directory_chains(
-                    home,
-                    current_release_directory_chains,
-                    expected_owner_uid,
-                )
-        finally:
-            _close_install_release_directory_chains(
-                current_release_directory_chains
+        _apply_reconcile_actions(
+            home,
+            current_actions,
+            dry_run=False,
+            pending_batch=pending_batch,
+            pending_scope="current",
+            batch_root=pending_batch.batch_root,
+            transaction=current_transaction,
+        )
+        if install_release_directory_chains:
+            _require_install_release_directory_chains(
+                home,
+                install_release_directory_chains,
+                expected_owner_uid,
             )
         link_transaction = ReconcileTransaction(
             batch_root=pending_batch.batch_root,
@@ -21613,11 +21655,21 @@ def _install_release_set_unlocked(
         _verify_managed_link_snapshots(home, next_state, managed_link_snapshots)
         _verify_committed_pending_link_records(home, pending_batch)
         _verify_published_state_transaction(home, state_transaction)
+        if install_release_directory_chains:
+            _require_install_release_directory_chains(
+                home,
+                install_release_directory_chains,
+                expected_owner_uid,
+            )
         _publish_pending_commit_marker(home, pending_batch)
         state_committed = True
         _mark_pending_batch_cleanup_ready(home, pending_batch)
         _clear_pending_link_pointer(home, pending_batch, phase="after")
     except BaseException as error:
+        _close_install_release_directory_chains(
+            install_release_directory_chains
+        )
+        install_release_directory_chains = []
         if (
             not state_committed
             and pending_batch is not None
@@ -21675,6 +21727,9 @@ def _install_release_set_unlocked(
         assert pending_batch is not None
         _try_cleanup_committed_pending_batch(home, pending_batch)
     finally:
+        _close_install_release_directory_chains(
+            install_release_directory_chains
+        )
         _close_install_release_bindings(held_bindings)
     if not actions:
         print("all managed symlinks already point at current")

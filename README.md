@@ -433,15 +433,24 @@ property. Every bound directory descriptor is revalidated at installation and
 final admission for its expected UID and for the absence of any extended-ACL
 `ALLOW` entry that grants access to a non-owner. No extended ACL, a deny-only
 ACL, and owner-only `ALLOW` entries are accepted; unknown or unreadable ACL
-state fails closed. A safe-to-safe change in raw ACL text or ordering, `ctime`,
-or other extended attributes does not by itself prove that the access policy
-is unsafe because each boundary repeats the semantic policy check. This ACL
+state fails closed. A retrieved ACL must pass `acl_valid`
+before enumeration; an invalid-argument result is accepted as normal
+exhaustion only while requesting the next entry, never while requesting the
+first entry. A safe-to-safe change in raw ACL text or ordering, `ctime`, or
+other extended attributes does not by itself prove that the access policy is
+unsafe because each boundary repeats the semantic policy check. This ACL
 contract does not relax independent bound-directory change signals, including
 directory `mtime`; create-and-remove child-entry churn can still reject
-revalidation. Non-Darwin behavior is unchanged. An unsafe inherited ACL can
-therefore block installation or final active-inventory admission even when
-POSIX mode bits look restrictive; have an administrator remove the unsafe
-inherited ACL and retry.
+revalidation.
+
+Every successful Darwin installation retains the complete descriptor chain
+from the synchronization home through each next-current release and
+revalidates that chain's identity and access-policy safety at final admission.
+This includes an exact no-op and a managed-link-only update; an unchanged
+`current` pointer does not bypass the chain gate. Non-Darwin behavior is
+unchanged. An unsafe inherited ACL can therefore block installation or final
+active-inventory admission even when POSIX mode bits look restrictive; have an
+administrator remove the unsafe inherited ACL and retry.
 
 ## Test
 
