@@ -7255,6 +7255,25 @@ while True:
     def test_install_fd_probe_precedes_normal_and_managed_only_staging(
         self,
     ) -> None:
+        host_platform = MODULE.sys.platform
+        real_rename_noreplace_at = MODULE._rename_noreplace_at
+
+        def rename_noreplace_on_host(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            # Keep release publication on the real host atomic primitive while the
+            # surrounding install simulates Darwin access-policy admission.
+            with mock.patch.object(MODULE.sys, "platform", host_platform):
+                real_rename_noreplace_at(
+                    source_parent_fd,
+                    source_name,
+                    destination_parent_fd,
+                    destination_name,
+                )
+
         for scenario in ("normal", "managed-only"):
             with self.subTest(scenario=scenario):
                 case_root = self.root / scenario
@@ -7300,6 +7319,11 @@ while True:
                     mock.patch.object(MODULE.sys, "platform", "darwin"),
                     mock.patch.object(
                         MODULE,
+                        "_rename_noreplace_at",
+                        side_effect=rename_noreplace_on_host,
+                    ) as publish_release,
+                    mock.patch.object(
+                        MODULE,
                         "_require_release_identity_fd_access_policy",
                         side_effect=lambda file_descriptor, _path, _uid: os.fstat(
                             file_descriptor
@@ -7332,6 +7356,10 @@ while True:
 
                 probe.assert_called_once()
                 stage_pending.assert_not_called()
+                if scenario == "normal":
+                    publish_release.assert_called_once()
+                else:
+                    publish_release.assert_not_called()
                 self.assertEqual(
                     MODULE._source_release_identity(
                         install_source,
@@ -10136,7 +10164,10 @@ while True:
             release_identity_owner_uid: int | None = None,
         ):
             nonlocal identity_calls, original_file_identity
-            self.assertEqual(release_identity_owner_uid, os.geteuid())
+            self.assertEqual(
+                release_identity_owner_uid,
+                os.geteuid() if sys.platform == "darwin" else None,
+            )
             expectation = real_identity(
                 identity_home,
                 identity_owner,
@@ -10217,7 +10248,10 @@ while True:
             release_identity_owner_uid: int | None = None,
         ):
             nonlocal identity_calls, original_file_identity
-            self.assertEqual(release_identity_owner_uid, os.geteuid())
+            self.assertEqual(
+                release_identity_owner_uid,
+                os.geteuid() if sys.platform == "darwin" else None,
+            )
             identity_calls += 1
             if identity_calls == 4:
                 self.assertEqual(identity_owner, "private")
