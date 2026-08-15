@@ -430,20 +430,23 @@ install a scheduler, or perform synchronization.
 On Darwin, the active-release and release-inventory trust chain treats
 access-policy safety, rather than raw ACL serialization, as the protected
 property. Every bound directory descriptor is revalidated at installation and
-final admission for its expected UID and for the absence of any extended-ACL
-`ALLOW` entry that grants access to a non-owner. No extended ACL, a deny-only
-ACL, and owner-only `ALLOW` entries are accepted; unknown or unreadable ACL
-state fails closed. A retrieved ACL must pass `acl_valid`
-before enumeration; an invalid-argument result is accepted as normal
-exhaustion only while requesting the next entry, never while requesting the
-first entry. Once acquired, both the ACL object and each qualifier object are
-always offered to `acl_free`. A cleanup failure does not replace an existing
-primary admission or qualifier-decoding error; without an existing primary,
-the cleanup failure itself fails admission closed. A safe-to-safe change in raw
-ACL text or ordering, `ctime`, or other extended attributes does not by itself
-prove that the access policy is unsafe because each boundary repeats the
-semantic policy check. A `ctime` change is nevertheless always a revalidation
-trigger and is never ignored as content proof. For a regular file with only
+final admission for its expected UID, a POSIX mode with no group/world-write
+bits (`mode & 0o022 == 0`), and the absence of any extended-ACL `ALLOW` entry
+that grants access to a non-owner. The mode gate runs before ACL parsing and
+fails closed on any group/world-write bit. Safe group/world read and execute
+bits remain acceptable. No extended ACL, a deny-only ACL, and owner-only
+`ALLOW` entries are accepted; unknown or unreadable ACL state fails closed. A
+retrieved ACL must pass `acl_valid` before enumeration; an invalid-argument
+result is accepted as normal exhaustion only while requesting the next entry,
+never while requesting the first entry. Once acquired, both the ACL object and
+each qualifier object are always offered to `acl_free`. A cleanup failure does
+not replace an existing primary admission or qualifier-decoding error; without
+an existing primary, the cleanup failure itself fails admission closed. A
+safe-to-safe change in raw ACL text or ordering, `ctime`, or other extended
+attributes does not by itself prove that the access policy is unsafe because
+each boundary repeats the semantic policy check. A `ctime` change is
+nevertheless always a revalidation trigger and is never ignored as content
+proof. For a regular file with only
 `ctime` drift, the same retained descriptor performs at most one bounded rehash
 of the retained `size || SHA-256`, then terminally binds ACL safety, object
 metadata, the settled `ctime`, and the canonical name. This once-only budget is
@@ -475,18 +478,29 @@ across owners. Each release binding's `releases_fd` and `release_fd` remain
 borrowed rather than transferring into that container, and are revalidated
 separately.
 
-After initial chain validation, every non-no-op Darwin install, including a
+New immutable release content may be staged and canonically published before
+the activation headroom probe. If the later probe fails, that inactive
+candidate may remain installed. Earlier valid retention or pending recovery,
+ready-batch cleanup, and lock, root, or state-directory scaffolding may also
+precede the probe and remain. After initial validation of the ancestor chains
+and borrowed release bindings, every non-no-op Darwin install, including a
 managed-link-only update, performs a point-in-time 80-FD `dup` headroom probe
-before pending staging or any publication, `current`, managed-link, or state
-change. Every probe descriptor is closed on both success and failure. An exact
-no-op still validates its chains but skips this mutation-only probe. The probe
-demonstrates capacity only at that instant; it does not claim protection from
-concurrent same-process FD churn. If managed-state prepublication detects ACL
-drift, the stable error remains `current-release-unverifiable`. Non-Darwin
-behavior is unchanged. An unsafe inherited ACL can therefore block
-installation or final active-inventory admission even when POSIX mode bits
-look restrictive; have an administrator remove the unsafe inherited ACL and
-retry.
+before starting this attempt's new pending activation transaction. On probe
+failure, its pending records, pointer publication, `current` and managed-link
+changes, `managed-links.json` publication, and commit marker have not begun.
+Every probe descriptor is closed on both success and failure. An exact no-op
+still validates its chains but skips this mutation-only probe; a
+managed-link-only update does not. The probe demonstrates capacity only at
+that instant and does not claim protection from concurrent same-process FD
+churn. Probe failure leaves semantic activation state unchanged; preceding
+valid recovery, cleanup, scaffolding, and inactive candidate publication are
+not rolled back. A same-SHA retry revalidates and may reuse the inactive
+candidate, while ordinary retention or pruning may remove an unreferenced
+candidate. If managed-state prepublication detects ACL drift, the stable error
+remains `current-release-unverifiable`. Non-Darwin behavior is unchanged. An
+unsafe inherited ACL can therefore block installation or final
+active-inventory admission even when POSIX mode bits look restrictive; have
+an administrator remove the unsafe inherited ACL and retry.
 
 ## Test
 

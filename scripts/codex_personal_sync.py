@@ -18656,7 +18656,8 @@ def _require_release_identity_fd_access_policy(
     """Prove the release object is owner-controlled on this exact bound FD.
 
     Raw ACL bytes and entry order are deliberately not evidence. The protected
-    property is the expected UID plus the absence of any non-owner ALLOW entry.
+    property is the expected UID plus the absence of non-owner write authority
+    from POSIX mode bits or the extended ACL admission policy.
     """
     try:
         metadata = os.fstat(file_descriptor)
@@ -18672,6 +18673,13 @@ def _require_release_identity_fd_access_policy(
         raise _release_identity_policy_error(
             display_path,
             f"owner UID {metadata.st_uid} != expected UID {expected_owner_uid}",
+            mismatch=True,
+        )
+    mode = stat.S_IMODE(metadata.st_mode)
+    if mode & 0o022:
+        raise _release_identity_policy_error(
+            display_path,
+            f"mode {mode:04o} grants group or world write authority",
             mismatch=True,
         )
     try:
