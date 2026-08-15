@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import pwd
 import shutil
 import stat
 import subprocess
@@ -6263,6 +6264,811 @@ while True:
         self.assertEqual(issues[0][0], "immutable-release-drift")
         self.assertIn("differs from the last verified", issues[0][3])
 
+    def test_release_identity_acl_parser_accepts_deny_and_owner_allow(self) -> None:
+        owner_uuid = bytes(range(16))
+
+        MODULE._require_darwin_acl_entries_owner_only(
+            (
+                (MODULE._DARWIN_ACL_EXTENDED_DENY, None),
+                (MODULE._DARWIN_ACL_EXTENDED_ALLOW, owner_uuid),
+            ),
+            owner_uuid,
+            self.root / "release-entry",
+        )
+
+    def test_release_identity_acl_parser_rejects_non_owner_allow(self) -> None:
+        owner_uuid = bytes(range(16))
+        for label, qualifier in (
+            ("named non-owner", bytes(reversed(range(16)))),
+            ("everyone", b"\xff" * 16),
+        ):
+            with (
+                self.subTest(label=label),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "grants ALLOW access to a non-owner qualifier",
+                ) as raised,
+            ):
+                MODULE._require_darwin_acl_entries_owner_only(
+                    ((MODULE._DARWIN_ACL_EXTENDED_ALLOW, qualifier),),
+                    owner_uuid,
+                    self.root / "release-entry",
+                )
+            self.assertEqual(
+                raised.exception.code,
+                "current-release-unverifiable",
+            )
+
+    def test_release_identity_acl_parser_rejects_unknown_tag(self) -> None:
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "unknown tag",
+        ) as raised:
+            MODULE._require_darwin_acl_entries_owner_only(
+                ((99, None),),
+                None,
+                self.root / "release-entry",
+            )
+
+        self.assertEqual(raised.exception.code, "current-release-unverifiable")
+
+    def test_release_identity_acl_adapter_allows_only_enoent(self) -> None:
+        def missing_acl(_file_descriptor: int, _acl_type: int):
+            MODULE.ctypes.set_errno(MODULE.errno.ENOENT)
+            return None
+
+        no_acl_api = MODULE._DarwinExtendedAclApi(
+            acl_get_fd_np=missing_acl,
+            acl_get_entry=mock.Mock(),
+            acl_get_tag_type=mock.Mock(),
+            acl_get_qualifier=mock.Mock(),
+            acl_free=mock.Mock(),
+            mbr_uid_to_uuid=mock.Mock(),
+        )
+        self.assertEqual(
+            MODULE._darwin_extended_acl_entries(
+                10,
+                self.root / "release-entry",
+                no_acl_api,
+            ),
+            (),
+        )
+
+        def unreadable_acl(_file_descriptor: int, _acl_type: int):
+            MODULE.ctypes.set_errno(MODULE.errno.EIO)
+            return None
+
+        unreadable_api = MODULE._DarwinExtendedAclApi(
+            acl_get_fd_np=unreadable_acl,
+            acl_get_entry=mock.Mock(),
+            acl_get_tag_type=mock.Mock(),
+            acl_get_qualifier=mock.Mock(),
+            acl_free=mock.Mock(),
+            mbr_uid_to_uuid=mock.Mock(),
+        )
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "acl_get_fd_np failed with errno",
+        ) as raised:
+            MODULE._darwin_extended_acl_entries(
+                10,
+                self.root / "release-entry",
+                unreadable_api,
+            )
+        self.assertEqual(raised.exception.code, "current-release-unverifiable")
+
+    def test_release_identity_acl_non_darwin_does_not_load_symbols(self) -> None:
+        release_file = self.root / "release-entry"
+        release_file.write_bytes(b"entry")
+        file_descriptor = os.open(release_file, os.O_RDONLY)
+        try:
+            with (
+                mock.patch.object(MODULE.sys, "platform", "linux"),
+                mock.patch.object(
+                    MODULE,
+                    "_load_darwin_extended_acl_api",
+                    side_effect=AssertionError("Darwin symbols must not be loaded"),
+                ) as load_api,
+            ):
+                metadata = MODULE._require_release_identity_fd_access_policy(
+                    file_descriptor,
+                    release_file,
+                    os.geteuid() + 1,
+                )
+            self.assertEqual(metadata.st_uid, os.geteuid())
+            load_api.assert_not_called()
+        finally:
+            os.close(file_descriptor)
+
+    def test_release_identity_policy_survives_legacy_identity_wrapper(
+        self,
+    ) -> None:
+        release_root = self.root / "release"
+        write_minimal_release(release_root)
+        release_fd = os.open(release_root, MODULE._source_directory_flags())
+        real_identity = MODULE._release_tree_identity_from_directory_fd
+        observed_owner_uids: list[int] = []
+        wrapper_calls = 0
+        expected_owner_uid = os.geteuid()
+
+        def legacy_identity_wrapper(
+            root_fd: int,
+            display_root: Path,
+            *,
+            require_sanitized_modes: bool = False,
+        ):
+            nonlocal wrapper_calls
+            wrapper_calls += 1
+            return real_identity(
+                root_fd,
+                display_root,
+                require_sanitized_modes=require_sanitized_modes,
+            )
+
+        def record_policy(
+            file_descriptor: int,
+            _display_path: Path,
+            expected_owner_uid: int,
+        ) -> os.stat_result:
+            observed_owner_uids.append(expected_owner_uid)
+            return os.fstat(file_descriptor)
+
+        try:
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE,
+                    "_require_release_identity_fd_access_policy",
+                    side_effect=record_policy,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_release_tree_identity_from_directory_fd",
+                    side_effect=legacy_identity_wrapper,
+                ),
+            ):
+                MODULE._release_tree_identity_with_owner_access_policy(
+                    release_fd,
+                    release_root,
+                    require_sanitized_modes=True,
+                    expected_owner_uid=expected_owner_uid,
+                )
+        finally:
+            os.close(release_fd)
+
+        self.assertEqual(wrapper_calls, 1)
+        self.assertTrue(observed_owner_uids)
+        self.assertEqual(set(observed_owner_uids), {expected_owner_uid})
+        self.assertIsNone(MODULE._RELEASE_IDENTITY_OWNER_UID.get())
+
+    def test_install_policy_survives_legacy_stage_wrapper(self) -> None:
+        observed_owner_uids: list[int | None] = []
+        expected_binding = mock.sentinel.install_binding
+
+        def legacy_stage_wrapper(
+            source_root: Path,
+            home: Path,
+            sha: str,
+            manifest: MODULE.ManifestData,
+            source_expectation: MODULE.ReleaseTreeExpectation | None,
+        ):
+            observed_owner_uids.append(MODULE._INSTALL_RELEASE_OWNER_UID.get())
+            return expected_binding
+
+        with (
+            mock.patch.object(MODULE.sys, "platform", "darwin"),
+            mock.patch.object(
+                MODULE,
+                "_stage_release_tree_for_install",
+                side_effect=legacy_stage_wrapper,
+            ) as stage_release,
+        ):
+            binding = (
+                MODULE._stage_release_tree_for_install_with_owner_access_policy(
+                    self.root / "release",
+                    self.root / "home",
+                    SHA1,
+                    mock.sentinel.manifest,
+                    None,
+                    expected_owner_uid=4321,
+                )
+            )
+
+        self.assertIs(binding, expected_binding)
+        self.assertEqual(observed_owner_uids, [4321])
+        self.assertIsNone(MODULE._INSTALL_RELEASE_OWNER_UID.get())
+        stage_release.assert_called_once_with(
+            self.root / "release",
+            self.root / "home",
+            SHA1,
+            mock.sentinel.manifest,
+            None,
+        )
+
+    def test_release_identities_non_darwin_preserves_foreign_uid_behavior(
+        self,
+    ) -> None:
+        release_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_minimal_release(release_root)
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+        expected = MODULE.release_identities(
+            home,
+            mode="public",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+        installed_agent = (
+            home
+            / "personal-sync"
+            / "releases"
+            / SHA1
+            / "personal_codex"
+            / "AGENTS.md"
+        )
+        installed_identity = (
+            installed_agent.stat().st_dev,
+            installed_agent.stat().st_ino,
+        )
+        real_fstat = os.fstat
+
+        class ForeignOwnerMetadata:
+            def __init__(self, metadata: os.stat_result) -> None:
+                self._metadata = metadata
+                self.st_uid = os.geteuid() + 1
+
+            def __getattr__(self, name: str):
+                return getattr(self._metadata, name)
+
+        def foreign_file_owner(file_descriptor: int):
+            metadata = real_fstat(file_descriptor)
+            if (metadata.st_dev, metadata.st_ino) != installed_identity:
+                return metadata
+            return ForeignOwnerMetadata(metadata)
+
+        with (
+            mock.patch.object(MODULE.sys, "platform", "linux"),
+            mock.patch.object(
+                MODULE.os,
+                "fstat",
+                side_effect=foreign_file_owner,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_load_darwin_extended_acl_api",
+                side_effect=AssertionError("Darwin symbols must not be loaded"),
+            ) as load_api,
+        ):
+            self.assertEqual(
+                MODULE.release_identities(
+                    home,
+                    mode="public",
+                    owner=MODULE.PUBLIC_OWNER,
+                ),
+                expected,
+            )
+        load_api.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin owner policy")
+    def test_release_tree_identity_rejects_child_owner_mismatch(self) -> None:
+        release_root = self.root / "release"
+        write_minimal_release(release_root)
+        release_child = release_root / "personal_codex" / "AGENTS.md"
+        child_metadata = release_child.stat()
+        child_identity = (child_metadata.st_dev, child_metadata.st_ino)
+        real_fstat = os.fstat
+
+        class MismatchedOwnerMetadata:
+            def __init__(self, metadata: os.stat_result) -> None:
+                self._metadata = metadata
+                self.st_uid = os.geteuid() + 1
+
+            def __getattr__(self, name: str):
+                return getattr(self._metadata, name)
+
+        def mismatched_child_owner(file_descriptor: int):
+            metadata = real_fstat(file_descriptor)
+            if (metadata.st_dev, metadata.st_ino) != child_identity:
+                return metadata
+            return MismatchedOwnerMetadata(metadata)
+
+        release_fd = os.open(release_root, MODULE._source_directory_flags())
+        try:
+            with (
+                mock.patch.object(
+                    MODULE.os,
+                    "fstat",
+                    side_effect=mismatched_child_owner,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "owner UID.*expected UID",
+                ) as raised,
+            ):
+                MODULE._release_tree_identity_from_directory_fd(
+                    release_fd,
+                    release_root,
+                    require_sanitized_modes=True,
+                    expected_owner_uid=os.geteuid(),
+                )
+        finally:
+            os.close(release_fd)
+
+        self.assertEqual(raised.exception.code, "current-release-unverifiable")
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACLs")
+    def test_release_identity_darwin_owner_allow_and_deny_preserve_mode(
+        self,
+    ) -> None:
+        release_file = self.root / "release-entry"
+        release_file.write_bytes(b"entry")
+        before_mode = stat.S_IMODE(release_file.stat().st_mode)
+        user_name = pwd.getpwuid(os.geteuid()).pw_name
+        subprocess.run(
+            [
+                "/bin/chmod",
+                "+a",
+                f"user:{user_name} allow read",
+                os.fspath(release_file),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                "/bin/chmod",
+                "+a",
+                "everyone deny write",
+                os.fspath(release_file),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        file_descriptor = os.open(release_file, os.O_RDONLY)
+        try:
+            MODULE._require_release_identity_fd_access_policy(
+                file_descriptor,
+                release_file,
+                os.geteuid(),
+            )
+        finally:
+            os.close(file_descriptor)
+
+        self.assertEqual(stat.S_IMODE(release_file.stat().st_mode), before_mode)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACLs")
+    def test_release_identities_rejects_acl_only_non_owner_allow_drift(
+        self,
+    ) -> None:
+        release_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_minimal_release(release_root)
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+        MODULE.release_identities(
+            home,
+            mode="public",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+        installed_agent = (
+            home
+            / "personal-sync"
+            / "releases"
+            / SHA1
+            / "personal_codex"
+            / "AGENTS.md"
+        )
+        before_mode = stat.S_IMODE(installed_agent.stat().st_mode)
+        real_identity = MODULE._installed_release_identity_and_directory_evidence
+        identity_calls = 0
+
+        def add_acl_after_initial_identity(
+            identity_home: Path,
+            identity_owner: str,
+            identity_sha: str,
+            *,
+            release_identity_owner_uid: int | None = None,
+        ):
+            nonlocal identity_calls
+            identity_calls += 1
+            expectation = real_identity(
+                identity_home,
+                identity_owner,
+                identity_sha,
+                release_identity_owner_uid=release_identity_owner_uid,
+            )
+            if identity_calls == 1:
+                subprocess.run(
+                    [
+                        "/bin/chmod",
+                        "+a",
+                        "everyone allow read",
+                        os.fspath(installed_agent),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            return expectation
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_installed_release_identity_and_directory_evidence",
+                side_effect=add_acl_after_initial_identity,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "grants ALLOW access to a non-owner qualifier",
+            ) as raised,
+        ):
+            MODULE.release_identities(
+                home,
+                mode="public",
+                owner=MODULE.PUBLIC_OWNER,
+            )
+
+        self.assertEqual(identity_calls, 2)
+        self.assertEqual(raised.exception.code, "current-release-unverifiable")
+        self.assertEqual(stat.S_IMODE(installed_agent.stat().st_mode), before_mode)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACLs")
+    def test_release_identities_accepts_safe_acl_only_churn(self) -> None:
+        release_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_minimal_release(release_root)
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+        initial = MODULE.release_identities(
+            home,
+            mode="public",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+        installed_agent = (
+            home
+            / "personal-sync"
+            / "releases"
+            / SHA1
+            / "personal_codex"
+            / "AGENTS.md"
+        )
+        before_mode = stat.S_IMODE(installed_agent.stat().st_mode)
+        user_name = pwd.getpwuid(os.geteuid()).pw_name
+        real_identity = MODULE._installed_release_identity_and_directory_evidence
+        identity_calls = 0
+
+        def add_safe_acl_after_initial_identity(
+            identity_home: Path,
+            identity_owner: str,
+            identity_sha: str,
+            *,
+            release_identity_owner_uid: int | None = None,
+        ):
+            nonlocal identity_calls
+            identity_calls += 1
+            expectation = real_identity(
+                identity_home,
+                identity_owner,
+                identity_sha,
+                release_identity_owner_uid=release_identity_owner_uid,
+            )
+            if identity_calls == 1:
+                for acl_entry in (
+                    f"user:{user_name} allow read",
+                    "everyone deny write",
+                ):
+                    subprocess.run(
+                        [
+                            "/bin/chmod",
+                            "+a",
+                            acl_entry,
+                            os.fspath(installed_agent),
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+            return expectation
+
+        with mock.patch.object(
+            MODULE,
+            "_installed_release_identity_and_directory_evidence",
+            side_effect=add_safe_acl_after_initial_identity,
+        ):
+            self.assertEqual(
+                MODULE.release_identities(
+                    home,
+                    mode="public",
+                    owner=MODULE.PUBLIC_OWNER,
+                ),
+                initial,
+            )
+        self.assertEqual(identity_calls, 3)
+        self.assertEqual(stat.S_IMODE(installed_agent.stat().st_mode), before_mode)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACLs")
+    def test_release_identities_rejects_non_owner_acl_on_current_ancestor(
+        self,
+    ) -> None:
+        release_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_minimal_release(release_root)
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+        current_parent = home / "personal-sync"
+        before_mode = stat.S_IMODE(current_parent.stat().st_mode)
+        subprocess.run(
+            [
+                "/bin/chmod",
+                "+a",
+                "everyone allow read",
+                os.fspath(current_parent),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "grants ALLOW access to a non-owner qualifier",
+        ) as raised:
+            MODULE.release_identities(
+                home,
+                mode="public",
+                owner=MODULE.PUBLIC_OWNER,
+            )
+
+        self.assertEqual(raised.exception.code, "current-release-unverifiable")
+        self.assertEqual(stat.S_IMODE(current_parent.stat().st_mode), before_mode)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACLs")
+    def test_release_identities_rejects_non_owner_acl_on_release_directory(
+        self,
+    ) -> None:
+        source_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_minimal_release(source_root)
+        self.run_quietly(
+            MODULE.install_release_tree,
+            source_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+        release_root = home / "personal-sync" / "releases" / SHA1
+        before_mode = stat.S_IMODE(release_root.stat().st_mode)
+        subprocess.run(
+            [
+                "/bin/chmod",
+                "+a",
+                "everyone allow readattr",
+                os.fspath(release_root),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "grants ALLOW access to a non-owner qualifier",
+        ) as raised:
+            MODULE.release_identities(
+                home,
+                mode="public",
+                owner=MODULE.PUBLIC_OWNER,
+            )
+
+        self.assertEqual(raised.exception.code, "current-release-unverifiable")
+        self.assertEqual(stat.S_IMODE(release_root.stat().st_mode), before_mode)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACLs")
+    def test_install_rejects_inheritable_non_owner_acl_before_current(self) -> None:
+        source_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        releases_root = home / "personal-sync" / "releases"
+        write_minimal_release(source_root)
+        releases_root.mkdir(parents=True, mode=0o700)
+        before_mode = stat.S_IMODE(releases_root.stat().st_mode)
+        subprocess.run(
+            [
+                "/bin/chmod",
+                "+a",
+                "everyone allow readattr,file_inherit,directory_inherit",
+                os.fspath(releases_root),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "grants ALLOW access to a non-owner qualifier",
+        ) as raised:
+            self.run_quietly(
+                MODULE.install_release_tree,
+                source_root,
+                home,
+                SHA1,
+                dry_run=False,
+            )
+
+        self.assertEqual(raised.exception.code, "current-release-unverifiable")
+        self.assertFalse(os.path.lexists(home / "personal-sync" / "current"))
+        self.assertEqual(stat.S_IMODE(releases_root.stat().st_mode), before_mode)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACLs")
+    def test_install_rejects_non_owner_acl_on_current_parent_before_current(
+        self,
+    ) -> None:
+        source_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        current_parent = home / "personal-sync"
+        write_minimal_release(source_root)
+        current_parent.mkdir(parents=True, mode=0o700)
+        before_mode = stat.S_IMODE(current_parent.stat().st_mode)
+        subprocess.run(
+            [
+                "/bin/chmod",
+                "+a",
+                "everyone allow readattr",
+                os.fspath(current_parent),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "grants ALLOW access to a non-owner qualifier",
+        ) as raised:
+            self.run_quietly(
+                MODULE.install_release_tree,
+                source_root,
+                home,
+                SHA1,
+                dry_run=False,
+            )
+
+        self.assertEqual(raised.exception.code, "current-release-unverifiable")
+        self.assertFalse(os.path.lexists(current_parent / "current"))
+        self.assertEqual(stat.S_IMODE(current_parent.stat().st_mode), before_mode)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACLs")
+    def test_install_rejects_staged_non_owner_acl_before_publication(self) -> None:
+        source_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_minimal_release(source_root)
+        real_copy = MODULE._copy_tree_from_directory_fd
+
+        def copy_then_inject_acl(
+            source_fd: int,
+            destination_fd: int,
+            display_root: Path,
+            relative_root,
+            source_snapshots,
+            source_members,
+        ) -> None:
+            real_copy(
+                source_fd,
+                destination_fd,
+                display_root,
+                relative_root,
+                source_snapshots,
+                source_members,
+            )
+            raw_path = MODULE.fcntl.fcntl(
+                destination_fd,
+                50,
+                b"\0" * 1024,
+            )
+            staging_root = Path(raw_path.split(b"\0", 1)[0].decode())
+            staged_directory = staging_root / "personal_codex"
+            before_mode = stat.S_IMODE(staged_directory.stat().st_mode)
+            subprocess.run(
+                [
+                    "/bin/chmod",
+                    "+a",
+                    "everyone allow readattr",
+                    os.fspath(staged_directory),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                stat.S_IMODE(staged_directory.stat().st_mode),
+                before_mode,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_copy_tree_from_directory_fd",
+                side_effect=copy_then_inject_acl,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "grants ALLOW access to a non-owner qualifier",
+            ) as raised,
+        ):
+            self.run_quietly(
+                MODULE.install_release_tree,
+                source_root,
+                home,
+                SHA1,
+                dry_run=False,
+            )
+
+        self.assertEqual(raised.exception.code, "current-release-unverifiable")
+        self.assertFalse(os.path.lexists(home / "personal-sync" / "current"))
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACLs")
+    def test_install_accepts_inherited_deny_and_owner_allow_acl(self) -> None:
+        source_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        releases_root = home / "personal-sync" / "releases"
+        write_minimal_release(source_root)
+        releases_root.mkdir(parents=True, mode=0o700)
+        before_mode = stat.S_IMODE(releases_root.stat().st_mode)
+        user_name = pwd.getpwuid(os.geteuid()).pw_name
+        for acl_entry in (
+            f"user:{user_name} allow readattr,file_inherit,directory_inherit",
+            "everyone deny writeattr,file_inherit,directory_inherit",
+        ):
+            subprocess.run(
+                [
+                    "/bin/chmod",
+                    "+a",
+                    acl_entry,
+                    os.fspath(releases_root),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        self.run_quietly(
+            MODULE.install_release_tree,
+            source_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+        self.assertEqual(stat.S_IMODE(releases_root.stat().st_mode), before_mode)
+        MODULE.release_identities(
+            home,
+            mode="public",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+
     def test_release_identities_reports_exact_private_release_pair(self) -> None:
         home = self.root / "home" / ".codex"
         public_release = self.root / "public-release"
@@ -6435,12 +7241,16 @@ while True:
             identity_home: Path,
             identity_owner: str,
             identity_sha: str,
+            *,
+            release_identity_owner_uid: int | None = None,
         ):
             nonlocal identity_calls, original_file_identity
+            self.assertEqual(release_identity_owner_uid, os.geteuid())
             expectation = real_identity(
                 identity_home,
                 identity_owner,
                 identity_sha,
+                release_identity_owner_uid=release_identity_owner_uid,
             )
             identity_calls += 1
             if identity_calls == 1:
@@ -6512,8 +7322,11 @@ while True:
             identity_home: Path,
             identity_owner: str,
             identity_sha: str,
+            *,
+            release_identity_owner_uid: int | None = None,
         ):
             nonlocal identity_calls, original_file_identity
+            self.assertEqual(release_identity_owner_uid, os.geteuid())
             identity_calls += 1
             if identity_calls == 4:
                 self.assertEqual(identity_owner, "private")
@@ -6534,6 +7347,7 @@ while True:
                 identity_home,
                 identity_owner,
                 identity_sha,
+                release_identity_owner_uid=release_identity_owner_uid,
             )
 
         with (

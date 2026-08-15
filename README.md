@@ -427,6 +427,22 @@ release manifest and full tree, and rejects a `current` pointer change across
 the validation boundary. It is read-only and does not infer a host role,
 install a scheduler, or perform synchronization.
 
+On Darwin, the active-release and release-inventory trust chain treats
+access-policy safety, rather than raw ACL serialization, as the protected
+property. Every bound directory descriptor is revalidated at installation and
+final admission for its expected UID and for the absence of any extended-ACL
+`ALLOW` entry that grants access to a non-owner. No extended ACL, a deny-only
+ACL, and owner-only `ALLOW` entries are accepted; unknown or unreadable ACL
+state fails closed. A safe-to-safe change in raw ACL text or ordering, `ctime`,
+or other extended attributes does not by itself prove that the access policy
+is unsafe because each boundary repeats the semantic policy check. This ACL
+contract does not relax independent bound-directory change signals, including
+directory `mtime`; create-and-remove child-entry churn can still reject
+revalidation. Non-Darwin behavior is unchanged. An unsafe inherited ACL can
+therefore block installation or final active-inventory admission even when
+POSIX mode bits look restrictive; have an administrator remove the unsafe
+inherited ACL and retry.
+
 ## Test
 
 ```bash
