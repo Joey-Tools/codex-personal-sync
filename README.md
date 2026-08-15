@@ -442,7 +442,23 @@ primary admission or qualifier-decoding error; without an existing primary,
 the cleanup failure itself fails admission closed. A safe-to-safe change in raw
 ACL text or ordering, `ctime`, or other extended attributes does not by itself
 prove that the access policy is unsafe because each boundary repeats the
-semantic policy check. This ACL contract does not relax independent
+semantic policy check. A `ctime` change is nevertheless always a revalidation
+trigger and is never ignored as content proof. For a regular file with only
+`ctime` drift, the same retained descriptor performs one bounded rehash of the
+retained `size || SHA-256`, then terminally binds ACL safety, object metadata,
+the settled `ctime`, and the canonical name. A second drift before that
+terminal proof completes fails closed. A directory with only `ctime` drift is
+not byte-hashed. Its retained parent descriptor must reproduce the exact member
+names and, for every immediate child, the exact device, inode, type, mode,
+size, `mtime`, and `ctime`; applying that rule at every directory binds the
+tree recursively. Initial snapshot construction performs terminal and stable
+member rescans on that retained directory descriptor after visiting its
+children, including the immediate-child identity check. Later verification
+adds a deepest-first postorder directory admission pass, so each parent is
+finalized after its children. Each directory uses a constant number of
+member-count-bounded scans under the existing tree limits; the protocol
+neither retains an unbounded FD set nor rehashes file content merely because a
+directory `ctime` changed. This ACL contract does not relax independent
 bound-directory change signals, including directory `mtime`;
 create-and-remove child-entry churn can still reject revalidation.
 

@@ -99,6 +99,17 @@ class CloseFailingSelector:
         raise self.error
 
 
+class MetadataOverride:
+    def __init__(self, metadata: os.stat_result, **overrides: int) -> None:
+        self._metadata = metadata
+        self._overrides = overrides
+
+    def __getattr__(self, name: str):
+        if name in self._overrides:
+            return self._overrides[name]
+        return getattr(self._metadata, name)
+
+
 def snapshot_tree(root: Path) -> tuple[tuple[str, str, int, bytes | str | None], ...]:
     if not os.path.lexists(root):
         return ()
@@ -6957,6 +6968,755 @@ while True:
             os.close(release_fd)
 
         self.assertEqual(raised.exception.code, "current-release-unverifiable")
+
+    def test_release_tree_identity_rehashes_ctime_only_file_drift(self) -> None:
+        release_root = self.root / "release"
+        write_minimal_release(release_root, agent_text="agent\n")
+        release_file = release_root / "personal_codex" / "AGENTS.md"
+        real_hash = MODULE._hash_exact_regular_file
+        target_hashes = 0
+        rewrote_file = False
+
+        def hash_then_rewrite(
+            file_descriptor: int,
+            snapshot,
+            display_path: Path,
+            *,
+            capture_payload: bool,
+        ):
+            nonlocal target_hashes, rewrote_file
+            result = real_hash(
+                file_descriptor,
+                snapshot,
+                display_path,
+                capture_payload=capture_payload,
+            )
+            if display_path == release_file:
+                target_hashes += 1
+                if not rewrote_file:
+                    rewrote_file = True
+                    before = release_file.stat()
+                    writer_fd = os.open(release_file, os.O_WRONLY)
+                    try:
+                        self.assertEqual(os.write(writer_fd, b"raced\n"), 6)
+                        os.fsync(writer_fd)
+                    finally:
+                        os.close(writer_fd)
+                    os.utime(
+                        release_file,
+                        ns=(before.st_atime_ns, snapshot.mtime_ns),
+                        follow_symlinks=False,
+                    )
+                    after = release_file.stat()
+                    self.assertEqual(
+                        (after.st_dev, after.st_ino, after.st_size),
+                        (snapshot.device, snapshot.inode, snapshot.size),
+                    )
+                    self.assertEqual(after.st_mtime_ns, snapshot.mtime_ns)
+            return result
+
+        release_fd = os.open(release_root, MODULE._source_directory_flags())
+        try:
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE,
+                    "_require_release_identity_fd_access_policy",
+                    side_effect=lambda file_descriptor, _path, _uid: os.fstat(
+                        file_descriptor
+                    ),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_hash_exact_regular_file",
+                    side_effect=hash_then_rewrite,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "release source changed during identity validation",
+                ),
+            ):
+                MODULE._release_tree_identity_from_directory_fd(
+                    release_fd,
+                    release_root,
+                    require_sanitized_modes=True,
+                    expected_owner_uid=os.geteuid(),
+                )
+        finally:
+            os.close(release_fd)
+
+        self.assertTrue(rewrote_file)
+        self.assertEqual(target_hashes, 2)
+        self.assertEqual(release_file.read_bytes(), b"raced\n")
+
+    def test_release_tree_identity_rejects_child_replaced_after_terminal_scan(
+        self,
+    ) -> None:
+        release_root = self.root / "release"
+        write_minimal_release(release_root, agent_text="agent\n")
+        release_directory = release_root / "personal_codex"
+        release_file = release_directory / "AGENTS.md"
+        retained_file = self.root / "retained-agent"
+        file_metadata = release_file.stat()
+        file_payload = release_file.read_bytes()
+        directory_metadata = release_directory.stat()
+        directory_identity = (
+            directory_metadata.st_dev,
+            directory_metadata.st_ino,
+        )
+        real_member_names = MODULE._directory_member_names
+        target_enumerations = 0
+
+        def stable_directory_policy(
+            file_descriptor: int,
+            _display_path: Path,
+            _expected_owner_uid: int,
+        ):
+            metadata = os.fstat(file_descriptor)
+            if (metadata.st_dev, metadata.st_ino) == directory_identity:
+                return MetadataOverride(
+                    metadata,
+                    st_mode=directory_metadata.st_mode,
+                    st_size=directory_metadata.st_size,
+                    st_mtime_ns=directory_metadata.st_mtime_ns,
+                )
+            return metadata
+
+        def replace_child_after_terminal_scan(directory_fd: int, **kwargs):
+            nonlocal target_enumerations
+            metadata = os.fstat(directory_fd)
+            is_target = (
+                metadata.st_dev,
+                metadata.st_ino,
+            ) == directory_identity
+            if is_target:
+                target_enumerations += 1
+            names = real_member_names(directory_fd, **kwargs)
+            if is_target and target_enumerations == 2:
+                before = release_directory.stat()
+                release_file.rename(retained_file)
+                release_file.write_bytes(file_payload)
+                os.chmod(release_file, stat.S_IMODE(file_metadata.st_mode))
+                os.utime(
+                    release_file,
+                    ns=(file_metadata.st_atime_ns, file_metadata.st_mtime_ns),
+                )
+                os.utime(
+                    release_directory,
+                    ns=(before.st_atime_ns, before.st_mtime_ns),
+                )
+            return names
+
+        release_fd = os.open(release_root, MODULE._source_directory_flags())
+        try:
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE,
+                    "_require_release_identity_fd_access_policy",
+                    side_effect=stable_directory_policy,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_directory_member_names",
+                    side_effect=replace_child_after_terminal_scan,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "release tree directory changed while hashing",
+                ),
+            ):
+                MODULE._release_tree_identity_from_directory_fd(
+                    release_fd,
+                    release_root,
+                    require_sanitized_modes=True,
+                    expected_owner_uid=os.geteuid(),
+                )
+        finally:
+            os.close(release_fd)
+
+        self.assertEqual(target_enumerations, 3)
+        self.assertNotEqual(release_file.stat().st_ino, file_metadata.st_ino)
+
+    def test_release_snapshot_revalidation_skips_unchanged_file_rehash(
+        self,
+    ) -> None:
+        release_root = self.root / "release"
+        write_minimal_release(release_root, agent_text="agent\n")
+        (
+            _manifest_payload,
+            _tree_digest,
+            _path_kinds,
+            source_snapshots,
+            source_members,
+            _captured_files,
+        ) = self.snapshot_release_tree(release_root)
+        release_fd = os.open(release_root, MODULE._source_directory_flags())
+        try:
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE,
+                    "_require_release_identity_fd_access_policy",
+                    side_effect=lambda file_descriptor, _path, _uid: os.fstat(
+                        file_descriptor
+                    ),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_hash_exact_regular_file",
+                    side_effect=AssertionError("unchanged files must not rehash"),
+                ) as rehash,
+            ):
+                MODULE._verify_release_source_snapshot(
+                    release_fd,
+                    release_root,
+                    source_snapshots,
+                    source_members,
+                    operation="identity validation",
+                    expected_owner_uid=os.geteuid(),
+                )
+        finally:
+            os.close(release_fd)
+
+        rehash.assert_not_called()
+
+    def test_release_snapshot_revalidation_rejects_ctime_drift_during_rehash(
+        self,
+    ) -> None:
+        release_root = self.root / "release"
+        write_minimal_release(release_root, agent_text="agent\n")
+        release_file = release_root / "personal_codex" / "AGENTS.md"
+        (
+            _manifest_payload,
+            _tree_digest,
+            _path_kinds,
+            source_snapshots,
+            source_members,
+            _captured_files,
+        ) = self.snapshot_release_tree(release_root)
+        release_fd = os.open(release_root, MODULE._source_directory_flags())
+        try:
+            file_mode = stat.S_IMODE(release_file.stat().st_mode)
+            release_file.chmod(file_mode)
+            real_hash = MODULE._hash_exact_regular_file
+            target_rehashes = 0
+
+            def hash_then_change_ctime_again(
+                file_descriptor: int,
+                snapshot,
+                display_path: Path,
+                *,
+                capture_payload: bool,
+            ):
+                nonlocal target_rehashes
+                result = real_hash(
+                    file_descriptor,
+                    snapshot,
+                    display_path,
+                    capture_payload=capture_payload,
+                )
+                if display_path == release_file:
+                    target_rehashes += 1
+                    release_file.chmod(file_mode)
+                return result
+
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE,
+                    "_require_release_identity_fd_access_policy",
+                    side_effect=lambda file_descriptor, _path, _uid: os.fstat(
+                        file_descriptor
+                    ),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_hash_exact_regular_file",
+                    side_effect=hash_then_change_ctime_again,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "release source changed during identity validation",
+                ),
+            ):
+                MODULE._verify_release_source_snapshot(
+                    release_fd,
+                    release_root,
+                    source_snapshots,
+                    source_members,
+                    operation="identity validation",
+                    expected_owner_uid=os.geteuid(),
+                )
+        finally:
+            os.close(release_fd)
+
+        self.assertEqual(target_rehashes, 1)
+
+    def test_release_snapshot_revalidation_accepts_directory_ctime_drift(
+        self,
+    ) -> None:
+        release_root = self.root / "release"
+        write_minimal_release(release_root, agent_text="agent\n")
+        release_directory = release_root / "personal_codex"
+        (
+            _manifest_payload,
+            _tree_digest,
+            _path_kinds,
+            source_snapshots,
+            source_members,
+            _captured_files,
+        ) = self.snapshot_release_tree(release_root)
+        release_fd = os.open(release_root, MODULE._source_directory_flags())
+        try:
+            release_directory.chmod(
+                stat.S_IMODE(release_directory.stat().st_mode)
+            )
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE,
+                    "_require_release_identity_fd_access_policy",
+                    side_effect=lambda file_descriptor, _path, _uid: os.fstat(
+                        file_descriptor
+                    ),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_hash_exact_regular_file",
+                    side_effect=AssertionError(
+                        "directory ctime drift must not hash file bytes"
+                    ),
+                ) as rehash,
+            ):
+                MODULE._verify_release_source_snapshot(
+                    release_fd,
+                    release_root,
+                    source_snapshots,
+                    source_members,
+                    operation="identity validation",
+                    expected_owner_uid=os.geteuid(),
+                )
+        finally:
+            os.close(release_fd)
+
+        rehash.assert_not_called()
+
+    def test_release_snapshot_revalidation_rejects_member_added_after_first_scan(
+        self,
+    ) -> None:
+        release_root = self.root / "release"
+        write_minimal_release(release_root, agent_text="agent\n")
+        release_directory = release_root / "personal_codex"
+        (
+            _manifest_payload,
+            _tree_digest,
+            _path_kinds,
+            source_snapshots,
+            source_members,
+            _captured_files,
+        ) = self.snapshot_release_tree(release_root)
+        directory_metadata = release_directory.stat()
+        directory_identity = (
+            directory_metadata.st_dev,
+            directory_metadata.st_ino,
+        )
+        real_member_names = MODULE._directory_member_names
+        target_enumerations = 0
+
+        def stable_directory_policy(
+            file_descriptor: int,
+            _display_path: Path,
+            _expected_owner_uid: int,
+        ):
+            metadata = os.fstat(file_descriptor)
+            if (metadata.st_dev, metadata.st_ino) == directory_identity:
+                return MetadataOverride(
+                    metadata,
+                    st_mode=directory_metadata.st_mode,
+                    st_size=directory_metadata.st_size,
+                    st_mtime_ns=directory_metadata.st_mtime_ns,
+                )
+            return metadata
+
+        def add_member_after_first_scan(directory_fd: int, **kwargs):
+            nonlocal target_enumerations
+            metadata = os.fstat(directory_fd)
+            if (metadata.st_dev, metadata.st_ino) == directory_identity:
+                target_enumerations += 1
+            names = real_member_names(directory_fd, **kwargs)
+            if target_enumerations == 1 and (
+                metadata.st_dev,
+                metadata.st_ino,
+            ) == directory_identity:
+                before = release_directory.stat()
+                (release_directory / "unexpected.txt").write_text(
+                    "unexpected\n",
+                    encoding="utf-8",
+                )
+                os.utime(
+                    release_directory,
+                    ns=(before.st_atime_ns, before.st_mtime_ns),
+                )
+            return names
+
+        release_fd = os.open(release_root, MODULE._source_directory_flags())
+        try:
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE,
+                    "_require_release_identity_fd_access_policy",
+                    side_effect=stable_directory_policy,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_directory_member_names",
+                    side_effect=add_member_after_first_scan,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "release source directory changed during identity validation",
+                ),
+            ):
+                MODULE._verify_release_source_snapshot(
+                    release_fd,
+                    release_root,
+                    source_snapshots,
+                    source_members,
+                    operation="identity validation",
+                    expected_owner_uid=os.geteuid(),
+                )
+        finally:
+            os.close(release_fd)
+
+        self.assertEqual(target_enumerations, 2)
+
+    def test_release_snapshot_postorder_rejects_parent_drift_during_child_pass(
+        self,
+    ) -> None:
+        release_root = self.root / "release"
+        write_minimal_release(release_root, agent_text="agent\n")
+        release_directory = release_root / "personal_codex"
+        release_file = release_directory / "AGENTS.md"
+        (
+            _manifest_payload,
+            _tree_digest,
+            _path_kinds,
+            source_snapshots,
+            source_members,
+            _captured_files,
+        ) = self.snapshot_release_tree(release_root)
+        added_sibling = False
+        parent_policy_calls = 0
+
+        def add_sibling_during_child_validation(
+            file_descriptor: int,
+            display_path: Path,
+            _expected_owner_uid: int,
+        ):
+            nonlocal added_sibling, parent_policy_calls
+            metadata = os.fstat(file_descriptor)
+            if display_path == release_directory:
+                parent_policy_calls += 1
+            if display_path == release_file and not added_sibling:
+                added_sibling = True
+                (release_directory / "late-sibling").write_bytes(b"late\n")
+            return metadata
+
+        release_fd = os.open(release_root, MODULE._source_directory_flags())
+        try:
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE,
+                    "_require_release_identity_fd_access_policy",
+                    side_effect=add_sibling_during_child_validation,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "release source (directory )?changed during identity validation",
+                ),
+            ):
+                MODULE._verify_release_source_snapshot(
+                    release_fd,
+                    release_root,
+                    source_snapshots,
+                    source_members,
+                    operation="identity validation",
+                    expected_owner_uid=os.geteuid(),
+                )
+        finally:
+            os.close(release_fd)
+
+        self.assertTrue(added_sibling)
+        self.assertGreaterEqual(parent_policy_calls, 4)
+
+    def test_release_snapshot_postorder_rejects_same_name_child_replacement(
+        self,
+    ) -> None:
+        for child_kind in ("file", "directory"):
+            with self.subTest(child_kind=child_kind):
+                release_root = self.root / f"release-{child_kind}"
+                write_minimal_release(release_root, agent_text="agent\n")
+                release_directory = release_root / "personal_codex"
+                if child_kind == "file":
+                    parent = release_directory
+                    child = release_directory / "AGENTS.md"
+                else:
+                    parent = release_root
+                    child = release_directory
+                (
+                    _manifest_payload,
+                    _tree_digest,
+                    _path_kinds,
+                    source_snapshots,
+                    source_members,
+                    _captured_files,
+                ) = self.snapshot_release_tree(release_root)
+                parent_metadata = parent.stat()
+                child_metadata = child.stat()
+                retained_child = self.root / f"retained-{child_kind}"
+                child_payload = child.read_bytes() if child.is_file() else None
+                replaced_child = False
+                parent_policy_calls = 0
+
+                def replace_child_before_parent_postorder_scan(
+                    file_descriptor: int,
+                    display_path: Path,
+                    _expected_owner_uid: int,
+                ):
+                    nonlocal replaced_child, parent_policy_calls
+                    metadata = os.fstat(file_descriptor)
+                    if display_path != parent:
+                        return metadata
+                    parent_policy_calls += 1
+                    if parent_policy_calls == 4:
+                        child.rename(retained_child)
+                        if child_kind == "file":
+                            assert child_payload is not None
+                            child.write_bytes(child_payload)
+                        else:
+                            shutil.copytree(retained_child, child)
+                        os.chmod(child, stat.S_IMODE(child_metadata.st_mode))
+                        os.utime(
+                            child,
+                            ns=(
+                                child_metadata.st_atime_ns,
+                                child_metadata.st_mtime_ns,
+                            ),
+                        )
+                        os.utime(
+                            parent,
+                            ns=(
+                                parent_metadata.st_atime_ns,
+                                parent_metadata.st_mtime_ns,
+                            ),
+                        )
+                        replaced_child = True
+                        metadata = os.fstat(file_descriptor)
+                    if replaced_child:
+                        return MetadataOverride(
+                            metadata,
+                            st_mode=parent_metadata.st_mode,
+                            st_size=parent_metadata.st_size,
+                            st_mtime_ns=parent_metadata.st_mtime_ns,
+                        )
+                    return metadata
+
+                release_fd = os.open(
+                    release_root,
+                    MODULE._source_directory_flags(),
+                )
+                try:
+                    with (
+                        mock.patch.object(MODULE.sys, "platform", "darwin"),
+                        mock.patch.object(
+                            MODULE,
+                            "_require_release_identity_fd_access_policy",
+                            side_effect=(
+                                replace_child_before_parent_postorder_scan
+                            ),
+                        ),
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            "release source directory changed during "
+                            "identity validation",
+                        ),
+                    ):
+                        MODULE._verify_release_source_snapshot(
+                            release_fd,
+                            release_root,
+                            source_snapshots,
+                            source_members,
+                            operation="identity validation",
+                            expected_owner_uid=os.geteuid(),
+                        )
+                finally:
+                    os.close(release_fd)
+
+                self.assertTrue(replaced_child)
+                self.assertEqual(parent_policy_calls, 4)
+                self.assertNotEqual(child.stat().st_ino, child_metadata.st_ino)
+
+    def test_release_snapshot_revalidation_rejects_drift_after_second_scan(
+        self,
+    ) -> None:
+        release_root = self.root / "release"
+        write_minimal_release(release_root, agent_text="agent\n")
+        release_directory = release_root / "personal_codex"
+        (
+            _manifest_payload,
+            _tree_digest,
+            _path_kinds,
+            source_snapshots,
+            source_members,
+            _captured_files,
+        ) = self.snapshot_release_tree(release_root)
+        directory_metadata = release_directory.stat()
+        directory_identity = (
+            directory_metadata.st_dev,
+            directory_metadata.st_ino,
+        )
+        real_member_names = MODULE._directory_member_names
+        target_enumerations = 0
+
+        def churn_after_second_scan(directory_fd: int, **kwargs):
+            nonlocal target_enumerations
+            metadata = os.fstat(directory_fd)
+            is_target = (
+                metadata.st_dev,
+                metadata.st_ino,
+            ) == directory_identity
+            if is_target:
+                target_enumerations += 1
+            names = real_member_names(directory_fd, **kwargs)
+            if is_target and target_enumerations == 2:
+                before = release_directory.stat()
+                churn_path = release_directory / "ctime-churn"
+                churn_path.write_bytes(b"churn")
+                churn_path.unlink()
+                os.utime(
+                    release_directory,
+                    ns=(before.st_atime_ns, before.st_mtime_ns),
+                )
+                after = release_directory.stat()
+                self.assertEqual(
+                    (
+                        after.st_dev,
+                        after.st_ino,
+                        after.st_mode,
+                        after.st_size,
+                        after.st_mtime_ns,
+                    ),
+                    (
+                        before.st_dev,
+                        before.st_ino,
+                        before.st_mode,
+                        before.st_size,
+                        before.st_mtime_ns,
+                    ),
+                )
+                self.assertNotEqual(after.st_ctime_ns, before.st_ctime_ns)
+            return names
+
+        release_fd = os.open(release_root, MODULE._source_directory_flags())
+        try:
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE,
+                    "_require_release_identity_fd_access_policy",
+                    side_effect=lambda file_descriptor, _path, _uid: os.fstat(
+                        file_descriptor
+                    ),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_directory_member_names",
+                    side_effect=churn_after_second_scan,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "release source changed during identity validation",
+                ),
+            ):
+                MODULE._verify_release_source_snapshot(
+                    release_fd,
+                    release_root,
+                    source_snapshots,
+                    source_members,
+                    operation="identity validation",
+                    expected_owner_uid=os.geteuid(),
+                )
+        finally:
+            os.close(release_fd)
+
+        self.assertEqual(target_enumerations, 2)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin xattrs")
+    def test_release_tree_identity_accepts_xattr_only_ctime_drift(self) -> None:
+        release_root = self.root / "release"
+        write_minimal_release(release_root, agent_text="agent\n")
+        release_file = release_root / "personal_codex" / "AGENTS.md"
+        real_hash = MODULE._hash_exact_regular_file
+        target_hashes = 0
+        changed_xattr = False
+
+        def hash_then_change_xattr(
+            file_descriptor: int,
+            snapshot,
+            display_path: Path,
+            *,
+            capture_payload: bool,
+        ):
+            nonlocal target_hashes, changed_xattr
+            result = real_hash(
+                file_descriptor,
+                snapshot,
+                display_path,
+                capture_payload=capture_payload,
+            )
+            if display_path == release_file:
+                target_hashes += 1
+                if not changed_xattr:
+                    changed_xattr = True
+                    subprocess.run(
+                        [
+                            "/usr/bin/xattr",
+                            "-w",
+                            "com.openai.codex-personal-sync-test",
+                            "safe",
+                            os.fspath(release_file),
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+            return result
+
+        release_fd = os.open(release_root, MODULE._source_directory_flags())
+        try:
+            with mock.patch.object(
+                MODULE,
+                "_hash_exact_regular_file",
+                side_effect=hash_then_change_xattr,
+            ):
+                _payload, _manifest, tree_digest = (
+                    MODULE._release_tree_identity_from_directory_fd(
+                        release_fd,
+                        release_root,
+                        require_sanitized_modes=True,
+                        expected_owner_uid=os.geteuid(),
+                    )
+                )
+        finally:
+            os.close(release_fd)
+
+        self.assertTrue(changed_xattr)
+        self.assertEqual(target_hashes, 2)
+        self.assertRegex(tree_digest, r"^[0-9a-f]{64}$")
+        self.assertEqual(release_file.read_bytes(), b"agent\n")
 
     @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACLs")
     def test_release_identity_darwin_owner_allow_and_deny_preserve_mode(

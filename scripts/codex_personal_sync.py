@@ -18330,6 +18330,7 @@ class _ReleaseSourceSnapshot:
     size: int
     mtime_ns: int
     ctime_ns: int
+    content_identity: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -18837,25 +18838,23 @@ def _release_source_matches(
     ignore_ctime: bool = False,
 ) -> bool:
     current = _release_source_snapshot(metadata)
-    if not ignore_ctime:
-        return snapshot == current
-    # Release-identity validation separately rehashes file content, compares
-    # directory members, binds object identity/type/mode/size/mtime, and proves
-    # UID/ACL policy on the bound FD. ctime alone can reflect safe ACL or xattr
-    # metadata changes, so it is not mutation of that protected property.
-    return (
+    expected_metadata = (
         snapshot.device,
         snapshot.inode,
         snapshot.mode,
         snapshot.size,
         snapshot.mtime_ns,
-    ) == (
+    )
+    current_metadata = (
         current.device,
         current.inode,
         current.mode,
         current.size,
         current.mtime_ns,
     )
+    if expected_metadata != current_metadata:
+        return False
+    return ignore_ctime or snapshot.ctime_ns == current.ctime_ns
 
 
 def _require_release_source_unchanged(
@@ -18864,13 +18863,44 @@ def _require_release_source_unchanged(
     display_path: Path,
     *,
     ignore_ctime: bool = False,
-) -> None:
-    if not _release_source_matches(
-        snapshot,
-        metadata,
-        ignore_ctime=ignore_ctime,
+    file_descriptor: int | None = None,
+    expected_owner_uid: int | None = None,
+    operation: str = "copy",
+) -> _ReleaseSourceSnapshot:
+    if _release_source_matches(snapshot, metadata):
+        return snapshot
+    if not (
+        ignore_ctime
+        and _release_source_matches(snapshot, metadata, ignore_ctime=True)
     ):
-        raise SyncError(f"release source changed during copy: {display_path}")
+        raise SyncError(
+            f"release source changed during {operation}: {display_path}"
+        )
+    # ctime is only a revalidation trigger. Directory entry content is bound by
+    # exact immediate-member identities; a regular file with ctime-only drift
+    # must be rehashed from the same bound FD before safe metadata churn is
+    # accepted.
+    if stat.S_ISREG(snapshot.mode):
+        if file_descriptor is None or snapshot.content_identity is None:
+            raise SyncError(
+                "release source content cannot be revalidated after ctime drift "
+                f"during {operation}: {display_path}"
+            )
+        terminal_metadata = _rehash_release_source_file_content(
+            file_descriptor,
+            snapshot,
+            metadata,
+            display_path,
+            expected_owner_uid=expected_owner_uid,
+            operation=operation,
+        )
+        return replace(snapshot, ctime_ns=terminal_metadata.st_ctime_ns)
+    if not stat.S_ISDIR(snapshot.mode):
+        raise SyncError(
+            "release source type cannot be revalidated after ctime drift "
+            f"during {operation}: {display_path}"
+        )
+    return replace(snapshot, ctime_ns=metadata.st_ctime_ns)
 
 
 def _source_directory_flags() -> int:
@@ -18962,6 +18992,52 @@ def _hash_exact_regular_file(
     content_identity = snapshot.size.to_bytes(8, "big") + content_digest.digest()
     payload = b"".join(chunks) if chunks is not None else None
     return content_identity, payload
+
+
+def _rehash_release_source_file_content(
+    file_descriptor: int,
+    snapshot: _ReleaseSourceSnapshot,
+    revalidation_metadata: os.stat_result,
+    display_path: Path,
+    *,
+    expected_owner_uid: int | None,
+    operation: str,
+) -> os.stat_result:
+    try:
+        os.lseek(file_descriptor, 0, os.SEEK_SET)
+    except OSError as error:
+        raise SyncError(
+            "release source content cannot be revalidated after ctime drift "
+            f"during {operation}: {display_path}"
+        ) from error
+    observed_identity, _payload = _hash_exact_regular_file(
+        file_descriptor,
+        snapshot,
+        display_path,
+        capture_payload=False,
+    )
+    if observed_identity != snapshot.content_identity:
+        raise SyncError(
+            f"release source changed during {operation}: {display_path}"
+        )
+    terminal_metadata = (
+        _require_release_identity_fd_access_policy(
+            file_descriptor,
+            display_path,
+            expected_owner_uid,
+        )
+        if expected_owner_uid is not None
+        else os.fstat(file_descriptor)
+    )
+    if not _release_source_matches(
+        snapshot,
+        terminal_metadata,
+        ignore_ctime=True,
+    ) or terminal_metadata.st_ctime_ns != revalidation_metadata.st_ctime_ns:
+        raise SyncError(
+            f"release source changed during {operation}: {display_path}"
+        )
+    return terminal_metadata
 
 
 def _open_release_source_root(
@@ -19588,14 +19664,14 @@ def _release_tree_snapshot_from_directory_fd(
                         _source_directory_flags(),
                         dir_fd=directory_fd,
                     )
-                    _require_release_source_unchanged(
+                    snapshot = _require_release_source_unchanged(
                         snapshot,
                         os.fstat(child_fd),
                         display_path,
                         ignore_ctime=expected_owner_uid is not None,
                     )
                     visit_directory(child_fd, relative_path)
-                    _require_release_source_unchanged(
+                    snapshot = _require_release_source_unchanged(
                         snapshot,
                         os.fstat(child_fd),
                         display_path,
@@ -19616,12 +19692,13 @@ def _release_tree_snapshot_from_directory_fd(
                             f"{expected_owner_uid}",
                             mismatch=True,
                         )
-                    _require_release_source_unchanged(
+                    snapshot = _require_release_source_unchanged(
                         snapshot,
                         current_metadata,
                         display_path,
                         ignore_ctime=expected_owner_uid is not None,
                     )
+                    source_snapshots[relative_path] = snapshot
                 except OSError as error:
                     raise SyncError(
                         f"release tree changed while hashing: {display_path}"
@@ -19679,6 +19756,11 @@ def _release_tree_snapshot_from_directory_fd(
                     display_path,
                     capture_payload=capture_limit is not None,
                 )
+                opened_snapshot = replace(
+                    opened_snapshot,
+                    content_identity=file_identity,
+                )
+                source_snapshots[relative_path] = opened_snapshot
                 if relative_path == manifest_relative:
                     assert captured_payload is not None
                     manifest_payload = captured_payload
@@ -19694,11 +19776,14 @@ def _release_tree_snapshot_from_directory_fd(
                     if expected_owner_uid is not None
                     else os.fstat(file_fd)
                 )
-                _require_release_source_unchanged(
+                opened_snapshot = _require_release_source_unchanged(
                     opened_snapshot,
                     terminal_file_metadata,
                     display_path,
                     ignore_ctime=expected_owner_uid is not None,
+                    file_descriptor=file_fd,
+                    expected_owner_uid=expected_owner_uid,
+                    operation="identity validation",
                 )
                 current_metadata = os.stat(
                     name,
@@ -19715,12 +19800,16 @@ def _release_tree_snapshot_from_directory_fd(
                         f"{expected_owner_uid}",
                         mismatch=True,
                     )
-                _require_release_source_unchanged(
+                opened_snapshot = _require_release_source_unchanged(
                     opened_snapshot,
                     current_metadata,
                     display_path,
                     ignore_ctime=expected_owner_uid is not None,
+                    file_descriptor=file_fd,
+                    expected_owner_uid=expected_owner_uid,
+                    operation="identity validation",
                 )
+                source_snapshots[relative_path] = opened_snapshot
                 record(
                     b"file",
                     relative_path,
@@ -19754,12 +19843,51 @@ def _release_tree_snapshot_from_directory_fd(
             if expected_owner_uid is not None
             else os.fstat(directory_fd)
         )
-        _require_release_source_unchanged(
+        directory_snapshot = _require_release_source_unchanged(
             directory_snapshot,
             terminal_directory_metadata,
             display_directory,
             ignore_ctime=expected_owner_uid is not None,
         )
+        if expected_owner_uid is not None:
+            stable_names = _directory_member_names(
+                directory_fd,
+                maximum_entries=len(names),
+                overflow_message=(
+                    "release tree directory changed while hashing: "
+                    f"{display_directory}"
+                ),
+            )
+            if stable_names != names:
+                raise SyncError(
+                    "release tree directory changed while hashing: "
+                    f"{display_directory}"
+                )
+            _require_release_directory_members_unchanged(
+                directory_fd,
+                relative_root,
+                names,
+                source_snapshots,
+                (
+                    "release tree directory changed while hashing: "
+                    f"{display_directory}"
+                ),
+            )
+            stable_directory_metadata = (
+                _require_release_identity_fd_access_policy(
+                    directory_fd,
+                    display_directory,
+                    expected_owner_uid,
+                )
+            )
+            if not _release_source_matches(
+                directory_snapshot,
+                stable_directory_metadata,
+            ):
+                raise SyncError(
+                    f"release tree changed while hashing: {display_directory}"
+                )
+        source_snapshots[relative_root] = directory_snapshot
 
     resource_budget.reserve_path_entries()
     try:
@@ -19807,6 +19935,30 @@ def _directory_member_names(
                 raise SyncError(overflow_message)
             names.append(entry.name)
     return tuple(sorted(names))
+
+
+def _require_release_directory_members_unchanged(
+    directory_fd: int,
+    relative_root: PurePosixPath,
+    expected_names: tuple[str, ...],
+    source_snapshots: dict[PurePosixPath, _ReleaseSourceSnapshot],
+    changed_message: str,
+) -> None:
+    for name in expected_names:
+        relative_path = relative_root / name
+        expected_snapshot = source_snapshots.get(relative_path)
+        if expected_snapshot is None:
+            raise SyncError(changed_message)
+        try:
+            current_metadata = os.stat(
+                name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise SyncError(changed_message) from error
+        if not _release_source_matches(expected_snapshot, current_metadata):
+            raise SyncError(changed_message)
 
 
 def _open_source_directory_entry(
@@ -20079,14 +20231,89 @@ def _verify_release_source_snapshot(
                     display_path,
                     expected_owner_uid,
                 )
-                if not _release_source_matches(
+                snapshot = _require_release_source_unchanged(
                     snapshot,
                     opened_metadata,
+                    display_path,
                     ignore_ctime=True,
+                    file_descriptor=entry_fd,
+                    expected_owner_uid=expected_owner_uid,
+                    operation=operation,
+                )
+                if stat.S_ISDIR(snapshot.mode):
+                    expected_names = source_members.get(relative_path)
+                    if expected_names is None:
+                        raise SyncError(
+                            "release source directory identity is incomplete: "
+                            f"{display_path}"
+                        )
+                    changed_message = (
+                        "release source directory changed during "
+                        f"{operation}: {display_path}"
+                    )
+                    current_names = _directory_member_names(
+                        entry_fd,
+                        maximum_entries=len(expected_names),
+                        overflow_message=changed_message,
+                    )
+                    if current_names != expected_names:
+                        raise SyncError(changed_message)
+                terminal_opened_metadata = (
+                    _require_release_identity_fd_access_policy(
+                        entry_fd,
+                        display_path,
+                        expected_owner_uid,
+                    )
+                )
+                snapshot = _require_release_source_unchanged(
+                    snapshot,
+                    terminal_opened_metadata,
+                    display_path,
+                    ignore_ctime=True,
+                    file_descriptor=entry_fd,
+                    expected_owner_uid=expected_owner_uid,
+                    operation=operation,
+                )
+                if stat.S_ISDIR(snapshot.mode):
+                    terminal_names = _directory_member_names(
+                        entry_fd,
+                        maximum_entries=len(expected_names),
+                        overflow_message=changed_message,
+                    )
+                    if terminal_names != expected_names:
+                        raise SyncError(changed_message)
+                    stable_opened_metadata = (
+                        _require_release_identity_fd_access_policy(
+                            entry_fd,
+                            display_path,
+                            expected_owner_uid,
+                        )
+                    )
+                    if not _release_source_matches(
+                        snapshot,
+                        stable_opened_metadata,
+                    ):
+                        raise SyncError(
+                            f"release source changed during {operation}: "
+                            f"{display_path}"
+                        )
+                terminal_named_metadata = (
+                    os.fstat(entry_fd)
+                    if not relative_path.parts
+                    else os.stat(
+                        name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                )
+                if not _release_source_matches(
+                    snapshot,
+                    terminal_named_metadata,
                 ):
                     raise SyncError(
                         f"release source changed during {operation}: {display_path}"
                     )
+                source_snapshots[relative_path] = snapshot
             except OSError as error:
                 raise SyncError(
                     f"release source changed during {operation}: {display_path}"
@@ -20096,14 +20323,98 @@ def _verify_release_source_snapshot(
                     _close_fd_quietly(entry_fd)
                 if parent_fd >= 0:
                     _close_fd_quietly(parent_fd)
-        if not _release_source_matches(
-            snapshot,
-            metadata,
-            ignore_ctime=expected_owner_uid is not None,
-        ):
+        elif not _release_source_matches(snapshot, metadata):
             raise SyncError(
                 f"release source changed during {operation}: {display_path}"
             )
+    if expected_owner_uid is not None:
+        for relative_path, expected_names in sorted(
+            source_members.items(),
+            key=lambda item: len(item[0].parts),
+            reverse=True,
+        ):
+            snapshot = source_snapshots[relative_path]
+            display_path = display_root / Path(*relative_path.parts)
+            changed_message = (
+                f"release source directory changed during {operation}: "
+                f"{display_path}"
+            )
+            parent_fd = -1
+            entry_fd = -1
+            try:
+                if not relative_path.parts:
+                    entry_fd = os.dup(root_fd)
+                else:
+                    parent_fd, name = _open_relative_parent_fd(
+                        root_fd,
+                        relative_path,
+                    )
+                    entry_fd = os.open(
+                        name,
+                        _source_directory_flags(),
+                        dir_fd=parent_fd,
+                    )
+                opened_metadata = _require_release_identity_fd_access_policy(
+                    entry_fd,
+                    display_path,
+                    expected_owner_uid,
+                )
+                snapshot = _require_release_source_unchanged(
+                    snapshot,
+                    opened_metadata,
+                    display_path,
+                    ignore_ctime=True,
+                    operation=operation,
+                )
+                current_names = _directory_member_names(
+                    entry_fd,
+                    maximum_entries=len(expected_names),
+                    overflow_message=changed_message,
+                )
+                if current_names != expected_names:
+                    raise SyncError(changed_message)
+                _require_release_directory_members_unchanged(
+                    entry_fd,
+                    relative_path,
+                    expected_names,
+                    source_snapshots,
+                    changed_message,
+                )
+                stable_opened_metadata = (
+                    _require_release_identity_fd_access_policy(
+                        entry_fd,
+                        display_path,
+                        expected_owner_uid,
+                    )
+                )
+                if not _release_source_matches(
+                    snapshot,
+                    stable_opened_metadata,
+                ):
+                    raise SyncError(changed_message)
+                terminal_named_metadata = (
+                    os.fstat(entry_fd)
+                    if not relative_path.parts
+                    else os.stat(
+                        name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                )
+                if not _release_source_matches(
+                    snapshot,
+                    terminal_named_metadata,
+                ):
+                    raise SyncError(changed_message)
+                source_snapshots[relative_path] = snapshot
+            except OSError as error:
+                raise SyncError(changed_message) from error
+            finally:
+                if entry_fd >= 0:
+                    _close_fd_quietly(entry_fd)
+                if parent_fd >= 0:
+                    _close_fd_quietly(parent_fd)
+        return
     for relative_path, expected_names in source_members.items():
         display_path = display_root / Path(*relative_path.parts)
         changed_message = (
