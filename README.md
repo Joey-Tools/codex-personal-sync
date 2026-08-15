@@ -436,12 +436,15 @@ ACL, and owner-only `ALLOW` entries are accepted; unknown or unreadable ACL
 state fails closed. A retrieved ACL must pass `acl_valid`
 before enumeration; an invalid-argument result is accepted as normal
 exhaustion only while requesting the next entry, never while requesting the
-first entry. A safe-to-safe change in raw ACL text or ordering, `ctime`, or
-other extended attributes does not by itself prove that the access policy is
-unsafe because each boundary repeats the semantic policy check. This ACL
-contract does not relax independent bound-directory change signals, including
-directory `mtime`; create-and-remove child-entry churn can still reject
-revalidation.
+first entry. Once acquired, both the ACL object and each qualifier object are
+always offered to `acl_free`. A cleanup failure does not replace an existing
+primary admission or qualifier-decoding error; without an existing primary,
+the cleanup failure itself fails admission closed. A safe-to-safe change in raw
+ACL text or ordering, `ctime`, or other extended attributes does not by itself
+prove that the access policy is unsafe because each boundary repeats the
+semantic policy check. This ACL contract does not relax independent
+bound-directory change signals, including directory `mtime`;
+create-and-remove child-entry churn can still reject revalidation.
 
 Every successful Darwin installation retains the complete descriptor chain
 from the synchronization home through each next-current release and

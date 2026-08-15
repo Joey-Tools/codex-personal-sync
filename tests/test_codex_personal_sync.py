@@ -6501,6 +6501,181 @@ while True:
         api.acl_get_entry.assert_not_called()
         self.assertEqual(freed_pointers, [41])
 
+    def test_release_identity_acl_adapter_preserves_qualifier_primary_error(
+        self,
+    ) -> None:
+        qualifier_buffer = MODULE.ctypes.create_string_buffer(bytes(range(16)))
+        qualifier_pointer = MODULE.ctypes.addressof(qualifier_buffer)
+        freed_pointers: list[int] = []
+
+        def get_entry(_acl_pointer, _selector: int, entry_pointer) -> int:
+            entry_pointer._obj.value = 100
+            return 0
+
+        def get_tag_type(_entry_pointer, tag_pointer) -> int:
+            tag_pointer._obj.value = MODULE._DARWIN_ACL_EXTENDED_ALLOW
+            return 0
+
+        def free_pointer(pointer) -> int:
+            freed_pointers.append(pointer)
+            if pointer == qualifier_pointer:
+                MODULE.ctypes.set_errno(MODULE.errno.EIO)
+                return -1
+            return 0
+
+        api = MODULE._DarwinExtendedAclApi(
+            acl_get_fd_np=lambda _file_descriptor, _acl_type: 41,
+            acl_valid=mock.Mock(return_value=0),
+            acl_get_entry=get_entry,
+            acl_get_tag_type=get_tag_type,
+            acl_get_qualifier=lambda _entry_pointer: qualifier_pointer,
+            acl_free=free_pointer,
+            mbr_uid_to_uuid=mock.Mock(),
+        )
+        primary_error = RuntimeError("injected qualifier decoding failure")
+
+        with (
+            mock.patch.object(
+                MODULE.ctypes,
+                "string_at",
+                side_effect=primary_error,
+            ),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            MODULE._darwin_extended_acl_entries(
+                10,
+                self.root / "release-entry",
+                api,
+            )
+
+        self.assertIs(raised.exception, primary_error)
+        self.assertEqual(freed_pointers, [qualifier_pointer, 41])
+
+    def test_release_identity_acl_adapter_preserves_acl_primary_error(
+        self,
+    ) -> None:
+        freed_pointers: list[int] = []
+
+        def invalid_acl(_acl_pointer) -> int:
+            MODULE.ctypes.set_errno(MODULE.errno.EINVAL)
+            return -1
+
+        def fail_acl_free(pointer) -> int:
+            freed_pointers.append(pointer)
+            MODULE.ctypes.set_errno(MODULE.errno.EIO)
+            return -1
+
+        api = MODULE._DarwinExtendedAclApi(
+            acl_get_fd_np=lambda _file_descriptor, _acl_type: 41,
+            acl_valid=invalid_acl,
+            acl_get_entry=mock.Mock(),
+            acl_get_tag_type=mock.Mock(),
+            acl_get_qualifier=mock.Mock(),
+            acl_free=fail_acl_free,
+            mbr_uid_to_uuid=mock.Mock(),
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "acl_valid failed with errno",
+        ) as raised:
+            MODULE._darwin_extended_acl_entries(
+                10,
+                self.root / "release-entry",
+                api,
+            )
+
+        self.assertNotIn("acl_free ACL", str(raised.exception))
+        self.assertEqual(freed_pointers, [41])
+
+    def test_release_identity_acl_adapter_qualifier_cleanup_only_raises(
+        self,
+    ) -> None:
+        qualifier_buffer = MODULE.ctypes.create_string_buffer(bytes(range(16)))
+        qualifier_pointer = MODULE.ctypes.addressof(qualifier_buffer)
+        freed_pointers: list[int] = []
+
+        def get_entry(_acl_pointer, _selector: int, entry_pointer) -> int:
+            entry_pointer._obj.value = 100
+            return 0
+
+        def get_tag_type(_entry_pointer, tag_pointer) -> int:
+            tag_pointer._obj.value = MODULE._DARWIN_ACL_EXTENDED_ALLOW
+            return 0
+
+        def free_pointer(pointer) -> int:
+            freed_pointers.append(pointer)
+            if pointer == qualifier_pointer:
+                MODULE.ctypes.set_errno(MODULE.errno.EIO)
+                return -1
+            return 0
+
+        api = MODULE._DarwinExtendedAclApi(
+            acl_get_fd_np=lambda _file_descriptor, _acl_type: 41,
+            acl_valid=mock.Mock(return_value=0),
+            acl_get_entry=get_entry,
+            acl_get_tag_type=get_tag_type,
+            acl_get_qualifier=lambda _entry_pointer: qualifier_pointer,
+            acl_free=free_pointer,
+            mbr_uid_to_uuid=mock.Mock(),
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "acl_free qualifier failed with errno",
+        ):
+            MODULE._darwin_extended_acl_entries(
+                10,
+                self.root / "release-entry",
+                api,
+            )
+
+        self.assertEqual(freed_pointers, [qualifier_pointer, 41])
+
+    def test_release_identity_acl_adapter_acl_cleanup_only_raises(self) -> None:
+        entry_calls = 0
+        freed_pointers: list[int] = []
+
+        def get_entry(_acl_pointer, _selector: int, entry_pointer) -> int:
+            nonlocal entry_calls
+            entry_calls += 1
+            if entry_calls == 1:
+                entry_pointer._obj.value = 100
+                return 0
+            MODULE.ctypes.set_errno(MODULE.errno.EINVAL)
+            return -1
+
+        def get_tag_type(_entry_pointer, tag_pointer) -> int:
+            tag_pointer._obj.value = MODULE._DARWIN_ACL_EXTENDED_DENY
+            return 0
+
+        def fail_acl_free(pointer) -> int:
+            freed_pointers.append(pointer)
+            MODULE.ctypes.set_errno(MODULE.errno.EIO)
+            return -1
+
+        api = MODULE._DarwinExtendedAclApi(
+            acl_get_fd_np=lambda _file_descriptor, _acl_type: 41,
+            acl_valid=mock.Mock(return_value=0),
+            acl_get_entry=get_entry,
+            acl_get_tag_type=get_tag_type,
+            acl_get_qualifier=mock.Mock(),
+            acl_free=fail_acl_free,
+            mbr_uid_to_uuid=mock.Mock(),
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "acl_free ACL failed with errno",
+        ):
+            MODULE._darwin_extended_acl_entries(
+                10,
+                self.root / "release-entry",
+                api,
+            )
+
+        self.assertEqual(freed_pointers, [41])
+
     def test_release_identity_acl_non_darwin_does_not_load_symbols(self) -> None:
         release_file = self.root / "release-entry"
         release_file.write_bytes(b"entry")

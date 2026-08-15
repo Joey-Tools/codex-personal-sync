@@ -26,6 +26,7 @@ superseded_by:
 - `release-identities` holds the installation lock, validates each installed manifest and full tree, and rejects any current-pointer change across the validation boundary.
 - The Darwin access-policy gate accepts no extended ACL, deny-only ACLs, and owner-only `ALLOW` entries. Any non-owner `ALLOW`, unknown ACL structure, failed query, or unreadable state fails closed at install or final admission.
 - A retrieved Darwin ACL must pass `acl_valid` before entry enumeration. Invalid-argument is normal exhaustion only for a next-entry request; the same result on the first entry fails closed.
+- Every acquired ACL and qualifier object is offered to `acl_free`. Cleanup failure never masks an already-active admission or qualifier-decoding error, while a cleanup-only failure remains a fail-closed unverifiable admission.
 - The protected property is access-policy safety, not raw ACL serialization. Raw ACL text/order, `ctime`, and unrelated extended-attribute changes do not independently prove an unsafe policy; the semantic gate is rerun at each admission boundary. Existing independent directory signals, including `mtime`, remain enforced, so create-and-remove child churn can still reject revalidation.
 - Every successful Darwin install retains and finally revalidates the full synchronization-home-to-release ancestor descriptor chain for every next-current release, including exact no-op and managed-link-only paths. An empty `current` action set does not bypass admission.
 - The canonical repository does not infer host roles or implement SSH fanout. A headless Mac must not install this Aqua scheduler.
@@ -47,7 +48,7 @@ superseded_by:
 
 - Implementation: `scripts/codex_personal_sync.py`.
 - Operator contract: `README.md` and `docs/ARCHITECTURE.md`.
-- Seven new focused ACL and directory-chain tests passed 7/7 under both the current Python and macOS system Python 3.9; five error-priority compatibility selectors passed 5/5 under both runtimes.
-- `tests.test_codex_personal_sync` exited zero under both runtimes with 263 tests run and one skipped per run. `tests.test_personal_sync_reconciliation_safety` exited zero under both runtimes with 305 tests run and no skips per run.
+- Four focused cleanup-precedence tests passed 4/4 under both the current Python and macOS system Python 3.9.
+- `tests.test_codex_personal_sync` exited zero under both runtimes with 267 tests run and one skipped per run. `tests.test_personal_sync_reconciliation_safety` exited zero under both runtimes with 305 tests per runtime.
 - Source-lock currentness and serialization selectors passed 2/2 under both runtimes. Ruff, built-in compilation under both Python versions, `git diff --check`, and `refresh-lock --check` also passed.
 - Superseded decision: `docs/project_journal/2026/08/2026-08-04-macos-background-launchagent.md`.

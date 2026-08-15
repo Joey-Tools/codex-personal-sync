@@ -18468,6 +18468,7 @@ def _darwin_extended_acl_entries(
         )
 
     entries: list[tuple[int, bytes | None]] = []
+    acl_primary_error: BaseException | None = None
     try:
         ctypes.set_errno(0)
         if api.acl_valid(acl_pointer) != 0:
@@ -18524,20 +18525,38 @@ def _darwin_extended_acl_entries(
                         f"acl_get_qualifier failed with errno {error_number}",
                         mismatch=False,
                     )
+                qualifier_primary_error: BaseException | None = None
                 try:
                     qualifier = ctypes.string_at(
                         qualifier_pointer,
                         _DARWIN_UUID_BYTES,
                     )
+                except BaseException as error:
+                    qualifier_primary_error = error
+                    raise
                 finally:
-                    ctypes.set_errno(0)
-                    if api.acl_free(qualifier_pointer) != 0:
+                    try:
+                        ctypes.set_errno(0)
+                        qualifier_free_result = api.acl_free(qualifier_pointer)
                         error_number = ctypes.get_errno()
-                        raise _release_identity_policy_error(
-                            display_path,
-                            f"acl_free qualifier failed with errno {error_number}",
-                            mismatch=False,
-                        )
+                    except BaseException as cleanup_error:
+                        if qualifier_primary_error is None:
+                            raise _release_identity_policy_error(
+                                display_path,
+                                f"acl_free qualifier failed: {cleanup_error}",
+                                mismatch=False,
+                            ) from cleanup_error
+                    else:
+                        if (
+                            qualifier_free_result != 0
+                            and qualifier_primary_error is None
+                        ):
+                            raise _release_identity_policy_error(
+                                display_path,
+                                "acl_free qualifier failed with errno "
+                                f"{error_number}",
+                                mismatch=False,
+                            )
             entries.append((tag_type.value, qualifier))
             if len(entries) > 128:
                 raise _release_identity_policy_error(
@@ -18546,15 +18565,28 @@ def _darwin_extended_acl_entries(
                     mismatch=False,
                 )
             entry_selector = _DARWIN_ACL_NEXT_ENTRY
+    except BaseException as error:
+        acl_primary_error = error
+        raise
     finally:
-        ctypes.set_errno(0)
-        if api.acl_free(acl_pointer) != 0:
+        try:
+            ctypes.set_errno(0)
+            acl_free_result = api.acl_free(acl_pointer)
             error_number = ctypes.get_errno()
-            raise _release_identity_policy_error(
-                display_path,
-                f"acl_free ACL failed with errno {error_number}",
-                mismatch=False,
-            )
+        except BaseException as cleanup_error:
+            if acl_primary_error is None:
+                raise _release_identity_policy_error(
+                    display_path,
+                    f"acl_free ACL failed: {cleanup_error}",
+                    mismatch=False,
+                ) from cleanup_error
+        else:
+            if acl_free_result != 0 and acl_primary_error is None:
+                raise _release_identity_policy_error(
+                    display_path,
+                    f"acl_free ACL failed with errno {error_number}",
+                    mismatch=False,
+                )
     return tuple(entries)
 
 
