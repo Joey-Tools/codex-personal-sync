@@ -7049,6 +7049,84 @@ while True:
         self.assertEqual(target_hashes, 2)
         self.assertEqual(release_file.read_bytes(), b"raced\n")
 
+    def test_release_tree_identity_rejects_second_file_stage_ctime_drift(
+        self,
+    ) -> None:
+        release_root = self.root / "release"
+        write_minimal_release(release_root, agent_text="agent\n")
+        release_file = release_root / "personal_codex" / "AGENTS.md"
+        file_mode = stat.S_IMODE(release_file.stat().st_mode)
+        changed_mode = file_mode ^ stat.S_IXUSR
+        real_hash = MODULE._hash_exact_regular_file
+        target_hashes = 0
+        target_policy_calls = 0
+
+        def hash_then_trigger_first_ctime_drift(
+            file_descriptor: int,
+            snapshot,
+            display_path: Path,
+            *,
+            capture_payload: bool,
+        ):
+            nonlocal target_hashes
+            result = real_hash(
+                file_descriptor,
+                snapshot,
+                display_path,
+                capture_payload=capture_payload,
+            )
+            if display_path == release_file:
+                target_hashes += 1
+                if target_hashes == 1:
+                    release_file.chmod(changed_mode)
+                    release_file.chmod(file_mode)
+            return result
+
+        def trigger_second_ctime_drift_after_rehash(
+            file_descriptor: int,
+            display_path: Path,
+            _expected_owner_uid: int,
+        ):
+            nonlocal target_policy_calls
+            metadata = os.fstat(file_descriptor)
+            if display_path == release_file:
+                target_policy_calls += 1
+                if target_policy_calls == 3:
+                    release_file.chmod(changed_mode)
+                    release_file.chmod(file_mode)
+            return metadata
+
+        release_fd = os.open(release_root, MODULE._source_directory_flags())
+        try:
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE,
+                    "_require_release_identity_fd_access_policy",
+                    side_effect=trigger_second_ctime_drift_after_rehash,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_hash_exact_regular_file",
+                    side_effect=hash_then_trigger_first_ctime_drift,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "release source changed during identity validation",
+                ),
+            ):
+                MODULE._release_tree_identity_from_directory_fd(
+                    release_fd,
+                    release_root,
+                    require_sanitized_modes=True,
+                    expected_owner_uid=os.geteuid(),
+                )
+        finally:
+            os.close(release_fd)
+
+        self.assertEqual(target_policy_calls, 3)
+        self.assertEqual(target_hashes, 2)
+
     def test_release_tree_identity_rejects_child_replaced_after_terminal_scan(
         self,
     ) -> None:
@@ -7251,6 +7329,91 @@ while True:
         finally:
             os.close(release_fd)
 
+        self.assertEqual(target_rehashes, 1)
+
+    def test_release_snapshot_revalidation_rejects_second_ctime_drift(
+        self,
+    ) -> None:
+        release_root = self.root / "release"
+        write_minimal_release(release_root, agent_text="agent\n")
+        release_file = release_root / "personal_codex" / "AGENTS.md"
+        (
+            _manifest_payload,
+            _tree_digest,
+            _path_kinds,
+            source_snapshots,
+            source_members,
+            _captured_files,
+        ) = self.snapshot_release_tree(release_root)
+        file_mode = stat.S_IMODE(release_file.stat().st_mode)
+        changed_mode = file_mode ^ stat.S_IXUSR
+        release_file.chmod(changed_mode)
+        release_file.chmod(file_mode)
+        real_hash = MODULE._hash_exact_regular_file
+        target_rehashes = 0
+        target_policy_calls = 0
+
+        def count_target_rehash(
+            file_descriptor: int,
+            snapshot,
+            display_path: Path,
+            *,
+            capture_payload: bool,
+        ):
+            nonlocal target_rehashes
+            if display_path == release_file:
+                target_rehashes += 1
+            return real_hash(
+                file_descriptor,
+                snapshot,
+                display_path,
+                capture_payload=capture_payload,
+            )
+
+        def change_ctime_before_later_policy_check(
+            file_descriptor: int,
+            display_path: Path,
+            _expected_owner_uid: int,
+        ):
+            nonlocal target_policy_calls
+            if display_path == release_file:
+                target_policy_calls += 1
+                if target_policy_calls == 3:
+                    release_file.chmod(changed_mode)
+                    release_file.chmod(file_mode)
+            return os.fstat(file_descriptor)
+
+        release_fd = os.open(release_root, MODULE._source_directory_flags())
+        try:
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE,
+                    "_require_release_identity_fd_access_policy",
+                    side_effect=change_ctime_before_later_policy_check,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_hash_exact_regular_file",
+                    side_effect=count_target_rehash,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "release source changed during identity validation",
+                ),
+            ):
+                MODULE._verify_release_source_snapshot(
+                    release_fd,
+                    release_root,
+                    source_snapshots,
+                    source_members,
+                    operation="identity validation",
+                    expected_owner_uid=os.geteuid(),
+                )
+        finally:
+            os.close(release_fd)
+
+        self.assertEqual(target_policy_calls, 3)
         self.assertEqual(target_rehashes, 1)
 
     def test_release_snapshot_revalidation_accepts_directory_ctime_drift(

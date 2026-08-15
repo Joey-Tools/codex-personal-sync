@@ -18879,7 +18879,9 @@ def _require_release_source_unchanged(
     # ctime is only a revalidation trigger. Directory entry content is bound by
     # exact immediate-member identities; a regular file with ctime-only drift
     # must be rehashed from the same bound FD before safe metadata churn is
-    # accepted.
+    # accepted. Callers with more than one terminal check for the same retained
+    # file FD use _require_release_stage_source_unchanged to enforce one rehash
+    # across that stage.
     if stat.S_ISREG(snapshot.mode):
         if file_descriptor is None or snapshot.content_identity is None:
             raise SyncError(
@@ -18901,6 +18903,37 @@ def _require_release_source_unchanged(
             f"during {operation}: {display_path}"
         )
     return replace(snapshot, ctime_ns=metadata.st_ctime_ns)
+
+
+def _require_release_stage_source_unchanged(
+    snapshot: _ReleaseSourceSnapshot,
+    metadata: os.stat_result,
+    display_path: Path,
+    *,
+    rehash_used: bool,
+    ignore_ctime: bool,
+    file_descriptor: int,
+    expected_owner_uid: int | None,
+    operation: str,
+) -> tuple[_ReleaseSourceSnapshot, bool]:
+    exact_match = _release_source_matches(snapshot, metadata)
+    if rehash_used and stat.S_ISREG(snapshot.mode) and not exact_match:
+        raise SyncError(
+            f"release source changed during {operation}: {display_path}"
+        )
+    updated_snapshot = _require_release_source_unchanged(
+        snapshot,
+        metadata,
+        display_path,
+        ignore_ctime=ignore_ctime,
+        file_descriptor=file_descriptor,
+        expected_owner_uid=expected_owner_uid,
+        operation=operation,
+    )
+    return (
+        updated_snapshot,
+        rehash_used or (stat.S_ISREG(snapshot.mode) and not exact_match),
+    )
 
 
 def _source_directory_flags() -> int:
@@ -19776,10 +19809,15 @@ def _release_tree_snapshot_from_directory_fd(
                     if expected_owner_uid is not None
                     else os.fstat(file_fd)
                 )
-                opened_snapshot = _require_release_source_unchanged(
+                file_stage_rehash_used = False
+                (
+                    opened_snapshot,
+                    file_stage_rehash_used,
+                ) = _require_release_stage_source_unchanged(
                     opened_snapshot,
                     terminal_file_metadata,
                     display_path,
+                    rehash_used=file_stage_rehash_used,
                     ignore_ctime=expected_owner_uid is not None,
                     file_descriptor=file_fd,
                     expected_owner_uid=expected_owner_uid,
@@ -19800,10 +19838,14 @@ def _release_tree_snapshot_from_directory_fd(
                         f"{expected_owner_uid}",
                         mismatch=True,
                     )
-                opened_snapshot = _require_release_source_unchanged(
+                (
+                    opened_snapshot,
+                    file_stage_rehash_used,
+                ) = _require_release_stage_source_unchanged(
                     opened_snapshot,
                     current_metadata,
                     display_path,
+                    rehash_used=file_stage_rehash_used,
                     ignore_ctime=expected_owner_uid is not None,
                     file_descriptor=file_fd,
                     expected_owner_uid=expected_owner_uid,
@@ -20212,6 +20254,7 @@ def _verify_release_source_snapshot(
                 )
             parent_fd = -1
             entry_fd = -1
+            file_stage_rehash_used = False
             try:
                 if not relative_path.parts:
                     entry_fd = os.dup(root_fd)
@@ -20231,10 +20274,14 @@ def _verify_release_source_snapshot(
                     display_path,
                     expected_owner_uid,
                 )
-                snapshot = _require_release_source_unchanged(
+                (
+                    snapshot,
+                    file_stage_rehash_used,
+                ) = _require_release_stage_source_unchanged(
                     snapshot,
                     opened_metadata,
                     display_path,
+                    rehash_used=file_stage_rehash_used,
                     ignore_ctime=True,
                     file_descriptor=entry_fd,
                     expected_owner_uid=expected_owner_uid,
@@ -20265,10 +20312,14 @@ def _verify_release_source_snapshot(
                         expected_owner_uid,
                     )
                 )
-                snapshot = _require_release_source_unchanged(
+                (
+                    snapshot,
+                    file_stage_rehash_used,
+                ) = _require_release_stage_source_unchanged(
                     snapshot,
                     terminal_opened_metadata,
                     display_path,
+                    rehash_used=file_stage_rehash_used,
                     ignore_ctime=True,
                     file_descriptor=entry_fd,
                     expected_owner_uid=expected_owner_uid,
