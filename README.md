@@ -441,8 +441,21 @@ result is accepted as normal exhaustion only while requesting the next entry,
 never while requesting the first entry. Once acquired, both the ACL object and
 each qualifier object are always offered to `acl_free`. A cleanup failure does
 not replace an existing primary admission or qualifier-decoding error; without
-an existing primary, the cleanup failure itself fails admission closed. A
-safe-to-safe change in raw ACL text or ordering, `ctime`, or other extended
+an existing primary, the cleanup failure itself fails admission closed.
+
+Each Darwin access-policy decision uses one coherent sample on the same bound
+descriptor: pre-ACL `fstat`, semantic ACL validation with complete cleanup, and
+post-ACL `fstat`. Only a successful ACL phase proceeds to the post-ACL stat. If
+object identity (device, inode, and type) and expected UID remain stable and
+both observed modes remain safe, a `ctime` or safe-mode change triggers at most
+one complete resample of that same sequence on the same descriptor; the change
+is a retry trigger, not proof of an unsafe policy. Any observed object-identity
+or expected-UID mismatch, group/world-write mode, or non-owner `ALLOW` entry
+rejects admission. Continued drift after the resample, an ACL API failure, a
+cleanup-only failure, or a post-ACL `fstat` failure fails closed as
+unverifiable. Non-Darwin behavior remains unchanged.
+
+A safe-to-safe change in raw ACL text or ordering, `ctime`, or other extended
 attributes does not by itself prove that the access policy is unsafe because
 each boundary repeats the semantic policy check. A `ctime` change is
 nevertheless always a revalidation trigger and is never ignored as content
