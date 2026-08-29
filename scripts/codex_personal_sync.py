@@ -185,7 +185,7 @@ MAX_MANAGED_STATE_BYTES = 16 * 1024 * 1024
 QUARANTINE_RELATIVE_PATH = Path("quarantine")
 PENDING_LINK_POINTER_NAME = ".personal-sync-pending-transaction.json"
 PENDING_LINK_METADATA_NAME = "pending-transaction.json"
-PENDING_LINK_METADATA_VERSION = 5
+PENDING_LINK_METADATA_VERSION = 6
 PENDING_RELINQUISH_FOREIGN_ACTION = "relinquish-foreign"
 PENDING_LINK_V4_ACTIONS = frozenset(
     {
@@ -200,6 +200,7 @@ PENDING_LINK_V4_ACTIONS = frozenset(
 PENDING_LINK_ACTIONS_BY_METADATA_VERSION = {
     4: PENDING_LINK_V4_ACTIONS,
     5: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
+    6: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
 }
 SUPPORTED_PENDING_LINK_METADATA_VERSIONS = frozenset(
     PENDING_LINK_ACTIONS_BY_METADATA_VERSION
@@ -208,6 +209,7 @@ PENDING_STATE_BEFORE_EVIDENCE = PurePosixPath("pending", "state", "before")
 PENDING_STATE_AFTER_EVIDENCE = PurePosixPath("pending", "state", "after")
 PENDING_STATE_COMMIT_EVIDENCE = PurePosixPath("pending", "state", "commit-evidence")
 PENDING_STATE_COMMIT_MARKER = PurePosixPath("pending", "state", "committed")
+PENDING_STATE_ROLLBACK_MARKER = PurePosixPath("pending", "state", "rolled-back")
 PENDING_CLEANUP_INDEX_RELATIVE_PATH = Path("pending-cleanup")
 PENDING_CLEANUP_TICKET_SUFFIX = ".json"
 PENDING_CLEANUP_CURSOR_NAME = ".scan-cursor"
@@ -4636,6 +4638,8 @@ class LinkAction:
     target: Path
     link_target: str
     kind: str
+    materialization: str = "symlink"
+    regular_source: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -4666,6 +4670,13 @@ class PendingLinkRecord:
     owner: str | None
     link_target: str | None
     release_sha: str | None
+    materialization: str
+    regular_sha256: str | None
+    regular_size: int | None
+    regular_mode: int | None
+    regular_uid: int | None
+    regular_gid: int | None
+    regular_link_count: int | None
     before_evidence: PurePosixPath | None
     before_evidence_identity: tuple[int, int] | None
     backup: PurePosixPath | None
@@ -4673,6 +4684,9 @@ class PendingLinkRecord:
     stage_identity: tuple[int, int] | None
     evidence: PurePosixPath | None
     evidence_identity: tuple[int, int] | None
+
+    def is_regular(self) -> bool:
+        return self.materialization == "regular"
 
     def managed_record(self) -> ManagedLinkRecord:
         if (
@@ -4742,10 +4756,13 @@ class PendingLinkBatch:
 
 @dataclass(frozen=True)
 class PendingBatchCleanupTicket:
+    version: int
+    phase: str
     path: Path
     snapshot: ManagedStateFileSnapshot
     batch_root: Path
     batch_root_identity: tuple[int, int]
+    marker_path: PurePosixPath
     marker_parent_identity: tuple[int, int]
     marker_file_identity: tuple[int, int]
     marker_mode: int
@@ -4761,6 +4778,8 @@ class ReconcileAction:
     expected_link_target: str | None = None
     removed_link_key: str | None = None
     planned_snapshot: ReconcileTargetSnapshot | None = None
+    materialization: str = "symlink"
+    regular_source: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -4804,18 +4823,52 @@ class SymlinkSnapshot:
 
 
 @dataclass(frozen=True)
+class RegularFileSnapshot:
+    parent_identity: tuple[int, int]
+    file_identity: tuple[int, int]
+    sha256: str
+    size: int
+    mode: int
+    uid: int
+    gid: int
+    link_count: int
+
+
+@dataclass(frozen=True)
 class ReconcileTargetSnapshot:
     parent_identity: tuple[int, int] | None
     link_identity: tuple[int, int] | None = None
     link_target: str | None = None
     ancestor_identity: tuple[int, int] | None = None
     missing_parent_parts: tuple[str, ...] = ()
+    regular_sha256: str | None = None
+    regular_size: int | None = None
+    regular_mode: int | None = None
+    regular_uid: int | None = None
+    regular_gid: int | None = None
+    regular_link_count: int | None = None
 
     def __post_init__(self) -> None:
         if self.parent_identity is None and self.link_identity is not None:
             raise ValueError("a missing reconcile parent cannot contain a link")
         if self.link_identity is None and self.link_target is not None:
             raise ValueError("an absent reconcile leaf cannot contain a link target")
+        regular_fields = (
+            self.regular_sha256,
+            self.regular_size,
+            self.regular_mode,
+            self.regular_uid,
+            self.regular_gid,
+            self.regular_link_count,
+        )
+        if any(value is not None for value in regular_fields) and not all(
+            value is not None for value in regular_fields
+        ):
+            raise ValueError("regular-file reconcile evidence must be complete")
+        if self.regular_sha256 is not None and self.link_target is not None:
+            raise ValueError("a reconcile leaf cannot be both regular and a symlink")
+        if self.regular_sha256 is not None and self.link_identity is None:
+            raise ValueError("regular-file reconcile evidence requires an identity")
         if self.parent_identity is None:
             if self.ancestor_identity is None or not self.missing_parent_parts:
                 raise ValueError(
@@ -4829,7 +4882,7 @@ class ReconcileTargetSnapshot:
 class ReconcileMutation:
     action: ReconcileAction
     backup: Path | None = None
-    created_snapshot: SymlinkSnapshot | None = None
+    created_snapshot: SymlinkSnapshot | RegularFileSnapshot | None = None
 
 
 @dataclass
@@ -8766,31 +8819,44 @@ def _atomic_move_beneath_home(
             if (
                 expected_snapshot.parent_identity is None
                 or expected_snapshot.link_identity is None
-                or expected_snapshot.link_target is None
             ):
                 raise SyncError(
-                    f"destructive move has no planned symlink snapshot: {source}"
+                    f"destructive move has no planned target snapshot: {source}"
                 )
             actual_parent_identity = _directory_identity(source_parent_fd)
             if actual_parent_identity != expected_snapshot.parent_identity:
                 raise SyncError(
                     f"source parent changed after planning: {source.parent}"
                 )
-            if not stat.S_ISLNK(source_metadata.st_mode):
-                raise SyncError(f"source changed after planning: {source}")
-            actual_target = os.readlink(source.name, dir_fd=source_parent_fd)
-            source_metadata_after = os.stat(
-                source.name,
-                dir_fd=source_parent_fd,
-                follow_symlinks=False,
-            )
-            if (
-                (source_metadata_after.st_dev, source_metadata_after.st_ino)
-                != source_identity
-                or source_identity != expected_snapshot.link_identity
-                or actual_target != expected_snapshot.link_target
-            ):
-                raise SyncError(f"source changed after planning: {source}")
+            planned_regular = _regular_snapshot_from_reconcile(expected_snapshot)
+            if planned_regular is not None:
+                if not stat.S_ISREG(source_metadata.st_mode):
+                    raise SyncError(f"source changed after planning: {source}")
+                actual_regular = _regular_file_snapshot_at(
+                    source_parent_fd,
+                    source.name,
+                    source,
+                )
+                if actual_regular != planned_regular:
+                    raise SyncError(f"source changed after planning: {source}")
+            else:
+                if expected_snapshot.link_target is None or not stat.S_ISLNK(
+                    source_metadata.st_mode
+                ):
+                    raise SyncError(f"source changed after planning: {source}")
+                actual_target = os.readlink(source.name, dir_fd=source_parent_fd)
+                source_metadata_after = os.stat(
+                    source.name,
+                    dir_fd=source_parent_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    (source_metadata_after.st_dev, source_metadata_after.st_ino)
+                    != source_identity
+                    or source_identity != expected_snapshot.link_identity
+                    or actual_target != expected_snapshot.link_target
+                ):
+                    raise SyncError(f"source changed after planning: {source}")
         if not _bound_directory_matches(home, source.parent, source_parent_fd):
             raise SyncError(f"source parent changed before move: {source.parent}")
         if not _bound_directory_matches(
@@ -8940,6 +9006,162 @@ def _symlink_snapshot_at(
     return identity, link_target
 
 
+def _regular_file_snapshot_at(
+    parent_fd: int,
+    name: str,
+    path: Path,
+    *,
+    maximum_bytes: int = MAX_ARCHIVE_MEMBER_BYTES,
+) -> RegularFileSnapshot:
+    try:
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise SyncError(f"managed regular file is unreadable: {path}: {error}") from error
+    if not stat.S_ISREG(named.st_mode):
+        raise SyncError(f"managed target is not a regular file: {path}")
+    if named.st_size > maximum_bytes:
+        raise SyncError(
+            f"managed regular file exceeds {maximum_bytes} bytes: {path}"
+        )
+    expected_identity = (named.st_dev, named.st_ino)
+    expected_metadata = (
+        stat.S_IFMT(named.st_mode),
+        stat.S_IMODE(named.st_mode),
+        named.st_uid,
+        named.st_gid,
+        named.st_size,
+        named.st_nlink,
+    )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    file_fd = -1
+    try:
+        try:
+            file_fd = os.open(name, flags, dir_fd=parent_fd)
+        except OSError as error:
+            raise SyncError(
+                f"managed regular file is unreadable: {path}: {error}"
+            ) from error
+        opened = os.fstat(file_fd)
+        _require_release_identity_fd_access_policy(
+            file_fd,
+            path,
+            os.geteuid(),
+        )
+        opened_metadata = (
+            stat.S_IFMT(opened.st_mode),
+            stat.S_IMODE(opened.st_mode),
+            opened.st_uid,
+            opened.st_gid,
+            opened.st_size,
+            opened.st_nlink,
+        )
+        if (opened.st_dev, opened.st_ino) != expected_identity or (
+            opened_metadata != expected_metadata
+        ):
+            raise SyncError(f"managed regular file changed before read: {path}")
+        payload = _read_managed_state_bytes(file_fd, path, maximum_bytes)
+        os.lseek(file_fd, 0, os.SEEK_SET)
+        if _read_managed_state_bytes(file_fd, path, maximum_bytes) != payload:
+            raise SyncError(f"managed regular file content changed during read: {path}")
+        confirmed = os.fstat(file_fd)
+        confirmed_metadata = (
+            stat.S_IFMT(confirmed.st_mode),
+            stat.S_IMODE(confirmed.st_mode),
+            confirmed.st_uid,
+            confirmed.st_gid,
+            confirmed.st_size,
+            confirmed.st_nlink,
+        )
+        if (confirmed.st_dev, confirmed.st_ino) != expected_identity or (
+            confirmed_metadata != expected_metadata
+        ):
+            raise SyncError(f"managed regular file changed during read: {path}")
+        rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        rebound_metadata = (
+            stat.S_IFMT(rebound.st_mode),
+            stat.S_IMODE(rebound.st_mode),
+            rebound.st_uid,
+            rebound.st_gid,
+            rebound.st_size,
+            rebound.st_nlink,
+        )
+        if (rebound.st_dev, rebound.st_ino) != expected_identity or (
+            rebound_metadata != expected_metadata
+        ):
+            raise SyncError(f"managed regular file changed during read: {path}")
+    finally:
+        if file_fd >= 0:
+            _close_fd_quietly(file_fd)
+    return RegularFileSnapshot(
+        parent_identity=_directory_identity(parent_fd),
+        file_identity=expected_identity,
+        sha256=hashlib.sha256(payload).hexdigest(),
+        size=len(payload),
+        mode=stat.S_IMODE(named.st_mode),
+        uid=named.st_uid,
+        gid=named.st_gid,
+        link_count=named.st_nlink,
+    )
+
+
+def _read_regular_file_snapshot_beneath(
+    home: Path,
+    path: Path,
+    *,
+    require_managed_access: bool,
+) -> RegularFileSnapshot:
+    parent_fd = _open_directory_beneath(home, path.parent)
+    try:
+        if not _bound_directory_matches(home, path.parent, parent_fd):
+            raise SyncError(f"managed regular-file parent changed: {path.parent}")
+        snapshot = _regular_file_snapshot_at(parent_fd, path.name, path)
+        if require_managed_access and (
+            snapshot.mode != 0o600
+            or snapshot.uid != os.geteuid()
+            or snapshot.link_count != 1
+        ):
+            raise SyncError(
+                "managed regular file access policy mismatch: "
+                f"{path} (mode={snapshot.mode:o}, uid={snapshot.uid}, "
+                f"links={snapshot.link_count})"
+            )
+        if not _bound_directory_matches(home, path.parent, parent_fd):
+            raise SyncError(f"managed regular-file parent changed: {path.parent}")
+        return snapshot
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _remove_expected_regular_file_beneath(
+    home: Path,
+    target: Path,
+    expected: RegularFileSnapshot,
+) -> None:
+    parent_fd = _open_directory_beneath(home, target.parent)
+    try:
+        actual = _regular_file_snapshot_at(parent_fd, target.name, target)
+        if actual != expected:
+            raise SyncError(
+                f"refusing to remove changed managed regular file: {target}"
+            )
+        os.unlink(target.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        try:
+            os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise SyncError(
+                f"managed regular file reappeared after removal: {target}"
+            )
+        if not _bound_directory_matches(home, target.parent, parent_fd):
+            raise SyncError(f"managed target parent changed: {target.parent}")
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
 def _validate_reconcile_link_target(link_target: str, label: str) -> str:
     try:
         encoded = os.fsencode(link_target)
@@ -8991,6 +9213,25 @@ def _capture_reconcile_target_snapshot(
             return ReconcileTargetSnapshot(
                 parent_identity=parent_identity,
                 ancestor_identity=parent_identity,
+            )
+        if stat.S_ISREG(metadata.st_mode):
+            regular = _regular_file_snapshot_at(
+                parent_fd,
+                target.name,
+                target,
+            )
+            if not _bound_directory_matches(home, target.parent, parent_fd):
+                raise SyncError(f"managed target parent changed: {target.parent}")
+            return ReconcileTargetSnapshot(
+                parent_identity=parent_identity,
+                link_identity=regular.file_identity,
+                ancestor_identity=parent_identity,
+                regular_sha256=regular.sha256,
+                regular_size=regular.size,
+                regular_mode=regular.mode,
+                regular_uid=regular.uid,
+                regular_gid=regular.gid,
+                regular_link_count=regular.link_count,
             )
         if not stat.S_ISLNK(metadata.st_mode):
             return ReconcileTargetSnapshot(
@@ -9377,6 +9618,153 @@ def _create_symlink_beneath(
             ) from error
         raise
     finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _read_regular_source_payload(home: Path, source: Path) -> bytes:
+    try:
+        source.relative_to(home)
+    except ValueError:
+        try:
+            named = os.lstat(source)
+        except OSError as error:
+            raise SyncError(
+                f"managed regular-file source is unreadable: {source}: {error}"
+            ) from error
+        if not stat.S_ISREG(named.st_mode):
+            raise SyncError(f"managed regular-file source is not regular: {source}")
+        if named.st_size > MAX_ARCHIVE_MEMBER_BYTES:
+            raise SyncError(
+                "managed regular-file source exceeds the size limit: "
+                f"{source}"
+            )
+        expected = _managed_state_metadata_snapshot(named)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        file_fd = -1
+        try:
+            file_fd = os.open(source, flags)
+            if _managed_state_metadata_snapshot(os.fstat(file_fd)) != expected:
+                raise SyncError(
+                    f"managed regular-file source changed before read: {source}"
+                )
+            payload = _read_managed_state_bytes(
+                file_fd,
+                source,
+                MAX_ARCHIVE_MEMBER_BYTES,
+            )
+            os.lseek(file_fd, 0, os.SEEK_SET)
+            confirmed = _read_managed_state_bytes(
+                file_fd,
+                source,
+                MAX_ARCHIVE_MEMBER_BYTES,
+            )
+            if confirmed != payload or (
+                _managed_state_metadata_snapshot(os.fstat(file_fd)) != expected
+            ):
+                raise SyncError(
+                    f"managed regular-file source changed during read: {source}"
+                )
+            if _managed_state_metadata_snapshot(os.lstat(source)) != expected:
+                raise SyncError(
+                    f"managed regular-file source changed during read: {source}"
+                )
+            return payload
+        finally:
+            if file_fd >= 0:
+                _close_fd_quietly(file_fd)
+    parent_fd = _open_directory_beneath(home, source.parent)
+    try:
+        snapshot = _read_managed_state_file_snapshot(
+            home,
+            source,
+            parent_fd,
+            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+        )
+        if not snapshot.exists or snapshot.payload is None:
+            raise SyncError(f"managed regular-file source is missing: {source}")
+        if snapshot.file_type != stat.S_IFREG:
+            raise SyncError(f"managed regular-file source is not regular: {source}")
+        return snapshot.payload
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _create_regular_file_beneath(
+    home: Path,
+    source: Path,
+    target: Path,
+    expected_snapshot: ReconcileTargetSnapshot | None = None,
+    created_parent_identities: dict[Path, tuple[int, int]] | None = None,
+) -> RegularFileSnapshot:
+    payload = _read_regular_source_payload(home, source)
+    _ensure_safe_target_parent(home, target)
+    if expected_snapshot is not None:
+        if created_parent_identities is None:
+            created_parent_identities = {}
+        parent_fd = _open_reconcile_parent_for_create(
+            home,
+            target,
+            expected_snapshot,
+            created_parent_identities,
+        )
+    else:
+        parent_fd = _open_or_create_directory_beneath(home, target.parent)
+    file_fd = -1
+    created_identity: tuple[int, int] | None = None
+    try:
+        parent_identity = _directory_identity(parent_fd)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        file_fd = os.open(target.name, flags, 0o600, dir_fd=parent_fd)
+        opened = os.fstat(file_fd)
+        created_identity = (opened.st_dev, opened.st_ino)
+        with os.fdopen(file_fd, "wb", closefd=True) as file:
+            file_fd = -1
+            file.write(payload)
+            file.flush()
+            os.fsync(file.fileno())
+        os.fsync(parent_fd)
+        snapshot = _regular_file_snapshot_at(parent_fd, target.name, target)
+        if (
+            snapshot.parent_identity != parent_identity
+            or snapshot.file_identity != created_identity
+            or snapshot.sha256 != hashlib.sha256(payload).hexdigest()
+            or snapshot.mode != 0o600
+            or snapshot.uid != os.geteuid()
+            or snapshot.link_count != 1
+        ):
+            raise SyncError(f"created managed regular file changed: {target}")
+        if not _bound_directory_matches(home, target.parent, parent_fd):
+            raise SyncError(f"managed target parent changed: {target.parent}")
+        return snapshot
+    except BaseException as error:
+        if file_fd >= 0:
+            _close_fd_quietly(file_fd)
+            file_fd = -1
+        if created_identity is not None:
+            try:
+                current = os.stat(
+                    target.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if (current.st_dev, current.st_ino) == created_identity:
+                    os.unlink(target.name, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_error:
+                raise SyncError(
+                    "managed regular-file creation failed and exact cleanup "
+                    f"could not be verified: {target}: {cleanup_error}"
+                ) from error
+        raise
+    finally:
+        if file_fd >= 0:
+            _close_fd_quietly(file_fd)
         _close_fd_quietly(parent_fd)
 
 
@@ -10999,6 +11387,8 @@ def _verify_managed_state_link_claims(
     home: Path,
     state: ManagedState,
     planned_actions: list[ReconcileAction] | None = None,
+    *,
+    allow_transaction_links: bool = False,
 ) -> None:
     relinquishments: dict[PurePosixPath, ReconcileAction] = {}
     for action in planned_actions or []:
@@ -11022,6 +11412,30 @@ def _verify_managed_state_link_claims(
         )
         if actual_snapshot.link_identity is None:
             continue
+        actual_regular = _regular_snapshot_from_reconcile(actual_snapshot)
+        if _record_materializes_regular_file(record) and actual_regular is not None:
+            if (
+                actual_regular.mode != 0o600
+                or actual_regular.uid != os.geteuid()
+                or (
+                    actual_regular.link_count != 1
+                    and not (
+                        allow_transaction_links
+                        and actual_regular.link_count > 1
+                    )
+                )
+            ):
+                raise SyncError(
+                    f"managed regular file access policy mismatch: {target}"
+                )
+            expected_source = _record_regular_source_path(home, record)
+            if actual_regular.sha256 == _regular_source_sha256(
+                home, expected_source
+            ):
+                continue
+            raise SyncError(
+                f"managed state/regular-file content mismatch for {target}"
+            )
         if actual_snapshot.link_target == record.link_target:
             continue
         relinquishment = relinquishments.get(target)
@@ -11246,6 +11660,90 @@ def _desired_link_target(home: Path, entry: LinkEntry) -> str:
         entry.source,
         entry.target,
         entry.owner,
+    )
+
+
+def _entry_materializes_regular_file(entry: LinkEntry) -> bool:
+    """Keep Codex custom-agent TOML files independent from release symlinks."""
+    return (
+        entry.kind == "file"
+        and len(entry.target.parts) == 2
+        and entry.target.parts[0] == "agents"
+        and entry.target.suffix == ".toml"
+    )
+
+
+def _record_materializes_regular_file(record: ManagedLinkRecord) -> bool:
+    return _entry_materializes_regular_file(
+        LinkEntry(
+            source=record.source,
+            target=record.target,
+            kind=record.kind,
+            owner=record.owner,
+        )
+    )
+
+
+def _entry_regular_source_path(
+    home: Path,
+    entry: LinkEntry,
+    owner_shas: dict[str, str] | None = None,
+) -> Path:
+    if not _entry_materializes_regular_file(entry):
+        raise SyncError(f"entry is not a managed regular file: {entry.target}")
+    sha = (owner_shas or {}).get(entry.owner)
+    if sha is None:
+        sha = _current_sha(home, entry.owner)
+    if sha is None:
+        raise SyncError(
+            f"managed regular file has no installed release: {entry.target}"
+        )
+    sha = _validate_release_sha(sha)
+    _ensure_safe_release_directory(home, entry.owner, sha, allow_missing=False)
+    return _releases_root(home, entry.owner) / sha / Path(*entry.source.parts)
+
+
+def _record_regular_source_path(home: Path, record: ManagedLinkRecord) -> Path:
+    if not _record_materializes_regular_file(record):
+        raise SyncError(f"record is not a managed regular file: {record.target}")
+    sha = _validate_release_sha(record.release_sha)
+    _ensure_safe_release_directory(home, record.owner, sha, allow_missing=False)
+    return _releases_root(home, record.owner) / sha / Path(*record.source.parts)
+
+
+def _regular_source_sha256(home: Path, source: Path) -> str:
+    return hashlib.sha256(_read_regular_source_payload(home, source)).hexdigest()
+
+
+def _regular_snapshot_has_managed_access(snapshot: RegularFileSnapshot) -> bool:
+    return (
+        snapshot.mode == 0o600
+        and snapshot.uid == os.geteuid()
+        and snapshot.link_count == 1
+    )
+
+
+def _regular_snapshot_from_reconcile(
+    snapshot: ReconcileTargetSnapshot,
+) -> RegularFileSnapshot | None:
+    if snapshot.regular_sha256 is None:
+        return None
+    assert snapshot.parent_identity is not None
+    assert snapshot.link_identity is not None
+    assert snapshot.regular_size is not None
+    assert snapshot.regular_mode is not None
+    assert snapshot.regular_uid is not None
+    assert snapshot.regular_gid is not None
+    assert snapshot.regular_link_count is not None
+    return RegularFileSnapshot(
+        parent_identity=snapshot.parent_identity,
+        file_identity=snapshot.link_identity,
+        sha256=snapshot.regular_sha256,
+        size=snapshot.regular_size,
+        mode=snapshot.regular_mode,
+        uid=snapshot.regular_uid,
+        gid=snapshot.regular_gid,
+        link_count=snapshot.regular_link_count,
     )
 
 
@@ -11513,6 +12011,8 @@ def _plan_reconciliation(
     *,
     allow_cross_owner: bool,
     allow_unledgered_removed_links: bool = False,
+    owner_shas: dict[str, str] | None = None,
+    incoming_regular_sources: dict[tuple[str, PurePosixPath], Path] | None = None,
 ) -> list[ReconcileAction]:
     desired_by_target = _entries_by_target(desired_entries)
     previous_targets: dict[PurePosixPath, set[str]] = {}
@@ -11554,6 +12054,10 @@ def _plan_reconciliation(
             record is not None
             and planned_snapshot is not None
             and planned_snapshot.link_identity is not None
+            and (
+                not _record_materializes_regular_file(record)
+                or planned_snapshot.regular_sha256 is None
+            )
             and planned_snapshot.link_target != record.link_target
         ):
             if _allows_optional_claim_relinquishment(
@@ -11577,6 +12081,20 @@ def _plan_reconciliation(
             )
         if desired_entry is not None:
             desired = _desired_link_target(home, desired_entry)
+            regular_source = (
+                (incoming_regular_sources or {}).get(
+                    (desired_entry.owner, desired_entry.target)
+                )
+                or _entry_regular_source_path(home, desired_entry, owner_shas)
+                if _entry_materializes_regular_file(desired_entry)
+                else None
+            )
+            materialization = "regular" if regular_source is not None else "symlink"
+            desired_regular_sha256 = (
+                _regular_source_sha256(home, regular_source)
+                if regular_source is not None
+                else None
+            )
             if planned_snapshot is None or planned_snapshot.link_identity is None:
                 actions.append(
                     ReconcileAction(
@@ -11585,6 +12103,68 @@ def _plan_reconciliation(
                         desired,
                         desired_entry.kind,
                         planned_snapshot=planned_snapshot,
+                        materialization=materialization,
+                        regular_source=regular_source,
+                    )
+                )
+                continue
+            planned_regular = _regular_snapshot_from_reconcile(planned_snapshot)
+            if regular_source is not None and planned_regular is not None:
+                if record is None:
+                    raise SyncError(
+                        f"refusing to adopt unproven regular-file target: {target}"
+                    )
+                if not _record_materializes_regular_file(record):
+                    raise SyncError(
+                        f"managed state target type mismatch for regular file: {target}"
+                    )
+                if not _regular_snapshot_has_managed_access(planned_regular):
+                    raise SyncError(
+                        f"managed regular file access policy mismatch: {target}"
+                    )
+                assert desired_regular_sha256 is not None
+                if planned_regular.sha256 == desired_regular_sha256:
+                    continue
+                prior_source = _record_regular_source_path(home, record)
+                if planned_regular.sha256 != _regular_source_sha256(
+                    home, prior_source
+                ):
+                    raise SyncError(
+                        f"refusing to replace modified managed regular file: {target}"
+                    )
+                actions.append(
+                    ReconcileAction(
+                        "replace",
+                        target,
+                        desired,
+                        desired_entry.kind,
+                        expected_link_target=record.link_target,
+                        planned_snapshot=planned_snapshot,
+                        materialization="regular",
+                        regular_source=regular_source,
+                    )
+                )
+                continue
+            if regular_source is not None and planned_snapshot.link_target is not None:
+                existing = planned_snapshot.link_target
+                proven = record is not None and record.link_target == existing
+                if not proven:
+                    existing_owner = _link_managed_owner(home, target)
+                    proven = existing_owner == desired_entry.owner and existing == desired
+                if not proven:
+                    raise SyncError(
+                        f"refusing to migrate unproven symlink target: {target}"
+                    )
+                actions.append(
+                    ReconcileAction(
+                        "replace",
+                        target,
+                        desired,
+                        desired_entry.kind,
+                        expected_link_target=existing,
+                        planned_snapshot=planned_snapshot,
+                        materialization="regular",
+                        regular_source=regular_source,
                     )
                 )
                 continue
@@ -11645,10 +12225,33 @@ def _plan_reconciliation(
                 continue
             raise SyncError(f"refusing to replace unproven symlink target: {target}")
 
-        if planned_snapshot is None or (
-            planned_snapshot.link_identity is None
-            or planned_snapshot.link_target is None
-        ):
+        if planned_snapshot is None or planned_snapshot.link_identity is None:
+            continue
+        planned_regular = _regular_snapshot_from_reconcile(planned_snapshot)
+        if planned_regular is not None:
+            if record is None or not _record_materializes_regular_file(record):
+                continue
+            if not _regular_snapshot_has_managed_access(planned_regular):
+                raise SyncError(
+                    f"managed regular file access policy mismatch: {target}"
+                )
+            prior_source = _record_regular_source_path(home, record)
+            if planned_regular.sha256 != _regular_source_sha256(home, prior_source):
+                raise SyncError(
+                    f"refusing to remove modified managed regular file: {target}"
+                )
+            actions.append(
+                ReconcileAction(
+                    "remove",
+                    target,
+                    "",
+                    record.kind,
+                    planned_snapshot=planned_snapshot,
+                    materialization="regular",
+                )
+            )
+            continue
+        if planned_snapshot.link_target is None:
             continue
         assert planned_snapshot.link_target is not None
         existing = planned_snapshot.link_target
@@ -11791,6 +12394,12 @@ def _planned_snapshot_payload(snapshot: ReconcileTargetSnapshot) -> dict[str, An
         "link_target": snapshot.link_target,
         "ancestor_identity": _identity_payload(snapshot.ancestor_identity),
         "missing_parent_parts": list(snapshot.missing_parent_parts),
+        "regular_sha256": snapshot.regular_sha256,
+        "regular_size": snapshot.regular_size,
+        "regular_mode": snapshot.regular_mode,
+        "regular_uid": snapshot.regular_uid,
+        "regular_gid": snapshot.regular_gid,
+        "regular_link_count": snapshot.regular_link_count,
     }
 
 
@@ -11852,6 +12461,28 @@ def _pending_commit_evidence_payload(
         "state_after_sha256": hashlib.sha256(state_after.payload).hexdigest(),
     }
     return (json.dumps(payload, indent=2, sort_keys=False) + "\n").encode("utf-8")
+
+
+def _pending_rollback_marker_payload(batch: PendingLinkBatch) -> bytes:
+    state_before = batch.state_before
+    if state_before.parent_identity is None:
+        raise SyncError("pending state-before parent is not fully bound")
+    payload = {
+        "version": 1,
+        "batch": batch.batch_root.name,
+        "phase": "before",
+        "state_parent_identity": _identity_payload(
+            state_before.parent_identity
+        ),
+        "state_before_exists": state_before.exists,
+        "state_before_identity": _identity_payload(state_before.file_identity),
+        "state_before_sha256": _snapshot_payload_digest(state_before),
+    }
+    return _bounded_json_document(
+        payload,
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending rollback marker exceeds the size limit",
+    )
 
 
 def _bounded_json_document(
@@ -11925,6 +12556,13 @@ def _pending_link_metadata_payload(
                 "owner": record.owner,
                 "link_target": record.link_target,
                 "release_sha": record.release_sha,
+                "materialization": record.materialization,
+                "regular_sha256": record.regular_sha256,
+                "regular_size": record.regular_size,
+                "regular_mode": record.regular_mode,
+                "regular_uid": record.regular_uid,
+                "regular_gid": record.regular_gid,
+                "regular_link_count": record.regular_link_count,
                 "before_evidence": (
                     record.before_evidence.as_posix()
                     if record.before_evidence is not None
@@ -12039,6 +12677,79 @@ def _publish_regular_hardlink_beneath(
         _close_fd_quietly(source_parent_fd)
 
 
+def _publish_regular_reconcile_hardlink_beneath(
+    home: Path,
+    source: Path,
+    target: Path,
+    source_snapshot: RegularFileSnapshot,
+    expected_target_snapshot: ReconcileTargetSnapshot,
+    created_parent_identities: dict[Path, tuple[int, int]],
+) -> RegularFileSnapshot:
+    source_parent_fd = _open_directory_beneath(home, source.parent)
+    try:
+        target_parent_fd = _open_reconcile_parent_for_create(
+            home,
+            target,
+            expected_target_snapshot,
+            created_parent_identities,
+        )
+    except BaseException:
+        _close_fd_quietly(source_parent_fd)
+        raise
+    published_snapshot: RegularFileSnapshot | None = None
+    try:
+        actual_source = _regular_file_snapshot_at(
+            source_parent_fd,
+            source.name,
+            source,
+        )
+        if actual_source != source_snapshot or not _bound_directory_matches(
+            home, source.parent, source_parent_fd
+        ):
+            raise SyncError(f"pending regular-file stage changed: {source}")
+        if not _bound_directory_matches(home, target.parent, target_parent_fd):
+            raise SyncError(f"managed target parent changed: {target.parent}")
+        os.link(
+            source.name,
+            target.name,
+            src_dir_fd=source_parent_fd,
+            dst_dir_fd=target_parent_fd,
+            follow_symlinks=False,
+        )
+        published_snapshot = _regular_file_snapshot_at(
+            target_parent_fd,
+            target.name,
+            target,
+        )
+        if not _regular_snapshot_leaf_matches(published_snapshot, source_snapshot) or (
+            published_snapshot.link_count != source_snapshot.link_count + 1
+        ):
+            raise SyncError(f"published managed regular file changed: {target}")
+        os.fsync(target_parent_fd)
+        if not _bound_directory_matches(
+            home, source.parent, source_parent_fd
+        ) or not _bound_directory_matches(home, target.parent, target_parent_fd):
+            raise SyncError(f"managed regular-file parent changed: {target}")
+        return published_snapshot
+    except BaseException as error:
+        if published_snapshot is not None:
+            try:
+                _remove_expected_regular_file_beneath(
+                    home,
+                    target,
+                    published_snapshot,
+                )
+            except BaseException as cleanup_error:
+                raise SyncError(
+                    "managed regular-file publication failed and exact cleanup "
+                    f"could not be verified: {target}: {cleanup_error}"
+                ) from error
+        raise
+    finally:
+        _close_fd_quietly(target_parent_fd)
+        _close_fd_quietly(source_parent_fd)
+
+
 def _pending_current_owner(
     home: Path,
     target: Path,
@@ -12096,6 +12807,11 @@ def _pending_state_claim_semantics(
             )
         )
     for record in state.links.values():
+        if _record_materializes_regular_file(record):
+            # Regular-file preimages are carried by the action record's exact
+            # before evidence. They intentionally do not masquerade as
+            # symlink claims in manifest-v1 pending metadata.
+            continue
         claims.append(
             (
                 "managed",
@@ -12396,6 +13112,13 @@ def _pending_link_record_for_action(
     owner: str | None = None
     release_sha: str | None = None
     link_target = action.link_target if producing else None
+    materialization = (
+        action.materialization if producing or destructive else "symlink"
+    )
+    if materialization not in {"symlink", "regular"}:
+        raise SyncError(f"unsupported pending materialization: {materialization}")
+    if materialization == "regular" and scope != "managed":
+        raise SyncError("only managed targets may materialize as regular files")
     if scope == "managed" and relinquishing_foreign:
         entry = desired_by_target.get(target)
         state_record = current_owner_state.links.get(target)
@@ -12462,6 +13185,13 @@ def _pending_link_record_for_action(
         owner=owner,
         link_target=link_target,
         release_sha=release_sha,
+        materialization=materialization,
+        regular_sha256=None,
+        regular_size=None,
+        regular_mode=None,
+        regular_uid=None,
+        regular_gid=None,
+        regular_link_count=None,
         before_evidence=(
             PurePosixPath("pending", "before", leaf) if destructive else None
         ),
@@ -12558,6 +13288,15 @@ def _projected_pending_record_payload(
         "owner": owner,
         "link_target": action.link_target if producing else None,
         "release_sha": release_sha if producing else None,
+        "materialization": (
+            action.materialization if producing or destructive else "symlink"
+        ),
+        "regular_sha256": "f" * 64 if producing and action.materialization == "regular" else None,
+        "regular_size": MAX_ARCHIVE_MEMBER_BYTES if producing and action.materialization == "regular" else None,
+        "regular_mode": 0o600 if producing and action.materialization == "regular" else None,
+        "regular_uid": _MAX_PENDING_IDENTITY if producing and action.materialization == "regular" else None,
+        "regular_gid": _MAX_PENDING_IDENTITY if producing and action.materialization == "regular" else None,
+        "regular_link_count": 2 if producing and action.materialization == "regular" else None,
         "before_evidence": (
             PurePosixPath("pending", "before", leaf).as_posix() if destructive else None
         ),
@@ -12603,6 +13342,13 @@ def _projected_retired_absence_record_payload(
         "owner": None,
         "link_target": None,
         "release_sha": None,
+        "materialization": "symlink",
+        "regular_sha256": None,
+        "regular_size": None,
+        "regular_mode": None,
+        "regular_uid": None,
+        "regular_gid": None,
+        "regular_link_count": None,
         "before_evidence": None,
         "before_evidence_identity": None,
         "backup": None,
@@ -12634,6 +13380,13 @@ def _projected_retired_current_absence_record_payload(
         "owner": owner,
         "link_target": None,
         "release_sha": None,
+        "materialization": "symlink",
+        "regular_sha256": None,
+        "regular_size": None,
+        "regular_mode": None,
+        "regular_uid": None,
+        "regular_gid": None,
+        "regular_link_count": None,
         "before_evidence": None,
         "before_evidence_identity": None,
         "backup": None,
@@ -13615,22 +14368,62 @@ def _stage_pending_link_batch(
                 seen.add(key)
                 if record.before_evidence is not None:
                     assert record.planned_snapshot.link_identity is not None
-                    assert record.planned_snapshot.link_target is not None
                     before_path = batch_root / Path(*record.before_evidence.parts)
-                    before_plan = _capture_reconcile_target_snapshot(home, before_path)
-                    before_snapshot = _publish_symlink_hardlink_beneath(
-                        home,
-                        action.target,
-                        before_path,
-                        SymlinkSnapshot(
-                            parent_identity=record.planned_snapshot.parent_identity,
-                            link_identity=record.planned_snapshot.link_identity,
-                            link_target=record.planned_snapshot.link_target,
-                        ),
-                        before_plan,
-                        created_parent_identities,
+                    planned_regular = _regular_snapshot_from_reconcile(
+                        record.planned_snapshot
                     )
-                    if before_snapshot.link_identity != record.before_evidence_identity:
+                    if planned_regular is not None:
+                        source_parent_fd = _open_directory_beneath(
+                            home, action.target.parent
+                        )
+                        try:
+                            regular_state_snapshot = _read_managed_state_file_snapshot(
+                                home,
+                                action.target,
+                                source_parent_fd,
+                                expected_identity=planned_regular.file_identity,
+                                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                            )
+                        finally:
+                            _close_fd_quietly(source_parent_fd)
+                        before_regular = _publish_regular_hardlink_beneath(
+                            home,
+                            action.target,
+                            before_path,
+                            regular_state_snapshot,
+                        )
+                        before_identity = before_regular.file_identity
+                        refreshed_regular = _read_regular_file_snapshot_beneath(
+                            home,
+                            action.target,
+                            require_managed_access=False,
+                        )
+                        record = replace(
+                            record,
+                            planned_snapshot=replace(
+                                record.planned_snapshot,
+                                regular_link_count=refreshed_regular.link_count,
+                            ),
+                        )
+                    else:
+                        assert record.planned_snapshot.link_target is not None
+                        before_plan = _capture_reconcile_target_snapshot(
+                            home, before_path
+                        )
+                        before_snapshot = _publish_symlink_hardlink_beneath(
+                            home,
+                            action.target,
+                            before_path,
+                            SymlinkSnapshot(
+                                parent_identity=record.planned_snapshot.parent_identity,
+                                link_identity=record.planned_snapshot.link_identity,
+                                link_target=record.planned_snapshot.link_target,
+                            ),
+                            before_plan,
+                            created_parent_identities,
+                        )
+                        before_identity = before_snapshot.link_identity
+                    if before_identity != record.before_evidence_identity:
                         raise SyncError(
                             f"pending before evidence changed: {record.target}"
                         )
@@ -13639,26 +14432,84 @@ def _stage_pending_link_batch(
                     assert record.link_target is not None
                     stage = batch_root / Path(*record.stage.parts)
                     evidence = batch_root / Path(*record.evidence.parts)
-                    stage_snapshot = _create_symlink_beneath(
-                        home,
-                        stage,
-                        record.link_target,
-                        record.kind,
-                    )
-                    evidence_plan = _capture_reconcile_target_snapshot(home, evidence)
-                    evidence_snapshot = _publish_symlink_hardlink_beneath(
-                        home,
-                        stage,
-                        evidence,
-                        stage_snapshot,
-                        evidence_plan,
-                        created_parent_identities,
-                    )
-                    record = replace(
-                        record,
-                        stage_identity=stage_snapshot.link_identity,
-                        evidence_identity=evidence_snapshot.link_identity,
-                    )
+                    if record.is_regular():
+                        source = _record_regular_source_path(
+                            home, record.managed_record()
+                        )
+                        _create_regular_file_beneath(home, source, stage)
+                        stage_parent_fd = _open_directory_beneath(home, stage.parent)
+                        try:
+                            stage_state = _read_managed_state_file_snapshot(
+                                home,
+                                stage,
+                                stage_parent_fd,
+                                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                            )
+                        finally:
+                            _close_fd_quietly(stage_parent_fd)
+                        _publish_regular_hardlink_beneath(
+                            home,
+                            stage,
+                            evidence,
+                            stage_state,
+                        )
+                        stage_snapshot = _read_regular_file_snapshot_beneath(
+                            home,
+                            stage,
+                            require_managed_access=False,
+                        )
+                        evidence_snapshot = _read_regular_file_snapshot_beneath(
+                            home,
+                            evidence,
+                            require_managed_access=False,
+                        )
+                        if (
+                            stage_snapshot.file_identity
+                            != evidence_snapshot.file_identity
+                            or stage_snapshot.sha256 != evidence_snapshot.sha256
+                            or stage_snapshot.size != evidence_snapshot.size
+                            or stage_snapshot.mode != 0o600
+                            or stage_snapshot.uid != os.geteuid()
+                            or stage_snapshot.link_count != 2
+                            or evidence_snapshot.link_count != 2
+                        ):
+                            raise SyncError(
+                                f"pending regular-file evidence changed: {record.target}"
+                            )
+                        record = replace(
+                            record,
+                            stage_identity=stage_snapshot.file_identity,
+                            evidence_identity=evidence_snapshot.file_identity,
+                            regular_sha256=stage_snapshot.sha256,
+                            regular_size=stage_snapshot.size,
+                            regular_mode=stage_snapshot.mode,
+                            regular_uid=stage_snapshot.uid,
+                            regular_gid=stage_snapshot.gid,
+                            regular_link_count=stage_snapshot.link_count,
+                        )
+                    else:
+                        stage_snapshot = _create_symlink_beneath(
+                            home,
+                            stage,
+                            record.link_target,
+                            record.kind,
+                        )
+                        evidence_plan = _capture_reconcile_target_snapshot(
+                            home, evidence
+                        )
+                        evidence_snapshot = _publish_symlink_hardlink_beneath(
+                            home,
+                            stage,
+                            evidence,
+                            stage_snapshot,
+                            evidence_plan,
+                            created_parent_identities,
+                        )
+                        record = replace(
+                            record,
+                            stage_identity=stage_snapshot.link_identity,
+                            evidence_identity=evidence_snapshot.link_identity,
+                        )
                 records.append(record)
 
         for target, state_record in retired_absence_specs:
@@ -13684,6 +14535,13 @@ def _stage_pending_link_batch(
                 owner=None,
                 link_target=None,
                 release_sha=None,
+                materialization="symlink",
+                regular_sha256=None,
+                regular_size=None,
+                regular_mode=None,
+                regular_uid=None,
+                regular_gid=None,
+                regular_link_count=None,
                 before_evidence=None,
                 before_evidence_identity=None,
                 backup=None,
@@ -13724,6 +14582,13 @@ def _stage_pending_link_batch(
                 owner=owner,
                 link_target=None,
                 release_sha=None,
+                materialization="symlink",
+                regular_sha256=None,
+                regular_size=None,
+                regular_mode=None,
+                regular_uid=None,
+                regular_gid=None,
+                regular_link_count=None,
                 before_evidence=None,
                 before_evidence_identity=None,
                 backup=None,
@@ -13867,14 +14732,30 @@ def _parse_pending_identity(value: object, label: str) -> tuple[int, int] | None
     return value[0], value[1]
 
 
-def _parse_pending_planned_snapshot(value: object) -> ReconcileTargetSnapshot:
-    if not isinstance(value, dict) or set(value) != {
+def _parse_pending_planned_snapshot(
+    value: object,
+    *,
+    allow_regular: bool,
+) -> ReconcileTargetSnapshot:
+    legacy_fields = {
         "parent_identity",
         "link_identity",
         "link_target",
         "ancestor_identity",
         "missing_parent_parts",
-    }:
+    }
+    regular_fields = {
+        "regular_sha256",
+        "regular_size",
+        "regular_mode",
+        "regular_uid",
+        "regular_gid",
+        "regular_link_count",
+    }
+    allowed_shapes = {frozenset(legacy_fields)}
+    if allow_regular:
+        allowed_shapes.add(frozenset(legacy_fields | regular_fields))
+    if not isinstance(value, dict) or set(value) not in allowed_shapes:
         raise SyncError("pending transaction planned-before snapshot is invalid")
     link_target = value.get("link_target")
     if link_target is not None and (
@@ -13896,6 +14777,23 @@ def _parse_pending_planned_snapshot(value: object) -> ReconcileTargetSnapshot:
         )
     ):
         raise SyncError("pending transaction missing-parent binding is invalid")
+    regular_sha256 = value.get("regular_sha256")
+    numeric_regular = [
+        value.get("regular_size"),
+        value.get("regular_mode"),
+        value.get("regular_uid"),
+        value.get("regular_gid"),
+        value.get("regular_link_count"),
+    ]
+    if regular_sha256 is not None and (
+        not isinstance(regular_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", regular_sha256) is None
+        or any(
+            not isinstance(part, int) or isinstance(part, bool) or part < 0
+            for part in numeric_regular
+        )
+    ):
+        raise SyncError("pending transaction planned regular-file evidence is invalid")
     try:
         return ReconcileTargetSnapshot(
             parent_identity=_parse_pending_identity(
@@ -13912,6 +14810,12 @@ def _parse_pending_planned_snapshot(value: object) -> ReconcileTargetSnapshot:
                 "pending ancestor identity",
             ),
             missing_parent_parts=tuple(raw_missing),
+            regular_sha256=regular_sha256,
+            regular_size=value.get("regular_size"),
+            regular_mode=value.get("regular_mode"),
+            regular_uid=value.get("regular_uid"),
+            regular_gid=value.get("regular_gid"),
+            regular_link_count=value.get("regular_link_count"),
         )
     except ValueError as error:
         raise SyncError(
@@ -14443,6 +15347,17 @@ def _parse_pending_link_batch(
         "evidence",
         "evidence_identity",
     }
+    v6_fields = {
+        "materialization",
+        "regular_sha256",
+        "regular_size",
+        "regular_mode",
+        "regular_uid",
+        "regular_gid",
+        "regular_link_count",
+    }
+    if version >= 6:
+        expected_fields.update(v6_fields)
     for index, raw_record in enumerate(raw_records):
         if not isinstance(raw_record, dict) or set(raw_record) != expected_fields:
             raise SyncError(f"pending transaction record #{index + 1} is invalid")
@@ -14457,7 +15372,10 @@ def _parse_pending_link_batch(
         kind = raw_record.get("kind")
         if kind not in {"file", "directory", "skill"}:
             raise SyncError(f"pending target {target} has unsupported kind")
-        planned = _parse_pending_planned_snapshot(raw_record.get("planned_before"))
+        planned = _parse_pending_planned_snapshot(
+            raw_record.get("planned_before"),
+            allow_regular=version >= 6,
+        )
         producing = action in {"create", "replace", "quarantine-replace"}
         destructive = action in {
             "replace",
@@ -14493,6 +15411,70 @@ def _parse_pending_link_batch(
             raise SyncError(f"pending target {target} has invalid link target")
         raw_sha = raw_record.get("release_sha")
         release_sha = None if raw_sha is None else _validate_release_sha(raw_sha)
+        materialization = (
+            raw_record.get("materialization") if version >= 6 else "symlink"
+        )
+        if materialization not in {"symlink", "regular"}:
+            raise SyncError(
+                f"pending target {target} has invalid materialization"
+            )
+        regular_sha256 = (
+            raw_record.get("regular_sha256") if version >= 6 else None
+        )
+        regular_size = raw_record.get("regular_size") if version >= 6 else None
+        regular_mode = raw_record.get("regular_mode") if version >= 6 else None
+        regular_uid = raw_record.get("regular_uid") if version >= 6 else None
+        regular_gid = raw_record.get("regular_gid") if version >= 6 else None
+        regular_link_count = (
+            raw_record.get("regular_link_count") if version >= 6 else None
+        )
+        regular_values = (
+            regular_sha256,
+            regular_size,
+            regular_mode,
+            regular_uid,
+            regular_gid,
+            regular_link_count,
+        )
+        planned_regular = _regular_snapshot_from_reconcile(planned)
+        if materialization == "regular":
+            produced_regular_is_invalid = producing and (
+                not isinstance(regular_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", regular_sha256) is None
+                or any(
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 0
+                    for value in regular_values[1:]
+                )
+                or regular_mode != 0o600
+                or regular_uid != os.geteuid()
+                or regular_link_count != 2
+            )
+            removed_regular_is_invalid = (
+                not producing
+                and (
+                    not destructive
+                    or planned_regular is None
+                    or any(value is not None for value in regular_values)
+                )
+            )
+            if (
+                scope != "managed"
+                or produced_regular_is_invalid
+                or removed_regular_is_invalid
+            ):
+                raise SyncError(
+                    f"pending target {target} has invalid regular-file evidence"
+                )
+        elif any(value is not None for value in regular_values):
+            raise SyncError(
+                f"pending symlink target {target} has regular-file evidence"
+            )
+        elif planned_regular is not None:
+            raise SyncError(
+                f"pending regular-file preimage {target} has symlink materialization"
+            )
         leaf = f"{index:08d}"
         before_evidence = _parse_pending_relative_or_none(
             raw_record.get("before_evidence"),
@@ -14526,16 +15508,40 @@ def _parse_pending_link_batch(
                 or backup != PurePosixPath("links") / target
             ):
                 raise SyncError(f"pending target {target} has invalid preimage paths")
-            assert planned.link_target is not None
-            before_snapshot = _read_symlink_snapshot_beneath(
-                home,
-                batch_root / Path(*before_evidence.parts),
-            )
-            if (
-                before_snapshot.link_identity != before_identity
-                or before_snapshot.link_target != planned.link_target
-            ):
-                raise SyncError(f"pending target {target} before evidence changed")
+            planned_regular = _regular_snapshot_from_reconcile(planned)
+            if planned_regular is not None:
+                before_snapshot = _read_regular_file_snapshot_beneath(
+                    home,
+                    batch_root / Path(*before_evidence.parts),
+                    require_managed_access=False,
+                )
+                if (
+                    before_snapshot.file_identity != before_identity
+                    or before_snapshot.sha256 != planned_regular.sha256
+                    or before_snapshot.size != planned_regular.size
+                    or before_snapshot.mode != planned_regular.mode
+                    or before_snapshot.uid != planned_regular.uid
+                    or before_snapshot.gid != planned_regular.gid
+                ):
+                    raise SyncError(
+                        f"pending target {target} before evidence changed"
+                    )
+            else:
+                if planned.link_target is None:
+                    raise SyncError(
+                        f"pending target {target} has no typed preimage"
+                    )
+                before_snapshot = _read_symlink_snapshot_beneath(
+                    home,
+                    batch_root / Path(*before_evidence.parts),
+                )
+                if (
+                    before_snapshot.link_identity != before_identity
+                    or before_snapshot.link_target != planned.link_target
+                ):
+                    raise SyncError(
+                        f"pending target {target} before evidence changed"
+                    )
         elif any(
             value is not None for value in (before_evidence, before_identity, backup)
         ):
@@ -14551,21 +15557,56 @@ def _parse_pending_link_batch(
                 raise SyncError(
                     f"pending target {target} has invalid produced evidence"
                 )
-            stage_snapshot = _read_symlink_snapshot_beneath(
-                home,
-                batch_root / Path(*stage.parts),
-            )
-            evidence_snapshot = _read_symlink_snapshot_beneath(
-                home,
-                batch_root / Path(*evidence.parts),
-            )
-            if (
-                stage_snapshot.link_identity != stage_identity
-                or evidence_snapshot.link_identity != evidence_identity
-                or stage_snapshot.link_target != link_target
-                or evidence_snapshot.link_target != link_target
-            ):
-                raise SyncError(f"pending target {target} produced evidence changed")
+            if materialization == "regular":
+                stage_snapshot = _read_regular_file_snapshot_beneath(
+                    home,
+                    batch_root / Path(*stage.parts),
+                    require_managed_access=False,
+                )
+                evidence_snapshot = _read_regular_file_snapshot_beneath(
+                    home,
+                    batch_root / Path(*evidence.parts),
+                    require_managed_access=False,
+                )
+                if (
+                    stage_snapshot.file_identity != stage_identity
+                    or evidence_snapshot.file_identity != evidence_identity
+                    or stage_snapshot.file_identity != evidence_snapshot.file_identity
+                    or stage_snapshot.sha256 != regular_sha256
+                    or evidence_snapshot.sha256 != regular_sha256
+                    or stage_snapshot.size != regular_size
+                    or evidence_snapshot.size != regular_size
+                    or stage_snapshot.mode != regular_mode
+                    or evidence_snapshot.mode != regular_mode
+                    or stage_snapshot.uid != regular_uid
+                    or evidence_snapshot.uid != regular_uid
+                    or stage_snapshot.gid != regular_gid
+                    or evidence_snapshot.gid != regular_gid
+                    or stage_snapshot.link_count
+                    not in {regular_link_count, regular_link_count + 1}
+                    or evidence_snapshot.link_count != stage_snapshot.link_count
+                ):
+                    raise SyncError(
+                        f"pending target {target} produced evidence changed"
+                    )
+            else:
+                stage_snapshot = _read_symlink_snapshot_beneath(
+                    home,
+                    batch_root / Path(*stage.parts),
+                )
+                evidence_snapshot = _read_symlink_snapshot_beneath(
+                    home,
+                    batch_root / Path(*evidence.parts),
+                )
+                if (
+                    stage_snapshot.link_identity != stage_identity
+                    or evidence_snapshot.link_identity != evidence_identity
+                    or stage_snapshot.link_target != link_target
+                    or evidence_snapshot.link_target != link_target
+                ):
+                    raise SyncError(
+                        f"pending target {target} produced evidence changed"
+                    )
         elif any(
             value is not None
             for value in (
@@ -14725,6 +15766,13 @@ def _parse_pending_link_batch(
                 owner=owner,
                 link_target=link_target,
                 release_sha=release_sha,
+                materialization=materialization,
+                regular_sha256=regular_sha256,
+                regular_size=regular_size,
+                regular_mode=regular_mode,
+                regular_uid=regular_uid,
+                regular_gid=regular_gid,
+                regular_link_count=regular_link_count,
                 before_evidence=before_evidence,
                 before_evidence_identity=before_identity,
                 backup=backup,
@@ -14816,11 +15864,16 @@ def _parse_pending_link_batch(
                 f"pending before-state action claim is inconsistent: {record.target}"
             )
         if producing:
-            if after_claim is None or (
-                after_claim.parent_identity != record.planned_snapshot.parent_identity
-                or after_claim.link_identity != record.evidence_identity
-                or after_claim.link_target != record.link_target
-            ):
+            if record.is_regular():
+                invalid_after_claim = after_claim is not None
+            else:
+                invalid_after_claim = after_claim is None or (
+                    after_claim.parent_identity
+                    != record.planned_snapshot.parent_identity
+                    or after_claim.link_identity != record.evidence_identity
+                    or after_claim.link_target != record.link_target
+                )
+            if invalid_after_claim:
                 raise SyncError(
                     f"pending after-state action claim is inconsistent: {record.target}"
                 )
@@ -15083,6 +16136,51 @@ def _publish_pending_commit_marker(home: Path, batch: PendingLinkBatch) -> None:
             raise SyncError("pending transaction commit marker parent changed")
     finally:
         _close_fd_quietly(parent_fd)
+
+
+def _pending_rollback_marker_snapshot(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> ManagedStateFileSnapshot | None:
+    marker_path = batch.batch_root / Path(*PENDING_STATE_ROLLBACK_MARKER.parts)
+    parent_fd = _open_directory_beneath(home, marker_path.parent)
+    try:
+        marker = _read_managed_state_file_snapshot(
+            home,
+            marker_path,
+            parent_fd,
+        )
+        if not marker.exists:
+            return None
+        expected_payload = _pending_rollback_marker_payload(batch)
+        if (
+            marker.payload != expected_payload
+            or marker.mode != 0o600
+            or marker.parent_identity != _directory_identity(parent_fd)
+        ):
+            raise SyncError("pending transaction rollback marker changed")
+        return marker
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _publish_pending_rollback_marker(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> ManagedStateFileSnapshot:
+    existing = _pending_rollback_marker_snapshot(home, batch)
+    if existing is not None:
+        return existing
+    marker_path = batch.batch_root / Path(*PENDING_STATE_ROLLBACK_MARKER.parts)
+    marker = _write_exclusive_internal_file(
+        home,
+        marker_path,
+        _pending_rollback_marker_payload(batch),
+    )
+    verified = _pending_rollback_marker_snapshot(home, batch)
+    if verified is None or verified != marker:
+        raise SyncError("pending transaction rollback marker changed")
+    return verified
 
 
 def _pending_cleanup_index_path(home: Path) -> Path:
@@ -15371,6 +16469,37 @@ def _pending_cleanup_ticket_payload(
     )
 
 
+def _pending_rollback_cleanup_ticket_payload(
+    batch_root: Path,
+    batch_root_identity: tuple[int, int],
+    marker: ManagedStateFileSnapshot,
+) -> bytes:
+    if (
+        marker.parent_identity is None
+        or marker.file_identity is None
+        or marker.payload is None
+        or marker.mode != 0o600
+    ):
+        raise SyncError("pending rollback marker is not fully bound")
+    return _bounded_json_document(
+        {
+            "version": 2,
+            "batch": batch_root.name,
+            "batch_root_identity": _identity_payload(batch_root_identity),
+            "finalization_marker": {
+                "phase": "before",
+                "path": PENDING_STATE_ROLLBACK_MARKER.as_posix(),
+                "parent_identity": _identity_payload(marker.parent_identity),
+                "file_identity": _identity_payload(marker.file_identity),
+                "mode": marker.mode,
+                "sha256": hashlib.sha256(marker.payload).hexdigest(),
+            },
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending cleanup ticket exceeds the size limit",
+    )
+
+
 def _read_pending_cleanup_ticket(
     home: Path,
     ticket_path: Path,
@@ -15404,17 +16533,27 @@ def _read_pending_cleanup_ticket(
         if snapshot.mode != 0o600:
             raise SyncError(f"pending cleanup ticket mode changed: {batch_name}")
         data = _decode_managed_state_json(snapshot.payload, ticket_path)
-        if set(data) != {
-            "version",
-            "batch",
-            "batch_root_identity",
-            "commit_marker",
-        }:
+        version = data.get("version")
+        if type(version) is not int or version not in {1, 2}:
             raise SyncError(
                 f"pending cleanup ticket has unsupported fields: {batch_name}"
             )
-        version = data.get("version")
-        if type(version) is not int or version != 1:
+        expected_top_level_fields = (
+            {
+                "version",
+                "batch",
+                "batch_root_identity",
+                "commit_marker",
+            }
+            if version == 1
+            else {
+                "version",
+                "batch",
+                "batch_root_identity",
+                "finalization_marker",
+            }
+        )
+        if set(data) != expected_top_level_fields:
             raise SyncError(
                 f"pending cleanup ticket has unsupported fields: {batch_name}"
             )
@@ -15426,59 +16565,107 @@ def _read_pending_cleanup_ticket(
         )
         if batch_identity is None:
             raise SyncError(f"pending cleanup batch identity is missing: {batch_name}")
-        marker = data.get("commit_marker")
+        marker = data.get(
+            "commit_marker" if version == 1 else "finalization_marker"
+        )
+        expected_marker_fields = {
+            "path",
+            "parent_identity",
+            "file_identity",
+            "mode",
+            "sha256",
+        }
+        if version == 2:
+            expected_marker_fields.add("phase")
         if (
             not isinstance(marker, dict)
-            or set(marker)
-            != {
-                "path",
-                "parent_identity",
-                "file_identity",
-                "mode",
-                "sha256",
-            }
-            or marker.get("path") != PENDING_STATE_COMMIT_MARKER.as_posix()
+            or set(marker) != expected_marker_fields
         ):
-            raise SyncError(f"pending cleanup commit marker changed: {batch_name}")
+            raise SyncError(
+                f"pending cleanup finalization marker changed: {batch_name}"
+            )
+        phase = "after" if version == 1 else marker.get("phase")
+        marker_path = (
+            PENDING_STATE_COMMIT_MARKER
+            if version == 1
+            else PENDING_STATE_ROLLBACK_MARKER
+        )
+        if phase not in {"before", "after"} or (
+            version == 1 and phase != "after"
+        ) or (version == 2 and phase != "before") or marker.get(
+            "path"
+        ) != marker_path.as_posix():
+            raise SyncError(
+                f"pending cleanup finalization marker changed: {batch_name}"
+            )
         marker_parent_identity = _parse_pending_identity(
             marker.get("parent_identity"),
-            "pending cleanup commit marker parent identity",
+            "pending cleanup finalization marker parent identity",
         )
         marker_file_identity = _parse_pending_identity(
             marker.get("file_identity"),
-            "pending cleanup commit marker file identity",
+            "pending cleanup finalization marker file identity",
         )
         if marker_parent_identity is None or marker_file_identity is None:
             raise SyncError(
-                f"pending cleanup commit marker identity is missing: {batch_name}"
+                "pending cleanup finalization marker identity is missing: "
+                f"{batch_name}"
             )
         marker_mode = marker.get("mode")
         marker_sha256 = marker.get("sha256")
         if marker_mode != 0o600:
-            raise SyncError(f"pending cleanup commit marker mode changed: {batch_name}")
+            raise SyncError(
+                f"pending cleanup finalization marker mode changed: {batch_name}"
+            )
         if (
             not isinstance(marker_sha256, str)
             or re.fullmatch(r"[0-9a-f]{64}", marker_sha256) is None
         ):
             raise SyncError(
-                f"pending cleanup commit marker digest changed: {batch_name}"
+                "pending cleanup finalization marker digest changed: "
+                f"{batch_name}"
             )
         batch_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH / batch_name
-        expected_payload = _pending_cleanup_ticket_payload(
-            batch_root,
-            batch_identity,
-            marker_parent_identity,
-            marker_file_identity,
-            marker_mode,
-            marker_sha256,
+        expected_payload = (
+            _pending_cleanup_ticket_payload(
+                batch_root,
+                batch_identity,
+                marker_parent_identity,
+                marker_file_identity,
+                marker_mode,
+                marker_sha256,
+            )
+            if version == 1
+            else _bounded_json_document(
+                {
+                    "version": 2,
+                    "batch": batch_name,
+                    "batch_root_identity": _identity_payload(batch_identity),
+                    "finalization_marker": {
+                        "phase": phase,
+                        "path": marker_path.as_posix(),
+                        "parent_identity": _identity_payload(
+                            marker_parent_identity
+                        ),
+                        "file_identity": _identity_payload(marker_file_identity),
+                        "mode": marker_mode,
+                        "sha256": marker_sha256,
+                    },
+                },
+                max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+                overflow_error="pending cleanup ticket exceeds the size limit",
+            )
         )
         if snapshot.payload != expected_payload:
             raise SyncError(f"pending cleanup ticket changed: {batch_name}")
         return PendingBatchCleanupTicket(
+            version=version,
+            phase=phase,
             path=ticket_path,
             snapshot=snapshot,
             batch_root=batch_root,
             batch_root_identity=batch_identity,
+            marker_path=marker_path,
             marker_parent_identity=marker_parent_identity,
             marker_file_identity=marker_file_identity,
             marker_mode=marker_mode,
@@ -15618,21 +16805,11 @@ def _verify_pending_cleanup_ticket_durable(
         _close_fd_quietly(index_fd)
 
 
-def _mark_pending_batch_cleanup_ready(
+def _publish_pending_batch_cleanup_ticket(
     home: Path,
     batch: PendingLinkBatch,
+    expected_payload: bytes,
 ) -> None:
-    marker = _pending_commit_marker_snapshot(home, batch)
-    if marker is None:
-        raise SyncError("refusing to mark an uncommitted pending batch for cleanup")
-    if (
-        not marker.exists
-        or marker.parent_identity is None
-        or marker.file_identity is None
-        or marker.payload is None
-        or marker.mode != 0o600
-    ):
-        raise SyncError("pending cleanup commit marker is not fully bound")
     index_fd = _open_or_create_directory_beneath(
         home,
         _pending_cleanup_index_path(home),
@@ -15643,14 +16820,6 @@ def _mark_pending_batch_cleanup_ready(
     existing = _read_pending_cleanup_ticket(
         home,
         ticket_path,
-    )
-    expected_payload = _pending_cleanup_ticket_payload(
-        batch.batch_root,
-        batch.batch_root_identity,
-        marker.parent_identity,
-        marker.file_identity,
-        marker.mode,
-        hashlib.sha256(marker.payload).hexdigest(),
     )
     if existing is not None:
         if existing.snapshot.payload != expected_payload:
@@ -15672,6 +16841,51 @@ def _mark_pending_batch_cleanup_ready(
     if verified is None or verified.snapshot != published:
         raise SyncError("pending cleanup ticket changed after publication")
     _verify_pending_cleanup_ticket_durable(home, verified)
+
+
+def _mark_pending_batch_cleanup_ready(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> None:
+    marker = _pending_commit_marker_snapshot(home, batch)
+    if marker is None:
+        raise SyncError("refusing to mark an uncommitted pending batch for cleanup")
+    if (
+        not marker.exists
+        or marker.parent_identity is None
+        or marker.file_identity is None
+        or marker.payload is None
+        or marker.mode != 0o600
+    ):
+        raise SyncError("pending cleanup commit marker is not fully bound")
+    _publish_pending_batch_cleanup_ticket(
+        home,
+        batch,
+        _pending_cleanup_ticket_payload(
+            batch.batch_root,
+            batch.batch_root_identity,
+            marker.parent_identity,
+            marker.file_identity,
+            marker.mode,
+            hashlib.sha256(marker.payload).hexdigest(),
+        ),
+    )
+
+
+def _mark_pending_batch_rollback_cleanup_ready(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> None:
+    marker = _publish_pending_rollback_marker(home, batch)
+    _publish_pending_batch_cleanup_ticket(
+        home,
+        batch,
+        _pending_rollback_cleanup_ticket_payload(
+            batch.batch_root,
+            batch.batch_root_identity,
+            marker,
+        ),
+    )
 
 
 def _pending_link_pointer_is_absent(home: Path) -> bool:
@@ -16228,7 +17442,7 @@ def _delete_pending_cleanup_ticket(
         _close_fd_quietly(index_fd)
 
 
-def _try_cleanup_committed_pending_batch(
+def _try_cleanup_finalized_pending_batch(
     home: Path,
     batch: PendingLinkBatch,
 ) -> bool:
@@ -16587,7 +17801,7 @@ def _pending_record_evidence_snapshot(
     home: Path,
     batch: PendingLinkBatch,
     record: PendingLinkRecord,
-) -> SymlinkSnapshot:
+) -> SymlinkSnapshot | RegularFileSnapshot:
     if (
         record.evidence is None
         or record.stage is None
@@ -16597,6 +17811,54 @@ def _pending_record_evidence_snapshot(
     ):
         raise SyncError(f"pending record has no produced evidence: {record.target}")
     evidence = batch.batch_root / Path(*record.evidence.parts)
+    stage = batch.batch_root / Path(*record.stage.parts)
+    if record.is_regular():
+        expected_values = (
+            record.regular_sha256,
+            record.regular_size,
+            record.regular_mode,
+            record.regular_uid,
+            record.regular_gid,
+            record.regular_link_count,
+        )
+        if any(value is None for value in expected_values):
+            raise SyncError(
+                f"pending regular-file record is incomplete: {record.target}"
+            )
+        try:
+            evidence_snapshot = _read_regular_file_snapshot_beneath(
+                home,
+                evidence,
+                require_managed_access=False,
+            )
+            stage_snapshot = _read_regular_file_snapshot_beneath(
+                home,
+                stage,
+                require_managed_access=False,
+            )
+        except (FileNotFoundError, OSError, SyncError) as error:
+            raise SyncError(
+                f"pending regular-file evidence is missing or unsafe: {record.target}"
+            ) from error
+        for snapshot in (stage_snapshot, evidence_snapshot):
+            if (
+                snapshot.file_identity != record.evidence_identity
+                or snapshot.file_identity != record.stage_identity
+                or snapshot.sha256 != record.regular_sha256
+                or snapshot.size != record.regular_size
+                or snapshot.mode != record.regular_mode
+                or snapshot.uid != record.regular_uid
+                or snapshot.gid != record.regular_gid
+                or snapshot.link_count
+                not in {
+                    record.regular_link_count,
+                    record.regular_link_count + 1,
+                }
+            ):
+                raise SyncError(
+                    f"pending regular-file evidence changed: {record.target}"
+                )
+        return evidence_snapshot
     try:
         evidence_snapshot = _read_symlink_snapshot_beneath(home, evidence)
     except (FileNotFoundError, OSError, SyncError) as error:
@@ -16608,7 +17870,6 @@ def _pending_record_evidence_snapshot(
         or evidence_snapshot.link_identity != record.evidence_identity
     ):
         raise SyncError(f"pending link evidence changed: {record.target}")
-    stage = batch.batch_root / Path(*record.stage.parts)
     stage_snapshot = _read_optional_symlink_snapshot_beneath(home, stage)
     if stage_snapshot is None or (
         stage_snapshot.link_identity != record.stage_identity
@@ -16623,12 +17884,31 @@ def _pending_record_before_evidence_snapshot(
     home: Path,
     batch: PendingLinkBatch,
     record: PendingLinkRecord,
-) -> SymlinkSnapshot:
+) -> SymlinkSnapshot | RegularFileSnapshot:
     if (
         record.before_evidence is None
         or record.before_evidence_identity is None
-        or record.planned_snapshot.link_target is None
     ):
+        raise SyncError(f"pending record has no before evidence: {record.target}")
+    planned_regular = _regular_snapshot_from_reconcile(record.planned_snapshot)
+    if planned_regular is not None:
+        snapshot = _read_regular_file_snapshot_beneath(
+            home,
+            batch.batch_root / Path(*record.before_evidence.parts),
+            require_managed_access=False,
+        )
+        if (
+            snapshot.file_identity != record.before_evidence_identity
+            or snapshot.file_identity != planned_regular.file_identity
+            or snapshot.sha256 != planned_regular.sha256
+            or snapshot.size != planned_regular.size
+            or snapshot.mode != planned_regular.mode
+            or snapshot.uid != planned_regular.uid
+            or snapshot.gid != planned_regular.gid
+        ):
+            raise SyncError(f"pending before evidence changed: {record.target}")
+        return snapshot
+    if record.planned_snapshot.link_target is None:
         raise SyncError(f"pending record has no before evidence: {record.target}")
     snapshot = _read_symlink_snapshot_beneath(
         home,
@@ -16647,10 +17927,29 @@ def _pending_record_backup_snapshot(
     home: Path,
     batch: PendingLinkBatch,
     record: PendingLinkRecord,
-) -> SymlinkSnapshot | None:
+) -> SymlinkSnapshot | RegularFileSnapshot | None:
     if record.backup is None:
         return None
     backup = batch.batch_root / Path(*record.backup.parts)
+    planned_regular = _regular_snapshot_from_reconcile(record.planned_snapshot)
+    if planned_regular is not None:
+        if not _path_exists_or_is_link(backup):
+            return None
+        snapshot = _read_regular_file_snapshot_beneath(
+            home,
+            backup,
+            require_managed_access=False,
+        )
+        if (
+            snapshot.file_identity != record.before_evidence_identity
+            or snapshot.sha256 != planned_regular.sha256
+            or snapshot.size != planned_regular.size
+            or snapshot.mode != planned_regular.mode
+            or snapshot.uid != planned_regular.uid
+            or snapshot.gid != planned_regular.gid
+        ):
+            raise SyncError(f"pending backup changed: {record.target}")
+        return snapshot
     snapshot = _read_optional_symlink_snapshot_beneath(home, backup)
     if snapshot is None:
         if _path_exists_or_is_link(backup):
@@ -16667,19 +17966,33 @@ def _pending_record_backup_snapshot(
 def _pending_target_snapshot(
     home: Path,
     target: Path,
-) -> tuple[SymlinkSnapshot | None, bool]:
-    snapshot = _read_optional_symlink_snapshot_beneath(home, target)
-    return snapshot, _path_exists_or_is_link(target)
+) -> tuple[SymlinkSnapshot | RegularFileSnapshot | None, bool]:
+    captured = _capture_reconcile_target_snapshot(home, target)
+    regular = _regular_snapshot_from_reconcile(captured)
+    if regular is not None:
+        return regular, True
+    if captured.link_target is not None:
+        assert captured.parent_identity is not None
+        assert captured.link_identity is not None
+        return (
+            SymlinkSnapshot(
+                parent_identity=captured.parent_identity,
+                link_identity=captured.link_identity,
+                link_target=captured.link_target,
+            ),
+            True,
+        )
+    return None, captured.link_identity is not None
 
 
 def _symlink_snapshot_matches(
-    actual: SymlinkSnapshot | None,
+    actual: SymlinkSnapshot | RegularFileSnapshot | None,
     expected_parent_identity: tuple[int, int] | None,
     expected_identity: tuple[int, int] | None,
     expected_target: str | None,
 ) -> bool:
     return (
-        actual is not None
+        isinstance(actual, SymlinkSnapshot)
         and expected_parent_identity is not None
         and expected_identity is not None
         and expected_target is not None
@@ -16690,12 +18003,12 @@ def _symlink_snapshot_matches(
 
 
 def _symlink_snapshot_leaf_matches(
-    actual: SymlinkSnapshot | None,
+    actual: SymlinkSnapshot | RegularFileSnapshot | None,
     expected_identity: tuple[int, int] | None,
     expected_target: str | None,
 ) -> bool:
     return (
-        actual is not None
+        isinstance(actual, SymlinkSnapshot)
         and expected_identity is not None
         and expected_target is not None
         and actual.link_identity == expected_identity
@@ -16703,11 +18016,47 @@ def _symlink_snapshot_leaf_matches(
     )
 
 
+def _regular_snapshot_matches(
+    actual: SymlinkSnapshot | RegularFileSnapshot | None,
+    expected_parent_identity: tuple[int, int] | None,
+    expected: RegularFileSnapshot,
+    *,
+    expected_link_count: int,
+) -> bool:
+    return (
+        isinstance(actual, RegularFileSnapshot)
+        and expected_parent_identity is not None
+        and actual.parent_identity == expected_parent_identity
+        and actual.file_identity == expected.file_identity
+        and actual.sha256 == expected.sha256
+        and actual.size == expected.size
+        and actual.mode == expected.mode
+        and actual.uid == expected.uid
+        and actual.gid == expected.gid
+        and actual.link_count == expected_link_count
+    )
+
+
+def _regular_snapshot_leaf_matches(
+    actual: SymlinkSnapshot | RegularFileSnapshot | None,
+    expected: RegularFileSnapshot,
+) -> bool:
+    return (
+        isinstance(actual, RegularFileSnapshot)
+        and actual.file_identity == expected.file_identity
+        and actual.sha256 == expected.sha256
+        and actual.size == expected.size
+        and actual.mode == expected.mode
+        and actual.uid == expected.uid
+        and actual.gid == expected.gid
+    )
+
+
 def _restore_pending_record_before(
     home: Path,
     batch: PendingLinkBatch,
     record: PendingLinkRecord,
-    before_evidence: SymlinkSnapshot,
+    before_evidence: SymlinkSnapshot | RegularFileSnapshot,
 ) -> None:
     assert record.before_evidence is not None
     target = home / Path(*record.target.parts)
@@ -16715,9 +18064,24 @@ def _restore_pending_record_before(
         parent_identity=record.planned_snapshot.parent_identity,
         ancestor_identity=record.planned_snapshot.parent_identity,
     )
+    source = batch.batch_root / Path(*record.before_evidence.parts)
+    if isinstance(before_evidence, RegularFileSnapshot):
+        restored = _publish_regular_reconcile_hardlink_beneath(
+            home,
+            source,
+            target,
+            before_evidence,
+            expected_target,
+            {},
+        )
+        if not _regular_snapshot_leaf_matches(restored, before_evidence):
+            raise SyncError(
+                f"pending preimage restoration changed: {record.target}"
+            )
+        return
     restored = _publish_symlink_hardlink_beneath(
         home,
-        batch.batch_root / Path(*record.before_evidence.parts),
+        source,
         target,
         before_evidence,
         expected_target,
@@ -16955,17 +18319,30 @@ def _verify_committed_pending_link_records(
             raise SyncError(f"committed pending backup is missing: {record.target}")
         if producing:
             evidence = _pending_record_evidence_snapshot(home, batch, record)
-            target_matches = _symlink_snapshot_matches(
-                target_snapshot,
-                record.planned_snapshot.parent_identity,
-                evidence.link_identity,
-                evidence.link_target,
-            )
-            if not target_matches and _symlink_snapshot_leaf_matches(
-                target_snapshot,
-                evidence.link_identity,
-                evidence.link_target,
-            ):
+            if isinstance(evidence, RegularFileSnapshot):
+                target_matches = _regular_snapshot_matches(
+                    target_snapshot,
+                    record.planned_snapshot.parent_identity,
+                    evidence,
+                    expected_link_count=evidence.link_count,
+                )
+                leaf_matches = _regular_snapshot_leaf_matches(
+                    target_snapshot,
+                    evidence,
+                )
+            else:
+                target_matches = _symlink_snapshot_matches(
+                    target_snapshot,
+                    record.planned_snapshot.parent_identity,
+                    evidence.link_identity,
+                    evidence.link_target,
+                )
+                leaf_matches = _symlink_snapshot_leaf_matches(
+                    target_snapshot,
+                    evidence.link_identity,
+                    evidence.link_target,
+                )
+            if not target_matches and leaf_matches:
                 raise SyncError(
                     f"committed pending target parent changed: {record.target}"
                 )
@@ -16982,17 +18359,30 @@ def _verify_committed_pending_link_records(
                 )
             continue
         before = _pending_record_before_evidence_snapshot(home, batch, record)
-        before_leaf_matches = _symlink_snapshot_leaf_matches(
-            target_snapshot,
-            before.link_identity,
-            before.link_target,
-        )
-        if _symlink_snapshot_matches(
-            target_snapshot,
-            record.planned_snapshot.parent_identity,
-            before.link_identity,
-            before.link_target,
-        ):
+        if isinstance(before, RegularFileSnapshot):
+            before_leaf_matches = _regular_snapshot_leaf_matches(
+                target_snapshot,
+                before,
+            )
+            before_matches = _regular_snapshot_matches(
+                target_snapshot,
+                record.planned_snapshot.parent_identity,
+                before,
+                expected_link_count=before.link_count,
+            )
+        else:
+            before_leaf_matches = _symlink_snapshot_leaf_matches(
+                target_snapshot,
+                before.link_identity,
+                before.link_target,
+            )
+            before_matches = _symlink_snapshot_matches(
+                target_snapshot,
+                record.planned_snapshot.parent_identity,
+                before.link_identity,
+                before.link_target,
+            )
+        if before_matches:
             raise SyncError(f"committed managed removal did not run: {record.target}")
         if before_leaf_matches:
             raise SyncError(
@@ -17000,6 +18390,86 @@ def _verify_committed_pending_link_records(
             )
         # A foreign replacement is unclaimed by the committed state and is
         # intentionally preserved.
+
+
+def _batch_has_regular_records(batch: PendingLinkBatch) -> bool:
+    return any(record.is_regular() for record in batch.records)
+
+
+def _verify_final_regular_targets(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> None:
+    for record in batch.records:
+        if not record.is_regular() or record.action not in {
+            "create",
+            "replace",
+            "quarantine-replace",
+        }:
+            continue
+        target = home / Path(*record.target.parts)
+        snapshot = _read_regular_file_snapshot_beneath(
+            home,
+            target,
+            require_managed_access=True,
+        )
+        if (
+            snapshot.sha256 != record.regular_sha256
+            or snapshot.size != record.regular_size
+            or snapshot.mode != record.regular_mode
+            or snapshot.uid != record.regular_uid
+            or snapshot.gid != record.regular_gid
+            or snapshot.link_count != 1
+        ):
+            raise SyncError(
+                f"final managed regular file changed: {record.target}"
+            )
+
+
+def _pending_relinquishment_actions(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> list[ReconcileAction]:
+    return [
+        ReconcileAction(
+            action=record.action,
+            target=home / Path(*record.target.parts),
+            link_target="",
+            kind=record.kind,
+            planned_snapshot=record.planned_snapshot,
+        )
+        for record in batch.records
+        if record.action == PENDING_RELINQUISH_FOREIGN_ACTION
+    ]
+
+
+def _finalize_rolled_back_pending_batch(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> None:
+    _verify_pending_link_phase(home, batch, "before")
+    relinquishments = _pending_relinquishment_actions(home, batch)
+    has_regular_records = _batch_has_regular_records(batch)
+    _verify_managed_state_link_claims(
+        home,
+        batch.state_before_value,
+        relinquishments,
+        allow_transaction_links=has_regular_records,
+    )
+    if has_regular_records:
+        _mark_pending_batch_rollback_cleanup_ready(home, batch)
+    _clear_pending_link_pointer(home, batch, phase="before")
+    if not has_regular_records:
+        return
+    if not _try_cleanup_finalized_pending_batch(home, batch):
+        raise SyncError(
+            "rolled-back pending regular-file evidence cleanup was deferred"
+        )
+    _verify_managed_state_link_claims(
+        home,
+        batch.state_before_value,
+        relinquishments,
+    )
 
 
 def _recover_pending_link_transaction(
@@ -17030,7 +18500,13 @@ def _recover_pending_link_transaction(
         _verify_committed_pending_link_records(home, batch)
         _mark_pending_batch_cleanup_ready(home, batch)
         _clear_pending_link_pointer(home, batch, phase="after")
-        _try_cleanup_committed_pending_batch(home, batch)
+        cleaned = _try_cleanup_finalized_pending_batch(home, batch)
+        if _batch_has_regular_records(batch):
+            if not cleaned:
+                raise SyncError(
+                    "committed pending regular-file evidence cleanup was deferred"
+                )
+            _verify_final_regular_targets(home, batch)
         return state, state_snapshot, True
 
     state, state_snapshot = _rollback_pending_state_to_before(
@@ -17071,40 +18547,68 @@ def _recover_pending_link_transaction(
         )
         if destructive:
             _pending_record_backup_snapshot(home, batch, record)
-        target_has_produced_leaf = (
-            produced_evidence is not None
-            and _symlink_snapshot_leaf_matches(
+        if isinstance(produced_evidence, RegularFileSnapshot):
+            target_has_produced_leaf = _regular_snapshot_leaf_matches(
+                target_snapshot,
+                produced_evidence,
+            )
+            target_is_produced = _regular_snapshot_matches(
+                target_snapshot,
+                record.planned_snapshot.parent_identity,
+                produced_evidence,
+                expected_link_count=produced_evidence.link_count,
+            )
+        elif isinstance(produced_evidence, SymlinkSnapshot):
+            target_has_produced_leaf = _symlink_snapshot_leaf_matches(
                 target_snapshot,
                 produced_evidence.link_identity,
                 produced_evidence.link_target,
             )
-        )
-        target_is_produced = (
-            produced_evidence is not None
-            and _symlink_snapshot_matches(
+            target_is_produced = _symlink_snapshot_matches(
                 target_snapshot,
                 record.planned_snapshot.parent_identity,
                 produced_evidence.link_identity,
                 produced_evidence.link_target,
             )
-        )
-        target_is_before = before_evidence is not None and _symlink_snapshot_matches(
-            target_snapshot,
-            record.planned_snapshot.parent_identity,
-            before_evidence.link_identity,
-            before_evidence.link_target,
-        )
+        else:
+            target_has_produced_leaf = False
+            target_is_produced = False
+        if isinstance(before_evidence, RegularFileSnapshot):
+            target_is_before = _regular_snapshot_matches(
+                target_snapshot,
+                record.planned_snapshot.parent_identity,
+                before_evidence,
+                expected_link_count=before_evidence.link_count,
+            )
+        elif isinstance(before_evidence, SymlinkSnapshot):
+            target_is_before = _symlink_snapshot_matches(
+                target_snapshot,
+                record.planned_snapshot.parent_identity,
+                before_evidence.link_identity,
+                before_evidence.link_target,
+            )
+        else:
+            target_is_before = False
         if target_has_produced_leaf and not target_is_produced:
             raise SyncError(f"pending produced target parent changed: {record.target}")
         if target_is_produced:
             assert target_snapshot is not None
             assert produced_evidence is not None
-            _remove_expected_symlink_beneath(
-                home,
-                target,
-                produced_evidence.link_target,
-                target_snapshot,
-            )
+            if isinstance(produced_evidence, RegularFileSnapshot):
+                assert isinstance(target_snapshot, RegularFileSnapshot)
+                _remove_expected_regular_file_beneath(
+                    home,
+                    target,
+                    target_snapshot,
+                )
+            else:
+                assert isinstance(target_snapshot, SymlinkSnapshot)
+                _remove_expected_symlink_beneath(
+                    home,
+                    target,
+                    produced_evidence.link_target,
+                    target_snapshot,
+                )
             target_snapshot = None
             target_exists = False
         if destructive:
@@ -17121,8 +18625,13 @@ def _recover_pending_link_transaction(
         if target_is_produced or not target_exists:
             continue
         if record.scope == "managed" and record.action == "create":
-            # The before-state never owned this path. Preserve a foreign occupant
-            # without adopting it into managed state.
+            if record.target in batch.state_before_value.links:
+                raise SyncError(
+                    "pending managed create absence changed during rollback: "
+                    f"{record.target}"
+                )
+            # A genuinely new path was not owned by the before-state. Preserve a
+            # foreign occupant without adopting it into managed state.
             continue
         if record.action == "retire-absent":
             raise SyncError(
@@ -17134,7 +18643,7 @@ def _recover_pending_link_transaction(
             f"were retained: {record.target}"
         )
 
-    _clear_pending_link_pointer(home, batch, phase="before")
+    _finalize_rolled_back_pending_batch(home, batch)
     state, state_snapshot = _load_managed_state_with_snapshot(home)
     return state, state_snapshot, True
 
@@ -17251,17 +18760,32 @@ def _apply_reconcile_actions(
         actions,
         required_replacements,
     )
+    for action in ordered_actions:
+        if (
+            action.planned_snapshot is not None
+            and _regular_snapshot_from_reconcile(action.planned_snapshot) is not None
+            and action.materialization != "regular"
+        ):
+            raise SyncError(
+                f"regular-file preimage has a symlink action: {action.target}"
+            )
 
     if dry_run:
         if transaction is not None:
             raise SyncError("dry-run reconciliation cannot mutate a transaction")
         for action in ordered_actions:
+            object_kind = (
+                "regular file" if action.materialization == "regular" else "symlink"
+            )
             if action.action.endswith("remove"):
-                print(f"would {action.action} symlink {action.target}")
+                print(f"would {action.action} {object_kind} {action.target}")
             else:
-                print(
-                    f"would {action.action} symlink {action.target} -> {action.link_target}"
+                detail = (
+                    ""
+                    if action.materialization == "regular"
+                    else f" -> {action.link_target}"
                 )
+                print(f"would {action.action} {object_kind} {action.target}{detail}")
         return None
 
     missing_snapshots = [
@@ -17316,20 +18840,38 @@ def _apply_reconcile_actions(
                     == record.planned_snapshot.parent_identity
                     and not record.planned_snapshot.missing_parent_parts
                 )
-                if not parent_refresh_is_valid:
+                original_regular = (
+                    _regular_snapshot_from_reconcile(original_snapshot)
+                    if original_snapshot is not None
+                    else None
+                )
+                record_regular = _regular_snapshot_from_reconcile(
+                    record.planned_snapshot
+                )
+                regular_evidence_refresh_is_valid = (
+                    original_regular is not None
+                    and record_regular is not None
+                    and replace(
+                        record_regular,
+                        link_count=original_regular.link_count,
+                    )
+                    == original_regular
+                    and record_regular.link_count == original_regular.link_count + 1
+                )
+                if not (
+                    parent_refresh_is_valid or regular_evidence_refresh_is_valid
+                ):
                     raise SyncError(
                         f"pending {pending_scope} planning snapshot changed: "
                         f"{action.target}"
                     )
-                action = replace(
-                    action,
-                    planned_snapshot=record.planned_snapshot,
-                )
+                action = replace(action, planned_snapshot=record.planned_snapshot)
             if (
                 record.target != relative_target
                 or record.action != action.action
                 or record.kind != action.kind
                 or record.planned_snapshot != action.planned_snapshot
+                or record.materialization != action.materialization
                 or record.link_target
                 != (
                     action.link_target
@@ -17383,39 +18925,72 @@ def _apply_reconcile_actions(
                 ):
                     raise SyncError(f"pending create evidence changed: {action.target}")
             if pending_record is None:
-                created_snapshot = _create_symlink_beneath(
-                    home,
-                    action.target,
-                    action.link_target,
-                    action.kind,
-                    action.planned_snapshot,
-                    created_parent_identities,
-                )
+                if action.materialization == "regular":
+                    if action.regular_source is None:
+                        raise SyncError(
+                            f"managed regular-file action has no source: {action.target}"
+                        )
+                    created_snapshot = _create_regular_file_beneath(
+                        home,
+                        action.regular_source,
+                        action.target,
+                        action.planned_snapshot,
+                        created_parent_identities,
+                    )
+                else:
+                    created_snapshot = _create_symlink_beneath(
+                        home,
+                        action.target,
+                        action.link_target,
+                        action.kind,
+                        action.planned_snapshot,
+                        created_parent_identities,
+                    )
             else:
                 assert pending_record.stage is not None
                 stage = pending_batch.batch_root / Path(*pending_record.stage.parts)
-                stage_snapshot = _read_symlink_snapshot_beneath(home, stage)
                 evidence_snapshot = _pending_record_evidence_snapshot(
                     home,
                     pending_batch,
                     pending_record,
                 )
-                if (
-                    stage_snapshot.link_identity != evidence_snapshot.link_identity
-                    or stage_snapshot.link_target != evidence_snapshot.link_target
-                ):
-                    raise SyncError(
-                        f"pending create stage is not inode-bound: {action.target}"
-                    )
                 assert action.planned_snapshot is not None
-                created_snapshot = _publish_symlink_hardlink_beneath(
-                    home,
-                    stage,
-                    action.target,
-                    stage_snapshot,
-                    action.planned_snapshot,
-                    created_parent_identities,
-                )
+                if pending_record.is_regular():
+                    assert isinstance(evidence_snapshot, RegularFileSnapshot)
+                    stage_snapshot = _read_regular_file_snapshot_beneath(
+                        home,
+                        stage,
+                        require_managed_access=False,
+                    )
+                    created_snapshot = _publish_regular_reconcile_hardlink_beneath(
+                        home,
+                        stage,
+                        action.target,
+                        stage_snapshot,
+                        action.planned_snapshot,
+                        created_parent_identities,
+                    )
+                else:
+                    assert isinstance(evidence_snapshot, SymlinkSnapshot)
+                    stage_snapshot = _read_symlink_snapshot_beneath(home, stage)
+                    if (
+                        stage_snapshot.link_identity
+                        != evidence_snapshot.link_identity
+                        or stage_snapshot.link_target
+                        != evidence_snapshot.link_target
+                    ):
+                        raise SyncError(
+                            "pending create stage is not inode-bound: "
+                            f"{action.target}"
+                        )
+                    created_snapshot = _publish_symlink_hardlink_beneath(
+                        home,
+                        stage,
+                        action.target,
+                        stage_snapshot,
+                        action.planned_snapshot,
+                        created_parent_identities,
+                    )
             transaction.mutations.append(
                 ReconcileMutation(
                     action=action,
@@ -17423,8 +18998,18 @@ def _apply_reconcile_actions(
                 )
             )
             _verify_created_reconcile_mutation(home, transaction.mutations[-1])
-            print(f"created symlink {action.target} -> {action.link_target}")
-        _verify_reconcile_action_targets(home, create_actions)
+            if action.materialization == "regular":
+                print(f"created regular file {action.target}")
+            else:
+                print(f"created symlink {action.target} -> {action.link_target}")
+        if pending_batch is None:
+            _verify_reconcile_action_targets(home, create_actions)
+        else:
+            _verify_reconcile_action_targets(
+                home,
+                create_actions,
+                allow_transaction_links=True,
+            )
 
         if destructive_actions and transaction.batch_root is None:
             transaction.batch_root = _quarantine_batch_root(
@@ -17481,7 +19066,12 @@ def _apply_reconcile_actions(
             _verify_reconcile_backup(home, action, backup)
             if prior_replacements:
                 _verify_required_replacement_targets(home, prior_replacements)
-            print(f"quarantined symlink {action.target} -> {backup}")
+            object_kind = (
+                "regular file"
+                if action.materialization == "regular"
+                else "symlink"
+            )
+            print(f"quarantined {object_kind} {action.target} -> {backup}")
 
             if action.action in {"replace", "quarantine-replace"}:
                 replacement_plan = ReconcileTargetSnapshot(
@@ -17489,45 +19079,91 @@ def _apply_reconcile_actions(
                     ancestor_identity=action.planned_snapshot.parent_identity,
                 )
                 if pending_record is None:
-                    mutation.created_snapshot = _create_symlink_beneath(
-                        home,
-                        action.target,
-                        action.link_target,
-                        action.kind,
-                        replacement_plan,
-                        created_parent_identities,
-                    )
+                    if action.materialization == "regular":
+                        if action.regular_source is None:
+                            raise SyncError(
+                                "managed regular-file action has no source: "
+                                f"{action.target}"
+                            )
+                        mutation.created_snapshot = _create_regular_file_beneath(
+                            home,
+                            action.regular_source,
+                            action.target,
+                            replacement_plan,
+                            created_parent_identities,
+                        )
+                    else:
+                        mutation.created_snapshot = _create_symlink_beneath(
+                            home,
+                            action.target,
+                            action.link_target,
+                            action.kind,
+                            replacement_plan,
+                            created_parent_identities,
+                        )
                 else:
                     assert pending_record.stage is not None
                     stage = pending_batch.batch_root / Path(*pending_record.stage.parts)
-                    stage_snapshot = _read_symlink_snapshot_beneath(home, stage)
                     evidence_snapshot = _pending_record_evidence_snapshot(
                         home,
                         pending_batch,
                         pending_record,
                     )
-                    if (
-                        stage_snapshot.link_identity != evidence_snapshot.link_identity
-                        or stage_snapshot.link_target != evidence_snapshot.link_target
-                    ):
-                        raise SyncError(
-                            f"pending replacement stage changed: {action.target}"
+                    if pending_record.is_regular():
+                        assert isinstance(evidence_snapshot, RegularFileSnapshot)
+                        stage_snapshot = _read_regular_file_snapshot_beneath(
+                            home,
+                            stage,
+                            require_managed_access=False,
                         )
-                    mutation.created_snapshot = _publish_symlink_hardlink_beneath(
-                        home,
-                        stage,
-                        action.target,
-                        stage_snapshot,
-                        replacement_plan,
-                        created_parent_identities,
-                    )
+                        mutation.created_snapshot = (
+                            _publish_regular_reconcile_hardlink_beneath(
+                                home,
+                                stage,
+                                action.target,
+                                stage_snapshot,
+                                replacement_plan,
+                                created_parent_identities,
+                            )
+                        )
+                    else:
+                        assert isinstance(evidence_snapshot, SymlinkSnapshot)
+                        stage_snapshot = _read_symlink_snapshot_beneath(home, stage)
+                        if (
+                            stage_snapshot.link_identity
+                            != evidence_snapshot.link_identity
+                            or stage_snapshot.link_target
+                            != evidence_snapshot.link_target
+                        ):
+                            raise SyncError(
+                                "pending replacement stage changed: "
+                                f"{action.target}"
+                            )
+                        mutation.created_snapshot = _publish_symlink_hardlink_beneath(
+                            home,
+                            stage,
+                            action.target,
+                            stage_snapshot,
+                            replacement_plan,
+                            created_parent_identities,
+                        )
                 _verify_created_reconcile_mutation(home, mutation)
-                _verify_reconcile_action_targets(home, [action])
+                if pending_batch is None:
+                    _verify_reconcile_action_targets(home, [action])
+                else:
+                    _verify_reconcile_action_targets(
+                        home,
+                        [action],
+                        allow_transaction_links=True,
+                    )
                 if replacements:
                     _verify_required_replacement_targets(home, replacements)
-                print(f"replaced symlink {action.target} -> {action.link_target}")
+                if action.materialization == "regular":
+                    print(f"replaced regular file {action.target}")
+                else:
+                    print(f"replaced symlink {action.target} -> {action.link_target}")
             else:
-                print(f"removed stale symlink {action.target}")
+                print(f"removed stale {object_kind} {action.target}")
     except BaseException as error:
         try:
             _rollback_reconcile_transaction(home, transaction)
@@ -17547,7 +19183,25 @@ def _verify_reconcile_backup(
     action: ReconcileAction,
     backup: Path,
 ) -> None:
-    if action.expected_link_target is None or action.planned_snapshot is None:
+    if action.planned_snapshot is None:
+        raise SyncError(f"destructive action has no expected target: {action.target}")
+    planned_regular = _regular_snapshot_from_reconcile(action.planned_snapshot)
+    if planned_regular is not None:
+        try:
+            backup_snapshot = _read_regular_file_snapshot_beneath(
+                home,
+                backup,
+                require_managed_access=False,
+            )
+        except (FileNotFoundError, OSError, SyncError) as error:
+            raise SyncError(f"reconciliation backup is missing: {backup}") from error
+        if backup_snapshot != replace(
+            planned_regular,
+            parent_identity=backup_snapshot.parent_identity,
+        ):
+            raise SyncError(f"target changed after preflight: {action.target}")
+        return
+    if action.expected_link_target is None:
         raise SyncError(f"destructive action has no expected symlink: {action.target}")
     if (
         action.planned_snapshot.link_identity is None
@@ -17581,12 +19235,19 @@ def _rollback_reconcile_transaction(
                     raise SyncError(
                         f"changed target was left in place during rollback: {action.target}"
                     )
-                _remove_expected_symlink_beneath(
-                    home,
-                    action.target,
-                    action.link_target,
-                    mutation.created_snapshot,
-                )
+                if isinstance(mutation.created_snapshot, RegularFileSnapshot):
+                    _remove_expected_regular_file_beneath(
+                        home,
+                        action.target,
+                        mutation.created_snapshot,
+                    )
+                else:
+                    _remove_expected_symlink_beneath(
+                        home,
+                        action.target,
+                        action.link_target,
+                        mutation.created_snapshot,
+                    )
             if mutation.backup is None:
                 continue
 
@@ -17615,8 +19276,18 @@ def _rollback_reconcile_transaction(
                     "refusing to restore through changed target parent during "
                     f"rollback: {action.target.parent}"
                 )
-            assert action.expected_link_target is not None
-            backup_snapshot = _read_symlink_snapshot_beneath(home, backup)
+            planned_regular = _regular_snapshot_from_reconcile(
+                action.planned_snapshot
+            )
+            backup_snapshot = (
+                _read_regular_file_snapshot_beneath(
+                    home,
+                    backup,
+                    require_managed_access=False,
+                )
+                if planned_regular is not None
+                else _read_symlink_snapshot_beneath(home, backup)
+            )
             _atomic_move_beneath_home(
                 home,
                 backup,
@@ -17626,20 +19297,41 @@ def _rollback_reconcile_transaction(
                     link_identity=action.planned_snapshot.link_identity,
                     link_target=action.planned_snapshot.link_target,
                     ancestor_identity=backup_snapshot.parent_identity,
+                    regular_sha256=action.planned_snapshot.regular_sha256,
+                    regular_size=action.planned_snapshot.regular_size,
+                    regular_mode=action.planned_snapshot.regular_mode,
+                    regular_uid=action.planned_snapshot.regular_uid,
+                    regular_gid=action.planned_snapshot.regular_gid,
+                    regular_link_count=action.planned_snapshot.regular_link_count,
                 ),
                 action.planned_snapshot.parent_identity,
             )
-            restored_snapshot = _read_symlink_snapshot_beneath(home, action.target)
-            if (
-                restored_snapshot.parent_identity
-                != action.planned_snapshot.parent_identity
-                or restored_snapshot.link_identity
-                != action.planned_snapshot.link_identity
-                or restored_snapshot.link_target != action.planned_snapshot.link_target
-            ):
-                raise SyncError(
-                    f"restored symlink changed during rollback: {action.target}"
+            if planned_regular is not None:
+                restored_snapshot = _read_regular_file_snapshot_beneath(
+                    home,
+                    action.target,
+                    require_managed_access=True,
                 )
+                if restored_snapshot != planned_regular:
+                    raise SyncError(
+                        "restored regular file changed during rollback: "
+                        f"{action.target}"
+                    )
+            else:
+                restored_snapshot = _read_symlink_snapshot_beneath(
+                    home, action.target
+                )
+                if (
+                    restored_snapshot.parent_identity
+                    != action.planned_snapshot.parent_identity
+                    or restored_snapshot.link_identity
+                    != action.planned_snapshot.link_identity
+                    or restored_snapshot.link_target
+                    != action.planned_snapshot.link_target
+                ):
+                    raise SyncError(
+                        f"restored symlink changed during rollback: {action.target}"
+                    )
         except (OSError, SyncError) as error:
             errors.append(f"{action.target}: {error}")
 
@@ -17662,9 +19354,17 @@ def _verify_created_reconcile_mutation(
             f"reconciliation mutation has no created snapshot: {mutation.action.target}"
         )
     try:
-        actual_snapshot = _read_symlink_snapshot_beneath(
-            home,
-            mutation.action.target,
+        actual_snapshot = (
+            _read_regular_file_snapshot_beneath(
+                home,
+                mutation.action.target,
+                require_managed_access=False,
+            )
+            if isinstance(mutation.created_snapshot, RegularFileSnapshot)
+            else _read_symlink_snapshot_beneath(
+                home,
+                mutation.action.target,
+            )
         )
     except (FileNotFoundError, OSError, SyncError) as error:
         raise SyncError(
@@ -17674,13 +19374,47 @@ def _verify_created_reconcile_mutation(
         raise SyncError(
             f"created symlink changed during reconciliation: {mutation.action.target}"
         )
+    if isinstance(actual_snapshot, RegularFileSnapshot) and (
+        actual_snapshot.mode != 0o600 or actual_snapshot.uid != os.geteuid()
+    ):
+        raise SyncError(
+            f"created regular-file access policy changed: {mutation.action.target}"
+        )
 
 
 def _verify_reconcile_action_targets(
     home: Path,
     actions: list[ReconcileAction],
+    *,
+    allow_transaction_links: bool = False,
 ) -> None:
     for action in actions:
+        if action.materialization == "regular":
+            if action.regular_source is None:
+                raise SyncError(
+                    f"managed regular-file action has no source: {action.target}"
+                )
+            try:
+                actual = _read_regular_file_snapshot_beneath(
+                    home,
+                    action.target,
+                    require_managed_access=False,
+                )
+            except (FileNotFoundError, OSError, SyncError) as error:
+                raise SyncError(
+                    f"reconciled regular-file verification failed: {action.target}"
+                ) from error
+            if (
+                actual.sha256 != _regular_source_sha256(home, action.regular_source)
+                or actual.mode != 0o600
+                or actual.uid != os.geteuid()
+                or (not allow_transaction_links and actual.link_count != 1)
+                or (allow_transaction_links and actual.link_count < 1)
+            ):
+                raise SyncError(
+                    f"reconciled regular-file verification failed: {action.target}"
+                )
+            continue
         try:
             actual_target = _read_symlink_beneath(home, action.target)
         except (FileNotFoundError, OSError, SyncError) as error:
@@ -17710,7 +19444,12 @@ def _verify_required_replacement_targets(
             )
 
 
-def _verify_desired_entries(home: Path, desired_entries: list[LinkEntry]) -> None:
+def _verify_desired_entries(
+    home: Path,
+    desired_entries: list[LinkEntry],
+    *,
+    allow_transaction_links: bool = False,
+) -> None:
     issues: list[str] = []
     for entry in desired_entries:
         target = _entry_target_path(home, entry)
@@ -17718,6 +19457,23 @@ def _verify_desired_entries(home: Path, desired_entries: list[LinkEntry]) -> Non
         actual = _read_optional_symlink_target_beneath(home, target)
         if actual == desired:
             continue
+        if _entry_materializes_regular_file(entry) and target.is_file():
+            regular = _read_regular_file_snapshot_beneath(
+                home,
+                target,
+                require_managed_access=False,
+            )
+            source = _entry_regular_source_path(home, entry)
+            if (
+                regular.sha256 == _regular_source_sha256(home, source)
+                and regular.mode == 0o600
+                and regular.uid == os.geteuid()
+                and (
+                    regular.link_count == 1
+                    or (allow_transaction_links and regular.link_count > 1)
+                )
+            ):
+                continue
         if _is_optional_desired_entry(entry):
             continue
         if actual is None:
@@ -17747,12 +19503,36 @@ def _committed_state(
         desired = _desired_link_target(home, entry)
         actual = _read_optional_symlink_target_beneath(home, target)
         if actual != desired:
-            if _is_optional_desired_entry(entry):
-                continue
-            issue = "missing" if actual is None else "drifted"
-            raise SyncError(
-                f"mandatory desired link {issue} before state commit: {target}"
-            )
+            regular_matches = False
+            if _entry_materializes_regular_file(entry):
+                try:
+                    regular = _read_regular_file_snapshot_beneath(
+                        home,
+                        target,
+                        require_managed_access=False,
+                    )
+                    regular_matches = (
+                        regular.sha256
+                        == _regular_source_sha256(
+                            home,
+                            _entry_regular_source_path(
+                                home,
+                                entry,
+                                owner_shas,
+                            ),
+                        )
+                        and regular.mode == 0o600
+                        and regular.uid == os.geteuid()
+                    )
+                except (FileNotFoundError, OSError, SyncError):
+                    regular_matches = False
+            if not regular_matches:
+                if _is_optional_desired_entry(entry):
+                    continue
+                issue = "missing" if actual is None else "drifted"
+                raise SyncError(
+                    f"mandatory desired link {issue} before state commit: {target}"
+                )
         links[entry.target] = ManagedLinkRecord(
             source=entry.source,
             target=entry.target,
@@ -17832,26 +19612,38 @@ def _verify_published_state_transaction(
 def _capture_managed_state_link_snapshots(
     home: Path,
     state: ManagedState,
-) -> dict[PurePosixPath, SymlinkSnapshot]:
-    snapshots: dict[PurePosixPath, SymlinkSnapshot] = {}
+) -> dict[PurePosixPath, SymlinkSnapshot | RegularFileSnapshot]:
+    snapshots: dict[PurePosixPath, SymlinkSnapshot | RegularFileSnapshot] = {}
     for relative_target, record in sorted(
         state.links.items(),
         key=lambda item: item[0].as_posix(),
     ):
         target = home / Path(*relative_target.parts)
-        snapshot = _read_optional_symlink_snapshot_beneath(home, target)
-        if snapshot is None:
-            continue
-        if snapshot.link_target == record.link_target:
-            snapshots[relative_target] = snapshot
+        if _record_materializes_regular_file(record):
+            try:
+                snapshot = _read_regular_file_snapshot_beneath(
+                    home,
+                    target,
+                    require_managed_access=True,
+                )
+            except (FileNotFoundError, OSError, SyncError):
+                continue
+            if snapshot.sha256 == _regular_source_sha256(
+                home, _record_regular_source_path(home, record)
+            ):
+                snapshots[relative_target] = snapshot
+        else:
+            snapshot = _read_optional_symlink_snapshot_beneath(home, target)
+            if snapshot is not None and snapshot.link_target == record.link_target:
+                snapshots[relative_target] = snapshot
     return snapshots
 
 
 def _created_reconcile_link_snapshots(
     home: Path,
     transaction: ReconcileTransaction | None,
-) -> dict[PurePosixPath, SymlinkSnapshot]:
-    snapshots: dict[PurePosixPath, SymlinkSnapshot] = {}
+) -> dict[PurePosixPath, SymlinkSnapshot | RegularFileSnapshot]:
+    snapshots: dict[PurePosixPath, SymlinkSnapshot | RegularFileSnapshot] = {}
     if transaction is None:
         return snapshots
     for mutation in transaction.mutations:
@@ -17873,11 +19665,11 @@ def _created_reconcile_link_snapshots(
 def _trusted_managed_link_snapshots_for_state(
     home: Path,
     state: ManagedState,
-    baseline_snapshots: dict[PurePosixPath, SymlinkSnapshot],
+    baseline_snapshots: dict[PurePosixPath, SymlinkSnapshot | RegularFileSnapshot],
     transaction: ReconcileTransaction | None,
-) -> dict[PurePosixPath, SymlinkSnapshot]:
+) -> dict[PurePosixPath, SymlinkSnapshot | RegularFileSnapshot]:
     created_snapshots = _created_reconcile_link_snapshots(home, transaction)
-    snapshots: dict[PurePosixPath, SymlinkSnapshot] = {}
+    snapshots: dict[PurePosixPath, SymlinkSnapshot | RegularFileSnapshot] = {}
     for relative_target, record in sorted(
         state.links.items(),
         key=lambda item: item[0].as_posix(),
@@ -17889,13 +19681,29 @@ def _trusted_managed_link_snapshots_for_state(
             raise SyncError(
                 f"managed link has no trusted identity snapshot: {relative_target}"
             )
-        if snapshot.link_target != record.link_target:
-            raise SyncError(
-                f"managed link target changed before publication: {relative_target}"
-            )
         target = home / Path(*relative_target.parts)
         try:
-            current_snapshot = _read_symlink_snapshot_beneath(home, target)
+            if _record_materializes_regular_file(record):
+                if not isinstance(snapshot, RegularFileSnapshot):
+                    raise SyncError(
+                        f"managed target type changed: {relative_target}"
+                    )
+                current_snapshot = _read_regular_file_snapshot_beneath(
+                    home,
+                    target,
+                    require_managed_access=False,
+                )
+            else:
+                if not isinstance(snapshot, SymlinkSnapshot):
+                    raise SyncError(
+                        f"managed target type changed: {relative_target}"
+                    )
+                if snapshot.link_target != record.link_target:
+                    raise SyncError(
+                        "managed link target changed before publication: "
+                        f"{relative_target}"
+                    )
+                current_snapshot = _read_symlink_snapshot_beneath(home, target)
         except (FileNotFoundError, OSError, SyncError) as error:
             raise SyncError(
                 f"managed link changed before publication: {relative_target}"
@@ -17911,7 +19719,7 @@ def _trusted_managed_link_snapshots_for_state(
 def _verify_managed_link_snapshots(
     home: Path,
     state: ManagedState,
-    snapshots: dict[PurePosixPath, SymlinkSnapshot],
+    snapshots: dict[PurePosixPath, SymlinkSnapshot | RegularFileSnapshot],
 ) -> None:
     if set(snapshots) != set(state.links):
         raise SyncError("managed link snapshot targets changed after publication")
@@ -17920,13 +19728,29 @@ def _verify_managed_link_snapshots(
         key=lambda item: item[0].as_posix(),
     ):
         expected_snapshot = snapshots[relative_target]
-        if expected_snapshot.link_target != record.link_target:
-            raise SyncError(
-                f"managed link target changed after publication: {relative_target}"
-            )
         target = home / Path(*relative_target.parts)
         try:
-            current_snapshot = _read_symlink_snapshot_beneath(home, target)
+            if _record_materializes_regular_file(record):
+                if not isinstance(expected_snapshot, RegularFileSnapshot):
+                    raise SyncError(
+                        f"managed target type changed: {relative_target}"
+                    )
+                current_snapshot = _read_regular_file_snapshot_beneath(
+                    home,
+                    target,
+                    require_managed_access=False,
+                )
+            else:
+                if not isinstance(expected_snapshot, SymlinkSnapshot):
+                    raise SyncError(
+                        f"managed target type changed: {relative_target}"
+                    )
+                if expected_snapshot.link_target != record.link_target:
+                    raise SyncError(
+                        "managed link target changed after publication: "
+                        f"{relative_target}"
+                    )
+                current_snapshot = _read_symlink_snapshot_beneath(home, target)
         except (FileNotFoundError, OSError, SyncError) as error:
             raise SyncError(
                 f"managed link identity changed after release validation: "
@@ -17944,7 +19768,9 @@ def _verify_published_transaction_matches_desired(
     desired_entries: list[LinkEntry],
     expected_state: ManagedState,
     transaction: ManagedStateFileTransaction | None,
-    managed_link_snapshots: dict[PurePosixPath, SymlinkSnapshot],
+    managed_link_snapshots: dict[
+        PurePosixPath, SymlinkSnapshot | RegularFileSnapshot
+    ],
 ) -> None:
     _verify_published_state_transaction(home, transaction)
     _verify_published_state_matches_desired(
@@ -18008,6 +19834,12 @@ def plan_link_actions(
     for entry in entries:
         target = _entry_target_path(home, entry)
         desired = _desired_link_target(home, entry)
+        regular_source = (
+            _entry_regular_source_path(home, entry)
+            if _entry_materializes_regular_file(entry)
+            else None
+        )
+        materialization = "regular" if regular_source is not None else "symlink"
         parent = target.parent
         public_entry = public_by_target.get(entry.target)
         if entry.owner != PUBLIC_OWNER:
@@ -18030,6 +19862,19 @@ def plan_link_actions(
             raise SyncError(f"link parent exists but is not a directory: {parent}")
         if _path_exists_or_is_link(target):
             if not target.is_symlink():
+                if regular_source is not None and target.is_file():
+                    snapshot = _read_regular_file_snapshot_beneath(
+                        home,
+                        target,
+                        require_managed_access=True,
+                    )
+                    if snapshot.sha256 == _regular_source_sha256(
+                        home, regular_source
+                    ):
+                        continue
+                    raise SyncError(
+                        f"refusing to replace modified managed regular file: {target}"
+                    )
                 if (
                     entry.owner == PUBLIC_OWNER
                     and entry.target in OPTIONAL_PUBLIC_TARGETS
@@ -18037,7 +19882,7 @@ def plan_link_actions(
                     continue
                 raise SyncError(f"refusing to replace non-symlink target: {target}")
             existing = os.readlink(target)
-            if existing == desired:
+            if existing == desired and regular_source is None:
                 continue
             existing_owner = _link_managed_owner(home, target, entry_owners)
             if existing_owner is None:
@@ -18066,9 +19911,27 @@ def plan_link_actions(
                         f"target {target} is managed by {existing_owner}; "
                         f"manifest owner {entry.owner} must declare override=true"
                     )
-            actions.append(LinkAction("replace", target, desired, entry.kind))
+            actions.append(
+                LinkAction(
+                    "replace",
+                    target,
+                    desired,
+                    entry.kind,
+                    materialization=materialization,
+                    regular_source=regular_source,
+                )
+            )
         else:
-            actions.append(LinkAction("create", target, desired, entry.kind))
+            actions.append(
+                LinkAction(
+                    "create",
+                    target,
+                    desired,
+                    entry.kind,
+                    materialization=materialization,
+                    regular_source=regular_source,
+                )
+            )
     return actions
 
 
@@ -18090,6 +19953,25 @@ def apply_link_actions(actions: list[LinkAction], *, dry_run: bool) -> None:
         action.target.parent.mkdir(parents=True, exist_ok=True)
         if action.target.is_symlink():
             action.target.unlink()
+        if action.materialization == "regular":
+            if action.regular_source is None:
+                raise SyncError(
+                    f"managed regular-file action has no source: {action.target}"
+                )
+            payload = action.regular_source.read_bytes()
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            fd = os.open(action.target, flags, 0o600)
+            try:
+                with os.fdopen(fd, "wb", closefd=True) as file:
+                    fd = -1
+                    file.write(payload)
+                    file.flush()
+                    os.fsync(file.fileno())
+            finally:
+                if fd >= 0:
+                    _close_fd_quietly(fd)
+            print(f"{action.action}d regular file {action.target}")
+            continue
         action.target.symlink_to(
             action.link_target,
             target_is_directory=action.kind in {"directory", "skill"},
@@ -21817,6 +23699,12 @@ def _install_release_set_unlocked(
         manifest.owner: sha
         for _source_root, sha, manifest, _source_expectation in releases
     }
+    incoming_regular_sources = {
+        (entry.owner, entry.target): source_root / Path(*entry.source.parts)
+        for source_root, _sha, manifest, _source_expectation in releases
+        for entry in manifest.entries
+        if _entry_materializes_regular_file(entry)
+    }
     _validate_install_target_portability(current_manifests, next_manifests)
     releases = _resolve_install_release_expectations(releases)
     active_expectations = _capture_active_release_expectations(
@@ -21877,6 +23765,8 @@ def _install_release_set_unlocked(
         state,
         allow_cross_owner=allow_cross_owner,
         allow_unledgered_removed_links=bootstrap_history,
+        owner_shas=expected_next_shas,
+        incoming_regular_sources=incoming_regular_sources,
     )
     _verify_managed_state_link_claims(home, state, actions)
     link_actions = [
@@ -22157,9 +24047,15 @@ def _install_release_set_unlocked(
             batch_root=pending_batch.batch_root,
             transaction=link_transaction,
         )
-        _verify_desired_entries(home, desired_entries)
+        _verify_desired_entries(
+            home, desired_entries, allow_transaction_links=True
+        )
         for manifest in overlay_manifests:
-            issues = _collect_overlay_issues(home, manifest.owner)
+            issues = _collect_overlay_issues(
+                home,
+                manifest.owner,
+                allow_transaction_links=True,
+            )
             if issues:
                 for issue in issues:
                     print(f"overlay issue: {issue}")
@@ -22205,7 +24101,9 @@ def _install_release_set_unlocked(
             phase="during final managed-state validation",
             verify_current=True,
         )
-        _verify_desired_entries(home, desired_entries)
+        _verify_desired_entries(
+            home, desired_entries, allow_transaction_links=True
+        )
         _verify_managed_link_snapshots(home, next_state, managed_link_snapshots)
         state_transaction = _prepare_pending_managed_state_transaction(
             home,
@@ -22230,7 +24128,9 @@ def _install_release_set_unlocked(
             phase="during final managed-state validation",
             verify_current=True,
         )
-        _verify_desired_entries(home, desired_entries)
+        _verify_desired_entries(
+            home, desired_entries, allow_transaction_links=True
+        )
         _verify_managed_link_snapshots(home, next_state, managed_link_snapshots)
         _write_managed_state(home, next_state, state_transaction)
         _verify_published_state_transaction(home, state_transaction)
@@ -22252,7 +24152,9 @@ def _install_release_set_unlocked(
             phase="after managed-state publication",
             verify_current=True,
         )
-        _verify_desired_entries(home, desired_entries)
+        _verify_desired_entries(
+            home, desired_entries, allow_transaction_links=True
+        )
         _verify_managed_link_snapshots(home, next_state, managed_link_snapshots)
         _verify_committed_pending_link_records(home, pending_batch)
         _verify_published_state_transaction(home, state_transaction)
@@ -22310,9 +24212,11 @@ def _install_release_set_unlocked(
             and not rollback_errors
         ):
             try:
-                _clear_pending_link_pointer(home, pending_batch, phase="before")
+                _finalize_rolled_back_pending_batch(home, pending_batch)
             except (OSError, SyncError) as rollback_error:
-                rollback_errors.append(f"pending pointer: {rollback_error}")
+                rollback_errors.append(
+                    f"pending rollback finalization: {rollback_error}"
+                )
         if rollback_errors:
             _close_install_release_bindings(held_bindings)
             raise SyncError(
@@ -22326,7 +24230,13 @@ def _install_release_set_unlocked(
         _commit_reconcile_transaction(link_transaction)
         _commit_reconcile_transaction(current_transaction)
         assert pending_batch is not None
-        _try_cleanup_committed_pending_batch(home, pending_batch)
+        cleaned = _try_cleanup_finalized_pending_batch(home, pending_batch)
+        if _batch_has_regular_records(pending_batch):
+            if not cleaned:
+                raise SyncError(
+                    "committed regular-file evidence cleanup was deferred"
+                )
+            _verify_final_regular_targets(home, pending_batch)
     finally:
         _close_install_release_directory_chains(
             install_release_directory_chains
@@ -24264,6 +26174,31 @@ def status(home: Path, owner: str = PUBLIC_OWNER) -> bool:
         if record.owner != owner:
             continue
         target = home / Path(*record.target.parts)
+        if _record_materializes_regular_file(record):
+            try:
+                actual_snapshot = _capture_reconcile_target_snapshot(home, target)
+            except (OSError, SyncError) as error:
+                raise SyncError(
+                    "managed regular target could not be read during status "
+                    f"validation: {target}"
+                ) from error
+            if actual_snapshot.link_identity is None:
+                state_issues.append(f"regular file missing: {target}")
+                continue
+            actual_regular = _regular_snapshot_from_reconcile(actual_snapshot)
+            if actual_regular is None:
+                state_issues.append(f"regular file type mismatch: {target}")
+                continue
+            if not _regular_snapshot_has_managed_access(actual_regular):
+                state_issues.append(f"regular file access policy mismatch: {target}")
+                continue
+            expected_source = _record_regular_source_path(home, record)
+            if actual_regular.sha256 != _regular_source_sha256(
+                home,
+                expected_source,
+            ):
+                state_issues.append(f"regular file content mismatch: {target}")
+            continue
         try:
             actual_target = _read_optional_symlink_target_beneath(home, target)
         except OSError as error:
@@ -26119,7 +28054,12 @@ def _overlay_scan_parents(
     return parents
 
 
-def _collect_overlay_issues(home: Path, owner: str) -> list[str]:
+def _collect_overlay_issues(
+    home: Path,
+    owner: str,
+    *,
+    allow_transaction_links: bool = False,
+) -> list[str]:
     owner = _validate_owner(owner)
     if owner == PUBLIC_OWNER:
         raise SyncError("overlay owner must not be public")
@@ -26136,6 +28076,63 @@ def _collect_overlay_issues(home: Path, owner: str) -> list[str]:
     known_owners = {owner, PUBLIC_OWNER}
     for entry in overlay_entries:
         target = _entry_target_path(home, entry)
+        if _entry_materializes_regular_file(entry):
+            try:
+                snapshot = _capture_reconcile_target_snapshot(home, target)
+            except (OSError, SyncError) as error:
+                issues.append(
+                    f"overlay regular-file validation failed: {target}: {error}"
+                )
+            else:
+                regular = _regular_snapshot_from_reconcile(snapshot)
+                if snapshot.link_identity is None:
+                    issues.append(f"missing overlay regular file: {target}")
+                elif regular is None:
+                    issues.append(f"overlay regular-file type mismatch: {target}")
+                elif (
+                    regular.mode != 0o600
+                    or regular.uid != os.geteuid()
+                    or (
+                        regular.link_count != 1
+                        and not (
+                            allow_transaction_links and regular.link_count > 1
+                        )
+                    )
+                ):
+                    issues.append(
+                        f"overlay regular-file access policy mismatch: {target}"
+                    )
+                else:
+                    try:
+                        source = _entry_regular_source_path(home, entry)
+                        expected_sha256 = _regular_source_sha256(home, source)
+                    except (OSError, SyncError) as error:
+                        issues.append(
+                            "overlay regular-file source validation failed: "
+                            f"{target}: {error}"
+                        )
+                    else:
+                        if regular.sha256 != expected_sha256:
+                            issues.append(
+                                f"overlay regular-file content mismatch: {target}"
+                            )
+            public_entry = public_by_target.get(entry.target)
+            if (
+                public_entry is not None
+                and not entry.override
+                and entry.target not in OPTIONAL_PUBLIC_TARGETS
+            ):
+                issues.append(
+                    "target also exists in public manifest but lacks "
+                    f"override=true: {target}"
+                )
+            if (
+                public_entry is None
+                and entry.override
+                and entry.target not in OPTIONAL_PUBLIC_TARGETS
+            ):
+                issues.append(f"override target has no public base target: {target}")
+            continue
         live_target = _read_optional_symlink_target_beneath(home, target)
         if live_target is None:
             issues.append(f"missing overlay symlink: {target}")
@@ -26214,7 +28211,13 @@ def verify_overlay(home: Path, owner: str) -> None:
                 link_target=_desired_link_target(home, entry),
                 release_sha=current_sha,
             )
-            if record is not None and record != expected_record:
+            if record is None:
+                if _entry_materializes_regular_file(entry):
+                    issues.append(
+                        f"managed link state is missing an overlay target: "
+                        f"{_entry_target_path(home, entry)}"
+                    )
+            elif record != expected_record:
                 issues.append(
                     f"managed link state has a conflicting overlay target: "
                     f"{_entry_target_path(home, entry)}"
@@ -26516,9 +28519,15 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
                 raise SyncError(
                     f"missing current pointer changed during overlay uninstall: {current}"
                 )
-            _verify_desired_entries(home, desired_entries)
+            _verify_desired_entries(
+                home, desired_entries, allow_transaction_links=True
+            )
             for manifest in overlay_manifests:
-                issues = _collect_overlay_issues(home, manifest.owner)
+                issues = _collect_overlay_issues(
+                    home,
+                    manifest.owner,
+                    allow_transaction_links=True,
+                )
                 if issues:
                     for issue in issues:
                         print(f"overlay issue: {issue}")
@@ -26561,7 +28570,9 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
                 phase="during final overlay uninstall state validation",
                 verify_current=False,
             )
-            _verify_desired_entries(home, desired_entries)
+            _verify_desired_entries(
+                home, desired_entries, allow_transaction_links=True
+            )
             _verify_managed_link_snapshots(
                 home,
                 next_state,
@@ -26584,7 +28595,9 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
                 phase="during final overlay uninstall state validation",
                 verify_current=False,
             )
-            _verify_desired_entries(home, desired_entries)
+            _verify_desired_entries(
+                home, desired_entries, allow_transaction_links=True
+            )
             _verify_managed_link_snapshots(
                 home,
                 next_state,
@@ -26604,7 +28617,9 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
                 phase="after overlay uninstall managed-state publication",
                 verify_current=False,
             )
-            _verify_desired_entries(home, desired_entries)
+            _verify_desired_entries(
+                home, desired_entries, allow_transaction_links=True
+            )
             _verify_managed_link_snapshots(
                 home,
                 next_state,
@@ -26714,7 +28729,7 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
             _commit_reconcile_transaction(current_transaction)
             _commit_reconcile_transaction(link_transaction)
             assert pending_batch is not None
-            _try_cleanup_committed_pending_batch(home, pending_batch)
+            _try_cleanup_finalized_pending_batch(home, pending_batch)
         finally:
             _close_install_release_bindings(held_bindings)
         if not actions:

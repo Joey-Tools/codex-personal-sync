@@ -102,6 +102,38 @@ def write_agent_skill_release(
     return MODULE.load_manifest_data(release_root)
 
 
+def write_reviewer_role_release(
+    release_root: Path,
+    *,
+    payload: str = 'name = "reviewer"\n',
+    owner: str = MODULE.PUBLIC_OWNER,
+) -> MODULE.ManifestData:
+    source = release_root / "personal_codex" / "agents" / "reviewer.toml"
+    source.parent.mkdir(parents=True)
+    source.write_text(payload, encoding="utf-8")
+    manifest_path = release_root / MODULE.MANIFEST_RELATIVE_PATH
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "owner": MODULE.PUBLIC_OWNER,
+                "links": [
+                    {
+                        "source": "personal_codex/agents/reviewer.toml",
+                        "target": "agents/reviewer.toml",
+                        "kind": "file",
+                        "owner": owner,
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return MODULE.load_manifest_data(release_root)
+
+
 def write_removed_links(
     release_root: Path,
     removed_links: list[dict[str, object]],
@@ -1519,6 +1551,208 @@ class ReconciliationOrderingTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+
+    def _agent_source(self, sha: str, payload: bytes) -> Path:
+        source = (
+            self.home
+            / "personal-sync"
+            / "releases"
+            / sha
+            / "personal_codex"
+            / "agents"
+            / "reviewer.toml"
+        )
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(payload)
+        return source
+
+    def _agent_entry(self) -> MODULE.LinkEntry:
+        return MODULE.LinkEntry(
+            source=PurePosixPath("personal_codex/agents/reviewer.toml"),
+            target=PurePosixPath("agents/reviewer.toml"),
+            kind="file",
+        )
+
+    def test_creates_agent_toml_as_independent_regular_file(self) -> None:
+        source = self._agent_source(SHA_A, b'name = "reviewer"\n')
+        target = self.home / "agents" / "reviewer.toml"
+        action = planned_reconcile_action(
+            self.home,
+            "create",
+            target,
+            "../personal-sync/current/personal_codex/agents/reviewer.toml",
+            "file",
+            materialization="regular",
+            regular_source=source,
+        )
+
+        MODULE._apply_reconcile_actions(self.home, [action], dry_run=False)
+
+        self.assertTrue(target.is_file())
+        self.assertFalse(target.is_symlink())
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+        metadata = target.stat()
+        self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+        self.assertEqual(metadata.st_nlink, 1)
+
+    def test_install_release_materializes_reviewer_role_as_regular_file(self) -> None:
+        source_root = self.home / "source-release"
+        expected = b'name = "reviewer"\n'
+        write_reviewer_role_release(source_root, payload=expected.decode())
+        install_home = self.home / "install-home"
+
+        install_quietly(source_root, install_home, SHA_A)
+
+        target = install_home / "agents" / "reviewer.toml"
+        self.assertTrue(target.is_file())
+        self.assertFalse(target.is_symlink())
+        self.assertEqual(target.read_bytes(), expected)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        self.assertEqual(target.stat().st_nlink, 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(MODULE.status(install_home))
+
+        original_identity = (target.stat().st_dev, target.stat().st_ino)
+        install_quietly(source_root, install_home, SHA_A)
+        self.assertEqual((target.stat().st_dev, target.stat().st_ino), original_identity)
+        self.assertEqual(target.read_bytes(), expected)
+
+    def test_install_release_removes_managed_reviewer_regular_file(self) -> None:
+        source_root = self.home / "source-release"
+        empty_root = self.home / "empty-release"
+        write_reviewer_role_release(source_root)
+        write_skill_release(
+            empty_root,
+            source_name="replacement",
+            target_name="replacement",
+        )
+        install_home = self.home / "remove-home"
+        install_quietly(source_root, install_home, SHA_A)
+        target = install_home / "agents" / "reviewer.toml"
+        self.assertTrue(target.is_file())
+
+        install_quietly(empty_root, install_home, SHA_B)
+
+        self.assertFalse(os.path.lexists(target))
+        state = MODULE._load_managed_state(install_home)
+        self.assertNotIn(PurePosixPath("agents/reviewer.toml"), state.links)
+
+    def test_install_release_updates_managed_reviewer_regular_file(self) -> None:
+        source_a = self.home / "source-a"
+        source_b = self.home / "source-b"
+        write_reviewer_role_release(source_a, payload='version = "a"\n')
+        write_reviewer_role_release(source_b, payload='version = "b"\n')
+        install_home = self.home / "update-home"
+        install_quietly(source_a, install_home, SHA_A)
+
+        install_quietly(source_b, install_home, SHA_B)
+
+        target = install_home / "agents" / "reviewer.toml"
+        self.assertFalse(target.is_symlink())
+        self.assertEqual(target.read_text(encoding="utf-8"), 'version = "b"\n')
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        self.assertEqual(target.stat().st_nlink, 1)
+
+    def test_migrates_proven_agent_symlink_to_regular_file(self) -> None:
+        source = self._agent_source(SHA_A, b'name = "reviewer"\n')
+        target = self.home / "agents" / "reviewer.toml"
+        target.parent.mkdir()
+        legacy_target = (
+            "../personal-sync/current/personal_codex/agents/reviewer.toml"
+        )
+        target.symlink_to(legacy_target)
+        action = planned_reconcile_action(
+            self.home,
+            "replace",
+            target,
+            legacy_target,
+            "file",
+            expected_link_target=legacy_target,
+            materialization="regular",
+            regular_source=source,
+        )
+
+        MODULE._apply_reconcile_actions(self.home, [action], dry_run=False)
+
+        self.assertTrue(target.is_file())
+        self.assertFalse(target.is_symlink())
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+
+    def test_regular_file_rollback_restores_exact_preimage(self) -> None:
+        old_source = self._agent_source(SHA_A, b'old = true\n')
+        new_source = self._agent_source(SHA_B, b'new = true\n')
+        target = self.home / "agents" / "reviewer.toml"
+        target.parent.mkdir()
+        target.write_bytes(old_source.read_bytes())
+        target.chmod(0o600)
+        original_identity = (target.stat().st_dev, target.stat().st_ino)
+        action = planned_reconcile_action(
+            self.home,
+            "replace",
+            target,
+            "../personal-sync/current/personal_codex/agents/reviewer.toml",
+            "file",
+            expected_link_target="../personal-sync/current/personal_codex/agents/reviewer.toml",
+            materialization="regular",
+            regular_source=new_source,
+        )
+
+        transaction = MODULE._apply_reconcile_actions(
+            self.home, [action], dry_run=False
+        )
+        self.assertEqual(target.read_bytes(), new_source.read_bytes())
+        MODULE._rollback_reconcile_transaction(self.home, transaction)
+
+        self.assertEqual(target.read_bytes(), old_source.read_bytes())
+        self.assertEqual((target.stat().st_dev, target.stat().st_ino), original_identity)
+
+    def test_plan_rejects_modified_or_unproven_agent_regular_file(self) -> None:
+        old_source = self._agent_source(SHA_A, b'old = true\n')
+        self._agent_source(SHA_B, b'new = true\n')
+        entry = self._agent_entry()
+        target = self.home / "agents" / "reviewer.toml"
+        target.parent.mkdir()
+        target.write_bytes(b'modified = true\n')
+        target.chmod(0o600)
+        record = MODULE.ManagedLinkRecord(
+            source=entry.source,
+            target=entry.target,
+            kind=entry.kind,
+            owner=entry.owner,
+            link_target=MODULE._desired_link_target(self.home, entry),
+            release_sha=SHA_A,
+        )
+        state = MODULE.ManagedState(
+            owners={MODULE.PUBLIC_OWNER: SHA_A},
+            links={entry.target: record},
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "modified managed regular file",
+        ):
+            MODULE._plan_reconciliation(
+                self.home,
+                [entry],
+                [entry],
+                [],
+                state,
+                allow_cross_owner=False,
+                owner_shas={MODULE.PUBLIC_OWNER: SHA_B},
+            )
+
+        target.write_bytes(old_source.read_bytes())
+        target.chmod(0o600)
+        with self.assertRaisesRegex(MODULE.SyncError, "unproven regular-file"):
+            MODULE._plan_reconciliation(
+                self.home,
+                [entry],
+                [],
+                [],
+                MODULE.ManagedState(owners={}, links={}),
+                allow_cross_owner=False,
+                owner_shas={MODULE.PUBLIC_OWNER: SHA_B},
+            )
 
     def test_create_failure_preserves_old_link_without_quarantine(self) -> None:
         old_target = self.home / "skills" / "old"
@@ -5964,9 +6198,15 @@ class InstallTransactionSafetyTests(unittest.TestCase):
         def verify_then_enter_mapping_phase(
             home: Path,
             desired_entries: list[MODULE.LinkEntry],
+            *,
+            allow_transaction_links: bool = False,
         ) -> None:
             nonlocal mapping_phase
-            real_verify_desired(home, desired_entries)
+            real_verify_desired(
+                home,
+                desired_entries,
+                allow_transaction_links=allow_transaction_links,
+            )
             mapping_phase = True
 
         def current_sha_with_aba(
@@ -6158,6 +6398,10 @@ class InstallTransactionSafetyTests(unittest.TestCase):
             *,
             allow_cross_owner: bool,
             allow_unledgered_removed_links: bool = False,
+            owner_shas: dict[str, str] | None = None,
+            incoming_regular_sources: (
+                dict[tuple[str, PurePosixPath], Path] | None
+            ) = None,
         ) -> list[MODULE.ReconcileAction]:
             nonlocal injected, plan_calls, raced_snapshot
             actions = real_plan(
@@ -6168,6 +6412,8 @@ class InstallTransactionSafetyTests(unittest.TestCase):
                 state,
                 allow_cross_owner=allow_cross_owner,
                 allow_unledgered_removed_links=(allow_unledgered_removed_links),
+                owner_shas=owner_shas,
+                incoming_regular_sources=incoming_regular_sources,
             )
             plan_calls += 1
             if not injected and plan_calls == 2:
@@ -9105,12 +9351,12 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
 
         self.assertIsNotNone(parsed)
         assert parsed is not None
-        self.assertEqual(metadata["version"], 5)
+        self.assertEqual(metadata["version"], 6)
         self.assertIn(
             MODULE.PENDING_RELINQUISH_FOREIGN_ACTION,
             MODULE.PENDING_LINK_ACTIONS_BY_METADATA_VERSION[5],
         )
-        with mock.patch.object(MODULE, "PENDING_LINK_METADATA_VERSION", 6):
+        with mock.patch.object(MODULE, "PENDING_LINK_METADATA_VERSION", 7):
             self.assertIsNotNone(MODULE._load_pending_link_batch(self.home))
         record = next(
             record
@@ -9247,10 +9493,35 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
             MODULE.PENDING_RELINQUISH_FOREIGN_ACTION,
             MODULE.PENDING_LINK_ACTIONS_BY_METADATA_VERSION[4],
         )
-        self._rewrite_metadata_and_republish(
-            batch,
-            lambda payload: payload.__setitem__("version", 4),
-        )
+        def downgrade_to_v4(payload: dict[str, object]) -> None:
+            payload["version"] = 4
+            records = payload["records"]
+            assert isinstance(records, list)
+            for record in records:
+                assert isinstance(record, dict)
+                for field in (
+                    "materialization",
+                    "regular_sha256",
+                    "regular_size",
+                    "regular_mode",
+                    "regular_uid",
+                    "regular_gid",
+                    "regular_link_count",
+                ):
+                    record.pop(field)
+                planned_before = record["planned_before"]
+                assert isinstance(planned_before, dict)
+                for field in (
+                    "regular_sha256",
+                    "regular_size",
+                    "regular_mode",
+                    "regular_uid",
+                    "regular_gid",
+                    "regular_link_count",
+                ):
+                    planned_before.pop(field)
+
+        self._rewrite_metadata_and_republish(batch, downgrade_to_v4)
 
         with self.assertRaisesRegex(MODULE.SyncError, "invalid role"):
             MODULE._load_pending_link_batch(self.home)
@@ -9263,7 +9534,7 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
         )
         self._rewrite_metadata_and_republish(
             batch,
-            lambda payload: payload.__setitem__("version", 6),
+            lambda payload: payload.__setitem__("version", 7),
         )
 
         with self.assertRaisesRegex(
@@ -11673,6 +11944,26 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         metadata_path = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
         payload["version"] = 4
+        for record in payload["records"]:
+            for field in (
+                "materialization",
+                "regular_sha256",
+                "regular_size",
+                "regular_mode",
+                "regular_uid",
+                "regular_gid",
+                "regular_link_count",
+            ):
+                record.pop(field)
+            for field in (
+                "regular_sha256",
+                "regular_size",
+                "regular_mode",
+                "regular_uid",
+                "regular_gid",
+                "regular_link_count",
+            ):
+                record["planned_before"].pop(field)
         metadata_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
         batch.pointer_snapshot = None
         MODULE._publish_pending_link_pointer(self.home, batch)

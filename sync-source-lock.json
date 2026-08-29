@@ -18,7 +18,7 @@
     "engine": {
       "mode": "0755",
       "path": "scripts/codex_personal_sync.py",
-      "sha256": "72e824a70f5bde006ef6b202eb398201644ba594e60f159f2f3a3efebafa895d"
+      "sha256": "1487ff10920cebfa7645b245b4471c9e78c4f4f5b4bf0a36bff7bc81aabd94a5"
     },
     "engine_tests": {
       "mode": "0644",
@@ -33,7 +33,7 @@
     "reconciliation_safety_tests": {
       "mode": "0644",
       "path": "tests/test_personal_sync_reconciliation_safety.py",
-      "sha256": "1ed909e7ca46286a18cba4b61ba2d5634e0aaa86277f7e790748d9bcebcf88a8"
+      "sha256": "15706626e3ebc64d9a3276118fadb59c2a8ae23b39db87532544746a11a6f2a3"
     },
     "release_retention_tests": {
       "mode": "0644",
