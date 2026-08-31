@@ -2100,7 +2100,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 MODULE.SyncError,
-                "rollback was incomplete: pending pointer: forced pending pointer failure",
+                "rollback was incomplete: pending rollback finalization: "
+                "forced pending pointer failure",
             ):
                 self.run_quietly(
                     MODULE.uninstall_overlay,

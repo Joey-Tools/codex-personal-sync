@@ -210,8 +210,12 @@ PENDING_STATE_AFTER_EVIDENCE = PurePosixPath("pending", "state", "after")
 PENDING_STATE_COMMIT_EVIDENCE = PurePosixPath("pending", "state", "commit-evidence")
 PENDING_STATE_COMMIT_MARKER = PurePosixPath("pending", "state", "committed")
 PENDING_STATE_ROLLBACK_MARKER = PurePosixPath("pending", "state", "rolled-back")
+PENDING_STATE_STAGING_MARKER = PurePosixPath(
+    "pending", "state", "staging-cleanup-ready"
+)
 PENDING_CLEANUP_INDEX_RELATIVE_PATH = Path("pending-cleanup")
 PENDING_CLEANUP_TICKET_SUFFIX = ".json"
+PENDING_CLEANUP_EMPTY_PROOF_SUFFIX = ".empty-proof"
 PENDING_CLEANUP_CURSOR_NAME = ".scan-cursor"
 PENDING_CLEANUP_CURSOR_TEMP_NAME = ".scan-cursor.tmp"
 PENDING_CLEANUP_RETAINED_PREFIX = ".retained-cleanup-"
@@ -4735,6 +4739,7 @@ class PendingReleaseExpectation:
 
 @dataclass
 class PendingLinkBatch:
+    metadata_version: int
     batch_root: Path
     batch_root_identity: tuple[int, int]
     records: tuple[PendingLinkRecord, ...]
@@ -12789,6 +12794,8 @@ def _managed_state_value_from_snapshot(
 def _pending_state_claim_semantics(
     home: Path,
     state: ManagedState,
+    *,
+    metadata_version: int,
 ) -> list[tuple[str, PurePosixPath, str, PurePosixPath | None, str, str, str]]:
     claims: list[
         tuple[str, PurePosixPath, str, PurePosixPath | None, str, str, str]
@@ -12807,10 +12814,11 @@ def _pending_state_claim_semantics(
             )
         )
     for record in state.links.values():
-        if _record_materializes_regular_file(record):
+        if metadata_version >= 6 and _record_materializes_regular_file(record):
             # Regular-file preimages are carried by the action record's exact
-            # before evidence. They intentionally do not masquerade as
-            # symlink claims in manifest-v1 pending metadata.
+            # before evidence. Since pending metadata v6, they intentionally do
+            # not masquerade as symlink claims. Legacy v4/v5 metadata still
+            # describes every managed agents/*.toml target as a symlink claim.
             continue
         claims.append(
             (
@@ -12972,7 +12980,11 @@ def _stage_pending_link_claims(
         raise SyncError(f"unsupported pending claim phase: {phase}")
     record_by_target = {(record.scope, record.target): record for record in records}
     claims: list[PendingLinkClaim] = []
-    for semantic in _pending_state_claim_semantics(home, state):
+    for semantic in _pending_state_claim_semantics(
+        home,
+        state,
+        metadata_version=PENDING_LINK_METADATA_VERSION,
+    ):
         (
             scope,
             target,
@@ -13438,7 +13450,11 @@ def _projected_pending_claim_payloads(
     record_actions: dict[tuple[str, PurePosixPath], str],
 ) -> list[dict[str, Any]]:
     claims: list[dict[str, Any]] = []
-    for semantic in _pending_state_claim_semantics(home, state):
+    for semantic in _pending_state_claim_semantics(
+        home,
+        state,
+        metadata_version=PENDING_LINK_METADATA_VERSION,
+    ):
         action = record_actions.get((semantic[0], semantic[1]))
         if phase == "before" and action in {
             "create",
@@ -13615,7 +13631,11 @@ def _manifest_transition_capacity_profile(
 
     before_current_claim_size: int | None = None
     before_claim_sizes: dict[PurePosixPath, int] = {}
-    for semantic in _pending_state_claim_semantics(home, state):
+    for semantic in _pending_state_claim_semantics(
+        home,
+        state,
+        metadata_version=PENDING_LINK_METADATA_VERSION,
+    ):
         item_size = _projected_top_level_array_element_size(
             _projected_pending_claim_payload("before", semantic, 0)
         )
@@ -13630,7 +13650,11 @@ def _manifest_transition_capacity_profile(
 
     after_claim_size_sum = 0
     after_claim_count = 0
-    for semantic in _pending_state_claim_semantics(home, state):
+    for semantic in _pending_state_claim_semantics(
+        home,
+        state,
+        metadata_version=PENDING_LINK_METADATA_VERSION,
+    ):
         after_claim_size_sum += _projected_top_level_array_element_size(
             _projected_pending_claim_payload("after", semantic, 0)
         )
@@ -14181,9 +14205,16 @@ def _build_pending_link_capacity_plan(
         for semantic in _pending_state_claim_semantics(
             home,
             state_before_value,
+            metadata_version=PENDING_LINK_METADATA_VERSION,
         )
     )
-    after_claim_count = len(_pending_state_claim_semantics(home, state_after_value))
+    after_claim_count = len(
+        _pending_state_claim_semantics(
+            home,
+            state_after_value,
+            metadata_version=PENDING_LINK_METADATA_VERSION,
+        )
+    )
     if before_claim_count > MAX_PENDING_LINK_CLAIMS:
         raise SyncError("pending transaction has too many before-state claims")
     if after_claim_count > MAX_PENDING_LINK_CLAIMS:
@@ -14309,7 +14340,14 @@ def _stage_pending_link_batch(
     records: list[PendingLinkRecord] = []
     seen: set[tuple[str, PurePosixPath]] = set()
     created_parent_identities: dict[Path, tuple[int, int]] = {}
+    staging_authority_published = False
     try:
+        _mark_pending_batch_staging_cleanup_ready(
+            home,
+            batch_root,
+            batch_root_identity,
+        )
+        staging_authority_published = True
         for scope, actions in ordered_groups:
             for action in actions:
                 planned_snapshot = action.planned_snapshot
@@ -14398,11 +14436,28 @@ def _stage_pending_link_batch(
                             action.target,
                             require_managed_access=False,
                         )
+                        if (
+                            refreshed_regular.parent_identity
+                            != planned_regular.parent_identity
+                            or refreshed_regular.file_identity
+                            != planned_regular.file_identity
+                            or refreshed_regular.sha256 != planned_regular.sha256
+                            or refreshed_regular.size != planned_regular.size
+                            or refreshed_regular.mode != planned_regular.mode
+                            or refreshed_regular.uid != planned_regular.uid
+                            or refreshed_regular.gid != planned_regular.gid
+                            or refreshed_regular.link_count
+                            != planned_regular.link_count + 1
+                        ):
+                            raise SyncError(
+                                "pending live regular preimage changed during "
+                                f"staging: {record.target}"
+                            )
                         record = replace(
                             record,
                             planned_snapshot=replace(
                                 record.planned_snapshot,
-                                regular_link_count=refreshed_regular.link_count,
+                                regular_link_count=planned_regular.link_count + 1,
                             ),
                         )
                     else:
@@ -14691,10 +14746,24 @@ def _stage_pending_link_batch(
                 commit_evidence,
             ),
         )
-    except BaseException:
-        # The unreferenced durable batch is deliberately retained for auditability.
+    except BaseException as error:
+        if staging_authority_published:
+            try:
+                _cleanup_failed_pending_staging_batch(
+                    home,
+                    batch_root,
+                    batch_root_identity,
+                )
+            except BaseException as cleanup_error:
+                raise SyncError(
+                    "pending transaction staging failed and exact cleanup was "
+                    f"incomplete: {cleanup_error}"
+                ) from error
+        # Failures before cleanup authority was published cannot have created a
+        # live-file hard link, so retaining that empty batch is harmless.
         raise
     return PendingLinkBatch(
+        metadata_version=PENDING_LINK_METADATA_VERSION,
         batch_root=batch_root,
         batch_root_identity=batch_root_identity,
         records=record_tuple,
@@ -14836,6 +14905,7 @@ def _parse_pending_link_claims(
     raw_claims: object,
     state: ManagedState,
     *,
+    metadata_version: int,
     omitted_keys: set[tuple[str, PurePosixPath]] | None = None,
 ) -> tuple[PendingLinkClaim, ...]:
     if phase not in {"before", "after"}:
@@ -14843,7 +14913,11 @@ def _parse_pending_link_claims(
     omitted_keys = set() if omitted_keys is None else omitted_keys
     if phase != "before" and omitted_keys:
         raise SyncError("only pending before-state claims may use absence coverage")
-    all_semantics = _pending_state_claim_semantics(home, state)
+    all_semantics = _pending_state_claim_semantics(
+        home,
+        state,
+        metadata_version=metadata_version,
+    )
     semantic_keys = {(semantic[0], semantic[1]) for semantic in all_semantics}
     if not omitted_keys.issubset(semantic_keys):
         raise SyncError(
@@ -15791,7 +15865,11 @@ def _parse_pending_link_batch(
             _require_pending_record_bound_foreign_relinquishment(record)
     before_semantic_keys = {
         (semantic[0], semantic[1])
-        for semantic in _pending_state_claim_semantics(home, state_before_value)
+        for semantic in _pending_state_claim_semantics(
+            home,
+            state_before_value,
+            metadata_version=version,
+        )
     }
     state_claimed_absences = {
         (record.scope, record.target)
@@ -15810,6 +15888,7 @@ def _parse_pending_link_batch(
         "before",
         data.get("claims_before"),
         state_before_value,
+        metadata_version=version,
         omitted_keys=state_claimed_absences,
     )
     claims_after = _parse_pending_link_claims(
@@ -15818,6 +15897,7 @@ def _parse_pending_link_batch(
         "after",
         data.get("claims_after"),
         state_after_value,
+        metadata_version=version,
     )
     before_claims_by_target = {
         (claim.scope, claim.target): claim for claim in claims_before
@@ -15883,6 +15963,7 @@ def _parse_pending_link_batch(
             )
     assert state_after_evidence is not None
     return PendingLinkBatch(
+        metadata_version=version,
         batch_root=batch_root,
         batch_root_identity=batch_root_identity,
         records=tuple(records),
@@ -15926,6 +16007,7 @@ def _publish_pending_link_pointer(home: Path, batch: PendingLinkBatch) -> None:
     source_parent_fd = -1
     target_parent_fd = -1
     published = False
+    pointer_authoritative = False
     try:
         source_parent_fd = _open_directory_beneath(
             home,
@@ -15975,8 +16057,10 @@ def _publish_pending_link_pointer(home: Path, batch: PendingLinkBatch) -> None:
         ) or not _bound_directory_matches(home, pointer_path.parent, target_parent_fd):
             raise SyncError("pending link pointer parent changed during publication")
         batch.pointer_snapshot = target_snapshot
+        pointer_authoritative = True
+        _retire_pending_staging_cleanup_authority(home, batch)
     except BaseException as error:
-        if published:
+        if published and not pointer_authoritative:
             try:
                 _quarantine_pending_link_pointer(
                     home,
@@ -16195,6 +16279,17 @@ def _pending_cleanup_ticket_path(home: Path, batch_name: str) -> Path:
         raise SyncError("pending cleanup ticket has an invalid batch name")
     return _pending_cleanup_index_path(home) / (
         batch_name + PENDING_CLEANUP_TICKET_SUFFIX
+    )
+
+
+def _pending_cleanup_empty_proof_path(home: Path, batch_name: str) -> Path:
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        raise SyncError("pending cleanup empty proof has an invalid batch name")
+    return _pending_cleanup_index_path(home) / (
+        batch_name + PENDING_CLEANUP_EMPTY_PROOF_SUFFIX
     )
 
 
@@ -16500,6 +16595,53 @@ def _pending_rollback_cleanup_ticket_payload(
     )
 
 
+def _pending_staging_marker_payload(
+    batch_root: Path,
+    batch_root_identity: tuple[int, int],
+) -> bytes:
+    return _bounded_json_document(
+        {
+            "version": 1,
+            "batch": batch_root.name,
+            "phase": "staging",
+            "batch_root_identity": _identity_payload(batch_root_identity),
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending staging cleanup marker exceeds the size limit",
+    )
+
+
+def _pending_staging_cleanup_ticket_payload(
+    batch_root: Path,
+    batch_root_identity: tuple[int, int],
+    marker: ManagedStateFileSnapshot,
+) -> bytes:
+    if (
+        marker.parent_identity is None
+        or marker.file_identity is None
+        or marker.payload is None
+        or marker.mode != 0o600
+    ):
+        raise SyncError("pending staging cleanup marker is not fully bound")
+    return _bounded_json_document(
+        {
+            "version": 3,
+            "batch": batch_root.name,
+            "batch_root_identity": _identity_payload(batch_root_identity),
+            "finalization_marker": {
+                "phase": "staging",
+                "path": PENDING_STATE_STAGING_MARKER.as_posix(),
+                "parent_identity": _identity_payload(marker.parent_identity),
+                "file_identity": _identity_payload(marker.file_identity),
+                "mode": marker.mode,
+                "sha256": hashlib.sha256(marker.payload).hexdigest(),
+            },
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending cleanup ticket exceeds the size limit",
+    )
+
+
 def _read_pending_cleanup_ticket(
     home: Path,
     ticket_path: Path,
@@ -16534,7 +16676,7 @@ def _read_pending_cleanup_ticket(
             raise SyncError(f"pending cleanup ticket mode changed: {batch_name}")
         data = _decode_managed_state_json(snapshot.payload, ticket_path)
         version = data.get("version")
-        if type(version) is not int or version not in {1, 2}:
+        if type(version) is not int or version not in {1, 2, 3}:
             raise SyncError(
                 f"pending cleanup ticket has unsupported fields: {batch_name}"
             )
@@ -16575,7 +16717,7 @@ def _read_pending_cleanup_ticket(
             "mode",
             "sha256",
         }
-        if version == 2:
+        if version in {2, 3}:
             expected_marker_fields.add("phase")
         if (
             not isinstance(marker, dict)
@@ -16585,16 +16727,16 @@ def _read_pending_cleanup_ticket(
                 f"pending cleanup finalization marker changed: {batch_name}"
             )
         phase = "after" if version == 1 else marker.get("phase")
-        marker_path = (
-            PENDING_STATE_COMMIT_MARKER
-            if version == 1
-            else PENDING_STATE_ROLLBACK_MARKER
-        )
-        if phase not in {"before", "after"} or (
-            version == 1 and phase != "after"
-        ) or (version == 2 and phase != "before") or marker.get(
-            "path"
-        ) != marker_path.as_posix():
+        marker_path = {
+            1: PENDING_STATE_COMMIT_MARKER,
+            2: PENDING_STATE_ROLLBACK_MARKER,
+            3: PENDING_STATE_STAGING_MARKER,
+        }[version]
+        expected_phase = {1: "after", 2: "before", 3: "staging"}[version]
+        if (
+            phase != expected_phase
+            or marker.get("path") != marker_path.as_posix()
+        ):
             raise SyncError(
                 f"pending cleanup finalization marker changed: {batch_name}"
             )
@@ -16626,8 +16768,8 @@ def _read_pending_cleanup_ticket(
                 f"{batch_name}"
             )
         batch_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH / batch_name
-        expected_payload = (
-            _pending_cleanup_ticket_payload(
+        if version == 1:
+            expected_payload = _pending_cleanup_ticket_payload(
                 batch_root,
                 batch_identity,
                 marker_parent_identity,
@@ -16635,10 +16777,10 @@ def _read_pending_cleanup_ticket(
                 marker_mode,
                 marker_sha256,
             )
-            if version == 1
-            else _bounded_json_document(
+        else:
+            expected_payload = _bounded_json_document(
                 {
-                    "version": 2,
+                    "version": version,
                     "batch": batch_name,
                     "batch_root_identity": _identity_payload(batch_identity),
                     "finalization_marker": {
@@ -16655,7 +16797,6 @@ def _read_pending_cleanup_ticket(
                 max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
                 overflow_error="pending cleanup ticket exceeds the size limit",
             )
-        )
         if snapshot.payload != expected_payload:
             raise SyncError(f"pending cleanup ticket changed: {batch_name}")
         return PendingBatchCleanupTicket(
@@ -16805,9 +16946,9 @@ def _verify_pending_cleanup_ticket_durable(
         _close_fd_quietly(index_fd)
 
 
-def _publish_pending_batch_cleanup_ticket(
+def _publish_pending_batch_cleanup_ticket_for_root(
     home: Path,
-    batch: PendingLinkBatch,
+    batch_root: Path,
     expected_payload: bytes,
 ) -> None:
     index_fd = _open_or_create_directory_beneath(
@@ -16816,7 +16957,7 @@ def _publish_pending_batch_cleanup_ticket(
         mode=0o700,
     )
     _close_fd_quietly(index_fd)
-    ticket_path = _pending_cleanup_ticket_path(home, batch.batch_root.name)
+    ticket_path = _pending_cleanup_ticket_path(home, batch_root.name)
     existing = _read_pending_cleanup_ticket(
         home,
         ticket_path,
@@ -16841,6 +16982,177 @@ def _publish_pending_batch_cleanup_ticket(
     if verified is None or verified.snapshot != published:
         raise SyncError("pending cleanup ticket changed after publication")
     _verify_pending_cleanup_ticket_durable(home, verified)
+
+
+def _publish_pending_batch_cleanup_ticket(
+    home: Path,
+    batch: PendingLinkBatch,
+    expected_payload: bytes,
+) -> None:
+    _publish_pending_batch_cleanup_ticket_for_root(
+        home,
+        batch.batch_root,
+        expected_payload,
+    )
+
+
+def _pending_staging_marker_snapshot(
+    home: Path,
+    batch_root: Path,
+    batch_root_identity: tuple[int, int],
+) -> ManagedStateFileSnapshot | None:
+    marker_path = batch_root / Path(*PENDING_STATE_STAGING_MARKER.parts)
+    parent_fd = _open_directory_beneath(home, marker_path.parent)
+    try:
+        marker = _read_managed_state_file_snapshot(
+            home,
+            marker_path,
+            parent_fd,
+        )
+        if not marker.exists:
+            return None
+        expected_payload = _pending_staging_marker_payload(
+            batch_root,
+            batch_root_identity,
+        )
+        if (
+            marker.file_type != stat.S_IFREG
+            or marker.mode != 0o600
+            or marker.payload != expected_payload
+            or marker.parent_identity != _directory_identity(parent_fd)
+        ):
+            raise SyncError("pending staging cleanup marker changed")
+        return marker
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _mark_pending_batch_staging_cleanup_ready(
+    home: Path,
+    batch_root: Path,
+    batch_root_identity: tuple[int, int],
+) -> PendingBatchCleanupTicket:
+    marker_path = batch_root / Path(*PENDING_STATE_STAGING_MARKER.parts)
+    marker = _write_exclusive_internal_file(
+        home,
+        marker_path,
+        _pending_staging_marker_payload(batch_root, batch_root_identity),
+    )
+    verified_marker = _pending_staging_marker_snapshot(
+        home,
+        batch_root,
+        batch_root_identity,
+    )
+    if verified_marker is None or verified_marker != marker:
+        raise SyncError("pending staging cleanup marker changed after publication")
+    expected_payload = _pending_staging_cleanup_ticket_payload(
+        batch_root,
+        batch_root_identity,
+        verified_marker,
+    )
+    _publish_pending_batch_cleanup_ticket_for_root(
+        home,
+        batch_root,
+        expected_payload,
+    )
+    ticket = _read_pending_cleanup_ticket(
+        home,
+        _pending_cleanup_ticket_path(home, batch_root.name),
+    )
+    if (
+        ticket is None
+        or ticket.version != 3
+        or ticket.phase != "staging"
+        or ticket.batch_root_identity != batch_root_identity
+        or ticket.snapshot.payload != expected_payload
+    ):
+        raise SyncError("pending staging cleanup ticket changed after publication")
+    return ticket
+
+
+def _retire_pending_staging_cleanup_authority(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> None:
+    ticket_path = _pending_cleanup_ticket_path(home, batch.batch_root.name)
+    ticket = _read_pending_cleanup_ticket(home, ticket_path)
+    marker = _pending_staging_marker_snapshot(
+        home,
+        batch.batch_root,
+        batch.batch_root_identity,
+    )
+    if ticket is not None and ticket.version != 3:
+        if marker is not None:
+            raise SyncError(
+                "pending staging cleanup marker overlaps finalized cleanup authority"
+            )
+        return
+    if ticket is None and marker is None:
+        return
+    if batch.pointer_snapshot is None:
+        raise SyncError(
+            "refusing to retire pending staging cleanup authority without an "
+            "active pointer"
+        )
+    if ticket is not None:
+        if (
+            ticket.version != 3
+            or ticket.phase != "staging"
+            or ticket.batch_root_identity != batch.batch_root_identity
+            or marker is None
+            or marker.parent_identity != ticket.marker_parent_identity
+            or marker.file_identity != ticket.marker_file_identity
+            or marker.mode != ticket.marker_mode
+            or marker.payload is None
+            or hashlib.sha256(marker.payload).hexdigest() != ticket.marker_sha256
+        ):
+            raise SyncError("pending staging cleanup authority changed")
+        # The active pointer was fsynced before this deletion. Once the ticket
+        # is gone, only the pointer may authorize transaction recovery. A crash
+        # before marker deletion is recovered by the ticket-absent branch.
+        _delete_pending_cleanup_ticket(home, ticket)
+    if marker is None:
+        return
+    marker_path = batch.batch_root / Path(*PENDING_STATE_STAGING_MARKER.parts)
+    parent_fd = _open_directory_beneath(home, marker_path.parent)
+    try:
+        current = _read_managed_state_file_snapshot(
+            home,
+            marker_path,
+            parent_fd,
+            expected_identity=marker.file_identity,
+        )
+        if current != marker:
+            raise SyncError("pending staging cleanup marker changed before deletion")
+        _isolate_and_delete_pending_cleanup_file(
+            home,
+            marker_path,
+            parent_fd,
+            marker,
+            label="pending staging cleanup marker",
+        )
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _cleanup_failed_pending_staging_batch(
+    home: Path,
+    batch_root: Path,
+    batch_root_identity: tuple[int, int],
+) -> None:
+    ticket = _read_pending_cleanup_ticket(
+        home,
+        _pending_cleanup_ticket_path(home, batch_root.name),
+    )
+    if (
+        ticket is None
+        or ticket.version != 3
+        or ticket.phase != "staging"
+        or ticket.batch_root_identity != batch_root_identity
+    ):
+        raise SyncError("pending staging cleanup ticket is missing or changed")
+    if not _remove_cleanup_ready_batch(home, ticket):
+        raise SyncError("pending staging cleanup was deferred")
 
 
 def _mark_pending_batch_cleanup_ready(
@@ -17314,6 +17626,133 @@ def _remove_pending_batch_directory_contents(
         os.fsync(directory_fd)
 
 
+def _pending_cleanup_empty_proof_payload(
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+) -> bytes:
+    if ticket.snapshot.file_identity is None or ticket.snapshot.payload is None:
+        raise SyncError("pending cleanup ticket has no empty-proof identity")
+    return _bounded_json_document(
+        {
+            "version": 1,
+            "batch": ticket.batch_root.name,
+            "batch_root_identity": _identity_payload(ticket.batch_root_identity),
+            "quarantine_root_identity": _identity_payload(
+                quarantine_root_identity
+            ),
+            "isolated_name": _pending_cleanup_isolated_batch_name(
+                ticket.batch_root.name
+            ),
+            "ticket_identity": _identity_payload(ticket.snapshot.file_identity),
+            "ticket_sha256": hashlib.sha256(ticket.snapshot.payload).hexdigest(),
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending cleanup empty proof exceeds the size limit",
+    )
+
+
+def _read_pending_cleanup_empty_proof(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+) -> ManagedStateFileSnapshot | None:
+    proof_path = _pending_cleanup_empty_proof_path(
+        home,
+        ticket.batch_root.name,
+    )
+    index_fd = _open_directory_beneath(home, proof_path.parent)
+    try:
+        proof = _read_managed_state_file_snapshot(
+            home,
+            proof_path,
+            index_fd,
+        )
+        if not proof.exists:
+            return None
+        expected_payload = _pending_cleanup_empty_proof_payload(
+            ticket,
+            quarantine_root_identity,
+        )
+        if (
+            proof.file_type != stat.S_IFREG
+            or proof.mode != 0o600
+            or proof.payload != expected_payload
+            or proof.parent_identity != _directory_identity(index_fd)
+        ):
+            raise SyncError(
+                f"pending cleanup empty proof changed: {ticket.batch_root.name}"
+            )
+        return proof
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _publish_pending_cleanup_empty_proof(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+) -> ManagedStateFileSnapshot:
+    existing = _read_pending_cleanup_empty_proof(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
+    if existing is not None:
+        return existing
+    proof_path = _pending_cleanup_empty_proof_path(
+        home,
+        ticket.batch_root.name,
+    )
+    proof = _write_exclusive_internal_file(
+        home,
+        proof_path,
+        _pending_cleanup_empty_proof_payload(
+            ticket,
+            quarantine_root_identity,
+        ),
+    )
+    verified = _read_pending_cleanup_empty_proof(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
+    if verified is None or verified != proof:
+        raise SyncError(
+            f"pending cleanup empty proof changed after publication: "
+            f"{ticket.batch_root.name}"
+        )
+    return verified
+
+
+def _delete_pending_cleanup_empty_proof(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+) -> None:
+    proof = _read_pending_cleanup_empty_proof(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
+    if proof is None:
+        return
+    proof_path = _pending_cleanup_empty_proof_path(
+        home,
+        ticket.batch_root.name,
+    )
+    index_fd = _open_directory_beneath(home, proof_path.parent)
+    try:
+        _isolate_and_delete_pending_cleanup_file(
+            home,
+            proof_path,
+            index_fd,
+            proof,
+            label=f"pending cleanup empty proof {ticket.batch_root.name}",
+        )
+    finally:
+        _close_fd_quietly(index_fd)
+
+
 def _remove_cleanup_ready_batch(
     home: Path,
     ticket: PendingBatchCleanupTicket,
@@ -17339,6 +17778,7 @@ def _remove_cleanup_ready_batch(
     try:
         if not _bound_directory_matches(home, quarantine_root, quarantine_fd):
             raise SyncError("pending cleanup quarantine root changed")
+        quarantine_root_identity = _directory_identity(quarantine_fd)
         batch_name = ticket.batch_root.name
         isolated_name = _pending_cleanup_isolated_batch_name(batch_name)
         bound_batch_root = ticket.batch_root
@@ -17357,7 +17797,22 @@ def _remove_cleanup_ready_batch(
                     dir_fd=quarantine_fd,
                 )
             except FileNotFoundError:
+                proof = _read_pending_cleanup_empty_proof(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                )
+                if proof is None:
+                    raise SyncError(
+                        "pending cleanup batch root is missing without an exact "
+                        f"empty proof: {batch_name}"
+                    )
                 _delete_pending_cleanup_ticket(home, ticket)
+                _delete_pending_cleanup_empty_proof(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                )
                 return True
         if _directory_identity(
             batch_fd
@@ -17396,6 +17851,11 @@ def _remove_cleanup_ready_batch(
             or not _bound_directory_matches(home, bound_batch_root, batch_fd)
         ):
             raise SyncError(f"pending cleanup batch root changed: {batch_name}")
+        _publish_pending_cleanup_empty_proof(
+            home,
+            ticket,
+            quarantine_root_identity,
+        )
         os.rmdir(isolated_name, dir_fd=quarantine_fd)
         os.fsync(quarantine_fd)
         if _named_entry_identity(quarantine_fd, isolated_name) is not None:
@@ -17405,6 +17865,11 @@ def _remove_cleanup_ready_batch(
             _close_fd_quietly(batch_fd)
         _close_fd_quietly(quarantine_fd)
     _delete_pending_cleanup_ticket(home, ticket)
+    _delete_pending_cleanup_empty_proof(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
     return True
 
 
@@ -17543,6 +18008,36 @@ def _write_pending_cleanup_cursor(
         )
         if published.payload != payload or published.mode != 0o600:
             raise SyncError("pending cleanup scan cursor changed during publication")
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _pending_cleanup_ready_batch_is_observed(home: Path) -> bool:
+    if not _pending_link_pointer_is_absent(home):
+        return False
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return False
+    try:
+        if not _bound_directory_matches(home, index_root, index_fd):
+            raise SyncError("pending cleanup index changed")
+        with os.scandir(index_fd) as iterator:
+            for scanned, entry in enumerate(iterator, start=1):
+                if scanned > MAX_PENDING_CLEANUP_BATCH_SCAN + 3:
+                    raise SyncError(
+                        "pending cleanup ticket scan exceeds the size limit"
+                    )
+                if not entry.name.endswith(PENDING_CLEANUP_TICKET_SUFFIX):
+                    continue
+                batch_name = entry.name[: -len(PENDING_CLEANUP_TICKET_SUFFIX)]
+                if (
+                    len(batch_name) <= MAX_PENDING_LINK_BATCH_NAME_BYTES
+                    and PENDING_LINK_BATCH_RE.fullmatch(batch_name) is not None
+                ):
+                    return True
+        return False
     finally:
         _close_fd_quietly(index_fd)
 
@@ -18213,6 +18708,7 @@ def _verify_pending_before_absences(
         for semantic in _pending_state_claim_semantics(
             home,
             batch.state_before_value,
+            metadata_version=batch.metadata_version,
         )
     }
     for record in batch.records:
@@ -18447,6 +18943,7 @@ def _finalize_rolled_back_pending_batch(
     home: Path,
     batch: PendingLinkBatch,
 ) -> None:
+    _retire_pending_staging_cleanup_authority(home, batch)
     _verify_pending_link_phase(home, batch, "before")
     relinquishments = _pending_relinquishment_actions(home, batch)
     has_regular_records = _batch_has_regular_records(batch)
@@ -18487,6 +18984,7 @@ def _recover_pending_link_transaction(
         # Validate the pointer without mutation and let the caller report that
         # recovery must precede any requested new work.
         return state, state_snapshot, True
+    _retire_pending_staging_cleanup_authority(home, batch)
 
     if committed:
         if (
@@ -23601,6 +24099,7 @@ def _preflight_pending_recovery(home: Path, *, dry_run: bool) -> bool:
         home,
         dry_run=True,
     )
+    observed_cleanup_ready_batch = _pending_cleanup_ready_batch_is_observed(home)
     loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(home)
     (
         _loaded_state,
@@ -23612,12 +24111,21 @@ def _preflight_pending_recovery(home: Path, *, dry_run: bool) -> bool:
         initial_state_snapshot,
         dry_run=True,
     )
-    if not observed_retention_transaction and not observed_pending_transaction:
+    if (
+        not observed_retention_transaction
+        and not observed_pending_transaction
+        and not observed_cleanup_ready_batch
+    ):
         return False
     if dry_run:
         if observed_pending_transaction:
             print(
                 "would recover pending personal sync transaction under the install lock"
+            )
+        if observed_cleanup_ready_batch:
+            print(
+                "would clean a finalized or interrupted pending transaction under "
+                "the install lock"
             )
         return True
     with installation_lock(home):
@@ -23625,6 +24133,7 @@ def _preflight_pending_recovery(home: Path, *, dry_run: bool) -> bool:
             home,
             dry_run=False,
         )
+        cleaned_pending_batches = _cleanup_ready_pending_batches(home)
         loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(home)
         (
             _loaded_state,
@@ -23637,7 +24146,9 @@ def _preflight_pending_recovery(home: Path, *, dry_run: bool) -> bool:
             dry_run=False,
         )
     return bool(
-        recovered_retention_transaction is not None or recovered_pending_transaction
+        recovered_retention_transaction is not None
+        or recovered_pending_transaction
+        or cleaned_pending_batches
     )
 
 
@@ -23666,6 +24177,16 @@ def _install_release_set_unlocked(
     )
     if recovered_retention_transaction and (dry_run or preflight_only):
         return
+    observed_cleanup_ready_batch = _pending_cleanup_ready_batch_is_observed(home)
+    if observed_cleanup_ready_batch and (dry_run or preflight_only):
+        if not preflight_only:
+            print(
+                "would clean a finalized or interrupted pending transaction under "
+                "the install lock"
+            )
+        return
+    if not dry_run and not preflight_only:
+        _cleanup_ready_pending_batches(home)
     loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(home)
     (
         loaded_state,
@@ -23688,8 +24209,6 @@ def _install_release_set_unlocked(
         manifest.owner for _source_root, _sha, manifest, _source_expectation in releases
     )
     _known_owners(home, install_owners)
-    if not dry_run and not preflight_only:
-        _try_cleanup_ready_pending_batches(home)
     _verify_managed_state_current_owner_claims(home, loaded_state)
     current_manifests = _installed_manifests(home)
     next_manifests = dict(current_manifests)
@@ -26170,6 +26689,16 @@ def status(home: Path, owner: str = PUBLIC_OWNER) -> bool:
         state_issues.append(
             f"release mismatch: state={state.owners.get(owner)}, current={sha}"
         )
+    for entry in entries:
+        if (
+            _entry_materializes_regular_file(entry)
+            and not _is_optional_desired_entry(entry)
+            and entry.target not in state.links
+        ):
+            state_issues.append(
+                "regular file is missing its managed state claim: "
+                f"{_entry_target_path(home, entry)}"
+            )
     for record in state.links.values():
         if record.owner != owner:
             continue
@@ -28713,9 +29242,11 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
                 and not rollback_errors
             ):
                 try:
-                    _clear_pending_link_pointer(home, pending_batch, phase="before")
+                    _finalize_rolled_back_pending_batch(home, pending_batch)
                 except (OSError, SyncError) as rollback_error:
-                    rollback_errors.append(f"pending pointer: {rollback_error}")
+                    rollback_errors.append(
+                        f"pending rollback finalization: {rollback_error}"
+                    )
             if rollback_errors:
                 _close_install_release_bindings(held_bindings)
                 raise SyncError(
@@ -28729,7 +29260,13 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
             _commit_reconcile_transaction(current_transaction)
             _commit_reconcile_transaction(link_transaction)
             assert pending_batch is not None
-            _try_cleanup_finalized_pending_batch(home, pending_batch)
+            cleaned = _try_cleanup_finalized_pending_batch(home, pending_batch)
+            if _batch_has_regular_records(pending_batch):
+                if not cleaned:
+                    raise SyncError(
+                        "committed regular-file evidence cleanup was deferred"
+                    )
+                _verify_final_regular_targets(home, pending_batch)
         finally:
             _close_install_release_bindings(held_bindings)
         if not actions:

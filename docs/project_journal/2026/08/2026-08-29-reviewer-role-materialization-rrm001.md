@@ -3,7 +3,7 @@ id: 20260829-rrm001
 title: Reviewer Role Regular-File Materialization
 status: active
 created: 2026-08-29
-updated: 2026-08-29
+updated: 2026-09-01
 branch: codex/daily-skill-friction-20260829-codex-personal-sync-reviewer-role-regular-install
 pr:
 supersedes: []
@@ -48,6 +48,18 @@ superseded_by:
   `0600`, current effective UID, and one final hard link. A temporary link count
   above one is accepted only inside the bound transaction while its evidence
   inode exists; terminal validation requires one link.
+- Staging now publishes a version-3 cleanup ticket and a batch-bound marker
+  before creating the first hard link to a live regular target. A durable
+  pending pointer supersedes that staging authority; without a pointer, the
+  next lock holder removes the exact bound batch before validating final link
+  counts.
+- Cleanup does not treat a missing batch name as proof that cleanup completed.
+  It publishes a separate durable empty-batch proof only after recursively
+  clearing and identity-verifying the isolated batch root. A renamed or
+  replaced batch without that proof retains its ticket and fails closed.
+- Pending metadata versions 4 and 5 keep their historical agent-TOML symlink
+  claim semantics. Only version 6 applies the path-derived regular-file claim
+  omission, so an upgrade cannot strand an older pending transaction.
 
 ## Next Steps
 
@@ -74,6 +86,28 @@ superseded_by:
   no failures. The focused regular-agent suite ran 13 tests, including rollback
   pointer retention, cleanup-ticket recovery, regular update rollback, removal,
   overlay uninstall, status drift, and pending-v5/v6 compatibility.
+- The first frozen whole-range review of commit `cd9ef61d` found five valid
+  blockers: a pre-pointer regular-preimage hard-link crash window, incorrect
+  v4/v5 agent claim projection, incomplete overlay-uninstall rollback and
+  cleanup finalization, and a missing mandatory-regular ledger check in
+  `status`. All five now have dedicated regression coverage.
+- A focused fresh-context GPT-5.6 Sol Ultra audit of the staging repair found a
+  further cleanup-authority bug: renaming a bound batch to a third name could
+  make the old cleanup path delete its only ticket. The durable empty-proof
+  protocol fixes that ambiguity. The same audit exposed a hard-link race after
+  preimage publication; staging now requires the live link count to increase
+  by exactly one instead of adopting a concurrent third link.
+- The post-fix focused suites ran 25 tests covering regular materialization,
+  v4/v5 claim compatibility, uninstall/status finalization, six staging crash
+  and tamper windows, and exact final link counts. The reconciliation safety
+  suite then passed 312/312 tests in 84.316 seconds.
+- The post-fix complete discovery run exercised 1,255 tests in 974.693 seconds.
+  Its only repository-local failure was an assertion that still expected the
+  superseded `pending pointer` rollback label; the corrected exact test passed.
+  Source-lock drift was refreshed and both the repository source-lock tests and
+  `refresh-lock --check` passed. The four outer-sandbox private-home setup
+  errors passed 4/4 outside the sandbox, and the core synchronizer file passed
+  303 tests with one platform-condition skip.
 - The synchronizer test file ran 303 tests with one platform-condition skip.
   Three compatibility regressions showed that a foreign regular `AGENTS.md`
   must still use the established optional claim-relinquishment path; the final
