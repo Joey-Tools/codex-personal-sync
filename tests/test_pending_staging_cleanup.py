@@ -250,6 +250,8 @@ class PendingStagingCleanupTests(unittest.TestCase):
         data["version"] = metadata_version
         data.pop("terminal_regular_before", None)
         data.pop("terminal_regular_after", None)
+        for record in data["records"]:
+            record.pop("publication_cleanup")
         if metadata_version < 6:
             for record in data["records"]:
                 for field in (
@@ -1377,6 +1379,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
             Path("pending/stage"),
             Path("pending/evidence"),
             Path("pending/state"),
+            Path("pending/cleanup"),
             Path("pending/claims/before"),
             Path("pending/claims/after"),
         ):
@@ -1411,7 +1414,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
 
         self.assertEqual(
             maximum_entries,
-            [3, 6, 3, 1, 1, 1, 1, 1, 2],
+            [3, 7, 3, 1, 1, 1, 1, 1, 1, 2],
         )
 
     def test_cursor_temp_failures_do_not_hold_index_fd(self) -> None:
@@ -1593,6 +1596,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
             Path("pending/stage"),
             Path("pending/evidence"),
             Path("pending/state"),
+            Path("pending/cleanup"),
             Path("pending/claims/before"),
             Path("pending/claims/after"),
         ):

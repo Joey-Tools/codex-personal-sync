@@ -9447,12 +9447,12 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
 
         self.assertIsNotNone(parsed)
         assert parsed is not None
-        self.assertEqual(metadata["version"], 7)
+        self.assertEqual(metadata["version"], 8)
         self.assertIn(
             MODULE.PENDING_RELINQUISH_FOREIGN_ACTION,
             MODULE.PENDING_LINK_ACTIONS_BY_METADATA_VERSION[5],
         )
-        with mock.patch.object(MODULE, "PENDING_LINK_METADATA_VERSION", 7):
+        with mock.patch.object(MODULE, "PENDING_LINK_METADATA_VERSION", 8):
             self.assertIsNotNone(MODULE._load_pending_link_batch(self.home))
         record = next(
             record
@@ -9688,6 +9688,7 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
             assert isinstance(records, list)
             for record in records:
                 assert isinstance(record, dict)
+                record.pop("publication_cleanup")
                 for field in (
                     "materialization",
                     "regular_sha256",
@@ -12119,6 +12120,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         payload.pop("terminal_regular_before")
         payload.pop("terminal_regular_after")
         for record in payload["records"]:
+            record.pop("publication_cleanup")
             for field in (
                 "materialization",
                 "regular_sha256",

@@ -161,6 +161,9 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
         if version < 7:
             payload.pop("terminal_regular_before")
             payload.pop("terminal_regular_after")
+        if version < 8:
+            for raw_record in payload["records"]:
+                raw_record.pop("publication_cleanup", None)
         if version < 6:
             for raw_record in payload["records"]:
                 for field in (
@@ -693,9 +696,9 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
                         parsed,
                     )
 
-    def test_v7_active_pointer_rejects_missing_cleanup_index(self) -> None:
-        home = self.root / "home-v7-no-cleanup-index"
-        release = self.root / "release-v7-no-cleanup-index"
+    def test_v8_active_pointer_rejects_missing_cleanup_index(self) -> None:
+        home = self.root / "home-v8-no-cleanup-index"
+        release = self.root / "release-v8-no-cleanup-index"
         write_agent_release(release)
         self._retain_batch(
             home,
@@ -710,7 +713,7 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             MODULE.SyncError,
-            "cleanup index is missing: metadata v7",
+            "cleanup index is missing: metadata v8",
         ):
             MODULE._read_or_restore_active_pointer_cleanup_ticket(home, parsed)
 

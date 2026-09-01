@@ -63,6 +63,12 @@ superseded_by:
   7 additionally persists the complete regular-target state before and after
   the transaction; uncovered version-6 terminal state fails closed instead of
   guessing that omitted records prove a healthy final file.
+- Version 8 journals each exact live-leaf cleanup before the leaf is renamed
+  away. The immutable receipt binds the transaction record, cleanup phase,
+  target and parent identity, file identity, digest, size, mode, UID, exact link
+  count, and active cleanup name. Recovery consumes both produced-file and
+  restored-preimage receipts before validating the terminal target, so a crash
+  after the durable rename cannot leave an unrecorded third hard link.
 - Terminal regular-file cleanup now uses cleanup-ticket version 4 as the last
   durable authority. It binds the complete affected target group to each
   parent and file identity, exact digest and size, mode `0600`, and effective
@@ -208,3 +214,17 @@ superseded_by:
   reconciliation ordering passed 22/22. Ruff `E4/E7/E9/F`, repository-wide
   `compileall`, `git diff --check`, source-lock canonical serialization, and the
   refreshed ten-source `refresh-lock --check` all passed on the same source.
+- A subsequent frozen whole-range GPT-5.6 Sol Ultra review identified one
+  remaining crash window: exact regular-leaf cleanup durably renamed the target
+  to an active cleanup name before unlinking it, but did not persist that third
+  alias. Version-8 per-record receipts now make both produced-file deletion and
+  preimage-restoration cleanup recoverable. The five previously failing
+  compatibility and rollback cases passed 5/5, the focused receipt recovery
+  tests passed, and reconciliation safety passed 314/314 in 85.566 seconds.
+- The exact post-repair repository discovery passed 1,349/1,349 tests in
+  987.701 seconds with three expected platform skips. The final focused pending
+  compatibility and staging-cleanup run passed 48/48; core synchronization
+  passed 313/313 with one expected skip; regular materialization and overlay
+  regression coverage passed 59/59. Ruff, repository-wide `compileall`, project
+  journal validation, `git diff --check`, and the refreshed ten-source
+  `refresh-lock --check` all passed on the same source bytes.
