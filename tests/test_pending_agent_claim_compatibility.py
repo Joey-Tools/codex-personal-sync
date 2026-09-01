@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from dataclasses import replace
 import importlib.util
 import io
 import json
@@ -154,6 +155,8 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
         self,
         batch: MODULE.PendingLinkBatch,
         version: int,
+        *,
+        preserve_v6_null_gid: bool = False,
     ) -> None:
         metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
         payload = json.loads(metadata.read_text(encoding="utf-8"))
@@ -164,7 +167,11 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
         if version < 8:
             for raw_record in payload["records"]:
                 raw_record.pop("publication_cleanup", None)
-        if version == 6:
+        if version < 9:
+            for field in ("state_before", "state_after", "commit_evidence"):
+                payload[field].pop("uid")
+                payload[field].pop("gid")
+        if version == 6 and not preserve_v6_null_gid:
             for raw_record in payload["records"]:
                 if (
                     raw_record["materialization"] == "regular"
@@ -358,6 +365,213 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
             "after claims do not exactly match state",
         ):
             MODULE._load_pending_link_batch(home)
+
+    def test_v6_historical_null_gid_regular_records_recover(self) -> None:
+        for committed in (False, True):
+            with self.subTest(committed=committed):
+                home = self.root / f"home-v6-null-gid-{committed}"
+                release = self.root / f"release-v6-null-gid-{committed}"
+                write_agent_release(release)
+                batch = self._retain_batch(
+                    home,
+                    release,
+                    committed=committed,
+                    legacy_symlink=False,
+                )
+                self._downgrade_metadata(
+                    batch,
+                    6,
+                    preserve_v6_null_gid=True,
+                )
+
+                metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+                payload = json.loads(metadata.read_text(encoding="utf-8"))
+                producing_regular = [
+                    raw_record
+                    for raw_record in payload["records"]
+                    if raw_record["materialization"] == "regular"
+                    and raw_record["action"]
+                    in {"create", "replace", "quarantine-replace"}
+                ]
+                self.assertTrue(producing_regular)
+                self.assertTrue(
+                    all(
+                        raw_record["regular_gid"] is None
+                        for raw_record in producing_regular
+                    )
+                )
+
+                parsed = MODULE._load_pending_link_batch(home)
+                self.assertIsNotNone(parsed)
+                state, snapshot = MODULE._load_managed_state_with_snapshot(home)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    _state, _snapshot, recovered = (
+                        MODULE._recover_pending_link_transaction(
+                            home,
+                            state,
+                            snapshot,
+                            dry_run=False,
+                        )
+                    )
+
+                self.assertTrue(recovered)
+                self.assertFalse(
+                    os.path.lexists(MODULE._pending_link_pointer_path(home))
+                )
+                self.assertEqual((home / ROLE_TARGET).is_file(), committed)
+
+    def test_v7_v8_reject_integer_regular_gid(self) -> None:
+        for version in (7, 8):
+            with self.subTest(version=version):
+                home = self.root / f"home-v{version}-integer-gid"
+                release = self.root / f"release-v{version}-integer-gid"
+                write_agent_release(release)
+                batch = self._retain_batch(
+                    home,
+                    release,
+                    committed=True,
+                    legacy_symlink=False,
+                )
+                self._downgrade_metadata(batch, version)
+                metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+                payload = json.loads(metadata.read_text(encoding="utf-8"))
+                raw_record = next(
+                    raw_record
+                    for raw_record in payload["records"]
+                    if raw_record["materialization"] == "regular"
+                    and raw_record["action"]
+                    in {"create", "replace", "quarantine-replace"}
+                )
+                assert raw_record["regular_gid"] is None
+                stage = raw_record["stage"]
+                assert isinstance(stage, str)
+                raw_record["regular_gid"] = os.stat(batch.batch_root / stage).st_gid
+                metadata.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "invalid regular-file evidence",
+                ):
+                    MODULE._load_pending_link_batch(home)
+
+    def test_v9_managed_state_evidence_binds_uid_and_gid_policy(self) -> None:
+        home = self.root / "home-v9-state-ownership"
+        release = self.root / "release-v9-state-ownership"
+        write_agent_release(release)
+        batch = self._retain_batch(
+            home,
+            release,
+            committed=True,
+            legacy_symlink=False,
+        )
+        metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        payload = json.loads(metadata.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["version"], 9)
+        self.assertIsNone(payload["state_before"]["uid"])
+        self.assertIsNone(payload["state_before"]["gid"])
+        for field in ("state_after", "commit_evidence"):
+            raw = payload[field]
+            evidence = raw["evidence"]
+            assert isinstance(evidence, str)
+            evidence_stat = os.stat(batch.batch_root / evidence)
+            self.assertEqual(raw["uid"], evidence_stat.st_uid)
+            self.assertEqual(raw["gid"], evidence_stat.st_gid)
+
+        raw_after = payload["state_after"]
+        changed_uid = dict(raw_after)
+        changed_uid["uid"] += 1
+        with self.assertRaisesRegex(MODULE.SyncError, "evidence changed"):
+            MODULE._read_pending_state_evidence(
+                home,
+                batch.batch_root,
+                changed_uid,
+                label="state-after",
+                state_parent_identity=batch.state_after.parent_identity,
+                require_exists=True,
+                required_mode=0o600,
+                metadata_version=9,
+            )
+
+        private_gid_drift = dict(raw_after)
+        private_gid_drift["gid"] += 1
+        snapshot, _evidence = MODULE._read_pending_state_evidence(
+            home,
+            batch.batch_root,
+            private_gid_drift,
+            label="state-after",
+            state_parent_identity=batch.state_after.parent_identity,
+            require_exists=True,
+            required_mode=0o600,
+            metadata_version=9,
+        )
+        self.assertEqual(snapshot.file_identity, batch.state_after.file_identity)
+        assert batch.state_after.uid is not None
+        assert batch.state_after.gid is not None
+        self.assertFalse(
+            MODULE._managed_state_snapshot_exact(
+                replace(batch.state_after, uid=batch.state_after.uid + 1),
+                batch.state_after,
+            )
+        )
+        self.assertTrue(
+            MODULE._managed_state_snapshot_exact(
+                replace(batch.state_after, gid=batch.state_after.gid + 1),
+                batch.state_after,
+            )
+        )
+        group_bound = replace(batch.state_after, mode=0o640)
+        self.assertFalse(
+            MODULE._managed_state_snapshot_exact(
+                replace(group_bound, gid=batch.state_after.gid + 1),
+                group_bound,
+            )
+        )
+
+        evidence = raw_after["evidence"]
+        assert isinstance(evidence, str)
+        evidence_path = batch.batch_root / evidence
+        evidence_path.chmod(0o640)
+        group_bearing = dict(raw_after)
+        group_bearing["mode"] = 0o640
+        MODULE._read_pending_state_evidence(
+            home,
+            batch.batch_root,
+            group_bearing,
+            label="state-after",
+            state_parent_identity=batch.state_after.parent_identity,
+            require_exists=True,
+            required_mode=None,
+            metadata_version=9,
+        )
+        changed_group = dict(group_bearing)
+        changed_group["gid"] += 1
+        with self.assertRaisesRegex(MODULE.SyncError, "evidence changed"):
+            MODULE._read_pending_state_evidence(
+                home,
+                batch.batch_root,
+                changed_group,
+                label="state-after",
+                state_parent_identity=batch.state_after.parent_identity,
+                require_exists=True,
+                required_mode=None,
+                metadata_version=9,
+            )
+
+        legacy_group_bearing = dict(group_bearing)
+        legacy_group_bearing.pop("uid")
+        legacy_group_bearing.pop("gid")
+        with self.assertRaisesRegex(MODULE.SyncError, "file metadata is invalid"):
+            MODULE._read_pending_state_evidence(
+                home,
+                batch.batch_root,
+                legacy_group_bearing,
+                label="state-after",
+                state_parent_identity=batch.state_after.parent_identity,
+                require_exists=True,
+                required_mode=None,
+                metadata_version=8,
+            )
 
     def test_legacy_agent_symlink_migrates_to_regular_on_update(self) -> None:
         home = self.root / "home-legacy-update"
@@ -719,12 +933,13 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
         home = self.root / "home-v8-no-cleanup-index"
         release = self.root / "release-v8-no-cleanup-index"
         write_agent_release(release)
-        self._retain_batch(
+        batch = self._retain_batch(
             home,
             release,
             committed=True,
             legacy_symlink=False,
         )
+        self._downgrade_metadata(batch, 8)
         self._drop_cleanup_index(home)
         parsed = MODULE._load_pending_link_batch(home)
         self.assertIsNotNone(parsed)

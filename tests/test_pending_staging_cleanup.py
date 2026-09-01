@@ -258,6 +258,9 @@ class PendingStagingCleanupTests(unittest.TestCase):
         metadata_path = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
         data = json.loads(metadata_path.read_text(encoding="utf-8"))
         data["version"] = metadata_version
+        for field in ("state_before", "state_after", "commit_evidence"):
+            data[field].pop("uid")
+            data[field].pop("gid")
         data.pop("terminal_regular_before", None)
         data.pop("terminal_regular_after", None)
         for record in data["records"]:
@@ -841,6 +844,155 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 (quarantine_root.stat().st_dev, quarantine_root.stat().st_ino),
             )
         self.assertEqual(proof_path.read_bytes(), b"{\n")
+
+    def test_cleanup_authority_readers_reject_foreign_owner_uid(self) -> None:
+        foreign_uid = os.geteuid() + 1
+        ticket = self._publish_legacy_cleanup_ticket(version=3)
+        quarantine_root = (
+            MODULE._personal_sync_root(self.home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        quarantine_root_identity = (
+            quarantine_root.stat().st_dev,
+            quarantine_root.stat().st_ino,
+        )
+        proof = MODULE._publish_pending_cleanup_empty_proof(
+            self.home,
+            ticket,
+            quarantine_root_identity,
+        )
+
+        staging_root = MODULE._quarantine_batch_root(self.home, [])
+        staging_identity = (
+            staging_root.stat().st_dev,
+            staging_root.stat().st_ino,
+        )
+        staging_path = staging_root / Path(
+            *MODULE.PENDING_STATE_STAGING_MARKER.parts
+        )
+        staging_path.parent.mkdir(parents=True, exist_ok=True)
+        marker = MODULE._write_exclusive_internal_file(
+            self.home,
+            staging_path,
+            MODULE._pending_staging_marker_payload(
+                staging_root,
+                staging_identity,
+            ),
+        )
+        self.assertEqual(ticket.snapshot.uid, os.geteuid())
+        self.assertEqual(proof.uid, os.geteuid())
+        self.assertEqual(marker.uid, os.geteuid())
+
+        with mock.patch.object(MODULE.os, "geteuid", return_value=foreign_uid):
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup ticket owner changed",
+            ):
+                MODULE._read_pending_cleanup_ticket(self.home, ticket.path)
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup empty proof changed",
+            ):
+                MODULE._read_pending_cleanup_empty_proof(
+                    self.home,
+                    ticket,
+                    quarantine_root_identity,
+                )
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending staging cleanup marker changed",
+            ):
+                MODULE._pending_staging_marker_snapshot(
+                    self.home,
+                    staging_root,
+                    staging_identity,
+                )
+
+    def test_atomic_authority_publisher_rejects_foreign_owner_uid(self) -> None:
+        authority_root = self.home / "atomic-authority-owner-tests"
+        authority_root.mkdir()
+        payload = b'{"authority": true}\n'
+        foreign_uid = os.geteuid() + 1
+
+        existing_path = authority_root / "existing.json"
+        existing_path.write_bytes(payload)
+        existing_path.chmod(0o600)
+        with (
+            mock.patch.object(MODULE.os, "geteuid", return_value=foreign_uid),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "atomic internal authority is incomplete or changed",
+            ),
+        ):
+            MODULE._publish_atomic_exclusive_internal_file(
+                self.home,
+                existing_path,
+                payload,
+            )
+
+        raced_path = authority_root / "raced.json"
+
+        def publish_foreign_owner_race(*_args) -> None:
+            raced_path.write_bytes(payload)
+            raced_path.chmod(0o600)
+            raise FileExistsError("injected authority publication race")
+
+        with (
+            mock.patch.object(MODULE.os, "geteuid", return_value=foreign_uid),
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=publish_foreign_owner_race,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "atomic internal authority appeared with changed content",
+            ),
+        ):
+            MODULE._publish_atomic_exclusive_internal_file(
+                self.home,
+                raced_path,
+                payload,
+            )
+
+    def test_cleanup_ticket_file_exists_race_rejects_foreign_owner_uid(
+        self,
+    ) -> None:
+        index_root = MODULE._pending_cleanup_index_path(self.home)
+        index_fd = MODULE._open_or_create_directory_beneath(
+            self.home,
+            index_root,
+            mode=0o700,
+        )
+        MODULE._close_fd_quietly(index_fd)
+        ticket_path = MODULE._pending_cleanup_ticket_path(
+            self.home,
+            "20260901T000000Z-12-0",
+        )
+        payload = b'{"ticket": true}\n'
+        foreign_uid = os.geteuid() + 1
+
+        def publish_foreign_owner_race(*_args) -> None:
+            ticket_path.write_bytes(payload)
+            ticket_path.chmod(0o600)
+            raise FileExistsError("injected cleanup ticket publication race")
+
+        with (
+            mock.patch.object(MODULE.os, "geteuid", return_value=foreign_uid),
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=publish_foreign_owner_race,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup ticket appeared with changed content",
+            ),
+        ):
+            MODULE._publish_pending_cleanup_ticket(
+                self.home,
+                ticket_path,
+                payload,
+            )
 
     def test_ticket_temp_publisher_recovers_truncated_rollback_and_staging_temps(
         self,

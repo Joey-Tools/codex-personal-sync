@@ -187,7 +187,7 @@ MAX_MANAGED_STATE_BYTES = 16 * 1024 * 1024
 QUARANTINE_RELATIVE_PATH = Path("quarantine")
 PENDING_LINK_POINTER_NAME = ".personal-sync-pending-transaction.json"
 PENDING_LINK_METADATA_NAME = "pending-transaction.json"
-PENDING_LINK_METADATA_VERSION = 8
+PENDING_LINK_METADATA_VERSION = 9
 PENDING_RELINQUISH_FOREIGN_ACTION = "relinquish-foreign"
 PENDING_LINK_V4_ACTIONS = frozenset(
     {
@@ -205,6 +205,7 @@ PENDING_LINK_ACTIONS_BY_METADATA_VERSION = {
     6: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
     7: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
     8: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
+    9: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
 }
 SUPPORTED_PENDING_LINK_METADATA_VERSIONS = frozenset(
     PENDING_LINK_ACTIONS_BY_METADATA_VERSION
@@ -9064,8 +9065,11 @@ def _atomic_move_beneath_home(
     moved_identity_for_restore: tuple[int, int] | None = None
     moved_target_for_restore: str | None = None
     source_regular_for_restore: RegularFileSnapshot | None = None
+    source_parent_identity_for_restore: tuple[int, int] | None = None
     destination_parent_identity_for_restore: tuple[int, int] | None = None
+    rollback_source_parent_fd = -1
     try:
+        source_parent_identity_for_restore = _directory_identity(source_parent_fd)
         if expected_destination_parent_identity is not None:
             destination_parent_identity_for_restore = _directory_identity(
                 destination_parent_fd
@@ -9108,8 +9112,10 @@ def _atomic_move_beneath_home(
                 raise SyncError(
                     f"destructive move has no planned target snapshot: {source}"
                 )
-            actual_parent_identity = _directory_identity(source_parent_fd)
-            if actual_parent_identity != expected_snapshot.parent_identity:
+            if (
+                source_parent_identity_for_restore
+                != expected_snapshot.parent_identity
+            ):
                 raise SyncError(
                     f"source parent changed after planning: {source.parent}"
                 )
@@ -9224,6 +9230,23 @@ def _atomic_move_beneath_home(
         if moved:
             restored = False
             try:
+                rollback_source_parent_fd = _open_directory_beneath(
+                    home,
+                    source.parent,
+                )
+                if (
+                    _directory_identity(rollback_source_parent_fd)
+                    != source_parent_identity_for_restore
+                    or not _bound_directory_matches(
+                        home,
+                        source.parent,
+                        rollback_source_parent_fd,
+                    )
+                ):
+                    raise SyncError(
+                        "canonical source parent changed before failed-move "
+                        f"restoration; evidence was retained at {destination}"
+                    )
                 if source_regular_for_restore is not None:
                     destination_regular_before_restore = _regular_file_snapshot_at(
                         destination_parent_fd,
@@ -9240,19 +9263,38 @@ def _atomic_move_beneath_home(
                             "moved regular file changed before failed-move "
                             f"restoration and was retained at {destination}"
                         )
+                try:
+                    rollback_source_metadata = os.stat(
+                        source.name,
+                        dir_fd=rollback_source_parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    rollback_source_identity = (
+                        rollback_source_metadata.st_dev,
+                        rollback_source_metadata.st_ino,
+                    )
+                    raise SyncError(
+                        "canonical source leaf appeared before failed-move "
+                        "restoration and was left in place: "
+                        f"{source} ({rollback_source_identity}); evidence was "
+                        f"retained at {destination}"
+                    )
                 _rename_noreplace_at(
                     destination_parent_fd,
                     destination.name,
-                    source_parent_fd,
+                    rollback_source_parent_fd,
                     source.name,
                 )
                 restored = True
-                os.fsync(source_parent_fd)
-                if destination_parent_fd != source_parent_fd:
+                os.fsync(rollback_source_parent_fd)
+                if destination_parent_fd != rollback_source_parent_fd:
                     os.fsync(destination_parent_fd)
                 restored_metadata = os.stat(
                     source.name,
-                    dir_fd=source_parent_fd,
+                    dir_fd=rollback_source_parent_fd,
                     follow_symlinks=False,
                 )
                 if (
@@ -9264,7 +9306,7 @@ def _atomic_move_beneath_home(
                     )
                 if moved_target_for_restore is not None:
                     restored_identity, restored_target = _symlink_snapshot_at(
-                        source_parent_fd,
+                        rollback_source_parent_fd,
                         source.name,
                     )
                     if (
@@ -9279,7 +9321,7 @@ def _atomic_move_beneath_home(
                     restored_regular_error: BaseException | None = None
                     try:
                         restored_regular = _regular_file_snapshot_at(
-                            source_parent_fd,
+                            rollback_source_parent_fd,
                             source.name,
                             source,
                         )
@@ -9296,32 +9338,49 @@ def _atomic_move_beneath_home(
                     )
                     if not restored_regular_matches:
                         try:
+                            retained_source_metadata = os.stat(
+                                source.name,
+                                dir_fd=rollback_source_parent_fd,
+                                follow_symlinks=False,
+                            )
+                            retained_source_identity = (
+                                retained_source_metadata.st_dev,
+                                retained_source_metadata.st_ino,
+                            )
+                            if (
+                                not stat.S_ISREG(retained_source_metadata.st_mode)
+                                or retained_source_identity
+                                != moved_identity_for_restore
+                            ):
+                                raise SyncError(
+                                    "canonical source leaf changed before evidence "
+                                    "retention and was left in place: "
+                                    f"{source} ({retained_source_identity})"
+                                )
                             _rename_noreplace_at(
-                                source_parent_fd,
+                                rollback_source_parent_fd,
                                 source.name,
                                 destination_parent_fd,
                                 destination.name,
                             )
                             restored = False
-                            os.fsync(source_parent_fd)
-                            if destination_parent_fd != source_parent_fd:
+                            os.fsync(rollback_source_parent_fd)
+                            if destination_parent_fd != rollback_source_parent_fd:
                                 os.fsync(destination_parent_fd)
+                            retained_identity: tuple[int, int]
                             if restored_regular is None:
                                 retained_metadata = os.stat(
                                     destination.name,
                                     dir_fd=destination_parent_fd,
                                     follow_symlinks=False,
                                 )
-                                if (
-                                    not stat.S_ISREG(retained_metadata.st_mode)
-                                    or (
-                                        retained_metadata.st_dev,
-                                        retained_metadata.st_ino,
-                                    )
-                                    != moved_identity_for_restore
-                                ):
+                                retained_identity = (
+                                    retained_metadata.st_dev,
+                                    retained_metadata.st_ino,
+                                )
+                                if not stat.S_ISREG(retained_metadata.st_mode):
                                     raise SyncError(
-                                        "unreadable regular-file evidence changed "
+                                        "unreadable regular-file evidence type changed "
                                         f"while retaining it at {destination}"
                                     )
                             else:
@@ -9330,16 +9389,63 @@ def _atomic_move_beneath_home(
                                     destination.name,
                                     destination,
                                 )
-                                if not _regular_snapshot_matches(
-                                    retained_regular,
-                                    destination_parent_identity_for_restore,
-                                    restored_regular,
-                                    expected_link_count=restored_regular.link_count,
+                                retained_identity = retained_regular.file_identity
+                                if (
+                                    retained_identity
+                                    == moved_identity_for_restore
+                                    and not _regular_snapshot_matches(
+                                        retained_regular,
+                                        destination_parent_identity_for_restore,
+                                        restored_regular,
+                                        expected_link_count=(
+                                            restored_regular.link_count
+                                        ),
+                                    )
                                 ):
                                     raise SyncError(
                                         "changed regular-file evidence could not be "
                                         f"validated at {destination}"
                                     )
+                            if retained_identity != moved_identity_for_restore:
+                                try:
+                                    _rename_noreplace_at(
+                                        destination_parent_fd,
+                                        destination.name,
+                                        rollback_source_parent_fd,
+                                        source.name,
+                                    )
+                                    restored = True
+                                    os.fsync(rollback_source_parent_fd)
+                                    if (
+                                        destination_parent_fd
+                                        != rollback_source_parent_fd
+                                    ):
+                                        os.fsync(destination_parent_fd)
+                                    restored_racer = os.stat(
+                                        source.name,
+                                        dir_fd=rollback_source_parent_fd,
+                                        follow_symlinks=False,
+                                    )
+                                    if (
+                                        restored_racer.st_dev,
+                                        restored_racer.st_ino,
+                                    ) != retained_identity:
+                                        raise SyncError(
+                                            "raced source leaf changed while being "
+                                            f"restored without replacement: {source}"
+                                        )
+                                except BaseException as racer_restore_error:
+                                    raise SyncError(
+                                        "wrong source leaf was moved while retaining "
+                                        "regular-file evidence and could not be "
+                                        "restored without replacement: "
+                                        f"{source}: {racer_restore_error}"
+                                    ) from racer_restore_error
+                                raise SyncError(
+                                    "wrong source leaf was moved while retaining "
+                                    "regular-file evidence and was restored without "
+                                    f"replacement: {source}"
+                                )
                         except BaseException as retention_error:
                             raise SyncError(
                                 "restored regular file changed after failed move "
@@ -9371,7 +9477,7 @@ def _atomic_move_beneath_home(
                 if not _bound_directory_matches(
                     home,
                     source.parent,
-                    source_parent_fd,
+                    rollback_source_parent_fd,
                 ):
                     raise SyncError(f"restored source parent changed: {source.parent}")
             except BaseException as rollback_error:
@@ -9386,6 +9492,8 @@ def _atomic_move_beneath_home(
                 ) from error
         raise
     finally:
+        if rollback_source_parent_fd >= 0:
+            _close_fd_quietly(rollback_source_parent_fd)
         _close_fd_quietly(source_parent_fd)
         _close_fd_quietly(destination_parent_fd)
 
@@ -9841,36 +9949,9 @@ def _move_regular_leaf_to_unique_quarantine(
             source_snapshot,
         ) and moved.link_count == source_snapshot.link_count
         if not moved_matches:
-            try:
-                _rename_noreplace_at(
-                    quarantine_parent_fd,
-                    destination.name,
-                    source_parent_fd,
-                    source_name,
-                )
-                os.fsync(source_parent_fd)
-                os.fsync(quarantine_parent_fd)
-            except BaseException as restore_error:
-                raise SyncError(
-                    "regular file changed during quarantine and the moved "
-                    f"replacement was retained at {destination}: {restore_error}"
-                ) from restore_error
-            restored = _regular_file_snapshot_at(
-                source_parent_fd,
-                source_name,
-                source_path,
-            )
-            if not _regular_snapshot_leaf_matches(
-                restored,
-                moved,
-            ) or restored.link_count != moved.link_count:
-                raise SyncError(
-                    "regular file changed during quarantine and its exact "
-                    f"restoration could not be verified: {source_name}"
-                )
             raise SyncError(
-                "regular file changed during quarantine; the moved replacement "
-                f"was restored without replacement: {source_name}"
+                "regular file changed during quarantine and was retained as "
+                f"isolated evidence at {destination}"
             )
         return destination, moved
     finally:
@@ -13291,6 +13372,8 @@ def _state_evidence_payload(
         "mode": snapshot.mode if snapshot.exists else None,
         "sha256": _snapshot_payload_digest(snapshot),
         "identity": _identity_payload(snapshot.file_identity),
+        "uid": snapshot.uid if snapshot.exists else None,
+        "gid": snapshot.gid if snapshot.exists else None,
         "evidence": evidence.as_posix() if evidence is not None else None,
     }
 
@@ -13857,6 +13940,7 @@ def _publish_atomic_exclusive_internal_file(
             if (
                 existing.file_type != stat.S_IFREG
                 or existing.mode != 0o600
+                or existing.uid != os.geteuid()
                 or existing.payload != payload
                 or not _managed_state_snapshot_has_complete_file_evidence(existing)
             ):
@@ -13905,6 +13989,7 @@ def _publish_atomic_exclusive_internal_file(
                 not existing.exists
                 or existing.file_type != stat.S_IFREG
                 or existing.mode != 0o600
+                or existing.uid != os.geteuid()
                 or existing.payload != payload
             ):
                 raise SyncError(
@@ -13939,7 +14024,11 @@ def _publish_atomic_exclusive_internal_file(
             parent_fd,
             expected_identity=staged.file_identity,
         )
-        if published.payload != payload or published.mode != 0o600:
+        if (
+            published.payload != payload
+            or published.mode != 0o600
+            or published.uid != os.geteuid()
+        ):
             raise SyncError(
                 f"atomic internal authority changed during publication: {path}"
             )
@@ -14078,6 +14167,31 @@ def _publish_regular_hardlink_beneath(
                     "regular-file evidence publication failed after a namespace "
                     "race; the destination leaf was retained without deletion: "
                     f"{destination}",
+                    code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
+                ) from error
+            try:
+                current_source = _read_managed_state_file_snapshot(
+                    home,
+                    source,
+                    source_parent_fd,
+                    expected_identity=expected_source.file_identity,
+                    maximum_bytes=maximum_bytes,
+                )
+            except (OSError, SyncError):
+                raise SyncError(
+                    "regular-file evidence publication failed and no exact "
+                    "source alias could be revalidated; the destination leaf "
+                    f"was retained without deletion: {destination}",
+                    code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
+                ) from error
+            if not _managed_state_snapshot_matches_bound_file_evidence(
+                current_source,
+                expected_source,
+            ):
+                raise SyncError(
+                    "regular-file evidence publication failed and no exact "
+                    "source alias could be revalidated; the destination leaf "
+                    f"was retained without deletion: {destination}",
                     code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
                 ) from error
             _isolate_and_delete_pending_cleanup_file(
@@ -14256,62 +14370,15 @@ def _delete_exact_regular_publication_beneath(
             expected,
             expected_link_count=expected.link_count,
         ) or _pending_cleanup_entry_plan(isolated) != planned:
-            try:
-                if not _bound_directory_matches(home, target.parent, parent_fd):
-                    raise SyncError(
-                        "published regular-file destination parent changed during "
-                        f"cleanup: {target.parent}"
-                    )
-                current_isolated = _regular_file_snapshot_at(
-                    parent_fd,
-                    active_name,
-                    target.with_name(active_name),
-                    maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
-                )
-                if not _regular_snapshot_matches(
-                    current_isolated,
-                    expected.parent_identity,
-                    isolated_snapshot,
-                    expected_link_count=isolated_snapshot.link_count,
-                ):
-                    raise SyncError(
-                        "published regular-file isolated replacement changed during "
-                        f"cleanup: {target}"
-                    )
-                _rename_noreplace_at(
-                    parent_fd,
-                    active_name,
-                    parent_fd,
-                    target.name,
-                )
-                os.fsync(parent_fd)
-                restored = _regular_file_snapshot_at(
-                    parent_fd,
-                    target.name,
-                    target,
-                    maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
-                )
-            except (OSError, SyncError) as error:
-                raise SyncError(
+            _retain_pending_cleanup_entry(
+                parent_fd,
+                active_name,
+                expected.parent_identity,
+                planned,
+                label=(
                     "published regular-file destination changed during cleanup; "
                     f"the isolated replacement was retained: {target}"
-                ) from error
-            if (
-                not _regular_snapshot_matches(
-                    restored,
-                    expected.parent_identity,
-                    isolated_snapshot,
-                    expected_link_count=isolated_snapshot.link_count,
-                )
-                or not _bound_directory_matches(home, target.parent, parent_fd)
-            ):
-                raise SyncError(
-                    "published regular-file destination changed during cleanup; "
-                    f"the restored replacement could not be verified: {target}"
-                )
-            raise SyncError(
-                "published regular-file destination changed during cleanup; "
-                f"the replacement was restored without quarantine: {target}"
+                ),
             )
         os.unlink(active_name, dir_fd=parent_fd)
         os.fsync(parent_fd)
@@ -15754,6 +15821,8 @@ def _projected_pending_metadata_payload(
                 if state_before_exists
                 else None
             ),
+            "uid": _MAX_PENDING_IDENTITY[0] if state_before_exists else None,
+            "gid": _MAX_PENDING_IDENTITY[0] if state_before_exists else None,
             "evidence": state_before_evidence,
         },
         "state_after": {
@@ -15761,6 +15830,8 @@ def _projected_pending_metadata_payload(
             "mode": 0o600,
             "sha256": _MAX_PENDING_DIGEST,
             "identity": _identity_payload(_MAX_PENDING_IDENTITY),
+            "uid": _MAX_PENDING_IDENTITY[0],
+            "gid": _MAX_PENDING_IDENTITY[0],
             "evidence": PENDING_STATE_AFTER_EVIDENCE.as_posix(),
         },
         "releases_before": releases_before,
@@ -15772,6 +15843,8 @@ def _projected_pending_metadata_payload(
             "mode": 0o600,
             "sha256": _MAX_PENDING_DIGEST,
             "identity": _identity_payload(_MAX_PENDING_IDENTITY),
+            "uid": _MAX_PENDING_IDENTITY[0],
+            "gid": _MAX_PENDING_IDENTITY[0],
             "evidence": PENDING_STATE_COMMIT_EVIDENCE.as_posix(),
         },
         "commit_marker": PENDING_STATE_COMMIT_MARKER.as_posix(),
@@ -17456,14 +17529,18 @@ def _read_pending_state_evidence(
     state_parent_identity: tuple[int, int],
     require_exists: bool,
     required_mode: int | None,
+    metadata_version: int,
 ) -> tuple[ManagedStateFileSnapshot, PurePosixPath | None]:
-    if not isinstance(raw, dict) or set(raw) != {
+    expected_fields = {
         "exists",
         "mode",
         "sha256",
         "identity",
         "evidence",
-    }:
+    }
+    if metadata_version >= 9:
+        expected_fields.update({"uid", "gid"})
+    if not isinstance(raw, dict) or set(raw) != expected_fields:
         raise SyncError(f"pending transaction {label} evidence is invalid")
     exists = raw.get("exists")
     if not isinstance(exists, bool) or (require_exists and not exists):
@@ -17478,8 +17555,13 @@ def _read_pending_state_evidence(
         raw.get("evidence"),
         f"pending transaction {label} evidence path",
     )
+    uid = raw.get("uid") if metadata_version >= 9 else None
+    gid = raw.get("gid") if metadata_version >= 9 else None
     if not exists:
-        if any(value is not None for value in (mode, digest, identity, evidence)):
+        if any(
+            value is not None
+            for value in (mode, digest, identity, uid, gid, evidence)
+        ):
             raise SyncError(f"missing pending transaction {label} has file metadata")
         return (
             ManagedStateFileSnapshot(
@@ -17498,6 +17580,18 @@ def _read_pending_state_evidence(
         or re.fullmatch(r"[0-9a-f]{64}", digest) is None
         or identity is None
         or evidence is None
+        or (
+            metadata_version >= 9
+            and (
+                type(uid) is not int
+                or uid < 0
+                or uid >= 2**64
+                or type(gid) is not int
+                or gid < 0
+                or gid >= 2**64
+            )
+        )
+        or (metadata_version < 9 and bool(mode & 0o070))
     ):
         raise SyncError(f"pending transaction {label} file metadata is invalid")
     evidence_path = batch_root / Path(*evidence.parts)
@@ -17516,6 +17610,15 @@ def _read_pending_state_evidence(
         or actual.mode != mode
         or actual.file_identity != identity
         or _snapshot_payload_digest(actual) != digest
+        or actual.uid != (uid if metadata_version >= 9 else os.geteuid())
+        or (
+            metadata_version >= 9
+            and not _gid_matches_regular_file_access_policy(
+                actual.gid,
+                gid,
+                mode,
+            )
+        )
     ):
         raise SyncError(f"pending transaction {label} evidence changed")
     return (
@@ -17603,6 +17706,7 @@ def _read_pending_commit_evidence(
     *,
     state_parent_identity: tuple[int, int],
     state_after: ManagedStateFileSnapshot,
+    metadata_version: int,
 ) -> tuple[ManagedStateFileSnapshot, PurePosixPath]:
     snapshot, evidence = _read_pending_state_evidence(
         home,
@@ -17612,6 +17716,7 @@ def _read_pending_commit_evidence(
         state_parent_identity=state_parent_identity,
         require_exists=True,
         required_mode=0o600,
+        metadata_version=metadata_version,
     )
     if evidence != PENDING_STATE_COMMIT_EVIDENCE:
         raise SyncError("pending transaction commit evidence path is not canonical")
@@ -17725,6 +17830,7 @@ def _parse_pending_link_batch(
         state_parent_identity=state_parent_identity,
         require_exists=False,
         required_mode=None,
+        metadata_version=version,
     )
     state_after, state_after_evidence = _read_pending_state_evidence(
         home,
@@ -17734,6 +17840,7 @@ def _parse_pending_link_batch(
         state_parent_identity=state_parent_identity,
         require_exists=True,
         required_mode=0o600,
+        metadata_version=version,
     )
     if state_before.exists:
         if state_before_evidence != PENDING_STATE_BEFORE_EVIDENCE:
@@ -17798,6 +17905,7 @@ def _parse_pending_link_batch(
         data.get("commit_evidence"),
         state_parent_identity=state_parent_identity,
         state_after=state_after,
+        metadata_version=version,
     )
     if data.get("commit_marker") != PENDING_STATE_COMMIT_MARKER.as_posix():
         raise SyncError("pending transaction commit marker path is not canonical")
@@ -17930,6 +18038,7 @@ def _parse_pending_link_batch(
                 )
                 or (
                     version == 6
+                    and regular_gid is not None
                     and (
                         not isinstance(regular_gid, int)
                         or isinstance(regular_gid, bool)
@@ -19546,6 +19655,8 @@ def _read_pending_cleanup_ticket(
             raise SyncError(f"pending cleanup ticket exceeds its limit: {batch_name}")
         if snapshot.mode != 0o600:
             raise SyncError(f"pending cleanup ticket mode changed: {batch_name}")
+        if snapshot.uid != os.geteuid():
+            raise SyncError(f"pending cleanup ticket owner changed: {batch_name}")
         data = _decode_managed_state_json(snapshot.payload, ticket_path)
         version = data.get("version")
         if type(version) is not int or version not in {1, 2, 3, 4}:
@@ -19874,7 +19985,12 @@ def _publish_pending_cleanup_ticket(
                 ticket_path,
                 index_fd,
             )
-            if not existing.exists or existing.payload != payload:
+            if (
+                not existing.exists
+                or existing.mode != 0o600
+                or existing.uid != os.geteuid()
+                or existing.payload != payload
+            ):
                 raise SyncError("pending cleanup ticket appeared with changed content")
             current_temp = _read_managed_state_file_snapshot(
                 home,
@@ -19904,7 +20020,11 @@ def _publish_pending_cleanup_ticket(
             index_fd,
             expected_identity=staged.file_identity,
         )
-        if published.payload != payload or published.mode != 0o600:
+        if (
+            published.payload != payload
+            or published.mode != 0o600
+            or published.uid != os.geteuid()
+        ):
             raise SyncError("pending cleanup ticket changed during publication")
         return published
     finally:
@@ -20039,6 +20159,7 @@ def _pending_staging_marker_snapshot(
         if (
             marker.file_type != stat.S_IFREG
             or marker.mode != 0o600
+            or marker.uid != os.geteuid()
             or marker.payload != expected_payload
             or marker.parent_identity != _directory_identity(parent_fd)
         ):
@@ -21379,6 +21500,7 @@ def _read_pending_cleanup_empty_proof(
         if (
             proof.file_type != stat.S_IFREG
             or proof.mode != 0o600
+            or proof.uid != os.geteuid()
             or proof.payload != expected_payload
             or proof.parent_identity != _directory_identity(index_fd)
         ):
@@ -22910,6 +23032,12 @@ def _managed_state_snapshot_exact(
         actual.file_identity == expected.file_identity
         and actual.mode == expected.mode
         and actual.payload == expected.payload
+        and actual.uid == expected.uid
+        and _gid_matches_regular_file_access_policy(
+            actual.gid,
+            expected.gid,
+            expected.mode,
+        )
     )
 
 

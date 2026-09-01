@@ -341,3 +341,22 @@ superseded_by:
   1,381/1,381 tests in 997.782 seconds with three expected platform skips.
   The source lock, static checks, signed checkpoint, and a new clean-clone
   whole-range review remain the required next gates.
+- The next independent GPT-5.6 Sol Ultra whole-range review found six real
+  blockers before remote publication. Historical version-6 writers had emitted
+  both integer and `null` `regular_gid` values; version 9 now persists
+  managed-state UID/GID evidence, accepts only the real closed legacy shapes,
+  and binds UID always while binding GID only when group permission bits give
+  it access-policy meaning. Legacy state evidence without a group-bearing GID
+  fails closed rather than being silently upgraded.
+- The same audit tightened destructive recovery. Failed hard-link publication
+  retains the destination when no exact source alias can be re-proven; changed
+  regular evidence is retained outside the active agent path instead of being
+  renamed back into it; failed moves rebind the canonical parent and never move
+  a newly inserted racer; and all cleanup ticket, staging-marker, and
+  empty-proof adoption paths require the effective UID. New race and
+  compatibility coverage passed 465/465 focused tests in 132.856 seconds.
+  A first 1,393-test discovery then had no product regression: four
+  account-home temporary-directory tests were denied by the outer sandbox and
+  the source-lock test correctly observed pending source changes. Refresh the
+  lock, rerun that suite with its narrowly required private-home permission,
+  then create a new signed frozen head and a clean-clone whole-range review.

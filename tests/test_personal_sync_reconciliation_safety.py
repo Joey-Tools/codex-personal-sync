@@ -1595,6 +1595,75 @@ class ReconciliationOrderingTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
         self.assertEqual(metadata.st_nlink, 1)
 
+    def test_changed_agent_leaf_remains_quarantined(self) -> None:
+        target = self.home / "agents" / "reviewer.toml"
+        target.parent.mkdir()
+        target.write_bytes(b'role = "reviewer"\n')
+        target.chmod(0o600)
+        target_identity = (target.stat().st_dev, target.stat().st_ino)
+        target_parent_fd = MODULE._open_directory_beneath(self.home, target.parent)
+        real_rename_noreplace = MODULE._rename_noreplace_at
+        mutated = False
+
+        def mutate_after_quarantine(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal mutated
+            real_rename_noreplace(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+            if source_name == target.name and not mutated:
+                destination_fd = os.open(
+                    destination_name,
+                    os.O_WRONLY | os.O_TRUNC,
+                    dir_fd=destination_parent_fd,
+                )
+                try:
+                    os.write(destination_fd, b"tampered = true\n")
+                finally:
+                    os.close(destination_fd)
+                mutated = True
+
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_rename_noreplace_at",
+                    side_effect=mutate_after_quarantine,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "retained as isolated evidence",
+                ),
+            ):
+                MODULE._move_regular_leaf_to_unique_quarantine(
+                    self.home,
+                    target_parent_fd,
+                    target.name,
+                    label="agent-test",
+                    expected_identity=target_identity,
+                )
+        finally:
+            MODULE._close_fd_quietly(target_parent_fd)
+
+        self.assertTrue(mutated)
+        self.assertFalse(os.path.lexists(target))
+        quarantined = list(
+            (self.home / "personal-sync" / "quarantine").glob("*/leaf/*")
+        )
+        self.assertEqual(len(quarantined), 1)
+        self.assertEqual(
+            (quarantined[0].stat().st_dev, quarantined[0].stat().st_ino),
+            target_identity,
+        )
+        self.assertEqual(quarantined[0].read_bytes(), b"tampered = true\n")
+
     def test_install_release_materializes_reviewer_role_as_regular_file(self) -> None:
         source_root = self.home / "source-release"
         expected = b'name = "reviewer"\n'
@@ -1706,7 +1775,7 @@ class ReconciliationOrderingTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), old_source.read_bytes())
         self.assertEqual((target.stat().st_dev, target.stat().st_ino), original_identity)
 
-    def test_regular_rollback_cleanup_restores_name_replacement_before_quarantine(
+    def test_regular_rollback_cleanup_retains_name_replacement_out_of_path(
         self,
     ) -> None:
         old_source = self._agent_source(SHA_A, b'old = true\n')
@@ -1785,10 +1854,14 @@ class ReconciliationOrderingTests(unittest.TestCase):
 
         self.assertTrue(replaced)
         self.assertIsNotNone(replacement_identity)
-        self.assertTrue(target.is_file())
-        self.assertEqual(target.read_bytes(), b"foreign = true\n")
+        self.assertFalse(os.path.lexists(target))
+        retained = list(
+            target.parent.glob(f"{MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX}*")
+        )
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), b"foreign = true\n")
         self.assertEqual(
-            (target.stat().st_dev, target.stat().st_ino),
+            (retained[0].stat().st_dev, retained[0].stat().st_ino),
             replacement_identity,
         )
         self.assertTrue(displaced.is_file())
@@ -2877,6 +2950,305 @@ class AtomicMoveSafetyTests(unittest.TestCase):
 
             self.assertTrue(source.is_symlink())
             self.assertEqual(os.readlink(source), "original-source")
+            self.assertFalse(os.path.lexists(destination))
+
+    def test_failed_move_does_not_restore_through_replaced_source_parent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir) / "home"
+            source = home / "agents" / "reviewer.toml"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"original\n")
+            source.chmod(0o600)
+            source_snapshot = MODULE._capture_reconcile_target_snapshot(home, source)
+            source_identity = (source.stat().st_dev, source.stat().st_ino)
+            displaced_parent = home / "agents-before-race"
+            destination = home / "quarantine" / "reviewer.toml"
+            destination.parent.mkdir(parents=True)
+            destination_parent_identity = (
+                destination.parent.stat().st_dev,
+                destination.parent.stat().st_ino,
+            )
+            real_bound_directory_matches = MODULE._bound_directory_matches
+            source_parent_checks = 0
+            racer_identity: tuple[int, int] | None = None
+
+            def replace_parent_after_move(
+                root: Path,
+                directory: Path,
+                directory_fd: int,
+            ) -> bool:
+                nonlocal racer_identity, source_parent_checks
+                if directory == source.parent:
+                    source_parent_checks += 1
+                    if source_parent_checks == 2:
+                        source.parent.rename(displaced_parent)
+                        source.parent.mkdir()
+                        source.write_bytes(b"racer\n")
+                        source.chmod(0o600)
+                        racer_identity = (source.stat().st_dev, source.stat().st_ino)
+                        return False
+                return real_bound_directory_matches(root, directory, directory_fd)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_bound_directory_matches",
+                    side_effect=replace_parent_after_move,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "canonical source parent changed",
+                ),
+            ):
+                MODULE._atomic_move_beneath_home(
+                    home,
+                    source,
+                    destination,
+                    source_snapshot,
+                    destination_parent_identity,
+                )
+
+            self.assertIsNotNone(racer_identity)
+            self.assertEqual(
+                (source.stat().st_dev, source.stat().st_ino),
+                racer_identity,
+            )
+            self.assertEqual(source.read_bytes(), b"racer\n")
+            self.assertFalse(os.path.lexists(displaced_parent / source.name))
+            self.assertEqual(
+                (destination.stat().st_dev, destination.stat().st_ino),
+                source_identity,
+            )
+            self.assertEqual(destination.read_bytes(), b"original\n")
+
+    def test_failed_regular_move_does_not_displace_snapshot_racer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir) / "home"
+            source = home / "agents" / "reviewer.toml"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"original\n")
+            source.chmod(0o600)
+            source_snapshot = MODULE._capture_reconcile_target_snapshot(home, source)
+            source_identity = (source.stat().st_dev, source.stat().st_ino)
+            displaced = source.with_name("reviewer-before-race.toml")
+            destination = home / "quarantine" / "reviewer.toml"
+            destination.parent.mkdir(parents=True)
+            destination_parent_identity = (
+                destination.parent.stat().st_dev,
+                destination.parent.stat().st_ino,
+            )
+            real_bound_directory_matches = MODULE._bound_directory_matches
+            real_regular_snapshot = MODULE._regular_file_snapshot_at
+            source_parent_checks = 0
+            snapshot_calls = 0
+            racer_identity: tuple[int, int] | None = None
+
+            def fail_post_move_source_parent_check(
+                root: Path,
+                directory: Path,
+                directory_fd: int,
+            ) -> bool:
+                nonlocal source_parent_checks
+                if directory == source.parent:
+                    source_parent_checks += 1
+                    if source_parent_checks == 2:
+                        return False
+                return real_bound_directory_matches(root, directory, directory_fd)
+
+            def replace_during_restored_snapshot(
+                parent_fd: int,
+                name: str,
+                path: Path,
+                *,
+                maximum_bytes: int = MODULE.MAX_ARCHIVE_MEMBER_BYTES,
+            ) -> MODULE.RegularFileSnapshot:
+                nonlocal racer_identity, snapshot_calls
+                snapshot_calls += 1
+                if snapshot_calls == 4:
+                    os.rename(
+                        name,
+                        displaced.name,
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
+                    )
+                    racer_fd = os.open(
+                        name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=parent_fd,
+                    )
+                    try:
+                        os.write(racer_fd, b"racer\n")
+                    finally:
+                        os.close(racer_fd)
+                    racer_metadata = os.stat(
+                        name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                    racer_identity = (
+                        racer_metadata.st_dev,
+                        racer_metadata.st_ino,
+                    )
+                return real_regular_snapshot(
+                    parent_fd,
+                    name,
+                    path,
+                    maximum_bytes=maximum_bytes,
+                )
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_bound_directory_matches",
+                    side_effect=fail_post_move_source_parent_check,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_regular_file_snapshot_at",
+                    side_effect=replace_during_restored_snapshot,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "canonical source leaf changed before evidence retention",
+                ),
+            ):
+                MODULE._atomic_move_beneath_home(
+                    home,
+                    source,
+                    destination,
+                    source_snapshot,
+                    destination_parent_identity,
+                )
+
+            self.assertIsNotNone(racer_identity)
+            self.assertEqual(
+                (source.stat().st_dev, source.stat().st_ino),
+                racer_identity,
+            )
+            self.assertEqual(source.read_bytes(), b"racer\n")
+            self.assertEqual(
+                (displaced.stat().st_dev, displaced.stat().st_ino),
+                source_identity,
+            )
+            self.assertEqual(displaced.read_bytes(), b"original\n")
+            self.assertFalse(os.path.lexists(destination))
+
+    def test_failed_regular_move_restores_retention_racer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir) / "home"
+            source = home / "agents" / "reviewer.toml"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"original\n")
+            source.chmod(0o600)
+            source_snapshot = MODULE._capture_reconcile_target_snapshot(home, source)
+            source_identity = (source.stat().st_dev, source.stat().st_ino)
+            displaced = source.with_name("reviewer-before-retention-race.toml")
+            destination = home / "quarantine" / "reviewer.toml"
+            destination.parent.mkdir(parents=True)
+            destination_parent_identity = (
+                destination.parent.stat().st_dev,
+                destination.parent.stat().st_ino,
+            )
+            real_bound_directory_matches = MODULE._bound_directory_matches
+            real_rename_noreplace = MODULE._rename_noreplace_at
+            source_parent_checks = 0
+            rename_calls = 0
+            racer_identity: tuple[int, int] | None = None
+
+            def fail_post_move_source_parent_check(
+                root: Path,
+                directory: Path,
+                directory_fd: int,
+            ) -> bool:
+                nonlocal source_parent_checks
+                if directory == source.parent:
+                    source_parent_checks += 1
+                    if source_parent_checks == 2:
+                        return False
+                return real_bound_directory_matches(root, directory, directory_fd)
+
+            def race_retention_rename(
+                source_parent_fd: int,
+                source_name: str,
+                destination_parent_fd: int,
+                destination_name: str,
+            ) -> None:
+                nonlocal racer_identity, rename_calls
+                rename_calls += 1
+                if rename_calls == 2:
+                    destination.write_bytes(b"tampered\n")
+                elif rename_calls == 3:
+                    os.rename(
+                        source_name,
+                        displaced.name,
+                        src_dir_fd=source_parent_fd,
+                        dst_dir_fd=source_parent_fd,
+                    )
+                    racer_fd = os.open(
+                        source_name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=source_parent_fd,
+                    )
+                    try:
+                        os.write(racer_fd, b"racer\n")
+                    finally:
+                        os.close(racer_fd)
+                    racer_metadata = os.stat(
+                        source_name,
+                        dir_fd=source_parent_fd,
+                        follow_symlinks=False,
+                    )
+                    racer_identity = (
+                        racer_metadata.st_dev,
+                        racer_metadata.st_ino,
+                    )
+                real_rename_noreplace(
+                    source_parent_fd,
+                    source_name,
+                    destination_parent_fd,
+                    destination_name,
+                )
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_bound_directory_matches",
+                    side_effect=fail_post_move_source_parent_check,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_rename_noreplace_at",
+                    side_effect=race_retention_rename,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "exact source restoration could not be validated",
+                ),
+            ):
+                MODULE._atomic_move_beneath_home(
+                    home,
+                    source,
+                    destination,
+                    source_snapshot,
+                    destination_parent_identity,
+                )
+
+            self.assertEqual(rename_calls, 4)
+            self.assertIsNotNone(racer_identity)
+            self.assertEqual(
+                (source.stat().st_dev, source.stat().st_ino),
+                racer_identity,
+            )
+            self.assertEqual(source.read_bytes(), b"racer\n")
+            self.assertEqual(
+                (displaced.stat().st_dev, displaced.stat().st_ino),
+                source_identity,
+            )
+            self.assertEqual(displaced.read_bytes(), b"tampered\n")
             self.assertFalse(os.path.lexists(destination))
 
     def test_failed_regular_move_retains_restore_window_mutation(self) -> None:
@@ -9562,12 +9934,19 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
 
         self.assertIsNotNone(parsed)
         assert parsed is not None
-        self.assertEqual(metadata["version"], 8)
+        self.assertEqual(
+            metadata["version"],
+            MODULE.PENDING_LINK_METADATA_VERSION,
+        )
         self.assertIn(
             MODULE.PENDING_RELINQUISH_FOREIGN_ACTION,
             MODULE.PENDING_LINK_ACTIONS_BY_METADATA_VERSION[5],
         )
-        with mock.patch.object(MODULE, "PENDING_LINK_METADATA_VERSION", 8):
+        with mock.patch.object(
+            MODULE,
+            "PENDING_LINK_METADATA_VERSION",
+            MODULE.PENDING_LINK_METADATA_VERSION,
+        ):
             self.assertIsNotNone(MODULE._load_pending_link_batch(self.home))
         record = next(
             record
@@ -9797,6 +10176,11 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
         )
         def downgrade_to_v4(payload: dict[str, object]) -> None:
             payload["version"] = 4
+            for field in ("state_before", "state_after", "commit_evidence"):
+                evidence = payload[field]
+                assert isinstance(evidence, dict)
+                evidence.pop("uid")
+                evidence.pop("gid")
             payload.pop("terminal_regular_before")
             payload.pop("terminal_regular_after")
             records = payload["records"]
@@ -12232,6 +12616,9 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         metadata_path = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
         payload["version"] = 4
+        for field in ("state_before", "state_after", "commit_evidence"):
+            payload[field].pop("uid")
+            payload[field].pop("gid")
         payload.pop("terminal_regular_before")
         payload.pop("terminal_regular_after")
         for record in payload["records"]:
@@ -13741,6 +14128,7 @@ class ManifestPathEncodingSafetyTests(unittest.TestCase):
                         payload=b"{}",
                         file_identity=(3, 4),
                     ),
+                    metadata_version=MODULE.PENDING_LINK_METADATA_VERSION,
                 )
 
             with tempfile.TemporaryDirectory(prefix="schema-version.") as tmpdir:

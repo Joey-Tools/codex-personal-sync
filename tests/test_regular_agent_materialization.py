@@ -110,13 +110,27 @@ def install(root: Path, home: Path, sha: str) -> None:
         MODULE.install_release_tree(root, home, sha, dry_run=False)
 
 
+def downgrade_pending_state_evidence_metadata(
+    payload: dict[str, object],
+    version: int,
+) -> None:
+    if version >= 9:
+        return
+    for field in ("state_before", "state_after", "commit_evidence"):
+        evidence = payload[field]
+        assert isinstance(evidence, dict)
+        evidence.pop("uid")
+        evidence.pop("gid")
+
+
 def legacy_v6_writer_metadata_payload(
     batch: MODULE.PendingLinkBatch,
 ) -> tuple[dict[str, object], int | None]:
     metadata_path = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
     payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-    assert payload["version"] == 8
+    assert payload["version"] == MODULE.PENDING_LINK_METADATA_VERSION
     payload["version"] = 6
+    downgrade_pending_state_evidence_metadata(payload, 6)
     payload.pop("terminal_regular_before")
     payload.pop("terminal_regular_after")
     legacy_gid: int | None = None
@@ -236,6 +250,125 @@ class PublicRegularAgentTests(unittest.TestCase):
                     os.link(target, target.with_name("reviewer-copy.toml"))
 
                 self.assertTrue(status_is_unhealthy(case_home))
+
+    def test_failed_evidence_publication_retains_last_alias_after_source_swap(
+        self,
+    ) -> None:
+        source = self.home / "personal-sync" / "source" / "authority"
+        destination = self.home / "personal-sync" / "evidence" / "published"
+        source.parent.mkdir(parents=True)
+        destination.parent.mkdir(parents=True)
+        source.write_bytes(b"authority")
+        source.chmod(0o600)
+        source_parent_fd = MODULE._open_directory_beneath(
+            self.home,
+            source.parent,
+        )
+        try:
+            expected = MODULE._read_managed_state_file_snapshot(
+                self.home,
+                source,
+                source_parent_fd,
+            )
+        finally:
+            MODULE._close_fd_quietly(source_parent_fd)
+        assert expected.file_identity is not None
+        real_link = os.link
+
+        def replace_source_after_link(*args: object, **kwargs: object) -> None:
+            real_link(*args, **kwargs)  # type: ignore[arg-type]
+            source.unlink()
+            source.write_bytes(b"foreign")
+            source.chmod(0o600)
+
+        with (
+            mock.patch.object(
+                MODULE.os,
+                "link",
+                side_effect=replace_source_after_link,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "no exact source alias could be revalidated",
+            ) as raised,
+        ):
+            MODULE._publish_regular_hardlink_beneath(
+                self.home,
+                source,
+                destination,
+                expected,
+            )
+
+        self.assertEqual(
+            raised.exception.code,
+            MODULE.PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
+        )
+        self.assertEqual(destination.read_bytes(), b"authority")
+        self.assertEqual(
+            (destination.stat().st_dev, destination.stat().st_ino),
+            expected.file_identity,
+        )
+        self.assertEqual(destination.stat().st_nlink, 1)
+        self.assertEqual(source.read_bytes(), b"foreign")
+        self.assertNotEqual(
+            (source.stat().st_dev, source.stat().st_ino),
+            expected.file_identity,
+        )
+
+    def test_exact_publication_cleanup_quarantines_target_replacement(
+        self,
+    ) -> None:
+        source = self.home / "personal-sync" / "source" / "authority"
+        target = self.home / ROLE_TARGET
+        source.parent.mkdir(parents=True)
+        target.parent.mkdir(parents=True)
+        source.write_bytes(b"authority")
+        source.chmod(0o600)
+        os.link(source, target, follow_symlinks=False)
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            self.home,
+            target,
+            require_managed_access=False,
+        )
+        real_isolate = MODULE._isolate_pending_cleanup_entry
+        replaced = False
+
+        def replace_target_before_isolation(
+            *args: object,
+            **kwargs: object,
+        ) -> tuple[str, os.stat_result]:
+            nonlocal replaced
+            target.unlink()
+            target.write_bytes(b"foreign")
+            target.chmod(0o600)
+            replaced = True
+            return real_isolate(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_isolate_pending_cleanup_entry",
+                side_effect=replace_target_before_isolation,
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "preserved as"),
+        ):
+            MODULE._delete_exact_regular_publication_beneath(
+                self.home,
+                target,
+                expected,
+            )
+
+        self.assertTrue(replaced)
+        self.assertFalse(os.path.lexists(target))
+        retained = tuple(
+            child
+            for child in target.parent.iterdir()
+            if child.name.startswith(MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX)
+        )
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), b"foreign")
+        self.assertEqual(source.read_bytes(), b"authority")
+        self.assertEqual(source.stat().st_nlink, 1)
 
     def test_desired_entry_verification_rejects_exact_target_symlink_for_regular_file(
         self,
@@ -668,7 +801,10 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         batch = MODULE._load_pending_link_batch(self.home)
         self.assertIsNotNone(batch)
         assert batch is not None
-        self.assertEqual(batch.metadata_version, 8)
+        self.assertEqual(
+            batch.metadata_version,
+            MODULE.PENDING_LINK_METADATA_VERSION,
+        )
         return batch
 
     def _assert_active_publication_journal(
@@ -737,6 +873,7 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         else:
             payload = json.loads(metadata.read_text(encoding="utf-8"))
             payload["version"] = version
+            downgrade_pending_state_evidence_metadata(payload, version)
         records = payload["records"]
         assert isinstance(records, list)
         for raw_record in records:
@@ -1154,6 +1291,7 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         metadata_path = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
         payload["version"] = 6
+        downgrade_pending_state_evidence_metadata(payload, 6)
         payload.pop("terminal_regular_before")
         payload.pop("terminal_regular_after")
         records = payload["records"]
@@ -2207,7 +2345,7 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
             terminal_regular_after=[],
         )
 
-        self.assertEqual(payload["version"], 8)
+        self.assertEqual(payload["version"], MODULE.PENDING_LINK_METADATA_VERSION)
         self.assertEqual(payload["terminal_regular_before"], [])
         self.assertEqual(payload["terminal_regular_after"], [])
 
@@ -2952,7 +3090,7 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
         legacy_payload, legacy_gid = legacy_v6_writer_metadata_payload(batch)
         assert legacy_gid is not None
 
-        for invalid_gid in (None, True, "20", -1):
+        for invalid_gid in (True, "20", -1):
             with self.subTest(version=6, regular_gid=invalid_gid):
                 payload = json.loads(json.dumps(legacy_payload))
                 regular_record = next(
@@ -2972,6 +3110,7 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
             with self.subTest(version=version, regular_gid=legacy_gid):
                 payload = json.loads(json.dumps(current_payload))
                 payload["version"] = version
+                downgrade_pending_state_evidence_metadata(payload, version)
                 if version == 7:
                     for raw_record in payload["records"]:
                         raw_record.pop("publication_cleanup")
@@ -2995,6 +3134,7 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
 
         def downgrade(payload: dict[str, object]) -> None:
             payload["version"] = 5
+            downgrade_pending_state_evidence_metadata(payload, 5)
             payload.pop("terminal_regular_before", None)
             payload.pop("terminal_regular_after", None)
             records = payload["records"]
@@ -3065,7 +3205,10 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
 
         metadata_path = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        self.assertEqual(metadata["version"], 8)
+        self.assertEqual(
+            metadata["version"],
+            MODULE.PENDING_LINK_METADATA_VERSION,
+        )
         self.assertEqual(
             [item["target"] for item in metadata["terminal_regular_before"]],
             [ROLE_TARGET.as_posix()],
