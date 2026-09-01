@@ -91,8 +91,7 @@ superseded_by:
 
 ## Next Steps
 
-- Form the signed landing commit and run the frozen whole-range fresh-context
-  local review.
+- Complete a frozen whole-range fresh-context local review of the signed head.
 - Open and merge the canonical pull request after CI and current-head GitHub
   Codex evidence pass.
 - Propagate the accepted canonical source through toolbox and the private
@@ -295,3 +294,11 @@ superseded_by:
   Because production and test bytes changed after the prior discovery, another
   full discovery and a new fresh whole-range review remain required before PR
   creation.
+- Signed checkpoint `70f859070e5b56d908946790da70aa6d349d5361` carries that
+  repair, the refreshed lock, and this journal. Its GPG signature verifies as
+  Joey Teng's configured EdDSA key. The repository-private full CI discovery
+  then passed 1,363/1,363 in 956.189 seconds with three expected skips. The
+  same exact code passed repository-wide `compileall`, Ruff,
+  `refresh-lock --check`, `git diff --check`, and project-journal validation.
+  The remaining gate is a new independent clean-clone whole-range review; this
+  journal-only checkpoint does not expand the implementation test surface.
