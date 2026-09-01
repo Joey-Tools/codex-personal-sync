@@ -9027,7 +9027,13 @@ def _atomic_move_beneath_home(
                     source.name,
                     source,
                 )
-                if actual_regular != planned_regular:
+                if not _regular_snapshot_matches(
+                    actual_regular,
+                    planned_regular.parent_identity,
+                    planned_regular,
+                    expected_link_count=planned_regular.link_count,
+                    protect_gid=bool(planned_regular.mode & 0o070),
+                ):
                     raise SyncError(f"source changed after planning: {source}")
             else:
                 if expected_snapshot.link_target is None or not stat.S_ISLNK(
@@ -23879,10 +23885,11 @@ def _verify_reconcile_backup(
             )
         except (FileNotFoundError, OSError, SyncError) as error:
             raise SyncError(f"reconciliation backup is missing: {backup}") from error
-        if backup_snapshot != replace(
+        if not _regular_snapshot_leaf_matches(
+            backup_snapshot,
             planned_regular,
-            parent_identity=backup_snapshot.parent_identity,
-        ):
+            protect_gid=bool(planned_regular.mode & 0o070),
+        ) or backup_snapshot.link_count != planned_regular.link_count:
             raise SyncError(f"target changed after preflight: {action.target}")
         return
     if action.expected_link_target is None:
@@ -24034,7 +24041,13 @@ def _rollback_reconcile_transaction(
                     action.target,
                     require_managed_access=True,
                 )
-                if restored_snapshot != planned_regular:
+                if not _regular_snapshot_matches(
+                    restored_snapshot,
+                    action.planned_snapshot.parent_identity,
+                    planned_regular,
+                    expected_link_count=planned_regular.link_count,
+                    protect_gid=bool(planned_regular.mode & 0o070),
+                ):
                     raise SyncError(
                         "restored regular file changed during rollback: "
                         f"{action.target}"

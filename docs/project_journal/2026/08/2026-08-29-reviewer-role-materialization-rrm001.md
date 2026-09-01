@@ -281,3 +281,17 @@ superseded_by:
 - The corrective full discovery passed 1,358/1,358 tests in 1,031.112 seconds
   with three expected platform skips. Its exact hard-link rejection regression
   passed, and no test error remained on the resulting code head.
+- A subsequent frozen GPT-5.6 Sol Ultra whole-range review found that three
+  destructive regular-file revalidation sites still compared every snapshot
+  field, including GID for owner-only mode `0600`. That made a harmless GID
+  change abort a planned replace, removal, or rollback even though it did not
+  alter the protected object identity, content, or access policy. Those sites
+  now use the existing semantic snapshot predicates: GID remains mandatory
+  when any group permission bit is present, while owner-only files tolerate
+  only that non-access-policy drift. New replace, removal, rollback, and
+  group-access rejection regressions cover the distinction. The focused
+  regular-materialization module passed 53/53 in 23.052 seconds; `py_compile`,
+  Ruff, `git diff --check`, and the refreshed ten-source lock check passed.
+  Because production and test bytes changed after the prior discovery, another
+  full discovery and a new fresh whole-range review remain required before PR
+  creation.

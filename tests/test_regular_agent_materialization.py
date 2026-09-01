@@ -1537,6 +1537,201 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self.assertEqual(target.read_text(encoding="utf-8"), 'name = "reviewer"\n')
         self.assertEqual(target.stat().st_gid, alternate_gid)
 
+    def test_replace_tolerates_mode_0600_gid_churn_during_destructive_staging(
+        self,
+    ) -> None:
+        install(self.release, self.home, SHA_A)
+        target = self.home / ROLE_TARGET
+        alternate_gid = next(
+            (gid for gid in os.getgroups() if gid != target.stat().st_gid),
+            None,
+        )
+        if alternate_gid is None:
+            self.skipTest("no alternate supplementary group is available")
+        next_release = self.root / "next-release"
+        write_release(next_release, role_payload='name = "updated"\n')
+        real_move = MODULE._atomic_move_beneath_home
+        churned = False
+
+        def churn_gid_before_move(*args: object, **kwargs: object) -> None:
+            nonlocal churned
+            if args[1] == target:
+                os.chown(target, -1, alternate_gid)
+                churned = True
+            real_move(*args, **kwargs)
+
+        with mock.patch.object(
+            MODULE,
+            "_atomic_move_beneath_home",
+            side_effect=churn_gid_before_move,
+        ):
+            install(next_release, self.home, SHA_B)
+
+        self.assertTrue(churned)
+        self.assertEqual(target.read_text(encoding="utf-8"), 'name = "updated"\n')
+
+    def test_removal_tolerates_mode_0600_gid_churn_during_destructive_staging(
+        self,
+    ) -> None:
+        install(self.release, self.home, SHA_A)
+        target = self.home / ROLE_TARGET
+        alternate_gid = next(
+            (gid for gid in os.getgroups() if gid != target.stat().st_gid),
+            None,
+        )
+        if alternate_gid is None:
+            self.skipTest("no alternate supplementary group is available")
+        next_release = self.root / "next-release"
+        write_release(next_release)
+        real_move = MODULE._atomic_move_beneath_home
+        churned = False
+
+        def churn_gid_before_move(*args: object, **kwargs: object) -> None:
+            nonlocal churned
+            if args[1] == target:
+                os.chown(target, -1, alternate_gid)
+                churned = True
+            real_move(*args, **kwargs)
+
+        with mock.patch.object(
+            MODULE,
+            "_atomic_move_beneath_home",
+            side_effect=churn_gid_before_move,
+        ):
+            install(next_release, self.home, SHA_B)
+
+        self.assertTrue(churned)
+        self.assertFalse(os.path.lexists(target))
+
+    def test_replace_rollback_tolerates_mode_0600_backup_gid_churn(self) -> None:
+        target = self.home / ROLE_TARGET
+        backup = (
+            self.home
+            / "personal-sync"
+            / "quarantine"
+            / "rollback"
+            / ROLE_TARGET
+        )
+        target.parent.mkdir(parents=True)
+        backup.parent.mkdir(parents=True)
+        target.write_text('name = "reviewer"\n', encoding="utf-8")
+        target.chmod(0o600)
+        planned = MODULE._capture_reconcile_target_snapshot(self.home, target)
+        alternate_gid = next(
+            (gid for gid in os.getgroups() if gid != target.stat().st_gid),
+            None,
+        )
+        if alternate_gid is None:
+            self.skipTest("no alternate supplementary group is available")
+        backup_parent_identity = (
+            backup.parent.stat().st_dev,
+            backup.parent.stat().st_ino,
+        )
+        MODULE._atomic_move_beneath_home(
+            self.home,
+            target,
+            backup,
+            planned,
+            backup_parent_identity,
+        )
+        os.chown(backup, -1, alternate_gid)
+        action = MODULE.ReconcileAction(
+            action="replace",
+            target=target,
+            link_target="",
+            kind="file",
+            planned_snapshot=planned,
+            materialization="regular",
+        )
+        MODULE._rollback_reconcile_transaction(
+            self.home,
+            MODULE.ReconcileTransaction(
+                batch_root=None,
+                mutations=[MODULE.ReconcileMutation(action=action, backup=backup)],
+            ),
+        )
+
+        self.assertEqual(target.read_text(encoding="utf-8"), 'name = "reviewer"\n')
+        self.assertEqual(target.stat().st_gid, alternate_gid)
+        self.assertFalse(os.path.lexists(backup))
+
+    def test_destructive_move_rejects_gid_churn_when_group_access_is_granted(
+        self,
+    ) -> None:
+        target = self.home / ROLE_TARGET
+        backup = self.home / "personal-sync" / "quarantine" / "reviewer.toml"
+        target.parent.mkdir(parents=True)
+        backup.parent.mkdir(parents=True)
+        target.write_text('name = "reviewer"\n', encoding="utf-8")
+        target.chmod(0o640)
+        planned = MODULE._capture_reconcile_target_snapshot(self.home, target)
+        alternate_gid = next(
+            (gid for gid in os.getgroups() if gid != target.stat().st_gid),
+            None,
+        )
+        if alternate_gid is None:
+            self.skipTest("no alternate supplementary group is available")
+        os.chown(target, -1, alternate_gid)
+        backup_parent_identity = (
+            backup.parent.stat().st_dev,
+            backup.parent.stat().st_ino,
+        )
+
+        with self.assertRaisesRegex(MODULE.SyncError, "source changed after planning"):
+            MODULE._atomic_move_beneath_home(
+                self.home,
+                target,
+                backup,
+                planned,
+                backup_parent_identity,
+            )
+
+        self.assertTrue(target.is_file())
+        self.assertFalse(os.path.lexists(backup))
+
+    def test_destructive_backup_rejects_gid_churn_when_group_access_is_granted(
+        self,
+    ) -> None:
+        target = self.home / ROLE_TARGET
+        backup = self.home / "personal-sync" / "quarantine" / "reviewer.toml"
+        target.parent.mkdir(parents=True)
+        backup.parent.mkdir(parents=True)
+        target.write_text('name = "reviewer"\n', encoding="utf-8")
+        target.chmod(0o640)
+        planned = MODULE._capture_reconcile_target_snapshot(self.home, target)
+        alternate_gid = next(
+            (gid for gid in os.getgroups() if gid != target.stat().st_gid),
+            None,
+        )
+        if alternate_gid is None:
+            self.skipTest("no alternate supplementary group is available")
+        backup_parent_identity = (
+            backup.parent.stat().st_dev,
+            backup.parent.stat().st_ino,
+        )
+        MODULE._atomic_move_beneath_home(
+            self.home,
+            target,
+            backup,
+            planned,
+            backup_parent_identity,
+        )
+        os.chown(backup, -1, alternate_gid)
+        action = MODULE.ReconcileAction(
+            action="remove",
+            target=target,
+            link_target="",
+            kind="file",
+            planned_snapshot=planned,
+            materialization="regular",
+        )
+
+        with self.assertRaisesRegex(MODULE.SyncError, "target changed after preflight"):
+            MODULE._verify_reconcile_backup(self.home, action, backup)
+
+        self.assertFalse(os.path.lexists(target))
+        self.assertTrue(backup.is_file())
+
     def test_terminal_ticket_validates_complete_regular_target_group(self) -> None:
         secondary_target = PurePosixPath("agents/security-reviewer.toml")
         secondary_source = (
