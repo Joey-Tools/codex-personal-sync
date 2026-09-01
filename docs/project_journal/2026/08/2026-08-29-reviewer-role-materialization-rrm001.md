@@ -277,6 +277,7 @@ superseded_by:
 - The first post-checkpoint discovery ran 1,358 tests in 1,094.464 seconds and
   exposed one test-fixture omission: a `Mock` pending batch did not initialize
   the new in-memory alias-index field, so attribute auto-creation masqueraded
-  as an invalid cache. The fixture now explicitly supplies `None`, its exact
-  hard-link rejection test passes, and a new full discovery is required for the
-  resulting head.
+  as an invalid cache. The fixture now explicitly supplies `None`.
+- The corrective full discovery passed 1,358/1,358 tests in 1,031.112 seconds
+  with three expected platform skips. Its exact hard-link rejection regression
+  passed, and no test error remained on the resulting code head.
