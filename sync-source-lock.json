@@ -27,7 +27,7 @@
     "engine_tests": {
       "mode": "0644",
       "path": "tests/test_codex_personal_sync.py",
-      "sha256": "b324bcfa40b61565a5f0750d5737809836bbb1aca8870e5c1f77864c9d044e8f"
+      "sha256": "98ba3af25d03383160c10bd3965948d31bcc3ed6e1a5bdc0aa9c8bb40333c621"
     },
     "manifest_schema": {
       "mode": "0644",

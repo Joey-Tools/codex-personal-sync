@@ -274,3 +274,9 @@ superseded_by:
   `compileall`, `git diff --check`, and the refreshed ten-source lock check
   passed. The final repository-wide discovery remains required for this new
   frozen head.
+- The first post-checkpoint discovery ran 1,358 tests in 1,094.464 seconds and
+  exposed one test-fixture omission: a `Mock` pending batch did not initialize
+  the new in-memory alias-index field, so attribute auto-creation masqueraded
+  as an invalid cache. The fixture now explicitly supplies `None`, its exact
+  hard-link rejection test passes, and a new full discovery is required for the
+  resulting head.

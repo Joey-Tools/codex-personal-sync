@@ -14017,6 +14017,7 @@ while True:
             batch_root=batch_root,
             batch_root_identity=(batch_root.stat().st_dev, batch_root.stat().st_ino),
             records=(record,),
+            regular_alias_authority_index=None,
         )
         snapshot = MODULE._read_regular_file_snapshot_beneath(
             home,
