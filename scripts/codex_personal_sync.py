@@ -9063,15 +9063,20 @@ def _atomic_move_beneath_home(
     moved = False
     moved_identity_for_restore: tuple[int, int] | None = None
     moved_target_for_restore: str | None = None
+    source_regular_for_restore: RegularFileSnapshot | None = None
+    destination_parent_identity_for_restore: tuple[int, int] | None = None
     try:
-        if (
-            expected_destination_parent_identity is not None
-            and _directory_identity(destination_parent_fd)
-            != expected_destination_parent_identity
-        ):
-            raise SyncError(
-                f"destination parent changed after planning: {destination.parent}"
+        if expected_destination_parent_identity is not None:
+            destination_parent_identity_for_restore = _directory_identity(
+                destination_parent_fd
             )
+            if (
+                destination_parent_identity_for_restore
+                != expected_destination_parent_identity
+            ):
+                raise SyncError(
+                    f"destination parent changed after planning: {destination.parent}"
+                )
         source_metadata = os.stat(
             source.name,
             dir_fd=source_parent_fd,
@@ -9083,6 +9088,18 @@ def _atomic_move_beneath_home(
             and source_identity != expected_entry_identity
         ):
             raise SyncError(f"source object changed after planning: {source}")
+        if stat.S_ISREG(source_metadata.st_mode):
+            source_regular_for_restore = _regular_file_snapshot_at(
+                source_parent_fd,
+                source.name,
+                source,
+            )
+            if source_regular_for_restore.file_identity != source_identity:
+                raise SyncError(f"source object changed after planning: {source}")
+            if destination_parent_identity_for_restore is None:
+                destination_parent_identity_for_restore = _directory_identity(
+                    destination_parent_fd
+                )
         if expected_snapshot is not None:
             if (
                 expected_snapshot.parent_identity is None
@@ -9098,15 +9115,10 @@ def _atomic_move_beneath_home(
                 )
             planned_regular = _regular_snapshot_from_reconcile(expected_snapshot)
             if planned_regular is not None:
-                if not stat.S_ISREG(source_metadata.st_mode):
+                if source_regular_for_restore is None:
                     raise SyncError(f"source changed after planning: {source}")
-                actual_regular = _regular_file_snapshot_at(
-                    source_parent_fd,
-                    source.name,
-                    source,
-                )
                 if not _regular_snapshot_matches(
-                    actual_regular,
+                    source_regular_for_restore,
                     planned_regular.parent_identity,
                     planned_regular,
                     expected_link_count=planned_regular.link_count,
@@ -9164,6 +9176,22 @@ def _atomic_move_beneath_home(
                 destination_parent_fd,
                 destination.name,
             )
+        elif source_regular_for_restore is not None:
+            moved_regular = _regular_file_snapshot_at(
+                destination_parent_fd,
+                destination.name,
+                destination,
+            )
+            moved_identity_for_restore = moved_regular.file_identity
+            if not _regular_snapshot_matches(
+                moved_regular,
+                destination_parent_identity_for_restore,
+                source_regular_for_restore,
+                expected_link_count=source_regular_for_restore.link_count,
+            ):
+                raise SyncError(
+                    f"moved regular file changed during reconciliation: {source}"
+                )
         if moved_identity_for_restore != source_identity:
             raise SyncError(f"moved entry changed during reconciliation: {source}")
         if expected_snapshot is not None:
@@ -9196,6 +9224,22 @@ def _atomic_move_beneath_home(
         if moved:
             restored = False
             try:
+                if source_regular_for_restore is not None:
+                    destination_regular_before_restore = _regular_file_snapshot_at(
+                        destination_parent_fd,
+                        destination.name,
+                        destination,
+                    )
+                    if not _regular_snapshot_matches(
+                        destination_regular_before_restore,
+                        destination_parent_identity_for_restore,
+                        source_regular_for_restore,
+                        expected_link_count=source_regular_for_restore.link_count,
+                    ):
+                        raise SyncError(
+                            "moved regular file changed before failed-move "
+                            f"restoration and was retained at {destination}"
+                        )
                 _rename_noreplace_at(
                     destination_parent_fd,
                     destination.name,
@@ -9229,6 +9273,88 @@ def _atomic_move_beneath_home(
                     ):
                         raise SyncError(
                             f"restored symlink changed after failed move: {source}"
+                        )
+                if source_regular_for_restore is not None:
+                    restored_regular: RegularFileSnapshot | None = None
+                    restored_regular_error: BaseException | None = None
+                    try:
+                        restored_regular = _regular_file_snapshot_at(
+                            source_parent_fd,
+                            source.name,
+                            source,
+                        )
+                    except BaseException as snapshot_error:
+                        restored_regular_error = snapshot_error
+                    restored_regular_matches = (
+                        restored_regular is not None
+                        and _regular_snapshot_matches(
+                            restored_regular,
+                            source_regular_for_restore.parent_identity,
+                            source_regular_for_restore,
+                            expected_link_count=source_regular_for_restore.link_count,
+                        )
+                    )
+                    if not restored_regular_matches:
+                        try:
+                            _rename_noreplace_at(
+                                source_parent_fd,
+                                source.name,
+                                destination_parent_fd,
+                                destination.name,
+                            )
+                            restored = False
+                            os.fsync(source_parent_fd)
+                            if destination_parent_fd != source_parent_fd:
+                                os.fsync(destination_parent_fd)
+                            if restored_regular is None:
+                                retained_metadata = os.stat(
+                                    destination.name,
+                                    dir_fd=destination_parent_fd,
+                                    follow_symlinks=False,
+                                )
+                                if (
+                                    not stat.S_ISREG(retained_metadata.st_mode)
+                                    or (
+                                        retained_metadata.st_dev,
+                                        retained_metadata.st_ino,
+                                    )
+                                    != moved_identity_for_restore
+                                ):
+                                    raise SyncError(
+                                        "unreadable regular-file evidence changed "
+                                        f"while retaining it at {destination}"
+                                    )
+                            else:
+                                retained_regular = _regular_file_snapshot_at(
+                                    destination_parent_fd,
+                                    destination.name,
+                                    destination,
+                                )
+                                if not _regular_snapshot_matches(
+                                    retained_regular,
+                                    destination_parent_identity_for_restore,
+                                    restored_regular,
+                                    expected_link_count=restored_regular.link_count,
+                                ):
+                                    raise SyncError(
+                                        "changed regular-file evidence could not be "
+                                        f"validated at {destination}"
+                                    )
+                        except BaseException as retention_error:
+                            raise SyncError(
+                                "restored regular file changed after failed move "
+                                "and could not be retained at its destination: "
+                                f"{destination}: {retention_error}"
+                            ) from retention_error
+                        if restored_regular_error is not None:
+                            raise SyncError(
+                                "restored regular file could not be semantically "
+                                "revalidated after failed move and was retained at "
+                                f"its destination: {destination}"
+                            ) from restored_regular_error
+                        raise SyncError(
+                            "restored regular file changed after failed move and "
+                            f"was retained at its destination: {destination}"
                         )
                 try:
                     os.stat(
@@ -10495,6 +10621,29 @@ def _managed_state_snapshot_matches_bound_file_evidence(
     return (
         actual.parent_identity == expected.parent_identity
         and _managed_state_snapshot_matches_file_evidence(actual, expected)
+    )
+
+
+def _pending_cleanup_ticket_matches(
+    actual: PendingBatchCleanupTicket,
+    expected: PendingBatchCleanupTicket,
+) -> bool:
+    return (
+        actual.version == expected.version
+        and actual.phase == expected.phase
+        and actual.path == expected.path
+        and _managed_state_snapshot_matches_bound_file_evidence(
+            actual.snapshot,
+            expected.snapshot,
+        )
+        and actual.batch_root == expected.batch_root
+        and actual.batch_root_identity == expected.batch_root_identity
+        and actual.marker_path == expected.marker_path
+        and actual.marker_parent_identity == expected.marker_parent_identity
+        and actual.marker_file_identity == expected.marker_file_identity
+        and actual.marker_mode == expected.marker_mode
+        and actual.marker_sha256 == expected.marker_sha256
+        and actual.terminal_regular_targets == expected.terminal_regular_targets
     )
 
 
@@ -12014,7 +12163,10 @@ def _verify_managed_state_link_claims(
             continue
         if (
             relinquishment is not None
-            and relinquishment.planned_snapshot == actual_snapshot
+            and _reconcile_target_snapshot_matches(
+                actual_snapshot,
+                relinquishment.planned_snapshot,
+            )
         ):
             matched_relinquishments.add(target)
             continue
@@ -13733,7 +13885,10 @@ def _publish_atomic_exclusive_internal_file(
             parent_fd,
             expected_identity=staged.file_identity,
         )
-        if current_temp != staged or current_temp.payload != payload:
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            current_temp,
+            staged,
+        ) or current_temp.payload != payload:
             raise SyncError(
                 f"atomic internal authority temp changed: {temp_path}"
             )
@@ -13761,7 +13916,10 @@ def _publish_atomic_exclusive_internal_file(
                 parent_fd,
                 expected_identity=staged.file_identity,
             )
-            if current_temp != staged:
+            if not _managed_state_snapshot_matches_bound_file_evidence(
+                current_temp,
+                staged,
+            ):
                 raise SyncError(
                     f"atomic internal authority temp changed after race: {temp_path}"
                 )
@@ -15001,7 +15159,10 @@ def _verify_pending_record_bound_foreign_relinquishment(
             f"pending {phase} foreign relinquishment could not be verified: "
             f"{record.target}"
         ) from error
-    if actual != record.planned_snapshot:
+    if not _reconcile_target_snapshot_matches(
+        actual,
+        record.planned_snapshot,
+    ):
         raise SyncError(
             f"pending {phase} foreign relinquishment changed: {record.target}"
         )
@@ -18595,7 +18756,10 @@ def _publish_pending_rollback_marker(
         _pending_rollback_marker_payload(batch),
     )
     verified = _pending_rollback_marker_snapshot(home, batch)
-    if verified is None or verified != marker:
+    if verified is None or not _managed_state_snapshot_matches_bound_file_evidence(
+        verified,
+        marker,
+    ):
         raise SyncError("pending transaction rollback marker changed")
     return verified
 
@@ -19692,7 +19856,10 @@ def _publish_pending_cleanup_ticket(
             index_fd,
             expected_identity=staged.file_identity,
         )
-        if current_temp != staged or current_temp.payload != payload:
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            current_temp,
+            staged,
+        ) or current_temp.payload != payload:
             raise SyncError("pending cleanup ticket changed before publication")
         try:
             _rename_noreplace_at(
@@ -19715,7 +19882,10 @@ def _publish_pending_cleanup_ticket(
                 index_fd,
                 expected_identity=staged.file_identity,
             )
-            if current_temp != staged:
+            if not _managed_state_snapshot_matches_bound_file_evidence(
+                current_temp,
+                staged,
+            ):
                 raise SyncError(
                     "pending cleanup ticket temp changed after publication race"
                 )
@@ -19767,7 +19937,10 @@ def _verify_pending_cleanup_ticket_durable(
             ticket.path,
             expected_ticket_identity=ticket.snapshot.file_identity,
         )
-        if durable != ticket:
+        if durable is None or not _pending_cleanup_ticket_matches(
+            durable,
+            ticket,
+        ):
             raise SyncError("pending cleanup ticket changed after fsync")
     finally:
         if index_parent_fd >= 0:
@@ -19824,7 +19997,10 @@ def _publish_pending_batch_cleanup_ticket_for_root(
         ticket_path,
         expected_ticket_identity=published.file_identity,
     )
-    if verified is None or verified.snapshot != published:
+    if verified is None or not _managed_state_snapshot_matches_bound_file_evidence(
+        verified.snapshot,
+        published,
+    ):
         raise SyncError("pending cleanup ticket changed after publication")
     _verify_pending_cleanup_ticket_durable(home, verified)
 
@@ -20205,7 +20381,10 @@ def _mark_pending_batch_staging_cleanup_ready(
         batch_root,
         batch_root_identity,
     )
-    if verified_marker is None or verified_marker != marker:
+    if verified_marker is None or not _managed_state_snapshot_matches_bound_file_evidence(
+        verified_marker,
+        marker,
+    ):
         raise SyncError("pending staging cleanup marker changed after publication")
     expected_payload = _pending_staging_cleanup_ticket_payload(
         batch_root,
@@ -20402,7 +20581,10 @@ def _retire_pending_staging_cleanup_authority(
             parent_fd,
             expected_identity=marker.file_identity,
         )
-        if current != marker:
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            current,
+            marker,
+        ):
             raise SyncError("pending staging cleanup marker changed before deletion")
         _isolate_and_delete_pending_cleanup_file(
             home,
@@ -21237,7 +21419,10 @@ def _publish_pending_cleanup_empty_proof(
         ticket,
         quarantine_root_identity,
     )
-    if verified is None or verified != proof:
+    if verified is None or not _managed_state_snapshot_matches_bound_file_evidence(
+        verified,
+        proof,
+    ):
         raise SyncError(
             f"pending cleanup empty proof changed after publication: "
             f"{ticket.batch_root.name}"
@@ -21285,7 +21470,10 @@ def _remove_cleanup_ready_batch(
         ticket.path,
         expected_ticket_identity=ticket.snapshot.file_identity,
     )
-    if current_ticket is None or current_ticket != ticket:
+    if current_ticket is None or not _pending_cleanup_ticket_matches(
+        current_ticket,
+        ticket,
+    ):
         raise SyncError(f"pending cleanup ticket changed: {ticket.batch_root.name}")
     quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
     try:
@@ -21412,7 +21600,10 @@ def _delete_pending_cleanup_ticket(
             index_fd,
             expected_identity=ticket.snapshot.file_identity,
         )
-        if current != ticket.snapshot:
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            current,
+            ticket.snapshot,
+        ):
             raise SyncError(f"pending cleanup ticket changed: {ticket.batch_root.name}")
         _isolate_and_delete_pending_cleanup_file(
             home,
@@ -21533,7 +21724,10 @@ def _write_pending_cleanup_cursor(
             index_fd,
             expected_identity=staged.file_identity,
         )
-        if current_temp != staged:
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            current_temp,
+            staged,
+        ):
             raise SyncError("pending cleanup scan cursor temp changed")
         os.rename(
             temp_path.name,
@@ -23021,7 +23215,10 @@ def _verify_final_regular_targets(
             ticket.path,
             expected_ticket_identity=ticket.snapshot.file_identity,
         )
-        if current_ticket is None or current_ticket != ticket:
+        if current_ticket is None or not _pending_cleanup_ticket_matches(
+            current_ticket,
+            ticket,
+        ):
             raise SyncError(
                 f"pending cleanup ticket changed: {ticket.batch_root.name}"
             )
@@ -23049,7 +23246,10 @@ def _verify_final_regular_targets(
         ticket.path,
         expected_ticket_identity=ticket.snapshot.file_identity,
     )
-    if current_ticket is None or current_ticket != ticket:
+    if current_ticket is None or not _pending_cleanup_ticket_matches(
+        current_ticket,
+        ticket,
+    ):
         raise SyncError(
             f"pending cleanup ticket changed: {ticket.batch_root.name}"
         )

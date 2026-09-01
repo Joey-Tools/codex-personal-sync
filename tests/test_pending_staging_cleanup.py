@@ -144,6 +144,16 @@ class PendingStagingCleanupTests(unittest.TestCase):
         assert ticket is not None
         return ticket
 
+    def _alternate_gid(self, current_gid: int) -> int:
+        alternate_gid = next(
+            (gid for gid in os.getgroups() if gid != current_gid),
+            None,
+        )
+        if alternate_gid is None:
+            self.skipTest("no alternate supplementary group is available")
+        assert alternate_gid is not None
+        return alternate_gid
+
     def _legacy_cleanup_ticket_payload(
         self,
         batch_root: Path,
@@ -873,6 +883,174 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     self.assertFalse(temp_path.exists())
                 finally:
                     self.home = original_home
+
+    def test_ticket_temp_rechecks_tolerate_mode_0600_gid_churn(self) -> None:
+        index_root = MODULE._pending_cleanup_index_path(self.home)
+        index_fd = MODULE._open_or_create_directory_beneath(
+            self.home,
+            index_root,
+            mode=0o700,
+        )
+        MODULE._close_fd_quietly(index_fd)
+        payload = b'{"ticket": true}\n'
+        real_write = MODULE._write_exclusive_internal_file
+
+        def write_then_churn_gid(
+            home: Path,
+            path: Path,
+            written_payload: bytes,
+        ) -> MODULE.ManagedStateFileSnapshot:
+            staged = real_write(home, path, written_payload)
+            assert staged.gid is not None
+            os.chown(path, -1, self._alternate_gid(staged.gid))
+            return staged
+
+        for batch_name, preexisting in (
+            ("20260901T000000Z-10-0", False),
+            ("20260901T000000Z-10-1", True),
+        ):
+            with self.subTest(preexisting=preexisting):
+                ticket_path = MODULE._pending_cleanup_ticket_path(
+                    self.home,
+                    batch_name,
+                )
+                if preexisting:
+                    ticket_path.write_bytes(payload)
+                    ticket_path.chmod(0o600)
+                with mock.patch.object(
+                    MODULE,
+                    "_write_exclusive_internal_file",
+                    side_effect=write_then_churn_gid,
+                ):
+                    published = MODULE._publish_pending_cleanup_ticket(
+                        self.home,
+                        ticket_path,
+                        payload,
+                    )
+
+                self.assertEqual(published.payload, payload)
+                self.assertEqual(ticket_path.read_bytes(), payload)
+                self.assertFalse(
+                    ticket_path.with_name(ticket_path.name + ".tmp").exists()
+                )
+
+    def test_ticket_rechecks_and_cleanup_tolerate_mode_0600_gid_churn(
+        self,
+    ) -> None:
+        batch_root = MODULE._quarantine_batch_root(self.home, [])
+        payload = self._legacy_cleanup_ticket_payload(batch_root, version=3)
+        published_before_churn: MODULE.ManagedStateFileSnapshot | None = None
+        real_publish = MODULE._publish_pending_cleanup_ticket
+
+        def publish_then_churn_gid(
+            home: Path,
+            ticket_path: Path,
+            ticket_payload: bytes,
+        ) -> MODULE.ManagedStateFileSnapshot:
+            nonlocal published_before_churn
+            published_before_churn = real_publish(
+                home,
+                ticket_path,
+                ticket_payload,
+            )
+            assert published_before_churn.gid is not None
+            os.chown(
+                ticket_path,
+                -1,
+                self._alternate_gid(published_before_churn.gid),
+            )
+            return published_before_churn
+
+        with mock.patch.object(
+            MODULE,
+            "_publish_pending_cleanup_ticket",
+            side_effect=publish_then_churn_gid,
+        ):
+            MODULE._publish_pending_batch_cleanup_ticket_for_root(
+                self.home,
+                batch_root,
+                payload,
+            )
+
+        self.assertIsNotNone(published_before_churn)
+        assert published_before_churn is not None
+        ticket_path = MODULE._pending_cleanup_ticket_path(
+            self.home,
+            batch_root.name,
+        )
+        current_ticket = MODULE._read_pending_cleanup_ticket(
+            self.home,
+            ticket_path,
+        )
+        self.assertIsNotNone(current_ticket)
+        assert current_ticket is not None
+        self.assertNotEqual(
+            current_ticket.snapshot.gid,
+            published_before_churn.gid,
+        )
+        expected_ticket = MODULE.replace(
+            current_ticket,
+            snapshot=published_before_churn,
+        )
+
+        MODULE._verify_pending_cleanup_ticket_durable(
+            self.home,
+            expected_ticket,
+        )
+        self.assertTrue(
+            MODULE._remove_cleanup_ready_batch(
+                self.home,
+                expected_ticket,
+            )
+        )
+
+        self.assertFalse(ticket_path.exists())
+        self.assertFalse(batch_root.exists())
+
+    def test_cursor_writer_tolerates_mode_0600_temp_gid_churn(self) -> None:
+        index_root = MODULE._pending_cleanup_index_path(self.home)
+        index_fd = MODULE._open_or_create_directory_beneath(
+            self.home,
+            index_root,
+            mode=0o700,
+        )
+        MODULE._close_fd_quietly(index_fd)
+        ticket_name = "20260901T000000Z-11-0.json"
+        real_write = MODULE._write_exclusive_internal_file
+        alternate_gid: int | None = None
+
+        def write_then_churn_gid(
+            home: Path,
+            path: Path,
+            payload: bytes,
+        ) -> MODULE.ManagedStateFileSnapshot:
+            nonlocal alternate_gid
+            staged = real_write(home, path, payload)
+            assert staged.gid is not None
+            alternate_gid = self._alternate_gid(staged.gid)
+            os.chown(path, -1, alternate_gid)
+            return staged
+
+        with mock.patch.object(
+            MODULE,
+            "_write_exclusive_internal_file",
+            side_effect=write_then_churn_gid,
+        ):
+            self.assertEqual(
+                MODULE._write_pending_cleanup_cursor(
+                    self.home,
+                    index_root,
+                    ticket_name,
+                ),
+                0,
+            )
+
+        cursor_path = index_root / MODULE.PENDING_CLEANUP_CURSOR_NAME
+        self.assertEqual(
+            MODULE._read_pending_cleanup_cursor(self.home, index_root),
+            ticket_name,
+        )
+        self.assertEqual(cursor_path.stat().st_gid, alternate_gid)
 
     def test_retained_ticket_temp_cleanup_is_bounded_per_run(self) -> None:
         index_root = MODULE._pending_cleanup_index_path(self.home)

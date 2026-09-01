@@ -1103,6 +1103,114 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self.assertEqual(target.read_text(encoding="utf-8"), 'name = "reviewer"\n')
         self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
 
+    def test_legacy_v6_foreign_regular_gid_recovers_uncommitted_relinquishment(
+        self,
+    ) -> None:
+        initial_release = self.root / "release-v6-foreign-initial"
+        next_release = self.root / "release-v6-foreign-next"
+        write_release(
+            initial_release,
+            role_payload='name = "managed"\n',
+            target="AGENTS.md",
+        )
+        write_release(
+            next_release,
+            role_payload='name = "next"\n',
+            target="AGENTS.md",
+        )
+        install(initial_release, self.home, SHA_A)
+        target = self.home / "AGENTS.md"
+        target.unlink()
+        target.write_text('name = "foreign"\n', encoding="utf-8")
+        target.chmod(0o600)
+        historical_snapshot = MODULE._capture_reconcile_target_snapshot(
+            self.home,
+            target,
+            capture_regular_content=True,
+        )
+        historical_gid = historical_snapshot.regular_gid
+        self.assertIsNotNone(historical_snapshot.regular_sha256)
+        self.assertIsNotNone(historical_gid)
+        assert historical_gid is not None
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_publish_pending_commit_marker",
+                side_effect=MODULE.SyncError("injected precommit crash"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_rollback_reconcile_transaction",
+                side_effect=MODULE.SyncError("injected hard rollback crash"),
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "rollback was incomplete"),
+        ):
+            install(next_release, self.home, SHA_B)
+
+        batch = MODULE._load_pending_link_batch(self.home)
+        self.assertIsNotNone(batch)
+        assert batch is not None
+        metadata_path = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        payload["version"] = 6
+        payload.pop("terminal_regular_before")
+        payload.pop("terminal_regular_after")
+        records = payload["records"]
+        assert isinstance(records, list)
+        foreign_record = None
+        for raw_record in records:
+            assert isinstance(raw_record, dict)
+            raw_record.pop("publication_cleanup")
+            if raw_record["action"] == MODULE.PENDING_RELINQUISH_FOREIGN_ACTION:
+                foreign_record = raw_record
+        self.assertIsNotNone(foreign_record)
+        assert isinstance(foreign_record, dict)
+        planned_before = foreign_record["planned_before"]
+        assert isinstance(planned_before, dict)
+        planned_before.update(
+            {
+                "regular_sha256": historical_snapshot.regular_sha256,
+                "regular_size": historical_snapshot.regular_size,
+                "regular_mode": historical_snapshot.regular_mode,
+                "regular_uid": historical_snapshot.regular_uid,
+                "regular_gid": historical_gid,
+                "regular_link_count": historical_snapshot.regular_link_count,
+            }
+        )
+        write_pending_metadata_payload(batch, payload)
+
+        alternate_gid = next(
+            (gid for gid in os.getgroups() if gid != historical_gid),
+            None,
+        )
+        if alternate_gid is None:
+            self.skipTest("no alternate supplementary group is available")
+        os.chown(target, -1, alternate_gid)
+
+        parsed = MODULE._load_pending_link_batch(self.home)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        parsed_record = next(
+            record
+            for record in parsed.records
+            if record.action == MODULE.PENDING_RELINQUISH_FOREIGN_ACTION
+        )
+        self.assertEqual(parsed.metadata_version, 6)
+        self.assertEqual(parsed_record.materialization, "symlink")
+        self.assertEqual(parsed_record.planned_snapshot.regular_gid, historical_gid)
+        self.assertEqual(target.stat().st_gid, alternate_gid)
+
+        install(next_release, self.home, SHA_B)
+
+        self.assertEqual(target.read_text(encoding="utf-8"), 'name = "foreign"\n')
+        self.assertEqual(target.stat().st_gid, alternate_gid)
+        self.assertNotIn(
+            PurePosixPath("AGENTS.md"),
+            MODULE._load_managed_state(self.home).links,
+        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
+
     def test_v6_v7_produced_active_alias_residue_recovers_exact_inode(self) -> None:
         for version in (6, 7):
             with self.subTest(version=version):
@@ -2287,6 +2395,237 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
                 expected,
             )
         )
+        for field, value in (
+            ("file_identity", (9, 9)),
+            ("payload", b"abd"),
+            ("mode", 0o640),
+            ("uid", 502),
+        ):
+            with self.subTest(field=field):
+                self.assertFalse(
+                    MODULE._managed_state_snapshot_matches_bound_file_evidence(
+                        MODULE.replace(actual, **{field: value}),
+                        expected,
+                    )
+                )
+
+    def test_control_snapshot_rechecks_tolerate_owner_only_gid_churn(self) -> None:
+        snapshot = MODULE.ManagedStateFileSnapshot(
+            exists=True,
+            payload=b"control\n",
+            mode=0o600,
+            parent_identity=(1, 2),
+            file_identity=(3, 4),
+            file_type=stat.S_IFREG,
+            size=8,
+            uid=os.geteuid(),
+            gid=20,
+        )
+        churned = MODULE.replace(snapshot, gid=80)
+        absent = MODULE.ManagedStateFileSnapshot(exists=False)
+        control_path = self.home / "control" / "marker"
+
+        with (
+            mock.patch.object(MODULE, "_open_directory_beneath", return_value=10),
+            mock.patch.object(MODULE, "_close_fd_quietly"),
+            mock.patch.object(
+                MODULE,
+                "_read_managed_state_file_snapshot",
+                side_effect=(absent, churned, churned),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_write_exclusive_internal_file",
+                return_value=snapshot,
+            ),
+            mock.patch.object(MODULE, "_discard_incomplete_pending_cleanup_ticket"),
+            mock.patch.object(
+                MODULE,
+                "_pending_cleanup_temp_residue_is_observed",
+                return_value=False,
+            ),
+            mock.patch.object(MODULE, "_rename_noreplace_at"),
+            mock.patch.object(MODULE.os, "fsync"),
+        ):
+            published = MODULE._publish_atomic_exclusive_internal_file(
+                self.home,
+                control_path,
+                snapshot.payload,
+            )
+        self.assertEqual(published, churned)
+
+        state_before = MODULE.ManagedStateFileSnapshot(
+            exists=False,
+            parent_identity=(5, 6),
+        )
+        rollback_batch = SimpleNamespace(
+            batch_root=self.home / "20000101T000000Z-1-1",
+            state_before=state_before,
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_pending_rollback_marker_snapshot",
+                side_effect=(None, churned),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_publish_atomic_exclusive_internal_file",
+                return_value=snapshot,
+            ),
+        ):
+            self.assertEqual(
+                MODULE._publish_pending_rollback_marker(
+                    self.home,
+                    rollback_batch,
+                ),
+                churned,
+            )
+
+        batch_root = self.home / "20000101T000000Z-1-2"
+        staging_ticket = SimpleNamespace(
+            version=3,
+            phase="staging",
+            batch_root_identity=(7, 8),
+            snapshot=SimpleNamespace(payload=b"ticket\n"),
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_publish_atomic_exclusive_internal_file",
+                return_value=snapshot,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_pending_staging_marker_snapshot",
+                return_value=churned,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_pending_staging_cleanup_ticket_payload",
+                return_value=b"ticket\n",
+            ),
+            mock.patch.object(
+                MODULE,
+                "_publish_pending_batch_cleanup_ticket_for_root",
+            ),
+            mock.patch.object(
+                MODULE,
+                "_read_pending_cleanup_ticket",
+                return_value=staging_ticket,
+            ),
+        ):
+            self.assertIs(
+                MODULE._mark_pending_batch_staging_cleanup_ready(
+                    self.home,
+                    batch_root,
+                    (7, 8),
+                ),
+                staging_ticket,
+            )
+
+        proof_ticket = SimpleNamespace(
+            batch_root=self.home / "20000101T000000Z-1-3"
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_read_pending_cleanup_empty_proof",
+                side_effect=(None, churned),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_publish_atomic_exclusive_internal_file",
+                return_value=snapshot,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_pending_cleanup_empty_proof_payload",
+                return_value=snapshot.payload,
+            ),
+        ):
+            self.assertEqual(
+                MODULE._publish_pending_cleanup_empty_proof(
+                    self.home,
+                    proof_ticket,
+                    (9, 10),
+                ),
+                churned,
+            )
+
+    def test_terminal_ticket_recheck_uses_access_policy_semantics(self) -> None:
+        ticket_snapshot = MODULE.ManagedStateFileSnapshot(
+            exists=True,
+            payload=b"ticket\n",
+            mode=0o600,
+            parent_identity=(1, 2),
+            file_identity=(3, 4),
+            file_type=stat.S_IFREG,
+            size=7,
+            uid=os.geteuid(),
+            gid=20,
+        )
+        target_expectation = MODULE.PendingRegularTargetExpectation(
+            target=ROLE_TARGET,
+            parent_identity=(5, 6),
+            file_identity=(7, 8),
+            sha256="a" * 64,
+            size=10,
+            mode=0o600,
+            uid=os.geteuid(),
+        )
+        ticket = MODULE.PendingBatchCleanupTicket(
+            version=4,
+            phase="after",
+            path=self.home / "ticket.json",
+            snapshot=ticket_snapshot,
+            batch_root=self.home / "batch",
+            batch_root_identity=(9, 10),
+            marker_path=MODULE.PENDING_STATE_COMMIT_MARKER,
+            marker_parent_identity=(11, 12),
+            marker_file_identity=(13, 14),
+            marker_mode=0o600,
+            marker_sha256="b" * 64,
+            terminal_regular_targets=(target_expectation,),
+        )
+        churned_ticket = MODULE.replace(
+            ticket,
+            snapshot=MODULE.replace(ticket_snapshot, gid=80),
+        )
+        target_snapshot = MODULE.RegularFileSnapshot(
+            parent_identity=target_expectation.parent_identity,
+            file_identity=target_expectation.file_identity,
+            sha256=target_expectation.sha256,
+            size=target_expectation.size,
+            mode=target_expectation.mode,
+            uid=target_expectation.uid,
+            gid=80,
+            link_count=1,
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_read_pending_cleanup_ticket",
+                return_value=churned_ticket,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_read_regular_file_snapshot_beneath",
+                return_value=target_snapshot,
+            ),
+        ):
+            MODULE._verify_final_regular_targets(self.home, ticket)
+
+        changed_ticket = MODULE.replace(churned_ticket, marker_sha256="c" * 64)
+        with (
+            mock.patch.object(
+                MODULE,
+                "_read_pending_cleanup_ticket",
+                return_value=changed_ticket,
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "cleanup ticket changed"),
+        ):
+            MODULE._verify_final_regular_targets(self.home, ticket)
 
     def test_stat_metadata_gid_comparison_follows_group_access(self) -> None:
         def metadata(mode: int, gid: int) -> SimpleNamespace:

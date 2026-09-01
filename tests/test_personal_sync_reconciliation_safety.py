@@ -2879,6 +2879,121 @@ class AtomicMoveSafetyTests(unittest.TestCase):
             self.assertEqual(os.readlink(source), "original-source")
             self.assertFalse(os.path.lexists(destination))
 
+    def test_failed_regular_move_retains_restore_window_mutation(self) -> None:
+        for mutation in ("content", "mode", "link-count"):
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                home = Path(temp_dir) / "home"
+                source = home / "agents" / "reviewer.toml"
+                source.parent.mkdir(parents=True)
+                source.write_bytes(b"original\n")
+                source.chmod(0o600)
+                source_snapshot = MODULE._capture_reconcile_target_snapshot(
+                    home,
+                    source,
+                )
+                source_identity = (source.stat().st_dev, source.stat().st_ino)
+                destination = home / "quarantine" / "reviewer.toml"
+                destination.parent.mkdir(parents=True)
+                destination_parent_identity = (
+                    destination.parent.stat().st_dev,
+                    destination.parent.stat().st_ino,
+                )
+                alias = destination.with_name("reviewer-alias.toml")
+                real_bound_directory_matches = MODULE._bound_directory_matches
+                real_rename_noreplace = MODULE._rename_noreplace_at
+                source_parent_checks = 0
+                rename_calls = 0
+                mutation_applied = False
+
+                def fail_post_move_source_parent_check(
+                    root: Path,
+                    directory: Path,
+                    directory_fd: int,
+                ) -> bool:
+                    nonlocal source_parent_checks
+                    if directory == source.parent:
+                        source_parent_checks += 1
+                        if source_parent_checks == 2:
+                            return False
+                    return real_bound_directory_matches(root, directory, directory_fd)
+
+                def mutate_during_restore_rename(
+                    source_parent_fd: int,
+                    source_name: str,
+                    destination_parent_fd: int,
+                    destination_name: str,
+                ) -> None:
+                    nonlocal mutation_applied, rename_calls
+                    rename_calls += 1
+                    if rename_calls == 2:
+                        identity_before = (
+                            destination.stat().st_dev,
+                            destination.stat().st_ino,
+                        )
+                        if mutation == "content":
+                            destination.write_bytes(b"tampered\n")
+                        elif mutation == "mode":
+                            destination.chmod(0o666)
+                        else:
+                            os.link(destination, alias, follow_symlinks=False)
+                        self.assertEqual(
+                            (destination.stat().st_dev, destination.stat().st_ino),
+                            identity_before,
+                        )
+                        mutation_applied = True
+                    real_rename_noreplace(
+                        source_parent_fd,
+                        source_name,
+                        destination_parent_fd,
+                        destination_name,
+                    )
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_bound_directory_matches",
+                        side_effect=fail_post_move_source_parent_check,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_rename_noreplace_at",
+                        side_effect=mutate_during_restore_rename,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "retained at its destination",
+                    ),
+                ):
+                    MODULE._atomic_move_beneath_home(
+                        home,
+                        source,
+                        destination,
+                        source_snapshot,
+                        destination_parent_identity,
+                    )
+
+                self.assertTrue(mutation_applied)
+                self.assertEqual(rename_calls, 3)
+                self.assertFalse(os.path.lexists(source))
+                self.assertTrue(destination.is_file())
+                self.assertEqual(
+                    (destination.stat().st_dev, destination.stat().st_ino),
+                    source_identity,
+                )
+                if mutation == "content":
+                    self.assertEqual(destination.read_bytes(), b"tampered\n")
+                elif mutation == "mode":
+                    self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o666)
+                else:
+                    self.assertEqual(destination.stat().st_nlink, 2)
+                    self.assertEqual(
+                        (alias.stat().st_dev, alias.stat().st_ino),
+                        source_identity,
+                    )
+
     def test_create_cleanup_restores_same_target_inode_racer(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             home = Path(temp_dir) / "home"

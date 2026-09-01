@@ -22,7 +22,7 @@
     "engine": {
       "mode": "0755",
       "path": "scripts/codex_personal_sync.py",
-      "sha256": "42261458ba55b46d7d0195ee9aa2587fa8add948a78414f6528e5047e0833be2"
+      "sha256": "b6184826f44360f2feee25022e2052d55e010044eb4ab9d892bac68c1f4b0735"
     },
     "engine_tests": {
       "mode": "0644",
@@ -37,22 +37,22 @@
     "pending_agent_claim_compatibility_tests": {
       "mode": "0644",
       "path": "tests/test_pending_agent_claim_compatibility.py",
-      "sha256": "0821772cb8290745effc5de1cb4383c3151cbad81c7b7ef4dc182a4f03df6b08"
+      "sha256": "562360b887146b9addd6e33350ae462bd0464d6d817524e4afee568a483f9301"
     },
     "pending_staging_cleanup_tests": {
       "mode": "0644",
       "path": "tests/test_pending_staging_cleanup.py",
-      "sha256": "2e6c6b92b3531fd0f64dfd0be16325f0e2e02187d4ba3e421fd55f2c5dafdc4a"
+      "sha256": "9997bd62a77463bbf289d5eaea397fcaa9feedd508c7d2bcae97653a13876dee"
     },
     "reconciliation_safety_tests": {
       "mode": "0644",
       "path": "tests/test_personal_sync_reconciliation_safety.py",
-      "sha256": "982b37e4fd69d90fa2262660ab6e14b92169bd0d414a1ff81dcb8b691899a9cf"
+      "sha256": "6c7f2ef224d08a0c5bfb5c95541fd50e0ffe87e6f54f7e5930252212d3ad528c"
     },
     "regular_agent_materialization_tests": {
       "mode": "0644",
       "path": "tests/test_regular_agent_materialization.py",
-      "sha256": "52194afce4c273c09ce4786cf08eba664c1646a0ca7caa30c3ea11d1ff6b1bc3"
+      "sha256": "070c08ad1560d522f3e84e487622d9d8f9b873ecad05e813e5ed05849f239e19"
     },
     "regular_overlay_uninstall_status_regressions_tests": {
       "mode": "0644",

@@ -318,3 +318,26 @@ superseded_by:
   the refreshed ten-source lock check passed on the same source. A new signed
   frozen head and clean-clone whole-range review remain required before PR
   creation.
+- The following independent GPT-5.6 Sol Ultra whole-range review found three
+  additional recovery defects before any remote publication: version-6 foreign
+  regular relinquishment still used dataclass equality for its complete
+  `planned_before` snapshot; several `0600` control authorities and cleanup
+  tickets did the same; and a failed ordinary-file move could restore a
+  same-inode leaf after its content, mode, UID, or link count changed. The
+  repairs apply the same access-policy semantic predicate consistently to
+  snapshots and tickets, retain strict identity/content/mode/UID/size/link
+  count/parent checks, and restore a failed moved leaf only after a full
+  regular-file revalidation. A changed or unreadable leaf is retained as
+  destination evidence instead. New regressions reproduce an actual v6
+  foreign-regular metadata shape, ticket/cursor GID-only churn, and same-inode
+  content/mode/link-count restore-window races. Focused recovery, staging, and
+  atomic-move suites passed; a fresh full discovery, source-lock refresh, signed
+  checkpoint, and new clean-clone whole-range review remain mandatory.
+- A first full discovery after that repair exposed one incomplete unit-test
+  fixture: the terminal-budget test constructed a ticket snapshot without the
+  complete file evidence that production parsing always supplies. The fixture
+  now represents a real `0600` ticket snapshot. Its targeted compatibility
+  class passed, then the final repository-private discovery passed
+  1,381/1,381 tests in 997.782 seconds with three expected platform skips.
+  The source lock, static checks, signed checkpoint, and a new clean-clone
+  whole-range review remain the required next gates.
