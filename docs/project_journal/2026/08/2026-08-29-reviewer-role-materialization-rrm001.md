@@ -360,3 +360,27 @@ superseded_by:
   the source-lock test correctly observed pending source changes. Refresh the
   lock, rerun that suite with its narrowly required private-home permission,
   then create a new signed frozen head and a clean-clone whole-range review.
+- The next fresh GPT-5.6 Sol Ultra whole-range review found eight concrete
+  remaining recovery/authority defects, all repaired before remote publication.
+  Failed-move rollback now never mutates through a detached destination parent
+  FD and first isolates a destination leaf before any restore; a replacement
+  racer therefore cannot enter an active `agents/*.toml` path. Once a hard
+  link is published, every later failure retains its destination evidence, and
+  canonical TOML cleanup isolates before snapshot or journal decisions so an
+  unreadable or mismatched leaf is never left loadable. State-before recovery
+  binds UID and semantic GID before and after linking; commit/rollback markers,
+  orphan proofs, staging skeletons, and staging-marker temporaries require the
+  effective UID and their expected access policy before they can become cleanup
+  authority. The implementation treats identity, content stability, and access
+  policy as distinct protected properties: group identity is compared only
+  when group permission bits make it meaningful.
+- The eight repairs have explicit interleaving regressions for detached parents,
+  destination racers, post-link last-alias loss, snapshot failure, pending
+  cleanup mismatch, UID/GID drift, wrong-owner markers/proofs, and foreign
+  staging skeletons. The merged changed-module run passed 770 tests with one
+  expected skip. The first 1,405-test discovery ran all implementation tests
+  successfully and reported only the expected stale source-lock hash; after
+  refreshing the ten-source lock, `refresh-lock --check` passed and the
+  source-lock module passed 280/280 with one expected skip in 514.753 seconds.
+  A new signed frozen head and another clean-clone GPT-5.6 Sol Ultra whole-range
+  review remain required before PR creation.

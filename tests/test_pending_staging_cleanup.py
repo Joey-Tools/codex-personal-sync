@@ -907,6 +907,65 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     staging_identity,
                 )
 
+    def test_orphan_empty_proof_rejects_foreign_owner_before_and_after_retention(
+        self,
+    ) -> None:
+        ticket = self._publish_legacy_cleanup_ticket(version=3)
+        quarantine_root = (
+            MODULE._personal_sync_root(self.home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        quarantine_root_identity = (
+            quarantine_root.stat().st_dev,
+            quarantine_root.stat().st_ino,
+        )
+        proof_path = MODULE._pending_cleanup_empty_proof_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        MODULE._publish_pending_cleanup_empty_proof(
+            self.home,
+            ticket,
+            quarantine_root_identity,
+        )
+        with mock.patch.object(
+            MODULE,
+            "_delete_pending_cleanup_empty_proof",
+            return_value=None,
+        ):
+            self.assertTrue(
+                MODULE._remove_cleanup_ready_batch(self.home, ticket)
+            )
+        self.assertFalse(ticket.batch_root.exists())
+        self.assertFalse(ticket.path.exists())
+        self.assertTrue(proof_path.is_file())
+
+        foreign_uid = os.geteuid() + 1
+        with (
+            mock.patch.object(MODULE.os, "geteuid", return_value=foreign_uid),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup empty proof changed",
+            ),
+        ):
+            MODULE._read_orphan_pending_cleanup_empty_proof(
+                self.home,
+                proof_path,
+            )
+
+        retained_name = next(MODULE._retained_pending_cleanup_names(proof_path))
+        retained_path = proof_path.with_name(retained_name)
+        proof_path.rename(retained_path)
+        with (
+            mock.patch.object(MODULE.os, "geteuid", return_value=foreign_uid),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup retained control owner changed",
+            ),
+        ):
+            MODULE._restore_pending_cleanup_control_tombstones(self.home)
+        self.assertFalse(proof_path.exists())
+        self.assertTrue(retained_path.is_file())
+
     def test_atomic_authority_publisher_rejects_foreign_owner_uid(self) -> None:
         authority_root = self.home / "atomic-authority-owner-tests"
         authority_root.mkdir()
@@ -1740,12 +1799,168 @@ class PendingStagingCleanupTests(unittest.TestCase):
             MODULE._require_pending_staging_initial_skeleton(
                 self.home,
                 batch_root,
+                (batch_root.stat().st_dev, batch_root.stat().st_ino),
             )
 
         self.assertEqual(
             maximum_entries,
             [3, 7, 3, 1, 1, 1, 1, 1, 1, 2],
         )
+
+    def test_staging_temp_recovery_rejects_unsafe_skeleton_modes(self) -> None:
+        for relative_path, unsafe_mode in (
+            (Path("."), 0o755),
+            (Path("pending"), 0o755),
+            (Path("pending/claims/after"), 0o755),
+            (Path("metadata.json"), 0o644),
+            (None, 0o644),
+        ):
+            with self.subTest(relative_path=relative_path):
+                batch_root = MODULE._quarantine_batch_root(self.home, [])
+                for skeleton_path in (
+                    Path("pending/before"),
+                    Path("pending/stage"),
+                    Path("pending/evidence"),
+                    Path("pending/state"),
+                    Path("pending/cleanup"),
+                    Path("pending/claims/before"),
+                    Path("pending/claims/after"),
+                ):
+                    directory_fd = MODULE._open_or_create_directory_beneath(
+                        self.home,
+                        batch_root / skeleton_path,
+                        mode=0o700,
+                    )
+                    MODULE._close_fd_quietly(directory_fd)
+                marker_path = batch_root / Path(
+                    *MODULE.PENDING_STATE_STAGING_MARKER.parts
+                )
+                temp_path = marker_path.with_name(
+                    marker_path.name
+                    + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+                )
+                temp_path.write_bytes(b"{\n")
+                temp_path.chmod(0o600)
+                unsafe_path = (
+                    temp_path
+                    if relative_path is None
+                    else batch_root / relative_path
+                )
+                unsafe_path.chmod(unsafe_mode)
+
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "pending staging (directory owner, mode, or identity|metadata|temp authority)",
+                ):
+                    MODULE._require_pending_staging_initial_skeleton(
+                        self.home,
+                        batch_root,
+                        (batch_root.stat().st_dev, batch_root.stat().st_ino),
+                    )
+
+                self.assertTrue(temp_path.exists())
+                self.assertFalse(marker_path.exists())
+                self.assertTrue(batch_root.exists())
+
+    def test_staging_temp_recovery_rejects_foreign_owned_temp_evidence(
+        self,
+    ) -> None:
+        for retained in (False, True):
+            with self.subTest(retained=retained):
+                batch_root = MODULE._quarantine_batch_root(self.home, [])
+                for relative_path in (
+                    Path("pending/before"),
+                    Path("pending/stage"),
+                    Path("pending/evidence"),
+                    Path("pending/state"),
+                    Path("pending/cleanup"),
+                    Path("pending/claims/before"),
+                    Path("pending/claims/after"),
+                ):
+                    directory_fd = MODULE._open_or_create_directory_beneath(
+                        self.home,
+                        batch_root / relative_path,
+                        mode=0o700,
+                    )
+                    MODULE._close_fd_quietly(directory_fd)
+                marker_path = batch_root / Path(
+                    *MODULE.PENDING_STATE_STAGING_MARKER.parts
+                )
+                temp_path = marker_path.with_name(
+                    marker_path.name
+                    + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+                )
+                temp_path.write_bytes(b"{\n")
+                temp_path.chmod(0o600)
+                observed_temp = temp_path
+                if retained:
+                    observed_temp = temp_path.with_name(
+                        next(MODULE._retained_pending_cleanup_names(temp_path))
+                    )
+                    temp_path.rename(observed_temp)
+                real_read = MODULE._read_managed_state_file_snapshot
+
+                def read_with_foreign_temp_owner(home, path, parent_fd, **kwargs):
+                    snapshot = real_read(home, path, parent_fd, **kwargs)
+                    if path == observed_temp and snapshot.exists:
+                        return MODULE.replace(
+                            snapshot,
+                            uid=os.geteuid() + 1,
+                        )
+                    return snapshot
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_read_managed_state_file_snapshot",
+                        side_effect=read_with_foreign_temp_owner,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "pending staging temp authority owner or mode changed",
+                    ),
+                ):
+                    MODULE._recover_pending_staging_marker_temps(
+                        self.home,
+                        budget=MODULE.PendingCleanupActionBudget(2),
+                    )
+
+                self.assertTrue(observed_temp.exists())
+                self.assertFalse(marker_path.exists())
+                self.assertTrue(batch_root.exists())
+
+    def test_incomplete_temp_discard_rejects_foreign_owner_uid(self) -> None:
+        temp_root = self.home / "foreign-temp-discard"
+        temp_root.mkdir(mode=0o700)
+        temp_path = temp_root / "authority.json.tmp"
+        temp_path.write_bytes(b"{\n")
+        temp_path.chmod(0o600)
+        real_read = MODULE._read_managed_state_file_snapshot
+
+        def read_with_foreign_owner(home, path, parent_fd, **kwargs):
+            snapshot = real_read(home, path, parent_fd, **kwargs)
+            if path == temp_path and snapshot.exists:
+                return MODULE.replace(snapshot, uid=os.geteuid() + 1)
+            return snapshot
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_read_managed_state_file_snapshot",
+                side_effect=read_with_foreign_owner,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "incomplete pending cleanup ticket changed",
+            ),
+        ):
+            MODULE._discard_incomplete_pending_cleanup_ticket(
+                self.home,
+                temp_path,
+            )
+
+        self.assertTrue(temp_path.exists())
+        self.assertEqual(temp_path.read_bytes(), b"{\n")
 
     def test_cursor_temp_failures_do_not_hold_index_fd(self) -> None:
         for label, cleanup_result, budget_limit in (

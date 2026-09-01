@@ -289,7 +289,7 @@ class PublicRegularAgentTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
-                "no exact source alias could be revalidated",
+                "retained without deletion",
             ) as raised,
         ):
             MODULE._publish_regular_hardlink_beneath(
@@ -314,6 +314,140 @@ class PublicRegularAgentTests(unittest.TestCase):
             (source.stat().st_dev, source.stat().st_ino),
             expected.file_identity,
         )
+
+    def test_post_link_failure_never_enters_path_revalidation_cleanup_window(
+        self,
+    ) -> None:
+        source = self.home / "personal-sync" / "source" / "authority"
+        destination = self.home / "personal-sync" / "evidence" / "published"
+        source.parent.mkdir(parents=True)
+        destination.parent.mkdir(parents=True)
+        source.write_bytes(b"authority")
+        source.chmod(0o600)
+        source_parent_fd = MODULE._open_directory_beneath(
+            self.home,
+            source.parent,
+        )
+        try:
+            expected = MODULE._read_managed_state_file_snapshot(
+                self.home,
+                source,
+                source_parent_fd,
+            )
+        finally:
+            MODULE._close_fd_quietly(source_parent_fd)
+        real_cleanup = MODULE._isolate_and_delete_pending_cleanup_file
+
+        def swap_source_then_delete(*args: object, **kwargs: object) -> None:
+            source.unlink()
+            source.write_bytes(b"foreign")
+            source.chmod(0o600)
+            real_cleanup(*args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            mock.patch.object(
+                MODULE.os,
+                "fsync",
+                side_effect=OSError("injected post-link failure"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_isolate_and_delete_pending_cleanup_file",
+                side_effect=swap_source_then_delete,
+            ) as cleanup,
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "retained without deletion",
+            ),
+        ):
+            MODULE._publish_regular_hardlink_beneath(
+                self.home,
+                source,
+                destination,
+                expected,
+            )
+
+        cleanup.assert_not_called()
+        self.assertEqual(source.read_bytes(), b"authority")
+        self.assertEqual(destination.read_bytes(), b"authority")
+        self.assertEqual(
+            (source.stat().st_dev, source.stat().st_ino),
+            (destination.stat().st_dev, destination.stat().st_ino),
+        )
+
+    def test_reconcile_snapshot_failure_clears_active_toml_before_error(
+        self,
+    ) -> None:
+        stage = self.home / "personal-sync" / "stage" / "00000000"
+        target = self.home / ROLE_TARGET
+        stage.parent.mkdir(parents=True)
+        target.parent.mkdir(parents=True)
+        stage.write_bytes(b"authority")
+        stage.chmod(0o600)
+        stage_snapshot = MODULE._read_regular_file_snapshot_beneath(
+            self.home,
+            stage,
+            require_managed_access=False,
+        )
+        target_plan = MODULE._capture_reconcile_target_snapshot(self.home, target)
+        real_snapshot = MODULE._regular_file_snapshot_at
+        real_link = os.link
+        linked = False
+
+        def mark_linked(*args: object, **kwargs: object) -> None:
+            nonlocal linked
+            real_link(*args, **kwargs)  # type: ignore[arg-type]
+            linked = True
+
+        def fail_first_canonical_snapshot(
+            directory_fd: int,
+            name: str,
+            path: Path,
+            *args: object,
+            **kwargs: object,
+        ) -> MODULE.RegularFileSnapshot:
+            if linked and path == target:
+                raise OSError("injected canonical snapshot failure")
+            return real_snapshot(
+                directory_fd,
+                name,
+                path,
+                *args,
+                **kwargs,
+            )
+
+        with (
+            mock.patch.object(MODULE.os, "link", side_effect=mark_linked),
+            mock.patch.object(
+                MODULE,
+                "_regular_file_snapshot_at",
+                side_effect=fail_first_canonical_snapshot,
+            ),
+            self.assertRaisesRegex(OSError, "injected canonical snapshot failure"),
+        ):
+            MODULE._publish_regular_reconcile_hardlink_beneath(
+                self.home,
+                stage,
+                target,
+                stage_snapshot,
+                target_plan,
+                {},
+            )
+
+        self.assertFalse(os.path.lexists(target))
+        self.assertEqual(stage.read_bytes(), b"authority")
+        self.assertEqual(stage.stat().st_nlink, 1)
+        internal = tuple(
+            child
+            for child in target.parent.iterdir()
+            if child.name.startswith(
+                (
+                    MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                    MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX,
+                )
+            )
+        )
+        self.assertEqual(internal, ())
 
     def test_exact_publication_cleanup_quarantines_target_replacement(
         self,
@@ -1699,7 +1833,7 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
             )
 
         self.assertTrue(crashed)
-        self.assertTrue(target.is_file())
+        self.assertFalse(os.path.lexists(target))
         self.assertTrue(journal.is_file())
         self.assertFalse(os.path.lexists(journal.with_name(temp_name)))
         self.assertIsNotNone(
@@ -1718,6 +1852,97 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
             "produced",
         )
         self.assertFalse(os.path.lexists(target))
+
+    def test_pending_cleanup_isolates_before_canonical_snapshot(self) -> None:
+        batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
+        record = next(candidate for candidate in batch.records if candidate.is_regular())
+        target = self.home / Path(*record.target.parts)
+        expected, exists = MODULE._pending_target_snapshot(self.home, target)
+        self.assertTrue(exists)
+        assert isinstance(expected, MODULE.RegularFileSnapshot)
+        real_snapshot = MODULE._regular_file_snapshot_at
+        canonical_reads = 0
+
+        def reject_canonical_snapshot(
+            directory_fd: int,
+            name: str,
+            path: Path,
+            *args: object,
+            **kwargs: object,
+        ) -> MODULE.RegularFileSnapshot:
+            nonlocal canonical_reads
+            if path == target:
+                canonical_reads += 1
+                raise OSError("canonical publication must already be isolated")
+            return real_snapshot(
+                directory_fd,
+                name,
+                path,
+                *args,
+                **kwargs,
+            )
+
+        with mock.patch.object(
+            MODULE,
+            "_regular_file_snapshot_at",
+            side_effect=reject_canonical_snapshot,
+        ):
+            MODULE._delete_pending_regular_publication_beneath(
+                self.home,
+                batch,
+                record,
+                target,
+                expected,
+                phase="produced",
+            )
+
+        self.assertEqual(canonical_reads, 0)
+        self.assertFalse(os.path.lexists(target))
+        self.assertIsNotNone(
+            MODULE._read_pending_regular_publication_cleanup(
+                self.home,
+                batch,
+                record,
+                "produced",
+            )
+        )
+
+    def test_pending_cleanup_retains_canonical_mismatch_off_active_path(
+        self,
+    ) -> None:
+        batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
+        record = next(candidate for candidate in batch.records if candidate.is_regular())
+        target = self.home / Path(*record.target.parts)
+        expected, exists = MODULE._pending_target_snapshot(self.home, target)
+        self.assertTrue(exists)
+        assert isinstance(expected, MODULE.RegularFileSnapshot)
+        target.unlink()
+        target.write_text('name = "foreign"\n', encoding="utf-8")
+        target.chmod(0o600)
+
+        with self.assertRaisesRegex(MODULE.SyncError, "preserved as"):
+            MODULE._delete_pending_regular_publication_beneath(
+                self.home,
+                batch,
+                record,
+                target,
+                expected,
+                phase="produced",
+            )
+
+        self.assertFalse(os.path.lexists(target))
+        retained = tuple(
+            child
+            for child in target.parent.iterdir()
+            if child.name.startswith(
+                MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX
+            )
+        )
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(
+            retained[0].read_text(encoding="utf-8"),
+            'name = "foreign"\n',
+        )
 
     def test_precommit_crash_recovery_retries_regular_publication(self) -> None:
         real_clear = MODULE._clear_pending_link_pointer

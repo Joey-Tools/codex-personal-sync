@@ -13964,7 +13964,7 @@ while True:
             ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
-                "retained without deletion",
+                "preserved as",
             ),
         ):
             MODULE._publish_regular_reconcile_hardlink_beneath(
@@ -13977,8 +13977,17 @@ while True:
             )
 
         self.assertEqual(stage.read_bytes(), b"authority")
-        self.assertEqual(target.read_bytes(), b"foreign")
-        self.assertNotEqual(stage.stat().st_ino, target.stat().st_ino)
+        self.assertFalse(os.path.lexists(target))
+        retained = tuple(
+            child
+            for child in target.parent.iterdir()
+            if child.name.startswith(
+                MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX
+            )
+        )
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), b"foreign")
+        self.assertNotEqual(stage.stat().st_ino, retained[0].stat().st_ino)
 
     def test_pending_regular_aliases_reject_foreign_hardlink(self) -> None:
         home = self.root / "home" / ".codex"

@@ -213,6 +213,29 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
             child.unlink()
         index.rmdir()
 
+    def _retain_batch_with_state_before(
+        self,
+        label: str,
+        *,
+        committed: bool,
+    ) -> tuple[Path, MODULE.PendingLinkBatch]:
+        home = self.root / f"home-state-before-{label}"
+        first_release = self.root / f"first-state-before-{label}"
+        next_release = self.root / f"next-state-before-{label}"
+        write_agent_release(first_release, payload='name = "first"\n')
+        write_agent_release(next_release, payload='name = "next"\n')
+        install(first_release, home, SHA_A)
+        batch = self._retain_batch(
+            home,
+            next_release,
+            committed=committed,
+            legacy_symlink=False,
+            sha=SHA_B,
+        )
+        self.assertTrue(batch.state_before.exists)
+        self.assertIsNotNone(batch.state_before_evidence)
+        return home, batch
+
     def _terminal_regular_budget_fixture(
         self,
         label: str,
@@ -572,6 +595,122 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
                 required_mode=None,
                 metadata_version=8,
             )
+
+    def test_state_before_restore_revalidates_uid_before_link(self) -> None:
+        home, batch = self._retain_batch_with_state_before(
+            "uid-drift",
+            committed=True,
+        )
+        assert batch.state_before_evidence is not None
+        evidence_path = batch.batch_root / Path(
+            *batch.state_before_evidence.parts
+        )
+        state_path = MODULE._state_path(home)
+        state_path.unlink()
+        real_read = MODULE._read_managed_state_file_snapshot
+
+        def read_with_foreign_owner(
+            selected_home: Path,
+            path: Path,
+            parent_fd: int,
+            **kwargs,
+        ):
+            snapshot = real_read(selected_home, path, parent_fd, **kwargs)
+            if path == evidence_path:
+                assert snapshot.uid is not None
+                return replace(snapshot, uid=snapshot.uid + 1)
+            return snapshot
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_read_managed_state_file_snapshot",
+                side_effect=read_with_foreign_owner,
+            ),
+            mock.patch.object(MODULE.os, "link", wraps=MODULE.os.link) as link,
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "state-before evidence changed",
+            ),
+        ):
+            MODULE._restore_pending_state_before(home, batch)
+        link.assert_not_called()
+        self.assertFalse(state_path.exists())
+
+    def test_state_before_restore_uses_gid_only_for_group_access(self) -> None:
+        alternate_gid = next(
+            (
+                gid
+                for gid in os.getgroups()
+                if gid != os.stat(self.root).st_gid
+            ),
+            None,
+        )
+        if alternate_gid is None:
+            self.skipTest("no alternate supplementary group is available")
+
+        for group_access in (False, True):
+            with self.subTest(group_access=group_access):
+                home, batch = self._retain_batch_with_state_before(
+                    f"gid-drift-{group_access}",
+                    committed=True,
+                )
+                assert batch.state_before_evidence is not None
+                evidence_path = batch.batch_root / Path(
+                    *batch.state_before_evidence.parts
+                )
+                state_path = MODULE._state_path(home)
+                state_path.unlink()
+                expected_mode = 0o640 if group_access else 0o600
+                evidence_path.chmod(expected_mode)
+                initial_gid = evidence_path.stat().st_gid
+                if alternate_gid == initial_gid:
+                    self.skipTest("alternate supplementary group matches evidence")
+                expected = replace(
+                    batch.state_before,
+                    mode=expected_mode,
+                    gid=initial_gid,
+                )
+                drifted_batch = replace(batch, state_before=expected)
+                os.chown(evidence_path, -1, alternate_gid)
+
+                if group_access:
+                    with self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "state-before evidence changed",
+                    ):
+                        MODULE._restore_pending_state_before(home, drifted_batch)
+                    self.assertFalse(state_path.exists())
+                else:
+                    MODULE._restore_pending_state_before(home, drifted_batch)
+                    self.assertTrue(state_path.is_file())
+
+    def test_commit_and_rollback_markers_reject_foreign_owner_uid(self) -> None:
+        commit_home, committed = self._retain_batch_with_state_before(
+            "commit-owner",
+            committed=True,
+        )
+        rollback_home, rolled_back = self._retain_batch_with_state_before(
+            "rollback-owner",
+            committed=False,
+        )
+        MODULE._publish_pending_rollback_marker(rollback_home, rolled_back)
+        foreign_uid = os.geteuid() + 1
+
+        with mock.patch.object(MODULE.os, "geteuid", return_value=foreign_uid):
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "commit evidence changed",
+            ):
+                MODULE._pending_commit_marker_snapshot(commit_home, committed)
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "rollback marker changed",
+            ):
+                MODULE._pending_rollback_marker_snapshot(
+                    rollback_home,
+                    rolled_back,
+                )
 
     def test_legacy_agent_symlink_migrates_to_regular_on_update(self) -> None:
         home = self.root / "home-legacy-update"

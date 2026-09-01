@@ -9044,6 +9044,229 @@ def _rename_exchange_at(
         )
 
 
+def _isolate_failed_move_destination(
+    home: Path,
+    destination: Path,
+    expected_parent_identity: tuple[int, int],
+    expected_identity: tuple[int, int],
+    expected_mode_type: int,
+    expected_target: str | None,
+    expected_regular: RegularFileSnapshot | None,
+) -> Path:
+    batch_root = _quarantine_batch_root(home, [])
+    isolation_parent = batch_root / "failed-move"
+    isolation_parent_fd = _open_or_create_directory_beneath(
+        home,
+        isolation_parent,
+        mode=0o700,
+    )
+    isolation_parent_metadata = os.fstat(isolation_parent_fd)
+    if (
+        stat.S_IMODE(isolation_parent_metadata.st_mode) != 0o700
+        or isolation_parent_metadata.st_uid != os.geteuid()
+    ):
+        _close_fd_quietly(isolation_parent_fd)
+        raise SyncError(
+            "failed-move isolation parent access policy mismatch: "
+            f"{isolation_parent}"
+        )
+    destination_parent_fd = -1
+    isolated: Path | None = None
+    try:
+        for attempt in range(100):
+            _close_fd_quietly(destination_parent_fd)
+            destination_parent_fd = _open_directory_beneath(
+                home,
+                destination.parent,
+            )
+            if (
+                _directory_identity(destination_parent_fd)
+                != expected_parent_identity
+                or not _bound_directory_matches(
+                    home,
+                    destination.parent,
+                    destination_parent_fd,
+                )
+            ):
+                raise SyncError(
+                    "canonical destination parent changed before failed-move "
+                    f"isolation; evidence was left in place: {destination}"
+                )
+            if not _bound_directory_matches(
+                home,
+                isolation_parent,
+                isolation_parent_fd,
+            ):
+                raise SyncError(
+                    "failed-move isolation parent changed before evidence "
+                    f"retention: {isolation_parent}"
+                )
+            if expected_regular is not None:
+                candidate = _regular_file_snapshot_at(
+                    destination_parent_fd,
+                    destination.name,
+                    destination,
+                )
+                if not _regular_snapshot_matches(
+                    candidate,
+                    expected_parent_identity,
+                    expected_regular,
+                    expected_link_count=expected_regular.link_count,
+                ):
+                    raise SyncError(
+                        "moved regular file changed before failed-move isolation "
+                        f"and was left in place: {destination}"
+                    )
+            elif stat.S_ISLNK(expected_mode_type):
+                candidate_identity, candidate_target = _symlink_snapshot_at(
+                    destination_parent_fd,
+                    destination.name,
+                )
+                if (
+                    candidate_identity != expected_identity
+                    or candidate_target != expected_target
+                ):
+                    raise SyncError(
+                        "moved symlink changed before failed-move isolation and "
+                        f"was left in place: {destination}"
+                    )
+            else:
+                candidate_metadata = os.stat(
+                    destination.name,
+                    dir_fd=destination_parent_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    (candidate_metadata.st_dev, candidate_metadata.st_ino)
+                    != expected_identity
+                    or stat.S_IFMT(candidate_metadata.st_mode)
+                    != expected_mode_type
+                ):
+                    raise SyncError(
+                        "moved entry changed before failed-move isolation and "
+                        f"was left in place: {destination}"
+                    )
+            candidate_name = (
+                f"restore-{os.getpid()}-{time.time_ns()}-{attempt}"
+            )
+            try:
+                _rename_noreplace_at(
+                    destination_parent_fd,
+                    destination.name,
+                    isolation_parent_fd,
+                    candidate_name,
+                )
+            except FileExistsError:
+                continue
+            isolated = isolation_parent / candidate_name
+            os.fsync(destination_parent_fd)
+            os.fsync(isolation_parent_fd)
+            break
+        if isolated is None:
+            raise SyncError(
+                "could not allocate private failed-move isolation for "
+                f"{destination}"
+            )
+        if expected_regular is not None:
+            isolated_regular = _regular_file_snapshot_at(
+                isolation_parent_fd,
+                isolated.name,
+                isolated,
+            )
+            if (
+                not _regular_snapshot_leaf_matches(
+                    isolated_regular,
+                    expected_regular,
+                )
+                or isolated_regular.link_count != expected_regular.link_count
+            ):
+                raise SyncError(
+                    "destination racer was retained outside the active source "
+                    f"after failed-move isolation: {isolated}"
+                )
+        elif stat.S_ISLNK(expected_mode_type):
+            isolated_identity, isolated_target = _symlink_snapshot_at(
+                isolation_parent_fd,
+                isolated.name,
+            )
+            if (
+                isolated_identity != expected_identity
+                or isolated_target != expected_target
+            ):
+                raise SyncError(
+                    "destination racer was retained outside the active source "
+                    f"after failed-move isolation: {isolated}"
+                )
+        else:
+            isolated_metadata = os.stat(
+                isolated.name,
+                dir_fd=isolation_parent_fd,
+                follow_symlinks=False,
+            )
+            if (
+                (isolated_metadata.st_dev, isolated_metadata.st_ino)
+                != expected_identity
+                or stat.S_IFMT(isolated_metadata.st_mode) != expected_mode_type
+            ):
+                raise SyncError(
+                    "destination racer was retained outside the active source "
+                    f"after failed-move isolation: {isolated}"
+                )
+        if not _bound_directory_matches(
+            home,
+            isolation_parent,
+            isolation_parent_fd,
+        ):
+            raise SyncError(
+                "failed-move isolation parent changed after evidence retention: "
+                f"{isolated}"
+            )
+        return isolated
+    finally:
+        _close_fd_quietly(destination_parent_fd)
+        _close_fd_quietly(isolation_parent_fd)
+
+
+def _isolate_current_failed_restore_leaf(
+    home: Path,
+    source: Path,
+    expected_parent_identity: tuple[int, int],
+    source_parent_fd: int,
+) -> Path:
+    metadata = os.stat(
+        source.name,
+        dir_fd=source_parent_fd,
+        follow_symlinks=False,
+    )
+    identity = (metadata.st_dev, metadata.st_ino)
+    mode_type = stat.S_IFMT(metadata.st_mode)
+    link_target = None
+    regular = None
+    if stat.S_ISREG(metadata.st_mode):
+        try:
+            regular = _regular_file_snapshot_at(
+                source_parent_fd,
+                source.name,
+                source,
+            )
+        except (OSError, SyncError):
+            pass
+    elif stat.S_ISLNK(metadata.st_mode):
+        identity, link_target = _symlink_snapshot_at(
+            source_parent_fd,
+            source.name,
+        )
+    return _isolate_failed_move_destination(
+        home,
+        source,
+        expected_parent_identity,
+        identity,
+        mode_type,
+        link_target,
+        regular,
+    )
+
+
 def _atomic_move_beneath_home(
     home: Path,
     source: Path,
@@ -9063,17 +9286,20 @@ def _atomic_move_beneath_home(
         raise
     moved = False
     moved_identity_for_restore: tuple[int, int] | None = None
+    moved_mode_type_for_restore: int | None = None
     moved_target_for_restore: str | None = None
     source_regular_for_restore: RegularFileSnapshot | None = None
     source_parent_identity_for_restore: tuple[int, int] | None = None
     destination_parent_identity_for_restore: tuple[int, int] | None = None
     rollback_source_parent_fd = -1
+    rollback_destination_parent_fd = -1
+    isolated_parent_fd = -1
     try:
         source_parent_identity_for_restore = _directory_identity(source_parent_fd)
+        destination_parent_identity_for_restore = _directory_identity(
+            destination_parent_fd
+        )
         if expected_destination_parent_identity is not None:
-            destination_parent_identity_for_restore = _directory_identity(
-                destination_parent_fd
-            )
             if (
                 destination_parent_identity_for_restore
                 != expected_destination_parent_identity
@@ -9087,6 +9313,7 @@ def _atomic_move_beneath_home(
             follow_symlinks=False,
         )
         source_identity = (source_metadata.st_dev, source_metadata.st_ino)
+        moved_mode_type_for_restore = stat.S_IFMT(source_metadata.st_mode)
         if (
             expected_entry_identity is not None
             and source_identity != expected_entry_identity
@@ -9100,10 +9327,6 @@ def _atomic_move_beneath_home(
             )
             if source_regular_for_restore.file_identity != source_identity:
                 raise SyncError(f"source object changed after planning: {source}")
-            if destination_parent_identity_for_restore is None:
-                destination_parent_identity_for_restore = _directory_identity(
-                    destination_parent_fd
-                )
         if expected_snapshot is not None:
             if (
                 expected_snapshot.parent_identity is None
@@ -9229,7 +9452,11 @@ def _atomic_move_beneath_home(
     except BaseException as error:
         if moved:
             restored = False
+            isolated: Path | None = None
             try:
+                assert destination_parent_identity_for_restore is not None
+                assert moved_identity_for_restore is not None
+                assert moved_mode_type_for_restore is not None
                 rollback_source_parent_fd = _open_directory_beneath(
                     home,
                     source.parent,
@@ -9247,22 +9474,6 @@ def _atomic_move_beneath_home(
                         "canonical source parent changed before failed-move "
                         f"restoration; evidence was retained at {destination}"
                     )
-                if source_regular_for_restore is not None:
-                    destination_regular_before_restore = _regular_file_snapshot_at(
-                        destination_parent_fd,
-                        destination.name,
-                        destination,
-                    )
-                    if not _regular_snapshot_matches(
-                        destination_regular_before_restore,
-                        destination_parent_identity_for_restore,
-                        source_regular_for_restore,
-                        expected_link_count=source_regular_for_restore.link_count,
-                    ):
-                        raise SyncError(
-                            "moved regular file changed before failed-move "
-                            f"restoration and was retained at {destination}"
-                        )
                 try:
                     rollback_source_metadata = os.stat(
                         source.name,
@@ -9282,16 +9493,112 @@ def _atomic_move_beneath_home(
                         f"{source} ({rollback_source_identity}); evidence was "
                         f"retained at {destination}"
                     )
+                isolated = _isolate_failed_move_destination(
+                    home,
+                    destination,
+                    destination_parent_identity_for_restore,
+                    moved_identity_for_restore,
+                    moved_mode_type_for_restore,
+                    moved_target_for_restore,
+                    source_regular_for_restore,
+                )
+                if (
+                    not _bound_directory_matches(
+                        home,
+                        source.parent,
+                        rollback_source_parent_fd,
+                    )
+                    or _directory_identity(rollback_source_parent_fd)
+                    != source_parent_identity_for_restore
+                ):
+                    raise SyncError(
+                        "canonical source parent changed after failed-move "
+                        f"isolation; evidence was retained at {isolated}"
+                    )
+                try:
+                    os.stat(
+                        source.name,
+                        dir_fd=rollback_source_parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise SyncError(
+                        "canonical source leaf appeared after failed-move "
+                        f"isolation and was left in place: {source}; evidence "
+                        f"was retained at {isolated}"
+                    )
+                isolated_parent_fd = _open_directory_beneath(
+                    home,
+                    isolated.parent,
+                )
+                if not _bound_directory_matches(
+                    home,
+                    isolated.parent,
+                    isolated_parent_fd,
+                ):
+                    raise SyncError(
+                        "failed-move isolation parent changed before exact "
+                        f"restoration; evidence was retained at {isolated}"
+                    )
+                if source_regular_for_restore is not None:
+                    isolated_regular = _regular_file_snapshot_at(
+                        isolated_parent_fd,
+                        isolated.name,
+                        isolated,
+                    )
+                    if (
+                        not _regular_snapshot_leaf_matches(
+                            isolated_regular,
+                            source_regular_for_restore,
+                        )
+                        or isolated_regular.link_count
+                        != source_regular_for_restore.link_count
+                    ):
+                        raise SyncError(
+                            "failed-move isolated regular evidence changed before "
+                            f"restoration and was retained at {isolated}"
+                        )
+                elif stat.S_ISLNK(moved_mode_type_for_restore):
+                    isolated_identity, isolated_target = _symlink_snapshot_at(
+                        isolated_parent_fd,
+                        isolated.name,
+                    )
+                    if (
+                        isolated_identity != moved_identity_for_restore
+                        or isolated_target != moved_target_for_restore
+                    ):
+                        raise SyncError(
+                            "failed-move isolated symlink evidence changed before "
+                            f"restoration and was retained at {isolated}"
+                        )
+                else:
+                    isolated_metadata = os.stat(
+                        isolated.name,
+                        dir_fd=isolated_parent_fd,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        (isolated_metadata.st_dev, isolated_metadata.st_ino)
+                        != moved_identity_for_restore
+                        or stat.S_IFMT(isolated_metadata.st_mode)
+                        != moved_mode_type_for_restore
+                    ):
+                        raise SyncError(
+                            "failed-move isolated evidence changed before exact "
+                            f"restoration and was retained at {isolated}"
+                        )
                 _rename_noreplace_at(
-                    destination_parent_fd,
-                    destination.name,
+                    isolated_parent_fd,
+                    isolated.name,
                     rollback_source_parent_fd,
                     source.name,
                 )
                 restored = True
                 os.fsync(rollback_source_parent_fd)
-                if destination_parent_fd != rollback_source_parent_fd:
-                    os.fsync(destination_parent_fd)
+                if isolated_parent_fd != rollback_source_parent_fd:
+                    os.fsync(isolated_parent_fd)
                 restored_metadata = os.stat(
                     source.name,
                     dir_fd=rollback_source_parent_fd,
@@ -9301,8 +9608,16 @@ def _atomic_move_beneath_home(
                     restored_metadata.st_dev,
                     restored_metadata.st_ino,
                 ) != moved_identity_for_restore:
+                    retained_racer = _isolate_current_failed_restore_leaf(
+                        home,
+                        source,
+                        source_parent_identity_for_restore,
+                        rollback_source_parent_fd,
+                    )
+                    restored = False
                     raise SyncError(
-                        f"restored entry changed after failed move: {source}"
+                        "restored entry changed after failed move and the racer "
+                        f"was retained outside the active path: {retained_racer}"
                     )
                 if moved_target_for_restore is not None:
                     restored_identity, restored_target = _symlink_snapshot_at(
@@ -9317,8 +9632,8 @@ def _atomic_move_beneath_home(
                             f"restored symlink changed after failed move: {source}"
                         )
                 if source_regular_for_restore is not None:
-                    restored_regular: RegularFileSnapshot | None = None
-                    restored_regular_error: BaseException | None = None
+                    restored_regular = None
+                    restored_regular_error = None
                     try:
                         restored_regular = _regular_file_snapshot_at(
                             rollback_source_parent_fd,
@@ -9327,145 +9642,50 @@ def _atomic_move_beneath_home(
                         )
                     except BaseException as snapshot_error:
                         restored_regular_error = snapshot_error
-                    restored_regular_matches = (
-                        restored_regular is not None
-                        and _regular_snapshot_matches(
+                    if (
+                        restored_regular is None
+                        or not _regular_snapshot_matches(
                             restored_regular,
                             source_regular_for_restore.parent_identity,
                             source_regular_for_restore,
                             expected_link_count=source_regular_for_restore.link_count,
                         )
-                    )
-                    if not restored_regular_matches:
-                        try:
-                            retained_source_metadata = os.stat(
-                                source.name,
-                                dir_fd=rollback_source_parent_fd,
-                                follow_symlinks=False,
-                            )
-                            retained_source_identity = (
-                                retained_source_metadata.st_dev,
-                                retained_source_metadata.st_ino,
-                            )
-                            if (
-                                not stat.S_ISREG(retained_source_metadata.st_mode)
-                                or retained_source_identity
-                                != moved_identity_for_restore
-                            ):
-                                raise SyncError(
-                                    "canonical source leaf changed before evidence "
-                                    "retention and was left in place: "
-                                    f"{source} ({retained_source_identity})"
-                                )
-                            _rename_noreplace_at(
-                                rollback_source_parent_fd,
-                                source.name,
-                                destination_parent_fd,
-                                destination.name,
-                            )
-                            restored = False
-                            os.fsync(rollback_source_parent_fd)
-                            if destination_parent_fd != rollback_source_parent_fd:
-                                os.fsync(destination_parent_fd)
-                            retained_identity: tuple[int, int]
-                            if restored_regular is None:
-                                retained_metadata = os.stat(
-                                    destination.name,
-                                    dir_fd=destination_parent_fd,
-                                    follow_symlinks=False,
-                                )
-                                retained_identity = (
-                                    retained_metadata.st_dev,
-                                    retained_metadata.st_ino,
-                                )
-                                if not stat.S_ISREG(retained_metadata.st_mode):
-                                    raise SyncError(
-                                        "unreadable regular-file evidence type changed "
-                                        f"while retaining it at {destination}"
-                                    )
-                            else:
-                                retained_regular = _regular_file_snapshot_at(
-                                    destination_parent_fd,
-                                    destination.name,
-                                    destination,
-                                )
-                                retained_identity = retained_regular.file_identity
-                                if (
-                                    retained_identity
-                                    == moved_identity_for_restore
-                                    and not _regular_snapshot_matches(
-                                        retained_regular,
-                                        destination_parent_identity_for_restore,
-                                        restored_regular,
-                                        expected_link_count=(
-                                            restored_regular.link_count
-                                        ),
-                                    )
-                                ):
-                                    raise SyncError(
-                                        "changed regular-file evidence could not be "
-                                        f"validated at {destination}"
-                                    )
-                            if retained_identity != moved_identity_for_restore:
-                                try:
-                                    _rename_noreplace_at(
-                                        destination_parent_fd,
-                                        destination.name,
-                                        rollback_source_parent_fd,
-                                        source.name,
-                                    )
-                                    restored = True
-                                    os.fsync(rollback_source_parent_fd)
-                                    if (
-                                        destination_parent_fd
-                                        != rollback_source_parent_fd
-                                    ):
-                                        os.fsync(destination_parent_fd)
-                                    restored_racer = os.stat(
-                                        source.name,
-                                        dir_fd=rollback_source_parent_fd,
-                                        follow_symlinks=False,
-                                    )
-                                    if (
-                                        restored_racer.st_dev,
-                                        restored_racer.st_ino,
-                                    ) != retained_identity:
-                                        raise SyncError(
-                                            "raced source leaf changed while being "
-                                            f"restored without replacement: {source}"
-                                        )
-                                except BaseException as racer_restore_error:
-                                    raise SyncError(
-                                        "wrong source leaf was moved while retaining "
-                                        "regular-file evidence and could not be "
-                                        "restored without replacement: "
-                                        f"{source}: {racer_restore_error}"
-                                    ) from racer_restore_error
-                                raise SyncError(
-                                    "wrong source leaf was moved while retaining "
-                                    "regular-file evidence and was restored without "
-                                    f"replacement: {source}"
-                                )
-                        except BaseException as retention_error:
-                            raise SyncError(
-                                "restored regular file changed after failed move "
-                                "and could not be retained at its destination: "
-                                f"{destination}: {retention_error}"
-                            ) from retention_error
-                        if restored_regular_error is not None:
-                            raise SyncError(
-                                "restored regular file could not be semantically "
-                                "revalidated after failed move and was retained at "
-                                f"its destination: {destination}"
-                            ) from restored_regular_error
-                        raise SyncError(
-                            "restored regular file changed after failed move and "
-                            f"was retained at its destination: {destination}"
+                    ):
+                        retained_path = _isolate_current_failed_restore_leaf(
+                            home,
+                            source,
+                            source_parent_identity_for_restore,
+                            rollback_source_parent_fd,
                         )
+                        restored = False
+                        semantic_error = SyncError(
+                            "restored regular source changed and was retained "
+                            f"outside the active path: {retained_path}"
+                        )
+                        if restored_regular_error is not None:
+                            raise semantic_error from restored_regular_error
+                        raise semantic_error
+                rollback_destination_parent_fd = _open_directory_beneath(
+                    home,
+                    destination.parent,
+                )
+                if (
+                    _directory_identity(rollback_destination_parent_fd)
+                    != destination_parent_identity_for_restore
+                    or not _bound_directory_matches(
+                        home,
+                        destination.parent,
+                        rollback_destination_parent_fd,
+                    )
+                ):
+                    raise SyncError(
+                        "canonical destination parent changed after exact source "
+                        f"restoration: {destination.parent}"
+                    )
                 try:
                     os.stat(
                         destination.name,
-                        dir_fd=destination_parent_fd,
+                        dir_fd=rollback_destination_parent_fd,
                         follow_symlinks=False,
                     )
                 except FileNotFoundError:
@@ -9486,12 +9706,17 @@ def _atomic_move_beneath_home(
                         "safe move failed after exact source restoration could not "
                         f"be validated: {source}: {rollback_error}"
                     ) from error
+                retained_location = isolated or destination
                 raise SyncError(
-                    "safe move failed and the entry was retained at its destination: "
-                    f"{destination}: {rollback_error}"
+                    "safe move failed and the entry was retained outside the "
+                    f"active source: {retained_location}: {rollback_error}"
                 ) from error
         raise
     finally:
+        if rollback_destination_parent_fd >= 0:
+            _close_fd_quietly(rollback_destination_parent_fd)
+        if isolated_parent_fd >= 0:
+            _close_fd_quietly(isolated_parent_fd)
         if rollback_source_parent_fd >= 0:
             _close_fd_quietly(rollback_source_parent_fd)
         _close_fd_quietly(source_parent_fd)
@@ -14144,64 +14369,17 @@ def _publish_regular_hardlink_beneath(
                 and error.code == PENDING_REGULAR_PUBLICATION_RETAINED_CODE
             ):
                 raise
-            try:
-                current_destination = _read_managed_state_file_snapshot(
-                    home,
-                    destination,
-                    destination_parent_fd,
-                    expected_identity=expected_source.file_identity,
-                    maximum_bytes=maximum_bytes,
-                )
-            except (OSError, SyncError):
-                raise SyncError(
-                    "regular-file evidence publication failed after a namespace "
-                    "race; the destination leaf was retained without deletion: "
-                    f"{destination}",
-                    code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
-                ) from error
-            if not _managed_state_snapshot_matches_file_evidence(
-                current_destination,
-                expected_source,
-            ):
-                raise SyncError(
-                    "regular-file evidence publication failed after a namespace "
-                    "race; the destination leaf was retained without deletion: "
-                    f"{destination}",
-                    code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
-                ) from error
-            try:
-                current_source = _read_managed_state_file_snapshot(
-                    home,
-                    source,
-                    source_parent_fd,
-                    expected_identity=expected_source.file_identity,
-                    maximum_bytes=maximum_bytes,
-                )
-            except (OSError, SyncError):
-                raise SyncError(
-                    "regular-file evidence publication failed and no exact "
-                    "source alias could be revalidated; the destination leaf "
-                    f"was retained without deletion: {destination}",
-                    code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
-                ) from error
-            if not _managed_state_snapshot_matches_bound_file_evidence(
-                current_source,
-                expected_source,
-            ):
-                raise SyncError(
-                    "regular-file evidence publication failed and no exact "
-                    "source alias could be revalidated; the destination leaf "
-                    f"was retained without deletion: {destination}",
-                    code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
-                ) from error
-            _isolate_and_delete_pending_cleanup_file(
-                home,
-                destination,
-                destination_parent_fd,
-                current_destination,
-                label="failed regular-file evidence publication",
-                maximum_bytes=maximum_bytes,
-            )
+            # Once link(2) succeeds, the destination may already be the last
+            # exact alias. A pathname revalidation of source cannot authorize a
+            # later destination unlink because source can be replaced between
+            # those operations. Retain every post-publication destination;
+            # batch recovery can classify it without risking evidence loss.
+            raise SyncError(
+                "regular-file evidence publication failed after link creation; "
+                "the destination leaf was retained without deletion: "
+                f"{destination}",
+                code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
+            ) from error
         raise
     finally:
         _close_fd_quietly(destination_parent_fd)
@@ -14231,7 +14409,9 @@ def _publish_regular_reconcile_hardlink_beneath(
     except BaseException:
         _close_fd_quietly(source_parent_fd)
         raise
+    published = False
     published_snapshot: RegularFileSnapshot | None = None
+    expected_publication: RegularFileSnapshot | None = None
     try:
         actual_source = _regular_file_snapshot_at(
             source_parent_fd,
@@ -14253,6 +14433,17 @@ def _publish_regular_reconcile_hardlink_beneath(
             src_dir_fd=source_parent_fd,
             dst_dir_fd=target_parent_fd,
             follow_symlinks=False,
+        )
+        published = True
+        expected_publication = RegularFileSnapshot(
+            parent_identity=_directory_identity(target_parent_fd),
+            file_identity=source_snapshot.file_identity,
+            sha256=source_snapshot.sha256,
+            size=source_snapshot.size,
+            mode=source_snapshot.mode,
+            uid=source_snapshot.uid,
+            gid=source_snapshot.gid,
+            link_count=source_snapshot.link_count + 1,
         )
         published_snapshot = _regular_file_snapshot_at(
             target_parent_fd,
@@ -14285,23 +14476,14 @@ def _publish_regular_reconcile_hardlink_beneath(
             raise SyncError(f"managed regular-file parent changed: {target}")
         return published_snapshot
     except BaseException as error:
-        if published_snapshot is not None:
-            if not _regular_snapshot_leaf_matches(
-                published_snapshot,
-                source_snapshot,
-            ):
-                raise SyncError(
-                    "managed regular-file publication failed after a namespace "
-                    "race; the destination leaf was retained without deletion: "
-                    f"{target}",
-                    code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
-                ) from error
+        if published:
+            assert expected_publication is not None
             try:
                 if pending_batch is None or pending_record is None:
                     _delete_exact_regular_publication_beneath(
                         home,
                         target,
-                        published_snapshot,
+                        expected_publication,
                     )
                 else:
                     _delete_pending_regular_publication_beneath(
@@ -14309,7 +14491,7 @@ def _publish_regular_reconcile_hardlink_beneath(
                         pending_batch,
                         pending_record,
                         target,
-                        published_snapshot,
+                        expected_publication,
                         phase=cleanup_phase,
                     )
             except BaseException as cleanup_error:
@@ -14331,21 +14513,6 @@ def _delete_exact_regular_publication_beneath(
 ) -> None:
     parent_fd = _open_directory_beneath(home, target.parent)
     try:
-        current = _regular_file_snapshot_at(
-            parent_fd,
-            target.name,
-            target,
-            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
-        )
-        if not _regular_snapshot_matches(
-            current,
-            expected.parent_identity,
-            expected,
-            expected_link_count=expected.link_count,
-        ):
-            raise SyncError(
-                f"published regular-file destination changed and was retained: {target}"
-            )
         planned = (
             expected.file_identity[0],
             expected.file_identity[1],
@@ -14356,14 +14523,25 @@ def _delete_exact_regular_publication_beneath(
             target.name,
             expected.parent_identity,
             planned,
-            retain_mismatch=False,
         )
-        isolated_snapshot = _regular_file_snapshot_at(
-            parent_fd,
-            active_name,
-            target.with_name(active_name),
-            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
-        )
+        try:
+            isolated_snapshot = _regular_file_snapshot_at(
+                parent_fd,
+                active_name,
+                target.with_name(active_name),
+                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+            )
+        except BaseException:
+            _retain_pending_cleanup_entry(
+                parent_fd,
+                active_name,
+                expected.parent_identity,
+                planned,
+                label=(
+                    "published regular-file destination became unreadable after "
+                    f"isolation: {target}"
+                ),
+            )
         if not _regular_snapshot_matches(
             isolated_snapshot,
             expected.parent_identity,
@@ -14632,42 +14810,77 @@ def _delete_pending_regular_publication_beneath(
             parent_identity,
             planned,
         )
-        journal_path = _pending_regular_publication_cleanup_path(batch, record, phase)
-        _publish_atomic_exclusive_internal_file(
-            home,
-            journal_path,
-            _pending_regular_publication_cleanup_payload(
-                batch, record, expected, phase, active_name
-            ),
-        )
-        current = _regular_file_snapshot_at(
-            parent_fd,
-            target.name,
-            target,
-            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
-        )
-        if not _regular_snapshot_matches(
-            current,
-            expected.parent_identity,
-            expected,
-            expected_link_count=expected.link_count,
-        ):
-            raise SyncError("pending regular publication changed before cleanup")
+        # Remove the publication from its Codex-loadable canonical name before
+        # any content read or cleanup-journal write can fail. The internal name
+        # is durable and does not end in .toml, so even unreadable or replaced
+        # content remains fail-closed.
         _rename_noreplace_at(parent_fd, target.name, parent_fd, active_name)
         os.fsync(parent_fd)
-        active = _regular_file_snapshot_at(
-            parent_fd,
-            active_name,
-            target.with_name(active_name),
-            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
-        )
+        journal_path = _pending_regular_publication_cleanup_path(batch, record, phase)
+        try:
+            _publish_atomic_exclusive_internal_file(
+                home,
+                journal_path,
+                _pending_regular_publication_cleanup_payload(
+                    batch, record, expected, phase, active_name
+                ),
+            )
+        except BaseException:
+            try:
+                published_journal = _read_pending_regular_publication_cleanup(
+                    home,
+                    batch,
+                    record,
+                    phase,
+                )
+            except BaseException:
+                published_journal = None
+            if published_journal is None:
+                _retain_pending_cleanup_entry(
+                    parent_fd,
+                    active_name,
+                    parent_identity,
+                    planned,
+                    label=(
+                        "pending regular publication cleanup journal failed after "
+                        f"isolation: {target}"
+                    ),
+                )
+            # The atomic rename may have committed the complete journal before
+            # surfacing an error. Leave its named internal entry in place so the
+            # normal recovery path can finish the exact deletion.
+            raise
+        try:
+            active = _regular_file_snapshot_at(
+                parent_fd,
+                active_name,
+                target.with_name(active_name),
+                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+            )
+        except BaseException:
+            _retain_pending_cleanup_entry(
+                parent_fd,
+                active_name,
+                parent_identity,
+                planned,
+                label=(
+                    "pending regular publication became unreadable after "
+                    f"isolation: {target}"
+                ),
+            )
         if not _regular_snapshot_matches(
             active,
             expected.parent_identity,
             expected,
             expected_link_count=expected.link_count,
         ):
-            raise SyncError("pending regular publication active entry changed")
+            _retain_pending_cleanup_entry(
+                parent_fd,
+                active_name,
+                parent_identity,
+                planned,
+                label=f"pending regular publication active entry changed: {target}",
+            )
         os.unlink(active_name, dir_fd=parent_fd)
         os.fsync(parent_fd)
         # Keep this immutable receipt until whole-batch finalization. Isolating
@@ -18728,11 +18941,8 @@ def _pending_commit_snapshot_matches(
     expected: ManagedStateFileSnapshot,
 ) -> bool:
     return (
-        actual.exists
-        and expected.exists
-        and actual.file_identity == expected.file_identity
-        and actual.mode == expected.mode
-        and actual.payload == expected.payload
+        _managed_state_snapshot_matches_file_evidence(actual, expected)
+        and actual.uid == os.geteuid()
     )
 
 
@@ -18841,8 +19051,10 @@ def _pending_rollback_marker_snapshot(
             return None
         expected_payload = _pending_rollback_marker_payload(batch)
         if (
-            marker.payload != expected_payload
+            marker.file_type != stat.S_IFREG
+            or marker.payload != expected_payload
             or marker.mode != 0o600
+            or marker.uid != os.geteuid()
             or marker.parent_identity != _directory_identity(parent_fd)
         ):
             raise SyncError("pending transaction rollback marker changed")
@@ -19859,6 +20071,7 @@ def _discard_incomplete_pending_cleanup_ticket(
                 if (
                     snapshot.file_type != stat.S_IFREG
                     or snapshot.mode != 0o600
+                    or snapshot.uid != os.geteuid()
                     or not _managed_state_snapshot_has_complete_file_evidence(snapshot)
                 ):
                     raise SyncError(
@@ -19891,6 +20104,7 @@ def _discard_incomplete_pending_cleanup_ticket(
             if (
                 retained_snapshot.file_type != stat.S_IFREG
                 or retained_snapshot.mode != 0o600
+                or retained_snapshot.uid != os.geteuid()
                 or not _managed_state_snapshot_has_complete_file_evidence(
                     retained_snapshot
                 )
@@ -20174,18 +20388,43 @@ def _bound_directory_member_names_for_staging_recovery(
     path: Path,
     *,
     expected_entries: int,
+    expected_identity: tuple[int, int] | None = None,
 ) -> tuple[str, ...]:
     if expected_entries < 0:
         raise SyncError("pending staging expected entry count is invalid")
     directory_fd = _open_directory_beneath(home, path)
     try:
+        before = os.fstat(directory_fd)
+        before_identity = (before.st_dev, before.st_ino)
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or stat.S_IMODE(before.st_mode) != 0o700
+            or before.st_uid != os.geteuid()
+            or (
+                expected_identity is not None
+                and before_identity != expected_identity
+            )
+        ):
+            raise SyncError(
+                f"pending staging directory owner, mode, or identity changed: {path}"
+            )
         if not _bound_directory_matches(home, path, directory_fd):
             raise SyncError(f"pending staging directory changed: {path}")
-        return _directory_member_names(
+        names = _directory_member_names(
             directory_fd,
             maximum_entries=expected_entries + 1,
             overflow_message="pending staging recovery exceeds the entry limit",
         )
+        after = os.fstat(directory_fd)
+        if (
+            (after.st_dev, after.st_ino) != before_identity
+            or not stat.S_ISDIR(after.st_mode)
+            or stat.S_IMODE(after.st_mode) != 0o700
+            or after.st_uid != os.geteuid()
+            or not _bound_directory_matches(home, path, directory_fd)
+        ):
+            raise SyncError(f"pending staging directory changed: {path}")
+        return names
     finally:
         _close_fd_quietly(directory_fd)
 
@@ -20193,12 +20432,14 @@ def _bound_directory_member_names_for_staging_recovery(
 def _require_pending_staging_initial_skeleton(
     home: Path,
     batch_root: Path,
+    batch_root_identity: tuple[int, int],
 ) -> None:
     if set(
         _bound_directory_member_names_for_staging_recovery(
             home,
             batch_root,
             expected_entries=2,
+            expected_identity=batch_root_identity,
         )
     ) != {"metadata.json", "pending"}:
         raise SyncError(
@@ -20206,6 +20447,13 @@ def _require_pending_staging_initial_skeleton(
         )
     batch_fd = _open_directory_beneath(home, batch_root)
     try:
+        if (
+            _directory_identity(batch_fd) != batch_root_identity
+            or not _bound_directory_matches(home, batch_root, batch_fd)
+        ):
+            raise SyncError(
+                f"pending staging batch changed: {batch_root.name}"
+            )
         metadata = _read_managed_state_file_snapshot(
             home,
             batch_root / "metadata.json",
@@ -20215,7 +20463,10 @@ def _require_pending_staging_initial_skeleton(
         if (
             metadata.file_type != stat.S_IFREG
             or metadata.mode != 0o600
+            or metadata.uid != os.geteuid()
             or metadata.payload is None
+            or metadata.parent_identity != batch_root_identity
+            or not _managed_state_snapshot_has_complete_file_evidence(metadata)
         ):
             raise SyncError(
                 f"pending staging metadata changed: {batch_root.name}"
@@ -20276,6 +20527,26 @@ def _require_pending_staging_initial_skeleton(
         raise SyncError(
             f"pending staging temp authority is ambiguous: {batch_root.name}"
         )
+    temp_path = marker_path.parent / state_names[0]
+    state_fd = _open_directory_beneath(home, marker_path.parent)
+    try:
+        temp = _read_managed_state_file_snapshot(
+            home,
+            temp_path,
+            state_fd,
+        )
+        if (
+            temp.file_type != stat.S_IFREG
+            or temp.mode != 0o600
+            or temp.uid != os.geteuid()
+            or not _managed_state_snapshot_has_complete_file_evidence(temp)
+        ):
+            raise SyncError(
+                f"pending staging temp authority owner or mode changed: "
+                f"{batch_root.name}"
+            )
+    finally:
+        _close_fd_quietly(state_fd)
 
 
 def _discover_pending_staging_marker_temps(
@@ -20358,7 +20629,11 @@ def _recover_pending_staging_marker_temps(
     ):
         if not budget.charge_batch(batch_root.name):
             continue
-        _require_pending_staging_initial_skeleton(home, batch_root)
+        _require_pending_staging_initial_skeleton(
+            home,
+            batch_root,
+            batch_identity,
+        )
         marker_path = batch_root / Path(*PENDING_STATE_STAGING_MARKER.parts)
         _publish_atomic_exclusive_internal_file(
             home,
@@ -20990,10 +21265,16 @@ def _isolate_pending_cleanup_entry(
             dir_fd=directory_fd,
             follow_symlinks=False,
         )
-    except OSError as error:
-        raise SyncError(
-            f"pending cleanup isolated entry changed: {active_name}"
-        ) from error
+    except OSError:
+        if retain_mismatch:
+            _retain_pending_cleanup_entry(
+                directory_fd,
+                active_name,
+                parent_identity,
+                planned,
+                label=f"pending cleanup isolated entry changed: {name}",
+            )
+        raise SyncError(f"pending cleanup isolated entry changed: {active_name}")
     if _pending_cleanup_entry_plan(current) != planned:
         if retain_mismatch:
             _retain_pending_cleanup_entry(
@@ -22021,6 +22302,10 @@ def _restore_pending_cleanup_control_tombstones(
                 raise SyncError(
                     f"pending cleanup retained control disappeared: {canonical}"
                 )
+            if retained_snapshot.uid != os.geteuid():
+                raise SyncError(
+                    f"pending cleanup retained control owner changed: {canonical}"
+                )
             recovered = _restore_retained_pending_cleanup_file(
                 home,
                 canonical_path,
@@ -22121,7 +22406,12 @@ def _read_orphan_pending_cleanup_empty_proof(
         )
     finally:
         _close_fd_quietly(index_fd)
-    if not proof.exists or proof.payload is None or proof.mode != 0o600:
+    if (
+        not proof.exists
+        or proof.payload is None
+        or proof.mode != 0o600
+        or proof.uid != os.geteuid()
+    ):
         raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
     data = _decode_managed_state_json(proof.payload, proof_path)
     if set(data) != {
@@ -22582,7 +22872,11 @@ def _restore_pending_state_before(
             expected_identity=batch.state_before.file_identity,
         )
         if (
-            evidence_snapshot.payload != batch.state_before.payload
+            not _managed_state_snapshot_matches_file_evidence(
+                evidence_snapshot,
+                batch.state_before,
+            )
+            or evidence_snapshot.payload != batch.state_before.payload
             or evidence_snapshot.mode != batch.state_before.mode
         ):
             raise SyncError("pending transaction state-before evidence changed")
@@ -22601,7 +22895,11 @@ def _restore_pending_state_before(
             expected_identity=batch.state_before.file_identity,
         )
         if (
-            restored.file_identity != batch.state_before.file_identity
+            not _managed_state_snapshot_matches_file_evidence(
+                restored,
+                batch.state_before,
+            )
+            or restored.file_identity != batch.state_before.file_identity
             or restored.payload != batch.state_before.payload
             or restored.mode != batch.state_before.mode
         ):
