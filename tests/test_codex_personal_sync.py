@@ -13706,6 +13706,481 @@ while True:
             self.assertIn(["/bin/launchctl", "bootout", target], calls)
             self.assertIn(["/bin/launchctl", "disable", target], calls)
 
+    def test_regular_evidence_publication_retains_source_swap_leaf(self) -> None:
+        home = self.root / "home" / ".codex"
+        source = home / "personal-sync" / "source" / "authority"
+        destination = home / "personal-sync" / "evidence" / "published"
+        source.parent.mkdir(parents=True)
+        destination.parent.mkdir(parents=True)
+        source.write_bytes(b"authority")
+        source.chmod(0o600)
+        source_parent_fd = MODULE._open_directory_beneath(home, source.parent)
+        try:
+            expected = MODULE._read_managed_state_file_snapshot(
+                home,
+                source,
+                source_parent_fd,
+            )
+        finally:
+            os.close(source_parent_fd)
+        original_authority = source.with_name("original-authority")
+        real_link = os.link
+
+        def swap_source_before_link(*args, **kwargs) -> None:
+            source.rename(original_authority)
+            source.write_bytes(b"foreign")
+            source.chmod(0o600)
+            real_link(*args, **kwargs)
+
+        with (
+            mock.patch.object(MODULE.os, "link", side_effect=swap_source_before_link),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "retained without deletion",
+            ),
+        ):
+            MODULE._publish_regular_hardlink_beneath(
+                home,
+                source,
+                destination,
+                expected,
+            )
+
+        self.assertEqual(original_authority.read_bytes(), b"authority")
+        self.assertEqual(destination.read_bytes(), b"foreign")
+        self.assertEqual(source.stat().st_ino, destination.stat().st_ino)
+
+    def test_regular_staging_source_swap_retains_batch_authority(self) -> None:
+        release = self.root / "release"
+        role_source = release / "personal_codex" / "agents" / "reviewer.toml"
+        role_source.parent.mkdir(parents=True)
+        role_source.write_text("name = 'reviewer'\n", encoding="utf-8")
+        manifest_path = release / MODULE.MANIFEST_RELATIVE_PATH
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "owner": MODULE.PUBLIC_OWNER,
+                    "links": [
+                        {
+                            "source": "personal_codex/agents/reviewer.toml",
+                            "target": "agents/reviewer.toml",
+                            "kind": "file",
+                            "owner": MODULE.PUBLIC_OWNER,
+                        }
+                    ],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        home = self.root / "home" / ".codex"
+        real_publish = MODULE._publish_regular_hardlink_beneath
+        raced_paths: dict[str, Path] = {}
+
+        def publish_with_source_swap(*args, **kwargs):
+            selected_home, source, destination, expected = args
+            if not raced_paths and source.parent.name == "stage":
+                original = source.with_name(source.name + ".original-authority")
+                real_link = MODULE.os.link
+
+                def swap_during_link(*link_args, **link_kwargs) -> None:
+                    source.rename(original)
+                    source.write_bytes(b"foreign")
+                    source.chmod(0o600)
+                    real_link(*link_args, **link_kwargs)
+
+                raced_paths.update(
+                    source=source,
+                    destination=destination,
+                    original=original,
+                )
+                with mock.patch.object(
+                    MODULE.os,
+                    "link",
+                    side_effect=swap_during_link,
+                ):
+                    return real_publish(
+                        selected_home,
+                        source,
+                        destination,
+                        expected,
+                        **kwargs,
+                    )
+            return real_publish(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_publish_regular_hardlink_beneath",
+                side_effect=publish_with_source_swap,
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "retained without deletion"),
+        ):
+            self.run_quietly(
+                MODULE.install_release_tree,
+                release,
+                home,
+                SHA1,
+                dry_run=False,
+            )
+
+        source = raced_paths["source"]
+        destination = raced_paths["destination"]
+        original = raced_paths["original"]
+        batch_root = destination.parents[2]
+        self.assertEqual(source.read_bytes(), b"foreign")
+        self.assertEqual(destination.read_bytes(), b"foreign")
+        self.assertEqual(source.stat().st_ino, destination.stat().st_ino)
+        self.assertEqual(original.read_text(encoding="utf-8"), "name = 'reviewer'\n")
+        self.assertTrue(
+            (batch_root / Path(*MODULE.PENDING_STATE_STAGING_MARKER.parts)).is_file()
+        )
+        self.assertTrue(
+            MODULE._pending_cleanup_ticket_path(home, batch_root.name).is_file()
+        )
+
+    def test_regular_evidence_publication_retains_destination_replacement(
+        self,
+    ) -> None:
+        home = self.root / "home" / ".codex"
+        source = home / "personal-sync" / "source" / "authority"
+        destination = home / "personal-sync" / "evidence" / "published"
+        source.parent.mkdir(parents=True)
+        destination.parent.mkdir(parents=True)
+        source.write_bytes(b"authority")
+        source.chmod(0o600)
+        source_parent_fd = MODULE._open_directory_beneath(home, source.parent)
+        try:
+            expected = MODULE._read_managed_state_file_snapshot(
+                home,
+                source,
+                source_parent_fd,
+            )
+        finally:
+            os.close(source_parent_fd)
+        real_link = os.link
+
+        def replace_destination_after_link(*args, **kwargs) -> None:
+            real_link(*args, **kwargs)
+            destination.unlink()
+            destination.write_bytes(b"foreign")
+            destination.chmod(0o600)
+
+        with (
+            mock.patch.object(
+                MODULE.os,
+                "link",
+                side_effect=replace_destination_after_link,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "retained without deletion",
+            ),
+        ):
+            MODULE._publish_regular_hardlink_beneath(
+                home,
+                source,
+                destination,
+                expected,
+            )
+
+        self.assertEqual(source.read_bytes(), b"authority")
+        self.assertEqual(destination.read_bytes(), b"foreign")
+        self.assertNotEqual(source.stat().st_ino, destination.stat().st_ino)
+
+    def test_regular_evidence_publication_uses_explicit_staging_limit(self) -> None:
+        home = self.root / "home" / ".codex"
+        source = home / "personal-sync" / "source" / "authority"
+        destination = home / "personal-sync" / "evidence" / "published"
+        source.parent.mkdir(parents=True)
+        destination.parent.mkdir(parents=True)
+        source.write_bytes(b"12345")
+        source.chmod(0o600)
+        source_parent_fd = MODULE._open_directory_beneath(home, source.parent)
+        try:
+            expected = MODULE._read_managed_state_file_snapshot(
+                home,
+                source,
+                source_parent_fd,
+                maximum_bytes=8,
+            )
+        finally:
+            os.close(source_parent_fd)
+
+        with (
+            mock.patch.object(MODULE, "MAX_MANAGED_STATE_BYTES", 4),
+            self.assertRaisesRegex(MODULE.SyncError, "exceeds 4 byte"),
+        ):
+            MODULE._publish_regular_hardlink_beneath(
+                home,
+                source,
+                destination,
+                expected,
+            )
+        self.assertFalse(os.path.lexists(destination))
+
+        with mock.patch.object(MODULE, "MAX_ARCHIVE_MEMBER_BYTES", 8):
+            published = MODULE._publish_regular_hardlink_beneath(
+                home,
+                source,
+                destination,
+                expected,
+                maximum_bytes=MODULE.MAX_ARCHIVE_MEMBER_BYTES,
+            )
+        self.assertEqual(published.payload, b"12345")
+        self.assertEqual(source.stat().st_ino, destination.stat().st_ino)
+
+    def test_regular_reconcile_publication_retains_destination_replacement(
+        self,
+    ) -> None:
+        home = self.root / "home" / ".codex"
+        stage = home / "personal-sync" / "stage" / "00000000"
+        target = home / "agents" / "reviewer.toml"
+        stage.parent.mkdir(parents=True)
+        target.parent.mkdir(parents=True)
+        stage.write_bytes(b"authority")
+        stage.chmod(0o600)
+        stage_snapshot = MODULE._read_regular_file_snapshot_beneath(
+            home,
+            stage,
+            require_managed_access=False,
+        )
+        target_plan = MODULE._capture_reconcile_target_snapshot(home, target)
+        real_link = os.link
+
+        def replace_destination_after_link(*args, **kwargs) -> None:
+            real_link(*args, **kwargs)
+            target.unlink()
+            target.write_bytes(b"foreign")
+            target.chmod(0o600)
+
+        with (
+            mock.patch.object(
+                MODULE.os,
+                "link",
+                side_effect=replace_destination_after_link,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "retained without deletion",
+            ),
+        ):
+            MODULE._publish_regular_reconcile_hardlink_beneath(
+                home,
+                stage,
+                target,
+                stage_snapshot,
+                target_plan,
+                {},
+            )
+
+        self.assertEqual(stage.read_bytes(), b"authority")
+        self.assertEqual(target.read_bytes(), b"foreign")
+        self.assertNotEqual(stage.stat().st_ino, target.stat().st_ino)
+
+    def test_pending_regular_aliases_reject_foreign_hardlink(self) -> None:
+        home = self.root / "home" / ".codex"
+        batch_root = (
+            home
+            / "personal-sync"
+            / "quarantine"
+            / "20260901T000000Z-1-1"
+        )
+        stage = batch_root / "pending" / "stage" / "00000000"
+        evidence = batch_root / "pending" / "evidence" / "00000000"
+        target = home / "agents" / "reviewer.toml"
+        stage.parent.mkdir(parents=True)
+        evidence.parent.mkdir(parents=True)
+        target.parent.mkdir(parents=True)
+        stage.write_bytes(b"role")
+        stage.chmod(0o600)
+        os.link(stage, evidence)
+        os.link(stage, target)
+        identity = (stage.stat().st_dev, stage.stat().st_ino)
+        record = mock.Mock()
+        record.is_regular.return_value = True
+        record.target = MODULE.PurePosixPath("agents/reviewer.toml")
+        record.stage = MODULE.PurePosixPath(
+            "pending", "stage", "00000000"
+        )
+        record.evidence = MODULE.PurePosixPath(
+            "pending", "evidence", "00000000"
+        )
+        record.stage_identity = identity
+        record.evidence_identity = identity
+        record.before_evidence_identity = None
+        record.before_evidence = None
+        record.backup = None
+        batch = mock.Mock(
+            batch_root=batch_root,
+            batch_root_identity=(batch_root.stat().st_dev, batch_root.stat().st_ino),
+            records=(record,),
+        )
+        snapshot = MODULE._read_regular_file_snapshot_beneath(
+            home,
+            target,
+            require_managed_access=False,
+        )
+        MODULE._verify_pending_regular_aliases(home, batch, target, snapshot)
+
+        foreign_alias = self.root / "foreign-alias"
+        os.link(stage, foreign_alias)
+        changed = MODULE._read_regular_file_snapshot_beneath(
+            home,
+            target,
+            require_managed_access=False,
+        )
+        with self.assertRaisesRegex(MODULE.SyncError, "unauthorized hard-link"):
+            MODULE._verify_pending_regular_aliases(home, batch, target, changed)
+        self.assertEqual(foreign_alias.read_bytes(), b"role")
+
+    def test_pending_cleanup_rejects_unknown_batch_entry_before_deletion(
+        self,
+    ) -> None:
+        batch_root = self.root / "batch"
+        batch_root.mkdir()
+        metadata = batch_root / "metadata.json"
+        metadata.write_text("{}\n", encoding="utf-8")
+        foreign = batch_root / "foreign"
+        foreign.write_text("foreign\n", encoding="utf-8")
+        batch_fd = os.open(batch_root, MODULE._directory_open_flags(nofollow=True))
+        try:
+            identity = MODULE._directory_identity(batch_fd)
+            with self.assertRaisesRegex(MODULE.SyncError, "unknown entry"):
+                MODULE._remove_pending_batch_directory_contents(
+                    batch_fd,
+                    identity,
+                    MODULE._directory_mount_identity(batch_fd),
+                    [32],
+                    depth=0,
+                    name_validator=MODULE._pending_batch_cleanup_name_is_authorized,
+                )
+        finally:
+            os.close(batch_fd)
+        self.assertEqual(metadata.read_text(encoding="utf-8"), "{}\n")
+        self.assertEqual(foreign.read_text(encoding="utf-8"), "foreign\n")
+
+    def test_pending_cleanup_identity_ledger_rejects_late_injection(self) -> None:
+        batch_root = self.root / "batch"
+        batch_root.mkdir()
+        metadata = batch_root / "metadata.json"
+        metadata.write_text("{}\n", encoding="utf-8")
+        foreign = batch_root / "foreign"
+        batch_fd = os.open(batch_root, MODULE._directory_open_flags(nofollow=True))
+        real_capture = MODULE._capture_pending_cleanup_identity_ledger
+        injected = False
+
+        def capture_then_inject(*args, **kwargs) -> None:
+            nonlocal injected
+            real_capture(*args, **kwargs)
+            if not injected:
+                foreign.write_text("foreign\n", encoding="utf-8")
+                injected = True
+
+        try:
+            identity = MODULE._directory_identity(batch_fd)
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_capture_pending_cleanup_identity_ledger",
+                    side_effect=capture_then_inject,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "identity-ledger capture",
+                ),
+            ):
+                MODULE._remove_pending_batch_directory_contents(
+                    batch_fd,
+                    identity,
+                    MODULE._directory_mount_identity(batch_fd),
+                    [32],
+                    depth=0,
+                    name_validator=MODULE._pending_batch_cleanup_name_is_authorized,
+                )
+        finally:
+            os.close(batch_fd)
+        self.assertEqual(metadata.read_text(encoding="utf-8"), "{}\n")
+        self.assertEqual(foreign.read_text(encoding="utf-8"), "foreign\n")
+
+    def test_quarantine_allocator_returns_bound_original_batch(self) -> None:
+        home = self.root / "home" / ".codex"
+        home.mkdir(parents=True)
+        allocation = MODULE._quarantine_batch_root(
+            home,
+            [],
+            retain_binding=True,
+        )
+        self.assertIsInstance(allocation, tuple)
+        batch_root, batch_fd, batch_identity = allocation
+        moved_root = batch_root.with_name(batch_root.name + ".moved")
+        try:
+            batch_root.rename(moved_root)
+            batch_root.mkdir()
+            self.assertEqual(MODULE._directory_identity(batch_fd), batch_identity)
+            self.assertFalse(MODULE._bound_directory_matches(home, batch_root, batch_fd))
+            self.assertEqual(list(batch_root.iterdir()), [])
+            self.assertTrue((moved_root / "metadata.json").is_file())
+        finally:
+            os.close(batch_fd)
+
+    def test_pending_staging_rejects_allocator_return_replacement(self) -> None:
+        release = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_agent_only_release(release)
+        real_allocate = MODULE._quarantine_batch_root
+        replacement_roots: list[Path] = []
+
+        def replace_batch_after_allocation(
+            selected_home: Path,
+            actions: list[MODULE.ReconcileAction],
+            *,
+            retain_binding: bool = False,
+        ):
+            allocation = real_allocate(
+                selected_home,
+                actions,
+                retain_binding=retain_binding,
+            )
+            if not retain_binding or replacement_roots:
+                return allocation
+            assert isinstance(allocation, tuple)
+            batch_root, _batch_fd, _batch_identity = allocation
+            moved_root = batch_root.with_name(batch_root.name + ".original")
+            batch_root.rename(moved_root)
+            batch_root.mkdir()
+            (batch_root / "foreign").write_text("foreign\n", encoding="utf-8")
+            replacement_roots.append(batch_root)
+            return allocation
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_quarantine_batch_root",
+                side_effect=replace_batch_after_allocation,
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "quarantine batch changed"),
+        ):
+            self.run_quietly(
+                MODULE.install_release_tree,
+                release,
+                home,
+                SHA1,
+                dry_run=False,
+            )
+
+        self.assertEqual(len(replacement_roots), 1)
+        self.assertEqual(
+            (replacement_roots[0] / "foreign").read_text(encoding="utf-8"),
+            "foreign\n",
+        )
+        self.assertEqual(
+            {path.name for path in replacement_roots[0].iterdir()},
+            {"foreign"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

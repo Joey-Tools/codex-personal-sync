@@ -35,6 +35,72 @@ class PendingStagingCleanupTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_existing_quarantine_directory_is_opened_once(self) -> None:
+        batch_root = self.root / "batch-existing-directory"
+        child = batch_root / "pending"
+        child.mkdir(parents=True)
+        root_fd = os.open(
+            batch_root,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        real_open = MODULE.os.open
+        opened_child_fds: list[int] = []
+
+        def track_open(name, flags, *args, **kwargs):
+            fd = real_open(name, flags, *args, **kwargs)
+            if name == child.name:
+                opened_child_fds.append(fd)
+            return fd
+
+        returned_fd = -1
+        try:
+            with mock.patch.object(MODULE.os, "open", side_effect=track_open):
+                returned_fd = MODULE._create_quarantine_batch_directory_at(
+                    root_fd,
+                    (child.name,),
+                )
+            self.assertEqual(opened_child_fds, [returned_fd])
+        finally:
+            if returned_fd >= 0:
+                os.close(returned_fd)
+            os.close(root_fd)
+
+    def test_quarantine_directory_open_closes_child_on_fsync_error(self) -> None:
+        batch_root = self.root / "batch-directory-fsync-error"
+        batch_root.mkdir()
+        root_fd = os.open(
+            batch_root,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        real_open = MODULE.os.open
+        opened_child_fds: list[int] = []
+
+        def track_open(name, flags, *args, **kwargs):
+            fd = real_open(name, flags, *args, **kwargs)
+            if name == "pending":
+                opened_child_fds.append(fd)
+            return fd
+
+        try:
+            with (
+                mock.patch.object(MODULE.os, "open", side_effect=track_open),
+                mock.patch.object(
+                    MODULE.os,
+                    "fsync",
+                    side_effect=OSError("injected directory fsync failure"),
+                ),
+                self.assertRaisesRegex(OSError, "injected directory fsync failure"),
+            ):
+                MODULE._create_quarantine_batch_directory_at(
+                    root_fd,
+                    ("pending",),
+                )
+            self.assertEqual(len(opened_child_fds), 1)
+            with self.assertRaises(OSError):
+                os.fstat(opened_child_fds[0])
+        finally:
+            os.close(root_fd)
+
     def _fail_after_live_preimage_hardlink(self):
         real_publish = MODULE._publish_regular_hardlink_beneath
         tripped = False
@@ -1195,6 +1261,224 @@ class PendingStagingCleanupTests(unittest.TestCase):
         self.assertEqual(budget.remaining, 0)
         self.assertEqual(
             MODULE._cleanup_ready_pending_batches(self.home, budget=budget),
+            0,
+        )
+
+    def test_orphan_empty_proof_scan_skips_paired_prefix_before_budget(
+        self,
+    ) -> None:
+        index_root = MODULE._pending_cleanup_index_path(self.home)
+        index_root.mkdir(parents=True, exist_ok=True)
+        for index in range(MODULE.MAX_PENDING_CLEANUP_BATCHES_PER_RUN + 1):
+            batch_name = f"20000101T000000Z-1-{index}"
+            (index_root / f"{batch_name}.empty-proof").write_bytes(b"paired proof\n")
+            (index_root / f"{batch_name}.json").write_bytes(b"paired ticket\n")
+        orphan_batch = "20990101T000000Z-1-0"
+        orphan_path = index_root / f"{orphan_batch}.empty-proof"
+        orphan_path.write_bytes(b"orphan proof\n")
+        proof = mock.Mock()
+
+        def isolate(
+            _home: Path,
+            path: Path,
+            _parent_fd: int,
+            _expected,
+            *,
+            label: str,
+        ) -> None:
+            self.assertEqual(path, orphan_path)
+            self.assertIn(orphan_batch, label)
+            path.unlink()
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_read_pending_cleanup_ticket",
+                return_value=None,
+            ) as read_ticket,
+            mock.patch.object(
+                MODULE,
+                "_read_orphan_pending_cleanup_empty_proof",
+                return_value=proof,
+            ) as read_proof,
+            mock.patch.object(
+                MODULE,
+                "_isolate_and_delete_pending_cleanup_file",
+                side_effect=isolate,
+            ) as delete_proof,
+        ):
+            self.assertEqual(
+                MODULE._cleanup_orphan_pending_cleanup_empty_proofs(
+                    self.home,
+                    limit=1,
+                ),
+                1,
+            )
+
+        read_ticket.assert_called_once_with(
+            self.home,
+            index_root / f"{orphan_batch}.json",
+        )
+        read_proof.assert_called_once_with(self.home, orphan_path)
+        delete_proof.assert_called_once()
+        self.assertFalse(orphan_path.exists())
+
+    def test_orphan_empty_proof_budget_is_charged_before_content_reads(
+        self,
+    ) -> None:
+        index_root = MODULE._pending_cleanup_index_path(self.home)
+        index_root.mkdir(parents=True, exist_ok=True)
+        batch_name = "20260901T000000Z-7-0"
+        proof_path = index_root / f"{batch_name}.empty-proof"
+        proof_path.write_bytes(b"not read\n")
+
+        for limit in (0, 1):
+            with self.subTest(limit=limit):
+                budget = MODULE.PendingCleanupActionBudget(limit)
+                ticket = None if limit == 0 else mock.Mock()
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_read_pending_cleanup_ticket",
+                        return_value=ticket,
+                    ) as read_ticket,
+                    mock.patch.object(
+                        MODULE,
+                        "_read_orphan_pending_cleanup_empty_proof",
+                    ) as read_proof,
+                    mock.patch.object(
+                        MODULE,
+                        "_isolate_and_delete_pending_cleanup_file",
+                    ) as delete_proof,
+                ):
+                    self.assertEqual(
+                        MODULE._cleanup_orphan_pending_cleanup_empty_proofs(
+                            self.home,
+                            budget=budget,
+                        ),
+                        0,
+                    )
+
+                if limit == 0:
+                    read_ticket.assert_not_called()
+                    self.assertEqual(budget.consumed, 0)
+                else:
+                    read_ticket.assert_called_once()
+                    self.assertEqual(budget.consumed, 1)
+                read_proof.assert_not_called()
+                delete_proof.assert_not_called()
+
+    def test_staging_initial_skeleton_uses_fixed_structural_scan_bounds(
+        self,
+    ) -> None:
+        batch_root = MODULE._quarantine_batch_root(self.home, [])
+        for relative_path in (
+            Path("pending/before"),
+            Path("pending/stage"),
+            Path("pending/evidence"),
+            Path("pending/state"),
+            Path("pending/claims/before"),
+            Path("pending/claims/after"),
+        ):
+            directory_fd = MODULE._open_or_create_directory_beneath(
+                self.home,
+                batch_root / relative_path,
+                mode=0o700,
+            )
+            MODULE._close_fd_quietly(directory_fd)
+        marker_path = batch_root / Path(*MODULE.PENDING_STATE_STAGING_MARKER.parts)
+        marker_temp = marker_path.with_name(
+            marker_path.name + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+        )
+        marker_temp.write_bytes(b"staging marker temp\n")
+        marker_temp.chmod(0o600)
+        maximum_entries: list[int | None] = []
+        real_member_names = MODULE._directory_member_names
+
+        def bounded_member_names(directory_fd: int, **kwargs):
+            maximum_entries.append(kwargs.get("maximum_entries"))
+            return real_member_names(directory_fd, **kwargs)
+
+        with mock.patch.object(
+            MODULE,
+            "_directory_member_names",
+            side_effect=bounded_member_names,
+        ):
+            MODULE._require_pending_staging_initial_skeleton(
+                self.home,
+                batch_root,
+            )
+
+        self.assertEqual(
+            maximum_entries,
+            [3, 6, 3, 1, 1, 1, 1, 1, 2],
+        )
+
+    def test_cursor_temp_failures_do_not_hold_index_fd(self) -> None:
+        for label, cleanup_result, budget_limit in (
+            ("cleanup", MODULE.SyncError("injected cursor cleanup failure"), 1),
+            ("consume", 2, 1),
+        ):
+            with self.subTest(failure=label):
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_pending_link_pointer_is_absent",
+                        return_value=True,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_restore_pending_cleanup_control_tombstones",
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_cleanup_pending_cleanup_ticket_temps",
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_publish_discovered_staging_cleanup_tickets",
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_cleanup_orphan_pending_cleanup_empty_proofs",
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_cleanup_pending_cleanup_cursor_temp",
+                        side_effect=(
+                            cleanup_result
+                            if isinstance(cleanup_result, BaseException)
+                            else None
+                        ),
+                        return_value=(
+                            cleanup_result
+                            if isinstance(cleanup_result, int)
+                            else mock.DEFAULT
+                        ),
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_open_directory_beneath",
+                        return_value=123,
+                    ) as open_index,
+                    mock.patch.object(MODULE, "_close_fd_quietly") as close_index,
+                    self.assertRaises(MODULE.SyncError),
+                ):
+                    MODULE._cleanup_ready_pending_batches(
+                        self.home,
+                        budget=MODULE.PendingCleanupActionBudget(budget_limit),
+                    )
+                open_index.assert_called_once_with(
+                    self.home,
+                    MODULE._pending_cleanup_index_path(self.home),
+                )
+                close_index.assert_called_once_with(123)
+
+    def test_cleanup_ready_batches_returns_zero_when_index_is_absent(self) -> None:
+        fresh_home = self.root / "fresh-home"
+        fresh_home.mkdir()
+        self.assertEqual(
+            MODULE._cleanup_ready_pending_batches(fresh_home),
             0,
         )
 

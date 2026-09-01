@@ -186,3 +186,25 @@ superseded_by:
   seconds with three expected platform skips. Ruff `E4/E7/E9/F`, repository-wide
   `compileall`, `git diff --check`, source-lock canonical serialization, and
   `refresh-lock --check` also passed.
+- The final pre-landing repair pass closed aggregate planning, evidence-read,
+  materialization, terminal-state, and cleanup budgets; exact pending-alias
+  authorization; frozen batch-root and cleanup-entry identity custody;
+  publication and rollback replacement races; version-4 through version-7
+  recovery compatibility; regular-file exact-noop, status, and uninstall
+  authority; restrictive-umask private-file creation; and tri-state backup
+  evidence. The source lock now covers all ten affected production and test
+  sources.
+- The first 1,342-test post-repair discovery exposed a test-process file
+  descriptor leak rather than a product-state failure: an existing quarantine
+  path was opened twice and the first descriptor was overwritten. The focused
+  regression closes both the normal and fsync-error descriptors. Repeated core
+  synchronizer measurements fell from about 745 accumulated descriptors per
+  round to one near-baseline descriptor per round, and both exact scheduler
+  guardian tests passed.
+- The final repository-private discovery passed 1,344/1,344 tests in 954.113
+  seconds with three expected platform skips. The core and reconciliation
+  safety suites separately passed 627/627, pending-agent compatibility passed
+  15/15, pending-staging cleanup passed 35/35, cleanup safety passed 83/83, and
+  reconciliation ordering passed 22/22. Ruff `E4/E7/E9/F`, repository-wide
+  `compileall`, `git diff --check`, source-lock canonical serialization, and the
+  refreshed ten-source `refresh-lock --check` all passed on the same source.

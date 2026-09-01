@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -100,6 +101,40 @@ def write_non_regular_release(
 def install(root: Path, home: Path, sha: str) -> None:
     with contextlib.redirect_stdout(io.StringIO()):
         MODULE.install_release_tree(root, home, sha, dry_run=False)
+
+
+def pending_authority_snapshot(home: Path) -> dict[str, tuple[object, ...]]:
+    snapshot: dict[str, tuple[object, ...]] = {}
+    roots = (
+        MODULE._pending_link_pointer_path(home),
+        MODULE._personal_sync_root(home) / MODULE.QUARANTINE_RELATIVE_PATH,
+        MODULE._pending_cleanup_index_path(home),
+    )
+    for root in roots:
+        if not os.path.lexists(root):
+            continue
+        paths = [root]
+        if root.is_dir() and not root.is_symlink():
+            paths.extend(root.rglob("*"))
+        for path in paths:
+            metadata = path.lstat()
+            if stat.S_ISREG(metadata.st_mode):
+                payload: object = path.read_bytes()
+            elif stat.S_ISLNK(metadata.st_mode):
+                payload = os.readlink(path)
+            else:
+                payload = None
+            snapshot[path.relative_to(home).as_posix()] = (
+                stat.S_IFMT(metadata.st_mode),
+                stat.S_IMODE(metadata.st_mode),
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_nlink,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                payload,
+            )
+    return snapshot
 
 
 class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
@@ -458,6 +493,184 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertFalse(list(ticket_root.glob(".retained-cleanup-*")))
         self.assertFalse(list(ticket_root.glob("*.empty-proof")))
 
+    def test_active_pointer_status_and_uninstall_dry_run_are_read_only(self) -> None:
+        real_verify_releases = MODULE._verify_install_release_identities
+        failed = False
+
+        def fail_after_pending_publication(
+            home: Path,
+            bindings,
+            *,
+            phase: str,
+            verify_current: bool,
+        ) -> None:
+            nonlocal failed
+            if phase == "before overlay uninstall" and not failed:
+                failed = True
+                raise MODULE.SyncError("injected active pointer retention")
+            real_verify_releases(
+                home,
+                bindings,
+                phase=phase,
+                verify_current=verify_current,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_verify_install_release_identities",
+                side_effect=fail_after_pending_publication,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_finalize_rolled_back_pending_batch",
+                side_effect=MODULE.SyncError("retain active pointer"),
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(MODULE.SyncError, "rollback was incomplete"),
+        ):
+            MODULE.uninstall_overlay(self.home, "private", dry_run=False)
+
+        pointer = MODULE._pending_link_pointer_path(self.home)
+        self.assertTrue(pointer.is_file())
+        before = pending_authority_snapshot(self.home)
+        status_output = io.StringIO()
+        with contextlib.redirect_stdout(status_output):
+            status_code = MODULE.main(
+                ["status", "--home", str(self.home), "--strict"]
+            )
+        dry_run_output = io.StringIO()
+        with contextlib.redirect_stdout(dry_run_output):
+            MODULE.uninstall_overlay(self.home, "private", dry_run=True)
+
+        after = pending_authority_snapshot(self.home)
+        self.assertEqual(status_code, 1)
+        self.assertIn(
+            "active pending transaction must be recovered",
+            status_output.getvalue(),
+        )
+        self.assertEqual(
+            dry_run_output.getvalue().strip(),
+            "would recover pending personal sync transaction under the install lock",
+        )
+        self.assertEqual(before, after)
+
+
+class RegularPendingAuthorityReadOnlyTests(unittest.TestCase):
+    def _installed_overlay_home(self, root: Path) -> Path:
+        home = root / "home"
+        public = root / "public"
+        private = root / "private"
+        write_regular_release(public, payload=PUBLIC_PAYLOAD)
+        write_regular_release(
+            private,
+            owner="private",
+            payload=PRIVATE_PAYLOAD,
+            override=True,
+            base_sha=SHA_A,
+        )
+        install(public, home, SHA_A)
+        install(private, home, SHA_B)
+        return home
+
+    def _publish_pointerless_authority(self, home: Path, kind: str) -> Path:
+        batch_root = MODULE._quarantine_batch_root(home, [])
+        batch_identity = (batch_root.stat().st_dev, batch_root.stat().st_ino)
+        if kind in {"v3", "retained"}:
+            marker_path = batch_root / Path(
+                *MODULE.PENDING_STATE_STAGING_MARKER.parts
+            )
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            ticket = MODULE._mark_pending_batch_staging_cleanup_ready(
+                home,
+                batch_root,
+                batch_identity,
+            )
+            authority = ticket.path
+            if kind == "retained":
+                retained_name = next(
+                    MODULE._retained_pending_cleanup_names(authority)
+                )
+                retained = authority.with_name(retained_name)
+                authority.rename(retained)
+                authority = retained
+            return authority
+        self.assertEqual(kind, "v4")
+        marker_path = batch_root / Path(*MODULE.PENDING_STATE_COMMIT_MARKER.parts)
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker = MODULE._write_exclusive_internal_file(
+            home,
+            marker_path,
+            b"legacy terminal cleanup marker\n",
+        )
+        self.assertIsNotNone(marker.parent_identity)
+        self.assertIsNotNone(marker.file_identity)
+        assert marker.parent_identity is not None
+        assert marker.file_identity is not None
+        payload = MODULE._bounded_json_document(
+            {
+                "version": 4,
+                "batch": batch_root.name,
+                "batch_root_identity": MODULE._identity_payload(batch_identity),
+                "finalization_marker": {
+                    "phase": "after",
+                    "path": MODULE.PENDING_STATE_COMMIT_MARKER.as_posix(),
+                    "parent_identity": MODULE._identity_payload(
+                        marker.parent_identity
+                    ),
+                    "file_identity": MODULE._identity_payload(marker.file_identity),
+                    "mode": 0o600,
+                    "sha256": hashlib.sha256(marker.payload or b"").hexdigest(),
+                },
+                "terminal_regular_targets": [],
+            },
+            max_bytes=MODULE.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+            overflow_error="pending cleanup ticket exceeds the size limit",
+        )
+        index_fd = MODULE._open_or_create_directory_beneath(
+            home,
+            MODULE._pending_cleanup_index_path(home),
+            mode=0o700,
+        )
+        MODULE._close_fd_quietly(index_fd)
+        authority = MODULE._pending_cleanup_ticket_path(home, batch_root.name)
+        MODULE._publish_pending_cleanup_ticket(home, authority, payload)
+        return authority
+
+    def test_pointerless_authority_status_and_dry_run_leave_evidence_unchanged(
+        self,
+    ) -> None:
+        for kind in ("v3", "v4", "retained"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary:
+                home = self._installed_overlay_home(Path(temporary))
+                authority = self._publish_pointerless_authority(home, kind)
+                self.assertTrue(authority.is_file())
+                before = pending_authority_snapshot(home)
+
+                status_output = io.StringIO()
+                with contextlib.redirect_stdout(status_output):
+                    status_code = MODULE.main(
+                        ["status", "--home", str(home), "--strict"]
+                    )
+                dry_run_output = io.StringIO()
+                with contextlib.redirect_stdout(dry_run_output):
+                    MODULE.uninstall_overlay(home, "private", dry_run=True)
+
+                after = pending_authority_snapshot(home)
+                self.assertEqual(status_code, 1)
+                self.assertIn(
+                    "finalized or interrupted pending transaction must be cleaned",
+                    status_output.getvalue(),
+                )
+                self.assertEqual(
+                    dry_run_output.getvalue().strip(),
+                    "would clean a finalized or interrupted pending transaction "
+                    "under the install lock",
+                )
+                self.assertNotIn("would remove", dry_run_output.getvalue())
+                self.assertNotIn("would replace", dry_run_output.getvalue())
+                self.assertEqual(before, after)
+
 
 class RegularStatusLedgerTests(unittest.TestCase):
     def test_public_status_accepts_and_validates_private_regular_override(self) -> None:
@@ -482,17 +695,106 @@ class RegularStatusLedgerTests(unittest.TestCase):
 
             self.assertTrue(healthy)
 
-    def test_regular_replacement_verifier_uses_transaction_link_policy(self) -> None:
+    def test_public_status_reports_stale_overlay_owner_without_current_pointer(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            public = root / "public"
+            private = root / "private"
+            write_regular_release(public, payload=PUBLIC_PAYLOAD)
+            write_regular_release(
+                private,
+                owner="private",
+                payload=PUBLIC_PAYLOAD,
+                override=True,
+                base_sha=SHA_A,
+            )
+            install(public, home, SHA_A)
+            install(private, home, SHA_B)
+            MODULE._current_link(home, "private").unlink()
+            output = io.StringIO()
+
+            with contextlib.redirect_stdout(output):
+                healthy = MODULE.status(home)
+
+            self.assertFalse(healthy)
+            self.assertIn(
+                f"release mismatch: owner=private, state={SHA_B}, current=None",
+                output.getvalue(),
+            )
+
+    def test_regular_replacement_verifier_requires_exact_transaction_aliases(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             home = root / "home"
             release = root / "release"
+            next_release = root / "next-release"
             write_regular_release(release, payload=PUBLIC_PAYLOAD)
+            write_regular_release(next_release, payload='provider = "next"\n')
             install(release, home, SHA_A)
-            entry = MODULE._current_manifest_data(home, MODULE.PUBLIC_OWNER).entries[0]
+            next_manifest = MODULE.load_manifest_data(next_release)
+            binding = MODULE._stage_release_tree_for_install(
+                next_release,
+                home,
+                SHA_B,
+                next_manifest,
+            )
+            MODULE._close_install_release_bindings([binding])
+            state, state_snapshot = MODULE._load_managed_state_with_snapshot(home)
+            current_manifest = MODULE._current_manifest_data(
+                home,
+                MODULE.PUBLIC_OWNER,
+            )
+            entry = current_manifest.entries[0]
+            next_entry = next_manifest.entries[0]
             target = home / ROLE_TARGET
-            alias = root / "reviewer-alias"
-            os.link(target, alias)
+            next_source = (
+                MODULE._releases_root(home, MODULE.PUBLIC_OWNER)
+                / SHA_B
+                / Path(*next_entry.source.parts)
+            )
+            actions = [
+                MODULE.ReconcileAction(
+                    "replace",
+                    target,
+                    MODULE._desired_link_target(home, next_entry),
+                    next_entry.kind,
+                    expected_link_target=MODULE._desired_link_target(home, entry),
+                    planned_snapshot=MODULE._capture_reconcile_target_snapshot(
+                        home,
+                        target,
+                    ),
+                    materialization="regular",
+                    regular_source=next_source,
+                    regular_size=next_source.stat().st_size,
+                )
+            ]
+            next_state = MODULE._planned_committed_state(
+                home,
+                next_manifest.entries,
+                {MODULE.PUBLIC_OWNER: SHA_B},
+                {ROLE_TARGET},
+            )
+            current_action = MODULE._plan_current_switch_action(
+                home,
+                SHA_B,
+                MODULE.PUBLIC_OWNER,
+            )
+            self.assertIsNotNone(current_action)
+            assert current_action is not None
+            batch = MODULE._stage_pending_link_batch(
+                home,
+                [("current", [current_action]), ("managed", actions)],
+                next_manifest.entries,
+                {MODULE.PUBLIC_OWNER: SHA_B},
+                state_snapshot,
+                state,
+                next_state,
+            )
 
             with self.assertRaisesRegex(
                 MODULE.SyncError,
@@ -503,8 +805,20 @@ class RegularStatusLedgerTests(unittest.TestCase):
             MODULE._verify_required_replacement_targets(
                 home,
                 [entry],
-                allow_transaction_links=True,
+                pending_batch=batch,
             )
+
+            foreign_alias = root / "reviewer-alias"
+            os.link(target, foreign_alias)
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "active replacement target changed before removal",
+            ):
+                MODULE._verify_required_replacement_targets(
+                    home,
+                    [entry],
+                    pending_batch=batch,
+                )
 
     def test_status_rejects_missing_mandatory_regular_state_claim(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

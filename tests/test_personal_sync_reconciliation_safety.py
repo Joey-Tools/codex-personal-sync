@@ -6295,13 +6295,13 @@ class InstallTransactionSafetyTests(unittest.TestCase):
             home: Path,
             desired_entries: list[MODULE.LinkEntry],
             *,
-            allow_transaction_links: bool = False,
+            pending_batch: MODULE.PendingLinkBatch | None = None,
         ) -> None:
             nonlocal mapping_phase
             real_verify_desired(
                 home,
                 desired_entries,
-                allow_transaction_links=allow_transaction_links,
+                pending_batch=pending_batch,
             )
             mapping_phase = True
 
@@ -10807,20 +10807,9 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         outside.mkdir()
         sentinel = outside / "sentinel"
         sentinel.write_text("keep\n", encoding="utf-8")
-        shutil.rmtree(batch_root / "pending")
-        (batch_root / "pending").symlink_to(outside, target_is_directory=True)
-        deep_root = (
-            batch_root
-            / "deep"
-            / Path(
-                *(
-                    f"level-{index:02d}"
-                    for index in range(MODULE.MAX_MANIFEST_TARGET_PATH_DEPTH)
-                )
-            )
-        )
-        deep_root.mkdir(parents=True)
-        (deep_root / "leaf").write_text("cleanup\n", encoding="utf-8")
+        pending = batch_root / "pending"
+        shutil.rmtree(pending)
+        pending.symlink_to(outside, target_is_directory=True)
 
         install_quietly(self.release_b, self.home, SHA_B)
 
@@ -10847,7 +10836,8 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
     def test_cleanup_rejects_special_nodes_and_resumes_after_repair(self) -> None:
         batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
-        fifo = batch_root / "unsupported-fifo"
+        fifo = batch_root / "metadata.json"
+        fifo.unlink()
         os.mkfifo(fifo, mode=0o600)
 
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
@@ -10863,8 +10853,8 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
     def test_cleanup_file_racer_is_retained_across_retries(self) -> None:
         batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
-        victim = batch_root / "cleanup-race-file"
-        expected = batch_root / "cleanup-race-file-expected"
+        victim = batch_root / "metadata.json"
+        expected = self.root / "cleanup-race-file-expected"
         victim.write_text("expected\n", encoding="utf-8")
         expected_identity = (victim.stat().st_dev, victim.stat().st_ino)
         foreign_identity: tuple[int, int] | None = None
@@ -10929,10 +10919,8 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
     def test_cleanup_directory_racer_is_retained_across_retries(self) -> None:
         batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
-        victim = batch_root / "cleanup-race-directory"
-        expected = batch_root / "cleanup-race-directory-expected"
-        victim.mkdir()
-        (victim / "sentinel").write_text("expected\n", encoding="utf-8")
+        victim = batch_root / "pending"
+        expected = self.root / "cleanup-race-directory-expected"
         expected_identity = (victim.stat().st_dev, victim.stat().st_ino)
         foreign_identity: tuple[int, int] | None = None
         real_rename = MODULE._rename_noreplace_at
@@ -10953,7 +10941,6 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
             ):
                 victim.rename(expected)
                 victim.mkdir()
-                (victim / "sentinel").write_text("foreign\n", encoding="utf-8")
                 foreign_identity = (victim.stat().st_dev, victim.stat().st_ino)
             real_rename(
                 source_parent_fd,
@@ -10978,17 +10965,10 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         )
         self.assertEqual(len(retained), 1)
         self.assertEqual(
-            (retained[0] / "sentinel").read_text(encoding="utf-8"),
-            "foreign\n",
-        )
-        self.assertEqual(
             (retained[0].stat().st_dev, retained[0].stat().st_ino),
             foreign_identity,
         )
-        self.assertEqual(
-            (expected / "sentinel").read_text(encoding="utf-8"),
-            "expected\n",
-        )
+        self.assertTrue(expected.is_dir())
         self.assertEqual(
             (expected.stat().st_dev, expected.stat().st_ino),
             expected_identity,
@@ -10999,15 +10979,15 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         self.assertIn("requires manual cleanup", retry_stdout.getvalue())
         self.assertTrue(ticket_path.is_file())
         self.assertEqual(
-            (retained[0] / "sentinel").read_text(encoding="utf-8"),
-            "foreign\n",
+            (retained[0].stat().st_dev, retained[0].stat().st_ino),
+            foreign_identity,
         )
 
     def test_cleanup_resumes_after_active_entry_isolation_interruption(
         self,
     ) -> None:
         batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
-        victim = batch_root / "cleanup-interrupted-file"
+        victim = batch_root / "metadata.json"
         victim.write_text("cleanup\n", encoding="utf-8")
         real_rename = MODULE._rename_noreplace_at
         interrupted = False
@@ -11057,7 +11037,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
     def test_cleanup_retry_reisolates_active_entry_before_deletion(self) -> None:
         batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
-        victim = batch_root / "cleanup-retry-file"
+        victim = batch_root / "metadata.json"
         victim.write_text("expected\n", encoding="utf-8")
         expected_identity = (victim.stat().st_dev, victim.stat().st_ino)
         real_rename = MODULE._rename_noreplace_at
@@ -11158,7 +11138,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
     def test_cleanup_resumes_mismatched_active_entry_as_retained(self) -> None:
         batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
-        victim = batch_root / "cleanup-mismatched-active-file"
+        victim = batch_root / "metadata.json"
         expected = self.root / "cleanup-mismatched-active-file-expected"
         victim.write_text("expected\n", encoding="utf-8")
         expected_identity = (victim.stat().st_dev, victim.stat().st_ino)

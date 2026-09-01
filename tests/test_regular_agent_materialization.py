@@ -167,6 +167,89 @@ class PublicRegularAgentTests(unittest.TestCase):
 
                 self.assertTrue(status_is_unhealthy(case_home))
 
+    def test_desired_entry_verification_rejects_exact_target_symlink_for_regular_file(
+        self,
+    ) -> None:
+        target = self._install()
+        entry = MODULE.load_manifest(self.release)[0]
+        target.unlink()
+        target.symlink_to(MODULE._desired_link_target(self.home, entry))
+
+        with mock.patch.object(
+            MODULE,
+            "_read_optional_symlink_target_beneath",
+            wraps=MODULE._read_optional_symlink_target_beneath,
+        ) as read_symlink, self.assertRaisesRegex(
+            MODULE.SyncError,
+            "managed link verification failed",
+        ):
+            MODULE._verify_desired_entries(self.home, [entry])
+
+        read_symlink.assert_not_called()
+
+    def test_committed_state_rejects_exact_target_symlink_for_regular_file(
+        self,
+    ) -> None:
+        target = self._install()
+        entry = MODULE.load_manifest(self.release)[0]
+        target.unlink()
+        target.symlink_to(MODULE._desired_link_target(self.home, entry))
+
+        with mock.patch.object(
+            MODULE,
+            "_read_optional_symlink_target_beneath",
+            wraps=MODULE._read_optional_symlink_target_beneath,
+        ) as read_symlink, self.assertRaisesRegex(
+            MODULE.SyncError,
+            "mandatory desired regular file drifted",
+        ):
+            MODULE._committed_state(
+                self.home,
+                [entry],
+                {MODULE.PUBLIC_OWNER: SHA_A},
+            )
+
+        read_symlink.assert_not_called()
+
+    def test_exact_noop_rejects_raced_exact_target_symlink_for_regular_file(
+        self,
+    ) -> None:
+        target = self._install()
+        entry = MODULE.load_manifest(self.release)[0]
+        real_verify = MODULE._verify_desired_entries
+        raced = False
+
+        def replace_before_noop_verification(
+            home: Path,
+            desired_entries: list[MODULE.LinkEntry],
+            *,
+            pending_batch: MODULE.PendingLinkBatch | None = None,
+        ) -> None:
+            nonlocal raced
+            if not raced:
+                target.unlink()
+                target.symlink_to(MODULE._desired_link_target(home, entry))
+                raced = True
+            real_verify(home, desired_entries, pending_batch=pending_batch)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_verify_desired_entries",
+                side_effect=replace_before_noop_verification,
+            ),
+            mock.patch.object(MODULE, "_stage_pending_link_batch") as stage,
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "managed link verification failed",
+            ),
+        ):
+            install(self.release, self.home, SHA_A)
+
+        self.assertTrue(raced)
+        stage.assert_not_called()
+        self.assertTrue(target.is_symlink())
+
     def test_public_manifest_transition_removes_regular_role_and_ledger_claim(
         self,
     ) -> None:
@@ -213,6 +296,24 @@ class RegularAgentMaterializationBudgetTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def _plan_initial_actions(self) -> list[MODULE.ReconcileAction]:
+        entries = MODULE.load_manifest(self.release)
+        incoming_sources = {
+            (entry.owner, entry.target): self.release / Path(*entry.source.parts)
+            for entry in entries
+            if MODULE._entry_materializes_regular_file(entry)
+        }
+        return MODULE._plan_reconciliation(
+            self.home,
+            entries,
+            [],
+            [],
+            MODULE.ManagedState(owners={}, links={}),
+            allow_cross_owner=False,
+            owner_shas={MODULE.PUBLIC_OWNER: SHA_A},
+            incoming_regular_sources=incoming_sources,
+        )
+
     def test_budget_charges_each_producing_target_even_for_shared_source(self) -> None:
         with (
             mock.patch.object(
@@ -250,6 +351,105 @@ class RegularAgentMaterializationBudgetTests(unittest.TestCase):
             (self.home / "agents" / "security-reviewer.toml").read_text(),
             self.payload,
         )
+
+    def test_dry_run_uses_the_same_materialization_capacity_gate(self) -> None:
+        with (
+            mock.patch.object(
+                MODULE,
+                "MAX_PENDING_REGULAR_MATERIALIZATION_BYTES",
+                len(self.payload.encode("utf-8")),
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "regular.*materialization.*(limit|budget)|materialization.*bytes",
+            ),
+        ):
+            MODULE.install_release_tree(
+                self.release,
+                self.home,
+                SHA_A,
+                dry_run=True,
+            )
+
+    def test_absent_create_rejects_before_reading_regular_payload(self) -> None:
+        with (
+            mock.patch.object(
+                MODULE,
+                "MAX_PENDING_REGULAR_MATERIALIZATION_BYTES",
+                0,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_read_regular_source_payload",
+                wraps=MODULE._read_regular_source_payload,
+            ) as read_payload,
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "regular.*materialization.*(limit|budget)|materialization.*bytes",
+            ),
+        ):
+            self._plan_initial_actions()
+
+        self.assertEqual(read_payload.call_count, 0)
+
+    def test_shared_source_is_read_once_under_independent_evidence_budget(self) -> None:
+        payload_size = len(self.payload.encode("utf-8"))
+        with (
+            mock.patch.object(
+                MODULE,
+                "MAX_PENDING_REGULAR_MATERIALIZATION_BYTES",
+                2 * payload_size,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MAX_PENDING_REGULAR_EVIDENCE_READ_BYTES",
+                payload_size,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_read_regular_source_payload",
+                wraps=MODULE._read_regular_source_payload,
+            ) as read_payload,
+        ):
+            actions = self._plan_initial_actions()
+
+        self.assertEqual(len(actions), 2)
+        self.assertEqual(read_payload.call_count, 1)
+
+    def test_distinct_source_evidence_reads_have_an_aggregate_budget(self) -> None:
+        second_source = "personal_codex/agents/security-reviewer.toml"
+        append_regular_link(
+            self.release,
+            target="agents/security-reviewer-alt.toml",
+            source=second_source,
+            payload=self.payload,
+        )
+        payload_size = len(self.payload.encode("utf-8"))
+        with (
+            mock.patch.object(
+                MODULE,
+                "MAX_PENDING_REGULAR_MATERIALIZATION_BYTES",
+                3 * payload_size,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MAX_PENDING_REGULAR_EVIDENCE_READ_BYTES",
+                payload_size,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_read_regular_source_payload",
+                wraps=MODULE._read_regular_source_payload,
+            ) as read_payload,
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "regular-file evidence reads.*aggregate.*size limit",
+            ),
+        ):
+            self._plan_initial_actions()
+
+        self.assertEqual(read_payload.call_count, 1)
 
     def test_exact_noop_does_not_consume_materialization_budget(self) -> None:
         install(self.release, self.home, SHA_A)
@@ -784,6 +984,92 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
             MODULE._projected_json_size(actual_regular, trailing_newline=False),
         )
 
+    def test_v7_metadata_projection_includes_empty_terminal_regular_arrays(
+        self,
+    ) -> None:
+        payload = MODULE._projected_pending_metadata_payload(
+            state_before_exists=False,
+            records=[],
+            claims_before=[],
+            claims_after=[],
+            releases_before=[],
+            releases_after=[],
+            terminal_regular_before=[],
+            terminal_regular_after=[],
+        )
+
+        self.assertEqual(payload["version"], 7)
+        self.assertEqual(payload["terminal_regular_before"], [])
+        self.assertEqual(payload["terminal_regular_after"], [])
+
+    def test_runtime_metadata_capacity_projects_terminal_regular_states(self) -> None:
+        profile = MODULE._manifest_transition_capacity_profile(
+            MODULE.PUBLIC_OWNER,
+            {
+                ROLE_TARGET.as_posix(): {
+                    "source": "personal_codex/agents/reviewer.toml",
+                    "target": ROLE_TARGET.as_posix(),
+                    "kind": "file",
+                }
+            },
+            {},
+        )
+        capacity = MODULE.PendingLinkCapacityPlan(
+            ordered_groups=(),
+            flattened_actions=(),
+            retired_absence_specs=(),
+        )
+        with mock.patch.object(
+            MODULE,
+            "_bounded_json_document",
+            wraps=MODULE._bounded_json_document,
+        ) as encode:
+            MODULE._validate_pending_link_metadata_capacity(
+                self.home,
+                capacity,
+                MODULE.ManagedStateFileSnapshot(exists=True),
+                profile.state,
+                profile.state,
+                profile.state,
+            )
+
+        projected = encode.call_args.args[0]
+        self.assertEqual(
+            [item["target"] for item in projected["terminal_regular_before"]],
+            [ROLE_TARGET.as_posix()],
+        )
+        self.assertEqual(
+            [item["target"] for item in projected["terminal_regular_after"]],
+            [ROLE_TARGET.as_posix()],
+        )
+
+    def test_manifest_transition_capacity_counts_terminal_regular_arrays(self) -> None:
+        profile = MODULE._manifest_transition_capacity_profile(
+            MODULE.PUBLIC_OWNER,
+            {
+                ROLE_TARGET.as_posix(): {
+                    "source": "personal_codex/agents/reviewer.toml",
+                    "target": ROLE_TARGET.as_posix(),
+                    "kind": "file",
+                }
+            },
+            {},
+        )
+        without_terminal_regular = MODULE.replace(
+            profile,
+            terminal_regular_size_sum=0,
+            terminal_regular_count=0,
+        )
+
+        self.assertEqual(profile.terminal_regular_count, 1)
+        self.assertGreater(
+            MODULE._manifest_transition_metadata_size(profile, profile),
+            MODULE._manifest_transition_metadata_size(
+                without_terminal_regular,
+                without_terminal_regular,
+            ),
+        )
+
     def test_access_bearing_regular_snapshot_protects_gid(self) -> None:
         expected = MODULE.RegularFileSnapshot(
             parent_identity=(1, 2),
@@ -976,7 +1262,9 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
         self.assertNotIn(ROLE_TARGET, acted_regular_targets)
         self.assertIn(secondary_target, acted_regular_targets)
 
-    def test_v6_metadata_rejects_uncovered_regular_state_target(self) -> None:
+    def test_v6_action_scoped_metadata_recovers_unchanged_regular_target(
+        self,
+    ) -> None:
         initial = self.root / "initial-release"
         write_release(initial, role_payload='name = "reviewer"\n')
         install(initial, self.home, SHA_A)
@@ -1002,11 +1290,32 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
             downgrade_without_state_regular_coverage,
         )
 
-        with self.assertRaisesRegex(
-            MODULE.SyncError,
-            "regular.*(cover|action|state|authority)|v6.*regular",
-        ):
-            MODULE._load_pending_link_batch(self.home)
+        parsed = MODULE._load_pending_link_batch(self.home)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.metadata_version, 6)
+        self.assertNotIn(
+            ROLE_TARGET,
+            {
+                record.target
+                for record in parsed.records
+                if record.is_regular()
+                and record.action in {"create", "replace", "quarantine-replace"}
+            },
+        )
+
+        install(next_release, self.home, SHA_B)
+
+        self.assertEqual(
+            (self.home / ROLE_TARGET).read_text(encoding="utf-8"),
+            'name = "reviewer"\n',
+        )
+        self.assertEqual(
+            (self.home / "agents" / "security-reviewer.toml").read_text(
+                encoding="utf-8"
+            ),
+            'name = "security-reviewer"\n',
+        )
 
 
 if __name__ == "__main__":
