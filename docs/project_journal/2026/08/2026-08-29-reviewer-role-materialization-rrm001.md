@@ -69,6 +69,12 @@ superseded_by:
   count, and active cleanup name. Recovery consumes both produced-file and
   restored-preimage receipts before validating the terminal target, so a crash
   after the durable rename cannot leave an unrecorded third hard link.
+- Version-6 and version-7 legacy active-alias recovery precomputes the immutable
+  batch alias authority and scans each distinct target parent once under a
+  shared bounded budget. The cache only narrows candidate discovery: before an
+  unlink, recovery still rebinds the parent and revalidates the live object,
+  content, access policy, alias set, and link count; duplicate or foreign
+  candidates remain fail closed.
 - Terminal regular-file cleanup now uses cleanup-ticket version 4 as the last
   durable authority. It binds the complete affected target group to each
   parent and file identity, exact digest and size, mode `0600`, and effective
@@ -261,3 +267,10 @@ superseded_by:
   narrow account-private temporary-directory permission required by four
   isolation tests; no sandbox-only failed precursor was counted as product
   evidence.
+- A fresh-context Codex GPT-5.6 Sol xhigh narrow review of the final legacy
+  recovery boundedness repair reported no findings. The current main process
+  then reran regular materialization 48/48 in 20.155 seconds and pending-agent
+  compatibility 15/15 in 4.622 seconds; Ruff `E4/E7/E9/F`, repository-wide
+  `compileall`, `git diff --check`, and the refreshed ten-source lock check
+  passed. The final repository-wide discovery remains required for this new
+  frozen head.

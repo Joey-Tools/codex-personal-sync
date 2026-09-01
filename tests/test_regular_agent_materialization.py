@@ -958,6 +958,147 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                 )
                 self.assertEqual(target.stat().st_nlink, 1)
 
+    def test_v7_legacy_active_entries_share_one_parent_scan_and_alias_index(
+        self,
+    ) -> None:
+        secondary_target = PurePosixPath("agents/security-reviewer.toml")
+        append_regular_link(
+            self.release,
+            target=secondary_target.as_posix(),
+            source="personal_codex/agents/security-reviewer.toml",
+            payload='name = "security"\n',
+        )
+        batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
+        parsed = self._downgrade_pending_regular_metadata(batch, 7)
+        records = tuple(record for record in parsed.records if record.is_regular())
+        self.assertEqual({record.target for record in records}, {ROLE_TARGET, secondary_target})
+        with mock.patch.object(
+            MODULE,
+            "_build_pending_regular_alias_authority_index",
+            wraps=MODULE._build_pending_regular_alias_authority_index,
+        ) as build_alias_index:
+            for record in records:
+                MODULE._pending_record_evidence_snapshot(self.home, parsed, record)
+        self.assertEqual(build_alias_index.call_count, 1)
+        active_paths = [
+            self._isolate_legacy_regular_publication(
+                parsed,
+                record,
+                self.home / Path(*record.target.parts),
+            )
+            for record in records
+        ]
+        parent_identity = (
+            self.home / Path(*ROLE_TARGET.parts)
+        ).parent.stat()
+        expected_identity = (parent_identity.st_dev, parent_identity.st_ino)
+        real_scandir = MODULE.os.scandir
+        agent_parent_scans = 0
+
+        def count_agent_parent_scans(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes] | int,
+        ) -> object:
+            nonlocal agent_parent_scans
+            if isinstance(path, int) and MODULE._directory_identity(path) == expected_identity:
+                agent_parent_scans += 1
+            return real_scandir(path)
+
+        with (
+            mock.patch.object(
+                MODULE.os,
+                "scandir",
+                side_effect=count_agent_parent_scans,
+            ),
+        ):
+            install(self.release, self.home, SHA_A)
+
+        self.assertEqual(agent_parent_scans, 1)
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
+        for active in active_paths:
+            self.assertFalse(os.path.lexists(active))
+        for target in (ROLE_TARGET, secondary_target):
+            installed = self.home / Path(*target.parts)
+            self.assertTrue(installed.is_file())
+            self.assertEqual(installed.stat().st_nlink, 1)
+
+    def test_v7_legacy_active_entry_duplicate_candidates_fail_closed(self) -> None:
+        batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
+        parsed = self._downgrade_pending_regular_metadata(batch, 7)
+        record = next(candidate for candidate in parsed.records if candidate.is_regular())
+        target = self.home / Path(*record.target.parts)
+        active = self._isolate_legacy_regular_publication(parsed, record, target)
+        assert record.planned_snapshot.parent_identity is not None
+        assert record.evidence_identity is not None
+        duplicate = active.with_name(
+            MODULE._pending_cleanup_entry_name(
+                MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                record.planned_snapshot.parent_identity,
+                (
+                    record.evidence_identity[0],
+                    record.evidence_identity[1],
+                    stat.S_IFREG,
+                ),
+            )
+        )
+        os.link(active, duplicate, follow_symlinks=False)
+        index = MODULE._build_legacy_pending_regular_publication_active_entry_index(
+            self.home,
+            parsed,
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending legacy regular publication cleanup is ambiguous",
+        ):
+            MODULE._recover_legacy_pending_regular_publication_active_entry(
+                self.home,
+                parsed,
+                record,
+                "produced",
+                active_entry_index=index,
+            )
+
+        self.assertTrue(active.is_file())
+        self.assertTrue(duplicate.is_file())
+        self.assertTrue(MODULE._pending_link_pointer_path(self.home).is_file())
+
+    def test_v7_legacy_active_entry_batch_scan_budget_fails_before_unlink(self) -> None:
+        secondary_target = PurePosixPath("agents/security-reviewer.toml")
+        append_regular_link(
+            self.release,
+            target=secondary_target.as_posix(),
+            source="personal_codex/agents/security-reviewer.toml",
+            payload='name = "security"\n',
+        )
+        batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
+        parsed = self._downgrade_pending_regular_metadata(batch, 7)
+        active_paths = [
+            self._isolate_legacy_regular_publication(
+                parsed,
+                record,
+                self.home / Path(*record.target.parts),
+            )
+            for record in parsed.records
+            if record.is_regular()
+        ]
+
+        with (
+            mock.patch.object(MODULE, "MAX_PENDING_CLEANUP_CONTROL_ENTRIES", 1),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending legacy regular publication active-entry scan exceeds the "
+                "batch limit",
+            ),
+        ):
+            MODULE._build_legacy_pending_regular_publication_active_entry_index(
+                self.home,
+                parsed,
+            )
+
+        self.assertTrue(MODULE._pending_link_pointer_path(self.home).is_file())
+        for active in active_paths:
+            self.assertTrue(active.is_file())
+
     def test_v7_produced_active_alias_foreign_replacement_fails_closed(self) -> None:
         batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
         parsed = self._downgrade_pending_regular_metadata(batch, 7)

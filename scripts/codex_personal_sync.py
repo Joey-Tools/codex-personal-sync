@@ -4742,6 +4742,51 @@ class PendingLinkClaim:
 
 
 @dataclass(frozen=True)
+class _PendingRegularAliasAuthority:
+    authorized_paths: frozenset[Path]
+    required_paths: frozenset[Path]
+
+
+@dataclass(frozen=True)
+class _PendingRegularAliasAuthorityIndex:
+    batch_root: Path
+    batch_root_identity: tuple[int, int]
+    by_identity: dict[tuple[int, int], _PendingRegularAliasAuthority]
+
+
+@dataclass
+class _LegacyPendingRegularPublicationActiveEntryIndex:
+    names_by_parent_plan: dict[
+        tuple[Path, tuple[int, int], tuple[int, int, int]], set[str]
+    ]
+
+    def names(
+        self,
+        parent: Path,
+        parent_identity: tuple[int, int],
+        planned: tuple[int, int, int],
+    ) -> tuple[str, ...]:
+        return tuple(
+            sorted(self.names_by_parent_plan.get((parent, parent_identity, planned), ()))
+        )
+
+    def consume(
+        self,
+        parent: Path,
+        parent_identity: tuple[int, int],
+        planned: tuple[int, int, int],
+        name: str,
+    ) -> None:
+        key = (parent, parent_identity, planned)
+        names = self.names_by_parent_plan.get(key)
+        if names is None or name not in names:
+            raise SyncError("pending legacy regular publication active entry changed")
+        names.remove(name)
+        if not names:
+            self.names_by_parent_plan.pop(key)
+
+
+@dataclass(frozen=True)
 class PendingReleaseExpectation:
     owner: str
     sha: str
@@ -4771,6 +4816,9 @@ class PendingLinkBatch:
     commit_evidence_path: PurePosixPath
     commit_marker_path: PurePosixPath
     pointer_snapshot: ManagedStateFileSnapshot | None = None
+    regular_alias_authority_index: _PendingRegularAliasAuthorityIndex | None = (
+        dataclass_field(default=None, compare=False, repr=False)
+    )
 
 
 @dataclass(frozen=True)
@@ -11716,6 +11764,93 @@ def _regular_alias_identity_beneath(
         _close_fd_quietly(parent_fd)
 
 
+def _verify_pending_regular_alias_batch_root(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> None:
+    batch_fd = _open_directory_beneath(home, batch.batch_root)
+    try:
+        if (
+            _directory_identity(batch_fd) != batch.batch_root_identity
+            or not _bound_directory_matches(home, batch.batch_root, batch_fd)
+        ):
+            raise SyncError(
+                f"pending regular-file batch root changed: {batch.batch_root}"
+            )
+    finally:
+        _close_fd_quietly(batch_fd)
+
+
+def _build_pending_regular_alias_authority_index(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> _PendingRegularAliasAuthorityIndex:
+    _verify_pending_regular_alias_batch_root(home, batch)
+    mutable_authorities: dict[tuple[int, int], tuple[set[Path], set[Path]]] = {}
+
+    def authority_for(
+        identity: tuple[int, int],
+    ) -> tuple[set[Path], set[Path]]:
+        return mutable_authorities.setdefault(identity, (set(), set()))
+
+    for record in batch.records:
+        if not record.is_regular():
+            continue
+        target = home / Path(*record.target.parts)
+        if record.evidence_identity is not None:
+            if record.stage is None or record.evidence is None:
+                raise SyncError(
+                    f"pending regular-file alias authority is incomplete: {record.target}"
+                )
+            authorized_paths, required_paths = authority_for(record.evidence_identity)
+            stage = batch.batch_root / Path(*record.stage.parts)
+            evidence = batch.batch_root / Path(*record.evidence.parts)
+            authorized_paths.update((stage, evidence, target))
+            required_paths.update((stage, evidence))
+        if record.before_evidence_identity is not None:
+            if record.before_evidence is None:
+                raise SyncError(
+                    f"pending regular-file preimage authority is incomplete: {record.target}"
+                )
+            authorized_paths, required_paths = authority_for(
+                record.before_evidence_identity
+            )
+            before = batch.batch_root / Path(*record.before_evidence.parts)
+            authorized_paths.update((before, target))
+            required_paths.add(before)
+            if record.backup is not None:
+                authorized_paths.add(batch.batch_root / Path(*record.backup.parts))
+
+    return _PendingRegularAliasAuthorityIndex(
+        batch_root=batch.batch_root,
+        batch_root_identity=batch.batch_root_identity,
+        by_identity={
+            identity: _PendingRegularAliasAuthority(
+                authorized_paths=frozenset(authorized_paths),
+                required_paths=frozenset(required_paths),
+            )
+            for identity, (authorized_paths, required_paths) in mutable_authorities.items()
+        },
+    )
+
+
+def _pending_regular_alias_authority_index(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> _PendingRegularAliasAuthorityIndex:
+    index = batch.regular_alias_authority_index
+    if index is None:
+        index = _build_pending_regular_alias_authority_index(home, batch)
+        batch.regular_alias_authority_index = index
+    elif (
+        index.batch_root != batch.batch_root
+        or index.batch_root_identity != batch.batch_root_identity
+    ):
+        raise SyncError("pending regular-file alias authority index is invalid")
+    _verify_pending_regular_alias_batch_root(home, batch)
+    return index
+
+
 def _verify_pending_regular_aliases(
     home: Path,
     batch: PendingLinkBatch | None,
@@ -11729,49 +11864,11 @@ def _verify_pending_regular_aliases(
             )
         return
 
-    batch_fd = _open_directory_beneath(home, batch.batch_root)
-    try:
-        if (
-            _directory_identity(batch_fd) != batch.batch_root_identity
-            or not _bound_directory_matches(home, batch.batch_root, batch_fd)
-        ):
-            raise SyncError(
-                f"pending regular-file batch root changed: {batch.batch_root}"
-            )
-    finally:
-        _close_fd_quietly(batch_fd)
-
     identity = snapshot.file_identity
-    authorized_paths: set[Path] = {observed_path}
-    required_paths: set[Path] = set()
-    matched_record = False
-    for record in batch.records:
-        if not record.is_regular():
-            continue
-        target = home / Path(*record.target.parts)
-        if record.evidence_identity == identity:
-            matched_record = True
-            if record.stage is None or record.evidence is None:
-                raise SyncError(
-                    f"pending regular-file alias authority is incomplete: {record.target}"
-                )
-            stage = batch.batch_root / Path(*record.stage.parts)
-            evidence = batch.batch_root / Path(*record.evidence.parts)
-            authorized_paths.update((stage, evidence, target))
-            required_paths.update((stage, evidence))
-        if record.before_evidence_identity == identity:
-            matched_record = True
-            if record.before_evidence is None:
-                raise SyncError(
-                    f"pending regular-file preimage authority is incomplete: {record.target}"
-                )
-            before = batch.batch_root / Path(*record.before_evidence.parts)
-            authorized_paths.update((before, target))
-            required_paths.add(before)
-            if record.backup is not None:
-                authorized_paths.add(batch.batch_root / Path(*record.backup.parts))
-
-    if not matched_record:
+    authority = _pending_regular_alias_authority_index(home, batch).by_identity.get(
+        identity
+    )
+    if authority is None:
         if snapshot.link_count != 1:
             raise SyncError(
                 "managed regular file has no transaction record authorizing its "
@@ -11780,9 +11877,9 @@ def _verify_pending_regular_aliases(
         return
 
     observed_aliases: set[Path] = set()
-    for path in authorized_paths:
+    for path in authority.authorized_paths | {observed_path}:
         alias_identity = _regular_alias_identity_beneath(home, path)
-        if path in required_paths and alias_identity != identity:
+        if path in authority.required_paths and alias_identity != identity:
             raise SyncError(f"pending regular-file authority changed: {path}")
         if alias_identity == identity:
             observed_aliases.add(path)
@@ -14325,14 +14422,16 @@ def _delete_pending_regular_publication_beneath(
         _close_fd_quietly(parent_fd)
 
 
-def _recover_legacy_pending_regular_publication_active_entry(
-    home: Path,
-    batch: PendingLinkBatch,
+def _legacy_pending_regular_publication_phase_authority(
     record: PendingLinkRecord,
     phase: str,
-) -> None:
-    if batch.metadata_version not in {6, 7}:
-        return
+) -> tuple[
+    tuple[int, int],
+    tuple[int, int],
+    PurePosixPath,
+    tuple[PurePosixPath | None, ...],
+    RegularFileSnapshot | None,
+]:
     parent_identity = record.planned_snapshot.parent_identity
     planned_regular = _regular_snapshot_from_reconcile(record.planned_snapshot)
     if phase == "produced":
@@ -14353,7 +14452,108 @@ def _recover_legacy_pending_regular_publication_active_entry(
         or (phase == "before" and planned_regular is None)
     ):
         raise SyncError("pending legacy regular publication evidence is incomplete")
+    return (
+        parent_identity,
+        file_identity,
+        evidence_path,
+        other_alias_paths,
+        planned_regular,
+    )
+
+
+def _build_legacy_pending_regular_publication_active_entry_index(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> _LegacyPendingRegularPublicationActiveEntryIndex:
+    if batch.metadata_version not in {6, 7}:
+        return _LegacyPendingRegularPublicationActiveEntryIndex({})
+    planned_by_parent: dict[
+        tuple[Path, tuple[int, int]], set[tuple[int, int, int]]
+    ] = {}
+    for record in batch.records:
+        if not record.is_regular() or record.action not in {
+            "create",
+            "replace",
+            "quarantine-replace",
+        }:
+            continue
+        phases = ("produced",)
+        if record.action in {"replace", "quarantine-replace"}:
+            phases += ("before",)
+        target = home / Path(*record.target.parts)
+        for phase in phases:
+            parent_identity, file_identity, _evidence_path, _other_alias_paths, _planned = (
+                _legacy_pending_regular_publication_phase_authority(record, phase)
+            )
+            planned_by_parent.setdefault(
+                (target.parent, parent_identity), set()
+            ).add((file_identity[0], file_identity[1], stat.S_IFREG))
+
+    names_by_parent_plan: dict[
+        tuple[Path, tuple[int, int], tuple[int, int, int]], set[str]
+    ] = {}
+    scanned_entries = 0
+    for (parent, parent_identity), plans in sorted(
+        planned_by_parent.items(),
+        key=lambda item: (str(item[0][0]), item[0][1]),
+    ):
+        parent_fd = _open_directory_beneath(home, parent)
+        try:
+            if (
+                _directory_identity(parent_fd) != parent_identity
+                or not _bound_directory_matches(home, parent, parent_fd)
+            ):
+                raise SyncError("pending legacy regular publication parent changed")
+            with os.scandir(parent_fd) as entries:
+                for entry in entries:
+                    scanned_entries += 1
+                    if scanned_entries > MAX_PENDING_CLEANUP_CONTROL_ENTRIES:
+                        raise SyncError(
+                            "pending legacy regular publication active-entry scan "
+                            "exceeds the batch limit"
+                        )
+                    planned = _pending_cleanup_internal_entry_plan(
+                        entry.name,
+                        PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                        parent_identity,
+                    )
+                    if planned in plans:
+                        names_by_parent_plan.setdefault(
+                            (parent, parent_identity, planned), set()
+                        ).add(entry.name)
+            if not _bound_directory_matches(home, parent, parent_fd):
+                raise SyncError("pending legacy regular publication parent changed")
+        finally:
+            _close_fd_quietly(parent_fd)
+    return _LegacyPendingRegularPublicationActiveEntryIndex(names_by_parent_plan)
+
+
+def _recover_legacy_pending_regular_publication_active_entry(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    *,
+    active_entry_index: _LegacyPendingRegularPublicationActiveEntryIndex | None = None,
+) -> None:
+    if batch.metadata_version not in {6, 7}:
+        return
+    (
+        parent_identity,
+        file_identity,
+        evidence_path,
+        other_alias_paths,
+        planned_regular,
+    ) = _legacy_pending_regular_publication_phase_authority(record, phase)
     target = home / Path(*record.target.parts)
+    planned = (file_identity[0], file_identity[1], stat.S_IFREG)
+    if active_entry_index is None:
+        active_entry_index = _build_legacy_pending_regular_publication_active_entry_index(
+            home, batch
+        )
+    candidates = active_entry_index.names(target.parent, parent_identity, planned)
+    if not candidates:
+        return
     parent_fd = _open_directory_beneath(home, target.parent)
     try:
         if (
@@ -14361,32 +14561,6 @@ def _recover_legacy_pending_regular_publication_active_entry(
             or not _bound_directory_matches(home, target.parent, parent_fd)
         ):
             raise SyncError("pending legacy regular publication parent changed")
-        planned = (
-            file_identity[0],
-            file_identity[1],
-            stat.S_IFREG,
-        )
-        candidates: list[str] = []
-        with os.scandir(parent_fd) as entries:
-            for scanned, entry in enumerate(entries, start=1):
-                if scanned > MAX_PENDING_CLEANUP_CONTROL_ENTRIES:
-                    raise SyncError(
-                        "pending legacy regular publication parent exceeds the "
-                        "active-entry scan limit"
-                    )
-                if (
-                    _pending_cleanup_internal_entry_plan(
-                        entry.name,
-                        PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
-                        parent_identity,
-                    )
-                    == planned
-                ):
-                    candidates.append(entry.name)
-        if not _bound_directory_matches(home, target.parent, parent_fd):
-            raise SyncError("pending legacy regular publication parent changed")
-        if not candidates:
-            return
         target_identity = _named_entry_identity(parent_fd, target.name)
         if len(candidates) != 1 or target_identity == file_identity:
             raise SyncError("pending legacy regular publication cleanup is ambiguous")
@@ -14456,6 +14630,12 @@ def _recover_legacy_pending_regular_publication_active_entry(
             or not _bound_directory_matches(home, target.parent, parent_fd)
         ):
             raise SyncError("pending legacy regular publication active entry reappeared")
+        active_entry_index.consume(
+            target.parent,
+            parent_identity,
+            planned,
+            active_name,
+        )
     finally:
         _close_fd_quietly(parent_fd)
 
@@ -14465,6 +14645,9 @@ def _recover_pending_regular_publication_cleanup(
     batch: PendingLinkBatch,
     record: PendingLinkRecord,
     phase: str,
+    *,
+    legacy_active_entry_index: _LegacyPendingRegularPublicationActiveEntryIndex
+    | None = None,
 ) -> None:
     if not record.is_regular() or record.action not in {
         "create",
@@ -14478,6 +14661,7 @@ def _recover_pending_regular_publication_cleanup(
             batch,
             record,
             phase,
+            active_entry_index=legacy_active_entry_index,
         )
         return
     journal = _read_pending_regular_publication_cleanup(home, batch, record, phase)
@@ -22960,6 +23144,17 @@ def _recover_pending_link_transaction(
         batch,
         state_snapshot,
     )
+    legacy_active_entry_index: _LegacyPendingRegularPublicationActiveEntryIndex | None = (
+        None
+    )
+    if batch.metadata_version in {6, 7} and _batch_has_regular_records(batch):
+        # The immutable batch metadata defines all legitimate hard-link aliases;
+        # cache that authority once before any recovery mutation. Likewise, scan
+        # each legacy active-entry parent once under one batch-wide budget.
+        _pending_regular_alias_authority_index(home, batch)
+        legacy_active_entry_index = (
+            _build_legacy_pending_regular_publication_active_entry_index(home, batch)
+        )
     for record in reversed(batch.records):
         if record.action == PENDING_RELINQUISH_FOREIGN_ACTION:
             _verify_pending_record_bound_foreign_relinquishment(
@@ -22982,11 +23177,19 @@ def _recover_pending_link_transaction(
         if record.is_regular():
             if producing:
                 _recover_pending_regular_publication_cleanup(
-                    home, batch, record, "produced"
+                    home,
+                    batch,
+                    record,
+                    "produced",
+                    legacy_active_entry_index=legacy_active_entry_index,
                 )
             if destructive:
                 _recover_pending_regular_publication_cleanup(
-                    home, batch, record, "before"
+                    home,
+                    batch,
+                    record,
+                    "before",
+                    legacy_active_entry_index=legacy_active_entry_index,
                 )
         target = home / Path(*record.target.parts)
         target_snapshot, target_exists = _pending_target_snapshot(home, target)
