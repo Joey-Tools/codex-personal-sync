@@ -60,6 +60,19 @@ superseded_by:
 - Pending metadata versions 4 and 5 keep their historical agent-TOML symlink
   claim semantics. Only version 6 applies the path-derived regular-file claim
   omission, so an upgrade cannot strand an older pending transaction.
+- Terminal regular-file cleanup now uses cleanup-ticket version 4 as the last
+  durable authority. It binds the complete affected target group to each
+  parent and file identity, exact digest and size, mode `0600`, and effective
+  UID; cleanup retires that authority only after whole-group validation. GID is
+  protected only when the recorded mode grants group access, so harmless group
+  churn on owner-only files cannot masquerade as an access-policy change.
+- Recovery treats marker-only staging batches, retained ticket or empty-proof
+  tombstones, and incomplete ticket or scan-cursor temporaries as observable
+  control state rather than absence-as-success. Malformed or ambiguous
+  authority fails closed. All reconciliation classes share a rotating budget
+  of eight logical batches or standalone cursor-control actions per installer
+  run; cursor residue consumes that same budget before ticket selection so a
+  persistent deferred prefix cannot starve later terminal validation.
 
 ## Next Steps
 
@@ -120,6 +133,26 @@ superseded_by:
   passed 4/4 in 0.701 seconds outside it.
 - `compileall`, `py_compile`, `git diff --check`, source-lock refresh/check,
   strict status, and private overlay verification passed.
+- After the first frozen whole-range review, eight additional regular-file and
+  recovery findings were fixed: terminal authority lifetime, parent/file
+  identity binding, non-access-bearing GID churn, marker-only staging recovery,
+  materialization-aware replacement checks, public status composition,
+  complete version-6 projection, and ticket/proof tombstone reconciliation.
+  Follow-up audits then closed active-pointer v3 tombstones, malformed v4
+  classification, bounded control reconciliation, retained temp cleanup, and
+  scan-cursor fairness. The final narrow independent audit reported no
+  remaining blocker.
+- Final post-fix focused coverage passed 46/46 tests in 22.011 seconds. The
+  reconciliation safety suite passed 312/312 tests in 87.791 seconds, and the
+  core synchronizer suite passed 303 tests in 47.677 seconds with one expected
+  platform-condition skip.
+- Final complete discovery exercised 1,278 tests in 966.031 seconds. The only
+  four errors were setup denials when the outer workspace sandbox prevented
+  `test_ci_private_tmp` from allocating its intentional private directory
+  under the account home; those exact four tests then passed 4/4 in 0.446
+  seconds with narrow home-directory permission. Three platform cases skipped.
+  Ruff `E4/E7/E9/F`, `compileall`, `git diff --check`, and the refreshed
+  six-source lock and `refresh-lock --check` also passed on this final source.
 - A task-local private install from the current released toolbox and private
   overlay created `agents/reviewer.toml` as a byte-identical regular file with
   mode `0600`, effective UID ownership, and link count one. An authenticated

@@ -215,6 +215,7 @@ PENDING_STATE_STAGING_MARKER = PurePosixPath(
 )
 PENDING_CLEANUP_INDEX_RELATIVE_PATH = Path("pending-cleanup")
 PENDING_CLEANUP_TICKET_SUFFIX = ".json"
+PENDING_CLEANUP_TICKET_TEMP_SUFFIX = ".json.tmp"
 PENDING_CLEANUP_EMPTY_PROOF_SUFFIX = ".empty-proof"
 PENDING_CLEANUP_CURSOR_NAME = ".scan-cursor"
 PENDING_CLEANUP_CURSOR_TEMP_NAME = ".scan-cursor.tmp"
@@ -228,6 +229,7 @@ PENDING_CLEANUP_ENTRY_TOKEN_RE = re.compile(
     r"([0-9a-f]{1,8})-([0-9a-f]{16})$"
 )
 MAX_PENDING_CLEANUP_TICKET_BYTES = 4096
+MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES = MAX_MANAGED_STATE_BYTES
 PENDING_LINK_BATCH_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+$")
 MAX_PENDING_LINK_BATCH_NAME_BYTES = 128
 MAX_PENDING_LINK_RECORDS = 10_000
@@ -235,6 +237,7 @@ MAX_PENDING_LINK_CLAIMS = 20_000
 MAX_PENDING_RELEASES = 10_000
 MAX_PENDING_CLEANUP_BATCH_SCAN = 10_000
 MAX_PENDING_CLEANUP_BATCHES_PER_RUN = 8
+MAX_PENDING_CLEANUP_CONTROL_ENTRIES = MAX_PENDING_CLEANUP_BATCH_SCAN * 3 + 8
 MAX_RETAINED_QUARANTINE_BATCHES = 8
 MAX_PENDING_CLEANUP_DEPTH = MAX_MANIFEST_TARGET_PATH_DEPTH + 8
 MAX_PENDING_CLEANUP_ENTRIES = (
@@ -4760,6 +4763,17 @@ class PendingLinkBatch:
 
 
 @dataclass(frozen=True)
+class PendingRegularTargetExpectation:
+    target: PurePosixPath
+    parent_identity: tuple[int, int]
+    file_identity: tuple[int, int]
+    sha256: str
+    size: int
+    mode: int
+    uid: int
+
+
+@dataclass(frozen=True)
 class PendingBatchCleanupTicket:
     version: int
     phase: str
@@ -4772,6 +4786,48 @@ class PendingBatchCleanupTicket:
     marker_file_identity: tuple[int, int]
     marker_mode: int
     marker_sha256: str
+    terminal_regular_targets: tuple[PendingRegularTargetExpectation, ...] = ()
+
+
+@dataclass
+class PendingCleanupActionBudget:
+    limit: int
+    consumed: int = 0
+    charged_batches: set[str] = dataclass_field(default_factory=set)
+    completed_batches: set[str] = dataclass_field(default_factory=set)
+    completed_control_actions: int = 0
+
+    def __post_init__(self) -> None:
+        if self.limit < 0:
+            raise SyncError("pending cleanup action budget is invalid")
+
+    @property
+    def remaining(self) -> int:
+        return self.limit - self.consumed
+
+    def charge_batch(self, batch_name: str) -> bool:
+        if batch_name in self.charged_batches:
+            return True
+        if self.remaining <= 0:
+            return False
+        self.charged_batches.add(batch_name)
+        self.consumed += 1
+        return True
+
+    def consume_control_actions(self, count: int) -> None:
+        if count < 0 or count > self.remaining:
+            raise SyncError("pending cleanup control action budget is invalid")
+        self.consumed += count
+        self.completed_control_actions += count
+
+    def mark_batch_completed(self, batch_name: str) -> None:
+        if batch_name not in self.charged_batches:
+            raise SyncError("pending cleanup completed an uncharged batch")
+        self.completed_batches.add(batch_name)
+
+    @property
+    def completed(self) -> int:
+        return len(self.completed_batches) + self.completed_control_actions
 
 
 @dataclass(frozen=True)
@@ -12726,7 +12782,11 @@ def _publish_regular_reconcile_hardlink_beneath(
             target.name,
             target,
         )
-        if not _regular_snapshot_leaf_matches(published_snapshot, source_snapshot) or (
+        if not _regular_snapshot_leaf_matches(
+            published_snapshot,
+            source_snapshot,
+            protect_gid=False,
+        ) or (
             published_snapshot.link_count != source_snapshot.link_count + 1
         ):
             raise SyncError(f"published managed regular file changed: {target}")
@@ -13233,12 +13293,20 @@ def _projected_pending_snapshot_payload(
         candidate_targets,
         key=lambda value: len(json.dumps(value, sort_keys=False).encode("utf-8")),
     )
+    projects_regular = snapshot is not None and snapshot.regular_sha256 is not None
+    maximum_scalar = _MAX_PENDING_IDENTITY[0]
     return {
         "parent_identity": _identity_payload(_MAX_PENDING_IDENTITY),
         "link_identity": _identity_payload(_MAX_PENDING_IDENTITY),
         "link_target": link_target,
         "ancestor_identity": _identity_payload(_MAX_PENDING_IDENTITY),
         "missing_parent_parts": list(relative_parent.parts),
+        "regular_sha256": _MAX_PENDING_DIGEST if projects_regular else None,
+        "regular_size": MAX_ARCHIVE_MEMBER_BYTES if projects_regular else None,
+        "regular_mode": 0o7777 if projects_regular else None,
+        "regular_uid": maximum_scalar if projects_regular else None,
+        "regular_gid": maximum_scalar if projects_regular else None,
+        "regular_link_count": maximum_scalar if projects_regular else None,
     }
 
 
@@ -13307,7 +13375,7 @@ def _projected_pending_record_payload(
         "regular_size": MAX_ARCHIVE_MEMBER_BYTES if producing and action.materialization == "regular" else None,
         "regular_mode": 0o600 if producing and action.materialization == "regular" else None,
         "regular_uid": _MAX_PENDING_IDENTITY if producing and action.materialization == "regular" else None,
-        "regular_gid": _MAX_PENDING_IDENTITY if producing and action.materialization == "regular" else None,
+        "regular_gid": None,
         "regular_link_count": 2 if producing and action.materialization == "regular" else None,
         "before_evidence": (
             PurePosixPath("pending", "before", leaf).as_posix() if destructive else None
@@ -14445,7 +14513,10 @@ def _stage_pending_link_batch(
                             or refreshed_regular.size != planned_regular.size
                             or refreshed_regular.mode != planned_regular.mode
                             or refreshed_regular.uid != planned_regular.uid
-                            or refreshed_regular.gid != planned_regular.gid
+                            or (
+                                bool(planned_regular.mode & 0o070)
+                                and refreshed_regular.gid != planned_regular.gid
+                            )
                             or refreshed_regular.link_count
                             != planned_regular.link_count + 1
                         ):
@@ -14539,7 +14610,7 @@ def _stage_pending_link_batch(
                             regular_size=stage_snapshot.size,
                             regular_mode=stage_snapshot.mode,
                             regular_uid=stage_snapshot.uid,
-                            regular_gid=stage_snapshot.gid,
+                            regular_gid=None,
                             regular_link_count=stage_snapshot.link_count,
                         )
                     else:
@@ -15507,9 +15578,9 @@ def _parse_pending_link_batch(
             regular_size,
             regular_mode,
             regular_uid,
-            regular_gid,
             regular_link_count,
         )
+        all_regular_values = (*regular_values, regular_gid)
         planned_regular = _regular_snapshot_from_reconcile(planned)
         if materialization == "regular":
             produced_regular_is_invalid = producing and (
@@ -15521,6 +15592,7 @@ def _parse_pending_link_batch(
                     or value < 0
                     for value in regular_values[1:]
                 )
+                or regular_gid is not None
                 or regular_mode != 0o600
                 or regular_uid != os.geteuid()
                 or regular_link_count != 2
@@ -15530,7 +15602,7 @@ def _parse_pending_link_batch(
                 and (
                     not destructive
                     or planned_regular is None
-                    or any(value is not None for value in regular_values)
+                    or any(value is not None for value in all_regular_values)
                 )
             )
             if (
@@ -15541,7 +15613,7 @@ def _parse_pending_link_batch(
                 raise SyncError(
                     f"pending target {target} has invalid regular-file evidence"
                 )
-        elif any(value is not None for value in regular_values):
+        elif any(value is not None for value in all_regular_values):
             raise SyncError(
                 f"pending symlink target {target} has regular-file evidence"
             )
@@ -15595,7 +15667,10 @@ def _parse_pending_link_batch(
                     or before_snapshot.size != planned_regular.size
                     or before_snapshot.mode != planned_regular.mode
                     or before_snapshot.uid != planned_regular.uid
-                    or before_snapshot.gid != planned_regular.gid
+                    or (
+                        bool(planned_regular.mode & 0o070)
+                        and before_snapshot.gid != planned_regular.gid
+                    )
                 ):
                     raise SyncError(
                         f"pending target {target} before evidence changed"
@@ -15654,8 +15729,6 @@ def _parse_pending_link_batch(
                     or evidence_snapshot.mode != regular_mode
                     or stage_snapshot.uid != regular_uid
                     or evidence_snapshot.uid != regular_uid
-                    or stage_snapshot.gid != regular_gid
-                    or evidence_snapshot.gid != regular_gid
                     or stage_snapshot.link_count
                     not in {regular_link_count, regular_link_count + 1}
                     or evidence_snapshot.link_count != stage_snapshot.link_count
@@ -16282,6 +16355,17 @@ def _pending_cleanup_ticket_path(home: Path, batch_name: str) -> Path:
     )
 
 
+def _pending_cleanup_authority_classification_error(
+    batch_name: str,
+    error: BaseException,
+) -> SyncError:
+    return SyncError(
+        "pending cleanup authority could not be safely classified and was "
+        f"retained: {batch_name}: {error}. Restore the exact canonical ticket "
+        "and retry the installer; do not delete pending cleanup evidence manually."
+    )
+
+
 def _pending_cleanup_empty_proof_path(home: Path, batch_name: str) -> Path:
     if (
         len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
@@ -16374,7 +16458,7 @@ def _retained_pending_cleanup_file(
     with os.scandir(parent_fd) as entries:
         for entry in entries:
             scanned += 1
-            if scanned > MAX_ACTIVE_SKILL_ENTRIES:
+            if scanned > MAX_PENDING_CLEANUP_CONTROL_ENTRIES:
                 raise SyncError(
                     f"{label} parent exceeds the retained-evidence scan limit"
                 )
@@ -16402,24 +16486,29 @@ def _retained_pending_cleanup_file(
     return retained_name, retained_snapshot
 
 
-def _restore_retained_pending_cleanup_file(
+def _restore_exact_retained_pending_cleanup_file(
     home: Path,
     path: Path,
     parent_fd: int,
+    retained_name: str,
     expected: ManagedStateFileSnapshot,
     *,
     label: str,
-) -> ManagedStateFileSnapshot | None:
-    retained = _retained_pending_cleanup_file(
+) -> ManagedStateFileSnapshot:
+    retained_path = path.with_name(retained_name)
+    retained_snapshot = _read_managed_state_file_snapshot(
         home,
-        path,
+        retained_path,
         parent_fd,
-        expected=expected,
-        label=label,
+        expected_identity=expected.file_identity,
     )
-    if retained is None:
-        return None
-    retained_name, _retained_snapshot = retained
+    if not _managed_state_snapshot_matches_file_evidence(
+        retained_snapshot,
+        expected,
+    ):
+        raise SyncError(f"{label} retained evidence changed")
+    if not _bound_directory_matches(home, path.parent, parent_fd):
+        raise SyncError(f"{label} parent changed before retained-evidence recovery")
     try:
         _rename_noreplace_at(
             parent_fd,
@@ -16443,6 +16532,59 @@ def _restore_retained_pending_cleanup_file(
     if not _bound_directory_matches(home, path.parent, parent_fd):
         raise SyncError(f"{label} parent changed during retained-evidence recovery")
     return restored
+
+
+def _restore_retained_pending_cleanup_file(
+    home: Path,
+    path: Path,
+    parent_fd: int,
+    expected: ManagedStateFileSnapshot,
+    *,
+    label: str,
+) -> ManagedStateFileSnapshot | None:
+    retained = _retained_pending_cleanup_file(
+        home,
+        path,
+        parent_fd,
+        expected=expected,
+        label=label,
+    )
+    if retained is None:
+        return None
+    retained_name, _retained_snapshot = retained
+    return _restore_exact_retained_pending_cleanup_file(
+        home,
+        path,
+        parent_fd,
+        retained_name,
+        expected,
+        label=label,
+    )
+
+
+def _retained_pending_cleanup_names_for_path(
+    home: Path,
+    path: Path,
+    parent_fd: int,
+    *,
+    label: str,
+) -> tuple[str, ...]:
+    if not _bound_directory_matches(home, path.parent, parent_fd):
+        raise SyncError(f"{label} parent changed while scanning retained evidence")
+    prefix = f"{PENDING_CLEANUP_RETAINED_PREFIX}{path.name}-"
+    pattern = re.compile(re.escape(prefix) + r"[0-9]+-[0-9a-f]{16}")
+    matches: list[str] = []
+    with os.scandir(parent_fd) as entries:
+        for scanned, entry in enumerate(entries, start=1):
+            if scanned > MAX_PENDING_CLEANUP_CONTROL_ENTRIES:
+                raise SyncError(
+                    f"{label} parent exceeds the retained-evidence scan limit"
+                )
+            if pattern.fullmatch(entry.name) is not None:
+                matches.append(entry.name)
+    if not _bound_directory_matches(home, path.parent, parent_fd):
+        raise SyncError(f"{label} parent changed while scanning retained evidence")
+    return tuple(sorted(matches))
 
 
 def _isolate_and_delete_pending_cleanup_file(
@@ -16642,6 +16784,204 @@ def _pending_staging_cleanup_ticket_payload(
     )
 
 
+def _pending_terminal_regular_targets(
+    batch: PendingLinkBatch,
+    *,
+    phase: str,
+) -> tuple[PendingRegularTargetExpectation, ...]:
+    if phase not in {"before", "after"}:
+        raise SyncError("pending terminal cleanup phase is invalid")
+    targets: list[PendingRegularTargetExpectation] = []
+    seen: set[PurePosixPath] = set()
+    for record in batch.records:
+        if phase == "after":
+            if not record.is_regular() or record.action not in {
+                "create",
+                "replace",
+                "quarantine-replace",
+            }:
+                continue
+            parent_identity = record.planned_snapshot.parent_identity
+            file_identity = record.evidence_identity
+            digest = record.regular_sha256
+            size = record.regular_size
+            mode = record.regular_mode
+            uid = record.regular_uid
+        else:
+            planned = _regular_snapshot_from_reconcile(record.planned_snapshot)
+            if planned is None or record.action not in {
+                "replace",
+                "quarantine-replace",
+                "remove",
+                "quarantine-remove",
+            }:
+                continue
+            parent_identity = record.planned_snapshot.parent_identity
+            file_identity = planned.file_identity
+            digest = planned.sha256
+            size = planned.size
+            mode = planned.mode
+            uid = planned.uid
+        if (
+            parent_identity is None
+            or file_identity is None
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or mode != 0o600
+            or uid != os.geteuid()
+        ):
+            raise SyncError(
+                f"pending terminal regular target is incomplete: {record.target}"
+            )
+        if record.target in seen:
+            raise SyncError(
+                f"pending terminal regular target is duplicated: {record.target}"
+            )
+        seen.add(record.target)
+        targets.append(
+            PendingRegularTargetExpectation(
+                target=record.target,
+                parent_identity=parent_identity,
+                file_identity=file_identity,
+                sha256=digest,
+                size=size,
+                mode=mode,
+                uid=uid,
+            )
+        )
+    return tuple(sorted(targets, key=lambda target: target.target.as_posix()))
+
+
+def _pending_terminal_cleanup_ticket_payload(
+    batch: PendingLinkBatch,
+    marker: ManagedStateFileSnapshot,
+    *,
+    phase: str,
+) -> bytes:
+    if (
+        marker.parent_identity is None
+        or marker.file_identity is None
+        or marker.payload is None
+        or marker.mode != 0o600
+    ):
+        raise SyncError("pending terminal cleanup marker is not fully bound")
+    marker_path = (
+        PENDING_STATE_COMMIT_MARKER
+        if phase == "after"
+        else PENDING_STATE_ROLLBACK_MARKER
+    )
+    targets = _pending_terminal_regular_targets(batch, phase=phase)
+    return _bounded_json_document(
+        {
+            "version": 4,
+            "batch": batch.batch_root.name,
+            "batch_root_identity": _identity_payload(batch.batch_root_identity),
+            "finalization_marker": {
+                "phase": phase,
+                "path": marker_path.as_posix(),
+                "parent_identity": _identity_payload(marker.parent_identity),
+                "file_identity": _identity_payload(marker.file_identity),
+                "mode": marker.mode,
+                "sha256": hashlib.sha256(marker.payload).hexdigest(),
+            },
+            "terminal_regular_targets": [
+                {
+                    "target": target.target.as_posix(),
+                    "parent_identity": _identity_payload(target.parent_identity),
+                    "file_identity": _identity_payload(target.file_identity),
+                    "sha256": target.sha256,
+                    "size": target.size,
+                    "mode": target.mode,
+                    "uid": target.uid,
+                }
+                for target in targets
+            ],
+        },
+        max_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+        overflow_error="pending terminal cleanup ticket exceeds the size limit",
+    )
+
+
+def _parse_pending_terminal_regular_targets(
+    raw_targets: object,
+    *,
+    batch_name: str,
+) -> tuple[PendingRegularTargetExpectation, ...]:
+    if (
+        not isinstance(raw_targets, list)
+        or len(raw_targets) > MAX_PENDING_LINK_RECORDS
+    ):
+        raise SyncError(
+            f"pending terminal regular targets are invalid: {batch_name}"
+        )
+    expected_fields = {
+        "target",
+        "parent_identity",
+        "file_identity",
+        "sha256",
+        "size",
+        "mode",
+        "uid",
+    }
+    targets: list[PendingRegularTargetExpectation] = []
+    previous_target: PurePosixPath | None = None
+    for raw_target in raw_targets:
+        if not isinstance(raw_target, dict) or set(raw_target) != expected_fields:
+            raise SyncError(
+                f"pending terminal regular target changed: {batch_name}"
+            )
+        target = _validate_relative_path(
+            raw_target.get("target"),
+            "pending terminal regular target",
+        )
+        if previous_target is not None and target.as_posix() <= previous_target.as_posix():
+            raise SyncError(
+                f"pending terminal regular target order changed: {batch_name}"
+            )
+        previous_target = target
+        parent_identity = _parse_pending_identity(
+            raw_target.get("parent_identity"),
+            "pending terminal regular parent identity",
+        )
+        file_identity = _parse_pending_identity(
+            raw_target.get("file_identity"),
+            "pending terminal regular file identity",
+        )
+        digest = raw_target.get("sha256")
+        size = raw_target.get("size")
+        mode = raw_target.get("mode")
+        uid = raw_target.get("uid")
+        if (
+            parent_identity is None
+            or file_identity is None
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or mode != 0o600
+            or uid != os.geteuid()
+        ):
+            raise SyncError(
+                f"pending terminal regular target changed: {batch_name}"
+            )
+        targets.append(
+            PendingRegularTargetExpectation(
+                target=target,
+                parent_identity=parent_identity,
+                file_identity=file_identity,
+                sha256=digest,
+                size=size,
+                mode=mode,
+                uid=uid,
+            )
+        )
+    return tuple(targets)
+
+
 def _read_pending_cleanup_ticket(
     home: Path,
     ticket_path: Path,
@@ -16667,34 +17007,34 @@ def _read_pending_cleanup_ticket(
         )
         if not snapshot.exists:
             return None
-        if (
-            snapshot.payload is None
-            or len(snapshot.payload) > MAX_PENDING_CLEANUP_TICKET_BYTES
+        if snapshot.payload is None or (
+            len(snapshot.payload) > MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES
         ):
             raise SyncError(f"pending cleanup ticket exceeds its limit: {batch_name}")
         if snapshot.mode != 0o600:
             raise SyncError(f"pending cleanup ticket mode changed: {batch_name}")
         data = _decode_managed_state_json(snapshot.payload, ticket_path)
         version = data.get("version")
-        if type(version) is not int or version not in {1, 2, 3}:
+        if type(version) is not int or version not in {1, 2, 3, 4}:
             raise SyncError(
                 f"pending cleanup ticket has unsupported fields: {batch_name}"
             )
-        expected_top_level_fields = (
-            {
+        if version == 1:
+            expected_top_level_fields = {
                 "version",
                 "batch",
                 "batch_root_identity",
                 "commit_marker",
             }
-            if version == 1
-            else {
+        else:
+            expected_top_level_fields = {
                 "version",
                 "batch",
                 "batch_root_identity",
                 "finalization_marker",
             }
-        )
+            if version == 4:
+                expected_top_level_fields.add("terminal_regular_targets")
         if set(data) != expected_top_level_fields:
             raise SyncError(
                 f"pending cleanup ticket has unsupported fields: {batch_name}"
@@ -16717,7 +17057,7 @@ def _read_pending_cleanup_ticket(
             "mode",
             "sha256",
         }
-        if version in {2, 3}:
+        if version in {2, 3, 4}:
             expected_marker_fields.add("phase")
         if (
             not isinstance(marker, dict)
@@ -16727,12 +17067,24 @@ def _read_pending_cleanup_ticket(
                 f"pending cleanup finalization marker changed: {batch_name}"
             )
         phase = "after" if version == 1 else marker.get("phase")
-        marker_path = {
-            1: PENDING_STATE_COMMIT_MARKER,
-            2: PENDING_STATE_ROLLBACK_MARKER,
-            3: PENDING_STATE_STAGING_MARKER,
-        }[version]
-        expected_phase = {1: "after", 2: "before", 3: "staging"}[version]
+        if version == 4:
+            if phase not in {"before", "after"}:
+                raise SyncError(
+                    f"pending cleanup finalization marker changed: {batch_name}"
+                )
+            marker_path = (
+                PENDING_STATE_COMMIT_MARKER
+                if phase == "after"
+                else PENDING_STATE_ROLLBACK_MARKER
+            )
+            expected_phase = phase
+        else:
+            marker_path = {
+                1: PENDING_STATE_COMMIT_MARKER,
+                2: PENDING_STATE_ROLLBACK_MARKER,
+                3: PENDING_STATE_STAGING_MARKER,
+            }[version]
+            expected_phase = {1: "after", 2: "before", 3: "staging"}[version]
         if (
             phase != expected_phase
             or marker.get("path") != marker_path.as_posix()
@@ -16768,6 +17120,14 @@ def _read_pending_cleanup_ticket(
                 f"{batch_name}"
             )
         batch_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH / batch_name
+        terminal_regular_targets = (
+            _parse_pending_terminal_regular_targets(
+                data.get("terminal_regular_targets"),
+                batch_name=batch_name,
+            )
+            if version == 4
+            else ()
+        )
         if version == 1:
             expected_payload = _pending_cleanup_ticket_payload(
                 batch_root,
@@ -16778,23 +17138,39 @@ def _read_pending_cleanup_ticket(
                 marker_sha256,
             )
         else:
-            expected_payload = _bounded_json_document(
-                {
-                    "version": version,
-                    "batch": batch_name,
-                    "batch_root_identity": _identity_payload(batch_identity),
-                    "finalization_marker": {
-                        "phase": phase,
-                        "path": marker_path.as_posix(),
-                        "parent_identity": _identity_payload(
-                            marker_parent_identity
-                        ),
-                        "file_identity": _identity_payload(marker_file_identity),
-                        "mode": marker_mode,
-                        "sha256": marker_sha256,
-                    },
+            payload_data: dict[str, Any] = {
+                "version": version,
+                "batch": batch_name,
+                "batch_root_identity": _identity_payload(batch_identity),
+                "finalization_marker": {
+                    "phase": phase,
+                    "path": marker_path.as_posix(),
+                    "parent_identity": _identity_payload(marker_parent_identity),
+                    "file_identity": _identity_payload(marker_file_identity),
+                    "mode": marker_mode,
+                    "sha256": marker_sha256,
                 },
-                max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+            }
+            if version == 4:
+                payload_data["terminal_regular_targets"] = [
+                    {
+                        "target": target.target.as_posix(),
+                        "parent_identity": _identity_payload(target.parent_identity),
+                        "file_identity": _identity_payload(target.file_identity),
+                        "sha256": target.sha256,
+                        "size": target.size,
+                        "mode": target.mode,
+                        "uid": target.uid,
+                    }
+                    for target in terminal_regular_targets
+                ]
+            expected_payload = _bounded_json_document(
+                payload_data,
+                max_bytes=(
+                    MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES
+                    if version == 4
+                    else MAX_PENDING_CLEANUP_TICKET_BYTES
+                ),
                 overflow_error="pending cleanup ticket exceeds the size limit",
             )
         if snapshot.payload != expected_payload:
@@ -16811,6 +17187,7 @@ def _read_pending_cleanup_ticket(
             marker_file_identity=marker_file_identity,
             marker_mode=marker_mode,
             marker_sha256=marker_sha256,
+            terminal_regular_targets=terminal_regular_targets,
         )
     finally:
         _close_fd_quietly(index_fd)
@@ -16819,7 +17196,89 @@ def _read_pending_cleanup_ticket(
 def _discard_incomplete_pending_cleanup_ticket(
     home: Path,
     temp_path: Path,
-) -> None:
+    *,
+    max_actions: int = MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+) -> int:
+    if max_actions < 0:
+        raise SyncError("pending cleanup temp action budget is invalid")
+    index_fd = _open_directory_beneath(home, temp_path.parent)
+    discarded = 0
+    try:
+        label = f"incomplete pending cleanup ticket {temp_path.name}"
+        while discarded < max_actions:
+            snapshot = _read_managed_state_file_snapshot(
+                home,
+                temp_path,
+                index_fd,
+            )
+            if snapshot.exists:
+                if (
+                    snapshot.file_type != stat.S_IFREG
+                    or snapshot.mode != 0o600
+                    or not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+                ):
+                    raise SyncError(
+                        f"incomplete pending cleanup ticket changed: {temp_path.name}"
+                    )
+                _isolate_and_delete_pending_cleanup_file(
+                    home,
+                    temp_path,
+                    index_fd,
+                    snapshot,
+                    label=label,
+                )
+                discarded += 1
+                continue
+            retained_names = _retained_pending_cleanup_names_for_path(
+                home,
+                temp_path,
+                index_fd,
+                label=label,
+            )
+            if not retained_names:
+                break
+            retained_name = retained_names[0]
+            retained_path = temp_path.with_name(retained_name)
+            retained_snapshot = _read_managed_state_file_snapshot(
+                home,
+                retained_path,
+                index_fd,
+            )
+            if (
+                retained_snapshot.file_type != stat.S_IFREG
+                or retained_snapshot.mode != 0o600
+                or not _managed_state_snapshot_has_complete_file_evidence(
+                    retained_snapshot
+                )
+            ):
+                raise SyncError(
+                    f"incomplete pending cleanup retained temp changed: {retained_name}"
+                )
+            restored = _restore_exact_retained_pending_cleanup_file(
+                home,
+                temp_path,
+                index_fd,
+                retained_name,
+                retained_snapshot,
+                label=label,
+            )
+            _isolate_and_delete_pending_cleanup_file(
+                home,
+                temp_path,
+                index_fd,
+                restored,
+                label=label,
+            )
+            discarded += 1
+    finally:
+        _close_fd_quietly(index_fd)
+    return discarded
+
+
+def _pending_cleanup_temp_residue_is_observed(
+    home: Path,
+    temp_path: Path,
+) -> bool:
     index_fd = _open_directory_beneath(home, temp_path.parent)
     try:
         snapshot = _read_managed_state_file_snapshot(
@@ -16827,18 +17286,15 @@ def _discard_incomplete_pending_cleanup_ticket(
             temp_path,
             index_fd,
         )
-        if not snapshot.exists:
-            return
-        if snapshot.mode != 0o600:
-            raise SyncError(
-                f"incomplete pending cleanup ticket mode changed: {temp_path.name}"
+        if snapshot.exists:
+            return True
+        return bool(
+            _retained_pending_cleanup_names_for_path(
+                home,
+                temp_path,
+                index_fd,
+                label=f"pending cleanup temp {temp_path.name}",
             )
-        _isolate_and_delete_pending_cleanup_file(
-            home,
-            temp_path,
-            index_fd,
-            snapshot,
-            label=f"incomplete pending cleanup ticket {temp_path.name}",
         )
     finally:
         _close_fd_quietly(index_fd)
@@ -16854,6 +17310,10 @@ def _publish_pending_cleanup_ticket(
     # and can be discarded by the next lock holder before retrying publication.
     temp_path = ticket_path.with_name(ticket_path.name + ".tmp")
     _discard_incomplete_pending_cleanup_ticket(home, temp_path)
+    if _pending_cleanup_temp_residue_is_observed(home, temp_path):
+        raise SyncError(
+            "incomplete pending cleanup ticket temp backlog was retained; retry"
+        )
     staged = _write_exclusive_internal_file(home, temp_path, payload)
     index_fd = _open_directory_beneath(home, ticket_path.parent)
     try:
@@ -16958,6 +17418,22 @@ def _publish_pending_batch_cleanup_ticket_for_root(
     )
     _close_fd_quietly(index_fd)
     ticket_path = _pending_cleanup_ticket_path(home, batch_root.name)
+    index_fd = _open_directory_beneath(home, ticket_path.parent)
+    try:
+        retained = _retained_pending_cleanup_file(
+            home,
+            ticket_path,
+            index_fd,
+            expected=None,
+            label=f"pending cleanup ticket {batch_root.name}",
+        )
+        if retained is not None:
+            raise SyncError(
+                "pending cleanup ticket retained evidence must be recovered before "
+                f"publication: {batch_root.name}"
+            )
+    finally:
+        _close_fd_quietly(index_fd)
     existing = _read_pending_cleanup_ticket(
         home,
         ticket_path,
@@ -17027,6 +17503,119 @@ def _pending_staging_marker_snapshot(
         _close_fd_quietly(parent_fd)
 
 
+def _discover_pending_staging_markers(
+    home: Path,
+) -> tuple[
+    tuple[Path, tuple[int, int], ManagedStateFileSnapshot],
+    ...,
+]:
+    quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
+    try:
+        quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    except FileNotFoundError:
+        return ()
+    discovered: list[tuple[Path, tuple[int, int], ManagedStateFileSnapshot]] = []
+    try:
+        if not _bound_directory_matches(home, quarantine_root, quarantine_fd):
+            raise SyncError("pending staging quarantine root changed")
+        with os.scandir(quarantine_fd) as iterator:
+            for scanned, entry in enumerate(iterator, start=1):
+                if scanned > MAX_PENDING_CLEANUP_BATCH_SCAN:
+                    raise SyncError("pending staging batch scan exceeds the size limit")
+                batch_name = _pending_cleanup_batch_name_from_quarantine_entry(
+                    entry.name
+                )
+                if batch_name is None or entry.name != batch_name:
+                    continue
+                try:
+                    existing_ticket = _read_pending_cleanup_ticket(
+                        home,
+                        _pending_cleanup_ticket_path(home, batch_name),
+                    )
+                except FileNotFoundError:
+                    existing_ticket = None
+                except (OSError, SyncError) as error:
+                    raise _pending_cleanup_authority_classification_error(
+                        batch_name,
+                        error,
+                    ) from error
+                if existing_ticket is not None:
+                    continue
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except OSError as error:
+                    raise SyncError(
+                        f"pending staging batch changed: {entry.name}"
+                    ) from error
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise SyncError(
+                        f"pending staging batch is not a directory: {entry.name}"
+                    )
+                batch_root = quarantine_root / batch_name
+                batch_identity = (metadata.st_dev, metadata.st_ino)
+                try:
+                    marker = _pending_staging_marker_snapshot(
+                        home,
+                        batch_root,
+                        batch_identity,
+                    )
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    raise SyncError(
+                        f"pending staging marker changed: {batch_name}"
+                    ) from error
+                if marker is not None:
+                    discovered.append((batch_root, batch_identity, marker))
+        if not _bound_directory_matches(home, quarantine_root, quarantine_fd):
+            raise SyncError("pending staging quarantine root changed")
+    finally:
+        _close_fd_quietly(quarantine_fd)
+    return tuple(discovered)
+
+
+def _publish_discovered_staging_cleanup_tickets(
+    home: Path,
+    *,
+    limit: int = MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+    budget: PendingCleanupActionBudget | None = None,
+) -> int:
+    if limit < 0:
+        raise SyncError("pending staging cleanup action budget is invalid")
+    published = 0
+    action_budget = budget or PendingCleanupActionBudget(limit)
+    discovered = sorted(
+        _discover_pending_staging_markers(home),
+        key=lambda item: item[0].name,
+    )
+    for batch_root, batch_identity, marker in discovered:
+        ticket_path = _pending_cleanup_ticket_path(home, batch_root.name)
+        try:
+            existing = _read_pending_cleanup_ticket(home, ticket_path)
+        except FileNotFoundError:
+            existing = None
+        except (OSError, SyncError) as error:
+            raise _pending_cleanup_authority_classification_error(
+                batch_root.name,
+                error,
+            ) from error
+        if existing is not None:
+            continue
+        if not action_budget.charge_batch(batch_root.name):
+            continue
+        _publish_pending_batch_cleanup_ticket_for_root(
+            home,
+            batch_root,
+            _pending_staging_cleanup_ticket_payload(
+                batch_root,
+                batch_identity,
+                marker,
+            ),
+        )
+        published += 1
+    return published
+
+
 def _mark_pending_batch_staging_cleanup_ready(
     home: Path,
     batch_root: Path,
@@ -17070,12 +17659,82 @@ def _mark_pending_batch_staging_cleanup_ready(
     return ticket
 
 
+def _read_or_restore_active_pointer_cleanup_ticket(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> PendingBatchCleanupTicket | None:
+    if batch.pointer_snapshot is None:
+        raise SyncError(
+            "refusing to recover pending cleanup ticket tombstone without an "
+            "active pointer"
+        )
+    ticket_path = _pending_cleanup_ticket_path(home, batch.batch_root.name)
+    index_fd = _open_directory_beneath(home, ticket_path.parent)
+    restored: ManagedStateFileSnapshot | None = None
+    try:
+        canonical = _read_managed_state_file_snapshot(
+            home,
+            ticket_path,
+            index_fd,
+        )
+        retained = _retained_pending_cleanup_file(
+            home,
+            ticket_path,
+            index_fd,
+            expected=None,
+            label=f"active pending cleanup ticket {batch.batch_root.name}",
+        )
+        if canonical.exists and retained is not None:
+            raise SyncError(
+                "active pending cleanup ticket overlaps retained evidence: "
+                f"{batch.batch_root.name}"
+            )
+        if not canonical.exists and retained is not None:
+            retained_name, retained_snapshot = retained
+            if not _managed_state_snapshot_has_complete_file_evidence(
+                retained_snapshot
+            ):
+                raise SyncError(
+                    "active pending cleanup ticket retained evidence changed: "
+                    f"{batch.batch_root.name}"
+                )
+            restored = _restore_exact_retained_pending_cleanup_file(
+                home,
+                ticket_path,
+                index_fd,
+                retained_name,
+                retained_snapshot,
+                label=f"active pending cleanup ticket {batch.batch_root.name}",
+            )
+    finally:
+        _close_fd_quietly(index_fd)
+    ticket = _read_pending_cleanup_ticket(
+        home,
+        ticket_path,
+        expected_ticket_identity=(restored.file_identity if restored is not None else None),
+    )
+    if restored is not None and (
+        ticket is None
+        or ticket.version != 3
+        or ticket.phase != "staging"
+        or ticket.batch_root_identity != batch.batch_root_identity
+    ):
+        raise SyncError(
+            "active pending staging cleanup ticket tombstone changed during recovery"
+        )
+    return ticket
+
+
 def _retire_pending_staging_cleanup_authority(
     home: Path,
     batch: PendingLinkBatch,
 ) -> None:
-    ticket_path = _pending_cleanup_ticket_path(home, batch.batch_root.name)
-    ticket = _read_pending_cleanup_ticket(home, ticket_path)
+    if batch.pointer_snapshot is None:
+        raise SyncError(
+            "refusing to retire pending staging cleanup authority without an "
+            "active pointer"
+        )
+    ticket = _read_or_restore_active_pointer_cleanup_ticket(home, batch)
     marker = _pending_staging_marker_snapshot(
         home,
         batch.batch_root,
@@ -17089,11 +17748,6 @@ def _retire_pending_staging_cleanup_authority(
         return
     if ticket is None and marker is None:
         return
-    if batch.pointer_snapshot is None:
-        raise SyncError(
-            "refusing to retire pending staging cleanup authority without an "
-            "active pointer"
-        )
     if ticket is not None:
         if (
             ticket.version != 3
@@ -17170,18 +17824,23 @@ def _mark_pending_batch_cleanup_ready(
         or marker.mode != 0o600
     ):
         raise SyncError("pending cleanup commit marker is not fully bound")
-    _publish_pending_batch_cleanup_ticket(
-        home,
-        batch,
-        _pending_cleanup_ticket_payload(
+    payload = (
+        _pending_terminal_cleanup_ticket_payload(
+            batch,
+            marker,
+            phase="after",
+        )
+        if _batch_has_regular_records(batch)
+        else _pending_cleanup_ticket_payload(
             batch.batch_root,
             batch.batch_root_identity,
             marker.parent_identity,
             marker.file_identity,
             marker.mode,
             hashlib.sha256(marker.payload).hexdigest(),
-        ),
+        )
     )
+    _publish_pending_batch_cleanup_ticket(home, batch, payload)
 
 
 def _mark_pending_batch_rollback_cleanup_ready(
@@ -17189,15 +17848,20 @@ def _mark_pending_batch_rollback_cleanup_ready(
     batch: PendingLinkBatch,
 ) -> None:
     marker = _publish_pending_rollback_marker(home, batch)
-    _publish_pending_batch_cleanup_ticket(
-        home,
-        batch,
-        _pending_rollback_cleanup_ticket_payload(
+    payload = (
+        _pending_terminal_cleanup_ticket_payload(
+            batch,
+            marker,
+            phase="before",
+        )
+        if _batch_has_regular_records(batch)
+        else _pending_rollback_cleanup_ticket_payload(
             batch.batch_root,
             batch.batch_root_identity,
             marker,
-        ),
+        )
     )
+    _publish_pending_batch_cleanup_ticket(home, batch, payload)
 
 
 def _pending_link_pointer_is_absent(home: Path) -> bool:
@@ -17807,6 +18471,7 @@ def _remove_cleanup_ready_batch(
                         "pending cleanup batch root is missing without an exact "
                         f"empty proof: {batch_name}"
                     )
+                _verify_final_regular_targets(home, ticket)
                 _delete_pending_cleanup_ticket(home, ticket)
                 _delete_pending_cleanup_empty_proof(
                     home,
@@ -17864,6 +18529,7 @@ def _remove_cleanup_ready_batch(
         if batch_fd >= 0:
             _close_fd_quietly(batch_fd)
         _close_fd_quietly(quarantine_fd)
+    _verify_final_regular_targets(home, ticket)
     _delete_pending_cleanup_ticket(home, ticket)
     _delete_pending_cleanup_empty_proof(
         home,
@@ -17977,11 +18643,26 @@ def _write_pending_cleanup_cursor(
     home: Path,
     index_root: Path,
     ticket_name: str,
-) -> None:
+    *,
+    max_temp_cleanup_actions: int = MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+) -> int:
+    if max_temp_cleanup_actions < 0:
+        raise SyncError("pending cleanup scan cursor temp action budget is invalid")
     cursor_path = index_root / PENDING_CLEANUP_CURSOR_NAME
     temp_path = index_root / PENDING_CLEANUP_CURSOR_TEMP_NAME
     payload = (ticket_name + "\n").encode("ascii")
-    _discard_incomplete_pending_cleanup_ticket(home, temp_path)
+    if (
+        max_temp_cleanup_actions == 0
+        and _pending_cleanup_temp_residue_is_observed(home, temp_path)
+    ):
+        return 0
+    discarded = _cleanup_pending_cleanup_cursor_temp(
+        home,
+        index_root,
+        limit=max_temp_cleanup_actions,
+    )
+    if _pending_cleanup_temp_residue_is_observed(home, temp_path):
+        return discarded
     staged = _write_exclusive_internal_file(home, temp_path, payload)
     index_fd = _open_directory_beneath(home, index_root)
     try:
@@ -18010,11 +18691,400 @@ def _write_pending_cleanup_cursor(
             raise SyncError("pending cleanup scan cursor changed during publication")
     finally:
         _close_fd_quietly(index_fd)
+    return discarded
+
+
+def _cleanup_pending_cleanup_cursor_temp(
+    home: Path,
+    index_root: Path,
+    *,
+    limit: int,
+) -> int:
+    if limit < 0:
+        raise SyncError("pending cleanup scan cursor temp action budget is invalid")
+    return _discard_incomplete_pending_cleanup_ticket(
+        home,
+        index_root / PENDING_CLEANUP_CURSOR_TEMP_NAME,
+        max_actions=limit,
+    )
+
+
+def _pending_cleanup_retained_canonical_name(name: str) -> str | None:
+    if not name.startswith(PENDING_CLEANUP_RETAINED_PREFIX):
+        return None
+    retained = name[len(PENDING_CLEANUP_RETAINED_PREFIX) :]
+    match = re.fullmatch(r"(.+)-[0-9]+-[0-9a-f]{16}", retained)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def _pending_cleanup_ticket_temp_batch_name(name: str) -> str | None:
+    if not name.endswith(PENDING_CLEANUP_TICKET_TEMP_SUFFIX):
+        return None
+    batch_name = name[: -len(PENDING_CLEANUP_TICKET_TEMP_SUFFIX)]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        return None
+    return batch_name
+
+
+def _pending_cleanup_retained_ticket_temp_name(
+    name: str,
+) -> tuple[str, str] | None:
+    canonical = _pending_cleanup_retained_canonical_name(name)
+    if canonical is None:
+        return None
+    batch_name = _pending_cleanup_ticket_temp_batch_name(canonical)
+    if batch_name is None:
+        return None
+    return canonical, batch_name
+
+
+def _pending_cleanup_cursor_temp_canonical_name(name: str) -> str | None:
+    if name == PENDING_CLEANUP_CURSOR_TEMP_NAME:
+        return name
+    canonical = _pending_cleanup_retained_canonical_name(name)
+    if canonical == PENDING_CLEANUP_CURSOR_TEMP_NAME:
+        return canonical
+    return None
+
+
+def _pending_cleanup_retained_control_name(
+    name: str,
+) -> tuple[str, str] | None:
+    canonical = _pending_cleanup_retained_canonical_name(name)
+    if canonical is None:
+        return None
+    for suffix in (
+        PENDING_CLEANUP_TICKET_SUFFIX,
+        PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
+    ):
+        if not canonical.endswith(suffix):
+            continue
+        batch_name = canonical[: -len(suffix)]
+        if (
+            len(batch_name) <= MAX_PENDING_LINK_BATCH_NAME_BYTES
+            and PENDING_LINK_BATCH_RE.fullmatch(batch_name) is not None
+        ):
+            return canonical, batch_name
+    return None
+
+
+def _restore_pending_cleanup_control_tombstones(
+    home: Path,
+    *,
+    limit: int = MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+    budget: PendingCleanupActionBudget | None = None,
+) -> int:
+    if limit < 0:
+        raise SyncError("pending cleanup control action budget is invalid")
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return 0
+    restored = 0
+    try:
+        if not _bound_directory_matches(home, index_root, index_fd):
+            raise SyncError("pending cleanup index changed")
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending cleanup control scan exceeds the size limit",
+        )
+        retained_by_canonical: dict[str, list[str]] = {}
+        for name in names:
+            parsed = _pending_cleanup_retained_control_name(name)
+            if parsed is None:
+                continue
+            canonical, _batch_name = parsed
+            retained_by_canonical.setdefault(canonical, []).append(name)
+        ordered = sorted(
+            retained_by_canonical,
+            key=lambda name: (
+                not name.endswith(PENDING_CLEANUP_TICKET_SUFFIX),
+                name,
+            ),
+        )
+        for canonical in ordered:
+            retained_names = retained_by_canonical[canonical]
+            if len(retained_names) != 1:
+                raise SyncError(
+                    f"pending cleanup control has multiple retained files: {canonical}"
+                )
+            canonical_path = index_root / canonical
+            canonical_snapshot = _read_managed_state_file_snapshot(
+                home,
+                canonical_path,
+                index_fd,
+            )
+            if canonical_snapshot.exists:
+                raise SyncError(
+                    f"pending cleanup control overlaps retained evidence: {canonical}"
+                )
+        action_budget = budget or PendingCleanupActionBudget(limit)
+        for canonical in ordered:
+            retained_names = retained_by_canonical[canonical]
+            parsed = _pending_cleanup_retained_control_name(retained_names[0])
+            assert parsed is not None
+            _parsed_canonical, batch_name = parsed
+            if not action_budget.charge_batch(batch_name):
+                continue
+            canonical_path = index_root / canonical
+            retained_path = index_root / retained_names[0]
+            retained_snapshot = _read_managed_state_file_snapshot(
+                home,
+                retained_path,
+                index_fd,
+            )
+            if not retained_snapshot.exists:
+                raise SyncError(
+                    f"pending cleanup retained control disappeared: {canonical}"
+                )
+            recovered = _restore_retained_pending_cleanup_file(
+                home,
+                canonical_path,
+                index_fd,
+                retained_snapshot,
+                label=f"pending cleanup control {canonical}",
+            )
+            if recovered is None:
+                raise SyncError(
+                    f"pending cleanup retained control disappeared: {canonical}"
+                )
+            if canonical.endswith(PENDING_CLEANUP_TICKET_SUFFIX):
+                ticket = _read_pending_cleanup_ticket(
+                    home,
+                    canonical_path,
+                    expected_ticket_identity=recovered.file_identity,
+                )
+                if ticket is None:
+                    raise SyncError(
+                        f"pending cleanup ticket recovery failed: {canonical}"
+                    )
+            restored += 1
+        if not _bound_directory_matches(home, index_root, index_fd):
+            raise SyncError("pending cleanup index changed")
+    finally:
+        _close_fd_quietly(index_fd)
+    return restored
+
+
+def _cleanup_pending_cleanup_ticket_temps(
+    home: Path,
+    *,
+    limit: int = MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+    budget: PendingCleanupActionBudget | None = None,
+) -> int:
+    if limit < 0:
+        raise SyncError("pending cleanup temp action budget is invalid")
+    if limit == 0 and budget is None:
+        return 0
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return 0
+    temp_names: set[str] = set()
+    try:
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending cleanup control scan exceeds the size limit",
+        )
+        for name in names:
+            if _pending_cleanup_ticket_temp_batch_name(name) is not None:
+                temp_names.add(name)
+                continue
+            retained = _pending_cleanup_retained_ticket_temp_name(name)
+            if retained is not None:
+                temp_names.add(retained[0])
+    finally:
+        _close_fd_quietly(index_fd)
+    action_budget = budget or PendingCleanupActionBudget(limit)
+    discarded = 0
+    for temp_name in sorted(temp_names):
+        batch_name = _pending_cleanup_ticket_temp_batch_name(temp_name)
+        assert batch_name is not None
+        if not action_budget.charge_batch(batch_name):
+            continue
+        discarded_for_batch = _discard_incomplete_pending_cleanup_ticket(
+            home,
+            index_root / temp_name,
+            max_actions=MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+        )
+        discarded += discarded_for_batch
+        if discarded_for_batch > 0:
+            action_budget.mark_batch_completed(batch_name)
+    return discarded
+
+
+def _read_orphan_pending_cleanup_empty_proof(
+    home: Path,
+    proof_path: Path,
+) -> ManagedStateFileSnapshot:
+    suffix = PENDING_CLEANUP_EMPTY_PROOF_SUFFIX
+    if not proof_path.name.endswith(suffix):
+        raise SyncError("pending cleanup empty proof has an invalid file name")
+    batch_name = proof_path.name[: -len(suffix)]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        raise SyncError("pending cleanup empty proof has an invalid batch name")
+    index_fd = _open_directory_beneath(home, proof_path.parent)
+    try:
+        proof = _read_managed_state_file_snapshot(
+            home,
+            proof_path,
+            index_fd,
+        )
+    finally:
+        _close_fd_quietly(index_fd)
+    if not proof.exists or proof.payload is None or proof.mode != 0o600:
+        raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
+    data = _decode_managed_state_json(proof.payload, proof_path)
+    if set(data) != {
+        "version",
+        "batch",
+        "batch_root_identity",
+        "quarantine_root_identity",
+        "isolated_name",
+        "ticket_identity",
+        "ticket_sha256",
+    } or data.get("version") != 1:
+        raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
+    batch_identity = _parse_pending_identity(
+        data.get("batch_root_identity"),
+        "pending cleanup empty-proof batch identity",
+    )
+    quarantine_identity = _parse_pending_identity(
+        data.get("quarantine_root_identity"),
+        "pending cleanup empty-proof quarantine identity",
+    )
+    ticket_identity = _parse_pending_identity(
+        data.get("ticket_identity"),
+        "pending cleanup empty-proof ticket identity",
+    )
+    ticket_sha256 = data.get("ticket_sha256")
+    isolated_name = _pending_cleanup_isolated_batch_name(batch_name)
+    if (
+        data.get("batch") != batch_name
+        or batch_identity is None
+        or quarantine_identity is None
+        or ticket_identity is None
+        or data.get("isolated_name") != isolated_name
+        or not isinstance(ticket_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", ticket_sha256) is None
+    ):
+        raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
+    expected_payload = _bounded_json_document(
+        {
+            "version": 1,
+            "batch": batch_name,
+            "batch_root_identity": _identity_payload(batch_identity),
+            "quarantine_root_identity": _identity_payload(quarantine_identity),
+            "isolated_name": isolated_name,
+            "ticket_identity": _identity_payload(ticket_identity),
+            "ticket_sha256": ticket_sha256,
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending cleanup empty proof exceeds the size limit",
+    )
+    if proof.payload != expected_payload:
+        raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
+    quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
+    quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    try:
+        if (
+            _directory_identity(quarantine_fd) != quarantine_identity
+            or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+        ):
+            raise SyncError("pending cleanup quarantine root changed")
+        if (
+            _named_entry_identity(quarantine_fd, batch_name) is not None
+            or _named_entry_identity(quarantine_fd, isolated_name) is not None
+        ):
+            raise SyncError(
+                f"pending cleanup empty proof still has a batch root: {batch_name}"
+            )
+    finally:
+        _close_fd_quietly(quarantine_fd)
+    return proof
+
+
+def _cleanup_orphan_pending_cleanup_empty_proofs(
+    home: Path,
+    *,
+    limit: int = MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+    budget: PendingCleanupActionBudget | None = None,
+) -> int:
+    if limit < 0:
+        raise SyncError("pending cleanup proof action budget is invalid")
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return 0
+    proof_names: list[str] = []
+    try:
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending cleanup control scan exceeds the size limit",
+        )
+        for name in names:
+            if not name.endswith(PENDING_CLEANUP_EMPTY_PROOF_SUFFIX):
+                continue
+            batch_name = name[: -len(PENDING_CLEANUP_EMPTY_PROOF_SUFFIX)]
+            if PENDING_LINK_BATCH_RE.fullmatch(batch_name) is not None:
+                proof_names.append(name)
+    finally:
+        _close_fd_quietly(index_fd)
+    action_budget = budget or PendingCleanupActionBudget(limit)
+    cleaned = 0
+    for proof_name in sorted(proof_names):
+        batch_name = proof_name[: -len(PENDING_CLEANUP_EMPTY_PROOF_SUFFIX)]
+        try:
+            ticket = _read_pending_cleanup_ticket(
+                home,
+                _pending_cleanup_ticket_path(home, batch_name),
+            )
+        except (FileNotFoundError, OSError, SyncError) as error:
+            raise _pending_cleanup_authority_classification_error(
+                batch_name,
+                error,
+            ) from error
+        if ticket is not None:
+            continue
+        if not action_budget.charge_batch(batch_name):
+            continue
+        proof_path = index_root / proof_name
+        proof = _read_orphan_pending_cleanup_empty_proof(home, proof_path)
+        index_fd = _open_directory_beneath(home, index_root)
+        try:
+            _isolate_and_delete_pending_cleanup_file(
+                home,
+                proof_path,
+                index_fd,
+                proof,
+                label=f"orphan pending cleanup empty proof {batch_name}",
+            )
+        finally:
+            _close_fd_quietly(index_fd)
+        cleaned += 1
+        action_budget.mark_batch_completed(batch_name)
+    return cleaned
 
 
 def _pending_cleanup_ready_batch_is_observed(home: Path) -> bool:
     if not _pending_link_pointer_is_absent(home):
         return False
+    if _discover_pending_staging_markers(home):
+        return True
     index_root = _pending_cleanup_index_path(home)
     try:
         index_fd = _open_directory_beneath(home, index_root)
@@ -18025,18 +19095,32 @@ def _pending_cleanup_ready_batch_is_observed(home: Path) -> bool:
             raise SyncError("pending cleanup index changed")
         with os.scandir(index_fd) as iterator:
             for scanned, entry in enumerate(iterator, start=1):
-                if scanned > MAX_PENDING_CLEANUP_BATCH_SCAN + 3:
+                if scanned > MAX_PENDING_CLEANUP_CONTROL_ENTRIES:
                     raise SyncError(
                         "pending cleanup ticket scan exceeds the size limit"
                     )
-                if not entry.name.endswith(PENDING_CLEANUP_TICKET_SUFFIX):
-                    continue
-                batch_name = entry.name[: -len(PENDING_CLEANUP_TICKET_SUFFIX)]
+                retained = _pending_cleanup_retained_control_name(entry.name)
+                if retained is not None:
+                    return True
                 if (
-                    len(batch_name) <= MAX_PENDING_LINK_BATCH_NAME_BYTES
-                    and PENDING_LINK_BATCH_RE.fullmatch(batch_name) is not None
+                    _pending_cleanup_ticket_temp_batch_name(entry.name) is not None
+                    or _pending_cleanup_retained_ticket_temp_name(entry.name) is not None
+                    or _pending_cleanup_cursor_temp_canonical_name(entry.name)
+                    is not None
                 ):
                     return True
+                for suffix in (
+                    PENDING_CLEANUP_TICKET_SUFFIX,
+                    PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
+                ):
+                    if not entry.name.endswith(suffix):
+                        continue
+                    batch_name = entry.name[: -len(suffix)]
+                    if (
+                        len(batch_name) <= MAX_PENDING_LINK_BATCH_NAME_BYTES
+                        and PENDING_LINK_BATCH_RE.fullmatch(batch_name) is not None
+                    ):
+                        return True
         return False
     finally:
         _close_fd_quietly(index_fd)
@@ -18045,23 +19129,44 @@ def _pending_cleanup_ready_batch_is_observed(home: Path) -> bool:
 def _cleanup_ready_pending_batches(home: Path) -> int:
     if not _pending_link_pointer_is_absent(home):
         return 0
+    budget = PendingCleanupActionBudget(MAX_PENDING_CLEANUP_BATCHES_PER_RUN)
+    _restore_pending_cleanup_control_tombstones(
+        home,
+        budget=budget,
+    )
+    _cleanup_pending_cleanup_ticket_temps(
+        home,
+        budget=budget,
+    )
+    _publish_discovered_staging_cleanup_tickets(
+        home,
+        budget=budget,
+    )
+    _cleanup_orphan_pending_cleanup_empty_proofs(
+        home,
+        budget=budget,
+    )
     index_root = _pending_cleanup_index_path(home)
     try:
         index_fd = _open_directory_beneath(home, index_root)
     except FileNotFoundError:
-        return 0
+        return budget.completed
+    cursor_cleanup_actions = _cleanup_pending_cleanup_cursor_temp(
+        home,
+        index_root,
+        limit=budget.remaining,
+    )
+    budget.consume_control_actions(cursor_cleanup_actions)
     candidates: list[str] = []
     try:
         if not _bound_directory_matches(home, index_root, index_fd):
             raise SyncError("pending cleanup index changed")
         with os.scandir(index_fd) as iterator:
             for scanned, entry in enumerate(iterator, start=1):
-                if scanned > MAX_PENDING_CLEANUP_BATCH_SCAN + 3:
-                    print(
-                        "warning: pending cleanup ticket scan reached its limit; "
-                        "processing the bounded window"
+                if scanned > MAX_PENDING_CLEANUP_CONTROL_ENTRIES:
+                    raise SyncError(
+                        "pending cleanup ticket scan exceeds the size limit"
                     )
-                    break
                 if not entry.name.endswith(PENDING_CLEANUP_TICKET_SUFFIX):
                     continue
                 batch_name = entry.name[: -len(PENDING_CLEANUP_TICKET_SUFFIX)]
@@ -18075,7 +19180,7 @@ def _cleanup_ready_pending_batches(home: Path) -> int:
 
     ordered = sorted(candidates)
     if not ordered:
-        return 0
+        return budget.completed
     cursor = _read_pending_cleanup_cursor(home, index_root)
     start = 0
     if cursor is not None:
@@ -18084,8 +19189,11 @@ def _cleanup_ready_pending_batches(home: Path) -> int:
             0,
         )
     rotated = ordered[start:] + ordered[:start]
-    selected = rotated[:MAX_PENDING_CLEANUP_BATCHES_PER_RUN]
-    cleaned = 0
+    selected: list[str] = []
+    for ticket_name in rotated:
+        batch_name = ticket_name[: -len(PENDING_CLEANUP_TICKET_SUFFIX)]
+        if budget.charge_batch(batch_name):
+            selected.append(ticket_name)
     for ticket_name in selected:
         batch_name = ticket_name[: -len(PENDING_CLEANUP_TICKET_SUFFIX)]
         try:
@@ -18093,17 +19201,35 @@ def _cleanup_ready_pending_batches(home: Path) -> int:
                 home,
                 index_root / ticket_name,
             )
-            if ticket is None:
-                continue
-            if _remove_cleanup_ready_batch(home, ticket):
-                cleaned += 1
         except (FileNotFoundError, OSError, SyncError) as error:
+            raise _pending_cleanup_authority_classification_error(
+                batch_name,
+                error,
+            ) from error
+        if ticket is None:
+            continue
+        try:
+            if _remove_cleanup_ready_batch(home, ticket):
+                budget.mark_batch_completed(batch_name)
+        except (FileNotFoundError, OSError, SyncError) as error:
+            if ticket.version == 4:
+                raise SyncError(
+                    "pending terminal regular-file validation was retained: "
+                    f"{batch_name}: {error}"
+                ) from error
             print(
                 "warning: deferred pending transaction cleanup was retained: "
                 f"{batch_name}: {error}"
             )
-    _write_pending_cleanup_cursor(home, index_root, selected[-1])
-    return cleaned
+    if selected:
+        cursor_cleanup_actions = _write_pending_cleanup_cursor(
+            home,
+            index_root,
+            selected[-1],
+            max_temp_cleanup_actions=budget.remaining,
+        )
+        budget.consume_control_actions(cursor_cleanup_actions)
+    return budget.completed
 
 
 def _try_cleanup_ready_pending_batches(home: Path) -> int:
@@ -18313,7 +19439,6 @@ def _pending_record_evidence_snapshot(
             record.regular_size,
             record.regular_mode,
             record.regular_uid,
-            record.regular_gid,
             record.regular_link_count,
         )
         if any(value is None for value in expected_values):
@@ -18343,7 +19468,6 @@ def _pending_record_evidence_snapshot(
                 or snapshot.size != record.regular_size
                 or snapshot.mode != record.regular_mode
                 or snapshot.uid != record.regular_uid
-                or snapshot.gid != record.regular_gid
                 or snapshot.link_count
                 not in {
                     record.regular_link_count,
@@ -18399,7 +19523,10 @@ def _pending_record_before_evidence_snapshot(
             or snapshot.size != planned_regular.size
             or snapshot.mode != planned_regular.mode
             or snapshot.uid != planned_regular.uid
-            or snapshot.gid != planned_regular.gid
+            or (
+                bool(planned_regular.mode & 0o070)
+                and snapshot.gid != planned_regular.gid
+            )
         ):
             raise SyncError(f"pending before evidence changed: {record.target}")
         return snapshot
@@ -18441,7 +19568,10 @@ def _pending_record_backup_snapshot(
             or snapshot.size != planned_regular.size
             or snapshot.mode != planned_regular.mode
             or snapshot.uid != planned_regular.uid
-            or snapshot.gid != planned_regular.gid
+            or (
+                bool(planned_regular.mode & 0o070)
+                and snapshot.gid != planned_regular.gid
+            )
         ):
             raise SyncError(f"pending backup changed: {record.target}")
         return snapshot
@@ -18517,6 +19647,7 @@ def _regular_snapshot_matches(
     expected: RegularFileSnapshot,
     *,
     expected_link_count: int,
+    protect_gid: bool,
 ) -> bool:
     return (
         isinstance(actual, RegularFileSnapshot)
@@ -18527,7 +19658,7 @@ def _regular_snapshot_matches(
         and actual.size == expected.size
         and actual.mode == expected.mode
         and actual.uid == expected.uid
-        and actual.gid == expected.gid
+        and (not protect_gid or actual.gid == expected.gid)
         and actual.link_count == expected_link_count
     )
 
@@ -18535,6 +19666,8 @@ def _regular_snapshot_matches(
 def _regular_snapshot_leaf_matches(
     actual: SymlinkSnapshot | RegularFileSnapshot | None,
     expected: RegularFileSnapshot,
+    *,
+    protect_gid: bool,
 ) -> bool:
     return (
         isinstance(actual, RegularFileSnapshot)
@@ -18543,7 +19676,7 @@ def _regular_snapshot_leaf_matches(
         and actual.size == expected.size
         and actual.mode == expected.mode
         and actual.uid == expected.uid
-        and actual.gid == expected.gid
+        and (not protect_gid or actual.gid == expected.gid)
     )
 
 
@@ -18569,7 +19702,11 @@ def _restore_pending_record_before(
             expected_target,
             {},
         )
-        if not _regular_snapshot_leaf_matches(restored, before_evidence):
+        if not _regular_snapshot_leaf_matches(
+            restored,
+            before_evidence,
+            protect_gid=bool(before_evidence.mode & 0o070),
+        ):
             raise SyncError(
                 f"pending preimage restoration changed: {record.target}"
             )
@@ -18821,10 +19958,12 @@ def _verify_committed_pending_link_records(
                     record.planned_snapshot.parent_identity,
                     evidence,
                     expected_link_count=evidence.link_count,
+                    protect_gid=False,
                 )
                 leaf_matches = _regular_snapshot_leaf_matches(
                     target_snapshot,
                     evidence,
+                    protect_gid=False,
                 )
             else:
                 target_matches = _symlink_snapshot_matches(
@@ -18859,12 +19998,14 @@ def _verify_committed_pending_link_records(
             before_leaf_matches = _regular_snapshot_leaf_matches(
                 target_snapshot,
                 before,
+                protect_gid=bool(before.mode & 0o070),
             )
             before_matches = _regular_snapshot_matches(
                 target_snapshot,
                 record.planned_snapshot.parent_identity,
                 before,
                 expected_link_count=before.link_count,
+                protect_gid=bool(before.mode & 0o070),
             )
         else:
             before_leaf_matches = _symlink_snapshot_leaf_matches(
@@ -18894,31 +20035,28 @@ def _batch_has_regular_records(batch: PendingLinkBatch) -> bool:
 
 def _verify_final_regular_targets(
     home: Path,
-    batch: PendingLinkBatch,
+    ticket: PendingBatchCleanupTicket,
 ) -> None:
-    for record in batch.records:
-        if not record.is_regular() or record.action not in {
-            "create",
-            "replace",
-            "quarantine-replace",
-        }:
-            continue
-        target = home / Path(*record.target.parts)
+    if ticket.version != 4:
+        return
+    for expected in ticket.terminal_regular_targets:
+        target = home / Path(*expected.target.parts)
         snapshot = _read_regular_file_snapshot_beneath(
             home,
             target,
             require_managed_access=True,
         )
         if (
-            snapshot.sha256 != record.regular_sha256
-            or snapshot.size != record.regular_size
-            or snapshot.mode != record.regular_mode
-            or snapshot.uid != record.regular_uid
-            or snapshot.gid != record.regular_gid
+            snapshot.parent_identity != expected.parent_identity
+            or snapshot.file_identity != expected.file_identity
+            or snapshot.sha256 != expected.sha256
+            or snapshot.size != expected.size
+            or snapshot.mode != expected.mode
+            or snapshot.uid != expected.uid
             or snapshot.link_count != 1
         ):
             raise SyncError(
-                f"final managed regular file changed: {record.target}"
+                f"final managed regular file changed: {expected.target}"
             )
 
 
@@ -18962,11 +20100,6 @@ def _finalize_rolled_back_pending_batch(
         raise SyncError(
             "rolled-back pending regular-file evidence cleanup was deferred"
         )
-    _verify_managed_state_link_claims(
-        home,
-        batch.state_before_value,
-        relinquishments,
-    )
 
 
 def _recover_pending_link_transaction(
@@ -19004,7 +20137,6 @@ def _recover_pending_link_transaction(
                 raise SyncError(
                     "committed pending regular-file evidence cleanup was deferred"
                 )
-            _verify_final_regular_targets(home, batch)
         return state, state_snapshot, True
 
     state, state_snapshot = _rollback_pending_state_to_before(
@@ -19049,12 +20181,14 @@ def _recover_pending_link_transaction(
             target_has_produced_leaf = _regular_snapshot_leaf_matches(
                 target_snapshot,
                 produced_evidence,
+                protect_gid=False,
             )
             target_is_produced = _regular_snapshot_matches(
                 target_snapshot,
                 record.planned_snapshot.parent_identity,
                 produced_evidence,
                 expected_link_count=produced_evidence.link_count,
+                protect_gid=False,
             )
         elif isinstance(produced_evidence, SymlinkSnapshot):
             target_has_produced_leaf = _symlink_snapshot_leaf_matches(
@@ -19077,6 +20211,7 @@ def _recover_pending_link_transaction(
                 record.planned_snapshot.parent_identity,
                 before_evidence,
                 expected_link_count=before_evidence.link_count,
+                protect_gid=bool(before_evidence.mode & 0o070),
             )
         elif isinstance(before_evidence, SymlinkSnapshot):
             target_is_before = _symlink_snapshot_matches(
@@ -19524,7 +20659,11 @@ def _apply_reconcile_actions(
                 if _entry_target_path(home, entry) != action.target
             ]
             if prior_replacements:
-                _verify_required_replacement_targets(home, prior_replacements)
+                _verify_required_replacement_targets(
+                    home,
+                    prior_replacements,
+                    allow_transaction_links=pending_batch is not None,
+                )
             try:
                 relative_target = action.target.relative_to(home)
             except ValueError as error:
@@ -19563,7 +20702,11 @@ def _apply_reconcile_actions(
             transaction.mutations.append(mutation)
             _verify_reconcile_backup(home, action, backup)
             if prior_replacements:
-                _verify_required_replacement_targets(home, prior_replacements)
+                _verify_required_replacement_targets(
+                    home,
+                    prior_replacements,
+                    allow_transaction_links=pending_batch is not None,
+                )
             object_kind = (
                 "regular file"
                 if action.materialization == "regular"
@@ -19655,7 +20798,11 @@ def _apply_reconcile_actions(
                         allow_transaction_links=True,
                     )
                 if replacements:
-                    _verify_required_replacement_targets(home, replacements)
+                    _verify_required_replacement_targets(
+                        home,
+                        replacements,
+                        allow_transaction_links=pending_batch is not None,
+                    )
                 if action.materialization == "regular":
                     print(f"replaced regular file {action.target}")
                 else:
@@ -19926,9 +21073,34 @@ def _verify_reconcile_action_targets(
 def _verify_required_replacement_targets(
     home: Path,
     required_replacements: list[LinkEntry],
+    *,
+    allow_transaction_links: bool = False,
 ) -> None:
     for entry in required_replacements:
         target = _entry_target_path(home, entry)
+        if _entry_materializes_regular_file(entry):
+            try:
+                snapshot = _read_regular_file_snapshot_beneath(
+                    home,
+                    target,
+                    require_managed_access=False,
+                )
+                source = _entry_regular_source_path(home, entry)
+            except (FileNotFoundError, OSError, SyncError) as error:
+                raise SyncError(
+                    f"active replacement target changed before removal: {target}"
+                ) from error
+            if (
+                snapshot.sha256 != _regular_source_sha256(home, source)
+                or snapshot.mode != 0o600
+                or snapshot.uid != os.geteuid()
+                or snapshot.link_count < 1
+                or (not allow_transaction_links and snapshot.link_count != 1)
+            ):
+                raise SyncError(
+                    f"active replacement target changed before removal: {target}"
+                )
+            continue
         expected = _desired_link_target(home, entry)
         try:
             actual = _read_symlink_beneath(home, target)
@@ -23574,12 +24746,20 @@ def _switch_current(
     print(f"switched {current} -> releases/{sha}")
 
 
-def _installed_manifests(home: Path) -> dict[str, ManifestData]:
+def _installed_manifests(
+    home: Path,
+    *,
+    manifest_cache: dict[tuple[str, str], ManifestData | None] | None = None,
+) -> dict[str, ManifestData]:
     manifests: dict[str, ManifestData] = {}
     for owner in sorted(_known_owners(home)):
         if _current_sha(home, owner) is None:
             continue
-        manifests[owner] = _current_manifest_data(home, owner)
+        manifests[owner] = _current_manifest_data(
+            home,
+            owner,
+            manifest_cache=manifest_cache,
+        )
     return manifests
 
 
@@ -24755,7 +25935,6 @@ def _install_release_set_unlocked(
                 raise SyncError(
                     "committed regular-file evidence cleanup was deferred"
                 )
-            _verify_final_regular_targets(home, pending_batch)
     finally:
         _close_install_release_directory_chains(
             install_release_directory_chains
@@ -26646,16 +27825,36 @@ def status(home: Path, owner: str = PUBLIC_OWNER) -> bool:
         sha,
         manifest_cache=manifest_cache,
     ).entries
-    public_entries = (
-        _current_manifest_data(
+    checked_entries = entries
+    checked_owners = {owner}
+    if owner == PUBLIC_OWNER:
+        installed_manifests = _installed_manifests(
+            home,
+            manifest_cache=manifest_cache,
+        )
+        overlays = [
+            manifest
+            for installed_owner, manifest in sorted(installed_manifests.items())
+            if installed_owner != PUBLIC_OWNER
+        ]
+        if overlays:
+            checked_entries = _combine_entries(entries, overlays)
+            checked_owners.update(manifest.owner for manifest in overlays)
+            public_entries = entries
+        else:
+            public_entries = None
+    else:
+        public_entries = _current_manifest_data(
             home,
             PUBLIC_OWNER,
             manifest_cache=manifest_cache,
         ).entries
-        if any(entry.owner != PUBLIC_OWNER for entry in entries)
-        else None
+    checked_targets = {entry.target for entry in checked_entries}
+    actions = plan_link_actions(
+        home,
+        checked_entries,
+        public_entries=public_entries,
     )
-    actions = plan_link_actions(home, entries, public_entries=public_entries)
     stale_removals = plan_stale_current_link_removals(
         home,
         entries,
@@ -26685,11 +27884,15 @@ def status(home: Path, owner: str = PUBLIC_OWNER) -> bool:
         return False
     state = _load_managed_state(home, manifest_cache=manifest_cache)
     state_issues: list[str] = []
-    if state.owners.get(owner) != sha:
-        state_issues.append(
-            f"release mismatch: state={state.owners.get(owner)}, current={sha}"
-        )
-    for entry in entries:
+    for checked_owner in sorted(checked_owners):
+        checked_sha = _current_sha(home, checked_owner)
+        if state.owners.get(checked_owner) != checked_sha:
+            state_issues.append(
+                "release mismatch: "
+                f"owner={checked_owner}, state={state.owners.get(checked_owner)}, "
+                f"current={checked_sha}"
+            )
+    for entry in checked_entries:
         if (
             _entry_materializes_regular_file(entry)
             and not _is_optional_desired_entry(entry)
@@ -26700,7 +27903,7 @@ def status(home: Path, owner: str = PUBLIC_OWNER) -> bool:
                 f"{_entry_target_path(home, entry)}"
             )
     for record in state.links.values():
-        if record.owner != owner:
+        if record.target not in checked_targets:
             continue
         target = home / Path(*record.target.parts)
         if _record_materializes_regular_file(record):
@@ -28782,7 +29985,7 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
             )
             return
         if not dry_run:
-            _try_cleanup_ready_pending_batches(home)
+            _cleanup_ready_pending_batches(home)
         _verify_managed_state_current_owner_claims(home, loaded_state)
         # Uncommitted recovery returns the exact restored before-state snapshot.
         # If that state was absent, plan this uninstall like a clean legacy retry
@@ -29266,7 +30469,6 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
                     raise SyncError(
                         "committed regular-file evidence cleanup was deferred"
                     )
-                _verify_final_regular_targets(home, pending_batch)
         finally:
             _close_install_release_bindings(held_bindings)
         if not actions:

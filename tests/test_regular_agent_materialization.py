@@ -303,9 +303,10 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         )
         self.assertIsNotNone(ticket)
         assert ticket is not None
-        self.assertEqual(ticket.version, 2)
+        self.assertEqual(ticket.version, 4)
         self.assertEqual(ticket.phase, "before")
         self.assertEqual(ticket.marker_path, MODULE.PENDING_STATE_ROLLBACK_MARKER)
+        self.assertEqual(ticket.terminal_regular_targets, ())
         self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
         self.assertTrue(batch.batch_root.is_dir())
         self._assert_recovered_install()
@@ -405,6 +406,100 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self.assertTrue(MODULE._pending_link_pointer_path(self.home).is_file())
         self._assert_recovered_install()
 
+    def test_committed_recovery_tolerates_non_access_bearing_gid_churn(self) -> None:
+        real_clear = MODULE._clear_pending_link_pointer
+
+        def retain_committed_pointer(
+            home: Path,
+            batch: MODULE.PendingLinkBatch,
+            *,
+            phase: str = "before",
+        ) -> None:
+            if phase == "after":
+                raise MODULE.SyncError("injected committed pointer retention")
+            real_clear(home, batch, phase=phase)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_clear_pending_link_pointer",
+                side_effect=retain_committed_pointer,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "committed managed state but finalization failed",
+            ),
+        ):
+            install(self.release, self.home, SHA_A)
+
+        self.assertTrue(MODULE._pending_link_pointer_path(self.home).is_file())
+        target = self.home / ROLE_TARGET
+        alternate_gid = next(
+            (gid for gid in os.getgroups() if gid != target.stat().st_gid),
+            None,
+        )
+        if alternate_gid is None:
+            self.skipTest("no alternate supplementary group is available")
+        os.chown(target, -1, alternate_gid)
+
+        self._assert_recovered_install()
+        self.assertEqual(target.stat().st_gid, alternate_gid)
+
+    def test_terminal_ticket_validates_complete_regular_target_group(self) -> None:
+        secondary_target = PurePosixPath("agents/security-reviewer.toml")
+        secondary_source = (
+            self.release / "personal_codex" / "agents" / "security-reviewer.toml"
+        )
+        secondary_source.write_text('name = "security-reviewer"\n', encoding="utf-8")
+        manifest_path = self.release / MODULE.MANIFEST_RELATIVE_PATH
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["links"].append(
+            {
+                "source": "personal_codex/agents/security-reviewer.toml",
+                "target": secondary_target.as_posix(),
+                "kind": "file",
+                "owner": MODULE.PUBLIC_OWNER,
+            }
+        )
+        manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+        real_verify = MODULE._verify_final_regular_targets
+        captured: list[MODULE.PendingBatchCleanupTicket] = []
+
+        def tamper_second_then_verify(
+            home: Path,
+            ticket: MODULE.PendingBatchCleanupTicket,
+        ) -> None:
+            captured.append(ticket)
+            target = home / Path(*secondary_target.parts)
+            target.write_text("tampered = true\n", encoding="utf-8")
+            target.chmod(0o600)
+            real_verify(home, ticket)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_verify_final_regular_targets",
+                side_effect=tamper_second_then_verify,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "committed regular-file evidence cleanup was deferred",
+            ),
+        ):
+            install(self.release, self.home, SHA_A)
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(
+            tuple(
+                expectation.target
+                for expectation in captured[0].terminal_regular_targets
+            ),
+            (ROLE_TARGET, secondary_target),
+        )
+        ticket_root = MODULE._pending_cleanup_index_path(self.home)
+        self.assertEqual(len(list(ticket_root.glob("*.json"))), 1)
+        self.assertEqual(len(list(ticket_root.glob("*.empty-proof"))), 1)
+
 
 class PendingMetadataCompatibilityTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -414,6 +509,93 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_projected_planned_snapshot_covers_every_v6_field(self) -> None:
+        target = self.home / ROLE_TARGET
+        absent = MODULE.ReconcileTargetSnapshot(
+            parent_identity=(1, 2),
+            ancestor_identity=(1, 2),
+        )
+        projected_absent = MODULE._projected_pending_snapshot_payload(
+            self.home,
+            target,
+            absent,
+        )
+        actual_absent = MODULE._planned_snapshot_payload(absent)
+        self.assertEqual(set(projected_absent), set(actual_absent))
+        for field in (
+            "regular_sha256",
+            "regular_size",
+            "regular_mode",
+            "regular_uid",
+            "regular_gid",
+            "regular_link_count",
+        ):
+            self.assertIsNone(projected_absent[field])
+
+        regular = MODULE.ReconcileTargetSnapshot(
+            parent_identity=(1, 2),
+            link_identity=(3, 4),
+            ancestor_identity=(1, 2),
+            regular_sha256="a" * 64,
+            regular_size=99,
+            regular_mode=0o600,
+            regular_uid=501,
+            regular_gid=20,
+            regular_link_count=9,
+        )
+        projected_regular = MODULE._projected_pending_snapshot_payload(
+            self.home,
+            target,
+            regular,
+        )
+        actual_regular = MODULE._planned_snapshot_payload(regular)
+        self.assertEqual(set(projected_regular), set(actual_regular))
+        self.assertGreaterEqual(
+            MODULE._projected_json_size(projected_regular, trailing_newline=False),
+            MODULE._projected_json_size(actual_regular, trailing_newline=False),
+        )
+
+    def test_access_bearing_regular_snapshot_protects_gid(self) -> None:
+        expected = MODULE.RegularFileSnapshot(
+            parent_identity=(1, 2),
+            file_identity=(3, 4),
+            sha256="a" * 64,
+            size=10,
+            mode=0o640,
+            uid=501,
+            gid=20,
+            link_count=1,
+        )
+        actual = MODULE.RegularFileSnapshot(
+            parent_identity=expected.parent_identity,
+            file_identity=expected.file_identity,
+            sha256=expected.sha256,
+            size=expected.size,
+            mode=expected.mode,
+            uid=expected.uid,
+            gid=80,
+            link_count=expected.link_count,
+        )
+
+        self.assertFalse(
+            MODULE._regular_snapshot_matches(
+                actual,
+                expected.parent_identity,
+                expected,
+                expected_link_count=1,
+                protect_gid=True,
+            )
+        )
+        self.assertTrue(
+            MODULE._regular_snapshot_matches(
+                actual,
+                expected.parent_identity,
+                expected,
+                expected_link_count=1,
+                protect_gid=False,
+            )
+        )
 
     def _retain_committed_batch(self, release: Path) -> MODULE.PendingLinkBatch:
         real_clear = MODULE._clear_pending_link_pointer
