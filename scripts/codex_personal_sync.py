@@ -5068,6 +5068,84 @@ class ReconcileTargetSnapshot:
             raise ValueError("an existing reconcile parent cannot have missing parts")
 
 
+def _gid_matches_regular_file_access_policy(
+    actual_gid: int | None,
+    expected_gid: int | None,
+    expected_mode: int | None,
+) -> bool:
+    if actual_gid is None or expected_gid is None or expected_mode is None:
+        return False
+    return not bool(expected_mode & 0o070) or actual_gid == expected_gid
+
+
+def _reconcile_target_snapshot_matches(
+    actual: ReconcileTargetSnapshot,
+    expected: ReconcileTargetSnapshot,
+) -> bool:
+    if (
+        actual.parent_identity != expected.parent_identity
+        or actual.link_identity != expected.link_identity
+        or actual.link_target != expected.link_target
+        or actual.ancestor_identity != expected.ancestor_identity
+        or actual.missing_parent_parts != expected.missing_parent_parts
+        or actual.regular_sha256 != expected.regular_sha256
+        or actual.regular_size != expected.regular_size
+        or actual.regular_mode != expected.regular_mode
+        or actual.regular_uid != expected.regular_uid
+        or actual.regular_link_count != expected.regular_link_count
+    ):
+        return False
+    if expected.regular_sha256 is None:
+        return actual.regular_gid is None and expected.regular_gid is None
+    return _gid_matches_regular_file_access_policy(
+        actual.regular_gid,
+        expected.regular_gid,
+        expected.regular_mode,
+    )
+
+
+def _regular_stat_metadata_matches(
+    actual: os.stat_result,
+    expected: os.stat_result,
+) -> bool:
+    expected_mode = stat.S_IMODE(expected.st_mode)
+    return (
+        actual.st_dev == expected.st_dev
+        and actual.st_ino == expected.st_ino
+        and stat.S_IFMT(actual.st_mode) == stat.S_IFMT(expected.st_mode)
+        and stat.S_IMODE(actual.st_mode) == expected_mode
+        and actual.st_uid == expected.st_uid
+        and _gid_matches_regular_file_access_policy(
+            actual.st_gid,
+            expected.st_gid,
+            expected_mode,
+        )
+        and actual.st_size == expected.st_size
+        and actual.st_nlink == expected.st_nlink
+    )
+
+
+def _regular_stat_matches_managed_state_file_snapshot(
+    actual: os.stat_result,
+    expected: ManagedStateFileSnapshot,
+) -> bool:
+    if not _managed_state_snapshot_has_complete_file_evidence(expected):
+        return False
+    assert expected.file_identity is not None
+    return (
+        (actual.st_dev, actual.st_ino) == expected.file_identity
+        and stat.S_IFMT(actual.st_mode) == expected.file_type
+        and stat.S_IMODE(actual.st_mode) == expected.mode
+        and actual.st_uid == expected.uid
+        and _gid_matches_regular_file_access_policy(
+            actual.st_gid,
+            expected.gid,
+            expected.mode,
+        )
+        and actual.st_size == expected.size
+    )
+
+
 @dataclass
 class ReconcileMutation:
     action: ReconcileAction
@@ -9032,7 +9110,6 @@ def _atomic_move_beneath_home(
                     planned_regular.parent_identity,
                     planned_regular,
                     expected_link_count=planned_regular.link_count,
-                    protect_gid=bool(planned_regular.mode & 0o070),
                 ):
                     raise SyncError(f"source changed after planning: {source}")
             else:
@@ -9220,14 +9297,6 @@ def _regular_file_snapshot_at(
             f"managed regular file exceeds {maximum_bytes} bytes: {path}"
         )
     expected_identity = (named.st_dev, named.st_ino)
-    expected_metadata = (
-        stat.S_IFMT(named.st_mode),
-        stat.S_IMODE(named.st_mode),
-        named.st_uid,
-        named.st_gid,
-        named.st_size,
-        named.st_nlink,
-    )
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     flags |= getattr(os, "O_NONBLOCK", 0)
@@ -9245,47 +9314,17 @@ def _regular_file_snapshot_at(
             path,
             os.geteuid(),
         )
-        opened_metadata = (
-            stat.S_IFMT(opened.st_mode),
-            stat.S_IMODE(opened.st_mode),
-            opened.st_uid,
-            opened.st_gid,
-            opened.st_size,
-            opened.st_nlink,
-        )
-        if (opened.st_dev, opened.st_ino) != expected_identity or (
-            opened_metadata != expected_metadata
-        ):
+        if not _regular_stat_metadata_matches(opened, named):
             raise SyncError(f"managed regular file changed before read: {path}")
         payload = _read_managed_state_bytes(file_fd, path, maximum_bytes)
         os.lseek(file_fd, 0, os.SEEK_SET)
         if _read_managed_state_bytes(file_fd, path, maximum_bytes) != payload:
             raise SyncError(f"managed regular file content changed during read: {path}")
         confirmed = os.fstat(file_fd)
-        confirmed_metadata = (
-            stat.S_IFMT(confirmed.st_mode),
-            stat.S_IMODE(confirmed.st_mode),
-            confirmed.st_uid,
-            confirmed.st_gid,
-            confirmed.st_size,
-            confirmed.st_nlink,
-        )
-        if (confirmed.st_dev, confirmed.st_ino) != expected_identity or (
-            confirmed_metadata != expected_metadata
-        ):
+        if not _regular_stat_metadata_matches(confirmed, named):
             raise SyncError(f"managed regular file changed during read: {path}")
         rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        rebound_metadata = (
-            stat.S_IFMT(rebound.st_mode),
-            stat.S_IMODE(rebound.st_mode),
-            rebound.st_uid,
-            rebound.st_gid,
-            rebound.st_size,
-            rebound.st_nlink,
-        )
-        if (rebound.st_dev, rebound.st_ino) != expected_identity or (
-            rebound_metadata != expected_metadata
-        ):
+        if not _regular_stat_metadata_matches(rebound, named):
             raise SyncError(f"managed regular file changed during read: {path}")
     finally:
         if file_fd >= 0:
@@ -9347,7 +9386,6 @@ def _remove_expected_regular_file_beneath(
         if not _regular_snapshot_leaf_matches(
             moved,
             expected,
-            protect_gid=bool(expected.mode & 0o070),
         ) or moved.link_count != expected.link_count:
             raise SyncError(
                 "managed regular file changed during removal and was retained "
@@ -9484,7 +9522,7 @@ def _require_reconcile_target_snapshot(
         actual_snapshot = _capture_reconcile_target_snapshot(home, target)
     except (OSError, SyncError) as error:
         raise SyncError(f"managed target changed after planning: {target}") from error
-    if actual_snapshot != expected_snapshot:
+    if not _reconcile_target_snapshot_matches(actual_snapshot, expected_snapshot):
         raise SyncError(f"managed target changed after planning: {target}")
 
 
@@ -9612,7 +9650,6 @@ def _move_regular_leaf_to_unique_quarantine(
         expected.parent_identity,
         expected,
         expected_link_count=expected.link_count,
-        protect_gid=bool(expected.mode & 0o070),
     ):
         raise SyncError(f"regular file changed before quarantine: {source_name}")
     if (
@@ -9676,7 +9713,6 @@ def _move_regular_leaf_to_unique_quarantine(
         moved_matches = _regular_snapshot_leaf_matches(
             moved,
             source_snapshot,
-            protect_gid=bool(source_snapshot.mode & 0o070),
         ) and moved.link_count == source_snapshot.link_count
         if not moved_matches:
             try:
@@ -9701,7 +9737,6 @@ def _move_regular_leaf_to_unique_quarantine(
             if not _regular_snapshot_leaf_matches(
                 restored,
                 moved,
-                protect_gid=bool(moved.mode & 0o070),
             ) or restored.link_count != moved.link_count:
                 raise SyncError(
                     "regular file changed during quarantine and its exact "
@@ -9981,14 +10016,13 @@ def _read_regular_source_payload(home: Path, source: Path) -> bytes:
                 "managed regular-file source exceeds the size limit: "
                 f"{source}"
             )
-        expected = _managed_state_metadata_snapshot(named)
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         flags |= getattr(os, "O_NONBLOCK", 0)
         file_fd = -1
         try:
             file_fd = os.open(source, flags)
-            if _managed_state_metadata_snapshot(os.fstat(file_fd)) != expected:
+            if not _regular_stat_metadata_matches(os.fstat(file_fd), named):
                 raise SyncError(
                     f"managed regular-file source changed before read: {source}"
                 )
@@ -10004,12 +10038,12 @@ def _read_regular_source_payload(home: Path, source: Path) -> bytes:
                 MAX_ARCHIVE_MEMBER_BYTES,
             )
             if confirmed != payload or (
-                _managed_state_metadata_snapshot(os.fstat(file_fd)) != expected
+                not _regular_stat_metadata_matches(os.fstat(file_fd), named)
             ):
                 raise SyncError(
                     f"managed regular-file source changed during read: {source}"
                 )
-            if _managed_state_metadata_snapshot(os.lstat(source)) != expected:
+            if not _regular_stat_metadata_matches(os.lstat(source), named):
                 raise SyncError(
                     f"managed regular-file source changed during read: {source}"
                 )
@@ -10446,7 +10480,21 @@ def _managed_state_snapshot_matches_file_evidence(
         and actual.file_type == expected.file_type
         and actual.size == expected.size
         and actual.uid == expected.uid
-        and actual.gid == expected.gid
+        and _gid_matches_regular_file_access_policy(
+            actual.gid,
+            expected.gid,
+            expected.mode,
+        )
+    )
+
+
+def _managed_state_snapshot_matches_bound_file_evidence(
+    actual: ManagedStateFileSnapshot,
+    expected: ManagedStateFileSnapshot,
+) -> bool:
+    return (
+        actual.parent_identity == expected.parent_identity
+        and _managed_state_snapshot_matches_file_evidence(actual, expected)
     )
 
 
@@ -10516,7 +10564,6 @@ def _read_managed_state_file_snapshot(
         raise SyncError(f"Failed to read {path}: {error}") from error
     if not stat.S_ISREG(named_metadata.st_mode):
         raise SyncError(f"refusing non-file sync state: {path}")
-    expected_snapshot = _managed_state_metadata_snapshot(named_metadata)
     if (
         expected_identity is not None
         and (named_metadata.st_dev, named_metadata.st_ino) != expected_identity
@@ -10539,7 +10586,7 @@ def _read_managed_state_file_snapshot(
         opened_metadata = os.fstat(file_fd)
         if not stat.S_ISREG(opened_metadata.st_mode):
             raise SyncError(f"refusing non-file sync state: {path}")
-        if _managed_state_metadata_snapshot(opened_metadata) != expected_snapshot:
+        if not _regular_stat_metadata_matches(opened_metadata, named_metadata):
             raise SyncError(f"managed sync state changed before read: {path}")
         if (
             expected_identity is not None
@@ -10565,7 +10612,7 @@ def _read_managed_state_file_snapshot(
         )
         if confirmed_payload != payload:
             raise SyncError(f"managed sync state content changed during read: {path}")
-        if _managed_state_metadata_snapshot(os.fstat(file_fd)) != expected_snapshot:
+        if not _regular_stat_metadata_matches(os.fstat(file_fd), named_metadata):
             raise SyncError(f"managed sync state changed during read: {path}")
         try:
             current_metadata = os.stat(
@@ -10577,7 +10624,7 @@ def _read_managed_state_file_snapshot(
             raise SyncError(
                 f"managed sync state changed during read: {path}"
             ) from error
-        if _managed_state_metadata_snapshot(current_metadata) != expected_snapshot:
+        if not _regular_stat_metadata_matches(current_metadata, named_metadata):
             raise SyncError(f"managed sync state changed during read: {path}")
         if not _bound_directory_matches(home, path.parent, parent_fd):
             raise SyncError(f"managed sync state parent changed during read: {path}")
@@ -10869,7 +10916,14 @@ def _managed_state_file_matches(
         and (snapshot.file_type is None or current.file_type == snapshot.file_type)
         and (snapshot.size is None or current.size == snapshot.size)
         and (snapshot.uid is None or current.uid == snapshot.uid)
-        and (snapshot.gid is None or current.gid == snapshot.gid)
+        and (
+            snapshot.gid is None
+            or _gid_matches_regular_file_access_policy(
+                current.gid,
+                snapshot.gid,
+                snapshot.mode,
+            )
+        )
         and (effective_identity is None or current.file_identity == effective_identity)
     )
 
@@ -13235,16 +13289,6 @@ def _stable_managed_regular_target_size_evidence(
                 f"managed regular file exceeds {MAX_ARCHIVE_MEMBER_BYTES} bytes: "
                 f"{target}"
             )
-        expected = (
-            named.st_dev,
-            named.st_ino,
-            stat.S_IFMT(named.st_mode),
-            stat.S_IMODE(named.st_mode),
-            named.st_uid,
-            named.st_gid,
-            named.st_size,
-            named.st_nlink,
-        )
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         flags |= getattr(os, "O_NONBLOCK", 0)
@@ -13260,29 +13304,9 @@ def _stable_managed_regular_target_size_evidence(
             dir_fd=parent_fd,
             follow_symlinks=False,
         )
-        opened_evidence = (
-            opened.st_dev,
-            opened.st_ino,
-            stat.S_IFMT(opened.st_mode),
-            stat.S_IMODE(opened.st_mode),
-            opened.st_uid,
-            opened.st_gid,
-            opened.st_size,
-            opened.st_nlink,
-        )
-        rebound_evidence = (
-            rebound.st_dev,
-            rebound.st_ino,
-            stat.S_IFMT(rebound.st_mode),
-            stat.S_IMODE(rebound.st_mode),
-            rebound.st_uid,
-            rebound.st_gid,
-            rebound.st_size,
-            rebound.st_nlink,
-        )
         if (
-            opened_evidence != expected
-            or rebound_evidence != expected
+            not _regular_stat_metadata_matches(opened, named)
+            or not _regular_stat_metadata_matches(rebound, named)
             or not _bound_directory_matches(home, target.parent, parent_fd)
         ):
             raise SyncError(f"managed regular file changed before read: {target}")
@@ -13801,7 +13825,10 @@ def _publish_regular_hardlink_beneath(
                 f"regular-file evidence source changed: {source}: {error}",
                 code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
             ) from error
-        if source_snapshot != expected_source:
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            source_snapshot,
+            expected_source,
+        ):
             raise SyncError(
                 f"regular-file evidence source changed: {source}",
                 code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
@@ -13828,7 +13855,10 @@ def _publish_regular_hardlink_beneath(
             expected_identity=expected_source.file_identity,
             maximum_bytes=maximum_bytes,
         )
-        if rebound_source != expected_source:
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            rebound_source,
+            expected_source,
+        ):
             raise SyncError(
                 "regular-file evidence source changed after publication; the "
                 "source and destination leaves were retained without deletion: "
@@ -13936,9 +13966,12 @@ def _publish_regular_reconcile_hardlink_beneath(
             source.name,
             source,
         )
-        if actual_source != source_snapshot or not _bound_directory_matches(
-            home, source.parent, source_parent_fd
-        ):
+        if not _regular_snapshot_matches(
+            actual_source,
+            source_snapshot.parent_identity,
+            source_snapshot,
+            expected_link_count=source_snapshot.link_count,
+        ) or not _bound_directory_matches(home, source.parent, source_parent_fd):
             raise SyncError(f"pending regular-file stage changed: {source}")
         if not _bound_directory_matches(home, target.parent, target_parent_fd):
             raise SyncError(f"managed target parent changed: {target.parent}")
@@ -13958,7 +13991,6 @@ def _publish_regular_reconcile_hardlink_beneath(
         if not _regular_snapshot_leaf_matches(
             published_snapshot,
             source_snapshot,
-            protect_gid=False,
         ) or (
             published_snapshot.link_count != source_snapshot.link_count + 1
         ):
@@ -13973,7 +14005,6 @@ def _publish_regular_reconcile_hardlink_beneath(
         if not _regular_snapshot_leaf_matches(
             rebound_source,
             source_snapshot,
-            protect_gid=False,
         ) or rebound_source.link_count != source_snapshot.link_count + 1:
             raise SyncError(f"pending regular-file stage changed: {source}")
         if not _bound_directory_matches(
@@ -13986,7 +14017,6 @@ def _publish_regular_reconcile_hardlink_beneath(
             if not _regular_snapshot_leaf_matches(
                 published_snapshot,
                 source_snapshot,
-                protect_gid=False,
             ):
                 raise SyncError(
                     "managed regular-file publication failed after a namespace "
@@ -14040,7 +14070,6 @@ def _delete_exact_regular_publication_beneath(
             expected.parent_identity,
             expected,
             expected_link_count=expected.link_count,
-            protect_gid=bool(expected.mode & 0o070),
         ):
             raise SyncError(
                 f"published regular-file destination changed and was retained: {target}"
@@ -14068,7 +14097,6 @@ def _delete_exact_regular_publication_beneath(
             expected.parent_identity,
             expected,
             expected_link_count=expected.link_count,
-            protect_gid=bool(expected.mode & 0o070),
         ) or _pending_cleanup_entry_plan(isolated) != planned:
             try:
                 if not _bound_directory_matches(home, target.parent, parent_fd):
@@ -14087,7 +14115,6 @@ def _delete_exact_regular_publication_beneath(
                     expected.parent_identity,
                     isolated_snapshot,
                     expected_link_count=isolated_snapshot.link_count,
-                    protect_gid=bool(isolated_snapshot.mode & 0o070),
                 ):
                     raise SyncError(
                         "published regular-file isolated replacement changed during "
@@ -14117,7 +14144,6 @@ def _delete_exact_regular_publication_beneath(
                     expected.parent_identity,
                     isolated_snapshot,
                     expected_link_count=isolated_snapshot.link_count,
-                    protect_gid=bool(isolated_snapshot.mode & 0o070),
                 )
                 or not _bound_directory_matches(home, target.parent, parent_fd)
             ):
@@ -14168,7 +14194,6 @@ def _pending_regular_publication_cleanup_payload(
             or not _regular_snapshot_leaf_matches(
                 expected,
                 planned_regular,
-                protect_gid=bool(planned_regular.mode & 0o070),
             )
             or expected.parent_identity != record.planned_snapshot.parent_identity
             or expected.link_count != planned_regular.link_count + 1
@@ -14401,7 +14426,6 @@ def _delete_pending_regular_publication_beneath(
             expected.parent_identity,
             expected,
             expected_link_count=expected.link_count,
-            protect_gid=bool(expected.mode & 0o070),
         ):
             raise SyncError("pending regular publication changed before cleanup")
         _rename_noreplace_at(parent_fd, target.name, parent_fd, active_name)
@@ -14417,7 +14441,6 @@ def _delete_pending_regular_publication_beneath(
             expected.parent_identity,
             expected,
             expected_link_count=expected.link_count,
-            protect_gid=bool(expected.mode & 0o070),
         ):
             raise SyncError("pending regular publication active entry changed")
         os.unlink(active_name, dir_fd=parent_fd)
@@ -14589,7 +14612,6 @@ def _recover_legacy_pending_regular_publication_active_entry(
             evidence_matches = _regular_snapshot_leaf_matches(
                 evidence_snapshot,
                 planned_regular,
-                protect_gid=bool(planned_regular.mode & 0o070),
             )
         if evidence_snapshot.file_identity != file_identity or not evidence_matches:
             raise SyncError("pending legacy regular publication evidence changed")
@@ -14625,7 +14647,6 @@ def _recover_legacy_pending_regular_publication_active_entry(
                 parent_identity,
                 planned_regular,
                 expected_link_count=expected_link_count,
-                protect_gid=bool(planned_regular.mode & 0o070),
             )
         if not matches:
             raise SyncError("pending legacy regular publication active entry changed")
@@ -14690,7 +14711,6 @@ def _recover_pending_regular_publication_cleanup(
         if not _regular_snapshot_leaf_matches(
             evidence_snapshot,
             expected,
-            protect_gid=bool(expected.mode & 0o070),
         ) or evidence_snapshot.link_count != expected.link_count - 1:
             raise SyncError("pending regular publication cleanup evidence changed")
 
@@ -14732,7 +14752,6 @@ def _recover_pending_regular_publication_cleanup(
                 expected.parent_identity,
                 expected,
                 expected_link_count=expected.link_count,
-                protect_gid=bool(expected.mode & 0o070),
             ):
                 if journal_phase == "produced" and active_snapshot is None:
                     # A completed publication deletion can be followed by
@@ -14757,7 +14776,6 @@ def _recover_pending_regular_publication_cleanup(
                 expected.parent_identity,
                 expected,
                 expected_link_count=expected.link_count,
-                protect_gid=bool(expected.mode & 0o070),
             ):
                 raise SyncError("pending regular publication active entry changed")
             os.unlink(active_name, dir_fd=parent_fd)
@@ -16635,21 +16653,11 @@ def _stage_pending_link_batch(
                             action.target,
                             require_managed_access=False,
                         )
-                        if (
-                            refreshed_regular.parent_identity
-                            != planned_regular.parent_identity
-                            or refreshed_regular.file_identity
-                            != planned_regular.file_identity
-                            or refreshed_regular.sha256 != planned_regular.sha256
-                            or refreshed_regular.size != planned_regular.size
-                            or refreshed_regular.mode != planned_regular.mode
-                            or refreshed_regular.uid != planned_regular.uid
-                            or (
-                                bool(planned_regular.mode & 0o070)
-                                and refreshed_regular.gid != planned_regular.gid
-                            )
-                            or refreshed_regular.link_count
-                            != planned_regular.link_count + 1
+                        if not _regular_snapshot_matches(
+                            refreshed_regular,
+                            planned_regular.parent_identity,
+                            planned_regular,
+                            expected_link_count=planned_regular.link_count + 1,
                         ):
                             raise SyncError(
                                 "pending live regular preimage changed during "
@@ -17759,7 +17767,15 @@ def _parse_pending_link_batch(
                     or value < 0
                     for value in regular_values[1:]
                 )
-                or regular_gid is not None
+                or (
+                    version == 6
+                    and (
+                        not isinstance(regular_gid, int)
+                        or isinstance(regular_gid, bool)
+                        or regular_gid < 0
+                    )
+                )
+                or (version >= 7 and regular_gid is not None)
                 or regular_mode != 0o600
                 or regular_uid != os.geteuid()
                 or regular_link_count != 2
@@ -17847,13 +17863,9 @@ def _parse_pending_link_batch(
                 )
                 if (
                     before_snapshot.file_identity != before_identity
-                    or before_snapshot.sha256 != planned_regular.sha256
-                    or before_snapshot.size != planned_regular.size
-                    or before_snapshot.mode != planned_regular.mode
-                    or before_snapshot.uid != planned_regular.uid
-                    or (
-                        bool(planned_regular.mode & 0o070)
-                        and before_snapshot.gid != planned_regular.gid
+                    or not _regular_snapshot_leaf_matches(
+                        before_snapshot,
+                        planned_regular,
                     )
                 ):
                     raise SyncError(
@@ -18903,19 +18915,11 @@ def _isolate_and_delete_pending_cleanup_file(
             ) from error
         if (
             not stat.S_ISREG(before.st_mode)
-            or _managed_state_metadata_snapshot(before)
-            != _managed_state_metadata_snapshot(after)
-            or _managed_state_metadata_snapshot(named)
-            != _managed_state_metadata_snapshot(after)
-            or _managed_state_metadata_snapshot(after)
-            != (
-                expected.file_identity[0],
-                expected.file_identity[1],
-                expected.file_type,
-                expected.mode,
-                expected.uid,
-                expected.gid,
-                expected.size,
+            or not _regular_stat_metadata_matches(after, before)
+            or not _regular_stat_metadata_matches(named, before)
+            or not _regular_stat_matches_managed_state_file_snapshot(
+                after,
+                expected,
             )
             or payload != expected.payload
             or confirmed_payload != expected.payload
@@ -22456,15 +22460,7 @@ def _pending_record_before_evidence_snapshot(
         )
         if (
             snapshot.file_identity != record.before_evidence_identity
-            or snapshot.file_identity != planned_regular.file_identity
-            or snapshot.sha256 != planned_regular.sha256
-            or snapshot.size != planned_regular.size
-            or snapshot.mode != planned_regular.mode
-            or snapshot.uid != planned_regular.uid
-            or (
-                bool(planned_regular.mode & 0o070)
-                and snapshot.gid != planned_regular.gid
-            )
+            or not _regular_snapshot_leaf_matches(snapshot, planned_regular)
         ):
             raise SyncError(f"pending before evidence changed: {record.target}")
         _verify_pending_regular_aliases(
@@ -22528,14 +22524,7 @@ def _pending_record_backup_snapshot(
             )
             if (
                 snapshot.file_identity != record.before_evidence_identity
-                or snapshot.sha256 != planned_regular.sha256
-                or snapshot.size != planned_regular.size
-                or snapshot.mode != planned_regular.mode
-                or snapshot.uid != planned_regular.uid
-                or (
-                    bool(planned_regular.mode & 0o070)
-                    and snapshot.gid != planned_regular.gid
-                )
+                or not _regular_snapshot_leaf_matches(snapshot, planned_regular)
             ):
                 raise SyncError(f"pending backup changed: {record.target}")
             _verify_pending_regular_aliases(
@@ -22627,7 +22616,6 @@ def _regular_snapshot_matches(
     expected: RegularFileSnapshot,
     *,
     expected_link_count: int,
-    protect_gid: bool,
 ) -> bool:
     return (
         isinstance(actual, RegularFileSnapshot)
@@ -22638,7 +22626,11 @@ def _regular_snapshot_matches(
         and actual.size == expected.size
         and actual.mode == expected.mode
         and actual.uid == expected.uid
-        and (not protect_gid or actual.gid == expected.gid)
+        and _gid_matches_regular_file_access_policy(
+            actual.gid,
+            expected.gid,
+            expected.mode,
+        )
         and actual.link_count == expected_link_count
     )
 
@@ -22646,8 +22638,6 @@ def _regular_snapshot_matches(
 def _regular_snapshot_leaf_matches(
     actual: SymlinkSnapshot | RegularFileSnapshot | None,
     expected: RegularFileSnapshot,
-    *,
-    protect_gid: bool,
 ) -> bool:
     return (
         isinstance(actual, RegularFileSnapshot)
@@ -22656,7 +22646,11 @@ def _regular_snapshot_leaf_matches(
         and actual.size == expected.size
         and actual.mode == expected.mode
         and actual.uid == expected.uid
-        and (not protect_gid or actual.gid == expected.gid)
+        and _gid_matches_regular_file_access_policy(
+            actual.gid,
+            expected.gid,
+            expected.mode,
+        )
     )
 
 
@@ -22688,7 +22682,6 @@ def _restore_pending_record_before(
         if not _regular_snapshot_leaf_matches(
             restored,
             before_evidence,
-            protect_gid=bool(before_evidence.mode & 0o070),
         ):
             raise SyncError(
                 f"pending preimage restoration changed: {record.target}"
@@ -22941,12 +22934,10 @@ def _verify_committed_pending_link_records(
                     record.planned_snapshot.parent_identity,
                     evidence,
                     expected_link_count=evidence.link_count,
-                    protect_gid=False,
                 )
                 leaf_matches = _regular_snapshot_leaf_matches(
                     target_snapshot,
                     evidence,
-                    protect_gid=False,
                 )
             else:
                 target_matches = _symlink_snapshot_matches(
@@ -22981,14 +22972,12 @@ def _verify_committed_pending_link_records(
             before_leaf_matches = _regular_snapshot_leaf_matches(
                 target_snapshot,
                 before,
-                protect_gid=bool(before.mode & 0o070),
             )
             before_matches = _regular_snapshot_matches(
                 target_snapshot,
                 record.planned_snapshot.parent_identity,
                 before,
                 expected_link_count=before.link_count,
-                protect_gid=bool(before.mode & 0o070),
             )
         else:
             before_leaf_matches = _symlink_snapshot_leaf_matches(
@@ -23215,14 +23204,12 @@ def _recover_pending_link_transaction(
             target_has_produced_leaf = _regular_snapshot_leaf_matches(
                 target_snapshot,
                 produced_evidence,
-                protect_gid=False,
             )
             target_is_produced = _regular_snapshot_matches(
                 target_snapshot,
                 record.planned_snapshot.parent_identity,
                 produced_evidence,
                 expected_link_count=produced_evidence.link_count,
-                protect_gid=False,
             )
         elif isinstance(produced_evidence, SymlinkSnapshot):
             target_has_produced_leaf = _symlink_snapshot_leaf_matches(
@@ -23245,7 +23232,6 @@ def _recover_pending_link_transaction(
                 record.planned_snapshot.parent_identity,
                 before_evidence,
                 expected_link_count=before_evidence.link_count,
-                protect_gid=bool(before_evidence.mode & 0o070),
             )
         elif isinstance(before_evidence, SymlinkSnapshot):
             target_is_before = _symlink_snapshot_matches(
@@ -23521,12 +23507,12 @@ def _apply_reconcile_actions(
                 regular_evidence_refresh_is_valid = (
                     original_regular is not None
                     and record_regular is not None
-                    and replace(
+                    and _regular_snapshot_matches(
                         record_regular,
-                        link_count=original_regular.link_count,
+                        original_regular.parent_identity,
+                        original_regular,
+                        expected_link_count=original_regular.link_count + 1,
                     )
-                    == original_regular
-                    and record_regular.link_count == original_regular.link_count + 1
                 )
                 if not (
                     parent_refresh_is_valid or regular_evidence_refresh_is_valid
@@ -23888,7 +23874,6 @@ def _verify_reconcile_backup(
         if not _regular_snapshot_leaf_matches(
             backup_snapshot,
             planned_regular,
-            protect_gid=bool(planned_regular.mode & 0o070),
         ) or backup_snapshot.link_count != planned_regular.link_count:
             raise SyncError(f"target changed after preflight: {action.target}")
         return
@@ -24046,7 +24031,6 @@ def _rollback_reconcile_transaction(
                     action.planned_snapshot.parent_identity,
                     planned_regular,
                     expected_link_count=planned_regular.link_count,
-                    protect_gid=bool(planned_regular.mode & 0o070),
                 ):
                     raise SyncError(
                         "restored regular file changed during rollback: "
@@ -24111,7 +24095,6 @@ def _verify_created_reconcile_mutation(
             mutation.created_snapshot.parent_identity,
             mutation.created_snapshot,
             expected_link_count=mutation.created_snapshot.link_count,
-            protect_gid=bool(mutation.created_snapshot.mode & 0o070),
         )
         if isinstance(mutation.created_snapshot, RegularFileSnapshot)
         else actual_snapshot == mutation.created_snapshot
@@ -24525,7 +24508,6 @@ def _trusted_managed_link_snapshots_for_state(
                 snapshot.parent_identity,
                 snapshot,
                 expected_link_count=snapshot.link_count,
-                protect_gid=bool(snapshot.mode & 0o070),
             )
             if isinstance(snapshot, RegularFileSnapshot)
             else current_snapshot == snapshot
@@ -24584,7 +24566,6 @@ def _verify_managed_link_snapshots(
                 expected_snapshot.parent_identity,
                 expected_snapshot,
                 expected_link_count=expected_snapshot.link_count,
-                protect_gid=bool(expected_snapshot.mode & 0o070),
             )
             if isinstance(expected_snapshot, RegularFileSnapshot)
             else current_snapshot == expected_snapshot
@@ -33825,8 +33806,7 @@ def _scheduler_runner_is_usable(runner: Path) -> bool:
     if (
         _managed_state_metadata_snapshot(lexical)
         != _managed_state_metadata_snapshot(lexical_after)
-        or _managed_state_metadata_snapshot(target)
-        != _managed_state_metadata_snapshot(target_after)
+        or not _regular_stat_metadata_matches(target_after, target)
         or link_target != link_target_after
         or stat.S_ISDIR(lexical.st_mode)
         or not stat.S_ISREG(target.st_mode)
@@ -34074,10 +34054,9 @@ def _read_scheduler_regular_file(path: Path, maximum_bytes: int) -> bytes:
     try:
         file_fd = os.open(path.name, flags, dir_fd=parent_fd)
         opened = os.fstat(file_fd)
-        expected = _managed_state_metadata_snapshot(named)
         if (
             not stat.S_ISREG(opened.st_mode)
-            or _managed_state_metadata_snapshot(opened) != expected
+            or not _regular_stat_metadata_matches(opened, named)
             or not _archive_path_matches_fd(path.parent, parent_fd)
         ):
             raise SyncError(f"scheduler config changed before read: {path}")
@@ -34118,8 +34097,8 @@ def _read_scheduler_regular_file(path: Path, maximum_bytes: int) -> bytes:
             follow_symlinks=False,
         )
         if (
-            _managed_state_metadata_snapshot(after) != expected
-            or _managed_state_metadata_snapshot(current) != expected
+            not _regular_stat_metadata_matches(after, named)
+            or not _regular_stat_metadata_matches(current, named)
             or not _archive_path_matches_fd(path.parent, parent_fd)
         ):
             raise SyncError(f"scheduler config changed during read: {path}")
@@ -35808,7 +35787,6 @@ def _revalidate_launchd_activation_binding(
         expected.file_type,
         expected.mode,
         expected.uid,
-        expected.gid,
     )
 
     def validate_metadata(metadata: os.stat_result) -> None:
@@ -35822,8 +35800,17 @@ def _revalidate_launchd_activation_binding(
             stat.S_IFMT(metadata.st_mode),
             stat.S_IMODE(metadata.st_mode),
             metadata.st_uid,
-            metadata.st_gid,
         ) != expected_access:
+            raise _launchd_activation_failure(
+                binding,
+                boundary,
+                "access policy changed",
+            )
+        if not _gid_matches_regular_file_access_policy(
+            metadata.st_gid,
+            expected.gid,
+            expected.mode,
+        ):
             raise _launchd_activation_failure(
                 binding,
                 boundary,
@@ -36971,7 +36958,7 @@ def _revalidate_published_systemd_pair(
             Path,
             int,
             ManagedStateFileSnapshot,
-            tuple[int, int, int, int, int, int, int],
+            os.stat_result,
         ]
     ] = []
     try:
@@ -37008,15 +36995,6 @@ def _revalidate_published_systemd_pair(
         flags |= getattr(os, "O_NOFOLLOW", 0)
         flags |= getattr(os, "O_NONBLOCK", 0)
         for path, bound in zip((service_path, timer_path), expected):
-            expected_metadata = (
-                bound.file_identity[0],
-                bound.file_identity[1],
-                bound.file_type,
-                bound.mode,
-                bound.uid,
-                bound.gid,
-                bound.size,
-            )
             named = os.stat(
                 path.name,
                 dir_fd=parent_fd,
@@ -37025,16 +37003,15 @@ def _revalidate_published_systemd_pair(
             file_fd = os.open(path.name, flags, dir_fd=parent_fd)
             opened_metadata = os.fstat(file_fd)
             if (
-                _managed_state_metadata_snapshot(named) != expected_metadata
-                or _managed_state_metadata_snapshot(opened_metadata)
-                != expected_metadata
+                not _regular_stat_matches_managed_state_file_snapshot(named, bound)
+                or not _regular_stat_metadata_matches(opened_metadata, named)
             ):
                 _close_fd_quietly(file_fd)
                 raise SyncError(
                     "published systemd scheduler service/timer pair changed "
                     "before daemon activation"
                 )
-            opened.append((path, file_fd, bound, expected_metadata))
+            opened.append((path, file_fd, bound, named))
             payload = _read_managed_state_bytes(
                 file_fd,
                 path,
@@ -37045,7 +37022,7 @@ def _revalidate_published_systemd_pair(
                     "published systemd scheduler service/timer pair changed "
                     "before daemon activation"
                 )
-        for path, file_fd, bound, expected_metadata in opened:
+        for path, file_fd, bound, baseline_metadata in opened:
             os.lseek(file_fd, 0, os.SEEK_SET)
             confirmed_payload = _read_managed_state_bytes(
                 file_fd,
@@ -37054,8 +37031,10 @@ def _revalidate_published_systemd_pair(
             )
             if (
                 confirmed_payload != bound.payload
-                or _managed_state_metadata_snapshot(os.fstat(file_fd))
-                != expected_metadata
+                or not _regular_stat_metadata_matches(
+                    os.fstat(file_fd),
+                    baseline_metadata,
+                )
             ):
                 raise SyncError(
                     "published systemd scheduler service/timer pair changed "
@@ -37064,16 +37043,18 @@ def _revalidate_published_systemd_pair(
         # Both descriptors have now been reread. Revalidate both canonical
         # names only after that shared read phase, then recheck both
         # descriptors once more before accepting the pair.
-        for path, file_fd, _bound, expected_metadata in opened:
+        for path, file_fd, _bound, baseline_metadata in opened:
             named = os.stat(
                 path.name,
                 dir_fd=parent_fd,
                 follow_symlinks=False,
             )
             if (
-                _managed_state_metadata_snapshot(named) != expected_metadata
-                or _managed_state_metadata_snapshot(os.fstat(file_fd))
-                != expected_metadata
+                not _regular_stat_metadata_matches(named, baseline_metadata)
+                or not _regular_stat_metadata_matches(
+                    os.fstat(file_fd),
+                    baseline_metadata,
+                )
             ):
                 raise SyncError(
                     "published systemd scheduler service/timer pair changed "
@@ -37124,7 +37105,11 @@ def _scheduler_file_logical_state_matches(
         and actual.file_type == expected.file_type
         and actual.size == expected.size
         and actual.uid == expected.uid
-        and actual.gid == expected.gid
+        and _gid_matches_regular_file_access_policy(
+            actual.gid,
+            expected.gid,
+            expected.mode,
+        )
     )
 
 
@@ -37147,18 +37132,9 @@ def _open_scheduler_recovery_binding(
         )
         file_fd = os.open(path.name, flags, dir_fd=parent_fd)
         opened = os.fstat(file_fd)
-        expected_metadata = (
-            expected.file_identity[0],
-            expected.file_identity[1],
-            expected.file_type,
-            expected.mode,
-            expected.uid,
-            expected.gid,
-            expected.size,
-        )
         if (
-            _managed_state_metadata_snapshot(named) != expected_metadata
-            or _managed_state_metadata_snapshot(opened) != expected_metadata
+            not _regular_stat_matches_managed_state_file_snapshot(named, expected)
+            or not _regular_stat_metadata_matches(opened, named)
         ):
             raise SyncError(f"scheduler recovery evidence changed: {path}")
         payload = _read_managed_state_bytes(
@@ -37175,7 +37151,7 @@ def _open_scheduler_recovery_binding(
         if (
             payload != expected.payload
             or confirmed_payload != expected.payload
-            or _managed_state_metadata_snapshot(os.fstat(file_fd)) != expected_metadata
+            or not _regular_stat_metadata_matches(os.fstat(file_fd), named)
         ):
             raise SyncError(f"scheduler recovery evidence changed: {path}")
         return file_fd
@@ -37198,15 +37174,6 @@ def _scheduler_recovery_binding_matches(
         or expected.parent_identity is None
     ):
         return False
-    expected_metadata = (
-        expected.file_identity[0],
-        expected.file_identity[1],
-        expected.file_type,
-        expected.mode,
-        expected.uid,
-        expected.gid,
-        expected.size,
-    )
     try:
         if expected.parent_identity != _directory_identity(
             parent_fd
@@ -37217,9 +37184,12 @@ def _scheduler_recovery_binding_matches(
             dir_fd=parent_fd,
             follow_symlinks=False,
         )
-        if _managed_state_metadata_snapshot(named_before) != expected_metadata:
+        if not _regular_stat_matches_managed_state_file_snapshot(
+            named_before,
+            expected,
+        ):
             return False
-        if _managed_state_metadata_snapshot(os.fstat(file_fd)) != expected_metadata:
+        if not _regular_stat_metadata_matches(os.fstat(file_fd), named_before):
             return False
         os.lseek(file_fd, 0, os.SEEK_SET)
         payload = _read_managed_state_bytes(
@@ -37241,8 +37211,8 @@ def _scheduler_recovery_binding_matches(
         return (
             payload == expected.payload
             and confirmed_payload == expected.payload
-            and _managed_state_metadata_snapshot(os.fstat(file_fd)) == expected_metadata
-            and _managed_state_metadata_snapshot(named_after) == expected_metadata
+            and _regular_stat_metadata_matches(os.fstat(file_fd), named_before)
+            and _regular_stat_metadata_matches(named_after, named_before)
             and expected.parent_identity == _directory_identity(parent_fd)
             and _bound_directory_matches(home, path.parent, parent_fd)
         )
@@ -40365,7 +40335,6 @@ def _read_bound_skill_manifest(
         return None
     if named.st_uid != os.geteuid() or stat.S_IMODE(named.st_mode) & 0o022:
         return None
-    expected = _managed_state_metadata_snapshot(named)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     flags |= getattr(os, "O_NONBLOCK", 0)
@@ -40376,7 +40345,7 @@ def _read_bound_skill_manifest(
             flags,
             dir_fd=directory_fd,
         )
-        if _managed_state_metadata_snapshot(os.fstat(file_fd)) != expected:
+        if not _regular_stat_metadata_matches(os.fstat(file_fd), named):
             raise SyncError(f"skill manifest changed before read: {manifest}")
 
         def read_once() -> bytes:
@@ -40404,8 +40373,8 @@ def _read_bound_skill_manifest(
             follow_symlinks=False,
         )
         if (
-            _managed_state_metadata_snapshot(os.fstat(file_fd)) != expected
-            or _managed_state_metadata_snapshot(current) != expected
+            not _regular_stat_metadata_matches(os.fstat(file_fd), named)
+            or not _regular_stat_metadata_matches(current, named)
         ):
             raise SyncError(f"skill manifest changed during read: {manifest}")
         return payload

@@ -302,3 +302,19 @@ superseded_by:
   `refresh-lock --check`, `git diff --check`, and project-journal validation.
   The remaining gate is a new independent clean-clone whole-range review; this
   journal-only checkpoint does not expand the implementation test surface.
+- The next independent GPT-5.6 Sol Ultra whole-range review found a genuine
+  version-6 recovery compatibility defect and several places where owner-only
+  (`0600`) regular-file GID churn was incorrectly treated as a protected
+  mutation. The repair deliberately uses a semantic comparison: object
+  identity, content, mode, UID, size, link count, and parent binding remain
+  strict; GID is exact only when group permission bits make it an access-policy
+  signal. Historical version-6 producing regular records must carry their
+  observed integer GID, while version-7/8 records must carry `null`; dedicated
+  committed and uncommitted create, replace, and removal recovery fixtures
+  cover those boundaries. The architecture contract now documents the narrow
+  `agents/*.toml` regular-file exception and this GID rule. The final local
+  full discovery passed 1,374/1,374 tests in 936.453 seconds with three
+  expected skips; repository-wide `compileall`, Ruff, `git diff --check`, and
+  the refreshed ten-source lock check passed on the same source. A new signed
+  frozen head and clean-clone whole-range review remain required before PR
+  creation.

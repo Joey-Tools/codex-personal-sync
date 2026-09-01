@@ -164,6 +164,18 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
         if version < 8:
             for raw_record in payload["records"]:
                 raw_record.pop("publication_cleanup", None)
+        if version == 6:
+            for raw_record in payload["records"]:
+                if (
+                    raw_record["materialization"] == "regular"
+                    and raw_record["action"]
+                    in {"create", "replace", "quarantine-replace"}
+                ):
+                    stage = raw_record["stage"]
+                    assert isinstance(stage, str)
+                    stage_metadata = os.stat(batch.batch_root / stage)
+                    assert raw_record["regular_gid"] is None
+                    raw_record["regular_gid"] = stage_metadata.st_gid
         if version < 6:
             for raw_record in payload["records"]:
                 for field in (

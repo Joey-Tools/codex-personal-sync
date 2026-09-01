@@ -79,14 +79,16 @@ macOS scheduler 在没有 `TMPDIR` 时，Python 可能选择系统 `/tmp`；该�
 
 ### Managed ledger
 
-`personal-sync/state/managed-links.json` 是生成链接的受管账本：
+`personal-sync/state/managed-links.json` 是生成目标的受管账本：
 
 - `owners` 绑定 owner 到 active release SHA；
 - `links` 为每个 target 保存 `source`、`target`、`kind`、`owner`、`link_target` 和 `release_sha`。
 
-账本只证明已知生成链接的精确 claim，不授予删除任意本地路径的权限。每次替换或移除仍会复核 `current`、release manifest、live symlink target 和对象身份；非 symlink、foreign target 或无法重验证的路径均 fail closed（无法证明安全时停止并保留证据）。
+账本只证明已知生成目标的精确 claim，不授予删除任意本地路径的权限。通常目标仍是 symlink；唯一的 regular-file 例外是 manifest 中 `kind=file` 且 target 恰为 `agents/*.toml` 的 managed custom-agent 配置，这些目标从对应 immutable release 的 source bytes 物化，不能据此收养其他普通文件。
 
-账本 before-state 的 bytes、identity、type、size、mode、uid 与 gid 都是绑定信号；其中 mode/uid/gid 共同表达原文件的 access policy。新 after-state 固定为 regular file、mode `0600` 且 owner 为当前 effective uid，因此 group 不再具备访问语义，仍必须显式验证 owner。
+每次替换或移除都会先复核 `current`、release manifest 与 live target。Symlink 必须保持已证明的 target 和对象身份；上述 regular file 必须保持已证明的对象身份与 content stability（size 和 SHA-256），并重验 access policy：mode 与 UID 始终绑定，只有 mode 的 group permission bits 具有访问语义时才绑定 GID，link count 则在稳态或 pending transaction 的已授权 alias 集合中按对应阶段精确验证。Foreign、无 ledger/transaction 证明、内容已修改、访问策略不符、出现未授权 hard link，或任何无法重验证的目标都 fail closed；破坏性操作不会把它们当作受管对象删除，并会保留原对象或 quarantine / pending evidence 供恢复与诊断。
+
+账本 before-state 的 bytes、identity、type、size、mode 与 uid 都是严格绑定信号；只有 mode 的 group permission bits 非零时，gid 才是精确的 access-policy binding。对 group permission bits 为零的 owner-only regular file，纯 gid drift 不单独证明对象身份、内容或访问策略改变；其他对象、内容、mode 与 uid 信号仍严格重验。新 after-state 固定为 regular file、mode `0600` 且 owner 为当前 effective uid，因此 group 不具备访问语义，仍必须显式验证 owner。
 
 ### `removed_links`
 

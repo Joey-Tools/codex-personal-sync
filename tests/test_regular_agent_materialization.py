@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 import stat
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -107,6 +108,75 @@ def append_regular_link(
 def install(root: Path, home: Path, sha: str) -> None:
     with contextlib.redirect_stdout(io.StringIO()):
         MODULE.install_release_tree(root, home, sha, dry_run=False)
+
+
+def legacy_v6_writer_metadata_payload(
+    batch: MODULE.PendingLinkBatch,
+) -> tuple[dict[str, object], int | None]:
+    metadata_path = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert payload["version"] == 8
+    payload["version"] = 6
+    payload.pop("terminal_regular_before")
+    payload.pop("terminal_regular_after")
+    legacy_gid: int | None = None
+    records = payload["records"]
+    assert isinstance(records, list)
+    for raw_record in records:
+        assert isinstance(raw_record, dict)
+        raw_record.pop("publication_cleanup")
+        if (
+            raw_record["materialization"] == "regular"
+            and raw_record["action"]
+            in {"create", "replace", "quarantine-replace"}
+        ):
+            stage = raw_record["stage"]
+            evidence = raw_record["evidence"]
+            assert isinstance(stage, str)
+            assert isinstance(evidence, str)
+            stage_metadata = os.stat(batch.batch_root / stage)
+            evidence_metadata = os.stat(batch.batch_root / evidence)
+            assert (stage_metadata.st_dev, stage_metadata.st_ino) == tuple(
+                raw_record["stage_identity"]
+            )
+            assert (evidence_metadata.st_dev, evidence_metadata.st_ino) == tuple(
+                raw_record["evidence_identity"]
+            )
+            assert (stage_metadata.st_dev, stage_metadata.st_ino) == (
+                evidence_metadata.st_dev,
+                evidence_metadata.st_ino,
+            )
+            assert stat.S_IMODE(stage_metadata.st_mode) == raw_record["regular_mode"]
+            assert stage_metadata.st_uid == raw_record["regular_uid"]
+            assert stage_metadata.st_nlink in {
+                raw_record["regular_link_count"],
+                raw_record["regular_link_count"] + 1,
+            }
+            assert evidence_metadata.st_nlink == stage_metadata.st_nlink
+            assert raw_record["regular_gid"] is None
+            raw_record["regular_gid"] = stage_metadata.st_gid
+            legacy_gid = stage_metadata.st_gid
+        elif raw_record["materialization"] == "regular":
+            assert raw_record["action"] in {"remove", "quarantine-remove"}
+            assert raw_record["regular_gid"] is None
+            planned = raw_record["planned_before"]
+            assert isinstance(planned, dict)
+            planned_gid = planned["regular_gid"]
+            assert isinstance(planned_gid, int)
+            assert not isinstance(planned_gid, bool)
+            assert planned_gid >= 0
+    return payload, legacy_gid
+
+
+def write_pending_metadata_payload(
+    batch: MODULE.PendingLinkBatch,
+    payload: dict[str, object],
+) -> None:
+    metadata_path = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+    metadata_path.write_text(
+        json.dumps(payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def status_is_unhealthy(home: Path) -> bool:
@@ -661,16 +731,17 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         version: int,
     ) -> MODULE.PendingLinkBatch:
         metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
-        payload = json.loads(metadata.read_text(encoding="utf-8"))
-        payload["version"] = version
         if version == 6:
-            payload.pop("terminal_regular_before")
-            payload.pop("terminal_regular_after")
+            payload, _legacy_gid = legacy_v6_writer_metadata_payload(batch)
+            assert _legacy_gid is not None
+        else:
+            payload = json.loads(metadata.read_text(encoding="utf-8"))
+            payload["version"] = version
         records = payload["records"]
         assert isinstance(records, list)
         for raw_record in records:
             assert isinstance(raw_record, dict)
-            raw_record.pop("publication_cleanup")
+            raw_record.pop("publication_cleanup", None)
         metadata.write_text(json.dumps(payload) + "\n", encoding="utf-8")
         parsed = MODULE._load_pending_link_batch(self.home)
         self.assertIsNotNone(parsed)
@@ -930,6 +1001,108 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                         os.path.lexists(MODULE._pending_link_pointer_path(self.home))
                     )
 
+    def test_legacy_v6_writer_gid_recovers_uncommitted_create_and_replace(
+        self,
+    ) -> None:
+        for action in ("create", "replace"):
+            with self.subTest(action=action):
+                self.home = self.root / f"home-v6-writer-{action}"
+                release = self.release
+                sha = SHA_A
+                old_identity: tuple[int, int] | None = None
+                if action == "replace":
+                    install(self.release, self.home, SHA_A)
+                    target = self.home / ROLE_TARGET
+                    old_identity = (target.stat().st_dev, target.stat().st_ino)
+                    release = self.root / "release-v6-writer-replace"
+                    write_release(release, role_payload='name = "updated"\n')
+                    sha = SHA_B
+
+                batch = self._interrupt_uncommitted_regular_publication(release, sha)
+                payload, legacy_gid = legacy_v6_writer_metadata_payload(batch)
+                assert legacy_gid is not None
+                write_pending_metadata_payload(batch, payload)
+                regular_record = next(
+                    record
+                    for record in batch.records
+                    if record.is_regular()
+                    and record.action in {"create", "replace"}
+                )
+                assert regular_record.stage is not None
+                stage = batch.batch_root / Path(*regular_record.stage.parts)
+                alternate_gid = next(
+                    (gid for gid in os.getgroups() if gid != legacy_gid),
+                    None,
+                )
+                if alternate_gid is None:
+                    self.skipTest("no alternate supplementary group is available")
+                os.chown(stage, -1, alternate_gid)
+
+                parsed = MODULE._load_pending_link_batch(self.home)
+                self.assertIsNotNone(parsed)
+                assert parsed is not None
+                parsed_record = next(
+                    record for record in parsed.records if record.is_regular()
+                )
+                self.assertEqual(parsed.metadata_version, 6)
+                self.assertEqual(parsed_record.regular_gid, legacy_gid)
+                self.assertEqual(stage.stat().st_gid, alternate_gid)
+
+                install(self.release, self.home, SHA_A)
+
+                target = self.home / ROLE_TARGET
+                self.assertEqual(
+                    target.read_text(encoding="utf-8"),
+                    'name = "reviewer"\n',
+                )
+                self.assertEqual(target.stat().st_nlink, 1)
+                if old_identity is not None:
+                    self.assertEqual(
+                        (target.stat().st_dev, target.stat().st_ino),
+                        old_identity,
+                    )
+                self.assertFalse(
+                    os.path.lexists(MODULE._pending_link_pointer_path(self.home))
+                )
+
+    def test_legacy_v6_writer_remove_recovers_uncommitted_rollback(self) -> None:
+        install(self.release, self.home, SHA_A)
+        target = self.home / ROLE_TARGET
+        original_identity = (target.stat().st_dev, target.stat().st_ino)
+        original_gid = target.stat().st_gid
+        removal_release = self.root / "release-v6-writer-remove-uncommitted"
+        write_release(removal_release)
+
+        batch = self._interrupt_uncommitted_regular_publication(
+            removal_release,
+            SHA_B,
+        )
+        payload, producing_gid = legacy_v6_writer_metadata_payload(batch)
+        self.assertIsNone(producing_gid)
+        write_pending_metadata_payload(batch, payload)
+
+        parsed = MODULE._load_pending_link_batch(self.home)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        record = next(
+            candidate for candidate in parsed.records if candidate.is_regular()
+        )
+        self.assertEqual(parsed.metadata_version, 6)
+        self.assertEqual(record.action, "remove")
+        self.assertIsNone(record.regular_gid)
+        self.assertEqual(record.planned_snapshot.regular_gid, original_gid)
+        self.assertFalse(os.path.lexists(target))
+
+        install(self.release, self.home, SHA_A)
+
+        self.assertTrue(target.is_file())
+        self.assertEqual(
+            (target.stat().st_dev, target.stat().st_ino),
+            original_identity,
+        )
+        self.assertEqual(target.read_text(encoding="utf-8"), 'name = "reviewer"\n')
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
+
     def test_v6_v7_produced_active_alias_residue_recovers_exact_inode(self) -> None:
         for version in (6, 7):
             with self.subTest(version=version):
@@ -1024,7 +1197,9 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
     def test_v7_legacy_active_entry_duplicate_candidates_fail_closed(self) -> None:
         batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
         parsed = self._downgrade_pending_regular_metadata(batch, 7)
-        record = next(candidate for candidate in parsed.records if candidate.is_regular())
+        record = next(
+            candidate for candidate in parsed.records if candidate.is_regular()
+        )
         target = self.home / Path(*record.target.parts)
         active = self._isolate_legacy_regular_publication(parsed, record, target)
         assert record.planned_snapshot.parent_identity is not None
@@ -1996,7 +2171,7 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
             ),
         )
 
-    def test_access_bearing_regular_snapshot_protects_gid(self) -> None:
+    def test_regular_snapshot_gid_comparison_follows_group_access(self) -> None:
         expected = MODULE.RegularFileSnapshot(
             parent_identity=(1, 2),
             file_identity=(3, 4),
@@ -2024,18 +2199,286 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
                 expected.parent_identity,
                 expected,
                 expected_link_count=1,
-                protect_gid=True,
             )
         )
+        non_access_bearing_expected = MODULE.replace(expected, mode=0o600)
+        non_access_bearing_actual = MODULE.replace(actual, mode=0o600)
         self.assertTrue(
             MODULE._regular_snapshot_matches(
-                actual,
-                expected.parent_identity,
-                expected,
+                non_access_bearing_actual,
+                non_access_bearing_expected.parent_identity,
+                non_access_bearing_expected,
                 expected_link_count=1,
-                protect_gid=False,
             )
         )
+
+    def test_reconcile_target_gid_revalidation_follows_group_access(self) -> None:
+        expected = MODULE.ReconcileTargetSnapshot(
+            parent_identity=(1, 2),
+            link_identity=(3, 4),
+            ancestor_identity=(1, 2),
+            regular_sha256="a" * 64,
+            regular_size=10,
+            regular_mode=0o600,
+            regular_uid=501,
+            regular_gid=20,
+            regular_link_count=1,
+        )
+        actual = MODULE.replace(expected, regular_gid=80)
+        target = self.home / ROLE_TARGET
+
+        with mock.patch.object(
+            MODULE,
+            "_capture_reconcile_target_snapshot",
+            return_value=actual,
+        ):
+            MODULE._require_reconcile_target_snapshot(self.home, target, expected)
+
+        group_expected = MODULE.replace(expected, regular_mode=0o640)
+        group_actual = MODULE.replace(actual, regular_mode=0o640)
+        with (
+            mock.patch.object(
+                MODULE,
+                "_capture_reconcile_target_snapshot",
+                return_value=group_actual,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "managed target changed after planning",
+            ),
+        ):
+            MODULE._require_reconcile_target_snapshot(
+                self.home,
+                target,
+                group_expected,
+            )
+
+    def test_managed_file_evidence_gid_comparison_follows_group_access(self) -> None:
+        expected = MODULE.ManagedStateFileSnapshot(
+            exists=True,
+            payload=b"abc",
+            mode=0o600,
+            parent_identity=(1, 2),
+            file_identity=(3, 4),
+            file_type=stat.S_IFREG,
+            size=3,
+            uid=501,
+            gid=20,
+        )
+        actual = MODULE.replace(expected, gid=80)
+
+        self.assertTrue(
+            MODULE._managed_state_snapshot_matches_bound_file_evidence(
+                actual,
+                expected,
+            )
+        )
+        group_expected = MODULE.replace(expected, mode=0o640)
+        group_actual = MODULE.replace(actual, mode=0o640)
+        self.assertFalse(
+            MODULE._managed_state_snapshot_matches_bound_file_evidence(
+                group_actual,
+                group_expected,
+            )
+        )
+        self.assertFalse(
+            MODULE._managed_state_snapshot_matches_bound_file_evidence(
+                MODULE.replace(actual, parent_identity=(9, 9)),
+                expected,
+            )
+        )
+
+    def test_stat_metadata_gid_comparison_follows_group_access(self) -> None:
+        def metadata(mode: int, gid: int) -> SimpleNamespace:
+            return SimpleNamespace(
+                st_dev=1,
+                st_ino=2,
+                st_mode=stat.S_IFREG | mode,
+                st_uid=501,
+                st_gid=gid,
+                st_size=10,
+                st_nlink=1,
+            )
+
+        self.assertTrue(
+            MODULE._regular_stat_metadata_matches(
+                metadata(0o600, 80),
+                metadata(0o600, 20),
+            )
+        )
+        self.assertFalse(
+            MODULE._regular_stat_metadata_matches(
+                metadata(0o640, 80),
+                metadata(0o640, 20),
+            )
+        )
+
+    def test_managed_state_file_match_gid_follows_group_access(self) -> None:
+        expected = MODULE.ManagedStateFileSnapshot(
+            exists=True,
+            payload=b'{"version": 1}\n',
+            mode=0o600,
+            parent_identity=(1, 2),
+            file_identity=(3, 4),
+            file_type=stat.S_IFREG,
+            size=15,
+            uid=501,
+            gid=20,
+        )
+        actual = MODULE.replace(expected, gid=80)
+        target = self.home / "state" / "managed.json"
+
+        with mock.patch.object(
+            MODULE,
+            "_read_managed_state_file_snapshot",
+            return_value=actual,
+        ):
+            self.assertTrue(
+                MODULE._managed_state_file_matches(
+                    self.home,
+                    target,
+                    expected,
+                    parent_fd=10,
+                )
+            )
+
+        group_expected = MODULE.replace(expected, mode=0o640)
+        group_actual = MODULE.replace(actual, mode=0o640)
+        with mock.patch.object(
+            MODULE,
+            "_read_managed_state_file_snapshot",
+            return_value=group_actual,
+        ):
+            self.assertFalse(
+                MODULE._managed_state_file_matches(
+                    self.home,
+                    target,
+                    group_expected,
+                    parent_fd=10,
+                )
+            )
+
+    def test_regular_file_snapshot_named_open_gid_churn_follows_group_access(
+        self,
+    ) -> None:
+        for mode in (0o600, 0o640):
+            with self.subTest(mode=oct(mode)):
+                target = self.home / f"regular-snapshot-{mode:o}.toml"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text('name = "reviewer"\n', encoding="utf-8")
+                target.chmod(mode)
+                original_gid = target.stat().st_gid
+                alternate_gid = next(
+                    (gid for gid in os.getgroups() if gid != original_gid),
+                    None,
+                )
+                if alternate_gid is None:
+                    self.skipTest("no alternate supplementary group is available")
+                parent_fd = MODULE._open_directory_beneath(self.home, target.parent)
+                real_open = MODULE.os.open
+                churned = False
+
+                def churn_gid_before_open(
+                    path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                    flags: int,
+                    mode_bits: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal churned
+                    if path == target.name and dir_fd == parent_fd and not churned:
+                        os.chown(target, -1, alternate_gid)
+                        churned = True
+                    return real_open(path, flags, mode_bits, dir_fd=dir_fd)
+
+                try:
+                    with mock.patch.object(
+                        MODULE.os,
+                        "open",
+                        side_effect=churn_gid_before_open,
+                    ):
+                        if mode == 0o600:
+                            snapshot = MODULE._regular_file_snapshot_at(
+                                parent_fd,
+                                target.name,
+                                target,
+                            )
+                            self.assertEqual(snapshot.gid, original_gid)
+                        else:
+                            with self.assertRaisesRegex(
+                                MODULE.SyncError,
+                                "changed before read",
+                            ):
+                                MODULE._regular_file_snapshot_at(
+                                    parent_fd,
+                                    target.name,
+                                    target,
+                                )
+                finally:
+                    MODULE._close_fd_quietly(parent_fd)
+                self.assertTrue(churned)
+                self.assertEqual(target.stat().st_gid, alternate_gid)
+
+    def test_managed_state_reader_named_open_gid_churn_follows_group_access(
+        self,
+    ) -> None:
+        for mode in (0o600, 0o640):
+            with self.subTest(mode=oct(mode)):
+                target = self.home / "state" / f"managed-{mode:o}.json"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text('{"version": 1}\n', encoding="utf-8")
+                target.chmod(mode)
+                original_gid = target.stat().st_gid
+                alternate_gid = next(
+                    (gid for gid in os.getgroups() if gid != original_gid),
+                    None,
+                )
+                if alternate_gid is None:
+                    self.skipTest("no alternate supplementary group is available")
+                parent_fd = MODULE._open_directory_beneath(self.home, target.parent)
+                real_open = MODULE.os.open
+                churned = False
+
+                def churn_gid_before_open(
+                    path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                    flags: int,
+                    mode_bits: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal churned
+                    if path == target.name and dir_fd == parent_fd and not churned:
+                        os.chown(target, -1, alternate_gid)
+                        churned = True
+                    return real_open(path, flags, mode_bits, dir_fd=dir_fd)
+
+                try:
+                    with mock.patch.object(
+                        MODULE.os,
+                        "open",
+                        side_effect=churn_gid_before_open,
+                    ):
+                        if mode == 0o600:
+                            snapshot = MODULE._read_managed_state_file_snapshot(
+                                self.home,
+                                target,
+                                parent_fd,
+                            )
+                            self.assertEqual(snapshot.gid, alternate_gid)
+                        else:
+                            with self.assertRaisesRegex(
+                                MODULE.SyncError,
+                                "changed before read",
+                            ):
+                                MODULE._read_managed_state_file_snapshot(
+                                    self.home,
+                                    target,
+                                    parent_fd,
+                                )
+                finally:
+                    MODULE._close_fd_quietly(parent_fd)
+                self.assertTrue(churned)
+                self.assertEqual(target.stat().st_gid, alternate_gid)
 
     def _retain_committed_batch(
         self,
@@ -2081,6 +2524,130 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
         payload = json.loads(metadata.read_text(encoding="utf-8"))
         mutate(payload)
         metadata.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    def test_legacy_v6_writer_gid_recovers_committed_create_and_replace(
+        self,
+    ) -> None:
+        for action in ("create", "replace"):
+            with self.subTest(action=action):
+                self.home = self.root / f"home-committed-v6-writer-{action}"
+                release = self.root / f"release-committed-v6-writer-{action}"
+                sha = SHA_A
+                expected_payload = 'name = "reviewer"\n'
+                if action == "replace":
+                    initial = self.root / "release-committed-v6-writer-initial"
+                    write_release(initial, role_payload='name = "initial"\n')
+                    install(initial, self.home, SHA_A)
+                    expected_payload = 'name = "updated"\n'
+                    sha = SHA_B
+                write_release(release, role_payload=expected_payload)
+
+                batch = self._retain_committed_batch(release, sha=sha)
+                payload, legacy_gid = legacy_v6_writer_metadata_payload(batch)
+                assert legacy_gid is not None
+                write_pending_metadata_payload(batch, payload)
+                target = self.home / ROLE_TARGET
+                alternate_gid = next(
+                    (gid for gid in os.getgroups() if gid != legacy_gid),
+                    None,
+                )
+                if alternate_gid is None:
+                    self.skipTest("no alternate supplementary group is available")
+                os.chown(target, -1, alternate_gid)
+
+                parsed = MODULE._load_pending_link_batch(self.home)
+                self.assertIsNotNone(parsed)
+                assert parsed is not None
+                parsed_record = next(
+                    record for record in parsed.records if record.is_regular()
+                )
+                self.assertEqual(parsed.metadata_version, 6)
+                self.assertEqual(parsed_record.regular_gid, legacy_gid)
+                self.assertEqual(target.stat().st_gid, alternate_gid)
+
+                install(release, self.home, sha)
+
+                self.assertEqual(target.read_text(encoding="utf-8"), expected_payload)
+                self.assertEqual(target.stat().st_gid, alternate_gid)
+                self.assertEqual(target.stat().st_nlink, 1)
+                self.assertFalse(
+                    os.path.lexists(MODULE._pending_link_pointer_path(self.home))
+                )
+
+    def test_legacy_v6_writer_remove_recovers_committed_finalization(self) -> None:
+        initial = self.root / "release-committed-v6-writer-remove-initial"
+        write_release(initial, role_payload='name = "reviewer"\n')
+        install(initial, self.home, SHA_A)
+        target = self.home / ROLE_TARGET
+        original_gid = target.stat().st_gid
+        removal_release = self.root / "release-committed-v6-writer-remove"
+        write_release(removal_release)
+
+        batch = self._retain_committed_batch(removal_release, sha=SHA_B)
+        payload, producing_gid = legacy_v6_writer_metadata_payload(batch)
+        self.assertIsNone(producing_gid)
+        write_pending_metadata_payload(batch, payload)
+
+        parsed = MODULE._load_pending_link_batch(self.home)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        record = next(candidate for candidate in parsed.records if candidate.is_regular())
+        self.assertEqual(parsed.metadata_version, 6)
+        self.assertEqual(record.action, "remove")
+        self.assertIsNone(record.regular_gid)
+        self.assertEqual(record.planned_snapshot.regular_gid, original_gid)
+        self.assertFalse(os.path.lexists(target))
+
+        install(removal_release, self.home, SHA_B)
+
+        self.assertFalse(os.path.lexists(target))
+        self.assertNotIn(ROLE_TARGET, MODULE._load_managed_state(self.home).links)
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
+
+    def test_pending_regular_gid_version_validation(self) -> None:
+        release = self.root / "release-regular-gid-validation"
+        write_release(release, role_payload='name = "reviewer"\n')
+        batch = self._retain_committed_batch(release)
+        metadata_path = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        current_payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        legacy_payload, legacy_gid = legacy_v6_writer_metadata_payload(batch)
+        assert legacy_gid is not None
+
+        for invalid_gid in (None, True, "20", -1):
+            with self.subTest(version=6, regular_gid=invalid_gid):
+                payload = json.loads(json.dumps(legacy_payload))
+                regular_record = next(
+                    record
+                    for record in payload["records"]
+                    if record["materialization"] == "regular"
+                )
+                regular_record["regular_gid"] = invalid_gid
+                write_pending_metadata_payload(batch, payload)
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "invalid regular-file evidence",
+                ):
+                    MODULE._load_pending_link_batch(self.home)
+
+        for version in (7, 8):
+            with self.subTest(version=version, regular_gid=legacy_gid):
+                payload = json.loads(json.dumps(current_payload))
+                payload["version"] = version
+                if version == 7:
+                    for raw_record in payload["records"]:
+                        raw_record.pop("publication_cleanup")
+                regular_record = next(
+                    record
+                    for record in payload["records"]
+                    if record["materialization"] == "regular"
+                )
+                regular_record["regular_gid"] = legacy_gid
+                write_pending_metadata_payload(batch, payload)
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "invalid regular-file evidence",
+                ):
+                    MODULE._load_pending_link_batch(self.home)
 
     def test_v5_symlink_pending_metadata_remains_readable(self) -> None:
         release = self.root / "symlink-release"
@@ -2129,18 +2696,14 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
         release = self.root / "regular-release"
         write_release(release, role_payload='name = "reviewer"\n')
         batch = self._retain_committed_batch(release)
-
-        def add_unknown_field(payload: dict[str, object]) -> None:
-            payload["version"] = 6
-            payload.pop("terminal_regular_before", None)
-            payload.pop("terminal_regular_after", None)
-            records = payload["records"]
-            assert isinstance(records, list)
-            record = records[-1]
-            assert isinstance(record, dict)
-            record["unexpected_regular_field"] = True
-
-        self._rewrite_linked_metadata(batch, add_unknown_field)
+        payload, _legacy_gid = legacy_v6_writer_metadata_payload(batch)
+        assert _legacy_gid is not None
+        records = payload["records"]
+        assert isinstance(records, list)
+        record = records[-1]
+        assert isinstance(record, dict)
+        record["unexpected_regular_field"] = True
+        write_pending_metadata_payload(batch, payload)
 
         with self.assertRaisesRegex(MODULE.SyncError, "record .* is invalid"):
             MODULE._load_pending_link_batch(self.home)
@@ -2204,23 +2767,9 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
             payload='name = "security-reviewer"\n',
         )
         batch = self._retain_committed_batch(next_release, sha=SHA_B)
-
-        def downgrade_without_state_regular_coverage(
-            payload: dict[str, object],
-        ) -> None:
-            payload["version"] = 6
-            payload.pop("terminal_regular_before")
-            payload.pop("terminal_regular_after")
-            records = payload["records"]
-            assert isinstance(records, list)
-            for record in records:
-                assert isinstance(record, dict)
-                record.pop("publication_cleanup")
-
-        self._rewrite_linked_metadata(
-            batch,
-            downgrade_without_state_regular_coverage,
-        )
+        legacy_payload, _legacy_gid = legacy_v6_writer_metadata_payload(batch)
+        assert _legacy_gid is not None
+        write_pending_metadata_payload(batch, legacy_payload)
 
         parsed = MODULE._load_pending_link_batch(self.home)
         self.assertIsNotNone(parsed)
