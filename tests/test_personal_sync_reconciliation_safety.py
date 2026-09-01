@@ -1706,6 +1706,100 @@ class ReconciliationOrderingTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), old_source.read_bytes())
         self.assertEqual((target.stat().st_dev, target.stat().st_ino), original_identity)
 
+    def test_regular_rollback_cleanup_restores_name_replacement_before_quarantine(
+        self,
+    ) -> None:
+        old_source = self._agent_source(SHA_A, b'old = true\n')
+        new_source = self._agent_source(SHA_B, b'new = true\n')
+        target = self.home / "agents" / "reviewer.toml"
+        target.parent.mkdir()
+        target.write_bytes(old_source.read_bytes())
+        target.chmod(0o600)
+        action = planned_reconcile_action(
+            self.home,
+            "replace",
+            target,
+            "../personal-sync/current/personal_codex/agents/reviewer.toml",
+            "file",
+            expected_link_target="../personal-sync/current/personal_codex/agents/reviewer.toml",
+            materialization="regular",
+            regular_source=new_source,
+        )
+        transaction = MODULE._apply_reconcile_actions(
+            self.home, [action], dry_run=False
+        )
+        assert transaction is not None
+        assert transaction.batch_root is not None
+        backup = transaction.batch_root / "links" / "agents" / "reviewer.toml"
+        created_identity = (target.stat().st_dev, target.stat().st_ino)
+        displaced = target.with_name("reviewer-before-quarantine-race.toml")
+        real_rename_noreplace = MODULE._rename_noreplace_at
+        replacement_identity: tuple[int, int] | None = None
+        replaced = False
+
+        def replace_name_before_quarantine(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal replaced, replacement_identity
+            if source_name == target.name and not replaced:
+                replaced = True
+                os.rename(
+                    target.name,
+                    displaced.name,
+                    src_dir_fd=source_parent_fd,
+                    dst_dir_fd=source_parent_fd,
+                )
+                replacement_fd = os.open(
+                    target.name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=source_parent_fd,
+                )
+                try:
+                    os.write(replacement_fd, b"foreign = true\n")
+                finally:
+                    os.close(replacement_fd)
+                metadata = os.stat(
+                    target.name,
+                    dir_fd=source_parent_fd,
+                    follow_symlinks=False,
+                )
+                replacement_identity = (metadata.st_dev, metadata.st_ino)
+            real_rename_noreplace(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+
+        with mock.patch.object(
+            MODULE,
+            "_rename_noreplace_at",
+            side_effect=replace_name_before_quarantine,
+        ):
+            with self.assertRaises(MODULE.SyncError):
+                MODULE._rollback_reconcile_transaction(self.home, transaction)
+
+        self.assertTrue(replaced)
+        self.assertIsNotNone(replacement_identity)
+        self.assertTrue(target.is_file())
+        self.assertEqual(target.read_bytes(), b"foreign = true\n")
+        self.assertEqual(
+            (target.stat().st_dev, target.stat().st_ino),
+            replacement_identity,
+        )
+        self.assertTrue(displaced.is_file())
+        self.assertEqual(displaced.read_bytes(), new_source.read_bytes())
+        self.assertEqual(
+            (displaced.stat().st_dev, displaced.stat().st_ino),
+            created_identity,
+        )
+        self.assertTrue(backup.is_file())
+        self.assertEqual(backup.read_bytes(), old_source.read_bytes())
+
     def test_plan_rejects_modified_or_unproven_agent_regular_file(self) -> None:
         old_source = self._agent_source(SHA_A, b'old = true\n')
         self._agent_source(SHA_B, b'new = true\n')
@@ -5688,6 +5782,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
             dry_run: bool,
             allow_cross_owner: bool,
             preflight_only: bool = False,
+            cleanup_budget: MODULE.PendingCleanupActionBudget | None = None,
         ) -> None:
             nonlocal injected
             if not dry_run and not injected:
@@ -5705,6 +5800,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
                 dry_run=dry_run,
                 allow_cross_owner=allow_cross_owner,
                 preflight_only=preflight_only,
+                cleanup_budget=cleanup_budget,
             )
 
         with mock.patch.object(
@@ -9351,7 +9447,7 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
 
         self.assertIsNotNone(parsed)
         assert parsed is not None
-        self.assertEqual(metadata["version"], 6)
+        self.assertEqual(metadata["version"], 7)
         self.assertIn(
             MODULE.PENDING_RELINQUISH_FOREIGN_ACTION,
             MODULE.PENDING_LINK_ACTIONS_BY_METADATA_VERSION[5],
@@ -9394,6 +9490,97 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
         )
         self.assertFalse(os.path.lexists(batch.batch_root / "links" / "AGENTS.md"))
         self.assertEqual(foreign_leaf_snapshot(self.agents), self.foreign_before)
+
+    def test_optional_foreign_regular_relinquishment_binds_identity_without_reading(
+        self,
+    ) -> None:
+        self.agents.unlink()
+        self.agents.write_text("foreign regular\n", encoding="utf-8")
+        foreign_identity = (
+            self.agents.stat().st_dev,
+            self.agents.stat().st_ino,
+        )
+        state = MODULE._load_managed_state(self.home)
+        current_manifest = MODULE._current_manifest_data(
+            self.home,
+            MODULE.PUBLIC_OWNER,
+        )
+
+        for error in (
+            PermissionError("simulated unreadable foreign file"),
+            MODULE.SyncError("managed regular file exceeds the size limit"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(
+                    MODULE,
+                    "_regular_file_snapshot_at",
+                    side_effect=error,
+                ) as read_regular:
+                    actions = MODULE._plan_reconciliation(
+                        self.home,
+                        self.manifest_b.entries,
+                        current_manifest.entries,
+                        [],
+                        state,
+                        allow_cross_owner=False,
+                    )
+
+                self.assertEqual(read_regular.call_count, 0)
+                self.assertEqual(
+                    [action.action for action in actions],
+                    [MODULE.PENDING_RELINQUISH_FOREIGN_ACTION],
+                )
+                snapshot = actions[0].planned_snapshot
+                assert snapshot is not None
+                self.assertEqual(snapshot.link_identity, foreign_identity)
+                self.assertIsNone(snapshot.link_target)
+                self.assertIsNone(snapshot.regular_sha256)
+                record = MODULE._pending_link_record_for_action(
+                    self.home,
+                    "managed",
+                    actions[0],
+                    {entry.target: entry for entry in self.manifest_b.entries},
+                    {MODULE.PUBLIC_OWNER: SHA_B},
+                    state,
+                    0,
+                )
+                self.assertEqual(
+                    record.planned_snapshot.link_identity,
+                    foreign_identity,
+                )
+                with mock.patch.object(
+                    MODULE,
+                    "_regular_file_snapshot_at",
+                    side_effect=error,
+                ) as verify_read_regular:
+                    MODULE._verify_managed_state_link_claims(
+                        self.home,
+                        state,
+                        actions,
+                    )
+                self.assertEqual(verify_read_regular.call_count, 0)
+
+        legacy_snapshot = MODULE._capture_reconcile_target_snapshot(
+            self.home,
+            self.agents,
+            capture_regular_content=True,
+        )
+        self.assertIsNotNone(legacy_snapshot.regular_sha256)
+        legacy_action = dataclasses.replace(
+            actions[0],
+            planned_snapshot=legacy_snapshot,
+        )
+        with mock.patch.object(
+            MODULE,
+            "_regular_file_snapshot_at",
+            wraps=MODULE._regular_file_snapshot_at,
+        ) as legacy_read_regular:
+            MODULE._verify_managed_state_link_claims(
+                self.home,
+                state,
+                [legacy_action],
+            )
+        self.assertEqual(legacy_read_regular.call_count, 1)
 
     def test_uncommitted_recovery_requires_exact_foreign_snapshot(self) -> None:
         _batch, state, state_snapshot = self._stage_batch()
@@ -9495,6 +9682,8 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
         )
         def downgrade_to_v4(payload: dict[str, object]) -> None:
             payload["version"] = 4
+            payload.pop("terminal_regular_before")
+            payload.pop("terminal_regular_after")
             records = payload["records"]
             assert isinstance(records, list)
             for record in records:
@@ -9534,7 +9723,10 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
         )
         self._rewrite_metadata_and_republish(
             batch,
-            lambda payload: payload.__setitem__("version", 7),
+            lambda payload: payload.__setitem__(
+                "version",
+                max(MODULE.SUPPORTED_PENDING_LINK_METADATA_VERSIONS) + 1,
+            ),
         )
 
         with self.assertRaisesRegex(
@@ -11944,6 +12136,8 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         metadata_path = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
         payload["version"] = 4
+        payload.pop("terminal_regular_before")
+        payload.pop("terminal_regular_after")
         for record in payload["records"]:
             for field in (
                 "materialization",

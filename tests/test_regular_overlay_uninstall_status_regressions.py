@@ -66,6 +66,37 @@ def write_regular_release(
     manifest.write_text(json.dumps(manifest_payload) + "\n", encoding="utf-8")
 
 
+def write_non_regular_release(
+    root: Path,
+    *,
+    owner: str = MODULE.PUBLIC_OWNER,
+    base_sha: str | None = None,
+) -> None:
+    source = root / "personal_codex" / "config" / "keep.txt"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("keep\n", encoding="utf-8")
+    manifest_payload: dict[str, object] = {
+        "version": 1,
+        "owner": owner,
+        "links": [
+            {
+                "source": "personal_codex/config/keep.txt",
+                "target": "config/keep.txt",
+                "kind": "file",
+                "owner": owner,
+            }
+        ],
+    }
+    if base_sha is not None:
+        manifest_payload["base_release"] = {
+            "repo": "Joey-Tools/codex-toolbox",
+            "sha": base_sha,
+        }
+    manifest = root / MODULE.MANIFEST_RELATIVE_PATH
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps(manifest_payload) + "\n", encoding="utf-8")
+
+
 def install(root: Path, home: Path, sha: str) -> None:
     with contextlib.redirect_stdout(io.StringIO()):
         MODULE.install_release_tree(root, home, sha, dry_run=False)
@@ -495,6 +526,201 @@ class RegularStatusLedgerTests(unittest.TestCase):
                 "regular file is missing its managed state claim",
                 output.getvalue(),
             )
+
+    def test_identical_override_rejects_legal_loser_claim_for_both_statuses(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            public = root / "public"
+            private = root / "private"
+            write_regular_release(public, payload=PUBLIC_PAYLOAD)
+            write_regular_release(
+                private,
+                owner="private",
+                payload=PUBLIC_PAYLOAD,
+                override=True,
+                base_sha=SHA_A,
+            )
+            install(public, home, SHA_A)
+            install(private, home, SHA_B)
+
+            public_entry = MODULE._current_manifest_data(
+                home,
+                MODULE.PUBLIC_OWNER,
+            ).entries[0]
+            public_record = MODULE.ManagedLinkRecord(
+                source=public_entry.source,
+                target=public_entry.target,
+                kind=public_entry.kind,
+                owner=MODULE.PUBLIC_OWNER,
+                link_target=MODULE._desired_link_target(home, public_entry),
+                release_sha=SHA_A,
+            )
+            state = MODULE._load_managed_state(home)
+            state.links[ROLE_TARGET] = public_record
+            MODULE._write_managed_state(home, state)
+            self.assertEqual(
+                MODULE._load_managed_state(home).links[ROLE_TARGET],
+                public_record,
+            )
+
+            public_output = io.StringIO()
+            with contextlib.redirect_stdout(public_output):
+                public_healthy = MODULE.status(home)
+            private_output = io.StringIO()
+            with contextlib.redirect_stdout(private_output):
+                private_healthy = MODULE.status(home, "private")
+
+            self.assertFalse(public_healthy)
+            self.assertFalse(private_healthy)
+            self.assertIn("winner claim conflict", public_output.getvalue())
+            self.assertIn("winner claim conflict", private_output.getvalue())
+
+
+class RegularClaimFailClosedTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.home = self.root / "home"
+        self.state_path = MODULE._state_path(self.home)
+        self.target = self.home / ROLE_TARGET
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _current_snapshot(self, owner: str) -> tuple[str, int, int]:
+        current = MODULE._current_link(self.home, owner)
+        metadata = current.lstat()
+        return os.readlink(current), metadata.st_dev, metadata.st_ino
+
+    def _target_snapshot(self) -> tuple[bytes, int, int, int, int, int]:
+        metadata = self.target.stat()
+        return (
+            self.target.read_bytes(),
+            metadata.st_dev,
+            metadata.st_ino,
+            stat.S_IMODE(metadata.st_mode),
+            metadata.st_uid,
+            metadata.st_nlink,
+        )
+
+    def test_verify_overlay_rejects_missing_regular_claim_ledger(self) -> None:
+        public = self.root / "public"
+        private = self.root / "private"
+        write_regular_release(public, payload=PUBLIC_PAYLOAD)
+        write_regular_release(
+            private,
+            owner="private",
+            payload=PRIVATE_PAYLOAD,
+            override=True,
+            base_sha=SHA_A,
+        )
+        install(public, self.home, SHA_A)
+        install(private, self.home, SHA_B)
+        self.state_path.unlink()
+        output = io.StringIO()
+
+        with (
+            contextlib.redirect_stdout(output),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "overlay verification failed",
+            ),
+        ):
+            MODULE.verify_overlay(self.home, "private")
+
+        self.assertIn("missing overlay regular claim", output.getvalue())
+
+    def test_same_release_install_does_not_bootstrap_exact_regular_bytes(
+        self,
+    ) -> None:
+        public = self.root / "public"
+        write_regular_release(public, payload=PUBLIC_PAYLOAD)
+        install(public, self.home, SHA_A)
+        current_before = self._current_snapshot(MODULE.PUBLIC_OWNER)
+        target_before = self._target_snapshot()
+        self.state_path.unlink()
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "unproven regular-file target",
+        ):
+            install(public, self.home, SHA_A)
+
+        self.assertFalse(os.path.lexists(self.state_path))
+        self.assertEqual(
+            self._current_snapshot(MODULE.PUBLIC_OWNER),
+            current_before,
+        )
+        self.assertEqual(self._target_snapshot(), target_before)
+
+    def test_private_only_missing_regular_claim_blocks_uninstall(self) -> None:
+        public = self.root / "public"
+        private = self.root / "private"
+        write_non_regular_release(public)
+        write_regular_release(
+            private,
+            owner="private",
+            payload=PRIVATE_PAYLOAD,
+            base_sha=SHA_A,
+        )
+        install(public, self.home, SHA_A)
+        install(private, self.home, SHA_B)
+        state = MODULE._load_managed_state(self.home)
+        state.links.pop(ROLE_TARGET)
+        MODULE._write_managed_state(self.home, state)
+        state_before = self.state_path.read_bytes()
+        current_before = self._current_snapshot("private")
+        target_before = self._target_snapshot()
+
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "missing overlay regular claim",
+            ),
+        ):
+            MODULE.uninstall_overlay(self.home, "private", dry_run=False)
+
+        self.assertEqual(self.state_path.read_bytes(), state_before)
+        self.assertEqual(self._current_snapshot("private"), current_before)
+        self.assertEqual(self._target_snapshot(), target_before)
+        self.assertEqual(
+            MODULE._load_managed_state(self.home).owners["private"],
+            SHA_B,
+        )
+
+    def test_public_upgrade_cannot_retire_unclaimed_regular_target(self) -> None:
+        public = self.root / "public"
+        upgraded = self.root / "upgraded"
+        write_regular_release(public, payload=PUBLIC_PAYLOAD)
+        write_non_regular_release(upgraded)
+        install(public, self.home, SHA_A)
+        state = MODULE._load_managed_state(self.home)
+        state.links.pop(ROLE_TARGET)
+        MODULE._write_managed_state(self.home, state)
+        state_before = self.state_path.read_bytes()
+        current_before = self._current_snapshot(MODULE.PUBLIC_OWNER)
+        target_before = self._target_snapshot()
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "missing.*regular claim",
+        ):
+            install(upgraded, self.home, SHA_B)
+
+        self.assertEqual(self.state_path.read_bytes(), state_before)
+        self.assertEqual(
+            self._current_snapshot(MODULE.PUBLIC_OWNER),
+            current_before,
+        )
+        self.assertEqual(self._target_snapshot(), target_before)
+        self.assertEqual(
+            MODULE._load_managed_state(self.home).owners[MODULE.PUBLIC_OWNER],
+            SHA_A,
+        )
 
 
 if __name__ == "__main__":

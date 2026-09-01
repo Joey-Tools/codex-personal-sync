@@ -58,8 +58,11 @@ superseded_by:
   clearing and identity-verifying the isolated batch root. A renamed or
   replaced batch without that proof retains its ticket and fails closed.
 - Pending metadata versions 4 and 5 keep their historical agent-TOML symlink
-  claim semantics. Only version 6 applies the path-derived regular-file claim
-  omission, so an upgrade cannot strand an older pending transaction.
+  claim semantics. Version 6 applies the path-derived regular-file claim
+  omission, so an upgrade cannot strand an older pending transaction. Version
+  7 additionally persists the complete regular-target state before and after
+  the transaction; uncovered version-6 terminal state fails closed instead of
+  guessing that omitted records prove a healthy final file.
 - Terminal regular-file cleanup now uses cleanup-ticket version 4 as the last
   durable authority. It binds the complete affected target group to each
   parent and file identity, exact digest and size, mode `0600`, and effective
@@ -163,3 +166,23 @@ superseded_by:
   `miku-bot-dev`, `hoteng-srv-01`, and `codex-hoteng-srv-01` timed out before
   SSH authentication; deployment will retry after the release rather than
   weakening the all-host verification requirement.
+- A later frozen whole-range GPT-5.6 Sol Ultra review found fifteen actionable
+  gaps across atomic regular-leaf removal, cumulative materialization and
+  cleanup budgets, v4-v6 recovery compatibility, exclusive control-file
+  publication, mandatory ledger coverage, complete version-7 terminal state,
+  optional foreign-file relinquishment, multi-pass final verification,
+  portable target aliases, semantic GID handling, status winner selection, and
+  overlay verification. Each finding was repaired with focused regression
+  coverage; no legacy helper entrypoint was added or reintroduced.
+- Optional foreign regular `AGENTS.md` relinquishment now binds only parent and
+  object identity without reading foreign contents. Verification reproduces
+  that identity-only projection, while retained version-6 transactions that
+  already contain full regular evidence continue to revalidate the full
+  snapshot before recovery.
+- The final pending-staging suite passed 26/26, reconciliation safety passed
+  314/314, and the core synchronizer passed 303/303 with one expected platform
+  skip. After correcting v4-v6 downgrade fixtures and refreshing the six-source
+  lock, the repository-private full discovery passed 1,301/1,301 in 1,241.556
+  seconds with three expected platform skips. Ruff `E4/E7/E9/F`, repository-wide
+  `compileall`, `git diff --check`, source-lock canonical serialization, and
+  `refresh-lock --check` also passed.

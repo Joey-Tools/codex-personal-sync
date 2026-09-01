@@ -80,6 +80,30 @@ def write_release(
     manifest.write_text(json.dumps(payload) + "\n", encoding="utf-8")
 
 
+def append_regular_link(
+    root: Path,
+    *,
+    target: str,
+    source: str = "personal_codex/agents/reviewer.toml",
+    payload: str | None = None,
+) -> None:
+    if payload is not None:
+        source_path = root / source
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(payload, encoding="utf-8")
+    manifest_path = root / MODULE.MANIFEST_RELATIVE_PATH
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["links"].append(
+        {
+            "source": source,
+            "target": target,
+            "kind": "file",
+            "owner": manifest["owner"],
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+
 def install(root: Path, home: Path, sha: str) -> None:
     with contextlib.redirect_stdout(io.StringIO()):
         MODULE.install_release_tree(root, home, sha, dry_run=False)
@@ -155,6 +179,87 @@ class PublicRegularAgentTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(target))
         state = MODULE._load_managed_state(self.home)
         self.assertNotIn(ROLE_TARGET, state.links)
+
+    def test_portable_agent_target_aliases_materialize_regular_files(self) -> None:
+        aliases = ("Agents/reviewer.toml", "agents/REVIEWER.TOML")
+        for index, alias in enumerate(aliases):
+            with self.subTest(alias=alias):
+                release = self.root / f"alias-release-{index}"
+                home = self.root / f"alias-home-{index}"
+                write_release(release, role_payload=self.payload, target=alias)
+
+                install(release, home, SHA_A)
+
+                target = home / Path(alias)
+                self.assertTrue(target.is_file())
+                self.assertFalse(target.is_symlink())
+                self.assertEqual(target.read_text(encoding="utf-8"), self.payload)
+                self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
+
+class RegularAgentMaterializationBudgetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.home = self.root / "home"
+        self.release = self.root / "release"
+        self.payload = 'name = "shared"\n'
+        write_release(self.release, role_payload=self.payload)
+        append_regular_link(
+            self.release,
+            target="agents/security-reviewer.toml",
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_budget_charges_each_producing_target_even_for_shared_source(self) -> None:
+        with (
+            mock.patch.object(
+                MODULE,
+                "MAX_PENDING_REGULAR_MATERIALIZATION_BYTES",
+                len(self.payload.encode("utf-8")),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_create_regular_file_beneath",
+                wraps=MODULE._create_regular_file_beneath,
+            ) as create_regular,
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "regular.*materialization.*(limit|budget)|materialization.*bytes",
+            ),
+        ):
+            install(self.release, self.home, SHA_A)
+
+        self.assertEqual(create_regular.call_count, 0)
+        self.assertFalse(os.path.lexists(self.home / ROLE_TARGET))
+        self.assertFalse(
+            os.path.lexists(self.home / "agents" / "security-reviewer.toml")
+        )
+
+        with mock.patch.object(
+            MODULE,
+            "MAX_PENDING_REGULAR_MATERIALIZATION_BYTES",
+            2 * len(self.payload.encode("utf-8")),
+        ):
+            install(self.release, self.home, SHA_A)
+
+        self.assertEqual((self.home / ROLE_TARGET).read_text(), self.payload)
+        self.assertEqual(
+            (self.home / "agents" / "security-reviewer.toml").read_text(),
+            self.payload,
+        )
+
+    def test_exact_noop_does_not_consume_materialization_budget(self) -> None:
+        install(self.release, self.home, SHA_A)
+
+        with mock.patch.object(
+            MODULE,
+            "MAX_PENDING_REGULAR_MATERIALIZATION_BYTES",
+            0,
+        ):
+            install(self.release, self.home, SHA_A)
 
 
 class PrivateRegularAgentTests(unittest.TestCase):
@@ -301,29 +406,36 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                 batch.batch_root.name,
             ),
         )
-        self.assertIsNotNone(ticket)
-        assert ticket is not None
-        self.assertEqual(ticket.version, 4)
-        self.assertEqual(ticket.phase, "before")
-        self.assertEqual(ticket.marker_path, MODULE.PENDING_STATE_ROLLBACK_MARKER)
-        self.assertEqual(ticket.terminal_regular_targets, ())
+        # A failed first install has no before-state regular target, so v7 does
+        # not mint terminal cleanup authority for the rolled-back phase.
+        self.assertIsNone(ticket)
         self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
         self.assertTrue(batch.batch_root.is_dir())
         self._assert_recovered_install()
 
     def test_post_clear_cleanup_failure_is_retried_from_durable_ticket(self) -> None:
+        real_clear = MODULE._clear_pending_link_pointer
+
+        def fail_after_pointer_clear(
+            home: Path,
+            batch: MODULE.PendingLinkBatch,
+            *,
+            phase: str = "before",
+        ) -> None:
+            real_clear(home, batch, phase=phase)
+            if phase == "after":
+                raise MODULE.SyncError("injected post-clear cleanup failure")
+
         with (
             mock.patch.object(
                 MODULE,
-                "_publish_pending_commit_marker",
-                side_effect=MODULE.SyncError("injected precommit crash"),
+                "_clear_pending_link_pointer",
+                side_effect=fail_after_pointer_clear,
             ),
-            mock.patch.object(
-                MODULE,
-                "_try_cleanup_finalized_pending_batch",
-                return_value=False,
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "committed managed state but finalization failed",
             ),
-            self.assertRaisesRegex(MODULE.SyncError, "rollback was incomplete"),
         ):
             install(self.release, self.home, SHA_A)
 
@@ -445,6 +557,55 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self._assert_recovered_install()
         self.assertEqual(target.stat().st_gid, alternate_gid)
 
+    def test_live_transaction_tolerates_mode_0600_gid_churn(self) -> None:
+        install(self.release, self.home, SHA_A)
+        target = self.home / ROLE_TARGET
+        alternate_gid = next(
+            (gid for gid in os.getgroups() if gid != target.stat().st_gid),
+            None,
+        )
+        if alternate_gid is None:
+            self.skipTest("no alternate supplementary group is available")
+        next_release = self.root / "next-release"
+        write_release(next_release, role_payload='name = "reviewer"\n')
+        append_regular_link(
+            next_release,
+            target="agents/security-reviewer.toml",
+            source="personal_codex/agents/security-reviewer.toml",
+            payload='name = "security-reviewer"\n',
+        )
+        real_capture = MODULE._capture_managed_state_link_snapshots
+        captures = 0
+        churned = False
+
+        def churn_gid_after_live_baseline(
+            home: Path,
+            state: MODULE.ManagedState,
+        ) -> dict[
+            PurePosixPath,
+            MODULE.SymlinkSnapshot | MODULE.RegularFileSnapshot,
+        ]:
+            nonlocal captures, churned
+            snapshots = real_capture(home, state)
+            captures += 1
+            # install_release_tree performs an unlocked preflight first. Drift
+            # only after the locked transaction's baseline has been captured.
+            if captures == 2:
+                os.chown(target, -1, alternate_gid)
+                churned = True
+            return snapshots
+
+        with mock.patch.object(
+            MODULE,
+            "_capture_managed_state_link_snapshots",
+            side_effect=churn_gid_after_live_baseline,
+        ):
+            install(next_release, self.home, SHA_B)
+
+        self.assertTrue(churned)
+        self.assertEqual(target.read_text(encoding="utf-8"), 'name = "reviewer"\n')
+        self.assertEqual(target.stat().st_gid, alternate_gid)
+
     def test_terminal_ticket_validates_complete_regular_target_group(self) -> None:
         secondary_target = PurePosixPath("agents/security-reviewer.toml")
         secondary_source = (
@@ -499,6 +660,73 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         ticket_root = MODULE._pending_cleanup_index_path(self.home)
         self.assertEqual(len(list(ticket_root.glob("*.json"))), 1)
         self.assertEqual(len(list(ticket_root.glob("*.empty-proof"))), 1)
+
+    def test_terminal_validation_rechecks_first_target_after_later_member(self) -> None:
+        secondary_target = PurePosixPath("agents/security-reviewer.toml")
+        append_regular_link(
+            self.release,
+            target=secondary_target.as_posix(),
+            source="personal_codex/agents/security-reviewer.toml",
+            payload='name = "security-reviewer"\n',
+        )
+        first_target = self.home / ROLE_TARGET
+        real_verify = MODULE._verify_final_regular_targets
+        real_read = MODULE._read_regular_file_snapshot_beneath
+        validating_terminal_group = False
+        drifted = False
+
+        def drift_first_while_reading_later(
+            home: Path,
+            path: Path,
+            *,
+            require_managed_access: bool,
+        ) -> MODULE.RegularFileSnapshot:
+            nonlocal drifted
+            snapshot = real_read(
+                home,
+                path,
+                require_managed_access=require_managed_access,
+            )
+            if (
+                validating_terminal_group
+                and not drifted
+                and path == home / Path(*secondary_target.parts)
+            ):
+                first_target.write_text("tampered = true\n", encoding="utf-8")
+                first_target.chmod(0o600)
+                drifted = True
+            return snapshot
+
+        def verify_with_mid_pass_drift(
+            home: Path,
+            ticket: MODULE.PendingBatchCleanupTicket,
+        ) -> None:
+            nonlocal validating_terminal_group
+            validating_terminal_group = True
+            try:
+                real_verify(home, ticket)
+            finally:
+                validating_terminal_group = False
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_read_regular_file_snapshot_beneath",
+                side_effect=drift_first_while_reading_later,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_verify_final_regular_targets",
+                side_effect=verify_with_mid_pass_drift,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "committed regular-file evidence cleanup was deferred",
+            ),
+        ):
+            install(self.release, self.home, SHA_A)
+
+        self.assertTrue(drifted)
 
 
 class PendingMetadataCompatibilityTests(unittest.TestCase):
@@ -597,7 +825,12 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
             )
         )
 
-    def _retain_committed_batch(self, release: Path) -> MODULE.PendingLinkBatch:
+    def _retain_committed_batch(
+        self,
+        release: Path,
+        *,
+        sha: str = SHA_A,
+    ) -> MODULE.PendingLinkBatch:
         real_clear = MODULE._clear_pending_link_pointer
 
         def retain_committed_pointer(
@@ -621,7 +854,7 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
                 "committed managed state but finalization failed",
             ),
         ):
-            install(release, self.home, SHA_A)
+            install(release, self.home, sha)
         batch = MODULE._load_pending_link_batch(self.home)
         self.assertIsNotNone(batch)
         assert batch is not None
@@ -644,6 +877,8 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
 
         def downgrade(payload: dict[str, object]) -> None:
             payload["version"] = 5
+            payload.pop("terminal_regular_before", None)
+            payload.pop("terminal_regular_after", None)
             records = payload["records"]
             assert isinstance(records, list)
             for raw_record in records:
@@ -683,6 +918,9 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
         batch = self._retain_committed_batch(release)
 
         def add_unknown_field(payload: dict[str, object]) -> None:
+            payload["version"] = 6
+            payload.pop("terminal_regular_before", None)
+            payload.pop("terminal_regular_after", None)
             records = payload["records"]
             assert isinstance(records, list)
             record = records[-1]
@@ -692,6 +930,82 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
         self._rewrite_linked_metadata(batch, add_unknown_field)
 
         with self.assertRaisesRegex(MODULE.SyncError, "record .* is invalid"):
+            MODULE._load_pending_link_batch(self.home)
+
+    def test_v7_terminal_regular_sets_cover_all_state_targets(self) -> None:
+        initial = self.root / "initial-release"
+        write_release(initial, role_payload='name = "reviewer"\n')
+        install(initial, self.home, SHA_A)
+        next_release = self.root / "next-release"
+        write_release(next_release, role_payload='name = "reviewer"\n')
+        secondary_target = PurePosixPath("agents/security-reviewer.toml")
+        append_regular_link(
+            next_release,
+            target=secondary_target.as_posix(),
+            source="personal_codex/agents/security-reviewer.toml",
+            payload='name = "security-reviewer"\n',
+        )
+
+        batch = self._retain_committed_batch(next_release, sha=SHA_B)
+
+        metadata_path = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        self.assertEqual(metadata["version"], 7)
+        self.assertEqual(
+            [item["target"] for item in metadata["terminal_regular_before"]],
+            [ROLE_TARGET.as_posix()],
+        )
+        self.assertEqual(
+            [item["target"] for item in metadata["terminal_regular_after"]],
+            [ROLE_TARGET.as_posix(), secondary_target.as_posix()],
+        )
+        self.assertEqual(
+            tuple(item.target for item in batch.terminal_regular_before),
+            (ROLE_TARGET,),
+        )
+        self.assertEqual(
+            tuple(item.target for item in batch.terminal_regular_after),
+            (ROLE_TARGET, secondary_target),
+        )
+        acted_regular_targets = {
+            record.target
+            for record in batch.records
+            if record.is_regular()
+            and record.action in {"create", "replace", "quarantine-replace"}
+        }
+        self.assertNotIn(ROLE_TARGET, acted_regular_targets)
+        self.assertIn(secondary_target, acted_regular_targets)
+
+    def test_v6_metadata_rejects_uncovered_regular_state_target(self) -> None:
+        initial = self.root / "initial-release"
+        write_release(initial, role_payload='name = "reviewer"\n')
+        install(initial, self.home, SHA_A)
+        next_release = self.root / "next-release"
+        write_release(next_release, role_payload='name = "reviewer"\n')
+        append_regular_link(
+            next_release,
+            target="agents/security-reviewer.toml",
+            source="personal_codex/agents/security-reviewer.toml",
+            payload='name = "security-reviewer"\n',
+        )
+        batch = self._retain_committed_batch(next_release, sha=SHA_B)
+
+        def downgrade_without_state_regular_coverage(
+            payload: dict[str, object],
+        ) -> None:
+            payload["version"] = 6
+            payload.pop("terminal_regular_before")
+            payload.pop("terminal_regular_after")
+
+        self._rewrite_linked_metadata(
+            batch,
+            downgrade_without_state_regular_coverage,
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "regular.*(cover|action|state|authority)|v6.*regular",
+        ):
             MODULE._load_pending_link_batch(self.home)
 
 

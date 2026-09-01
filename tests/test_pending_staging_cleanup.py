@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -75,6 +77,156 @@ class PendingStagingCleanupTests(unittest.TestCase):
         self.assertIsNotNone(ticket)
         assert ticket is not None
         return ticket
+
+    def _legacy_cleanup_ticket_payload(
+        self,
+        batch_root: Path,
+        *,
+        version: int,
+    ) -> bytes:
+        self.assertIn(version, {1, 2, 3, 4})
+        marker_path = {
+            1: MODULE.PENDING_STATE_COMMIT_MARKER,
+            2: MODULE.PENDING_STATE_ROLLBACK_MARKER,
+            3: MODULE.PENDING_STATE_STAGING_MARKER,
+            4: MODULE.PENDING_STATE_COMMIT_MARKER,
+        }[version]
+        marker_parent = batch_root / Path(*marker_path.parent.parts)
+        marker_parent.mkdir(parents=True, exist_ok=True)
+        marker = MODULE._write_exclusive_internal_file(
+            self.home,
+            marker_parent / marker_path.name,
+            b"legacy cleanup marker\n",
+        )
+        self.assertIsNotNone(marker.parent_identity)
+        self.assertIsNotNone(marker.file_identity)
+        assert marker.parent_identity is not None
+        assert marker.file_identity is not None
+        batch_identity = (batch_root.stat().st_dev, batch_root.stat().st_ino)
+        digest = hashlib.sha256(marker.payload or b"").hexdigest()
+        if version == 1:
+            return MODULE._pending_cleanup_ticket_payload(
+                batch_root,
+                batch_identity,
+                marker.parent_identity,
+                marker.file_identity,
+                0o600,
+                digest,
+            )
+        payload: dict[str, object] = {
+            "version": version,
+            "batch": batch_root.name,
+            "batch_root_identity": MODULE._identity_payload(batch_identity),
+            "finalization_marker": {
+                "phase": {2: "before", 3: "staging", 4: "after"}[version],
+                "path": marker_path.as_posix(),
+                "parent_identity": MODULE._identity_payload(marker.parent_identity),
+                "file_identity": MODULE._identity_payload(marker.file_identity),
+                "mode": 0o600,
+                "sha256": digest,
+            },
+        }
+        if version == 4:
+            payload["terminal_regular_targets"] = []
+        return MODULE._bounded_json_document(
+            payload,
+            max_bytes=MODULE.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+            overflow_error="pending cleanup ticket exceeds the size limit",
+        )
+
+    def _publish_legacy_cleanup_ticket(
+        self,
+        *,
+        version: int,
+    ) -> MODULE.PendingBatchCleanupTicket:
+        batch_root = MODULE._quarantine_batch_root(self.home, [])
+        payload = self._legacy_cleanup_ticket_payload(batch_root, version=version)
+        index_fd = MODULE._open_or_create_directory_beneath(
+            self.home,
+            MODULE._pending_cleanup_index_path(self.home),
+            mode=0o700,
+        )
+        MODULE._close_fd_quietly(index_fd)
+        ticket_path = MODULE._pending_cleanup_ticket_path(
+            self.home,
+            batch_root.name,
+        )
+        MODULE._publish_pending_cleanup_ticket(self.home, ticket_path, payload)
+        ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket_path)
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertEqual(ticket.version, version)
+        return ticket
+
+    def _stage_legacy_symlink_pointer(self, metadata_version: int):
+        legacy_home = self.root / f"legacy-home-v{metadata_version}"
+        first_release = self.root / f"legacy-first-v{metadata_version}"
+        next_release = self.root / f"legacy-next-v{metadata_version}"
+        write_release(first_release)
+        write_release(next_release)
+        install(first_release, legacy_home, SHA_A)
+        with (
+            mock.patch.object(
+                MODULE,
+                "_retire_pending_staging_cleanup_authority",
+                side_effect=MODULE.SyncError("injected active pointer retention"),
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "rollback was incomplete"),
+        ):
+            install(next_release, legacy_home, SHA_B)
+
+        batch = MODULE._load_pending_link_batch(legacy_home)
+        self.assertIsNotNone(batch)
+        assert batch is not None
+        MODULE._clear_pending_link_pointer(legacy_home, batch, phase="before")
+        metadata_path = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        data = json.loads(metadata_path.read_text(encoding="utf-8"))
+        data["version"] = metadata_version
+        data.pop("terminal_regular_before", None)
+        data.pop("terminal_regular_after", None)
+        if metadata_version < 6:
+            for record in data["records"]:
+                for field in (
+                    "materialization",
+                    "regular_sha256",
+                    "regular_size",
+                    "regular_mode",
+                    "regular_uid",
+                    "regular_gid",
+                    "regular_link_count",
+                ):
+                    record.pop(field)
+                for field in (
+                    "regular_sha256",
+                    "regular_size",
+                    "regular_mode",
+                    "regular_uid",
+                    "regular_gid",
+                    "regular_link_count",
+                ):
+                    record["planned_before"].pop(field)
+        metadata_path.write_bytes(
+            MODULE._bounded_json_document(
+                data,
+                max_bytes=MODULE.MAX_MANAGED_STATE_BYTES,
+                overflow_error="pending link transaction metadata exceeds the size limit",
+            )
+        )
+        os.link(
+            metadata_path,
+            MODULE._pending_link_pointer_path(legacy_home),
+            follow_symlinks=False,
+        )
+        restored_batch = MODULE._load_pending_link_batch(legacy_home)
+        self.assertIsNotNone(restored_batch)
+        assert restored_batch is not None
+        ticket_path = MODULE._pending_cleanup_ticket_path(
+            legacy_home,
+            restored_batch.batch_root.name,
+        )
+        ticket_path.unlink()
+        ticket_path.parent.rmdir()
+        return legacy_home, restored_batch
 
     def test_staging_failure_immediately_removes_live_preimage_hardlink(self) -> None:
         with (
@@ -465,6 +617,195 @@ class PendingStagingCleanupTests(unittest.TestCase):
         self.assertFalse(retained[0].exists())
         self.assertFalse(os.path.lexists(temp_path))
 
+    def test_legacy_active_pointer_without_cleanup_directory_recovers_only_before_v6(
+        self,
+    ) -> None:
+        for metadata_version in (4, 5, 6):
+            with self.subTest(metadata_version=metadata_version):
+                legacy_home, batch = self._stage_legacy_symlink_pointer(
+                    metadata_version
+                )
+                state, state_snapshot = MODULE._load_managed_state_with_snapshot(
+                    legacy_home
+                )
+                if metadata_version < 6:
+                    recovered, _snapshot, did_recover = (
+                        MODULE._recover_pending_link_transaction(
+                            legacy_home,
+                            state,
+                            state_snapshot,
+                            dry_run=False,
+                        )
+                    )
+                    self.assertTrue(did_recover)
+                    self.assertEqual(recovered, state)
+                    self.assertFalse(
+                        os.path.lexists(MODULE._pending_link_pointer_path(legacy_home))
+                    )
+                else:
+                    with self.assertRaises((MODULE.SyncError, OSError)):
+                        MODULE._recover_pending_link_transaction(
+                            legacy_home,
+                            state,
+                            state_snapshot,
+                            dry_run=False,
+                        )
+                    self.assertTrue(
+                        MODULE._pending_link_pointer_path(legacy_home).is_file()
+                    )
+                self.assertTrue(batch.batch_root.is_dir())
+
+    def test_rmdir_to_ticket_delete_crash_without_proof_only_recovers_legacy_tickets(
+        self,
+    ) -> None:
+        for version in (1, 2, 3, 4):
+            with self.subTest(ticket_version=version):
+                case_home = self.root / f"empty-proof-home-v{version}"
+                case_home.mkdir()
+                original_home = self.home
+                self.home = case_home
+                try:
+                    ticket = self._publish_legacy_cleanup_ticket(version=version)
+                    proof_path = MODULE._pending_cleanup_empty_proof_path(
+                        self.home,
+                        ticket.batch_root.name,
+                    )
+
+                    def crash_after_rmdir(
+                        _home: Path,
+                        _ticket: MODULE.PendingBatchCleanupTicket,
+                    ) -> None:
+                        self.assertTrue(proof_path.is_file())
+                        proof_path.unlink()
+                        raise SystemExit("injected rmdir-to-ticket-delete crash")
+
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_delete_pending_cleanup_ticket",
+                            side_effect=crash_after_rmdir,
+                        ),
+                        self.assertRaisesRegex(SystemExit, "ticket-delete crash"),
+                    ):
+                        MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+                    self.assertFalse(ticket.batch_root.exists())
+                    self.assertFalse(proof_path.exists())
+                    self.assertTrue(ticket.path.is_file())
+                    if version < 3:
+                        self.assertEqual(
+                            MODULE._cleanup_ready_pending_batches(self.home),
+                            1,
+                        )
+                        self.assertFalse(ticket.path.exists())
+                    elif version == 3:
+                        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                            self.assertEqual(
+                                MODULE._cleanup_ready_pending_batches(self.home),
+                                0,
+                            )
+                        self.assertIn("missing without an exact empty proof", stdout.getvalue())
+                        self.assertTrue(ticket.path.is_file())
+                    else:
+                        with self.assertRaises(MODULE.SyncError):
+                            MODULE._cleanup_ready_pending_batches(self.home)
+                        self.assertTrue(ticket.path.is_file())
+                finally:
+                    self.home = original_home
+
+    def test_partial_canonical_cleanup_authority_is_never_overwritten(self) -> None:
+        for version, label in ((2, "rollback"), (3, "staging")):
+            with self.subTest(label=label):
+                case_home = self.root / f"partial-ticket-home-{label}"
+                case_home.mkdir()
+                original_home = self.home
+                self.home = case_home
+                try:
+                    batch_root = MODULE._quarantine_batch_root(self.home, [])
+                    payload = self._legacy_cleanup_ticket_payload(
+                        batch_root,
+                        version=version,
+                    )
+                    ticket_path = MODULE._pending_cleanup_ticket_path(
+                        self.home,
+                        batch_root.name,
+                    )
+                    ticket_path.parent.mkdir(parents=True, exist_ok=True)
+                    partial = payload[: max(1, len(payload) // 2)]
+                    ticket_path.write_bytes(partial)
+                    ticket_path.chmod(0o600)
+
+                    with self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "appeared with changed content",
+                    ):
+                        MODULE._publish_pending_cleanup_ticket(
+                            self.home,
+                            ticket_path,
+                            payload,
+                        )
+                    self.assertEqual(ticket_path.read_bytes(), partial)
+                finally:
+                    self.home = original_home
+
+        ticket = self._publish_legacy_cleanup_ticket(version=3)
+        quarantine_root = MODULE._personal_sync_root(self.home) / MODULE.QUARANTINE_RELATIVE_PATH
+        proof_path = MODULE._pending_cleanup_empty_proof_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        proof_path.write_bytes(b"{\n")
+        proof_path.chmod(0o600)
+        with self.assertRaisesRegex(MODULE.SyncError, "empty proof changed"):
+            MODULE._publish_pending_cleanup_empty_proof(
+                self.home,
+                ticket,
+                (quarantine_root.stat().st_dev, quarantine_root.stat().st_ino),
+            )
+        self.assertEqual(proof_path.read_bytes(), b"{\n")
+
+    def test_ticket_temp_publisher_recovers_truncated_rollback_and_staging_temps(
+        self,
+    ) -> None:
+        for version, label in ((2, "rollback"), (3, "staging")):
+            with self.subTest(label=label):
+                case_home = self.root / f"temp-ticket-home-{label}"
+                case_home.mkdir()
+                original_home = self.home
+                self.home = case_home
+                try:
+                    batch_root = MODULE._quarantine_batch_root(self.home, [])
+                    payload = self._legacy_cleanup_ticket_payload(
+                        batch_root,
+                        version=version,
+                    )
+                    index_fd = MODULE._open_or_create_directory_beneath(
+                        self.home,
+                        MODULE._pending_cleanup_index_path(self.home),
+                        mode=0o700,
+                    )
+                    MODULE._close_fd_quietly(index_fd)
+                    ticket_path = MODULE._pending_cleanup_ticket_path(
+                        self.home,
+                        batch_root.name,
+                    )
+                    temp_path = ticket_path.with_name(
+                        batch_root.name + MODULE.PENDING_CLEANUP_TICKET_TEMP_SUFFIX
+                    )
+                    temp_path.write_bytes(payload[:1])
+                    temp_path.chmod(0o600)
+
+                    MODULE._publish_pending_cleanup_ticket(
+                        self.home,
+                        ticket_path,
+                        payload,
+                    )
+
+                    self.assertEqual(ticket_path.read_bytes(), payload)
+                    self.assertFalse(temp_path.exists())
+                finally:
+                    self.home = original_home
+
     def test_retained_ticket_temp_cleanup_is_bounded_per_run(self) -> None:
         index_root = MODULE._pending_cleanup_index_path(self.home)
         index_fd = MODULE._open_or_create_directory_beneath(
@@ -735,6 +1076,291 @@ class PendingStagingCleanupTests(unittest.TestCase):
             MODULE._restore_pending_cleanup_control_tombstones(self.home, limit=1)
 
         self.assertTrue(all(path.is_file() for path in retained_paths))
+
+    def test_top_level_install_reuses_one_cleanup_budget_across_passes(
+        self,
+    ) -> None:
+        release_expectation = MODULE._source_release_identity(
+            self.next_release,
+            None,
+        )
+        release = mock.Mock(
+            release_root=self.next_release,
+            release_expectation=release_expectation,
+        )
+        release.assets.sha = SHA_B
+        workspace = mock.Mock()
+        workspace.path = self.root / "download-workspace"
+        seen_budgets: list[MODULE.PendingCleanupActionBudget] = []
+        phases: list[str] = []
+
+        def preflight(
+            _home: Path,
+            *,
+            dry_run: bool,
+            cleanup_budget: MODULE.PendingCleanupActionBudget,
+        ) -> bool:
+            self.assertFalse(dry_run)
+            phases.append("preflight")
+            seen_budgets.append(cleanup_budget)
+            cleanup_budget.consume_control_actions(2)
+            return False
+
+        def install_set(
+            _home: Path,
+            _releases,
+            *,
+            dry_run: bool,
+            preflight_only: bool = False,
+            cleanup_budget: MODULE.PendingCleanupActionBudget,
+            **_kwargs,
+        ) -> None:
+            phases.append(
+                "dry preflight" if dry_run and preflight_only else "locked install"
+            )
+            seen_budgets.append(cleanup_budget)
+            cleanup_budget.consume_control_actions(2)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "temporary_archive_workspace",
+                return_value=contextlib.nullcontext(workspace),
+            ),
+            mock.patch.object(
+                MODULE,
+                "download_and_extract_release",
+                return_value=release,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_preflight_pending_recovery",
+                side_effect=preflight,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_install_release_set_unlocked",
+                side_effect=install_set,
+            ),
+            mock.patch.object(
+                MODULE,
+                "installation_lock",
+                return_value=contextlib.nullcontext(),
+            ),
+        ):
+            MODULE.install_from_github("Joey-Tools/example", self.home, dry_run=False)
+
+        self.assertEqual(
+            phases,
+            ["preflight", "preflight", "dry preflight", "locked install"],
+        )
+        self.assertTrue(all(budget is seen_budgets[0] for budget in seen_budgets))
+        self.assertEqual(
+            seen_budgets[0].limit,
+            MODULE.MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+        )
+        self.assertEqual(
+            seen_budgets[0].consumed,
+            MODULE.MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+        )
+        self.assertEqual(seen_budgets[0].remaining, 0)
+
+    def test_shared_cleanup_helper_reports_zero_delta_after_budget_is_spent(
+        self,
+    ) -> None:
+        index_root = MODULE._pending_cleanup_index_path(self.home)
+        index_fd = MODULE._open_or_create_directory_beneath(
+            self.home,
+            index_root,
+            mode=0o700,
+        )
+        MODULE._close_fd_quietly(index_fd)
+        for index in range(MODULE.MAX_PENDING_CLEANUP_BATCHES_PER_RUN):
+            batch_name = f"20260901T000000Z-6-{index}"
+            retained = index_root / (
+                f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}{batch_name}"
+                f"{MODULE.PENDING_CLEANUP_TICKET_TEMP_SUFFIX}-123-"
+                f"{index:016x}"
+            )
+            retained.write_bytes(b"temporary\n")
+            retained.chmod(0o600)
+
+        budget = MODULE.PendingCleanupActionBudget(
+            MODULE.MAX_PENDING_CLEANUP_BATCHES_PER_RUN
+        )
+        self.assertEqual(
+            MODULE._cleanup_ready_pending_batches(self.home, budget=budget),
+            MODULE.MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+        )
+        self.assertEqual(budget.remaining, 0)
+        self.assertEqual(
+            MODULE._cleanup_ready_pending_batches(self.home, budget=budget),
+            0,
+        )
+
+    def test_exhausted_budget_blocks_v3_v4_authority_before_new_mutation(
+        self,
+    ) -> None:
+        release_expectation = MODULE._source_release_identity(
+            self.next_release,
+            None,
+        )
+        manifest = release_expectation[0][1]
+        releases = [(self.next_release, SHA_B, manifest, release_expectation)]
+
+        for version in (3, 4):
+            with self.subTest(ticket_version=version):
+                case_home = self.root / f"terminal-authority-home-v{version}"
+                write_release(case_home / "first-release", role_payload='name = "first"\n')
+                install(case_home / "first-release", case_home, SHA_A)
+                case_target = case_home / ROLE_TARGET
+                case_state_path = MODULE._state_path(case_home)
+                target_before = case_target.read_bytes()
+                state_before = case_state_path.read_bytes()
+                original_home = self.home
+                self.home = case_home
+                try:
+                    if version == 3:
+                        batch_root = MODULE._quarantine_batch_root(self.home, [])
+                        batch_identity = (
+                            batch_root.stat().st_dev,
+                            batch_root.stat().st_ino,
+                        )
+                        marker_path = batch_root / Path(
+                            *MODULE.PENDING_STATE_STAGING_MARKER.parts
+                        )
+                        marker_path.parent.mkdir(parents=True, exist_ok=True)
+                        marker = MODULE._write_exclusive_internal_file(
+                            self.home,
+                            marker_path,
+                            MODULE._pending_staging_marker_payload(
+                                batch_root,
+                                batch_identity,
+                            ),
+                        )
+                        ticket_path = MODULE._pending_cleanup_ticket_path(
+                            self.home,
+                            batch_root.name,
+                        )
+                        index_fd = MODULE._open_or_create_directory_beneath(
+                            self.home,
+                            ticket_path.parent,
+                            mode=0o700,
+                        )
+                        MODULE._close_fd_quietly(index_fd)
+                        MODULE._publish_pending_cleanup_ticket(
+                            self.home,
+                            ticket_path,
+                            MODULE._pending_staging_cleanup_ticket_payload(
+                                batch_root,
+                                batch_identity,
+                                marker,
+                            ),
+                        )
+                        ticket = MODULE._read_pending_cleanup_ticket(
+                            self.home,
+                            ticket_path,
+                        )
+                        self.assertIsNotNone(ticket)
+                        assert ticket is not None
+                    else:
+                        ticket = self._publish_legacy_cleanup_ticket(version=version)
+                    budget = MODULE.PendingCleanupActionBudget(
+                        MODULE.MAX_PENDING_CLEANUP_BATCHES_PER_RUN
+                    )
+                    budget.consume_control_actions(budget.limit)
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_cleanup_ready_pending_batches",
+                            return_value=0,
+                        ) as cleanup,
+                        mock.patch.object(
+                            MODULE,
+                            "_stage_release_tree_for_install",
+                        ) as stage,
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            rf"ticket v{version}",
+                        ),
+                    ):
+                        MODULE._install_release_set_unlocked(
+                            case_home,
+                            releases,
+                            dry_run=False,
+                            allow_cross_owner=False,
+                            cleanup_budget=budget,
+                        )
+
+                    cleanup.assert_called_once_with(case_home, budget=budget)
+                    stage.assert_not_called()
+                    self.assertTrue(ticket.path.is_file())
+                    self.assertEqual(case_target.read_bytes(), target_before)
+                    self.assertEqual(case_state_path.read_bytes(), state_before)
+                finally:
+                    self.home = original_home
+
+    def test_truncated_staging_marker_publish_temp_recovers_and_cleans_batch(
+        self,
+    ) -> None:
+        batch_root = MODULE._quarantine_batch_root(self.home, [])
+        for relative_path in (
+            Path("pending/before"),
+            Path("pending/stage"),
+            Path("pending/evidence"),
+            Path("pending/state"),
+            Path("pending/claims/before"),
+            Path("pending/claims/after"),
+        ):
+            directory_fd = MODULE._open_or_create_directory_beneath(
+                self.home,
+                batch_root / relative_path,
+                mode=0o700,
+            )
+            MODULE._close_fd_quietly(directory_fd)
+        marker_path = batch_root / Path(*MODULE.PENDING_STATE_STAGING_MARKER.parts)
+        temp_path = marker_path.with_name(
+            marker_path.name + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+        )
+        temp_path.write_bytes(b"{\n")
+        temp_path.chmod(0o600)
+        batch_identity = (batch_root.stat().st_dev, batch_root.stat().st_ino)
+        expected_marker = MODULE._pending_staging_marker_payload(
+            batch_root,
+            batch_identity,
+        )
+        ticket_path = MODULE._pending_cleanup_ticket_path(
+            self.home,
+            batch_root.name,
+        )
+        real_publish = MODULE._publish_pending_batch_cleanup_ticket_for_root
+
+        def publish_ticket(home: Path, root: Path, payload: bytes) -> None:
+            self.assertEqual(root, batch_root)
+            self.assertEqual(marker_path.read_bytes(), expected_marker)
+            real_publish(home, root, payload)
+            self.assertTrue(ticket_path.is_file())
+
+        with mock.patch.object(
+            MODULE,
+            "_publish_pending_batch_cleanup_ticket_for_root",
+            side_effect=publish_ticket,
+        ):
+            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+
+        self.assertFalse(temp_path.exists())
+        self.assertFalse(marker_path.exists())
+        self.assertFalse(ticket_path.exists())
+        self.assertFalse(batch_root.exists())
+
+    def test_v1_v2_cleanup_backlog_does_not_block_terminal_authority_gate(
+        self,
+    ) -> None:
+        for version in (1, 2):
+            with self.subTest(ticket_version=version):
+                ticket = self._publish_legacy_cleanup_ticket(version=version)
+                MODULE._require_no_pending_terminal_mutation_authority(self.home)
+                self.assertTrue(ticket.path.is_file())
 
 
 if __name__ == "__main__":

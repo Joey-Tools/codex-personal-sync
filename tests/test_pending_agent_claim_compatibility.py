@@ -132,27 +132,31 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
         metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
         payload = json.loads(metadata.read_text(encoding="utf-8"))
         payload["version"] = version
-        for raw_record in payload["records"]:
-            for field in (
-                "materialization",
-                "regular_sha256",
-                "regular_size",
-                "regular_mode",
-                "regular_uid",
-                "regular_gid",
-                "regular_link_count",
-            ):
-                raw_record.pop(field)
-            planned = raw_record["planned_before"]
-            for field in (
-                "regular_sha256",
-                "regular_size",
-                "regular_mode",
-                "regular_uid",
-                "regular_gid",
-                "regular_link_count",
-            ):
-                planned.pop(field)
+        if version < 7:
+            payload.pop("terminal_regular_before")
+            payload.pop("terminal_regular_after")
+        if version < 6:
+            for raw_record in payload["records"]:
+                for field in (
+                    "materialization",
+                    "regular_sha256",
+                    "regular_size",
+                    "regular_mode",
+                    "regular_uid",
+                    "regular_gid",
+                    "regular_link_count",
+                ):
+                    raw_record.pop(field)
+                planned = raw_record["planned_before"]
+                for field in (
+                    "regular_sha256",
+                    "regular_size",
+                    "regular_mode",
+                    "regular_uid",
+                    "regular_gid",
+                    "regular_link_count",
+                ):
+                    planned.pop(field)
         metadata.write_text(json.dumps(payload) + "\n", encoding="utf-8")
 
     def test_v4_v5_agent_symlink_claims_parse_and_recover(self) -> None:
@@ -212,6 +216,7 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
             committed=True,
             legacy_symlink=False,
         )
+        self._downgrade_metadata(batch, 6)
 
         parsed = MODULE._load_pending_link_batch(home)
         self.assertIsNotNone(parsed)
