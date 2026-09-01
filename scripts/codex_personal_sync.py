@@ -14257,6 +14257,12 @@ def _delete_pending_regular_publication_beneath(
         "quarantine-replace",
     }:
         raise SyncError("pending regular publication cleanup has an invalid record")
+    if batch.metadata_version < 8:
+        # Metadata v6/v7 predates the durable publication receipt. Preserve its
+        # exact deletion protocol instead of routing legacy recovery through a
+        # receipt path that those closed metadata versions cannot name.
+        _delete_exact_regular_publication_beneath(home, target, expected)
+        return
     existing = _read_pending_regular_publication_cleanup(home, batch, record, phase)
     if existing is not None:
         raise SyncError("pending regular publication cleanup journal already exists")
@@ -14274,7 +14280,7 @@ def _delete_pending_regular_publication_beneath(
             planned,
         )
         journal_path = _pending_regular_publication_cleanup_path(batch, record, phase)
-        _write_exclusive_internal_file(
+        _publish_atomic_exclusive_internal_file(
             home,
             journal_path,
             _pending_regular_publication_cleanup_payload(
@@ -14319,17 +14325,160 @@ def _delete_pending_regular_publication_beneath(
         _close_fd_quietly(parent_fd)
 
 
+def _recover_legacy_pending_regular_publication_active_entry(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+) -> None:
+    if batch.metadata_version not in {6, 7}:
+        return
+    parent_identity = record.planned_snapshot.parent_identity
+    planned_regular = _regular_snapshot_from_reconcile(record.planned_snapshot)
+    if phase == "produced":
+        file_identity = record.evidence_identity
+        evidence_path = record.evidence
+        other_alias_paths = (record.stage,)
+    elif phase == "before":
+        file_identity = record.before_evidence_identity
+        evidence_path = record.before_evidence
+        other_alias_paths = (record.backup,)
+    else:
+        raise SyncError("pending legacy regular publication phase is invalid")
+    if (
+        parent_identity is None
+        or file_identity is None
+        or evidence_path is None
+        or (phase == "produced" and record.regular_link_count is None)
+        or (phase == "before" and planned_regular is None)
+    ):
+        raise SyncError("pending legacy regular publication evidence is incomplete")
+    target = home / Path(*record.target.parts)
+    parent_fd = _open_directory_beneath(home, target.parent)
+    try:
+        if (
+            _directory_identity(parent_fd) != parent_identity
+            or not _bound_directory_matches(home, target.parent, parent_fd)
+        ):
+            raise SyncError("pending legacy regular publication parent changed")
+        planned = (
+            file_identity[0],
+            file_identity[1],
+            stat.S_IFREG,
+        )
+        candidates: list[str] = []
+        with os.scandir(parent_fd) as entries:
+            for scanned, entry in enumerate(entries, start=1):
+                if scanned > MAX_PENDING_CLEANUP_CONTROL_ENTRIES:
+                    raise SyncError(
+                        "pending legacy regular publication parent exceeds the "
+                        "active-entry scan limit"
+                    )
+                if (
+                    _pending_cleanup_internal_entry_plan(
+                        entry.name,
+                        PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                        parent_identity,
+                    )
+                    == planned
+                ):
+                    candidates.append(entry.name)
+        if not _bound_directory_matches(home, target.parent, parent_fd):
+            raise SyncError("pending legacy regular publication parent changed")
+        if not candidates:
+            return
+        target_identity = _named_entry_identity(parent_fd, target.name)
+        if len(candidates) != 1 or target_identity == file_identity:
+            raise SyncError("pending legacy regular publication cleanup is ambiguous")
+        evidence = batch.batch_root / Path(*evidence_path.parts)
+        evidence_snapshot = _read_regular_file_snapshot_beneath(
+            home,
+            evidence,
+            require_managed_access=False,
+        )
+        if phase == "produced":
+            evidence_matches = (
+                evidence_snapshot.file_identity == record.evidence_identity
+                and evidence_snapshot.sha256 == record.regular_sha256
+                and evidence_snapshot.size == record.regular_size
+                and evidence_snapshot.mode == record.regular_mode
+                and evidence_snapshot.uid == record.regular_uid
+            )
+        else:
+            assert planned_regular is not None
+            evidence_matches = _regular_snapshot_leaf_matches(
+                evidence_snapshot,
+                planned_regular,
+                protect_gid=bool(planned_regular.mode & 0o070),
+            )
+        if evidence_snapshot.file_identity != file_identity or not evidence_matches:
+            raise SyncError("pending legacy regular publication evidence changed")
+        bound_alias_count = 1
+        for relative_alias in other_alias_paths:
+            if relative_alias is None:
+                continue
+            alias = batch.batch_root / Path(*relative_alias.parts)
+            if _regular_alias_identity_beneath(home, alias) == file_identity:
+                bound_alias_count += 1
+        if phase == "produced" and bound_alias_count != record.regular_link_count:
+            raise SyncError("pending legacy regular publication aliases changed")
+        expected_link_count = bound_alias_count + 1
+        if evidence_snapshot.link_count != expected_link_count:
+            raise SyncError("pending legacy regular publication link count changed")
+        active_name = candidates[0]
+        active = _regular_file_snapshot_at(
+            parent_fd,
+            active_name,
+            target.with_name(active_name),
+            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+        )
+        if phase == "produced":
+            matches = _pending_regular_publication_snapshot_matches(
+                active,
+                record,
+                expected_link_count=expected_link_count,
+            )
+        else:
+            assert planned_regular is not None
+            matches = _regular_snapshot_matches(
+                active,
+                parent_identity,
+                planned_regular,
+                expected_link_count=expected_link_count,
+                protect_gid=bool(planned_regular.mode & 0o070),
+            )
+        if not matches:
+            raise SyncError("pending legacy regular publication active entry changed")
+        os.unlink(active_name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        if (
+            _named_entry_identity(parent_fd, active_name) is not None
+            or not _bound_directory_matches(home, target.parent, parent_fd)
+        ):
+            raise SyncError("pending legacy regular publication active entry reappeared")
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
 def _recover_pending_regular_publication_cleanup(
     home: Path,
     batch: PendingLinkBatch,
     record: PendingLinkRecord,
     phase: str,
 ) -> None:
-    if batch.metadata_version < 8 or not record.is_regular() or record.action not in {
+    if not record.is_regular() or record.action not in {
         "create",
         "replace",
         "quarantine-replace",
     }:
+        return
+    if batch.metadata_version < 8:
+        _recover_legacy_pending_regular_publication_active_entry(
+            home,
+            batch,
+            record,
+            phase,
+        )
         return
     journal = _read_pending_regular_publication_cleanup(home, batch, record, phase)
     if journal is None:
@@ -20408,7 +20557,17 @@ def _pending_batch_cleanup_name_is_authorized(
     }:
         return re.fullmatch(r"[0-9]{8}", name) is not None
     if relative_parent == ("pending", "cleanup"):
-        return re.fullmatch(r"[0-9]{8}(?:\.before)?\.json", name) is not None
+        canonical = re.fullmatch(
+            r"[0-9]{8}(?:\.before)?\.json(?:\.publish-tmp)?",
+            name,
+        )
+        if canonical is not None:
+            return True
+        retained_canonical = _pending_cleanup_retained_canonical_name(name)
+        return retained_canonical is not None and re.fullmatch(
+            r"[0-9]{8}(?:\.before)?\.json(?:\.publish-tmp)?",
+            retained_canonical,
+        ) is not None
     if relative_parent == ("pending", "state"):
         canonical_names = {
             PENDING_STATE_BEFORE_EVIDENCE.name,

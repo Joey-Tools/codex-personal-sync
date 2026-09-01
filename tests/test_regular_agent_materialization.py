@@ -630,6 +630,84 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         )
         return record, active
 
+    def _interrupt_uncommitted_regular_publication(
+        self,
+        release: Path,
+        sha: str,
+    ) -> MODULE.PendingLinkBatch:
+        with (
+            mock.patch.object(
+                MODULE,
+                "_publish_pending_commit_marker",
+                side_effect=MODULE.SyncError("injected precommit crash"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_rollback_reconcile_transaction",
+                side_effect=MODULE.SyncError("injected hard rollback crash"),
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "rollback was incomplete"),
+        ):
+            install(release, self.home, sha)
+
+        batch = MODULE._load_pending_link_batch(self.home)
+        self.assertIsNotNone(batch)
+        assert batch is not None
+        return batch
+
+    def _downgrade_pending_regular_metadata(
+        self,
+        batch: MODULE.PendingLinkBatch,
+        version: int,
+    ) -> MODULE.PendingLinkBatch:
+        metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        payload = json.loads(metadata.read_text(encoding="utf-8"))
+        payload["version"] = version
+        if version == 6:
+            payload.pop("terminal_regular_before")
+            payload.pop("terminal_regular_after")
+        records = payload["records"]
+        assert isinstance(records, list)
+        for raw_record in records:
+            assert isinstance(raw_record, dict)
+            raw_record.pop("publication_cleanup")
+        metadata.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        parsed = MODULE._load_pending_link_batch(self.home)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.metadata_version, version)
+        return parsed
+
+    def _isolate_legacy_regular_publication(
+        self,
+        batch: MODULE.PendingLinkBatch,
+        record: MODULE.PendingLinkRecord,
+        target: Path,
+    ) -> Path:
+        parent_fd = MODULE._open_directory_beneath(self.home, target.parent)
+        try:
+            parent_identity = MODULE._directory_identity(parent_fd)
+            metadata = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+            planned = MODULE._pending_cleanup_entry_plan(metadata)
+            active_name = MODULE._pending_cleanup_entry_name(
+                MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                parent_identity,
+                planned,
+            )
+            MODULE._rename_noreplace_at(
+                parent_fd,
+                target.name,
+                parent_fd,
+                active_name,
+            )
+            os.fsync(parent_fd)
+        finally:
+            MODULE._close_fd_quietly(parent_fd)
+        active = target.with_name(active_name)
+        self.assertFalse(os.path.lexists(target))
+        self.assertTrue(active.is_file())
+        return active
+
     def test_create_rollback_recovers_durable_active_publication_cleanup(self) -> None:
         batch = self._interrupt_regular_publication_cleanup(self.release, SHA_A)
         _record, active = self._assert_active_publication_journal(batch)
@@ -804,6 +882,280 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self.assertEqual(active.read_text(encoding="utf-8"), "foreign = true\n")
         self.assertTrue(MODULE._pending_link_pointer_path(self.home).is_file())
         self.assertTrue(batch.batch_root.is_dir())
+
+    def test_v6_v7_uncommitted_create_and_replace_recover_without_v8_receipts(
+        self,
+    ) -> None:
+        for version in (6, 7):
+            for action in ("create", "replace"):
+                with self.subTest(version=version, action=action):
+                    self.home = self.root / f"home-v{version}-{action}"
+                    release = self.release
+                    sha = SHA_A
+                    old_identity: tuple[int, int] | None = None
+                    if action == "replace":
+                        install(self.release, self.home, SHA_A)
+                        target = self.home / ROLE_TARGET
+                        old_identity = (target.stat().st_dev, target.stat().st_ino)
+                        release = self.root / f"release-v{version}-{action}"
+                        write_release(release, role_payload='name = "updated"\n')
+                        sha = SHA_B
+
+                    batch = self._interrupt_uncommitted_regular_publication(
+                        release,
+                        sha,
+                    )
+                    parsed = self._downgrade_pending_regular_metadata(batch, version)
+                    record = next(
+                        candidate
+                        for candidate in parsed.records
+                        if candidate.is_regular()
+                    )
+                    self.assertEqual(record.action, action)
+
+                    install(self.release, self.home, SHA_A)
+
+                    target = self.home / ROLE_TARGET
+                    self.assertEqual(
+                        target.read_text(encoding="utf-8"),
+                        'name = "reviewer"\n',
+                    )
+                    self.assertEqual(target.stat().st_nlink, 1)
+                    if old_identity is not None:
+                        self.assertEqual(
+                            (target.stat().st_dev, target.stat().st_ino),
+                            old_identity,
+                        )
+                    self.assertFalse(
+                        os.path.lexists(MODULE._pending_link_pointer_path(self.home))
+                    )
+
+    def test_v6_v7_produced_active_alias_residue_recovers_exact_inode(self) -> None:
+        for version in (6, 7):
+            with self.subTest(version=version):
+                self.home = self.root / f"home-v{version}-active-residue"
+                batch = self._interrupt_uncommitted_regular_publication(
+                    self.release,
+                    SHA_A,
+                )
+                parsed = self._downgrade_pending_regular_metadata(batch, version)
+                record = next(
+                    candidate for candidate in parsed.records if candidate.is_regular()
+                )
+                target = self.home / Path(*record.target.parts)
+                active = self._isolate_legacy_regular_publication(
+                    parsed,
+                    record,
+                    target,
+                )
+
+                install(self.release, self.home, SHA_A)
+
+                self.assertFalse(os.path.lexists(active))
+                self.assertEqual(
+                    target.read_text(encoding="utf-8"),
+                    'name = "reviewer"\n',
+                )
+                self.assertEqual(target.stat().st_nlink, 1)
+
+    def test_v7_produced_active_alias_foreign_replacement_fails_closed(self) -> None:
+        batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
+        parsed = self._downgrade_pending_regular_metadata(batch, 7)
+        record = next(candidate for candidate in parsed.records if candidate.is_regular())
+        target = self.home / Path(*record.target.parts)
+        active = self._isolate_legacy_regular_publication(parsed, record, target)
+        active.unlink()
+        active.write_text("foreign = true\n", encoding="utf-8")
+        active.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending legacy regular publication .* changed",
+        ):
+            install(self.release, self.home, SHA_A)
+
+        self.assertEqual(active.read_text(encoding="utf-8"), "foreign = true\n")
+        self.assertTrue(MODULE._pending_link_pointer_path(self.home).is_file())
+
+    def test_v7_before_active_alias_residue_recovers_exact_preimage(self) -> None:
+        install(self.release, self.home, SHA_A)
+        target = self.home / ROLE_TARGET
+        old_identity = (target.stat().st_dev, target.stat().st_ino)
+        next_release = self.root / "next-release-v7-before"
+        write_release(next_release, role_payload='name = "updated"\n')
+        batch = self._interrupt_uncommitted_regular_publication(next_release, SHA_B)
+        parsed = self._downgrade_pending_regular_metadata(batch, 7)
+        record = next(candidate for candidate in parsed.records if candidate.is_regular())
+        assert record.before_evidence is not None
+        before = parsed.batch_root / Path(*record.before_evidence.parts)
+        parent_fd = MODULE._open_directory_beneath(self.home, target.parent)
+        try:
+            parent_identity = MODULE._directory_identity(parent_fd)
+            before_metadata = before.stat()
+            planned = MODULE._pending_cleanup_entry_plan(before_metadata)
+            active_name = MODULE._pending_cleanup_entry_name(
+                MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                parent_identity,
+                planned,
+            )
+            active = target.with_name(active_name)
+            os.link(before, active, follow_symlinks=False)
+            os.fsync(parent_fd)
+        finally:
+            MODULE._close_fd_quietly(parent_fd)
+        self.assertEqual(target.read_text(encoding="utf-8"), 'name = "updated"\n')
+        self.assertEqual((active.stat().st_dev, active.stat().st_ino), old_identity)
+
+        install(self.release, self.home, SHA_A)
+
+        self.assertFalse(os.path.lexists(active))
+        self.assertEqual((target.stat().st_dev, target.stat().st_ino), old_identity)
+        self.assertEqual(target.stat().st_nlink, 1)
+
+    def test_publication_receipt_recovers_truncated_atomic_temp(self) -> None:
+        batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
+        record = next(candidate for candidate in batch.records if candidate.is_regular())
+        target = self.home / Path(*record.target.parts)
+        expected, exists = MODULE._pending_target_snapshot(self.home, target)
+        self.assertTrue(exists)
+        assert isinstance(expected, MODULE.RegularFileSnapshot)
+        journal = MODULE._pending_regular_publication_cleanup_path(
+            batch,
+            record,
+            "produced",
+        )
+        temp = journal.with_name(
+            journal.name + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+        )
+        cleanup_parent_identity = (
+            batch.batch_root / "pending" / "cleanup"
+        ).stat()
+        parent_identity = (
+            cleanup_parent_identity.st_dev,
+            cleanup_parent_identity.st_ino,
+        )
+        retained_temp_name = (
+            MODULE.PENDING_CLEANUP_RETAINED_PREFIX
+            + temp.name
+            + "-1-"
+            + "a" * 16
+        )
+        self.assertTrue(
+            MODULE._pending_batch_cleanup_name_is_authorized(
+                ("pending", "cleanup"),
+                temp.name,
+                parent_identity,
+            )
+        )
+        self.assertTrue(
+            MODULE._pending_batch_cleanup_name_is_authorized(
+                ("pending", "cleanup"),
+                retained_temp_name,
+                parent_identity,
+            )
+        )
+        self.assertFalse(
+            MODULE._pending_batch_cleanup_name_is_authorized(
+                ("pending", "cleanup"),
+                "foreign.json.publish-tmp",
+                parent_identity,
+            )
+        )
+        temp.write_bytes(b"{")
+        temp.chmod(0o600)
+
+        MODULE._delete_pending_regular_publication_beneath(
+            self.home,
+            batch,
+            record,
+            target,
+            expected,
+            phase="produced",
+        )
+
+        self.assertFalse(os.path.lexists(temp))
+        self.assertFalse(os.path.lexists(target))
+        self.assertIsNotNone(
+            MODULE._read_pending_regular_publication_cleanup(
+                self.home,
+                batch,
+                record,
+                "produced",
+            )
+        )
+
+    def test_publication_receipt_is_complete_after_atomic_rename_boundary_crash(
+        self,
+    ) -> None:
+        batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
+        record = next(candidate for candidate in batch.records if candidate.is_regular())
+        target = self.home / Path(*record.target.parts)
+        expected, exists = MODULE._pending_target_snapshot(self.home, target)
+        self.assertTrue(exists)
+        assert isinstance(expected, MODULE.RegularFileSnapshot)
+        journal = MODULE._pending_regular_publication_cleanup_path(
+            batch,
+            record,
+            "produced",
+        )
+        temp_name = journal.name + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+        real_rename = MODULE._rename_noreplace_at
+        crashed = False
+
+        def crash_after_atomic_publication(
+            source_fd: int,
+            source_name: str,
+            destination_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal crashed
+            real_rename(
+                source_fd,
+                source_name,
+                destination_fd,
+                destination_name,
+            )
+            if source_name == temp_name and destination_name == journal.name:
+                crashed = True
+                raise MODULE.SyncError("injected atomic rename boundary crash")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=crash_after_atomic_publication,
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "atomic rename boundary crash"),
+        ):
+            MODULE._delete_pending_regular_publication_beneath(
+                self.home,
+                batch,
+                record,
+                target,
+                expected,
+                phase="produced",
+            )
+
+        self.assertTrue(crashed)
+        self.assertTrue(target.is_file())
+        self.assertTrue(journal.is_file())
+        self.assertFalse(os.path.lexists(journal.with_name(temp_name)))
+        self.assertIsNotNone(
+            MODULE._read_pending_regular_publication_cleanup(
+                self.home,
+                batch,
+                record,
+                "produced",
+            )
+        )
+
+        MODULE._recover_pending_regular_publication_cleanup(
+            self.home,
+            batch,
+            record,
+            "produced",
+        )
+        self.assertFalse(os.path.lexists(target))
 
     def test_precommit_crash_recovery_retries_regular_publication(self) -> None:
         real_clear = MODULE._clear_pending_link_pointer

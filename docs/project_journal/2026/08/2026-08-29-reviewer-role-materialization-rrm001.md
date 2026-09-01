@@ -228,3 +228,36 @@ superseded_by:
   regression coverage passed 59/59. Ruff, repository-wide `compileall`, project
   journal validation, `git diff --check`, and the refreshed ten-source
   `refresh-lock --check` all passed on the same source bytes.
+- The next frozen whole-range GPT-5.6 Sol Ultra review found two remaining
+  recovery gaps. Retained metadata versions 6 and 7 could parse regular-file
+  records but recovery routed their uncommitted produced target through the
+  version-8-only receipt API. Separately, the version-8 cleanup receipt used an
+  exclusive write directly at its final pathname, so a hard crash could leave
+  an empty or truncated final receipt that correctly failed closed but could
+  never recover automatically.
+- Version-6 and version-7 deletion now retain their closed legacy exact-delete
+  semantics. Recovery also recognizes a legacy active cleanup alias left by a
+  second crash in either the produced-file or restored-preimage phase, but only
+  after a bounded parent scan and exact parent, object, content, access-policy,
+  alias-set, and link-count validation. This compatibility authority applies to
+  both versions because the upgraded recovery code itself can expose either
+  retained version to the legacy rename-before-unlink window; foreign or
+  duplicate candidates remain fail closed.
+- Version-8 receipts are now written and synchronized at a temporary pathname
+  and published with a no-replace atomic rename. The batch cleanup allowlist
+  accepts only the canonical receipt temporary names and their exact retained
+  forms, allowing truncated temporary residue to be discarded and retried
+  without treating a partial final receipt as valid authority.
+- New regressions cover version 6 and 7 across uncommitted create and replace,
+  produced active-alias recovery, restored-preimage active-alias recovery with
+  a different produced target still present, foreign replacement, truncated
+  receipt temporary recovery, and the atomic-rename boundary. The complete
+  regular-materialization module passed 45/45 in 22.145 seconds and pending
+  compatibility passed 15/15 in 6.329 seconds. Ruff, focused `compileall`, and
+  `git diff --check` passed, and a fresh-context GPT-5.6 Sol Ultra narrow review
+  of the two-file repair reported no findings.
+- The exact post-repair full repository discovery passed 1,355/1,355 tests in
+  1,151.232 seconds with three expected platform skips. It ran once with the
+  narrow account-private temporary-directory permission required by four
+  isolation tests; no sandbox-only failed precursor was counted as product
+  evidence.
