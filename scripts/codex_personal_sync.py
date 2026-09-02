@@ -20856,7 +20856,6 @@ def _validate_pending_terminal_regular_targets_for_state(
     for expectation, (_target, state_record, pending_record) in zip(
         expectations,
         state_items,
-        strict=True,
     ):
         if expectation.file_identity in file_identities:
             raise SyncError(

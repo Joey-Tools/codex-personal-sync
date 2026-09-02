@@ -52,6 +52,11 @@ jobs:
           python3 -m unittest discover -s tests
           -p 'test_codex_personal_sync.py'
           -k macos_system_temp_alias
+      - name: Run Python 3.9 pending regular compatibility test
+        if: matrix.python-version == '3.9'
+        run: >-
+          python3 -m unittest
+          tests.test_pending_agent_claim_compatibility.PendingAgentClaimCompatibilityTests.test_terminal_regular_source_validation_preflights_whole_group
       - name: Run macOS Git locator tests
         run: >-
           python3 -m unittest discover -s tests
