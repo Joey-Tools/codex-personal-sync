@@ -467,6 +467,72 @@ class PendingStagingCleanupTests(unittest.TestCase):
             list(MODULE._pending_cleanup_index_path(self.home).glob("*.json"))
         )
 
+    def test_post_link_staging_failure_persists_manual_retention_guard(
+        self,
+    ) -> None:
+        real_publish = MODULE._publish_regular_hardlink_beneath
+        tripped = False
+
+        def publish_then_fail(
+            home: Path,
+            source: Path,
+            destination: Path,
+            expected_source,
+            **kwargs,
+        ):
+            nonlocal tripped
+            published = real_publish(
+                home,
+                source,
+                destination,
+                expected_source,
+                **kwargs,
+            )
+            if (
+                not tripped
+                and source.parent.name == "stage"
+                and destination.parent.name == "evidence"
+            ):
+                tripped = True
+                raise MODULE.SyncError(
+                    "injected post-link staging failure",
+                    code=MODULE.PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
+                )
+            return published
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_publish_regular_hardlink_beneath",
+                side_effect=publish_then_fail,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "retained for manual recovery",
+            ),
+        ):
+            install(self.next_release, self.home, SHA_B)
+
+        ticket = self._only_cleanup_ticket()
+        self.assertEqual(ticket.version, 3)
+        cleanup_entries = list((ticket.batch_root / "pending/cleanup").iterdir())
+        self.assertEqual(len(cleanup_entries), 1)
+        record_leaf = cleanup_entries[0].stem
+        stage = ticket.batch_root / "pending/stage" / record_leaf
+        evidence = ticket.batch_root / "pending/evidence" / record_leaf
+        self.assertEqual(
+            (stage.stat().st_dev, stage.stat().st_ino),
+            (evidence.stat().st_dev, evidence.stat().st_ino),
+        )
+
+        with self.assertRaisesRegex(MODULE.SyncError, "manual cleanup"):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(stage.is_file())
+        self.assertTrue(evidence.is_file())
+        self.assertTrue(cleanup_entries[0].is_file())
+
     def test_moved_batch_without_empty_proof_retains_cleanup_authority(self) -> None:
         with (
             self._fail_after_live_preimage_hardlink(),

@@ -3,7 +3,7 @@ id: 20260829-rrm001
 title: Reviewer Role Regular-File Materialization
 status: active
 created: 2026-08-29
-updated: 2026-09-01
+updated: 2026-09-02
 branch: codex/daily-skill-friction-20260829-codex-personal-sync-reviewer-role-regular-install
 pr:
 supersedes: []
@@ -384,3 +384,28 @@ superseded_by:
   source-lock module passed 280/280 with one expected skip in 514.753 seconds.
   A new signed frozen head and another clean-clone GPT-5.6 Sol Ultra whole-range
   review remain required before PR creation.
+- A new frozen-head review then exposed one P1 and eight P2 recovery and
+  authority gaps. The follow-up preserves a recovery alias through v4 terminal
+  validation and records that validation durably before deletion; binds GID when
+  either group/other permissions or setgid make it an access-policy signal;
+  validates the complete regular target-parent chain and leaf ACL both before
+  and after reads; and makes pending cleanup control objects Darwin-ACL-aware.
+  It also converts post-link retained staging into durable manual retention,
+  writes prepared v8/v9 cleanup receipts before moving canonical names, records
+  failed-move isolation in a fixed durable control namespace, and restores
+  regular-remove replacement dependencies. These changes protect object
+  identity, content stability, and access policy separately while allowing
+  safe directory link-count/read-execute churn.
+- During full validation, two compatibility regressions were repaired without
+  weakening the security contract: a failed `fchmod` now triggers exact-object
+  cleanup once `O_EXCL` has created the file, and release-retention cleanup
+  distinguishes ordinary release-tree files from `0600` pending authorities.
+  The latter still requires exact-FD identity, current UID, no group/world
+  write, and Darwin ACL admission; it merely accepts safe ordinary file modes
+  such as `0644`. Static checks passed, the expanded focused group passed
+  839 tests with one expected skip, full discovery passed all implementation
+  tests (1,427 with three expected skips) except the expected stale source lock,
+  then the refreshed ten-source lock verified and its dedicated suite passed
+  280/280 with one expected skip in 500.510 seconds. A signed checkpoint and
+  another clean-clone GPT-5.6 Sol Ultra whole-range review remain required
+  before PR creation.

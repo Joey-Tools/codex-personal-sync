@@ -753,6 +753,115 @@ class CodexPersonalSyncTests(unittest.TestCase):
         ):
             yield events
 
+    def plan_regular_removal_with_replacement(self):
+        home = self.root / "home" / ".codex"
+        old_source = MODULE.PurePosixPath("personal_codex/agents/a-old.toml")
+        replacement_source = MODULE.PurePosixPath(
+            "personal_codex/agents/z-replacement.toml"
+        )
+        old_target_path = MODULE.PurePosixPath("agents/a-old.toml")
+        replacement_target_path = MODULE.PurePosixPath(
+            "agents/z-replacement.toml"
+        )
+        old_entry = MODULE.LinkEntry(old_source, old_target_path, "file")
+        previous_replacement = MODULE.LinkEntry(
+            replacement_source,
+            replacement_target_path,
+            "file",
+        )
+        desired_replacement = MODULE.LinkEntry(
+            replacement_source,
+            replacement_target_path,
+            "file",
+        )
+        removed = MODULE.RemovedLink(
+            id="replace-old-agent",
+            source=old_source,
+            target=old_target_path,
+            kind="file",
+            owner=MODULE.PUBLIC_OWNER,
+            replacement_target=replacement_target_path,
+        )
+
+        old_release = MODULE._releases_root(home, MODULE.PUBLIC_OWNER) / SHA1
+        next_release = MODULE._releases_root(home, MODULE.PUBLIC_OWNER) / SHA2
+        old_payloads = {
+            old_source: b'role = "old"\n',
+            replacement_source: b'role = "replacement-old"\n',
+        }
+        next_payload = b'role = "replacement-new"\n'
+        for relative_source, payload in old_payloads.items():
+            source_path = old_release / Path(*relative_source.parts)
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            source_path.write_bytes(payload)
+            source_path.chmod(0o600)
+        next_source_path = next_release / Path(*replacement_source.parts)
+        next_source_path.parent.mkdir(parents=True, exist_ok=True)
+        next_source_path.write_bytes(next_payload)
+        next_source_path.chmod(0o600)
+        current = home / "personal-sync" / "current"
+        current.symlink_to(f"releases/{SHA2}")
+
+        targets = {
+            old_target_path: home / Path(*old_target_path.parts),
+            replacement_target_path: home / Path(*replacement_target_path.parts),
+        }
+        for relative_target, target in targets.items():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = old_source if relative_target == old_target_path else replacement_source
+            target.write_bytes(old_payloads[source])
+            target.chmod(0o600)
+
+        state = MODULE.ManagedState(
+            owners={MODULE.PUBLIC_OWNER: SHA1},
+            links={
+                old_target_path: MODULE.ManagedLinkRecord(
+                    source=old_source,
+                    target=old_target_path,
+                    kind="file",
+                    owner=MODULE.PUBLIC_OWNER,
+                    link_target=MODULE._desired_link_target(home, old_entry),
+                    release_sha=SHA1,
+                ),
+                replacement_target_path: MODULE.ManagedLinkRecord(
+                    source=replacement_source,
+                    target=replacement_target_path,
+                    kind="file",
+                    owner=MODULE.PUBLIC_OWNER,
+                    link_target=MODULE._desired_link_target(
+                        home,
+                        previous_replacement,
+                    ),
+                    release_sha=SHA1,
+                ),
+            },
+        )
+        actions = MODULE._plan_reconciliation(
+            home,
+            [desired_replacement],
+            [old_entry, previous_replacement],
+            [removed],
+            state,
+            allow_cross_owner=False,
+            owner_shas={MODULE.PUBLIC_OWNER: SHA2},
+        )
+        required = MODULE._required_replacements_for_removals(
+            home,
+            actions,
+            [removed],
+            [desired_replacement],
+        )
+        return (
+            home,
+            targets[old_target_path],
+            targets[replacement_target_path],
+            old_payloads[old_source],
+            old_payloads[replacement_source],
+            next_payload,
+            actions,
+            required,
+        )
+
     def install_private_pair(
         self,
         home: Path,
@@ -1164,6 +1273,152 @@ class CodexPersonalSyncTests(unittest.TestCase):
             if entry["target"] == "skills/moving-skill"
         )
         self.assertEqual(moving_record["owner"], "public")
+
+    def test_regular_removal_orders_replacement_producer_first(self) -> None:
+        (
+            home,
+            old_target,
+            replacement_target,
+            _old_payload,
+            _old_replacement_payload,
+            _next_payload,
+            actions,
+            required,
+        ) = self.plan_regular_removal_with_replacement()
+
+        by_target = {action.target: action for action in actions}
+        remove = by_target[old_target]
+        self.assertEqual(remove.action, "remove")
+        self.assertEqual(remove.materialization, "regular")
+        self.assertEqual(
+            remove.expected_link_target,
+            MODULE._relative_managed_link_target(
+                MODULE.PurePosixPath("personal_codex/agents/a-old.toml"),
+                MODULE.PurePosixPath("agents/a-old.toml"),
+                MODULE.PUBLIC_OWNER,
+            ),
+        )
+        self.assertEqual(
+            [MODULE._entry_target_path(home, entry) for entry in required[old_target]],
+            [replacement_target],
+        )
+        ordered = MODULE._ordered_reconcile_actions(home, actions, required)
+        self.assertEqual(
+            [(action.action, action.target) for action in ordered],
+            [("replace", replacement_target), ("remove", old_target)],
+        )
+
+    def test_regular_removal_rejects_replacement_drift_before_move(self) -> None:
+        (
+            home,
+            old_target,
+            replacement_target,
+            old_payload,
+            _old_replacement_payload,
+            _next_payload,
+            actions,
+            required,
+        ) = self.plan_regular_removal_with_replacement()
+        remove = next(action for action in actions if action.target == old_target)
+        replacement_target.write_bytes(b'role = "foreign"\n')
+        replacement_target.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "active replacement target changed before removal",
+        ):
+            self.run_quietly(
+                MODULE._apply_reconcile_actions,
+                home,
+                [remove],
+                dry_run=False,
+                required_replacements=required,
+            )
+
+        self.assertEqual(old_target.read_bytes(), old_payload)
+
+    def test_regular_removal_revalidates_replacement_before_and_after_move(
+        self,
+    ) -> None:
+        (
+            home,
+            old_target,
+            replacement_target,
+            _old_payload,
+            _old_replacement_payload,
+            next_payload,
+            actions,
+            required,
+        ) = self.plan_regular_removal_with_replacement()
+        real_verify = MODULE._verify_required_replacement_targets
+        verified_targets: list[tuple[Path, ...]] = []
+
+        def capture(home_arg, entries, *, pending_batch=None):
+            verified_targets.append(
+                tuple(MODULE._entry_target_path(home_arg, entry) for entry in entries)
+            )
+            return real_verify(
+                home_arg,
+                entries,
+                pending_batch=pending_batch,
+            )
+
+        with mock.patch.object(
+            MODULE,
+            "_verify_required_replacement_targets",
+            side_effect=capture,
+        ):
+            self.run_quietly(
+                MODULE._apply_reconcile_actions,
+                home,
+                actions,
+                dry_run=False,
+                required_replacements=required,
+            )
+
+        self.assertEqual(
+            verified_targets,
+            [(replacement_target,), (replacement_target,)],
+        )
+        self.assertFalse(os.path.lexists(old_target))
+        self.assertEqual(replacement_target.read_bytes(), next_payload)
+
+    def test_regular_removal_failure_rolls_back_replacement_producer(self) -> None:
+        (
+            home,
+            old_target,
+            replacement_target,
+            old_payload,
+            old_replacement_payload,
+            _next_payload,
+            actions,
+            required,
+        ) = self.plan_regular_removal_with_replacement()
+        real_move = MODULE._atomic_move_beneath_home
+
+        def fail_removal(home_arg, source, destination, *args, **kwargs):
+            if source == old_target:
+                raise MODULE.SyncError("injected regular removal failure")
+            return real_move(home_arg, source, destination, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_atomic_move_beneath_home",
+                side_effect=fail_removal,
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "reconciliation failed"),
+        ):
+            self.run_quietly(
+                MODULE._apply_reconcile_actions,
+                home,
+                actions,
+                dry_run=False,
+                required_replacements=required,
+            )
+
+        self.assertEqual(old_target.read_bytes(), old_payload)
+        self.assertEqual(replacement_target.read_bytes(), old_replacement_payload)
 
     def test_install_private_rejects_unavailable_active_replacement(self) -> None:
         home = self.root / "home" / ".codex"

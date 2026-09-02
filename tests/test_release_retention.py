@@ -304,6 +304,92 @@ class ReleaseRetentionTests(unittest.TestCase):
             os.path.lexists(MODULE._release_retention_pointer_path(self.home))
         )
 
+    def test_prune_accepts_safe_release_file_mode_without_control_mode(self) -> None:
+        self.install_pair()
+        skill = (
+            self.release_path(SHA_A)
+            / "personal_codex"
+            / "skills"
+            / "retention"
+            / "SKILL.md"
+        )
+        self.assertEqual(stat.S_IMODE(skill.stat().st_mode), 0o644)
+        observed_modes: list[int] = []
+        real_policy = MODULE._require_release_identity_fd_access_policy
+
+        def observe_policy(
+            file_descriptor: int,
+            display_path: Path,
+            expected_owner_uid: int,
+        ) -> os.stat_result:
+            metadata = real_policy(
+                file_descriptor,
+                display_path,
+                expected_owner_uid,
+            )
+            if stat.S_ISREG(metadata.st_mode) and display_path.name == "SKILL.md":
+                observed_modes.append(stat.S_IMODE(metadata.st_mode))
+            return metadata
+
+        with mock.patch.object(
+            MODULE,
+            "_require_release_identity_fd_access_policy",
+            side_effect=observe_policy,
+        ):
+            removed = self.run_quietly(
+                MODULE.prune_releases,
+                self.home,
+                dry_run=False,
+            )
+
+        self.assertEqual(removed, [(MODULE.PUBLIC_OWNER, SHA_A)])
+        self.assertIn(0o644, observed_modes)
+
+    def test_prune_retains_release_file_when_general_access_policy_fails(
+        self,
+    ) -> None:
+        self.install_pair()
+        real_policy = MODULE._require_release_identity_fd_access_policy
+
+        def reject_skill_acl(
+            file_descriptor: int,
+            display_path: Path,
+            expected_owner_uid: int,
+        ) -> os.stat_result:
+            metadata = real_policy(
+                file_descriptor,
+                display_path,
+                expected_owner_uid,
+            )
+            if stat.S_ISREG(metadata.st_mode) and display_path.name == "SKILL.md":
+                raise MODULE.SyncError("injected release content ACL mismatch")
+            return metadata
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_require_release_identity_fd_access_policy",
+                side_effect=reject_skill_acl,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup regular file changed: SKILL.md",
+            ),
+        ):
+            self.run_quietly(
+                MODULE.prune_releases,
+                self.home,
+                dry_run=False,
+            )
+
+        transaction = MODULE._load_release_retention_transaction(self.home)
+        self.assertIsNotNone(transaction)
+        assert transaction is not None
+        self.assertTrue(transaction.committed)
+        self.assertIsNotNone(
+            MODULE._quarantined_release_path(self.home, transaction)
+        )
+
     def test_current_and_ledger_owner_and_link_references_are_preserved(
         self,
     ) -> None:

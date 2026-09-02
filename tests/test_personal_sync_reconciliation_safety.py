@@ -3091,6 +3091,126 @@ class AtomicMoveSafetyTests(unittest.TestCase):
             )
             self.assertEqual(destination.read_bytes(), b"original\n")
 
+    def test_failed_move_isolation_receipt_recovers_crash_before_restore(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir) / "home"
+            source = home / "agents" / "reviewer.toml"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"original\n")
+            source.chmod(0o600)
+            source_snapshot = MODULE._capture_reconcile_target_snapshot(home, source)
+            source_identity = (source.stat().st_dev, source.stat().st_ino)
+            destination = home / "quarantine" / "reviewer.toml"
+            destination.parent.mkdir(parents=True)
+            destination_parent_identity = (
+                destination.parent.stat().st_dev,
+                destination.parent.stat().st_ino,
+            )
+            real_bound = MODULE._bound_directory_matches
+            real_rename = MODULE._rename_noreplace_at
+            source_parent_checks = 0
+            crashed = False
+
+            def fail_post_move_source_check(
+                root: Path,
+                directory: Path,
+                directory_fd: int,
+            ) -> bool:
+                nonlocal source_parent_checks
+                if directory == source.parent:
+                    source_parent_checks += 1
+                    if source_parent_checks == 2:
+                        return False
+                return real_bound(root, directory, directory_fd)
+
+            def crash_after_durable_isolation(
+                source_parent_fd: int,
+                source_name: str,
+                destination_parent_fd: int,
+                destination_name: str,
+            ) -> None:
+                nonlocal crashed
+                real_rename(
+                    source_parent_fd,
+                    source_name,
+                    destination_parent_fd,
+                    destination_name,
+                )
+                if (
+                    source_name == destination.name
+                    and destination_name
+                    == MODULE.FAILED_MOVE_ISOLATION_ENTRY_NAME
+                ):
+                    crashed = True
+                    raise MODULE.SyncError("injected crash after failed-move isolation")
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_bound_directory_matches",
+                    side_effect=fail_post_move_source_check,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_rename_noreplace_at",
+                    side_effect=crash_after_durable_isolation,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "injected crash after failed-move isolation",
+                ),
+            ):
+                MODULE._atomic_move_beneath_home(
+                    home,
+                    source,
+                    destination,
+                    source_snapshot,
+                    destination_parent_identity,
+                )
+
+            self.assertTrue(crashed)
+            self.assertFalse(os.path.lexists(source))
+            self.assertFalse(os.path.lexists(destination))
+            isolated = (
+                MODULE._failed_move_isolation_parent(home)
+                / MODULE.FAILED_MOVE_ISOLATION_ENTRY_NAME
+            )
+            self.assertEqual(
+                (isolated.stat().st_dev, isolated.stat().st_ino),
+                source_identity,
+            )
+            self.assertEqual(MODULE._quarantine_batch_count(home), 0)
+
+            self.assertTrue(MODULE._recover_failed_move_isolation(home))
+
+            self.assertFalse(os.path.lexists(isolated))
+            self.assertEqual(
+                (destination.stat().st_dev, destination.stat().st_ino),
+                source_identity,
+            )
+            self.assertFalse(
+                (
+                    MODULE._failed_move_isolation_parent(home)
+                    / MODULE.FAILED_MOVE_RECEIPT_NAME
+                ).exists()
+            )
+            self.assertEqual(MODULE._quarantine_batch_count(home), 0)
+
+            MODULE._atomic_move_beneath_home(
+                home,
+                destination,
+                source,
+                expected_destination_parent_identity=(
+                    source.parent.stat().st_dev,
+                    source.parent.stat().st_ino,
+                ),
+                expected_entry_identity=source_identity,
+            )
+            self.assertEqual(source.read_bytes(), b"original\n")
+            self.assertFalse(os.path.lexists(destination))
+
     def test_failed_move_destination_racer_stays_outside_active_source(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             home = Path(temp_dir) / "home"
@@ -3110,7 +3230,6 @@ class AtomicMoveSafetyTests(unittest.TestCase):
             real_bound_directory_matches = MODULE._bound_directory_matches
             real_rename_noreplace = MODULE._rename_noreplace_at
             source_parent_checks = 0
-            rename_calls = 0
             racer_identity: tuple[int, int] | None = None
 
             def fail_post_move_source_parent_check(
@@ -3131,9 +3250,12 @@ class AtomicMoveSafetyTests(unittest.TestCase):
                 destination_parent_fd: int,
                 destination_name: str,
             ) -> None:
-                nonlocal racer_identity, rename_calls
-                rename_calls += 1
-                if rename_calls == 2:
+                nonlocal racer_identity
+                if (
+                    source_name == destination.name
+                    and destination_name
+                    == MODULE.FAILED_MOVE_ISOLATION_ENTRY_NAME
+                ):
                     os.rename(
                         source_name,
                         displaced.name,
@@ -3198,13 +3320,20 @@ class AtomicMoveSafetyTests(unittest.TestCase):
             )
             self.assertEqual(displaced.read_bytes(), b"original\n")
             self.assertFalse(os.path.lexists(destination))
-            retained_racers = [
-                path
-                for path in (home / "personal-sync" / "quarantine").rglob("*")
-                if path.is_file()
-                and (path.stat().st_dev, path.stat().st_ino) == racer_identity
-            ]
-            self.assertEqual(len(retained_racers), 1)
+            retained_racer = (
+                MODULE._failed_move_isolation_parent(home)
+                / MODULE.FAILED_MOVE_ISOLATION_ENTRY_NAME
+            )
+            self.assertEqual(
+                (retained_racer.stat().st_dev, retained_racer.stat().st_ino),
+                racer_identity,
+            )
+            self.assertTrue(
+                (
+                    MODULE._failed_move_isolation_parent(home)
+                    / MODULE.FAILED_MOVE_RECEIPT_NAME
+                ).is_file()
+            )
 
     def test_failed_move_private_isolation_racer_is_removed_from_active(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3224,7 +3353,6 @@ class AtomicMoveSafetyTests(unittest.TestCase):
             real_bound_directory_matches = MODULE._bound_directory_matches
             real_rename_noreplace = MODULE._rename_noreplace_at
             source_parent_checks = 0
-            rename_calls = 0
             racer_identity: tuple[int, int] | None = None
 
             def fail_post_move_source_parent_check(
@@ -3245,9 +3373,11 @@ class AtomicMoveSafetyTests(unittest.TestCase):
                 destination_parent_fd: int,
                 destination_name: str,
             ) -> None:
-                nonlocal racer_identity, rename_calls
-                rename_calls += 1
-                if rename_calls == 3:
+                nonlocal racer_identity
+                if (
+                    source_name == MODULE.FAILED_MOVE_ISOLATION_ENTRY_NAME
+                    and destination_name == source.name
+                ):
                     displaced_name = f"{source_name}.original"
                     os.rename(
                         source_name,
@@ -3305,20 +3435,20 @@ class AtomicMoveSafetyTests(unittest.TestCase):
                     destination_parent_identity,
                 )
 
-            self.assertEqual(rename_calls, 4)
             self.assertIsNotNone(racer_identity)
             self.assertFalse(os.path.lexists(source))
-            self.assertFalse(os.path.lexists(destination))
-            retained_files = [
-                path
-                for path in (home / "personal-sync" / "quarantine").rglob("*")
-                if path.is_file()
-            ]
+            self.assertEqual(
+                (destination.stat().st_dev, destination.stat().st_ino),
+                racer_identity,
+            )
+            retained_files = list(
+                MODULE._failed_move_isolation_parent(home).glob("entry*")
+            )
             retained_identities = {
                 (path.stat().st_dev, path.stat().st_ino) for path in retained_files
             }
             self.assertIn(source_identity, retained_identities)
-            self.assertIn(racer_identity, retained_identities)
+            self.assertNotIn(racer_identity, retained_identities)
 
     def test_failed_regular_move_retains_restore_window_mutation(self) -> None:
         for mutation in ("content", "mode", "link-count"):
@@ -3420,16 +3550,11 @@ class AtomicMoveSafetyTests(unittest.TestCase):
 
                 self.assertTrue(mutation_applied)
                 self.assertFalse(os.path.lexists(source))
-                self.assertFalse(os.path.lexists(destination))
-                retained_files = [
-                    path
-                    for path in (home / "personal-sync" / "quarantine").rglob("*")
-                    if path.is_file()
-                    and (path.stat().st_dev, path.stat().st_ino)
-                    == source_identity
-                ]
-                self.assertGreaterEqual(len(retained_files), 1)
-                retained = retained_files[0]
+                self.assertEqual(
+                    (destination.stat().st_dev, destination.stat().st_ino),
+                    source_identity,
+                )
+                retained = destination
                 if mutation == "content":
                     self.assertEqual(retained.read_bytes(), b"tampered\n")
                 elif mutation == "mode":

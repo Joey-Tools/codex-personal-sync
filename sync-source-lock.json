@@ -22,12 +22,12 @@
     "engine": {
       "mode": "0755",
       "path": "scripts/codex_personal_sync.py",
-      "sha256": "fc34fa0af5191b8cc114f81216a5f474c88632c9d83c7098a6075351d80b157d"
+      "sha256": "2d0d6f71193e9919628d3600b96b8d69d990acffbb9c2b6cc815ee030b189923"
     },
     "engine_tests": {
       "mode": "0644",
       "path": "tests/test_codex_personal_sync.py",
-      "sha256": "8cd298cad6818e8a07c40ba4ad4fb3c7129507296f7245a0221d7ed53e90e5d6"
+      "sha256": "4bcd36c4212f03f24cc3cac3e2eb261860b12d0ffbd51c4d07ae0b20aba84a9c"
     },
     "manifest_schema": {
       "mode": "0644",
@@ -42,27 +42,27 @@
     "pending_staging_cleanup_tests": {
       "mode": "0644",
       "path": "tests/test_pending_staging_cleanup.py",
-      "sha256": "88b74dbd685c81b069c66fed28e89a67877d0dc3a2d3f0740228e9c5ac635c40"
+      "sha256": "c27421dda28de23ab381c6d5f6708d57eaf0234aaa0d2e51c9b5c2a5334c278c"
     },
     "reconciliation_safety_tests": {
       "mode": "0644",
       "path": "tests/test_personal_sync_reconciliation_safety.py",
-      "sha256": "7cae8adae2a0c0dcb6f698bc2887a3c70bf3de0527b660d4e83bc8bddc287430"
+      "sha256": "713967607c91a44a8cbd8eb09efb4974f9bf7b2521c2fd3b876f6d0a41883a4b"
     },
     "regular_agent_materialization_tests": {
       "mode": "0644",
       "path": "tests/test_regular_agent_materialization.py",
-      "sha256": "4e78b15bb4f2995840c4fb03379d46e0cd2059a6806ed2da00b7c3e23ceba52b"
+      "sha256": "a6a47fe86a35b5ec2af4a20ab6cabfcbe630483893a00a7eb9f42bfe42011d44"
     },
     "regular_overlay_uninstall_status_regressions_tests": {
       "mode": "0644",
       "path": "tests/test_regular_overlay_uninstall_status_regressions.py",
-      "sha256": "af0787f9416353872f508973cbac3d82bd55aae0e22109cffb7a6dcc54930e48"
+      "sha256": "a78a0c74df5c7930482f1814d6ed4becfa06b9e5b283a7270fa1acbbac17bb5e"
     },
     "release_retention_tests": {
       "mode": "0644",
       "path": "tests/test_release_retention.py",
-      "sha256": "bfc9a3be29cb08f6f9defe102ea19b8efc80407ca96382d17772b85075a197b1"
+      "sha256": "d81340daeda3898d6f998583ae745bf07814dd6a25e3c73a39665ddcc3ee566c"
     },
     "scheduler_doctor_tests": {
       "mode": "0644",

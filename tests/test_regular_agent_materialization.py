@@ -883,6 +883,268 @@ class PrivateRegularAgentTests(unittest.TestCase):
         self.assertEqual(record.owner, MODULE.PUBLIC_OWNER)
 
 
+class RegularAccessPolicyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.home = self.root / "home"
+        self.home.mkdir(mode=0o700)
+        self.agents = self.home / "agents"
+        self.agents.mkdir(mode=0o755)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_planning_rejects_group_writable_regular_parent(self) -> None:
+        os.chmod(self.agents, 0o775)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "managed regular-file parent access policy mismatch",
+        ):
+            MODULE._capture_reconcile_target_snapshot(
+                self.home,
+                self.agents / "reviewer.toml",
+                require_managed_parent_access=True,
+            )
+
+    def test_terminal_snapshot_rejects_world_writable_regular_parent(self) -> None:
+        target = self.agents / "reviewer.toml"
+        target.write_text('name = "reviewer"\n', encoding="utf-8")
+        os.chmod(target, 0o600)
+        os.chmod(self.agents, 0o777)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "managed regular-file parent access policy mismatch",
+        ):
+            MODULE._read_regular_file_snapshot_beneath(
+                self.home,
+                target,
+                require_managed_access=True,
+            )
+
+    def test_parent_access_rejects_foreign_owner_metadata(self) -> None:
+        parent_fd = os.open(self.agents, os.O_RDONLY)
+        actual = os.fstat(parent_fd)
+        foreign = SimpleNamespace(
+            st_mode=actual.st_mode,
+            st_uid=os.geteuid() + 1,
+            st_dev=actual.st_dev,
+            st_ino=actual.st_ino,
+        )
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_require_release_identity_fd_access_policy",
+                    return_value=foreign,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "managed regular-file parent access policy mismatch",
+                ),
+            ):
+                MODULE._require_managed_regular_directory_fd_access(
+                    self.home,
+                    self.agents,
+                    parent_fd,
+                )
+        finally:
+            os.close(parent_fd)
+
+    def test_new_regular_parent_is_revalidated_after_publication(self) -> None:
+        target = self.agents / "nested" / "reviewer.toml"
+        planned = MODULE._capture_reconcile_target_snapshot(
+            self.home,
+            target,
+            require_managed_parent_access=True,
+        )
+        real_publish = MODULE._publish_reconcile_directory_noreplace
+
+        def publish_with_unsafe_mode(
+            parent_fd: int,
+            name: str,
+            display_path: Path,
+        ) -> tuple[int, tuple[int, int]]:
+            directory_fd, identity = real_publish(parent_fd, name, display_path)
+            os.fchmod(directory_fd, 0o777)
+            return directory_fd, identity
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_publish_reconcile_directory_noreplace",
+                side_effect=publish_with_unsafe_mode,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "managed regular-file parent access policy mismatch",
+            ),
+        ):
+            MODULE._open_reconcile_parent_for_create(
+                self.home,
+                target,
+                planned,
+                {},
+                require_managed_parent_access=True,
+            )
+
+    def test_parent_chain_does_not_treat_directory_nlink_churn_as_mutation(
+        self,
+    ) -> None:
+        parent_fd = os.open(self.agents, os.O_RDONLY)
+        sample_count = 0
+
+        def metadata_with_nlink_churn(
+            file_descriptor: int,
+            _display_path: Path,
+            _expected_owner_uid: int,
+        ) -> SimpleNamespace:
+            nonlocal sample_count
+            sample_count += 1
+            actual = os.fstat(file_descriptor)
+            return SimpleNamespace(
+                st_mode=actual.st_mode,
+                st_uid=actual.st_uid,
+                st_dev=actual.st_dev,
+                st_ino=actual.st_ino,
+                st_nlink=actual.st_nlink + sample_count,
+            )
+
+        try:
+            with mock.patch.object(
+                MODULE,
+                "_require_release_identity_fd_access_policy",
+                side_effect=metadata_with_nlink_churn,
+            ):
+                MODULE._require_managed_regular_parent_chain_access(
+                    self.home,
+                    self.agents,
+                    bound_parent_fd=parent_fd,
+                )
+        finally:
+            os.close(parent_fd)
+
+    def test_darwin_parent_acl_rejects_non_owner_allow(self) -> None:
+        parent_fd = os.open(self.agents, os.O_RDONLY)
+        owner_uuid = b"o" * MODULE._DARWIN_UUID_BYTES
+        foreign_uuid = b"f" * MODULE._DARWIN_UUID_BYTES
+        try:
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE,
+                    "_load_darwin_extended_acl_api",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_darwin_extended_acl_entries",
+                    return_value=(
+                        (MODULE._DARWIN_ACL_EXTENDED_ALLOW, foreign_uuid),
+                    ),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_darwin_owner_uuid",
+                    return_value=owner_uuid,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "non-owner qualifier",
+                ),
+            ):
+                MODULE._require_managed_regular_directory_fd_access(
+                    self.home,
+                    self.agents,
+                    parent_fd,
+                )
+        finally:
+            os.close(parent_fd)
+
+    def test_darwin_parent_acl_query_failure_fails_closed(self) -> None:
+        parent_fd = os.open(self.agents, os.O_RDONLY)
+        try:
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE,
+                    "_load_darwin_extended_acl_api",
+                    side_effect=MODULE.SyncError("ACL query unavailable"),
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "access policy cannot be verified.*ACL query unavailable",
+                ),
+            ):
+                MODULE._require_managed_regular_directory_fd_access(
+                    self.home,
+                    self.agents,
+                    parent_fd,
+                )
+        finally:
+            os.close(parent_fd)
+
+    def test_regular_snapshot_revalidates_acl_on_the_same_fd_after_read(
+        self,
+    ) -> None:
+        target = self.agents / "reviewer.toml"
+        target.write_text('name = "reviewer"\n', encoding="utf-8")
+        os.chmod(target, 0o600)
+        parent_fd = os.open(self.agents, os.O_RDONLY)
+        sampled_fds: list[int] = []
+
+        def access_policy(
+            file_descriptor: int,
+            _display_path: Path,
+            _expected_owner_uid: int,
+        ) -> os.stat_result:
+            sampled_fds.append(file_descriptor)
+            if len(sampled_fds) == 2:
+                raise MODULE.SyncError("later ACL grants non-owner access")
+            return os.fstat(file_descriptor)
+
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_require_release_identity_fd_access_policy",
+                    side_effect=access_policy,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "later ACL grants non-owner access",
+                ),
+            ):
+                MODULE._regular_file_snapshot_at(
+                    parent_fd,
+                    target.name,
+                    target,
+                )
+        finally:
+            os.close(parent_fd)
+        self.assertEqual(len(sampled_fds), 2)
+        self.assertEqual(sampled_fds[0], sampled_fds[1])
+
+    def test_regular_metadata_match_ignores_ctime_only_drift(self) -> None:
+        target = self.agents / "reviewer.toml"
+        target.write_text('name = "reviewer"\n', encoding="utf-8")
+        baseline = os.lstat(target)
+        ctime_only = SimpleNamespace(
+            st_dev=baseline.st_dev,
+            st_ino=baseline.st_ino,
+            st_mode=baseline.st_mode,
+            st_uid=baseline.st_uid,
+            st_gid=baseline.st_gid,
+            st_size=baseline.st_size,
+            st_nlink=baseline.st_nlink,
+            st_ctime_ns=baseline.st_ctime_ns + 1,
+        )
+
+        self.assertTrue(MODULE._regular_stat_metadata_matches(ctime_only, baseline))
+
+
 class RegularAgentPendingRecoveryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -1833,7 +2095,7 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
             )
 
         self.assertTrue(crashed)
-        self.assertFalse(os.path.lexists(target))
+        self.assertTrue(target.is_file())
         self.assertTrue(journal.is_file())
         self.assertFalse(os.path.lexists(journal.with_name(temp_name)))
         self.assertIsNotNone(
@@ -1852,6 +2114,100 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
             "produced",
         )
         self.assertFalse(os.path.lexists(target))
+
+    def test_prepared_receipt_recovers_crash_after_active_rename(self) -> None:
+        install(self.release, self.home, SHA_A)
+        next_release = self.root / "next-release-prepared-receipt"
+        write_release(next_release, role_payload='name = "updated"\n')
+        batch = self._interrupt_uncommitted_regular_publication(next_release, SHA_B)
+        record = next(candidate for candidate in batch.records if candidate.is_regular())
+        target = self.home / Path(*record.target.parts)
+
+        for phase in ("produced", "before"):
+            with self.subTest(phase=phase):
+                if phase == "before":
+                    before = MODULE._pending_record_before_evidence_snapshot(
+                        self.home,
+                        batch,
+                        record,
+                    )
+                    MODULE._restore_pending_record_before(
+                        self.home,
+                        batch,
+                        record,
+                        before,
+                    )
+
+                expected, exists = MODULE._pending_target_snapshot(self.home, target)
+                self.assertTrue(exists)
+                assert isinstance(expected, MODULE.RegularFileSnapshot)
+                real_rename = MODULE._rename_noreplace_at
+                crashed = False
+
+                def crash_after_active_rename(
+                    source_fd: int,
+                    source_name: str,
+                    destination_fd: int,
+                    destination_name: str,
+                ) -> None:
+                    nonlocal crashed
+                    real_rename(
+                        source_fd,
+                        source_name,
+                        destination_fd,
+                        destination_name,
+                    )
+                    if (
+                        source_name == target.name
+                        and destination_name.startswith(
+                            MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+                        )
+                    ):
+                        crashed = True
+                        raise MODULE.SyncError(
+                            f"injected {phase} crash after active rename"
+                        )
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_rename_noreplace_at",
+                        side_effect=crash_after_active_rename,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        f"injected {phase} crash after active rename",
+                    ),
+                ):
+                    MODULE._delete_pending_regular_publication_beneath(
+                        self.home,
+                        batch,
+                        record,
+                        target,
+                        expected,
+                        phase=phase,
+                    )
+
+                self.assertTrue(crashed)
+                self.assertFalse(os.path.lexists(target))
+                journal = MODULE._read_pending_regular_publication_cleanup(
+                    self.home,
+                    batch,
+                    record,
+                    phase,
+                )
+                self.assertIsNotNone(journal)
+                assert journal is not None
+                _snapshot, active_name, _journal_phase, _journal_expected = journal
+                self.assertTrue(target.with_name(active_name).is_file())
+
+                MODULE._recover_pending_regular_publication_cleanup(
+                    self.home,
+                    batch,
+                    record,
+                    phase,
+                )
+                self.assertFalse(os.path.lexists(target.with_name(active_name)))
 
     def test_pending_cleanup_isolates_before_canonical_snapshot(self) -> None:
         batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
@@ -2641,6 +2997,20 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
                 without_terminal_regular,
             ),
         )
+
+    def test_regular_gid_policy_only_ignores_owner_only_gid_drift(self) -> None:
+        for mode, expected_match in (
+            (0o600, True),
+            (0o700, True),
+            (0o2700, False),
+            (0o604, False),
+            (0o640, False),
+        ):
+            with self.subTest(mode=oct(mode)):
+                self.assertEqual(
+                    MODULE._gid_matches_regular_file_access_policy(80, 20, mode),
+                    expected_match,
+                )
 
     def test_regular_snapshot_gid_comparison_follows_group_access(self) -> None:
         expected = MODULE.RegularFileSnapshot(

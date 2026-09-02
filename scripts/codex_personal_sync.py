@@ -185,6 +185,9 @@ MAX_RECONCILE_LINK_TARGET_BYTES = 4096
 STATE_RELATIVE_PATH = Path("state/managed-links.json")
 MAX_MANAGED_STATE_BYTES = 16 * 1024 * 1024
 QUARANTINE_RELATIVE_PATH = Path("quarantine")
+FAILED_MOVE_RECEIPT_NAME = "failed-move-recovery.json"
+FAILED_MOVE_ISOLATION_DIRECTORY_NAME = "failed-move"
+FAILED_MOVE_ISOLATION_ENTRY_NAME = "entry"
 PENDING_LINK_POINTER_NAME = ".personal-sync-pending-transaction.json"
 PENDING_LINK_METADATA_NAME = "pending-transaction.json"
 PENDING_LINK_METADATA_VERSION = 9
@@ -222,6 +225,7 @@ PENDING_CLEANUP_INDEX_RELATIVE_PATH = Path("pending-cleanup")
 PENDING_CLEANUP_TICKET_SUFFIX = ".json"
 PENDING_CLEANUP_TICKET_TEMP_SUFFIX = ".json.tmp"
 PENDING_CLEANUP_EMPTY_PROOF_SUFFIX = ".empty-proof"
+PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX = ".terminal-validation"
 PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX = ".publish-tmp"
 PENDING_CLEANUP_CURSOR_NAME = ".scan-cursor"
 PENDING_CLEANUP_CURSOR_TEMP_NAME = ".scan-cursor.tmp"
@@ -229,6 +233,7 @@ PENDING_CLEANUP_RETAINED_PREFIX = ".retained-cleanup-"
 PENDING_CLEANUP_ISOLATED_BATCH_PREFIX = ".cleanup-ready-"
 PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX = ".cleanup-active-entry-"
 PENDING_CLEANUP_RETAINED_ENTRY_PREFIX = ".cleanup-retained-entry-"
+PENDING_CLEANUP_TERMINAL_ALIAS_PREFIX = ".terminal-recovery-alias-"
 PENDING_REGULAR_PUBLICATION_RETAINED_CODE = (
     "pending-regular-publication-retained"
 )
@@ -246,7 +251,7 @@ MAX_PENDING_LINK_CLAIMS = 20_000
 MAX_PENDING_RELEASES = 10_000
 MAX_PENDING_CLEANUP_BATCH_SCAN = 10_000
 MAX_PENDING_CLEANUP_BATCHES_PER_RUN = 8
-MAX_PENDING_CLEANUP_CONTROL_ENTRIES = MAX_PENDING_CLEANUP_BATCH_SCAN * 3 + 8
+MAX_PENDING_CLEANUP_CONTROL_ENTRIES = MAX_PENDING_CLEANUP_BATCH_SCAN * 4 + 8
 MAX_RETAINED_QUARANTINE_BATCHES = 8
 MAX_PENDING_CLEANUP_DEPTH = MAX_MANIFEST_TARGET_PATH_DEPTH + 8
 MAX_PENDING_CLEANUP_ENTRIES = (
@@ -558,6 +563,10 @@ class SyncError(RuntimeError):
     def __init__(self, message: str, *, code: str | None = None) -> None:
         super().__init__(message)
         self.code = code
+
+
+class _PendingCleanupAccessPolicyError(SyncError):
+    pass
 
 
 class _PrivateControlRecoveryInitialAbsence(SyncError):
@@ -5069,6 +5078,11 @@ class ReconcileTargetSnapshot:
             raise ValueError("an existing reconcile parent cannot have missing parts")
 
 
+_REGULAR_FILE_GID_SENSITIVE_MODE_MASK = (
+    stat.S_IRWXG | stat.S_IRWXO | stat.S_ISGID
+)
+
+
 def _gid_matches_regular_file_access_policy(
     actual_gid: int | None,
     expected_gid: int | None,
@@ -5076,7 +5090,13 @@ def _gid_matches_regular_file_access_policy(
 ) -> bool:
     if actual_gid is None or expected_gid is None or expected_mode is None:
         return False
-    return not bool(expected_mode & 0o070) or actual_gid == expected_gid
+    # GID cannot affect an owner-only regular file without setgid. Any group or
+    # other permission can make GID select a different effective access class,
+    # while setgid can make GID part of the file's execution behavior.
+    return (
+        not bool(expected_mode & _REGULAR_FILE_GID_SENSITIVE_MODE_MASK)
+        or actual_gid == expected_gid
+    )
 
 
 def _reconcile_target_snapshot_matches(
@@ -5158,6 +5178,28 @@ class ReconcileMutation:
 class ReconcileTransaction:
     batch_root: Path | None
     mutations: list[ReconcileMutation]
+
+
+@dataclass(frozen=True)
+class FailedMoveIsolation:
+    isolation_parent: Path
+    isolation_parent_identity: tuple[int, int]
+    isolated: Path
+    receipt: ManagedStateFileSnapshot
+
+
+@dataclass(frozen=True)
+class FailedMoveRecoveryReceipt:
+    source: Path
+    source_parent_identity: tuple[int, int]
+    destination: Path
+    destination_parent_identity: tuple[int, int]
+    isolated: Path
+    isolation_parent_identity: tuple[int, int]
+    expected_identity: tuple[int, int]
+    expected_mode_type: int
+    expected_target: str | None
+    expected_regular: RegularFileSnapshot | None
 
 
 @dataclass(frozen=True)
@@ -9044,7 +9086,470 @@ def _rename_exchange_at(
         )
 
 
+def _failed_move_isolation_parent(home: Path) -> Path:
+    return _personal_sync_root(home) / FAILED_MOVE_ISOLATION_DIRECTORY_NAME
+
+
+def _failed_move_receipt_payload(
+    home: Path,
+    source: Path,
+    source_parent_identity: tuple[int, int],
+    destination: Path,
+    destination_parent_identity: tuple[int, int],
+    isolated: Path,
+    isolation_parent_identity: tuple[int, int],
+    expected_identity: tuple[int, int],
+    expected_mode_type: int,
+    expected_target: str | None,
+    expected_regular: RegularFileSnapshot | None,
+) -> bytes:
+    try:
+        source_relative = PurePosixPath(*source.relative_to(home).parts)
+        destination_relative = PurePosixPath(*destination.relative_to(home).parts)
+        isolated_relative = PurePosixPath(*isolated.relative_to(home).parts)
+    except ValueError as error:
+        raise SyncError("failed-move recovery path escaped the sync home") from error
+    regular_payload = None
+    if expected_regular is not None:
+        regular_payload = {
+            "sha256": expected_regular.sha256,
+            "size": expected_regular.size,
+            "mode": expected_regular.mode,
+            "uid": expected_regular.uid,
+            "gid": expected_regular.gid,
+            "link_count": expected_regular.link_count,
+        }
+    return _bounded_json_document(
+        {
+            "version": 1,
+            "source": source_relative.as_posix(),
+            "source_parent_identity": _identity_payload(source_parent_identity),
+            "destination": destination_relative.as_posix(),
+            "destination_parent_identity": _identity_payload(
+                destination_parent_identity
+            ),
+            "isolated": isolated_relative.as_posix(),
+            "isolation_parent_identity": _identity_payload(
+                isolation_parent_identity
+            ),
+            "expected_identity": _identity_payload(expected_identity),
+            "expected_mode_type": expected_mode_type,
+            "expected_target": expected_target,
+            "expected_regular": regular_payload,
+        },
+        max_bytes=4096,
+        overflow_error="failed-move recovery receipt exceeds the size limit",
+    )
+
+
+def _read_failed_move_recovery_receipt(
+    home: Path,
+) -> tuple[ManagedStateFileSnapshot, FailedMoveRecoveryReceipt] | None:
+    isolation_parent = _failed_move_isolation_parent(home)
+    receipt_path = isolation_parent / FAILED_MOVE_RECEIPT_NAME
+    try:
+        parent_fd = _open_directory_beneath(home, isolation_parent)
+    except FileNotFoundError:
+        return None
+    try:
+        parent_identity = _directory_identity(parent_fd)
+        metadata = os.fstat(parent_fd)
+        if (
+            stat.S_IMODE(metadata.st_mode) != 0o700
+            or metadata.st_uid != os.geteuid()
+            or not _bound_directory_matches(home, isolation_parent, parent_fd)
+        ):
+            raise SyncError("failed-move recovery directory access policy changed")
+        snapshot = _read_managed_state_file_snapshot(
+            home,
+            receipt_path,
+            parent_fd,
+            maximum_bytes=4096,
+        )
+    finally:
+        _close_fd_quietly(parent_fd)
+    if not snapshot.exists:
+        return None
+    if (
+        not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+        or snapshot.file_type != stat.S_IFREG
+        or snapshot.mode != 0o600
+        or snapshot.uid != os.geteuid()
+    ):
+        raise SyncError("failed-move recovery receipt changed")
+    data = _decode_managed_state_json(snapshot.payload, receipt_path)
+    if set(data) != {
+        "version",
+        "source",
+        "source_parent_identity",
+        "destination",
+        "destination_parent_identity",
+        "isolated",
+        "isolation_parent_identity",
+        "expected_identity",
+        "expected_mode_type",
+        "expected_target",
+        "expected_regular",
+    } or data.get("version") != 1:
+        raise SyncError("failed-move recovery receipt changed")
+    source_relative = _validate_relative_path(
+        data.get("source"), "failed-move recovery source"
+    )
+    destination_relative = _validate_relative_path(
+        data.get("destination"), "failed-move recovery destination"
+    )
+    isolated_relative = _validate_relative_path(
+        data.get("isolated"), "failed-move recovery isolated path"
+    )
+    source_parent_identity = _parse_pending_identity(
+        data.get("source_parent_identity"),
+        "failed-move recovery source parent identity",
+    )
+    destination_parent_identity = _parse_pending_identity(
+        data.get("destination_parent_identity"),
+        "failed-move recovery destination parent identity",
+    )
+    isolation_parent_identity = _parse_pending_identity(
+        data.get("isolation_parent_identity"),
+        "failed-move recovery isolation parent identity",
+    )
+    expected_identity = _parse_pending_identity(
+        data.get("expected_identity"),
+        "failed-move recovery entry identity",
+    )
+    expected_mode_type = data.get("expected_mode_type")
+    expected_target = data.get("expected_target")
+    if (
+        source_parent_identity is None
+        or destination_parent_identity is None
+        or isolation_parent_identity is None
+        or expected_identity is None
+        or not isinstance(expected_mode_type, int)
+        or isinstance(expected_mode_type, bool)
+        or expected_mode_type not in {stat.S_IFREG, stat.S_IFLNK, stat.S_IFDIR}
+        or (expected_target is not None and not isinstance(expected_target, str))
+    ):
+        raise SyncError("failed-move recovery receipt changed")
+    expected_regular = None
+    raw_regular = data.get("expected_regular")
+    if raw_regular is not None:
+        if not isinstance(raw_regular, dict) or set(raw_regular) != {
+            "sha256",
+            "size",
+            "mode",
+            "uid",
+            "gid",
+            "link_count",
+        }:
+            raise SyncError("failed-move recovery receipt changed")
+        integer_fields = ("size", "mode", "uid", "gid", "link_count")
+        if (
+            expected_mode_type != stat.S_IFREG
+            or not isinstance(raw_regular.get("sha256"), str)
+            or len(raw_regular["sha256"]) != 64
+            or any(
+                not isinstance(raw_regular.get(field), int)
+                or isinstance(raw_regular.get(field), bool)
+                for field in integer_fields
+            )
+        ):
+            raise SyncError("failed-move recovery receipt changed")
+        expected_regular = RegularFileSnapshot(
+            parent_identity=source_parent_identity,
+            file_identity=expected_identity,
+            sha256=raw_regular["sha256"],
+            size=raw_regular["size"],
+            mode=raw_regular["mode"],
+            uid=raw_regular["uid"],
+            gid=raw_regular["gid"],
+            link_count=raw_regular["link_count"],
+        )
+    elif expected_mode_type == stat.S_IFREG:
+        raise SyncError("failed-move regular recovery receipt is incomplete")
+    if (
+        (expected_mode_type == stat.S_IFLNK and expected_target is None)
+        or (expected_mode_type != stat.S_IFLNK and expected_target is not None)
+    ):
+        raise SyncError("failed-move recovery receipt changed")
+    source = home / Path(*source_relative.parts)
+    destination = home / Path(*destination_relative.parts)
+    isolated = home / Path(*isolated_relative.parts)
+    if (
+        isolated.parent != isolation_parent
+        or isolated.name != FAILED_MOVE_ISOLATION_ENTRY_NAME
+        or isolation_parent_identity != parent_identity
+        or source == destination
+        or source == isolated
+        or destination == isolated
+        or _failed_move_receipt_payload(
+            home,
+            source,
+            source_parent_identity,
+            destination,
+            destination_parent_identity,
+            isolated,
+            isolation_parent_identity,
+            expected_identity,
+            expected_mode_type,
+            expected_target,
+            expected_regular,
+        )
+        != snapshot.payload
+    ):
+        raise SyncError("failed-move recovery receipt changed")
+    return snapshot, FailedMoveRecoveryReceipt(
+        source=source,
+        source_parent_identity=source_parent_identity,
+        destination=destination,
+        destination_parent_identity=destination_parent_identity,
+        isolated=isolated,
+        isolation_parent_identity=isolation_parent_identity,
+        expected_identity=expected_identity,
+        expected_mode_type=expected_mode_type,
+        expected_target=expected_target,
+        expected_regular=expected_regular,
+    )
+
+
+def _failed_move_recovery_leaf_state(
+    home: Path,
+    path: Path,
+    parent_identity: tuple[int, int],
+    receipt: FailedMoveRecoveryReceipt,
+) -> str:
+    parent_fd = _open_directory_beneath(home, path.parent)
+    try:
+        if (
+            _directory_identity(parent_fd) != parent_identity
+            or not _bound_directory_matches(home, path.parent, parent_fd)
+        ):
+            raise SyncError(f"failed-move recovery parent changed: {path.parent}")
+        try:
+            metadata = os.stat(
+                path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return "missing"
+        if receipt.expected_regular is not None:
+            candidate = _regular_file_snapshot_at(parent_fd, path.name, path)
+            matches = (
+                _regular_snapshot_leaf_matches(candidate, receipt.expected_regular)
+                and candidate.link_count == receipt.expected_regular.link_count
+            )
+        elif receipt.expected_mode_type == stat.S_IFLNK:
+            identity, target = _symlink_snapshot_at(parent_fd, path.name)
+            matches = (
+                identity == receipt.expected_identity
+                and target == receipt.expected_target
+            )
+        else:
+            matches = (
+                (metadata.st_dev, metadata.st_ino) == receipt.expected_identity
+                and stat.S_IFMT(metadata.st_mode) == receipt.expected_mode_type
+            )
+        return "expected" if matches else "mismatch"
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _clear_failed_move_recovery_receipt(
+    home: Path,
+    snapshot: ManagedStateFileSnapshot,
+) -> None:
+    isolation_parent = _failed_move_isolation_parent(home)
+    parent_fd = _open_directory_beneath(home, isolation_parent)
+    try:
+        current = _read_managed_state_file_snapshot(
+            home,
+            isolation_parent / FAILED_MOVE_RECEIPT_NAME,
+            parent_fd,
+            maximum_bytes=4096,
+        )
+        if not _managed_state_snapshot_exact(current, snapshot):
+            raise SyncError("failed-move recovery receipt changed before cleanup")
+        os.unlink(FAILED_MOVE_RECEIPT_NAME, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        if _named_entry_identity(parent_fd, FAILED_MOVE_RECEIPT_NAME) is not None:
+            raise SyncError("failed-move recovery receipt reappeared")
+        if not _bound_directory_matches(home, isolation_parent, parent_fd):
+            raise SyncError("failed-move recovery directory changed during cleanup")
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _recover_failed_move_isolation(home: Path, *, dry_run: bool = False) -> bool:
+    loaded = _read_failed_move_recovery_receipt(home)
+    if loaded is None:
+        return False
+    snapshot, receipt = loaded
+    source_state = _failed_move_recovery_leaf_state(
+        home,
+        receipt.source,
+        receipt.source_parent_identity,
+        receipt,
+    )
+    destination_state = _failed_move_recovery_leaf_state(
+        home,
+        receipt.destination,
+        receipt.destination_parent_identity,
+        receipt,
+    )
+    isolated_state = _failed_move_recovery_leaf_state(
+        home,
+        receipt.isolated,
+        receipt.isolation_parent_identity,
+        receipt,
+    )
+    states = (source_state, destination_state, isolated_state)
+    if "mismatch" in states or states.count("expected") != 1:
+        raise SyncError(
+            "failed-move recovery aliases are ambiguous; exact evidence was retained"
+        )
+    if dry_run:
+        return True
+    if isolated_state == "expected":
+        destination_parent_fd = _open_directory_beneath(
+            home, receipt.destination.parent
+        )
+        isolation_parent_fd = _open_directory_beneath(home, receipt.isolated.parent)
+        try:
+            if (
+                _directory_identity(destination_parent_fd)
+                != receipt.destination_parent_identity
+                or _directory_identity(isolation_parent_fd)
+                != receipt.isolation_parent_identity
+            ):
+                raise SyncError("failed-move recovery parent changed before restore")
+            _rename_noreplace_at(
+                isolation_parent_fd,
+                receipt.isolated.name,
+                destination_parent_fd,
+                receipt.destination.name,
+            )
+            os.fsync(destination_parent_fd)
+            os.fsync(isolation_parent_fd)
+        finally:
+            _close_fd_quietly(isolation_parent_fd)
+            _close_fd_quietly(destination_parent_fd)
+        if (
+            _failed_move_recovery_leaf_state(
+                home,
+                receipt.destination,
+                receipt.destination_parent_identity,
+                receipt,
+            )
+            != "expected"
+        ):
+            raise SyncError("failed-move recovery destination could not be verified")
+    _clear_failed_move_recovery_receipt(home, snapshot)
+    return True
+
+
 def _isolate_failed_move_destination(
+    home: Path,
+    source: Path,
+    destination: Path,
+    expected_source_parent_identity: tuple[int, int],
+    expected_parent_identity: tuple[int, int],
+    expected_identity: tuple[int, int],
+    expected_mode_type: int,
+    expected_target: str | None,
+    expected_regular: RegularFileSnapshot | None,
+) -> FailedMoveIsolation:
+    if _recover_failed_move_isolation(home):
+        raise SyncError("recovered an earlier failed-move isolation; retry the move")
+    isolation_parent = _failed_move_isolation_parent(home)
+    isolation_parent_fd = _open_or_create_directory_beneath(
+        home,
+        isolation_parent,
+        mode=0o700,
+    )
+    destination_parent_fd = -1
+    try:
+        isolation_metadata = os.fstat(isolation_parent_fd)
+        isolation_parent_identity = _directory_identity(isolation_parent_fd)
+        if (
+            stat.S_IMODE(isolation_metadata.st_mode) != 0o700
+            or isolation_metadata.st_uid != os.geteuid()
+            or not _bound_directory_matches(
+                home, isolation_parent, isolation_parent_fd
+            )
+        ):
+            raise SyncError("failed-move isolation parent access policy mismatch")
+        if _named_entry_identity(
+            isolation_parent_fd, FAILED_MOVE_ISOLATION_ENTRY_NAME
+        ) is not None:
+            raise SyncError("failed-move isolation entry is already occupied")
+        destination_parent_fd = _open_directory_beneath(home, destination.parent)
+        if (
+            _directory_identity(destination_parent_fd) != expected_parent_identity
+            or not _bound_directory_matches(
+                home, destination.parent, destination_parent_fd
+            )
+        ):
+            raise SyncError(
+                "canonical destination parent changed before failed-move isolation; "
+                f"evidence was left in place: {destination}"
+            )
+        isolated = isolation_parent / FAILED_MOVE_ISOLATION_ENTRY_NAME
+        expected_receipt_payload = _failed_move_receipt_payload(
+            home,
+            source,
+            expected_source_parent_identity,
+            destination,
+            expected_parent_identity,
+            isolated,
+            isolation_parent_identity,
+            expected_identity,
+            expected_mode_type,
+            expected_target,
+            expected_regular,
+        )
+        receipt_path = isolation_parent / FAILED_MOVE_RECEIPT_NAME
+        _publish_atomic_exclusive_internal_file(
+            home,
+            receipt_path,
+            expected_receipt_payload,
+        )
+        loaded = _read_failed_move_recovery_receipt(home)
+        if loaded is None or loaded[0].payload != expected_receipt_payload:
+            raise SyncError("failed-move recovery receipt was not durable")
+        receipt_snapshot = loaded[0]
+        _rename_noreplace_at(
+            destination_parent_fd,
+            destination.name,
+            isolation_parent_fd,
+            isolated.name,
+        )
+        os.fsync(destination_parent_fd)
+        os.fsync(isolation_parent_fd)
+        if (
+            _failed_move_recovery_leaf_state(
+                home,
+                isolated,
+                isolation_parent_identity,
+                loaded[1],
+            )
+            != "expected"
+        ):
+            raise SyncError(
+                "destination racer was retained outside the active source after "
+                f"failed-move isolation: {isolated}"
+            )
+        return FailedMoveIsolation(
+            isolation_parent=isolation_parent,
+            isolation_parent_identity=isolation_parent_identity,
+            isolated=isolated,
+            receipt=receipt_snapshot,
+        )
+    finally:
+        _close_fd_quietly(destination_parent_fd)
+        _close_fd_quietly(isolation_parent_fd)
+
+
+def _retain_failed_restore_leaf(
     home: Path,
     destination: Path,
     expected_parent_identity: tuple[int, int],
@@ -9256,7 +9761,7 @@ def _isolate_current_failed_restore_leaf(
             source_parent_fd,
             source.name,
         )
-    return _isolate_failed_move_destination(
+    return _retain_failed_restore_leaf(
         home,
         source,
         expected_parent_identity,
@@ -9265,6 +9770,47 @@ def _isolate_current_failed_restore_leaf(
         link_target,
         regular,
     )
+
+
+def _return_failed_restore_mismatch_to_destination(
+    home: Path,
+    source: Path,
+    destination: Path,
+    source_parent_fd: int,
+    expected_source_parent_identity: tuple[int, int],
+    expected_destination_parent_identity: tuple[int, int],
+) -> Path:
+    destination_parent_fd = _open_directory_beneath(home, destination.parent)
+    try:
+        if (
+            _directory_identity(source_parent_fd)
+            != expected_source_parent_identity
+            or not _bound_directory_matches(home, source.parent, source_parent_fd)
+            or _directory_identity(destination_parent_fd)
+            != expected_destination_parent_identity
+            or not _bound_directory_matches(
+                home, destination.parent, destination_parent_fd
+            )
+        ):
+            raise SyncError(
+                "failed-move mismatch parent changed; active evidence was retained"
+            )
+        _rename_noreplace_at(
+            source_parent_fd,
+            source.name,
+            destination_parent_fd,
+            destination.name,
+        )
+        os.fsync(source_parent_fd)
+        if destination_parent_fd != source_parent_fd:
+            os.fsync(destination_parent_fd)
+        if _named_entry_identity(source_parent_fd, source.name) is not None:
+            raise SyncError(
+                "failed-move mismatch remained exposed at the active source"
+            )
+        return destination
+    finally:
+        _close_fd_quietly(destination_parent_fd)
 
 
 def _atomic_move_beneath_home(
@@ -9493,15 +10039,18 @@ def _atomic_move_beneath_home(
                         f"{source} ({rollback_source_identity}); evidence was "
                         f"retained at {destination}"
                     )
-                isolated = _isolate_failed_move_destination(
+                isolation = _isolate_failed_move_destination(
                     home,
+                    source,
                     destination,
+                    source_parent_identity_for_restore,
                     destination_parent_identity_for_restore,
                     moved_identity_for_restore,
                     moved_mode_type_for_restore,
                     moved_target_for_restore,
                     source_regular_for_restore,
                 )
+                isolated = isolation.isolated
                 if (
                     not _bound_directory_matches(
                         home,
@@ -9608,11 +10157,13 @@ def _atomic_move_beneath_home(
                     restored_metadata.st_dev,
                     restored_metadata.st_ino,
                 ) != moved_identity_for_restore:
-                    retained_racer = _isolate_current_failed_restore_leaf(
+                    retained_racer = _return_failed_restore_mismatch_to_destination(
                         home,
                         source,
-                        source_parent_identity_for_restore,
+                        destination,
                         rollback_source_parent_fd,
+                        source_parent_identity_for_restore,
+                        destination_parent_identity_for_restore,
                     )
                     restored = False
                     raise SyncError(
@@ -9651,11 +10202,13 @@ def _atomic_move_beneath_home(
                             expected_link_count=source_regular_for_restore.link_count,
                         )
                     ):
-                        retained_path = _isolate_current_failed_restore_leaf(
+                        retained_path = _return_failed_restore_mismatch_to_destination(
                             home,
                             source,
-                            source_parent_identity_for_restore,
+                            destination,
                             rollback_source_parent_fd,
+                            source_parent_identity_for_restore,
+                            destination_parent_identity_for_restore,
                         )
                         restored = False
                         semantic_error = SyncError(
@@ -9665,6 +10218,7 @@ def _atomic_move_beneath_home(
                         if restored_regular_error is not None:
                             raise semantic_error from restored_regular_error
                         raise semantic_error
+                _clear_failed_move_recovery_receipt(home, isolation.receipt)
                 rollback_destination_parent_fd = _open_directory_beneath(
                     home,
                     destination.parent,
@@ -9767,8 +10321,7 @@ def _regular_file_snapshot_at(
             raise SyncError(
                 f"managed regular file is unreadable: {path}: {error}"
             ) from error
-        opened = os.fstat(file_fd)
-        _require_release_identity_fd_access_policy(
+        opened = _require_release_identity_fd_access_policy(
             file_fd,
             path,
             os.geteuid(),
@@ -9785,6 +10338,15 @@ def _regular_file_snapshot_at(
         rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if not _regular_stat_metadata_matches(rebound, named):
             raise SyncError(f"managed regular file changed during read: {path}")
+        access_revalidated = _require_release_identity_fd_access_policy(
+            file_fd,
+            path,
+            os.geteuid(),
+        )
+        if not _regular_stat_metadata_matches(access_revalidated, named):
+            raise SyncError(
+                f"managed regular file changed during access-policy revalidation: {path}"
+            )
     finally:
         if file_fd >= 0:
             _close_fd_quietly(file_fd)
@@ -9808,8 +10370,11 @@ def _read_regular_file_snapshot_beneath(
 ) -> RegularFileSnapshot:
     parent_fd = _open_directory_beneath(home, path.parent)
     try:
-        if not _bound_directory_matches(home, path.parent, parent_fd):
-            raise SyncError(f"managed regular-file parent changed: {path.parent}")
+        _require_managed_regular_parent_chain_access(
+            home,
+            path.parent,
+            bound_parent_fd=parent_fd,
+        )
         snapshot = _regular_file_snapshot_at(parent_fd, path.name, path)
         if require_managed_access and (
             snapshot.mode != 0o600
@@ -9821,8 +10386,11 @@ def _read_regular_file_snapshot_beneath(
                 f"{path} (mode={snapshot.mode:o}, uid={snapshot.uid}, "
                 f"links={snapshot.link_count})"
             )
-        if not _bound_directory_matches(home, path.parent, parent_fd):
-            raise SyncError(f"managed regular-file parent changed: {path.parent}")
+        _require_managed_regular_parent_chain_access(
+            home,
+            path.parent,
+            bound_parent_fd=parent_fd,
+        )
         return snapshot
     finally:
         _close_fd_quietly(parent_fd)
@@ -9883,18 +10451,31 @@ def _capture_reconcile_target_snapshot(
     target: Path,
     *,
     capture_regular_content: bool = True,
+    require_managed_parent_access: bool = False,
 ) -> ReconcileTargetSnapshot:
     parent_parts = _directory_parts_beneath(home, target.parent)
     child_flags = _directory_open_flags(nofollow=True)
     parent_fd = _open_directory_beneath(home, home)
     current_path = home
     try:
+        if require_managed_parent_access:
+            _require_managed_regular_directory_fd_access(
+                home,
+                current_path,
+                parent_fd,
+            )
         for index, part in enumerate(parent_parts):
             try:
                 next_fd = os.open(part, child_flags, dir_fd=parent_fd)
             except FileNotFoundError:
                 ancestor_identity = _directory_identity(parent_fd)
-                if not _bound_directory_matches(home, current_path, parent_fd):
+                if require_managed_parent_access:
+                    _require_managed_regular_directory_fd_access(
+                        home,
+                        current_path,
+                        parent_fd,
+                    )
+                elif not _bound_directory_matches(home, current_path, parent_fd):
                     raise SyncError(f"managed target ancestor changed: {current_path}")
                 return ReconcileTargetSnapshot(
                     parent_identity=None,
@@ -9904,8 +10485,20 @@ def _capture_reconcile_target_snapshot(
             _close_fd_quietly(parent_fd)
             parent_fd = next_fd
             current_path /= part
+            if require_managed_parent_access:
+                _require_managed_regular_directory_fd_access(
+                    home,
+                    current_path,
+                    parent_fd,
+                )
         parent_identity = _directory_identity(parent_fd)
-        if not _bound_directory_matches(home, target.parent, parent_fd):
+        if require_managed_parent_access:
+            _require_managed_regular_directory_fd_access(
+                home,
+                target.parent,
+                parent_fd,
+            )
+        elif not _bound_directory_matches(home, target.parent, parent_fd):
             raise SyncError(f"managed target parent changed: {target.parent}")
         try:
             metadata = os.stat(
@@ -9914,7 +10507,13 @@ def _capture_reconcile_target_snapshot(
                 follow_symlinks=False,
             )
         except FileNotFoundError:
-            if not _bound_directory_matches(home, target.parent, parent_fd):
+            if require_managed_parent_access:
+                _require_managed_regular_directory_fd_access(
+                    home,
+                    target.parent,
+                    parent_fd,
+                )
+            elif not _bound_directory_matches(home, target.parent, parent_fd):
                 raise SyncError(f"managed target parent changed: {target.parent}")
             return ReconcileTargetSnapshot(
                 parent_identity=parent_identity,
@@ -9922,7 +10521,13 @@ def _capture_reconcile_target_snapshot(
             )
         if stat.S_ISREG(metadata.st_mode):
             if not capture_regular_content:
-                if not _bound_directory_matches(home, target.parent, parent_fd):
+                if require_managed_parent_access:
+                    _require_managed_regular_directory_fd_access(
+                        home,
+                        target.parent,
+                        parent_fd,
+                    )
+                elif not _bound_directory_matches(home, target.parent, parent_fd):
                     raise SyncError(
                         f"managed target parent changed: {target.parent}"
                     )
@@ -9936,7 +10541,13 @@ def _capture_reconcile_target_snapshot(
                 target.name,
                 target,
             )
-            if not _bound_directory_matches(home, target.parent, parent_fd):
+            if require_managed_parent_access:
+                _require_managed_regular_directory_fd_access(
+                    home,
+                    target.parent,
+                    parent_fd,
+                )
+            elif not _bound_directory_matches(home, target.parent, parent_fd):
                 raise SyncError(f"managed target parent changed: {target.parent}")
             return ReconcileTargetSnapshot(
                 parent_identity=parent_identity,
@@ -9950,6 +10561,12 @@ def _capture_reconcile_target_snapshot(
                 regular_link_count=regular.link_count,
             )
         if not stat.S_ISLNK(metadata.st_mode):
+            if require_managed_parent_access:
+                _require_managed_regular_directory_fd_access(
+                    home,
+                    target.parent,
+                    parent_fd,
+                )
             return ReconcileTargetSnapshot(
                 parent_identity=parent_identity,
                 link_identity=(metadata.st_dev, metadata.st_ino),
@@ -9960,7 +10577,13 @@ def _capture_reconcile_target_snapshot(
             link_target,
             f"managed target symlink value for {target}",
         )
-        if not _bound_directory_matches(home, target.parent, parent_fd):
+        if require_managed_parent_access:
+            _require_managed_regular_directory_fd_access(
+                home,
+                target.parent,
+                parent_fd,
+            )
+        elif not _bound_directory_matches(home, target.parent, parent_fd):
             raise SyncError(f"managed target parent changed: {target.parent}")
         return ReconcileTargetSnapshot(
             parent_identity=parent_identity,
@@ -9976,9 +10599,15 @@ def _require_reconcile_target_snapshot(
     home: Path,
     target: Path,
     expected_snapshot: ReconcileTargetSnapshot,
+    *,
+    require_managed_parent_access: bool = False,
 ) -> None:
     try:
-        actual_snapshot = _capture_reconcile_target_snapshot(home, target)
+        actual_snapshot = _capture_reconcile_target_snapshot(
+            home,
+            target,
+            require_managed_parent_access=require_managed_parent_access,
+        )
     except (OSError, SyncError) as error:
         raise SyncError(f"managed target changed after planning: {target}") from error
     if not _reconcile_target_snapshot_matches(actual_snapshot, expected_snapshot):
@@ -10255,16 +10884,29 @@ def _open_reconcile_parent_for_create(
     target: Path,
     expected_snapshot: ReconcileTargetSnapshot,
     created_parent_identities: dict[Path, tuple[int, int]],
+    *,
+    require_managed_parent_access: bool = False,
 ) -> int:
     if expected_snapshot.link_identity is not None:
         raise SyncError(f"create target was not absent when planned: {target}")
     if expected_snapshot.parent_identity is not None:
-        _require_reconcile_target_snapshot(home, target, expected_snapshot)
+        _require_reconcile_target_snapshot(
+            home,
+            target,
+            expected_snapshot,
+            require_managed_parent_access=require_managed_parent_access,
+        )
         parent_fd = _open_directory_beneath(home, target.parent)
         if _directory_identity(parent_fd) != expected_snapshot.parent_identity:
             _close_fd_quietly(parent_fd)
             raise SyncError(
                 f"managed target parent changed after planning: {target.parent}"
+            )
+        if require_managed_parent_access:
+            _require_managed_regular_parent_chain_access(
+                home,
+                target.parent,
+                bound_parent_fd=parent_fd,
             )
         return parent_fd
 
@@ -10287,6 +10929,12 @@ def _open_reconcile_parent_for_create(
         ):
             raise SyncError(
                 f"managed target ancestor changed after planning: {ancestor_path}"
+            )
+        if require_managed_parent_access:
+            _require_managed_regular_parent_chain_access(
+                home,
+                ancestor_path,
+                bound_parent_fd=parent_fd,
             )
         current_path = ancestor_path
         directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
@@ -10317,13 +10965,25 @@ def _open_reconcile_parent_for_create(
             _close_fd_quietly(parent_fd)
             parent_fd = next_fd
             current_path = next_path
-            if not _bound_directory_matches(home, current_path, parent_fd):
+            if require_managed_parent_access:
+                _require_managed_regular_directory_fd_access(
+                    home,
+                    current_path,
+                    parent_fd,
+                )
+            elif not _bound_directory_matches(home, current_path, parent_fd):
                 raise SyncError(
                     f"transaction-created managed parent changed: {current_path}"
                 )
         try:
             os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError:
+            if require_managed_parent_access:
+                _require_managed_regular_parent_chain_access(
+                    home,
+                    target.parent,
+                    bound_parent_fd=parent_fd,
+                )
             return parent_fd
         raise SyncError(f"managed target appeared after planning: {target}")
     except BaseException:
@@ -10517,12 +11177,18 @@ def _create_regular_file_beneath(
             target,
             expected_snapshot,
             created_parent_identities,
+            require_managed_parent_access=True,
         )
     else:
         parent_fd = _open_or_create_directory_beneath(home, target.parent)
     file_fd = -1
     created_identity: tuple[int, int] | None = None
     try:
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=parent_fd,
+        )
         parent_identity = _directory_identity(parent_fd)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         flags |= getattr(os, "O_CLOEXEC", 0)
@@ -10547,8 +11213,11 @@ def _create_regular_file_beneath(
             or snapshot.link_count != 1
         ):
             raise SyncError(f"created managed regular file changed: {target}")
-        if not _bound_directory_matches(home, target.parent, parent_fd):
-            raise SyncError(f"managed target parent changed: {target.parent}")
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=parent_fd,
+        )
         return snapshot
     except BaseException as error:
         if file_fd >= 0:
@@ -10951,6 +11620,84 @@ def _pending_cleanup_ticket_matches(
         and actual.marker_sha256 == expected.marker_sha256
         and actual.terminal_regular_targets == expected.terminal_regular_targets
     )
+
+
+def _require_pending_cleanup_fd_access_policy(
+    file_descriptor: int,
+    display_path: Path,
+    *,
+    expected_mode: int,
+) -> os.stat_result:
+    """Prove owner-only access on the exact pending-control object.
+
+    Object identity and type are stable signals and are revalidated by the
+    generic exact-FD ACL admission. POSIX mode and Darwin ACL semantics are the
+    protected access policy. ctime and directory link count are deliberately
+    only resampling signals; neither is treated as mutation by itself.
+    """
+    try:
+        metadata = _require_release_identity_fd_access_policy(
+            file_descriptor,
+            display_path,
+            os.geteuid(),
+        )
+    except SyncError as error:
+        raise _PendingCleanupAccessPolicyError(str(error)) from error
+    if stat.S_IMODE(metadata.st_mode) != expected_mode:
+        raise _PendingCleanupAccessPolicyError(
+            "pending cleanup access policy mismatch: "
+            f"{display_path}: mode {stat.S_IMODE(metadata.st_mode):04o} "
+            f"!= {expected_mode:04o}"
+        )
+    return metadata
+
+
+def _require_pending_cleanup_file_snapshot_access_policy(
+    home: Path,
+    path: Path,
+    parent_fd: int,
+    snapshot: ManagedStateFileSnapshot,
+) -> None:
+    if not snapshot.exists or snapshot.file_identity is None:
+        raise SyncError(f"pending cleanup authority is missing: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    file_fd = -1
+    try:
+        file_fd = os.open(path.name, flags, dir_fd=parent_fd)
+        before = _require_pending_cleanup_fd_access_policy(
+            file_fd,
+            path,
+            expected_mode=0o600,
+        )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (before.st_dev, before.st_ino) != snapshot.file_identity
+            or before.st_uid != snapshot.uid
+            or before.st_size != snapshot.size
+        ):
+            raise SyncError(f"pending cleanup authority changed: {path}")
+        rebound = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            (rebound.st_dev, rebound.st_ino) != snapshot.file_identity
+            or stat.S_IFMT(rebound.st_mode) != stat.S_IFREG
+            or not _bound_directory_matches(home, path.parent, parent_fd)
+        ):
+            raise SyncError(f"pending cleanup authority rebound: {path}")
+        after = _require_pending_cleanup_fd_access_policy(
+            file_fd,
+            path,
+            expected_mode=0o600,
+        )
+        if (
+            (after.st_dev, after.st_ino, after.st_size)
+            != (before.st_dev, before.st_ino, before.st_size)
+        ):
+            raise SyncError(f"pending cleanup authority changed: {path}")
+    finally:
+        if file_fd >= 0:
+            _close_fd_quietly(file_fd)
 
 
 def _read_managed_state_bytes(
@@ -12797,6 +13544,98 @@ def _ensure_safe_target_parent(home: Path, target: Path) -> None:
             raise SyncError(f"link parent exists but is not a directory: {current}")
 
 
+def _require_managed_regular_directory_fd_access(
+    home: Path,
+    directory: Path,
+    directory_fd: int,
+) -> os.stat_result:
+    """Prove an exact directory FD remains owner-controlled and path-bound.
+
+    The protected properties are directory object identity and access policy.
+    Child-entry churn is intentionally absent from the evidence: directory
+    link counts and timestamps are not compared.
+    """
+    try:
+        metadata = _require_release_identity_fd_access_policy(
+            directory_fd,
+            directory,
+            os.geteuid(),
+        )
+    except SyncError as error:
+        classification = (
+            "mismatch"
+            if " access policy mismatch:" in str(error)
+            else "cannot be verified"
+        )
+        raise SyncError(
+            f"managed regular-file parent access policy {classification}: "
+            f"{directory}: {error}"
+        ) from error
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or mode & 0o022
+    ):
+        raise SyncError(
+            "managed regular-file parent access policy mismatch: "
+            f"{directory} (mode={mode:04o}, uid={metadata.st_uid})"
+        )
+    if not _bound_directory_matches(home, directory, directory_fd):
+        raise SyncError(f"managed regular-file parent changed: {directory}")
+    return metadata
+
+
+def _require_managed_regular_parent_chain_access(
+    home: Path,
+    directory: Path,
+    *,
+    bound_parent_fd: int | None = None,
+) -> None:
+    parts = _directory_parts_beneath(home, directory)
+    current_fd = _bound_sync_home_anchor(home, None)
+    current_path = home
+    try:
+        metadata = _require_managed_regular_directory_fd_access(
+            home,
+            current_path,
+            current_fd,
+        )
+        for part in parts:
+            try:
+                next_fd = os.open(
+                    part,
+                    _directory_open_flags(nofollow=True),
+                    dir_fd=current_fd,
+                )
+            except OSError as error:
+                raise SyncError(
+                    f"managed regular-file parent chain is unreadable: {directory}"
+                ) from error
+            _close_fd_quietly(current_fd)
+            current_fd = next_fd
+            current_path /= part
+            metadata = _require_managed_regular_directory_fd_access(
+                home,
+                current_path,
+                current_fd,
+            )
+        if bound_parent_fd is None:
+            return
+        bound_metadata = _require_managed_regular_directory_fd_access(
+            home,
+            directory,
+            bound_parent_fd,
+        )
+        if (bound_metadata.st_dev, bound_metadata.st_ino) != (
+            metadata.st_dev,
+            metadata.st_ino,
+        ):
+            raise SyncError(f"managed regular-file parent changed: {directory}")
+    finally:
+        _close_fd_quietly(current_fd)
+
+
 def _known_owners(home: Path, extra_owners: set[str] | None = None) -> set[str]:
     owners = {PUBLIC_OWNER}
     if extra_owners:
@@ -13076,6 +13915,11 @@ def _plan_reconciliation(
             continue
         _ensure_safe_target_parent(home, target)
         record = state.links.get(relative_target)
+        require_managed_parent_access = bool(
+            (desired_entry is not None and _entry_materializes_regular_file(desired_entry))
+            or (record is not None and _record_materializes_regular_file(record))
+            or previous_regular_entries.get(relative_target)
+        )
         capture_regular_content = not (
             record is not None
             and not _record_materializes_regular_file(record)
@@ -13089,6 +13933,7 @@ def _plan_reconciliation(
                 home,
                 target,
                 capture_regular_content=capture_regular_content,
+                require_managed_parent_access=require_managed_parent_access,
             )
             if home.is_dir() and not home.is_symlink()
             else None
@@ -13333,6 +14178,7 @@ def _plan_reconciliation(
                     target,
                     "",
                     record.kind,
+                    expected_link_target=record.link_target,
                     planned_snapshot=planned_snapshot,
                     materialization="regular",
                 )
@@ -14117,14 +14963,35 @@ def _write_exclusive_internal_file(
             gid=created.st_gid,
         )
         os.fchmod(file_fd, 0o600)
+        admitted = _require_pending_cleanup_fd_access_policy(
+            file_fd,
+            path,
+            expected_mode=0o600,
+        )
+        empty_snapshot = ManagedStateFileSnapshot(
+            exists=True,
+            payload=b"",
+            mode=stat.S_IMODE(admitted.st_mode),
+            parent_identity=_directory_identity(parent_fd),
+            file_identity=(admitted.st_dev, admitted.st_ino),
+            file_type=stat.S_IFMT(admitted.st_mode),
+            size=admitted.st_size,
+            uid=admitted.st_uid,
+            gid=admitted.st_gid,
+        )
         with os.fdopen(file_fd, "wb", closefd=True) as file:
             file_fd = -1
             file.write(payload)
             file.flush()
             os.fsync(file.fileno())
+            _require_pending_cleanup_fd_access_policy(
+                file.fileno(),
+                path,
+                expected_mode=0o600,
+            )
         os.fsync(parent_fd)
         return _read_managed_state_file_snapshot(home, path, parent_fd)
-    except BaseException:
+    except BaseException as original_error:
         if file_fd >= 0:
             _close_fd_quietly(file_fd)
             file_fd = -1
@@ -14138,10 +15005,11 @@ def _write_exclusive_internal_file(
                     label="exclusive internal authority",
                 )
             except (OSError, SyncError) as cleanup_error:
-                raise SyncError(
+                original_error.add_note(
                     "exclusive internal authority creation failed and its "
-                    "final name could not be safely cleared"
-                ) from cleanup_error
+                    "final name could not be safely cleared: "
+                    f"{cleanup_error}"
+                )
         raise
     finally:
         if file_fd >= 0:
@@ -14185,7 +15053,12 @@ def _publish_atomic_exclusive_internal_file(
         raise SyncError(
             f"atomic internal authority temp backlog was retained: {temp_path}"
         )
-    staged = _write_exclusive_internal_file(home, temp_path, payload)
+    try:
+        staged = _write_exclusive_internal_file(home, temp_path, payload)
+    except _PendingCleanupAccessPolicyError as error:
+        raise SyncError(
+            f"atomic internal authority appeared with changed content: {path}"
+        ) from error
     parent_fd = _open_directory_beneath(home, path.parent)
     try:
         current_temp = _read_managed_state_file_snapshot(
@@ -14405,6 +15278,7 @@ def _publish_regular_reconcile_hardlink_beneath(
             target,
             expected_target_snapshot,
             created_parent_identities,
+            require_managed_parent_access=True,
         )
     except BaseException:
         _close_fd_quietly(source_parent_fd)
@@ -14425,8 +15299,11 @@ def _publish_regular_reconcile_hardlink_beneath(
             expected_link_count=source_snapshot.link_count,
         ) or not _bound_directory_matches(home, source.parent, source_parent_fd):
             raise SyncError(f"pending regular-file stage changed: {source}")
-        if not _bound_directory_matches(home, target.parent, target_parent_fd):
-            raise SyncError(f"managed target parent changed: {target.parent}")
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=target_parent_fd,
+        )
         os.link(
             source.name,
             target.name,
@@ -14470,10 +15347,13 @@ def _publish_regular_reconcile_hardlink_beneath(
             source_snapshot,
         ) or rebound_source.link_count != source_snapshot.link_count + 1:
             raise SyncError(f"pending regular-file stage changed: {source}")
-        if not _bound_directory_matches(
-            home, source.parent, source_parent_fd
-        ) or not _bound_directory_matches(home, target.parent, target_parent_fd):
+        if not _bound_directory_matches(home, source.parent, source_parent_fd):
             raise SyncError(f"managed regular-file parent changed: {target}")
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=target_parent_fd,
+        )
         return published_snapshot
     except BaseException as error:
         if published:
@@ -14796,7 +15676,13 @@ def _delete_pending_regular_publication_beneath(
         return
     existing = _read_pending_regular_publication_cleanup(home, batch, record, phase)
     if existing is not None:
-        raise SyncError("pending regular publication cleanup journal already exists")
+        _recover_pending_regular_publication_cleanup(
+            home,
+            batch,
+            record,
+            phase,
+        )
+        return
     parent_fd = _open_directory_beneath(home, target.parent)
     try:
         parent_identity = _directory_identity(parent_fd)
@@ -14810,46 +15696,20 @@ def _delete_pending_regular_publication_beneath(
             parent_identity,
             planned,
         )
-        # Remove the publication from its Codex-loadable canonical name before
-        # any content read or cleanup-journal write can fail. The internal name
-        # is durable and does not end in .toml, so even unreadable or replaced
-        # content remains fail-closed.
+        journal_path = _pending_regular_publication_cleanup_path(batch, record, phase)
+        _publish_atomic_exclusive_internal_file(
+            home,
+            journal_path,
+            _pending_regular_publication_cleanup_payload(
+                batch, record, expected, phase, active_name
+            ),
+        )
+        # Publish the complete immutable intent before removing a Codex-loadable
+        # canonical name. A crash can therefore leave only one of two authorized
+        # states: the exact target named in the intent, or its fully bound
+        # non-.toml active alias. Recovery accepts either and converges.
         _rename_noreplace_at(parent_fd, target.name, parent_fd, active_name)
         os.fsync(parent_fd)
-        journal_path = _pending_regular_publication_cleanup_path(batch, record, phase)
-        try:
-            _publish_atomic_exclusive_internal_file(
-                home,
-                journal_path,
-                _pending_regular_publication_cleanup_payload(
-                    batch, record, expected, phase, active_name
-                ),
-            )
-        except BaseException:
-            try:
-                published_journal = _read_pending_regular_publication_cleanup(
-                    home,
-                    batch,
-                    record,
-                    phase,
-                )
-            except BaseException:
-                published_journal = None
-            if published_journal is None:
-                _retain_pending_cleanup_entry(
-                    parent_fd,
-                    active_name,
-                    parent_identity,
-                    planned,
-                    label=(
-                        "pending regular publication cleanup journal failed after "
-                        f"isolation: {target}"
-                    ),
-                )
-            # The atomic rename may have committed the complete journal before
-            # surfacing an error. Leave its named internal entry in place so the
-            # normal recovery path can finish the exact deletion.
-            raise
         try:
             active = _regular_file_snapshot_at(
                 parent_fd,
@@ -17029,11 +17889,17 @@ def _stage_pending_link_batch(
                         action.target,
                         planned_snapshot,
                         created_parent_identities,
+                        require_managed_parent_access=(
+                            action.materialization == "regular"
+                        ),
                     )
                     _close_fd_quietly(parent_fd)
                     refreshed_snapshot = _capture_reconcile_target_snapshot(
                         home,
                         action.target,
+                        require_managed_parent_access=(
+                            action.materialization == "regular"
+                        ),
                     )
                     if (
                         refreshed_snapshot.parent_identity is None
@@ -17164,12 +18030,32 @@ def _stage_pending_link_batch(
                             )
                         finally:
                             _close_fd_quietly(stage_parent_fd)
-                        _publish_regular_hardlink_beneath(
-                            home,
-                            stage,
-                            evidence,
-                            stage_state,
+                        guard_path, guard = (
+                            _publish_pending_regular_staging_publication_guard(
+                                home,
+                                batch_root,
+                                batch_root_identity,
+                                record,
+                            )
                         )
+                        try:
+                            _publish_regular_hardlink_beneath(
+                                home,
+                                stage,
+                                evidence,
+                                stage_state,
+                            )
+                            _delete_pending_regular_staging_publication_guard(
+                                home,
+                                guard_path,
+                                guard,
+                            )
+                        except BaseException as error:
+                            raise SyncError(
+                                "pending regular staging publication was retained "
+                                f"for manual recovery: {record.target}: {error}",
+                                code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
+                            ) from error
                         stage_snapshot = _read_regular_file_snapshot_beneath(
                             home,
                             stage,
@@ -19122,6 +20008,22 @@ def _pending_cleanup_empty_proof_path(home: Path, batch_name: str) -> Path:
     )
 
 
+def _pending_cleanup_terminal_validation_path(
+    home: Path,
+    batch_name: str,
+) -> Path:
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        raise SyncError(
+            "pending cleanup terminal validation has an invalid batch name"
+        )
+    return _pending_cleanup_index_path(home) / (
+        batch_name + PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX
+    )
+
+
 def _pending_cleanup_isolated_batch_name(batch_name: str) -> str:
     return PENDING_CLEANUP_ISOLATED_BATCH_PREFIX + batch_name
 
@@ -19350,6 +20252,38 @@ def _isolate_and_delete_pending_cleanup_file(
     if not _bound_directory_matches(home, path.parent, parent_fd):
         raise SyncError(f"{label} parent changed before isolation")
 
+    preflight_fd = -1
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        try:
+            preflight_fd = os.open(path.name, flags, dir_fd=parent_fd)
+            preflight = _require_release_identity_fd_access_policy(
+                preflight_fd,
+                path,
+                os.geteuid(),
+            )
+            named_preflight = os.stat(
+                path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise SyncError(f"{label} changed before isolation") from error
+        if (
+            not _regular_stat_matches_managed_state_file_snapshot(
+                preflight,
+                expected,
+            )
+            or not _regular_stat_metadata_matches(named_preflight, preflight)
+            or not _bound_directory_matches(home, path.parent, parent_fd)
+        ):
+            raise SyncError(f"{label} changed before isolation")
+    finally:
+        if preflight_fd >= 0:
+            _close_fd_quietly(preflight_fd)
+
     retained_name: str | None = None
     for candidate in _retained_pending_cleanup_names(path):
         try:
@@ -19371,12 +20305,13 @@ def _isolate_and_delete_pending_cleanup_file(
     retained_path = path.with_name(retained_name)
     file_fd = -1
     try:
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        flags |= getattr(os, "O_NONBLOCK", 0)
         try:
             file_fd = os.open(retained_name, flags, dir_fd=parent_fd)
-            before = os.fstat(file_fd)
+            before = _require_release_identity_fd_access_policy(
+                file_fd,
+                retained_path,
+                os.geteuid(),
+            )
             payload = _read_managed_state_bytes(
                 file_fd,
                 retained_path,
@@ -19388,7 +20323,11 @@ def _isolate_and_delete_pending_cleanup_file(
                 retained_path,
                 maximum_bytes,
             )
-            after = os.fstat(file_fd)
+            after = _require_release_identity_fd_access_policy(
+                file_fd,
+                retained_path,
+                os.geteuid(),
+            )
             named = os.stat(
                 retained_name,
                 dir_fd=parent_fd,
@@ -19528,6 +20467,87 @@ def _pending_staging_cleanup_ticket_payload(
         max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
         overflow_error="pending cleanup ticket exceeds the size limit",
     )
+
+
+def _pending_regular_staging_publication_guard_payload(
+    batch_root: Path,
+    batch_root_identity: tuple[int, int],
+    record: PendingLinkRecord,
+) -> bytes:
+    if record.publication_cleanup is None or not record.is_regular():
+        raise SyncError("pending regular staging guard has no record authority")
+    return _bounded_json_document(
+        {
+            "version": 1,
+            "phase": "staging-publication",
+            "batch": batch_root.name,
+            "batch_root_identity": _identity_payload(batch_root_identity),
+            "record": record.index,
+            "stage": record.stage.as_posix() if record.stage is not None else None,
+            "evidence": (
+                record.evidence.as_posix() if record.evidence is not None else None
+            ),
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending regular staging guard exceeds the size limit",
+    )
+
+
+def _publish_pending_regular_staging_publication_guard(
+    home: Path,
+    batch_root: Path,
+    batch_root_identity: tuple[int, int],
+    record: PendingLinkRecord,
+) -> tuple[Path, ManagedStateFileSnapshot]:
+    if record.publication_cleanup is None:
+        raise SyncError("pending regular staging guard path is missing")
+    guard_path = batch_root / Path(*record.publication_cleanup.parts)
+    guard = _publish_atomic_exclusive_internal_file(
+        home,
+        guard_path,
+        _pending_regular_staging_publication_guard_payload(
+            batch_root,
+            batch_root_identity,
+            record,
+        ),
+    )
+    parent_fd = _open_directory_beneath(home, guard_path.parent)
+    try:
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            guard_path,
+            parent_fd,
+            guard,
+        )
+        os.fsync(parent_fd)
+    finally:
+        _close_fd_quietly(parent_fd)
+    return guard_path, guard
+
+
+def _delete_pending_regular_staging_publication_guard(
+    home: Path,
+    guard_path: Path,
+    guard: ManagedStateFileSnapshot,
+) -> None:
+    parent_fd = _open_directory_beneath(home, guard_path.parent)
+    try:
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            guard_path,
+            parent_fd,
+            guard,
+        )
+        _isolate_and_delete_pending_cleanup_file(
+            home,
+            guard_path,
+            parent_fd,
+            guard,
+            label="pending regular staging publication guard",
+        )
+        os.fsync(parent_fd)
+    finally:
+        _close_fd_quietly(parent_fd)
 
 
 def _pending_terminal_regular_targets_from_records(
@@ -19869,6 +20889,12 @@ def _read_pending_cleanup_ticket(
             raise SyncError(f"pending cleanup ticket mode changed: {batch_name}")
         if snapshot.uid != os.geteuid():
             raise SyncError(f"pending cleanup ticket owner changed: {batch_name}")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            ticket_path,
+            index_fd,
+            snapshot,
+        )
         data = _decode_managed_state_json(snapshot.payload, ticket_path)
         version = data.get("version")
         if type(version) is not int or version not in {1, 2, 3, 4}:
@@ -20031,6 +21057,12 @@ def _read_pending_cleanup_ticket(
             )
         if snapshot.payload != expected_payload:
             raise SyncError(f"pending cleanup ticket changed: {batch_name}")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            ticket_path,
+            index_fd,
+            snapshot,
+        )
         return PendingBatchCleanupTicket(
             version=version,
             phase=phase,
@@ -20077,6 +21109,12 @@ def _discard_incomplete_pending_cleanup_ticket(
                     raise SyncError(
                         f"incomplete pending cleanup ticket changed: {temp_path.name}"
                     )
+                _require_pending_cleanup_file_snapshot_access_policy(
+                    home,
+                    temp_path,
+                    index_fd,
+                    snapshot,
+                )
                 _isolate_and_delete_pending_cleanup_file(
                     home,
                     temp_path,
@@ -20112,6 +21150,12 @@ def _discard_incomplete_pending_cleanup_ticket(
                 raise SyncError(
                     f"incomplete pending cleanup retained temp changed: {retained_name}"
                 )
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                retained_path,
+                index_fd,
+                retained_snapshot,
+            )
             restored = _restore_exact_retained_pending_cleanup_file(
                 home,
                 temp_path,
@@ -20172,7 +21216,12 @@ def _publish_pending_cleanup_ticket(
         raise SyncError(
             "incomplete pending cleanup ticket temp backlog was retained; retry"
         )
-    staged = _write_exclusive_internal_file(home, temp_path, payload)
+    try:
+        staged = _write_exclusive_internal_file(home, temp_path, payload)
+    except _PendingCleanupAccessPolicyError as error:
+        raise SyncError(
+            "pending cleanup ticket appeared with changed content"
+        ) from error
     index_fd = _open_directory_beneath(home, ticket_path.parent)
     try:
         current_temp = _read_managed_state_file_snapshot(
@@ -20378,6 +21427,12 @@ def _pending_staging_marker_snapshot(
             or marker.parent_identity != _directory_identity(parent_fd)
         ):
             raise SyncError("pending staging cleanup marker changed")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            marker_path,
+            parent_fd,
+            marker,
+        )
         return marker
     finally:
         _close_fd_quietly(parent_fd)
@@ -20408,6 +21463,11 @@ def _bound_directory_member_names_for_staging_recovery(
             raise SyncError(
                 f"pending staging directory owner, mode, or identity changed: {path}"
             )
+        _require_pending_cleanup_fd_access_policy(
+            directory_fd,
+            path,
+            expected_mode=0o700,
+        )
         if not _bound_directory_matches(home, path, directory_fd):
             raise SyncError(f"pending staging directory changed: {path}")
         names = _directory_member_names(
@@ -20424,6 +21484,11 @@ def _bound_directory_member_names_for_staging_recovery(
             or not _bound_directory_matches(home, path, directory_fd)
         ):
             raise SyncError(f"pending staging directory changed: {path}")
+        _require_pending_cleanup_fd_access_policy(
+            directory_fd,
+            path,
+            expected_mode=0o700,
+        )
         return names
     finally:
         _close_fd_quietly(directory_fd)
@@ -20471,6 +21536,12 @@ def _require_pending_staging_initial_skeleton(
             raise SyncError(
                 f"pending staging metadata changed: {batch_root.name}"
             )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            batch_root / "metadata.json",
+            batch_fd,
+            metadata,
+        )
     finally:
         _close_fd_quietly(batch_fd)
     pending_root = batch_root / "pending"
@@ -20545,6 +21616,12 @@ def _require_pending_staging_initial_skeleton(
                 f"pending staging temp authority owner or mode changed: "
                 f"{batch_root.name}"
             )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            temp_path,
+            state_fd,
+            temp,
+        )
     finally:
         _close_fd_quietly(state_fd)
 
@@ -21308,6 +22385,11 @@ def _pending_batch_cleanup_name_is_authorized(
     ) is not None:
         return True
     if not relative_parent:
+        if re.fullmatch(
+            re.escape(PENDING_CLEANUP_TERMINAL_ALIAS_PREFIX) + r"[0-9]{8}",
+            name,
+        ) is not None:
+            return True
         return name in {
             "metadata.json",
             "pending",
@@ -21371,6 +22453,26 @@ def _pending_batch_cleanup_name_is_authorized(
     return False
 
 
+def _require_no_pending_staging_manual_retention(
+    home: Path,
+    bound_batch_root: Path,
+) -> None:
+    cleanup_root = bound_batch_root / "pending" / "cleanup"
+    try:
+        names = _bound_directory_member_names_for_staging_recovery(
+            home,
+            cleanup_root,
+            expected_entries=MAX_PENDING_LINK_RECORDS * 2,
+        )
+    except FileNotFoundError:
+        return
+    if names:
+        raise SyncError(
+            "pending staging regular-file evidence requires manual cleanup; "
+            f"the batch was retained without deletion: {bound_batch_root.name}"
+        )
+
+
 def _capture_pending_cleanup_identity_ledger(
     directory_fd: int,
     directory_identity: tuple[int, int],
@@ -21390,6 +22492,11 @@ def _capture_pending_cleanup_identity_ledger(
 ) -> None:
     if depth > MAX_PENDING_CLEANUP_DEPTH:
         raise SyncError("pending cleanup directory depth exceeds the limit")
+    _require_release_identity_fd_access_policy(
+        directory_fd,
+        Path("<pending-cleanup-scan>") / Path(*relative_parts),
+        os.geteuid(),
+    )
     if _directory_identity(directory_fd) != directory_identity:
         raise SyncError("pending cleanup directory identity changed")
     if _directory_mount_identity(directory_fd) != root_mount_identity:
@@ -21451,6 +22558,11 @@ def _capture_pending_cleanup_identity_ledger(
             )
             entries.append((entry.name, active_plan or planned, active_plan is not None))
     ledger[directory_identity] = tuple(entries)
+    _require_release_identity_fd_access_policy(
+        directory_fd,
+        Path("<pending-cleanup-scan>") / Path(*relative_parts),
+        os.geteuid(),
+    )
 
     directory_flags = _directory_open_flags(nofollow=True)
     for name, planned, _already_active in entries:
@@ -21499,9 +22611,15 @@ def _remove_pending_batch_directory_contents(
     name_validator: (
         Callable[[tuple[str, ...], str, tuple[int, int]], bool] | None
     ) = None,
+    regular_file_expected_mode: int | None = 0o600,
 ) -> None:
     if depth > MAX_PENDING_CLEANUP_DEPTH:
         raise SyncError("pending cleanup directory depth exceeds the limit")
+    _require_release_identity_fd_access_policy(
+        directory_fd,
+        Path(f"<pending-cleanup-fd:{directory_identity[0]}:{directory_identity[1]}>") ,
+        os.geteuid(),
+    )
     if _directory_identity(directory_fd) != directory_identity:
         raise SyncError("pending cleanup directory identity changed")
     if _directory_mount_identity(directory_fd) != root_mount_identity:
@@ -21549,6 +22667,11 @@ def _remove_pending_batch_directory_contents(
             "pending cleanup directory changed after identity-ledger capture; "
             "the batch was retained without deleting unknown entries"
         )
+    _require_release_identity_fd_access_policy(
+        directory_fd,
+        Path(f"<pending-cleanup-fd:{directory_identity[0]}:{directory_identity[1]}>") ,
+        os.geteuid(),
+    )
 
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     directory_flags |= getattr(os, "O_CLOEXEC", 0)
@@ -21634,6 +22757,7 @@ def _remove_pending_batch_directory_contents(
                     relative_parts=(*relative_parts, name),
                     identity_ledger=identity_ledger,
                     name_validator=name_validator,
+                    regular_file_expected_mode=regular_file_expected_mode,
                 )
                 try:
                     current = os.stat(
@@ -21674,6 +22798,49 @@ def _remove_pending_batch_directory_contents(
             finally:
                 _close_fd_quietly(child_fd)
         elif stat.S_ISREG(current.st_mode) or stat.S_ISLNK(current.st_mode):
+            if stat.S_ISREG(current.st_mode):
+                file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                file_flags |= getattr(os, "O_NOFOLLOW", 0)
+                file_flags |= getattr(os, "O_NONBLOCK", 0)
+                file_fd = -1
+                try:
+                    file_fd = os.open(
+                        active_name,
+                        file_flags,
+                        dir_fd=directory_fd,
+                    )
+                    display_path = (
+                        Path("<pending-cleanup-file>")
+                        / Path(*relative_parts)
+                        / name
+                    )
+                    if regular_file_expected_mode is None:
+                        opened = _require_release_identity_fd_access_policy(
+                            file_fd,
+                            display_path,
+                            os.geteuid(),
+                        )
+                    else:
+                        opened = _require_pending_cleanup_fd_access_policy(
+                            file_fd,
+                            display_path,
+                            expected_mode=regular_file_expected_mode,
+                        )
+                    if _pending_cleanup_entry_plan(opened) != planned:
+                        raise SyncError(
+                            f"pending cleanup regular file changed: {name}"
+                        )
+                except BaseException:
+                    _retain_pending_cleanup_entry(
+                        directory_fd,
+                        active_name,
+                        directory_identity,
+                        planned,
+                        label=f"pending cleanup regular file changed: {name}",
+                    )
+                finally:
+                    if file_fd >= 0:
+                        _close_fd_quietly(file_fd)
             try:
                 os.unlink(active_name, dir_fd=directory_fd)
             except OSError:
@@ -21727,8 +22894,288 @@ def _remove_pending_batch_directory_contents(
             )
     if mutated:
         os.fsync(directory_fd)
+    _require_release_identity_fd_access_policy(
+        directory_fd,
+        Path(f"<pending-cleanup-fd:{directory_identity[0]}:{directory_identity[1]}>") ,
+        os.geteuid(),
+    )
     if owns_ledger and identity_ledger:
         raise SyncError("pending cleanup identity ledger was not fully consumed")
+
+
+def _pending_terminal_snapshot_matches_expectation(
+    snapshot: RegularFileSnapshot,
+    expectation: PendingRegularTargetExpectation,
+    *,
+    expected_parent_identity: tuple[int, int],
+) -> bool:
+    return (
+        snapshot.parent_identity == expected_parent_identity
+        and snapshot.file_identity == expectation.file_identity
+        and snapshot.sha256 == expectation.sha256
+        and snapshot.size == expectation.size
+        and snapshot.mode == expectation.mode
+        and snapshot.uid == expectation.uid
+        and snapshot.link_count >= 1
+    )
+
+
+def _pending_terminal_recovery_alias_name(index: int) -> str:
+    if index < 0 or index >= MAX_PENDING_LINK_RECORDS:
+        raise SyncError("pending terminal recovery alias index is invalid")
+    return f"{PENDING_CLEANUP_TERMINAL_ALIAS_PREFIX}{index:08d}"
+
+
+def _validate_pending_terminal_target_and_alias(
+    home: Path,
+    bound_batch_root: Path,
+    batch_root_identity: tuple[int, int],
+    expectation: PendingRegularTargetExpectation,
+    alias_name: str,
+) -> None:
+    target = home / Path(*expectation.target.parts)
+    target_snapshot = _read_regular_file_snapshot_beneath(
+        home,
+        target,
+        require_managed_access=False,
+    )
+    if not _pending_terminal_snapshot_matches_expectation(
+        target_snapshot,
+        expectation,
+        expected_parent_identity=expectation.parent_identity,
+    ):
+        raise SyncError(f"final managed regular file changed: {expectation.target}")
+    alias = bound_batch_root / alias_name
+    alias_snapshot = _read_regular_file_snapshot_beneath(
+        home,
+        alias,
+        require_managed_access=False,
+    )
+    if not _pending_terminal_snapshot_matches_expectation(
+        alias_snapshot,
+        expectation,
+        expected_parent_identity=batch_root_identity,
+    ):
+        raise SyncError(
+            f"pending terminal recovery alias changed: {expectation.target}"
+        )
+
+
+def _ensure_pending_terminal_validation_receipt(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    bound_batch_root: Path,
+    batch_fd: int,
+    quarantine_root_identity: tuple[int, int],
+) -> None:
+    if ticket.version != 4 or not ticket.terminal_regular_targets:
+        return
+    existing_receipt = _read_pending_cleanup_terminal_validation(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
+    if existing_receipt is not None:
+        return
+
+    for index, expectation in enumerate(ticket.terminal_regular_targets):
+        alias_name = _pending_terminal_recovery_alias_name(index)
+        alias_identity = _named_entry_identity(batch_fd, alias_name)
+        target = home / Path(*expectation.target.parts)
+        if alias_identity is None:
+            target_parent_fd = _open_directory_beneath(home, target.parent)
+            try:
+                target_state = _read_managed_state_file_snapshot(
+                    home,
+                    target,
+                    target_parent_fd,
+                    expected_identity=expectation.file_identity,
+                    maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                )
+            finally:
+                _close_fd_quietly(target_parent_fd)
+            _publish_regular_hardlink_beneath(
+                home,
+                target,
+                bound_batch_root / alias_name,
+                target_state,
+                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+            )
+        elif alias_identity != expectation.file_identity:
+            raise SyncError(
+                f"pending terminal recovery alias changed: {expectation.target}"
+            )
+        _validate_pending_terminal_target_and_alias(
+            home,
+            bound_batch_root,
+            ticket.batch_root_identity,
+            expectation,
+            alias_name,
+        )
+
+    os.fsync(batch_fd)
+    current_ticket = _read_pending_cleanup_ticket(
+        home,
+        ticket.path,
+        expected_ticket_identity=ticket.snapshot.file_identity,
+    )
+    if current_ticket is None or not _pending_cleanup_ticket_matches(
+        current_ticket,
+        ticket,
+    ):
+        raise SyncError(f"pending cleanup ticket changed: {ticket.batch_root.name}")
+    _publish_pending_cleanup_terminal_validation(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
+    for index, expectation in enumerate(ticket.terminal_regular_targets):
+        _validate_pending_terminal_target_and_alias(
+            home,
+            bound_batch_root,
+            ticket.batch_root_identity,
+            expectation,
+            _pending_terminal_recovery_alias_name(index),
+        )
+
+
+def _pending_cleanup_terminal_validation_payload(
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+) -> bytes:
+    if ticket.snapshot.file_identity is None or ticket.snapshot.payload is None:
+        raise SyncError("pending cleanup ticket has no validation identity")
+    return _bounded_json_document(
+        {
+            "version": 1,
+            "phase": "terminal-validation",
+            "batch": ticket.batch_root.name,
+            "batch_root_identity": _identity_payload(ticket.batch_root_identity),
+            "quarantine_root_identity": _identity_payload(
+                quarantine_root_identity
+            ),
+            "ticket_identity": _identity_payload(ticket.snapshot.file_identity),
+            "ticket_sha256": hashlib.sha256(ticket.snapshot.payload).hexdigest(),
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending cleanup validation receipt exceeds the size limit",
+    )
+
+
+def _read_pending_cleanup_terminal_validation(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+) -> ManagedStateFileSnapshot | None:
+    receipt_path = _pending_cleanup_terminal_validation_path(
+        home,
+        ticket.batch_root.name,
+    )
+    index_fd = _open_directory_beneath(home, receipt_path.parent)
+    try:
+        receipt = _read_managed_state_file_snapshot(
+            home,
+            receipt_path,
+            index_fd,
+        )
+        if not receipt.exists:
+            return None
+        if (
+            receipt.file_type != stat.S_IFREG
+            or receipt.mode != 0o600
+            or receipt.uid != os.geteuid()
+            or receipt.payload
+            != _pending_cleanup_terminal_validation_payload(
+                ticket,
+                quarantine_root_identity,
+            )
+            or receipt.parent_identity != _directory_identity(index_fd)
+        ):
+            raise SyncError(
+                "pending cleanup terminal validation changed: "
+                f"{ticket.batch_root.name}"
+            )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            receipt_path,
+            index_fd,
+            receipt,
+        )
+        return receipt
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _publish_pending_cleanup_terminal_validation(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+) -> ManagedStateFileSnapshot:
+    existing = _read_pending_cleanup_terminal_validation(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
+    if existing is not None:
+        return existing
+    receipt_path = _pending_cleanup_terminal_validation_path(
+        home,
+        ticket.batch_root.name,
+    )
+    receipt = _publish_atomic_exclusive_internal_file(
+        home,
+        receipt_path,
+        _pending_cleanup_terminal_validation_payload(
+            ticket,
+            quarantine_root_identity,
+        ),
+    )
+    verified = _read_pending_cleanup_terminal_validation(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
+    if verified is None or not _managed_state_snapshot_matches_bound_file_evidence(
+        verified,
+        receipt,
+    ):
+        raise SyncError(
+            "pending cleanup terminal validation changed after publication: "
+            f"{ticket.batch_root.name}"
+        )
+    return verified
+
+
+def _delete_pending_cleanup_terminal_validation(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+) -> None:
+    receipt = _read_pending_cleanup_terminal_validation(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
+    if receipt is None:
+        return
+    receipt_path = _pending_cleanup_terminal_validation_path(
+        home,
+        ticket.batch_root.name,
+    )
+    index_fd = _open_directory_beneath(home, receipt_path.parent)
+    try:
+        _isolate_and_delete_pending_cleanup_file(
+            home,
+            receipt_path,
+            index_fd,
+            receipt,
+            label=(
+                "pending cleanup terminal validation "
+                f"{ticket.batch_root.name}"
+            ),
+        )
+    finally:
+        _close_fd_quietly(index_fd)
 
 
 def _pending_cleanup_empty_proof_payload(
@@ -21788,6 +23235,12 @@ def _read_pending_cleanup_empty_proof(
             raise SyncError(
                 f"pending cleanup empty proof changed: {ticket.batch_root.name}"
             )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            proof_path,
+            index_fd,
+            proof,
+        )
         return proof
     finally:
         _close_fd_quietly(index_fd)
@@ -21890,6 +23343,11 @@ def _remove_cleanup_ready_batch(
     try:
         if not _bound_directory_matches(home, quarantine_root, quarantine_fd):
             raise SyncError("pending cleanup quarantine root changed")
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd,
+            quarantine_root,
+            expected_mode=0o700,
+        )
         quarantine_root_identity = _directory_identity(quarantine_fd)
         batch_name = ticket.batch_root.name
         isolated_name = _pending_cleanup_isolated_batch_name(batch_name)
@@ -21921,8 +23379,13 @@ def _remove_cleanup_ready_batch(
                     raise SyncError(
                         "pending cleanup batch root is missing without an exact "
                         f"empty proof: {batch_name}"
-                    )
+                )
                 _verify_final_regular_targets(home, ticket)
+                _delete_pending_cleanup_terminal_validation(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                )
                 _delete_pending_cleanup_ticket(home, ticket)
                 _delete_pending_cleanup_empty_proof(
                     home,
@@ -21936,6 +23399,23 @@ def _remove_cleanup_ready_batch(
             home, bound_batch_root, batch_fd
         ):
             raise SyncError(f"pending cleanup batch root changed: {batch_name}")
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd,
+            bound_batch_root,
+            expected_mode=0o700,
+        )
+        if ticket.version == 3:
+            _require_no_pending_staging_manual_retention(
+                home,
+                bound_batch_root,
+            )
+        _ensure_pending_terminal_validation_receipt(
+            home,
+            ticket,
+            bound_batch_root,
+            batch_fd,
+            quarantine_root_identity,
+        )
         _remove_pending_batch_directory_contents(
             batch_fd,
             ticket.batch_root_identity,
@@ -21968,6 +23448,11 @@ def _remove_cleanup_ready_batch(
             or not _bound_directory_matches(home, bound_batch_root, batch_fd)
         ):
             raise SyncError(f"pending cleanup batch root changed: {batch_name}")
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd,
+            bound_batch_root,
+            expected_mode=0o700,
+        )
         _publish_pending_cleanup_empty_proof(
             home,
             ticket,
@@ -21982,6 +23467,11 @@ def _remove_cleanup_ready_batch(
             _close_fd_quietly(batch_fd)
         _close_fd_quietly(quarantine_fd)
     _verify_final_regular_targets(home, ticket)
+    _delete_pending_cleanup_terminal_validation(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
     _delete_pending_cleanup_ticket(home, ticket)
     _delete_pending_cleanup_empty_proof(
         home,
@@ -22219,6 +23709,7 @@ def _pending_cleanup_retained_control_name(
     for suffix in (
         PENDING_CLEANUP_TICKET_SUFFIX,
         PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
+        PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
     ):
         if not canonical.endswith(suffix):
             continue
@@ -22306,6 +23797,12 @@ def _restore_pending_cleanup_control_tombstones(
                 raise SyncError(
                     f"pending cleanup retained control owner changed: {canonical}"
                 )
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                retained_path,
+                index_fd,
+                retained_snapshot,
+            )
             recovered = _restore_retained_pending_cleanup_file(
                 home,
                 canonical_path,
@@ -22404,15 +23901,21 @@ def _read_orphan_pending_cleanup_empty_proof(
             proof_path,
             index_fd,
         )
+        if (
+            not proof.exists
+            or proof.payload is None
+            or proof.mode != 0o600
+            or proof.uid != os.geteuid()
+        ):
+            raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            proof_path,
+            index_fd,
+            proof,
+        )
     finally:
         _close_fd_quietly(index_fd)
-    if (
-        not proof.exists
-        or proof.payload is None
-        or proof.mode != 0o600
-        or proof.uid != os.geteuid()
-    ):
-        raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
     data = _decode_managed_state_json(proof.payload, proof_path)
     if set(data) != {
         "version",
@@ -22588,6 +24091,7 @@ def _pending_cleanup_ready_batch_is_observed(home: Path) -> bool:
                 for suffix in (
                     PENDING_CLEANUP_TICKET_SUFFIX,
                     PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
+                    PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
                 ):
                     if not entry.name.endswith(suffix):
                         continue
@@ -23730,6 +25234,8 @@ def _recover_pending_link_transaction(
     *,
     dry_run: bool,
 ) -> tuple[ManagedState, ManagedStateFileSnapshot, bool]:
+    if not dry_run:
+        _recover_failed_move_isolation(home)
     batch = _load_pending_link_batch(home)
     if batch is None:
         return state, state_snapshot, False
@@ -32789,6 +34295,7 @@ def _delete_quarantined_release(
             _directory_mount_identity(release_fd),
             [MAX_PENDING_CLEANUP_ENTRIES],
             depth=0,
+            regular_file_expected_mode=None,
         )
         isolated = os.stat(
             active_name,
@@ -33185,6 +34692,8 @@ def _recover_release_retention_transaction(
     *,
     dry_run: bool,
 ) -> ReleaseRetentionRecoveryOutcome | None:
+    if not dry_run:
+        _recover_failed_move_isolation(home)
     transaction = _load_release_retention_transaction(home)
     if transaction is None:
         return None

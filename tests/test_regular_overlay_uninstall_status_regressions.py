@@ -244,6 +244,156 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             {MODULE.PUBLIC_OWNER: SHA_A},
         )
 
+    def test_terminal_cleanup_retains_batch_when_canonical_target_is_missing(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(
+                MODULE,
+                "_try_cleanup_finalized_pending_batch",
+                return_value=False,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "committed regular-file evidence cleanup was deferred",
+            ),
+        ):
+            MODULE.uninstall_overlay(self.home, "private", dry_run=False)
+
+        ticket_paths = list(
+            MODULE._pending_cleanup_index_path(self.home).glob("*.json")
+        )
+        self.assertEqual(len(ticket_paths), 1)
+        ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket_paths[0])
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        expected_identity = ticket.terminal_regular_targets[0].file_identity
+        self.target.unlink()
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "(managed regular file is unreadable|no source identity)",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        retained_identities = {
+            (path.stat().st_dev, path.stat().st_ino)
+            for path in ticket.batch_root.rglob("*")
+            if path.is_file()
+        }
+        self.assertIn(expected_identity, retained_identities)
+        self.assertTrue(ticket.path.is_file())
+        self.assertFalse(
+            MODULE._pending_cleanup_empty_proof_path(
+                self.home,
+                ticket.batch_root.name,
+            ).exists()
+        )
+
+    def test_terminal_validation_receipt_survives_crash_before_deletion(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(
+                MODULE,
+                "_try_cleanup_finalized_pending_batch",
+                return_value=False,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "committed regular-file evidence cleanup was deferred",
+            ),
+        ):
+            MODULE.uninstall_overlay(self.home, "private", dry_run=False)
+
+        ticket_path = next(
+            MODULE._pending_cleanup_index_path(self.home).glob("*.json")
+        )
+        ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket_path)
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=SystemExit("injected crash after receipt"),
+            ),
+            self.assertRaisesRegex(SystemExit, "after receipt"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        receipt = MODULE._pending_cleanup_terminal_validation_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        proof = MODULE._pending_cleanup_empty_proof_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        alias = ticket.batch_root / MODULE._pending_terminal_recovery_alias_name(0)
+        self.assertTrue(receipt.is_file())
+        self.assertFalse(proof.exists())
+        self.assertTrue(alias.is_file())
+        self.assertEqual(
+            (alias.stat().st_dev, alias.stat().st_ino),
+            ticket.terminal_regular_targets[0].file_identity,
+        )
+
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
+        self.assertFalse(ticket.path.exists())
+        self.assertFalse(receipt.exists())
+        self.assertFalse(proof.exists())
+        self.assertFalse(ticket.batch_root.exists())
+        self.assertEqual(self.target.stat().st_nlink, 1)
+
+    def test_cleanup_acl_query_failure_retains_terminal_batch(self) -> None:
+        with (
+            mock.patch.object(
+                MODULE,
+                "_try_cleanup_finalized_pending_batch",
+                return_value=False,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "committed regular-file evidence cleanup was deferred",
+            ),
+        ):
+            MODULE.uninstall_overlay(self.home, "private", dry_run=False)
+
+        ticket_path = next(
+            MODULE._pending_cleanup_index_path(self.home).glob("*.json")
+        )
+        ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket_path)
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        real_policy = MODULE._require_pending_cleanup_fd_access_policy
+
+        def fail_batch_acl(file_descriptor, display_path, *, expected_mode):
+            if display_path == ticket.batch_root:
+                raise MODULE.SyncError("injected Darwin ACL query failure")
+            return real_policy(
+                file_descriptor,
+                display_path,
+                expected_mode=expected_mode,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_require_pending_cleanup_fd_access_policy",
+                side_effect=fail_batch_acl,
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "ACL query failure"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertGreater(self.target.stat().st_nlink, 1)
+
     def test_final_regular_target_is_verified_after_cleanup(self) -> None:
         real_verify = MODULE._verify_final_regular_targets
 
