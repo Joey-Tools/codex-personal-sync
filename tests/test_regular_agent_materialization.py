@@ -855,6 +855,28 @@ class PrivateRegularAgentTests(unittest.TestCase):
         ):
             MODULE.verify_overlay(self.home, "private")
 
+    def test_private_overlay_verify_rejects_unsafe_regular_target_ancestor(
+        self,
+    ) -> None:
+        self._install_public_base()
+        self._install_private()
+        os.chmod(self.home, 0o777)
+        output = io.StringIO()
+
+        with (
+            contextlib.redirect_stdout(output),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "overlay verification failed",
+            ),
+        ):
+            MODULE.verify_overlay(self.home, "private")
+
+        self.assertIn(
+            "managed regular-file parent access policy mismatch",
+            output.getvalue(),
+        )
+
     def test_uninstall_removes_private_only_regular_role(self) -> None:
         self._install_public_base()
         target = self._install_private()
@@ -989,6 +1011,90 @@ class RegularAccessPolicyTests(unittest.TestCase):
                 {},
                 require_managed_parent_access=True,
             )
+
+    def test_destructive_move_rejects_direct_parent_policy_drift(self) -> None:
+        target = self.agents / "reviewer.toml"
+        backup = self.home / "quarantine" / "reviewer.toml"
+        backup.parent.mkdir(mode=0o700)
+        target.write_text('name = "reviewer"\n', encoding="utf-8")
+        target.chmod(0o600)
+        planned = MODULE._capture_reconcile_target_snapshot(self.home, target)
+        backup_parent_identity = (
+            backup.parent.stat().st_dev,
+            backup.parent.stat().st_ino,
+        )
+        os.chmod(self.agents, 0o777)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "managed regular-file parent access policy mismatch",
+        ):
+            MODULE._atomic_move_beneath_home(
+                self.home,
+                target,
+                backup,
+                planned,
+                backup_parent_identity,
+            )
+
+        self.assertTrue(target.is_file())
+        self.assertFalse(os.path.lexists(backup))
+
+    def test_destructive_move_rejects_ancestor_policy_drift(self) -> None:
+        target = self.agents / "nested" / "reviewer.toml"
+        backup = self.home / "quarantine" / "reviewer.toml"
+        target.parent.mkdir(mode=0o755)
+        backup.parent.mkdir(mode=0o700)
+        target.write_text('name = "reviewer"\n', encoding="utf-8")
+        target.chmod(0o600)
+        planned = MODULE._capture_reconcile_target_snapshot(self.home, target)
+        backup_parent_identity = (
+            backup.parent.stat().st_dev,
+            backup.parent.stat().st_ino,
+        )
+        os.chmod(self.agents, 0o777)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "managed regular-file parent access policy mismatch",
+        ):
+            MODULE._atomic_move_beneath_home(
+                self.home,
+                target,
+                backup,
+                planned,
+                backup_parent_identity,
+            )
+
+        self.assertTrue(target.is_file())
+        self.assertFalse(os.path.lexists(backup))
+
+    def test_destructive_move_tolerates_parent_entry_and_nlink_churn(self) -> None:
+        target = self.agents / "reviewer.toml"
+        backup = self.home / "quarantine" / "reviewer.toml"
+        backup.parent.mkdir(mode=0o700)
+        target.write_text('name = "reviewer"\n', encoding="utf-8")
+        target.chmod(0o600)
+        planned = MODULE._capture_reconcile_target_snapshot(self.home, target)
+        backup_parent_identity = (
+            backup.parent.stat().st_dev,
+            backup.parent.stat().st_ino,
+        )
+        (self.agents / "benign-child").mkdir(mode=0o700)
+
+        MODULE._atomic_move_beneath_home(
+            self.home,
+            target,
+            backup,
+            planned,
+            backup_parent_identity,
+        )
+
+        self.assertFalse(os.path.lexists(target))
+        self.assertEqual(
+            backup.read_text(encoding="utf-8"),
+            'name = "reviewer"\n',
+        )
 
     def test_parent_chain_does_not_treat_directory_nlink_churn_as_mutation(
         self,

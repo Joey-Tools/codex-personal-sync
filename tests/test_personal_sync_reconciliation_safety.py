@@ -2899,6 +2899,41 @@ class InternalPathSafetyTests(unittest.TestCase):
 
 
 class AtomicMoveSafetyTests(unittest.TestCase):
+    def _prepare_failed_move_recovery_state(
+        self,
+        home: Path,
+    ) -> tuple[Path, Path, Path, Path, tuple[int, int]]:
+        source = home / "agents" / "reviewer.toml"
+        source.parent.mkdir(parents=True)
+        destination = home / "quarantine" / "reviewer.toml"
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"original\n")
+        destination.chmod(0o600)
+        expected_snapshot = MODULE._capture_reconcile_target_snapshot(
+            home,
+            destination,
+        )
+        expected_regular = MODULE._regular_snapshot_from_reconcile(expected_snapshot)
+        self.assertIsNotNone(expected_regular)
+        assert expected_regular is not None
+        expected_identity = expected_regular.file_identity
+        isolation = MODULE._isolate_failed_move_destination(
+            home,
+            source,
+            destination,
+            expected_source_parent_identity=(
+                source.parent.stat().st_dev,
+                source.parent.stat().st_ino,
+            ),
+            expected_parent_identity=expected_regular.parent_identity,
+            expected_identity=expected_identity,
+            expected_mode_type=stat.S_IFREG,
+            expected_target=None,
+            expected_regular=expected_regular,
+        )
+        receipt_path = isolation.isolation_parent / MODULE.FAILED_MOVE_RECEIPT_NAME
+        return source, destination, isolation.isolated, receipt_path, expected_identity
+
     def test_destination_collision_does_not_overwrite_or_move_source(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             home = Path(temp_dir) / "home"
@@ -3050,7 +3085,7 @@ class AtomicMoveSafetyTests(unittest.TestCase):
                 nonlocal racer_identity, source_parent_checks
                 if directory == source.parent:
                     source_parent_checks += 1
-                    if source_parent_checks == 2:
+                    if source_parent_checks == 4:
                         source.parent.rename(displaced_parent)
                         source.parent.mkdir()
                         source.write_bytes(b"racer\n")
@@ -3121,7 +3156,7 @@ class AtomicMoveSafetyTests(unittest.TestCase):
                 nonlocal source_parent_checks
                 if directory == source.parent:
                     source_parent_checks += 1
-                    if source_parent_checks == 2:
+                    if source_parent_checks == 4:
                         return False
                 return real_bound(root, directory, directory_fd)
 
@@ -3211,6 +3246,132 @@ class AtomicMoveSafetyTests(unittest.TestCase):
             self.assertEqual(source.read_bytes(), b"original\n")
             self.assertFalse(os.path.lexists(destination))
 
+    def test_failed_move_recovery_revalidates_rebound_parent_before_restore(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir) / "home"
+            source, destination, isolated, receipt_path, expected_identity = (
+                self._prepare_failed_move_recovery_state(home)
+            )
+            displaced_parent = home / "quarantine-before-recovery-race"
+            real_rebind = MODULE._rebind_failed_move_recovery_parent_fds
+            real_bound = MODULE._bound_directory_matches
+            injected = False
+            rebind_active = False
+            destination_binding_checks = 0
+
+            def observe_rebind(
+                *args: object,
+                **kwargs: object,
+            ) -> tuple[int, int]:
+                nonlocal rebind_active
+                rebind_active = True
+                try:
+                    return real_rebind(*args, **kwargs)
+                finally:
+                    rebind_active = False
+
+            def replace_destination_after_reopen(
+                checked_home: Path,
+                directory: Path,
+                directory_fd: int,
+            ) -> bool:
+                nonlocal destination_binding_checks, injected
+                if rebind_active and directory == destination.parent:
+                    destination_binding_checks += 1
+                    if destination_binding_checks == 2:
+                        destination.parent.rename(displaced_parent)
+                        destination.parent.mkdir()
+                        injected = True
+                return real_bound(checked_home, directory, directory_fd)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_rebind_failed_move_recovery_parent_fds",
+                    side_effect=observe_rebind,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_bound_directory_matches",
+                    side_effect=replace_destination_after_reopen,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "parent changed before restore",
+                ),
+            ):
+                MODULE._recover_failed_move_isolation(home)
+
+            self.assertTrue(injected)
+            self.assertFalse(os.path.lexists(source))
+            self.assertFalse(os.path.lexists(destination))
+            self.assertFalse(os.path.lexists(displaced_parent / destination.name))
+            self.assertEqual(
+                (isolated.stat().st_dev, isolated.stat().st_ino),
+                expected_identity,
+            )
+            self.assertTrue(receipt_path.is_file())
+
+    def test_failed_move_recovery_retains_receipt_after_alias_cleanup_race(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir) / "home"
+            source, destination, isolated, receipt_path, expected_identity = (
+                self._prepare_failed_move_recovery_state(home)
+            )
+            real_clear = MODULE._clear_failed_move_recovery_receipt
+            racer_identity: tuple[int, int] | None = None
+
+            def race_aliases_before_cleanup(
+                checked_home: Path,
+                snapshot: MODULE.ManagedStateFileSnapshot,
+                *,
+                receipt: MODULE.FailedMoveRecoveryReceipt | None = None,
+            ) -> None:
+                nonlocal racer_identity
+                self.assertIsNotNone(receipt)
+                destination.rename(isolated)
+                destination.write_bytes(b"racer\n")
+                destination.chmod(0o600)
+                racer_identity = (
+                    destination.stat().st_dev,
+                    destination.stat().st_ino,
+                )
+                real_clear(
+                    checked_home,
+                    snapshot,
+                    receipt=receipt,
+                )
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_clear_failed_move_recovery_receipt",
+                    side_effect=race_aliases_before_cleanup,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "aliases changed before cleanup",
+                ),
+            ):
+                MODULE._recover_failed_move_isolation(home)
+
+            self.assertIsNotNone(racer_identity)
+            self.assertFalse(os.path.lexists(source))
+            self.assertEqual(
+                (isolated.stat().st_dev, isolated.stat().st_ino),
+                expected_identity,
+            )
+            self.assertEqual(
+                (destination.stat().st_dev, destination.stat().st_ino),
+                racer_identity,
+            )
+            self.assertEqual(destination.read_bytes(), b"racer\n")
+            self.assertTrue(receipt_path.is_file())
+
     def test_failed_move_destination_racer_stays_outside_active_source(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             home = Path(temp_dir) / "home"
@@ -3240,7 +3401,7 @@ class AtomicMoveSafetyTests(unittest.TestCase):
                 nonlocal source_parent_checks
                 if directory == source.parent:
                     source_parent_checks += 1
-                    if source_parent_checks == 2:
+                    if source_parent_checks == 4:
                         return False
                 return real_bound_directory_matches(root, directory, directory_fd)
 
@@ -3363,7 +3524,7 @@ class AtomicMoveSafetyTests(unittest.TestCase):
                 nonlocal source_parent_checks
                 if directory == source.parent:
                     source_parent_checks += 1
-                    if source_parent_checks == 2:
+                    if source_parent_checks == 4:
                         return False
                 return real_bound_directory_matches(root, directory, directory_fd)
 
@@ -3487,7 +3648,7 @@ class AtomicMoveSafetyTests(unittest.TestCase):
                     nonlocal source_parent_checks
                     if directory == source.parent:
                         source_parent_checks += 1
-                        if source_parent_checks == 2:
+                        if source_parent_checks == 4:
                             return False
                     return real_bound_directory_matches(root, directory, directory_fd)
 
@@ -12414,6 +12575,8 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         cleanup_root = self.root / "cleanup-mount-root"
         child = cleanup_root / "child"
         child.mkdir(parents=True)
+        cleanup_root.chmod(0o700)
+        child.chmod(0o700)
         sentinel = child / "sentinel"
         sentinel.write_text("keep\n", encoding="utf-8")
         root_fd = os.open(

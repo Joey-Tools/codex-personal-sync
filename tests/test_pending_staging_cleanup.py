@@ -169,6 +169,10 @@ class PendingStagingCleanupTests(unittest.TestCase):
         }[version]
         marker_parent = batch_root / Path(*marker_path.parent.parts)
         marker_parent.mkdir(parents=True, exist_ok=True)
+        control_parent = batch_root
+        for part in marker_path.parent.parts:
+            control_parent /= part
+            control_parent.chmod(0o700)
         marker = MODULE._write_exclusive_internal_file(
             self.home,
             marker_parent / marker_path.name,
@@ -358,7 +362,9 @@ class PendingStagingCleanupTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
         ticket_root = MODULE._pending_cleanup_index_path(self.home)
         self.assertFalse(ticket_root.exists() and list(ticket_root.glob("*.json")))
-        quarantine = MODULE._personal_sync_root(self.home) / MODULE.QUARANTINE_RELATIVE_PATH
+        quarantine = (
+            MODULE._personal_sync_root(self.home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
         marker_batches = [
             batch
             for batch in quarantine.iterdir()
@@ -851,7 +857,9 @@ class PendingStagingCleanupTests(unittest.TestCase):
                                 MODULE._cleanup_ready_pending_batches(self.home),
                                 0,
                             )
-                        self.assertIn("missing without an exact empty proof", stdout.getvalue())
+                        self.assertIn(
+                            "missing without an exact empty proof", stdout.getvalue()
+                        )
                         self.assertTrue(ticket.path.is_file())
                     else:
                         with self.assertRaises(MODULE.SyncError):
@@ -896,7 +904,9 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     self.home = original_home
 
         ticket = self._publish_legacy_cleanup_ticket(version=3)
-        quarantine_root = MODULE._personal_sync_root(self.home) / MODULE.QUARANTINE_RELATIVE_PATH
+        quarantine_root = (
+            MODULE._personal_sync_root(self.home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
         proof_path = MODULE._pending_cleanup_empty_proof_path(
             self.home,
             ticket.batch_root.name,
@@ -932,9 +942,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
             staging_root.stat().st_dev,
             staging_root.stat().st_ino,
         )
-        staging_path = staging_root / Path(
-            *MODULE.PENDING_STATE_STAGING_MARKER.parts
-        )
+        staging_path = staging_root / Path(*MODULE.PENDING_STATE_STAGING_MARKER.parts)
         staging_path.parent.mkdir(parents=True, exist_ok=True)
         marker = MODULE._write_exclusive_internal_file(
             self.home,
@@ -973,6 +981,229 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     staging_identity,
                 )
 
+    def test_pending_cleanup_linux_fd_policy_requires_owner_and_exact_mode(
+        self,
+    ) -> None:
+        control_file = self.root / "pending-control.json"
+        control_file.write_bytes(b"{}\n")
+        control_file.chmod(0o600)
+        control_directory = self.root / "pending-control-directory"
+        control_directory.mkdir(mode=0o700)
+        foreign_uid = os.geteuid() + 1
+
+        for path, expected_mode, unsafe_mode, open_flags in (
+            (control_file, 0o600, 0o640, os.O_RDONLY),
+            (
+                control_directory,
+                0o700,
+                0o750,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            ),
+        ):
+            with self.subTest(path=path.name):
+                file_descriptor = os.open(path, open_flags)
+                try:
+                    with mock.patch.object(MODULE.sys, "platform", "linux"):
+                        metadata = MODULE._require_pending_cleanup_fd_access_policy(
+                            file_descriptor,
+                            path,
+                            expected_mode=expected_mode,
+                        )
+                        self.assertEqual(metadata.st_uid, os.geteuid())
+                        generic_metadata = (
+                            MODULE._require_release_identity_fd_access_policy(
+                                file_descriptor,
+                                path,
+                                foreign_uid,
+                            )
+                        )
+                        self.assertEqual(generic_metadata.st_uid, os.geteuid())
+                        with (
+                            mock.patch.object(
+                                MODULE.os,
+                                "geteuid",
+                                return_value=foreign_uid,
+                            ),
+                            self.assertRaisesRegex(
+                                MODULE.SyncError,
+                                "owner UID",
+                            ),
+                        ):
+                            MODULE._require_pending_cleanup_fd_access_policy(
+                                file_descriptor,
+                                path,
+                                expected_mode=expected_mode,
+                            )
+                        path.chmod(unsafe_mode)
+                        with self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            f"mode {unsafe_mode:04o} != {expected_mode:04o}",
+                        ):
+                            MODULE._require_pending_cleanup_fd_access_policy(
+                                file_descriptor,
+                                path,
+                                expected_mode=expected_mode,
+                            )
+                finally:
+                    os.close(file_descriptor)
+
+    def test_pending_cleanup_accepts_links_content_directories_mode_0755(
+        self,
+    ) -> None:
+        ticket = self._publish_legacy_cleanup_ticket(version=2)
+        links_parent = ticket.batch_root / "links"
+        content_parent = links_parent / "agents"
+        content_parent.mkdir(parents=True, mode=0o755)
+        links_parent.chmod(0o755)
+        content_parent.chmod(0o755)
+        content = content_parent / "role.toml"
+        content.write_bytes(b'name = "retained"\n')
+        content.chmod(0o600)
+
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
+
+        self.assertFalse(ticket.path.exists())
+        self.assertFalse(ticket.batch_root.exists())
+
+    def test_pending_cleanup_recovers_active_links_content_after_restart(
+        self,
+    ) -> None:
+        ticket = self._publish_legacy_cleanup_ticket(version=2)
+        links_parent = ticket.batch_root / "links"
+        content_parent = links_parent / "agents"
+        content_parent.mkdir(parents=True, mode=0o755)
+        links_parent.chmod(0o755)
+        content_parent.chmod(0o755)
+        content = content_parent / "role.toml"
+        content.write_bytes(b'name = "retained"\n')
+        content.chmod(0o600)
+        real_isolate = MODULE._isolate_pending_cleanup_entry
+        tripped = False
+
+        def isolate_then_fail(*args, **kwargs):
+            nonlocal tripped
+            active = real_isolate(*args, **kwargs)
+            if not tripped and args[1] == "links":
+                tripped = True
+                raise MODULE.SyncError("injected crash after links isolation")
+            return active
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_isolate_pending_cleanup_entry",
+                side_effect=isolate_then_fail,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "injected crash after links isolation",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        active_links = list(
+            ticket.batch_root.glob(
+                f"{MODULE.PENDING_CLEANUP_ACTIVE_LINKS_ENTRY_PREFIX}*"
+            )
+        )
+        self.assertEqual(len(active_links), 1)
+        self.assertEqual(active_links[0].stat().st_mode & 0o777, 0o755)
+        self.assertTrue(ticket.path.is_file())
+
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
+
+        self.assertFalse(ticket.path.exists())
+        self.assertFalse(ticket.batch_root.exists())
+
+    def test_pending_cleanup_active_control_directory_stays_exact_0700(
+        self,
+    ) -> None:
+        ticket = self._publish_legacy_cleanup_ticket(version=2)
+        state_directory = ticket.batch_root / "state"
+        state_directory.mkdir(mode=0o700)
+        control_directory = state_directory / "extra-control"
+        control_directory.mkdir(mode=0o700)
+        state_fd = os.open(
+            state_directory,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            metadata = control_directory.stat()
+            active_name, _active_metadata = MODULE._isolate_pending_cleanup_entry(
+                state_fd,
+                control_directory.name,
+                MODULE._directory_identity(state_fd),
+                (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    MODULE.stat.S_IFDIR,
+                ),
+            )
+        finally:
+            os.close(state_fd)
+        active_control = state_directory / active_name
+        active_control.chmod(0o755)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            rf"<pending-cleanup-scan>/state/{active_name}: mode 0755 != 0700",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(active_control.is_dir())
+        self.assertTrue(ticket.path.is_file())
+
+    def test_pending_cleanup_legacy_active_links_token_fails_closed(
+        self,
+    ) -> None:
+        ticket = self._publish_legacy_cleanup_ticket(version=2)
+        links_directory = ticket.batch_root / "links"
+        links_directory.mkdir(mode=0o700)
+        batch_fd = os.open(
+            ticket.batch_root,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            metadata = links_directory.stat()
+            active_name, _active_metadata = MODULE._isolate_pending_cleanup_entry(
+                batch_fd,
+                links_directory.name,
+                MODULE._directory_identity(batch_fd),
+                (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    MODULE.stat.S_IFDIR,
+                ),
+            )
+        finally:
+            os.close(batch_fd)
+        legacy_active_links = ticket.batch_root / active_name
+        legacy_active_links.chmod(0o755)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            rf"<pending-cleanup-scan>/{active_name}: mode 0755 != 0700",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(legacy_active_links.is_dir())
+        self.assertTrue(ticket.path.is_file())
+
+    def test_pending_cleanup_rejects_control_directory_mode_0755(self) -> None:
+        ticket = self._publish_legacy_cleanup_ticket(version=2)
+        control_directory = ticket.batch_root / "pending"
+        self.assertEqual(control_directory.stat().st_mode & 0o777, 0o700)
+        control_directory.chmod(0o755)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            r"<pending-cleanup-scan>/pending: mode 0755 != 0700",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+
     def test_orphan_empty_proof_rejects_foreign_owner_before_and_after_retention(
         self,
     ) -> None:
@@ -998,9 +1229,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
             "_delete_pending_cleanup_empty_proof",
             return_value=None,
         ):
-            self.assertTrue(
-                MODULE._remove_cleanup_ready_batch(self.home, ticket)
-            )
+            self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
         self.assertFalse(ticket.batch_root.exists())
         self.assertFalse(ticket.path.exists())
         self.assertTrue(proof_path.is_file())
@@ -1902,15 +2131,12 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     *MODULE.PENDING_STATE_STAGING_MARKER.parts
                 )
                 temp_path = marker_path.with_name(
-                    marker_path.name
-                    + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+                    marker_path.name + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
                 )
                 temp_path.write_bytes(b"{\n")
                 temp_path.chmod(0o600)
                 unsafe_path = (
-                    temp_path
-                    if relative_path is None
-                    else batch_root / relative_path
+                    temp_path if relative_path is None else batch_root / relative_path
                 )
                 unsafe_path.chmod(unsafe_mode)
 
@@ -1953,8 +2179,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     *MODULE.PENDING_STATE_STAGING_MARKER.parts
                 )
                 temp_path = marker_path.with_name(
-                    marker_path.name
-                    + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+                    marker_path.name + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
                 )
                 temp_path.write_bytes(b"{\n")
                 temp_path.chmod(0o600)
@@ -2109,7 +2334,9 @@ class PendingStagingCleanupTests(unittest.TestCase):
         for version in (3, 4):
             with self.subTest(ticket_version=version):
                 case_home = self.root / f"terminal-authority-home-v{version}"
-                write_release(case_home / "first-release", role_payload='name = "first"\n')
+                write_release(
+                    case_home / "first-release", role_payload='name = "first"\n'
+                )
                 install(case_home / "first-release", case_home, SHA_A)
                 case_target = case_home / ROLE_TARGET
                 case_state_path = MODULE._state_path(case_home)

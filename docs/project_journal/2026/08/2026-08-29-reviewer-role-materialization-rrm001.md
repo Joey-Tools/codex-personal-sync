@@ -409,3 +409,27 @@ superseded_by:
   280/280 with one expected skip in 500.510 seconds. A signed checkpoint and
   another clean-clone GPT-5.6 Sol Ultra whole-range review remain required
   before PR creation.
+- The final local repair round tightened three boundaries identified during
+  independent review. Failed-move recovery now rebinds both restore parents
+  immediately before its rename and rechecks the complete source/destination/
+  isolation alias group before retiring the durable receipt. A destructive
+  regular-file move revalidates the complete managed parent access policy at
+  its final mutation boundary, and overlay verification applies the same
+  parent-chain admission to regular targets.
+- Pending cleanup separates authority from ordinary content. Control
+  directories and files remain exact current-user `0700`/`0600` objects;
+  historical `links/**` evidence and release content may use safe normal modes
+  such as `0755` or `0644`, but still require exact-FD identity, current UID,
+  no group/world write, and Darwin ACL admission. A typed active cleanup token
+  records only a top-level `links` isolation, so a crash after that rename can
+  restore the content policy on restart without inferring it from a generic
+  internal name. Old untyped active tokens remain fail closed rather than being
+  guessed to be `links` content.
+- The corresponding race, recovery, and fixture coverage passed in the merged
+  focused group (514 tests in 186.667 seconds). After refreshing the ten-source
+  lock, the final repository discovery passed 1,440/1,440 tests in 987.912
+  seconds with three expected platform skips. It ran with the narrow
+  account-private temporary-directory permission needed by the four CI private
+  temp tests; their earlier outer-sandbox setup denials were verified 4/4 as
+  environment-only. `refresh-lock --check`, Ruff lint, repository-wide
+  `compileall`, and `git diff --check` passed on the same source bytes.

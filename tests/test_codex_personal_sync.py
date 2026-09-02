@@ -14306,6 +14306,7 @@ while True:
     ) -> None:
         batch_root = self.root / "batch"
         batch_root.mkdir()
+        batch_root.chmod(0o700)
         metadata = batch_root / "metadata.json"
         metadata.write_text("{}\n", encoding="utf-8")
         foreign = batch_root / "foreign"
@@ -14330,6 +14331,7 @@ while True:
     def test_pending_cleanup_identity_ledger_rejects_late_injection(self) -> None:
         batch_root = self.root / "batch"
         batch_root.mkdir()
+        batch_root.chmod(0o700)
         metadata = batch_root / "metadata.json"
         metadata.write_text("{}\n", encoding="utf-8")
         foreign = batch_root / "foreign"
