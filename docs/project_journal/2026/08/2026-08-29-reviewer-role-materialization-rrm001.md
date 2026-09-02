@@ -433,3 +433,15 @@ superseded_by:
   temp tests; their earlier outer-sandbox setup denials were verified 4/4 as
   environment-only. `refresh-lock --check`, Ruff lint, repository-wide
   `compileall`, and `git diff --check` passed on the same source bytes.
+- The downstream consumer's fresh review found one compatibility regression
+  before it could publish the generated mirror: `zip(..., strict=True)` in the
+  pending regular-target validation path requires Python 3.10, while this
+  runtime supports Python 3.9. The preceding exact target-tuple comparison
+  already proves equal length and order, so the canonical repair uses ordinary
+  `zip` without weakening that authority check. The macOS Python 3.9 CI matrix
+  now directly executes the affected validation test. Locally, the targeted
+  compatibility test passed, the CI-workflow tests passed with their narrow
+  private-home permission, and `actionlint`, Ruff, repository-wide
+  `compileall`, and `git diff --check` passed. The same affected test also
+  passed under the local Xcode Python 3.9.6 interpreter; the new GitHub matrix
+  lane keeps that runtime coverage durable.
