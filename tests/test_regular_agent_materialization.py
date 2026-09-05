@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import errno
 import importlib.util
 import io
 import json
@@ -86,12 +85,13 @@ def write_regular_to_symlink_release(
     root: Path,
     *,
     kind: str = "skill",
+    source_path: str = "personal_codex/skills/reviewer",
     removed_source: str = "personal_codex/agents/reviewer.toml",
     removed_kind: str = "file",
     replacement_target: str = "agents/reviewer.toml",
     include_removal: bool = True,
 ) -> None:
-    source = root / "personal_codex" / "skills" / "reviewer"
+    source = root / source_path
     source.mkdir(parents=True, exist_ok=True)
     (source / "SKILL.md").write_text("# Reviewer\n", encoding="utf-8")
     payload: dict[str, object] = {
@@ -99,7 +99,7 @@ def write_regular_to_symlink_release(
         "owner": MODULE.PUBLIC_OWNER,
         "links": [
             {
-                "source": "personal_codex/skills/reviewer",
+                "source": source_path,
                 "target": ROLE_TARGET.as_posix(),
                 "kind": kind,
                 "owner": MODULE.PUBLIC_OWNER,
@@ -313,6 +313,41 @@ class PublicRegularAgentTests(unittest.TestCase):
                 self.assertFalse(target.is_symlink())
                 self.assertEqual(target.read_text(encoding="utf-8"), self.payload)
 
+    def test_regular_state_rejects_substituted_matching_symlink_without_authority(
+        self,
+    ) -> None:
+        replacement = self.root / "replacement-substituted-matching-symlink"
+        write_regular_to_symlink_release(
+            replacement,
+            source_path="personal_codex/agents/reviewer.toml",
+            include_removal=False,
+        )
+        install(self.release, self.home, SHA_A)
+        target = self.home / ROLE_TARGET
+        desired_entry = MODULE.load_manifest_data(replacement).entries[0]
+        desired = MODULE._desired_link_target(self.home, desired_entry)
+        before_state = MODULE._load_managed_state(self.home)
+        self.assertEqual(before_state.links[ROLE_TARGET].link_target, desired)
+        target.unlink()
+        target.symlink_to(desired)
+        substituted_identity = (target.lstat().st_dev, target.lstat().st_ino)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "managed state target type mismatch for regular file",
+        ):
+            install(replacement, self.home, SHA_B)
+
+        self.assertTrue(target.is_symlink())
+        self.assertEqual(target.readlink().as_posix(), desired)
+        self.assertEqual(
+            (target.lstat().st_dev, target.lstat().st_ino),
+            substituted_identity,
+        )
+        state = MODULE._load_managed_state(self.home)
+        self.assertEqual(state.owners[MODULE.PUBLIC_OWNER], SHA_A)
+        self.assertEqual(state.links[ROLE_TARGET].kind, "file")
+
     def test_regular_to_symlink_migration_rejects_content_and_access_drift(
         self,
     ) -> None:
@@ -346,6 +381,168 @@ class PublicRegularAgentTests(unittest.TestCase):
         self.assertEqual(target.stat().st_nlink, 1)
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertTrue(MODULE.status(self.home))
+
+    def test_create_fstat_failure_evacuates_unbound_toml_to_private_quarantine(
+        self,
+    ) -> None:
+        self.home.mkdir()
+        target = self.home / ROLE_TARGET
+        target.parent.mkdir()
+        source = self.release / "personal_codex" / "agents" / "reviewer.toml"
+        real_open = os.open
+        real_fstat = os.fstat
+        real_rename_noreplace = MODULE._rename_noreplace_at
+        created_fd: int | None = None
+        created_parent_fd: int | None = None
+        injected = False
+        canonical_isolated = False
+
+        def capture_created_fd(
+            path: object,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal created_fd, created_parent_fd
+            file_descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if path == target.name and flags & os.O_CREAT:
+                created_fd = file_descriptor
+                created_parent_fd = dir_fd
+            return file_descriptor
+
+        def fail_initial_created_fstat(file_descriptor: int) -> os.stat_result:
+            nonlocal injected
+            if file_descriptor == created_fd and not injected:
+                injected = True
+                raise OSError("injected created-file fstat failure")
+            if injected and not canonical_isolated:
+                raise OSError("cleanup attempted fstat before canonical isolation")
+            return real_fstat(file_descriptor)
+
+        def observe_canonical_isolation(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal canonical_isolated
+            real_rename_noreplace(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+            if (
+                source_parent_fd == created_parent_fd
+                and destination_parent_fd == created_parent_fd
+                and source_name == target.name
+            ):
+                canonical_isolated = True
+
+        with (
+            mock.patch.object(MODULE.os, "open", side_effect=capture_created_fd),
+            mock.patch.object(
+                MODULE.os,
+                "fstat",
+                side_effect=fail_initial_created_fstat,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=observe_canonical_isolation,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "exact cleanup could not be verified",
+            ),
+        ):
+            MODULE._create_regular_file_beneath(self.home, source, target)
+
+        self.assertTrue(injected)
+        self.assertTrue(canonical_isolated)
+        self.assertFalse(os.path.lexists(target))
+        self.assertEqual(tuple(target.parent.glob("*.toml")), ())
+        retained = tuple((self.home / "personal-sync" / "quarantine").glob("*/leaf/*"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), b"")
+
+    def test_unbound_create_cleanup_retains_replacement_without_deleting_it(
+        self,
+    ) -> None:
+        self.home.mkdir()
+        target = self.home / ROLE_TARGET
+        target.parent.mkdir()
+        source = self.release / "personal_codex" / "agents" / "reviewer.toml"
+        real_open = os.open
+        real_fstat = os.fstat
+        created_fd: int | None = None
+        created_parent_fd: int | None = None
+        replacement_identity: tuple[int, int] | None = None
+        injected = False
+
+        def capture_created_fd(
+            path: object,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal created_fd, created_parent_fd
+            file_descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if path == target.name and flags & os.O_CREAT:
+                created_fd = file_descriptor
+                created_parent_fd = dir_fd
+            return file_descriptor
+
+        def replace_before_failed_identity_binding(
+            file_descriptor: int,
+        ) -> os.stat_result:
+            nonlocal injected, replacement_identity
+            if file_descriptor != created_fd or injected:
+                return real_fstat(file_descriptor)
+            injected = True
+            assert created_parent_fd is not None
+            os.unlink(target.name, dir_fd=created_parent_fd)
+            replacement_fd = real_open(
+                target.name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=created_parent_fd,
+            )
+            try:
+                os.write(replacement_fd, b"foreign")
+                replacement = real_fstat(replacement_fd)
+                replacement_identity = (replacement.st_dev, replacement.st_ino)
+            finally:
+                os.close(replacement_fd)
+            raise OSError("injected created-file fstat failure after replacement")
+
+        with (
+            mock.patch.object(MODULE.os, "open", side_effect=capture_created_fd),
+            mock.patch.object(
+                MODULE.os,
+                "fstat",
+                side_effect=replace_before_failed_identity_binding,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "exact cleanup could not be verified",
+            ),
+        ):
+            MODULE._create_regular_file_beneath(self.home, source, target)
+
+        self.assertTrue(injected)
+        self.assertIsNotNone(replacement_identity)
+        self.assertFalse(os.path.lexists(target))
+        self.assertEqual(tuple(target.parent.glob("*.toml")), ())
+        retained = tuple((self.home / "personal-sync" / "quarantine").glob("*/leaf/*"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), b"foreign")
+        self.assertEqual(
+            (retained[0].stat().st_dev, retained[0].stat().st_ino),
+            replacement_identity,
+        )
 
     def test_status_fails_closed_for_missing_type_content_mode_and_nlink_drift(
         self,
@@ -583,41 +780,51 @@ class PublicRegularAgentTests(unittest.TestCase):
             target,
             require_managed_access=False,
         )
-        real_snapshot = MODULE._regular_file_snapshot_at
+        real_rename_noreplace = MODULE._rename_noreplace_at
         replaced = False
+        replacement_identity: tuple[int, int] | None = None
 
-        def replace_active_alias_after_final_snapshot(
-            directory_fd: int,
-            name: str,
-            path: Path,
-            *args: object,
-            **kwargs: object,
-        ) -> MODULE.RegularFileSnapshot:
-            nonlocal replaced
-            snapshot = real_snapshot(directory_fd, name, path, *args, **kwargs)
+        def replace_alias_at_private_move(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal replaced, replacement_identity
             if (
-                name.startswith(MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+                source_name.startswith(".codex-publication-cleanup-")
+                and destination_name.startswith(".codex-ephemeral-cleanup-")
                 and not replaced
             ):
-                os.unlink(name, dir_fd=directory_fd)
+                os.unlink(source_name, dir_fd=source_parent_fd)
                 replacement_fd = os.open(
-                    name,
+                    source_name,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                     0o600,
-                    dir_fd=directory_fd,
+                    dir_fd=source_parent_fd,
                 )
                 try:
                     os.write(replacement_fd, b"foreign")
+                    replacement = os.fstat(replacement_fd)
+                    replacement_identity = (
+                        replacement.st_dev,
+                        replacement.st_ino,
+                    )
                 finally:
                     os.close(replacement_fd)
                 replaced = True
-            return snapshot
+            real_rename_noreplace(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
 
         with (
             mock.patch.object(
                 MODULE,
-                "_regular_file_snapshot_at",
-                side_effect=replace_active_alias_after_final_snapshot,
+                "_rename_noreplace_at",
+                side_effect=replace_alias_at_private_move,
             ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
@@ -631,10 +838,67 @@ class PublicRegularAgentTests(unittest.TestCase):
             )
 
         self.assertTrue(replaced)
+        self.assertIsNotNone(replacement_identity)
         self.assertFalse(os.path.lexists(target))
-        retained = tuple((self.home / "personal-sync" / "quarantine").glob("*/leaf/*"))
+        retained = tuple(
+            (self.home / "personal-sync" / "quarantine").glob(
+                ".codex-ephemeral-cleanup-*"
+            )
+        )
         self.assertEqual(len(retained), 1)
         self.assertEqual(retained[0].read_bytes(), b"foreign")
+        self.assertEqual(
+            (retained[0].stat().st_dev, retained[0].stat().st_ino),
+            replacement_identity,
+        )
+        self.assertEqual(source.read_bytes(), b"authority")
+        self.assertEqual(source.stat().st_nlink, 1)
+
+    def test_exact_publication_cleanup_privately_isolates_initial_foreign_canonical(
+        self,
+    ) -> None:
+        source = self.home / "personal-sync" / "source" / "authority"
+        target = self.home / ROLE_TARGET
+        source.parent.mkdir(parents=True)
+        target.parent.mkdir(parents=True)
+        source.write_bytes(b"authority")
+        source.chmod(0o600)
+        os.link(source, target, follow_symlinks=False)
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            self.home,
+            target,
+            require_managed_access=False,
+        )
+        target.unlink()
+        target.write_bytes(b"foreign canonical")
+        target.chmod(0o600)
+        replacement_identity = (
+            target.stat().st_dev,
+            target.stat().st_ino,
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "retained replacement as isolated evidence",
+        ):
+            MODULE._delete_exact_regular_publication_beneath(
+                self.home,
+                target,
+                expected,
+            )
+
+        self.assertFalse(os.path.lexists(target))
+        retained = tuple(
+            (self.home / "personal-sync" / "quarantine").glob(
+                ".codex-ephemeral-cleanup-*"
+            )
+        )
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), b"foreign canonical")
+        self.assertEqual(
+            (retained[0].stat().st_dev, retained[0].stat().st_ino),
+            replacement_identity,
+        )
         self.assertEqual(source.read_bytes(), b"authority")
         self.assertEqual(source.stat().st_nlink, 1)
 
@@ -694,7 +958,7 @@ class PublicRegularAgentTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
-                "reappeared during private isolation",
+                "public canonical reappeared after private isolation",
             ),
         ):
             MODULE._delete_exact_regular_publication_beneath(
@@ -707,13 +971,21 @@ class PublicRegularAgentTests(unittest.TestCase):
         self.assertIsNotNone(replacement_identity)
         self.assertEqual(target.read_bytes(), b"foreign")
         self.assertEqual(
-            (target.stat().st_dev, target.stat().st_ino), replacement_identity
+            (target.stat().st_dev, target.stat().st_ino),
+            replacement_identity,
         )
-        retained = tuple((self.home / "personal-sync" / "quarantine").glob("*/leaf/*"))
+        retained = tuple(
+            (self.home / "personal-sync" / "quarantine").glob(
+                ".codex-ephemeral-cleanup-*"
+            )
+        )
         self.assertEqual(len(retained), 1)
         self.assertEqual(retained[0].read_bytes(), b"authority")
         self.assertEqual(
-            (retained[0].stat().st_dev, retained[0].stat().st_ino),
+            (
+                retained[0].stat().st_dev,
+                retained[0].stat().st_ino,
+            ),
             (source.stat().st_dev, source.stat().st_ino),
         )
         self.assertEqual(source.stat().st_nlink, 2)
@@ -743,12 +1015,14 @@ class PublicRegularAgentTests(unittest.TestCase):
             **kwargs: object,
         ) -> None:
             nonlocal reappeared, replacement_identity
-            if name.startswith("publication-cleanup-") and not reappeared:
+            if name.startswith(".codex-ephemeral-cleanup-") and not reappeared:
+                real_unlink(name, *args, **kwargs)  # type: ignore[arg-type]
                 target.write_bytes(b"foreign")
                 target.chmod(0o600)
                 metadata = target.stat()
                 replacement_identity = (metadata.st_dev, metadata.st_ino)
                 reappeared = True
+                return
             real_unlink(name, *args, **kwargs)  # type: ignore[arg-type]
 
         with (
@@ -759,7 +1033,7 @@ class PublicRegularAgentTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
-                "reappeared while private cleanup completed",
+                "public canonical reappeared after private isolation",
             ),
         ):
             MODULE._delete_exact_regular_publication_beneath(
@@ -772,9 +1046,14 @@ class PublicRegularAgentTests(unittest.TestCase):
         self.assertIsNotNone(replacement_identity)
         self.assertEqual(target.read_bytes(), b"foreign")
         self.assertEqual(
-            (target.stat().st_dev, target.stat().st_ino), replacement_identity
+            (target.stat().st_dev, target.stat().st_ino),
+            replacement_identity,
         )
-        retained = tuple((self.home / "personal-sync" / "quarantine").glob("*/leaf/*"))
+        retained = tuple(
+            (self.home / "personal-sync" / "quarantine").glob(
+                ".codex-ephemeral-cleanup-*"
+            )
+        )
         self.assertEqual(retained, ())
         self.assertEqual(source.read_bytes(), b"authority")
         self.assertEqual(source.stat().st_nlink, 1)
@@ -840,12 +1119,13 @@ class PublicRegularAgentTests(unittest.TestCase):
         ) -> None:
             nonlocal added_sibling, sibling_identity
             real_unlink(name, *args, **kwargs)  # type: ignore[arg-type]
-            if not name.startswith("publication-cleanup-") or added_sibling:
+            if not name.startswith(".codex-ephemeral-cleanup-") or added_sibling:
                 return
             directory_fd = kwargs.get("dir_fd")
             assert isinstance(directory_fd, int)
+            sibling_name = f"{name}-retained-0"
             sibling_fd = os.open(
-                "foreign",
+                sibling_name,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                 0o600,
                 dir_fd=directory_fd,
@@ -866,7 +1146,7 @@ class PublicRegularAgentTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
-                "ephemeral quarantine leaf is not empty",
+                "retained replacement as isolated evidence",
             ),
         ):
             MODULE._delete_exact_regular_publication_beneath(
@@ -879,7 +1159,9 @@ class PublicRegularAgentTests(unittest.TestCase):
         self.assertIsNotNone(sibling_identity)
         self.assertFalse(os.path.lexists(target))
         siblings = tuple(
-            (self.home / "personal-sync" / "quarantine").glob("*/leaf/foreign")
+            (self.home / "personal-sync" / "quarantine").glob(
+                ".codex-ephemeral-cleanup-*-retained-0"
+            )
         )
         self.assertEqual(len(siblings), 1)
         self.assertEqual(
@@ -887,7 +1169,7 @@ class PublicRegularAgentTests(unittest.TestCase):
             sibling_identity,
         )
         self.assertEqual(siblings[0].read_bytes(), b"foreign")
-        self.assertEqual(MODULE._quarantine_batch_count(self.home), 1)
+        self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
 
     def test_receiptless_cleanup_reclaims_empty_setup_batch_after_leaf_failure(
         self,
@@ -905,45 +1187,17 @@ class PublicRegularAgentTests(unittest.TestCase):
             target,
             require_managed_access=False,
         )
-        real_batch_root = MODULE._quarantine_batch_root
-        real_open_directory = MODULE._open_or_create_directory_beneath
-        captured_batch_fd: int | None = None
-        captured_batch_root: Path | None = None
-
-        def capture_batch_root(
-            *args: object,
-            **kwargs: object,
-        ) -> Path | tuple[Path, int, tuple[int, int]]:
-            nonlocal captured_batch_fd, captured_batch_root
-            allocation = real_batch_root(*args, **kwargs)  # type: ignore[arg-type]
-            if isinstance(allocation, tuple):
-                captured_batch_root, captured_batch_fd, _identity = allocation
-            return allocation
-
-        def fail_leaf_setup(
-            home: Path,
-            path: Path,
-            *args: object,
-            **kwargs: object,
-        ) -> int:
-            if captured_batch_root is not None and path == captured_batch_root / "leaf":
-                raise MODULE.SyncError("injected ephemeral leaf setup failure")
-            return real_open_directory(home, path, *args, **kwargs)  # type: ignore[arg-type]
-
         with (
             mock.patch.object(
                 MODULE,
-                "_quarantine_batch_root",
-                side_effect=capture_batch_root,
-            ),
-            mock.patch.object(
-                MODULE,
-                "_open_or_create_directory_beneath",
-                side_effect=fail_leaf_setup,
+                "_publish_pending_batch_cleanup_ticket_for_root",
+                side_effect=MODULE.SyncError(
+                    "injected ephemeral ticket publication failure"
+                ),
             ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
-                "injected ephemeral leaf setup failure",
+                "injected ephemeral ticket publication failure",
             ),
         ):
             MODULE._delete_exact_regular_publication_beneath(
@@ -952,20 +1206,15 @@ class PublicRegularAgentTests(unittest.TestCase):
                 expected,
             )
 
-        self.assertIsNotNone(captured_batch_fd)
-        assert captured_batch_fd is not None
-        with self.assertRaises(OSError) as closed:
-            os.fstat(captured_batch_fd)
-        self.assertEqual(closed.exception.errno, errno.EBADF)
-        self.assertFalse(os.path.lexists(target))
-        public_aliases = tuple(target.parent.iterdir())
-        self.assertEqual(len(public_aliases), 1)
+        self.assertTrue(target.is_file())
         self.assertEqual(
-            (public_aliases[0].stat().st_dev, public_aliases[0].stat().st_ino),
+            (target.stat().st_dev, target.stat().st_ino),
             (source.stat().st_dev, source.stat().st_ino),
         )
         self.assertEqual(source.stat().st_nlink, 2)
         self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
+        quarantine_root = self.home / "personal-sync" / "quarantine"
+        self.assertFalse(tuple(quarantine_root.glob(".codex-ephemeral-cleanup-*")))
 
     def test_desired_entry_verification_rejects_exact_target_symlink_for_regular_file(
         self,
@@ -1860,6 +2109,29 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self.assertEqual(parsed.metadata_version, version)
         return parsed
 
+    def _downgrade_durable_pending_regular_metadata(
+        self,
+        batch: MODULE.PendingLinkBatch,
+        version: int,
+    ) -> MODULE.PendingLinkBatch:
+        metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        payload = json.loads(metadata.read_text(encoding="utf-8"))
+        payload["version"] = version
+        downgrade_pending_state_evidence_metadata(payload, version)
+        records = payload["records"]
+        assert isinstance(records, list)
+        for raw_record in records:
+            assert isinstance(raw_record, dict)
+            if version < 10:
+                raw_record.pop("before_materialization", None)
+                raw_record.pop("removed_link", None)
+        metadata.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        parsed = MODULE._load_pending_link_batch(self.home)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.metadata_version, version)
+        return parsed
+
     def _isolate_legacy_regular_publication(
         self,
         batch: MODULE.PendingLinkBatch,
@@ -2311,6 +2583,235 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self.assertEqual(
             (retained[0].stat().st_dev, retained[0].stat().st_ino),
             replacement_identity,
+        )
+        self.assertTrue(MODULE._pending_link_pointer_path(self.home).is_file())
+
+    def test_v8_v9_v10_produced_private_alias_accepts_exact_preimage(
+        self,
+    ) -> None:
+        for version in (8, 9, MODULE.PENDING_LINK_METADATA_VERSION):
+            with self.subTest(version=version):
+                self.home = self.root / f"home-v{version}-durable-private-preimage"
+                install(self.release, self.home, SHA_A)
+                target = self.home / ROLE_TARGET
+                old_identity = (target.stat().st_dev, target.stat().st_ino)
+                next_release = self.root / f"release-v{version}-durable-private"
+                write_release(next_release, role_payload='name = "updated"\n')
+                batch = self._interrupt_regular_publication_cleanup(
+                    next_release,
+                    SHA_B,
+                )
+                if version != MODULE.PENDING_LINK_METADATA_VERSION:
+                    batch = self._downgrade_durable_pending_regular_metadata(
+                        batch,
+                        version,
+                    )
+                record, active = self._assert_active_publication_journal(batch)
+                journal = MODULE._read_pending_regular_publication_cleanup(
+                    self.home,
+                    batch,
+                    record,
+                    "produced",
+                )
+                assert journal is not None
+                _snapshot, _active_name, _phase, expected = journal
+                real_rename = MODULE._rename_noreplace_at
+
+                def crash_after_private_rename(
+                    source_fd: int,
+                    source_name: str,
+                    destination_fd: int,
+                    destination_name: str,
+                ) -> None:
+                    real_rename(
+                        source_fd,
+                        source_name,
+                        destination_fd,
+                        destination_name,
+                    )
+                    if source_name == active.name and source_fd != destination_fd:
+                        raise MODULE.SyncError("injected durable private rename crash")
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_rename_noreplace_at",
+                        side_effect=crash_after_private_rename,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "durable private rename crash",
+                    ),
+                ):
+                    MODULE._recover_pending_regular_publication_cleanup(
+                        self.home,
+                        batch,
+                        record,
+                        "produced",
+                    )
+
+                cleanup = batch.batch_root / "pending" / "cleanup"
+                cleanup_metadata = cleanup.stat()
+                private_name = MODULE._pending_regular_publication_private_alias_name(
+                    (cleanup_metadata.st_dev, cleanup_metadata.st_ino),
+                    (*expected.file_identity, stat.S_IFREG),
+                    record.index,
+                    "produced",
+                )
+                private = cleanup / private_name
+                self.assertTrue(private.is_file())
+                self.assertFalse(os.path.lexists(active))
+                assert record.before_evidence is not None
+                before = batch.batch_root / Path(*record.before_evidence.parts)
+                os.link(before, target, follow_symlinks=False)
+                self.assertEqual(
+                    (target.stat().st_dev, target.stat().st_ino),
+                    old_identity,
+                )
+
+                MODULE._recover_pending_regular_publication_cleanup(
+                    self.home,
+                    batch,
+                    record,
+                    "produced",
+                )
+
+                self.assertFalse(os.path.lexists(private))
+                self.assertEqual(
+                    (target.stat().st_dev, target.stat().st_ino),
+                    old_identity,
+                )
+                install(self.release, self.home, SHA_A)
+                self.assertFalse(batch.batch_root.exists())
+                self.assertFalse(
+                    os.path.lexists(MODULE._pending_link_pointer_path(self.home))
+                )
+                self.assertEqual(
+                    (target.stat().st_dev, target.stat().st_ino),
+                    old_identity,
+                )
+                self.assertEqual(target.stat().st_nlink, 1)
+
+    def test_replace_produced_private_alias_rejects_foreign_canonical_races(
+        self,
+    ) -> None:
+        install(self.release, self.home, SHA_A)
+        target = self.home / ROLE_TARGET
+        next_release = self.root / "next-release-private-canonical-races"
+        write_release(next_release, role_payload='name = "updated"\n')
+        batch = self._interrupt_regular_publication_cleanup(next_release, SHA_B)
+        record, active = self._assert_active_publication_journal(batch)
+        journal = MODULE._read_pending_regular_publication_cleanup(
+            self.home,
+            batch,
+            record,
+            "produced",
+        )
+        assert journal is not None
+        _snapshot, _active_name, _phase, expected = journal
+        real_rename = MODULE._rename_noreplace_at
+
+        def crash_after_private_rename(
+            source_fd: int,
+            source_name: str,
+            destination_fd: int,
+            destination_name: str,
+        ) -> None:
+            real_rename(
+                source_fd,
+                source_name,
+                destination_fd,
+                destination_name,
+            )
+            if source_name == active.name and source_fd != destination_fd:
+                raise MODULE.SyncError("injected durable private rename crash")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=crash_after_private_rename,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "durable private rename crash",
+            ),
+        ):
+            MODULE._recover_pending_regular_publication_cleanup(
+                self.home,
+                batch,
+                record,
+                "produced",
+            )
+
+        cleanup = batch.batch_root / "pending" / "cleanup"
+        cleanup_metadata = cleanup.stat()
+        private_name = MODULE._pending_regular_publication_private_alias_name(
+            (cleanup_metadata.st_dev, cleanup_metadata.st_ino),
+            (*expected.file_identity, stat.S_IFREG),
+            record.index,
+            "produced",
+        )
+        private = cleanup / private_name
+        target.write_text("foreign before unlink\n", encoding="utf-8")
+        target.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "public name reappeared; exact private evidence was retained",
+        ):
+            MODULE._recover_pending_regular_publication_cleanup(
+                self.home,
+                batch,
+                record,
+                "produced",
+            )
+
+        self.assertTrue(private.is_file())
+        self.assertEqual(target.read_text(encoding="utf-8"), "foreign before unlink\n")
+        target.unlink()
+        assert record.before_evidence is not None
+        before = batch.batch_root / Path(*record.before_evidence.parts)
+        os.link(before, target, follow_symlinks=False)
+        real_unlink = MODULE.os.unlink
+        replaced = False
+
+        def replace_canonical_at_private_unlink(
+            name: str,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal replaced
+            if name == private_name and not replaced:
+                real_unlink(target)
+                target.write_text("foreign after validation\n", encoding="utf-8")
+                target.chmod(0o600)
+                replaced = True
+            real_unlink(name, *args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            mock.patch.object(
+                MODULE.os,
+                "unlink",
+                side_effect=replace_canonical_at_private_unlink,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "public name reappeared while private cleanup completed",
+            ),
+        ):
+            MODULE._recover_pending_regular_publication_cleanup(
+                self.home,
+                batch,
+                record,
+                "produced",
+            )
+
+        self.assertTrue(replaced)
+        self.assertFalse(os.path.lexists(private))
+        self.assertEqual(
+            target.read_text(encoding="utf-8"),
+            "foreign after validation\n",
         )
         self.assertTrue(MODULE._pending_link_pointer_path(self.home).is_file())
 
@@ -3142,7 +3643,121 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         )
         self.assertFalse(os.path.lexists(cleanup / private_name))
 
-    def test_v7_before_private_alias_accepts_restored_canonical_preimage(
+    def test_v6_v7_produced_private_alias_accepts_exact_preimage(self) -> None:
+        for version in (6, 7):
+            with self.subTest(version=version):
+                self.home = self.root / f"home-v{version}-legacy-private-preimage"
+                install(self.release, self.home, SHA_A)
+                target = self.home / ROLE_TARGET
+                old_identity = (target.stat().st_dev, target.stat().st_ino)
+                next_release = self.root / f"release-v{version}-legacy-private"
+                write_release(next_release, role_payload='name = "updated"\n')
+                batch = self._interrupt_uncommitted_regular_publication(
+                    next_release,
+                    SHA_B,
+                )
+                parsed = self._downgrade_pending_regular_metadata(batch, version)
+                record = next(
+                    candidate for candidate in parsed.records if candidate.is_regular()
+                )
+                active = self._isolate_legacy_regular_publication(
+                    parsed,
+                    record,
+                    target,
+                )
+                index = (
+                    MODULE._build_legacy_pending_regular_publication_active_entry_index(
+                        self.home,
+                        parsed,
+                    )
+                )
+                real_rename = MODULE._rename_noreplace_at
+
+                def crash_after_private_rename(
+                    source_fd: int,
+                    source_name: str,
+                    destination_fd: int,
+                    destination_name: str,
+                ) -> None:
+                    real_rename(
+                        source_fd,
+                        source_name,
+                        destination_fd,
+                        destination_name,
+                    )
+                    if source_name == active.name and source_fd != destination_fd:
+                        raise MODULE.SyncError("injected legacy private rename crash")
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_rename_noreplace_at",
+                        side_effect=crash_after_private_rename,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "legacy private rename crash",
+                    ),
+                ):
+                    MODULE._recover_legacy_pending_regular_publication_active_entry(
+                        self.home,
+                        parsed,
+                        record,
+                        "produced",
+                        active_entry_index=index,
+                    )
+
+                cleanup = parsed.batch_root / "pending" / "cleanup"
+                cleanup_metadata = cleanup.stat()
+                assert record.evidence_identity is not None
+                private_name = MODULE._pending_regular_publication_private_alias_name(
+                    (cleanup_metadata.st_dev, cleanup_metadata.st_ino),
+                    (*record.evidence_identity, stat.S_IFREG),
+                    record.index,
+                    "produced",
+                )
+                private = cleanup / private_name
+                self.assertTrue(private.is_file())
+                self.assertFalse(os.path.lexists(active))
+                assert record.before_evidence is not None
+                before = parsed.batch_root / Path(*record.before_evidence.parts)
+                os.link(before, target, follow_symlinks=False)
+                self.assertEqual(
+                    (target.stat().st_dev, target.stat().st_ino),
+                    old_identity,
+                )
+
+                fresh_index = (
+                    MODULE._build_legacy_pending_regular_publication_active_entry_index(
+                        self.home,
+                        parsed,
+                    )
+                )
+                MODULE._recover_legacy_pending_regular_publication_active_entry(
+                    self.home,
+                    parsed,
+                    record,
+                    "produced",
+                    active_entry_index=fresh_index,
+                )
+
+                self.assertFalse(os.path.lexists(private))
+                self.assertEqual(
+                    (target.stat().st_dev, target.stat().st_ino),
+                    old_identity,
+                )
+                install(self.release, self.home, SHA_A)
+                self.assertFalse(parsed.batch_root.exists())
+                self.assertFalse(
+                    os.path.lexists(MODULE._pending_link_pointer_path(self.home))
+                )
+                self.assertEqual(
+                    (target.stat().st_dev, target.stat().st_ino),
+                    old_identity,
+                )
+                self.assertEqual(target.stat().st_nlink, 1)
+
+    def test_v7_before_private_alias_rejects_canonical_reappearance_after_unlink(
         self,
     ) -> None:
         install(self.release, self.home, SHA_A)
@@ -3237,10 +3852,16 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                 os.link(before, target, follow_symlinks=False)
                 restored = True
 
-        with mock.patch.object(
-            MODULE.os,
-            "unlink",
-            side_effect=restore_canonical_after_private_unlink,
+        with (
+            mock.patch.object(
+                MODULE.os,
+                "unlink",
+                side_effect=restore_canonical_after_private_unlink,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "public name reappeared while private cleanup completed",
+            ),
         ):
             MODULE._recover_legacy_pending_regular_publication_active_entry(
                 self.home,
@@ -3253,6 +3874,7 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self.assertTrue(restored)
         self.assertFalse(os.path.lexists(cleanup / private_name))
         self.assertEqual(target.read_text(encoding="utf-8"), 'name = "reviewer"\n')
+        self.assertTrue(MODULE._pending_link_pointer_path(self.home).is_file())
         self._assert_recovered_install()
 
     def test_v7_final_public_snapshot_replacement_is_preserved_privately(

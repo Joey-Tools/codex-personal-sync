@@ -518,3 +518,52 @@ superseded_by:
   in 84.892 seconds. The final repository-private discovery then passed 1,466
   tests with three expected skips in 945.508 seconds. A fresh exact-head review
   remains pending.
+- A new frozen-range fresh review found and the follow-up repair closed the
+  remaining range-introduced boundaries. Creation cleanup now evacuates a
+  newly created TOML through a non-loadable name even when the final parent
+  access-policy check fails, so it cannot remain active in a newly unsafe
+  parent. Produced publication recovery accepts a public canonical name only
+  when it is the exact receipt-bound before preimage; every create, before,
+  foreign, or post-boundary replacement remains fail-closed. Receiptless
+  cleanup now publishes a version-5 `ephemeral-quarantine` durable ticket
+  before it unlinks private payload, and its recovery consumes only an exact
+  empty scaffold through the existing ticket, tombstone, and empty-proof
+  protocol. It never treats a nonempty leaf, foreign sibling, replacement, or
+  dual batch root as deletion authority. The parser also caches and budgets
+  v10 regular-to-symlink source evidence by its release-bound identity, so
+  repeated targets cannot amplify locked recovery reads. macOS Python 3.9 CI
+  now runs the exact v10 migration and recovery paths. The integrated affected
+  suites passed 522 tests in 160.205 seconds; the Xcode Python 3.9 pair passed
+  in 2.435 seconds and its compile check passed. The final repository-private
+  discovery passed 1,480 tests with three expected skips in 955.481 seconds.
+  Ruff, formatting, `actionlint`, and `git diff --check` passed, and the
+  ten-source lock was refreshed. A new final exact-head review remains pending.
+- The preceding version-5 scaffold description was superseded during the final
+  repair by a version-6 receiptless leaf ticket. It publishes a durable ticket
+  before any public or private leaf mutation, then publishes an immutable
+  `ephemeral-private-isolated` phase receipt after the exact authority inode
+  reaches private evidence and before that inode can be unlinked. The receipt
+  binds the ticket identity and digest, payload identity, public parent, target,
+  and quarantine root. This distinguishes an initial foreign object, which must
+  be isolated from the loadable TOML path and retained with its identity, from a
+  later canonical or alias reappearance, which is outside cleanup authority and
+  is retained in place. The receipt remains durable across private unlink and
+  ticket deletion; orphan recovery removes it only after revalidating bound
+  parents and proving every ticket-derived public and private name absent.
+  Thus object identity, content stability, link count, and access policy are
+  protected without treating benign directory child-entry churn as mutation.
+  The final affected five-module regression suite passed 536 tests in 184.901
+  seconds, after the phase repair; source lock refresh succeeded for all ten
+  sources. Full discovery and fresh exact-head review remain pending.
+- A final repository-private discovery subsequently passed 1,494 tests with
+  three expected skips in 948.300 seconds. It ran under a 30-minute
+  process-group deadline with a 128 MiB retained-log ceiling; the resulting
+  35 KiB log recorded no timeout or output-budget event. The prior unbounded
+  run's four CI-private-temp errors were sandbox write denials for deliberately
+  private home-directory fixtures, not product failures; the bounded local
+  run permitted those fixtures and passed. A stale v6 evidence-layout assertion
+  in the broader legacy suite was also aligned with the direct private evidence
+  path, while the publication error now retains both the `private isolation`
+  and retained-evidence diagnostic context. Ruff `E4/E7/E9/F`, Ruff format,
+  `actionlint`, Python compilation, and `git diff --check` passed after the
+  final source-lock refresh. A fresh exact-head review remains pending.

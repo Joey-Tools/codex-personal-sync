@@ -144,6 +144,100 @@ class PendingStagingCleanupTests(unittest.TestCase):
         assert ticket is not None
         return ticket
 
+    def _only_cleanup_ticket_for_home(self, home: Path):
+        tickets = list(MODULE._pending_cleanup_index_path(home).glob("*.json"))
+        self.assertEqual(len(tickets), 1)
+        ticket = MODULE._read_pending_cleanup_ticket(home, tickets[0])
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        return ticket
+
+    def _receiptless_cleanup_crash_patch(self, stage: str):
+        real_unlink = MODULE.os.unlink
+        real_rename = MODULE._rename_noreplace_at
+
+        if stage in {"ticket-temp", "canonical-alias", "alias-private"}:
+
+            def crash_during_rename(
+                source_parent_fd: int,
+                source_name: str,
+                destination_parent_fd: int,
+                destination_name: str,
+            ) -> None:
+                if (
+                    stage == "ticket-temp"
+                    and source_name.endswith(MODULE.PENDING_CLEANUP_TICKET_TEMP_SUFFIX)
+                    and destination_name.endswith(MODULE.PENDING_CLEANUP_TICKET_SUFFIX)
+                ):
+                    raise SystemExit("injected crash before ticket temp rename")
+                real_rename(
+                    source_parent_fd,
+                    source_name,
+                    destination_parent_fd,
+                    destination_name,
+                )
+                if stage == "canonical-alias" and destination_name.startswith(
+                    ".codex-publication-cleanup-"
+                ):
+                    raise SystemExit("injected crash after canonical isolation")
+                if stage == "alias-private" and destination_name.startswith(
+                    ".codex-ephemeral-cleanup-"
+                ):
+                    raise SystemExit("injected crash after private isolation")
+
+            return mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=crash_during_rename,
+            )
+        if stage in {"private-unlink-before", "private-unlink-after"}:
+
+            def crash_during_private_unlink(name: str, *args, **kwargs) -> None:
+                if name.startswith(".codex-ephemeral-cleanup-"):
+                    if stage == "private-unlink-before":
+                        raise SystemExit("injected crash before private unlink")
+                    real_unlink(name, *args, **kwargs)
+                    raise SystemExit("injected crash after private unlink")
+                real_unlink(name, *args, **kwargs)
+
+            return mock.patch.object(
+                MODULE.os,
+                "unlink",
+                side_effect=crash_during_private_unlink,
+            )
+        raise AssertionError(f"unknown crash stage: {stage}")
+
+    def _make_v5_empty_ticket(self, home: Path, target: Path):
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            home,
+            target,
+            require_managed_access=False,
+        )
+        parent_fd = MODULE._open_directory_beneath(home, target.parent)
+        try:
+            result = MODULE._move_regular_leaf_to_unique_quarantine(
+                home,
+                target.parent,
+                parent_fd,
+                target.name,
+                label="legacy-v5-test",
+                expected=expected,
+                retain_batch_binding=True,
+            )
+        finally:
+            MODULE._close_fd_quietly(parent_fd)
+        quarantine_path, _moved, binding = result
+        leaf_fd = MODULE._open_directory_beneath(home, quarantine_path.parent)
+        try:
+            os.unlink(quarantine_path.name, dir_fd=leaf_fd)
+            os.fsync(leaf_fd)
+        finally:
+            MODULE._close_fd_quietly(leaf_fd)
+        return MODULE._publish_pending_ephemeral_quarantine_cleanup_ticket(
+            home,
+            binding,
+        )
+
     def _alternate_gid(self, current_gid: int) -> int:
         alternate_gid = next(
             (gid for gid in os.getgroups() if gid != current_gid),
@@ -2319,6 +2413,10 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     ),
                     mock.patch.object(
                         MODULE,
+                        "_cleanup_orphan_pending_ephemeral_private_phases",
+                    ),
+                    mock.patch.object(
+                        MODULE,
                         "_cleanup_pending_cleanup_cursor_temp",
                         side_effect=(
                             cleanup_result
@@ -2514,6 +2612,520 @@ class PendingStagingCleanupTests(unittest.TestCase):
         self.assertFalse(marker_path.exists())
         self.assertFalse(ticket_path.exists())
         self.assertFalse(batch_root.exists())
+
+    def test_v6_ephemeral_cleanup_scanner_recovers_every_mutation_crash_window(
+        self,
+    ) -> None:
+        for stage in (
+            "ticket-temp",
+            "canonical-alias",
+            "alias-private",
+            "private-unlink-before",
+            "private-unlink-after",
+        ):
+            with self.subTest(stage=stage):
+                case_home = self.root / f"ephemeral-crash-{stage}"
+                install(self.first_release, case_home, SHA_A)
+                case_target = case_home / ROLE_TARGET
+                expected = MODULE._read_regular_file_snapshot_beneath(
+                    case_home,
+                    case_target,
+                    require_managed_access=False,
+                )
+                for _index in range(MODULE.MAX_RETAINED_QUARANTINE_BATCHES - 1):
+                    MODULE._quarantine_batch_root(case_home, [])
+
+                with (
+                    self._receiptless_cleanup_crash_patch(stage),
+                    self.assertRaisesRegex(SystemExit, "injected crash"),
+                ):
+                    MODULE._delete_exact_regular_publication_without_pending_receipt(
+                        case_home,
+                        case_target,
+                        expected,
+                    )
+
+                index_root = MODULE._pending_cleanup_index_path(case_home)
+                if stage == "ticket-temp":
+                    temps = list(index_root.glob("*.json.tmp"))
+                    self.assertEqual(len(temps), 1)
+                    self.assertFalse(list(index_root.glob("*.json")))
+                else:
+                    ticket = self._only_cleanup_ticket_for_home(case_home)
+                    self.assertEqual(ticket.version, 6)
+                    self.assertEqual(ticket.kind, "ephemeral-quarantine-leaf")
+                self.assertEqual(
+                    MODULE._quarantine_batch_count(case_home),
+                    MODULE.MAX_RETAINED_QUARANTINE_BATCHES - 1,
+                )
+
+                self.assertEqual(
+                    MODULE._cleanup_ready_pending_batches(case_home),
+                    1,
+                )
+
+                self.assertFalse(list(index_root.glob("*.json")))
+                self.assertFalse(list(index_root.glob("*.json.tmp")))
+                self.assertFalse(case_target.exists())
+                quarantine_root = (
+                    MODULE._personal_sync_root(case_home)
+                    / MODULE.QUARANTINE_RELATIVE_PATH
+                )
+                self.assertFalse(
+                    tuple(quarantine_root.glob(".codex-ephemeral-cleanup-*"))
+                )
+                self.assertEqual(
+                    MODULE._quarantine_batch_count(case_home),
+                    MODULE.MAX_RETAINED_QUARANTINE_BATCHES - 1,
+                )
+                self.assertIsInstance(
+                    MODULE._quarantine_batch_root(case_home, []),
+                    Path,
+                )
+
+    def test_v5_ephemeral_ticket_never_authorizes_a_retained_payload(self) -> None:
+        case_home = self.root / "ephemeral-retained-payload"
+        install(self.first_release, case_home, SHA_A)
+        case_target = case_home / ROLE_TARGET
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            case_home,
+            case_target,
+            require_managed_access=False,
+        )
+        parent_fd = MODULE._open_directory_beneath(case_home, case_target.parent)
+        try:
+            result = MODULE._move_regular_leaf_to_unique_quarantine(
+                case_home,
+                case_target.parent,
+                parent_fd,
+                case_target.name,
+                label="legacy-v5-payload",
+                expected=expected,
+                retain_batch_binding=True,
+            )
+        finally:
+            MODULE._close_fd_quietly(parent_fd)
+        _quarantine_path, _moved, binding = result
+        ticket = MODULE._publish_pending_ephemeral_quarantine_cleanup_ticket(
+            case_home,
+            binding,
+        )
+        self.assertEqual(ticket.version, 5)
+        payloads = tuple((ticket.batch_root / "leaf").iterdir())
+        self.assertEqual(len(payloads), 1)
+        payload_identity = (
+            payloads[0].stat().st_dev,
+            payloads[0].stat().st_ino,
+        )
+        payload = payloads[0].read_bytes()
+
+        with self.assertRaisesRegex(MODULE.SyncError, "leaf is not empty"):
+            MODULE._cleanup_ready_pending_batches(case_home)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertEqual(payloads[0].read_bytes(), payload)
+        self.assertEqual(
+            (payloads[0].stat().st_dev, payloads[0].stat().st_ino),
+            payload_identity,
+        )
+        with self.assertRaisesRegex(MODULE.SyncError, "ticket v5"):
+            MODULE._require_no_pending_terminal_mutation_authority(case_home)
+
+    def test_v6_ephemeral_cleanup_preserves_foreign_payload_replacements(
+        self,
+    ) -> None:
+        for case in (
+            "private-replacement",
+            "canonical-reappearance",
+            "alias-reappearance",
+        ):
+            with self.subTest(case=case):
+                case_home = self.root / f"ephemeral-v6-{case}"
+                install(self.first_release, case_home, SHA_A)
+                case_target = case_home / ROLE_TARGET
+                expected = MODULE._read_regular_file_snapshot_beneath(
+                    case_home,
+                    case_target,
+                    require_managed_access=False,
+                )
+                with (
+                    self._receiptless_cleanup_crash_patch("alias-private"),
+                    self.assertRaisesRegex(SystemExit, "after private isolation"),
+                ):
+                    MODULE._delete_exact_regular_publication_without_pending_receipt(
+                        case_home,
+                        case_target,
+                        expected,
+                    )
+                ticket = self._only_cleanup_ticket_for_home(case_home)
+                private_path = (
+                    MODULE._personal_sync_root(case_home)
+                    / MODULE.QUARANTINE_RELATIVE_PATH
+                    / MODULE._pending_ephemeral_quarantine_leaf_name(
+                        ticket.batch_root.name
+                    )
+                )
+                if case == "private-replacement":
+                    private_path.unlink()
+                    protected = private_path
+                elif case == "alias-reappearance":
+                    protected = case_target.with_name(
+                        MODULE._pending_ephemeral_public_alias_name(
+                            ticket.batch_root.name
+                        )
+                    )
+                else:
+                    protected = case_target
+                protected.write_bytes(b"foreign replacement\n")
+                protected.chmod(0o600)
+                protected_identity = (
+                    protected.stat().st_dev,
+                    protected.stat().st_ino,
+                )
+
+                expected_error = (
+                    "retained replacement as isolated evidence"
+                    if case == "private-replacement"
+                    else "reappeared after private isolation"
+                )
+                with self.assertRaisesRegex(MODULE.SyncError, expected_error):
+                    MODULE._cleanup_ready_pending_batches(case_home)
+
+                self.assertTrue(ticket.path.is_file())
+                evidence = tuple(
+                    (
+                        MODULE._personal_sync_root(case_home)
+                        / MODULE.QUARANTINE_RELATIVE_PATH
+                    ).glob(".codex-ephemeral-cleanup-*")
+                )
+                if case == "private-replacement":
+                    self.assertFalse(case_target.exists())
+                    protected_evidence = tuple(
+                        path
+                        for path in evidence
+                        if (path.stat().st_dev, path.stat().st_ino)
+                        == protected_identity
+                    )
+                    self.assertEqual(len(protected_evidence), 1)
+                    self.assertEqual(
+                        protected_evidence[0].read_bytes(),
+                        b"foreign replacement\n",
+                    )
+                else:
+                    self.assertEqual(protected.read_bytes(), b"foreign replacement\n")
+                    self.assertEqual(
+                        (protected.stat().st_dev, protected.stat().st_ino),
+                        protected_identity,
+                    )
+                    self.assertEqual(len(evidence), 1)
+
+    def test_v6_ephemeral_cleanup_restart_after_private_unlink_preserves_foreign_canonical(
+        self,
+    ) -> None:
+        case_home = self.root / "ephemeral-v6-post-unlink-reappearance"
+        install(self.first_release, case_home, SHA_A)
+        case_target = case_home / ROLE_TARGET
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            case_home,
+            case_target,
+            require_managed_access=False,
+        )
+        with (
+            self._receiptless_cleanup_crash_patch("private-unlink-after"),
+            self.assertRaisesRegex(SystemExit, "injected crash after private unlink"),
+        ):
+            MODULE._delete_exact_regular_publication_without_pending_receipt(
+                case_home,
+                case_target,
+                expected,
+            )
+
+        ticket = self._only_cleanup_ticket_for_home(case_home)
+        phase_receipt = MODULE._read_pending_cleanup_terminal_validation(
+            case_home,
+            ticket,
+            ticket.quarantine_root_identity,
+        )
+        self.assertIsNotNone(phase_receipt)
+        quarantine_root = (
+            MODULE._personal_sync_root(case_home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        self.assertFalse(tuple(quarantine_root.glob(".codex-ephemeral-cleanup-*")))
+
+        case_target.write_bytes(b"foreign after private unlink\n")
+        case_target.chmod(0o600)
+        protected_identity = (
+            case_target.stat().st_dev,
+            case_target.stat().st_ino,
+        )
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "public canonical reappeared after private isolation",
+        ):
+            MODULE._cleanup_ready_pending_batches(case_home)
+
+        self.assertEqual(case_target.read_bytes(), b"foreign after private unlink\n")
+        self.assertEqual(
+            (case_target.stat().st_dev, case_target.stat().st_ino),
+            protected_identity,
+        )
+        self.assertTrue(ticket.path.is_file())
+        self.assertIsNotNone(
+            MODULE._read_pending_cleanup_terminal_validation(
+                case_home,
+                ticket,
+                ticket.quarantine_root_identity,
+            )
+        )
+
+    def test_v6_ephemeral_cleanup_orphan_phase_preserves_foreign_after_ticket_delete(
+        self,
+    ) -> None:
+        case_home = self.root / "ephemeral-v6-orphan-private-phase"
+        install(self.first_release, case_home, SHA_A)
+        case_target = case_home / ROLE_TARGET
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            case_home,
+            case_target,
+            require_managed_access=False,
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_delete_pending_cleanup_terminal_validation",
+                side_effect=SystemExit("injected crash before phase deletion"),
+            ),
+            self.assertRaisesRegex(SystemExit, "before phase deletion"),
+        ):
+            MODULE._delete_exact_regular_publication_without_pending_receipt(
+                case_home,
+                case_target,
+                expected,
+            )
+
+        index_root = MODULE._pending_cleanup_index_path(case_home)
+        self.assertFalse(tuple(index_root.glob("*.json")))
+        phase_receipts = tuple(
+            index_root.glob(f"*{MODULE.PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX}")
+        )
+        self.assertEqual(len(phase_receipts), 1)
+        case_target.write_bytes(b"foreign after ticket deletion\n")
+        case_target.chmod(0o600)
+        protected_identity = (
+            case_target.stat().st_dev,
+            case_target.stat().st_ino,
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "public entry was retained in place",
+        ):
+            MODULE._cleanup_ready_pending_batches(case_home)
+
+        self.assertEqual(case_target.read_bytes(), b"foreign after ticket deletion\n")
+        self.assertEqual(
+            (case_target.stat().st_dev, case_target.stat().st_ino),
+            protected_identity,
+        )
+        self.assertTrue(phase_receipts[0].is_file())
+
+        case_target.unlink()
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(case_home), 1)
+        self.assertFalse(phase_receipts[0].exists())
+
+    def test_v5_ephemeral_cleanup_preserves_foreign_or_replaced_members(
+        self,
+    ) -> None:
+        for case in ("foreign-sibling", "metadata-replacement", "dual-roots"):
+            with self.subTest(case=case):
+                case_home = self.root / f"ephemeral-{case}"
+                install(self.first_release, case_home, SHA_A)
+                case_target = case_home / ROLE_TARGET
+                ticket = self._make_v5_empty_ticket(
+                    case_home,
+                    case_target,
+                )
+
+                if case == "foreign-sibling":
+                    protected = ticket.batch_root / "foreign"
+                    protected.write_bytes(b"foreign sibling")
+                    expected_error = "unknown member"
+                elif case == "metadata-replacement":
+                    protected = ticket.batch_root / "metadata.json"
+                    protected.unlink()
+                    protected.write_bytes(b"foreign metadata")
+                    protected.chmod(0o600)
+                    expected_error = "metadata"
+                else:
+                    protected = ticket.batch_root.with_name(ticket.isolated_name or "")
+                    protected.mkdir(mode=0o700)
+                    expected_error = "canonical and isolated roots"
+                protected_identity = (
+                    protected.stat().st_dev,
+                    protected.stat().st_ino,
+                )
+                protected_payload = (
+                    protected.read_bytes() if protected.is_file() else None
+                )
+
+                with self.assertRaisesRegex(MODULE.SyncError, expected_error):
+                    MODULE._cleanup_ready_pending_batches(case_home)
+
+                self.assertTrue(ticket.path.is_file())
+                self.assertTrue(protected.exists())
+                self.assertEqual(
+                    (protected.stat().st_dev, protected.stat().st_ino),
+                    protected_identity,
+                )
+                if protected_payload is not None:
+                    self.assertEqual(protected.read_bytes(), protected_payload)
+
+    def test_v5_ephemeral_cleanup_revalidates_ticket_control_properties(
+        self,
+    ) -> None:
+        for changed_property in ("identity", "content", "access-policy"):
+            with self.subTest(changed_property=changed_property):
+                case_home = self.root / f"ephemeral-ticket-{changed_property}"
+                install(self.first_release, case_home, SHA_A)
+                case_target = case_home / ROLE_TARGET
+                ticket = self._make_v5_empty_ticket(
+                    case_home,
+                    case_target,
+                )
+                ticket_payload = ticket.path.read_bytes()
+                real_members = MODULE._pending_ephemeral_batch_members
+                changed = False
+
+                def change_ticket_after_inventory(batch_fd: int, batch_name: str):
+                    nonlocal changed
+                    result = real_members(batch_fd, batch_name)
+                    if changed:
+                        return result
+                    changed = True
+                    if changed_property == "identity":
+                        ticket.path.unlink()
+                        ticket.path.write_bytes(ticket_payload)
+                        ticket.path.chmod(0o600)
+                    elif changed_property == "content":
+                        changed_payload = ticket_payload.replace(
+                            b'"leaf"',
+                            b'"leAf"',
+                            1,
+                        )
+                        self.assertNotEqual(changed_payload, ticket_payload)
+                        ticket.path.write_bytes(changed_payload)
+                    else:
+                        ticket.path.chmod(0o640)
+                    return result
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_pending_ephemeral_batch_members",
+                        side_effect=change_ticket_after_inventory,
+                    ),
+                    self.assertRaises(MODULE.SyncError),
+                ):
+                    MODULE._cleanup_ready_pending_batches(case_home)
+
+                self.assertTrue(changed)
+                self.assertTrue(ticket.batch_root.is_dir())
+                self.assertTrue(ticket.path.is_file())
+
+    def test_v5_ephemeral_cleanup_revalidates_leaf_at_rmdir_boundary(self) -> None:
+        case_home = self.root / "ephemeral-v5-leaf-rmdir-boundary"
+        install(self.first_release, case_home, SHA_A)
+        case_target = case_home / ROLE_TARGET
+        ticket = self._make_v5_empty_ticket(case_home, case_target)
+        leaf = ticket.batch_root / "leaf"
+        real_require = MODULE._require_pending_cleanup_fd_access_policy
+        leaf_checks = 0
+        replacement_identity: tuple[int, int] | None = None
+
+        def replace_leaf_on_final_access(
+            file_descriptor: int,
+            display_path: Path,
+            *,
+            expected_mode: int,
+        ):
+            nonlocal leaf_checks, replacement_identity
+            result = real_require(
+                file_descriptor,
+                display_path,
+                expected_mode=expected_mode,
+            )
+            if display_path == leaf:
+                leaf_checks += 1
+                if leaf_checks == 2:
+                    leaf.rmdir()
+                    leaf.mkdir(mode=0o700)
+                    protected = leaf / "foreign"
+                    protected.write_bytes(b"foreign leaf\n")
+                    replacement = leaf.stat()
+                    replacement_identity = (replacement.st_dev, replacement.st_ino)
+            return result
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_require_pending_cleanup_fd_access_policy",
+                side_effect=replace_leaf_on_final_access,
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "leaf changed before removal"),
+        ):
+            MODULE._cleanup_ready_pending_batches(case_home)
+
+        self.assertEqual(leaf_checks, 2)
+        self.assertTrue(ticket.path.is_file())
+        self.assertEqual((leaf.stat().st_dev, leaf.stat().st_ino), replacement_identity)
+        self.assertEqual((leaf / "foreign").read_bytes(), b"foreign leaf\n")
+
+    def test_v5_ephemeral_cleanup_revalidates_names_at_batch_rmdir_boundary(
+        self,
+    ) -> None:
+        case_home = self.root / "ephemeral-v5-batch-rmdir-boundary"
+        install(self.first_release, case_home, SHA_A)
+        case_target = case_home / ROLE_TARGET
+        ticket = self._make_v5_empty_ticket(case_home, case_target)
+        isolated = ticket.batch_root.with_name(ticket.isolated_name or "")
+        real_require = MODULE._require_pending_cleanup_ticket_unchanged
+        replacement_identity: tuple[int, int] | None = None
+
+        def recreate_canonical_before_final_rmdir(home: Path, current) -> None:
+            nonlocal replacement_identity
+            real_require(home, current)
+            if (
+                replacement_identity is None
+                and isolated.is_dir()
+                and not ticket.batch_root.exists()
+            ):
+                ticket.batch_root.mkdir(mode=0o700)
+                protected = ticket.batch_root / "foreign"
+                protected.write_bytes(b"foreign batch\n")
+                replacement = ticket.batch_root.stat()
+                replacement_identity = (replacement.st_dev, replacement.st_ino)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_require_pending_cleanup_ticket_unchanged",
+                side_effect=recreate_canonical_before_final_rmdir,
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "batch changed before removal"),
+        ):
+            MODULE._cleanup_ready_pending_batches(case_home)
+
+        self.assertIsNotNone(replacement_identity)
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(isolated.is_dir())
+        self.assertEqual(
+            (ticket.batch_root.stat().st_dev, ticket.batch_root.stat().st_ino),
+            replacement_identity,
+        )
+        self.assertEqual(
+            (ticket.batch_root / "foreign").read_bytes(),
+            b"foreign batch\n",
+        )
 
     def test_v1_v2_cleanup_backlog_does_not_block_terminal_authority_gate(
         self,

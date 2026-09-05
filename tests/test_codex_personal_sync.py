@@ -14192,7 +14192,9 @@ while True:
         self.assertEqual(stage.read_bytes(), b"authority")
         self.assertFalse(os.path.lexists(target))
         self.assertIsNotNone(replacement_identity)
-        quarantined = tuple((home / "personal-sync" / "quarantine").glob("*/leaf/*"))
+        quarantined = tuple(
+            (home / "personal-sync" / "quarantine").glob(".codex-ephemeral-cleanup-*")
+        )
         self.assertEqual(len(quarantined), 1)
         self.assertEqual(quarantined[0].read_bytes(), b"foreign")
         self.assertEqual(

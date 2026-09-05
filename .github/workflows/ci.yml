@@ -62,6 +62,12 @@ jobs:
         run: >-
           python3 -m unittest
           tests.test_pending_agent_claim_compatibility.PendingAgentClaimCompatibilityTests.test_internal_file_fchmod_and_cleanup_failure_remains_fail_closed
+      - name: Run Python 3.9 regular-to-symlink migration recovery tests
+        if: matrix.python-version == '3.9'
+        run: >-
+          python3 -m unittest
+          tests.test_regular_agent_materialization.PublicRegularAgentTests.test_exact_same_target_removal_migrates_regular_agent_to_symlink
+          tests.test_regular_agent_materialization.RegularAgentPendingRecoveryTests.test_regular_to_symlink_precommit_recovery_restores_exact_regular_file
       - name: Run macOS Git locator tests
         run: >-
           python3 -m unittest discover -s tests
