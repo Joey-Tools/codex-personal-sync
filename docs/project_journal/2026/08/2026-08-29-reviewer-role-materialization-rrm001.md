@@ -597,3 +597,26 @@ superseded_by:
   versions, release-receipt cache finalization, and the revised cache-hit
   compatibility contract. The next gate is a fresh exact-head whole-range
   review after a signed frozen commit; no PR has been created yet.
+- A final allocation/reclaim repair introduces a durable v8 allocation fence
+  before any quarantine batch, metadata, or leaf mutation. The fence reserves
+  capacity and blocks unsafe recovery, but is never deletion authority: only a
+  separately exact v5/v7 cleanup ticket may remove a bound entity. Legacy v5
+  ticket bytes retain their historical schema without `metadata.size`; complete
+  v5 temporary tickets are promoted only through full canonical validation.
+  Classification, promotion, duplicate-canonical handling, isolation, and
+  unlink now carry exact snapshots for object identity, content stability, and
+  access policy. A malformed captured object can be retired only when that
+  same object remains bound at the destructive edge; any replacement, vanished
+  name, I/O failure, or policy uncertainty preserves durable evidence and
+  blocks further mutation.
+- Three independent fresh GPT-5.6 Sol Ultra boundary reviews drove and then
+  rechecked this repair. They covered legacy v5 compatibility, temporary-ticket
+  promotion, same-inode callback rewrites, scanner classification-to-discard
+  replacement, and duplicate-canonical revalidation. The final focused review
+  returned PASS. The post-repair cross-module suite passed 921 tests with one
+  expected skip in 229.300 seconds; complete discovery passed 1,562 tests with
+  three expected skips in 960.578 seconds under the 30-minute process-group
+  deadline and 128 MiB log ceiling. Ruff `E4/E7/E9/F`, Ruff formatting,
+  `actionlint`, Python compilation, `git diff --check`, and the refreshed
+  ten-source lock check passed. A signed frozen exact-head whole-range review
+  remains required before PR creation.

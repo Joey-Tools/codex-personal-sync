@@ -225,6 +225,8 @@ PENDING_STATE_STAGING_MARKER = PurePosixPath(
 PENDING_CLEANUP_INDEX_RELATIVE_PATH = Path("pending-cleanup")
 PENDING_CLEANUP_TICKET_SUFFIX = ".json"
 PENDING_CLEANUP_TICKET_TEMP_SUFFIX = ".json.tmp"
+PENDING_QUARANTINE_ALLOCATION_SUFFIX = ".allocation.json"
+PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX = ".allocation.json.tmp"
 PENDING_CLEANUP_EMPTY_PROOF_SUFFIX = ".empty-proof"
 PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX = ".terminal-validation"
 PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX = ".publish-tmp"
@@ -4845,6 +4847,7 @@ class PendingBatchCleanupTicket:
     metadata_file_identity: tuple[int, int] | None = None
     metadata_mode: int | None = None
     metadata_sha256: str | None = None
+    metadata_size: int | None = None
     public_target: PurePosixPath | None = None
     public_parent_identity: tuple[int, int] | None = None
     payload_file_identity: tuple[int, int] | None = None
@@ -4854,6 +4857,22 @@ class PendingBatchCleanupTicket:
     payload_uid: int | None = None
     payload_gid: int | None = None
     payload_link_count: int | None = None
+
+
+@dataclass(frozen=True)
+class PendingQuarantineAllocationTicket:
+    """Durable reservation/fence; never deletion authority for a batch."""
+
+    path: Path
+    snapshot: ManagedStateFileSnapshot
+    batch_root: Path
+    quarantine_root_identity: tuple[int, int]
+    isolated_name: str
+    batch_mode: int
+    metadata_sha256: str
+    metadata_size: int
+    metadata_mode: int
+    leaf_mode: int
 
 
 @dataclass
@@ -5202,9 +5221,11 @@ class EphemeralQuarantineBatchBinding:
     """Exact authority retained solely to reclaim one operation's empty batch."""
 
     batch_root: Path
+    quarantine_root_identity: tuple[int, int]
     batch_identity: tuple[int, int]
     leaf_identity: tuple[int, int] | None
     metadata: ManagedStateFileSnapshot
+    allocation_ticket: PendingQuarantineAllocationTicket | None = None
 
 
 @dataclass(frozen=True)
@@ -5218,6 +5239,102 @@ class ManagedStateFileSnapshot:
     size: int | None = None
     uid: int | None = None
     gid: int | None = None
+
+
+@dataclass
+class EphemeralQuarantineBatchAllocation:
+    """Own one fully bound empty-scaffold allocation until private use begins.
+
+    The resource is constructed inside the allocator, with duplicated root and
+    batch descriptors, before control returns to a caller.  This closes the
+    otherwise unguarded return/unpack/binding window: abandoning the temporary
+    object closes every descriptor and attempts the same identity-bound durable
+    reclaim used by explicit error handling.  Reclaim authority is irrevocably
+    dropped before the first private rename, because an exception from rename
+    may arrive after the destination was created.
+    """
+
+    home: Path
+    quarantine_root: Path
+    quarantine_fd: int
+    batch_fd: int
+    binding: EphemeralQuarantineBatchBinding
+    leaf_fd: int = -1
+    reclaim_authorized: bool = True
+
+    @property
+    def batch_root(self) -> Path:
+        return self.binding.batch_root
+
+    def create_leaf(self) -> int:
+        if self.leaf_fd >= 0:
+            raise SyncError("ephemeral quarantine leaf is already bound")
+        _create_ephemeral_quarantine_leaf_at(self)
+        return self.leaf_fd
+
+    def revoke_reclaim(self) -> None:
+        self.reclaim_authorized = False
+
+    def retire_allocation_fence_after_private_use(
+        self,
+        *,
+        expected_leaf_members: tuple[str, ...],
+    ) -> None:
+        ticket = self.binding.allocation_ticket
+        if ticket is None:
+            raise SyncError("ephemeral quarantine allocation fence is missing")
+        # Two fsync/verification passes separate the private rename from fence
+        # retirement.  The ticket deletion helper repeats this exact boundary
+        # inside both its tombstone rename and unlink transitions.
+        for _pass in range(2):
+            os.fsync(self.leaf_fd)
+            os.fsync(self.batch_fd)
+            os.fsync(self.quarantine_fd)
+            _require_ephemeral_quarantine_private_boundary(
+                self,
+                expected_leaf_members=expected_leaf_members,
+            )
+        _delete_pending_quarantine_allocation_ticket(
+            self.home,
+            ticket,
+            boundary_revalidator=lambda: (
+                _require_ephemeral_quarantine_private_boundary(
+                    self,
+                    expected_leaf_members=expected_leaf_members,
+                )
+            ),
+        )
+
+    def close(self) -> None:
+        _close_fd_quietly(self.leaf_fd)
+        self.leaf_fd = -1
+        _close_fd_quietly(self.batch_fd)
+        self.batch_fd = -1
+        _close_fd_quietly(self.quarantine_fd)
+        self.quarantine_fd = -1
+
+    def reclaim_empty(self) -> None:
+        if not self.reclaim_authorized:
+            self.close()
+            return
+        # Revoke before entering cleanup.  A cleanup exception can itself be
+        # post-mutation; the durable ticket published by the cleanup protocol,
+        # rather than a second in-process attempt, is then the only authority.
+        self.reclaim_authorized = False
+        self.close()
+        _discard_empty_ephemeral_quarantine_batch(self.home, self.binding)
+
+    def __del__(self) -> None:
+        try:
+            if self.reclaim_authorized:
+                self.reclaim_empty()
+            else:
+                self.close()
+        except BaseException:
+            # Finalizers cannot report cleanup failures.  Destructive cleanup
+            # publishes durable authority first; pre-publication uncertainty
+            # intentionally retains the complete scaffold as evidence.
+            self.close()
 
 
 @dataclass
@@ -10847,24 +10964,20 @@ def _move_regular_leaf_to_unique_quarantine(
         and source_snapshot.file_identity != expected_identity
     ):
         raise SyncError(f"regular file changed before quarantine: {source_name}")
-    batch_fd = -1
-    batch_identity: tuple[int, int] | None = None
-    metadata: ManagedStateFileSnapshot | None = None
-    batch_root: Path | None = None
+    allocation: EphemeralQuarantineBatchAllocation | None = None
     quarantine_parent: Path | None = None
-    quarantine_parent_fd = -1
     destination: Path | None = None
-    batch_binding: EphemeralQuarantineBatchBinding | None = None
     try:
-        allocation = _quarantine_batch_root(home, [], retain_binding=True)
-        assert isinstance(allocation, tuple)
-        batch_root, batch_fd, batch_identity = allocation
-        metadata = _read_managed_state_file_snapshot(
+        allocated = _quarantine_batch_root(
             home,
-            batch_root / "metadata.json",
-            batch_fd,
-            maximum_bytes=MAX_MANAGED_STATE_BYTES,
+            [],
+            retain_binding=True,
+            retain_scaffold_binding=True,
         )
+        assert isinstance(allocated, EphemeralQuarantineBatchAllocation)
+        allocation = allocated
+        batch_root = allocation.batch_root
+        metadata = allocation.binding.metadata
         if (
             not _managed_state_snapshot_has_complete_file_evidence(metadata)
             or metadata.file_type != stat.S_IFREG
@@ -10872,36 +10985,26 @@ def _move_regular_leaf_to_unique_quarantine(
             or metadata.uid != os.geteuid()
         ):
             raise SyncError(f"ephemeral quarantine metadata is unsafe: {batch_root}")
+        current_metadata = _read_managed_state_file_snapshot(
+            home,
+            batch_root / "metadata.json",
+            allocation.batch_fd,
+            expected_identity=metadata.file_identity,
+            maximum_bytes=MAX_MANAGED_STATE_BYTES,
+        )
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            current_metadata,
+            metadata,
+        ):
+            raise SyncError(f"ephemeral quarantine metadata changed: {batch_root}")
         _require_pending_cleanup_file_snapshot_access_policy(
             home,
             batch_root / "metadata.json",
-            batch_fd,
-            metadata,
-        )
-        assert batch_identity is not None
-        batch_binding = EphemeralQuarantineBatchBinding(
-            batch_root=batch_root,
-            batch_identity=batch_identity,
-            leaf_identity=None,
-            metadata=metadata,
+            allocation.batch_fd,
+            current_metadata,
         )
         quarantine_parent = batch_root / "leaf"
-        quarantine_parent_fd = _open_or_create_directory_beneath(
-            home,
-            quarantine_parent,
-            mode=0o700,
-        )
-        assert batch_binding is not None
-        batch_binding = replace(
-            batch_binding,
-            leaf_identity=_directory_identity(quarantine_parent_fd),
-        )
-        if not _bound_directory_matches(
-            home,
-            quarantine_parent,
-            quarantine_parent_fd,
-        ):
-            raise SyncError(f"quarantine leaf directory changed: {quarantine_parent}")
+        allocation.create_leaf()
         for attempt in range(100):
             destination_name = f"{label}-{os.getpid()}-{time.time_ns()}-{attempt}"
             try:
@@ -10910,10 +11013,15 @@ def _move_regular_leaf_to_unique_quarantine(
                     source_parent,
                     bound_parent_fd=source_parent_fd,
                 )
+                _require_ephemeral_quarantine_private_boundary(allocation)
+                # rename(2) may commit and then surface a BaseException through
+                # a wrapper or signal.  Empty-scaffold authority is therefore
+                # revoked before the first attempt, not after apparent success.
+                allocation.revoke_reclaim()
                 _rename_noreplace_at(
                     source_parent_fd,
                     source_name,
-                    quarantine_parent_fd,
+                    allocation.leaf_fd,
                     destination_name,
                 )
             except FileExistsError:
@@ -10926,20 +11034,16 @@ def _move_regular_leaf_to_unique_quarantine(
             )
         try:
             os.fsync(source_parent_fd)
-            os.fsync(quarantine_parent_fd)
+            os.fsync(allocation.leaf_fd)
             moved = _regular_file_snapshot_at(
-                quarantine_parent_fd,
+                allocation.leaf_fd,
                 destination.name,
                 destination,
             )
-            if not _bound_directory_matches(
-                home,
-                quarantine_parent,
-                quarantine_parent_fd,
-            ):
-                raise SyncError(
-                    f"quarantine leaf directory changed: {quarantine_parent}"
-                )
+            _require_ephemeral_quarantine_private_boundary(
+                allocation,
+                expected_leaf_members=(destination.name,),
+            )
         except BaseException as error:
             raise SyncError(
                 "moved regular-file leaf was retained in quarantine after "
@@ -10957,37 +11061,20 @@ def _move_regular_leaf_to_unique_quarantine(
                 "regular file changed during quarantine and was retained as "
                 f"isolated evidence at {destination}"
             )
+        allocation.retire_allocation_fence_after_private_use(
+            expected_leaf_members=(destination.name,),
+        )
         if not retain_batch_binding:
             return destination, moved
-        assert batch_binding is not None
-        if (
-            _directory_member_names(
-                batch_fd,
-                maximum_entries=3,
-                overflow_message="ephemeral quarantine batch has too many entries",
-            )
-            != ("leaf", "metadata.json")
-            or not _bound_directory_matches(home, batch_root, batch_fd)
-            or not _bound_directory_matches(
-                home,
-                quarantine_parent,
-                quarantine_parent_fd,
-            )
-        ):
-            raise SyncError(f"ephemeral quarantine batch changed: {batch_root}")
         return (
             destination,
             moved,
-            batch_binding,
+            allocation.binding,
         )
     except BaseException as original_error:
-        _close_fd_quietly(quarantine_parent_fd)
-        quarantine_parent_fd = -1
-        _close_fd_quietly(batch_fd)
-        batch_fd = -1
-        if batch_binding is not None and destination is None:
+        if allocation is not None and allocation.reclaim_authorized:
             try:
-                _discard_empty_ephemeral_quarantine_batch(home, batch_binding)
+                allocation.reclaim_empty()
             except (OSError, SyncError) as cleanup_error:
                 cleanup_note = (
                     "fallback quarantine setup failed and its empty scaffold could "
@@ -11002,8 +11089,8 @@ def _move_regular_leaf_to_unique_quarantine(
                     ) from cleanup_error
         raise
     finally:
-        _close_fd_quietly(quarantine_parent_fd)
-        _close_fd_quietly(batch_fd)
+        if allocation is not None:
+            allocation.close()
 
 
 def _publish_reconcile_directory_noreplace(
@@ -11374,7 +11461,9 @@ def _evacuate_created_regular_leaf_after_failure(
     churn are not mutation signals; parent object replacement, an unreadable or
     changed leaf, alias reappearance, or canonical-name reappearance all retain
     evidence and fail closed. An unbound replacement can therefore be retained,
-    but is never deleted as though it were the created object.
+    but is never deleted as though it were the created object. Before the first
+    private move, an allocation-time binding over the batch, metadata and leaf
+    authorizes reclamation only while that scaffold remains exact and empty.
     """
     active_name: str | None = None
     for _attempt in range(128):
@@ -11409,36 +11498,60 @@ def _evacuate_created_regular_leaf_after_failure(
             f"alias after evacuation sync failed: {active_path}: {error}"
         ) from error
 
-    try:
-        batch_root = _quarantine_batch_root(home, [])
-        assert isinstance(batch_root, Path)
-        quarantine_parent = batch_root / "leaf"
-        quarantine_parent_fd = _open_or_create_directory_beneath(
-            home,
-            quarantine_parent,
-            mode=0o700,
-        )
-    except BaseException as error:
-        raise SyncError(
-            "created managed regular file was retained under a non-loadable "
-            f"alias because private quarantine setup failed: {active_path}: {error}"
-        ) from error
-
+    allocation: EphemeralQuarantineBatchAllocation | None = None
     destination: Path | None = None
+    quarantine_setup_complete = False
     try:
-        _require_pending_cleanup_fd_access_policy(
-            quarantine_parent_fd,
-            quarantine_parent,
-            expected_mode=0o700,
-        )
-        if not _bound_directory_matches(
-            home,
-            quarantine_parent,
-            quarantine_parent_fd,
-        ):
-            raise SyncError(
-                f"created-leaf private quarantine changed: {quarantine_parent}"
+        try:
+            allocated = _quarantine_batch_root(
+                home,
+                [],
+                retain_binding=True,
+                retain_scaffold_binding=True,
             )
+            assert isinstance(allocated, EphemeralQuarantineBatchAllocation)
+            allocation = allocated
+            batch_root = allocation.batch_root
+            metadata = allocation.binding.metadata
+            if (
+                not _managed_state_snapshot_has_complete_file_evidence(metadata)
+                or metadata.file_type != stat.S_IFREG
+                or metadata.mode != 0o600
+                or metadata.uid != os.geteuid()
+            ):
+                raise SyncError(
+                    f"ephemeral quarantine metadata is unsafe: {batch_root}"
+                )
+            current_metadata = _read_managed_state_file_snapshot(
+                home,
+                batch_root / "metadata.json",
+                allocation.batch_fd,
+                expected_identity=metadata.file_identity,
+                maximum_bytes=MAX_MANAGED_STATE_BYTES,
+            )
+            if not _managed_state_snapshot_matches_bound_file_evidence(
+                current_metadata,
+                metadata,
+            ):
+                raise SyncError(f"ephemeral quarantine metadata changed: {batch_root}")
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                batch_root / "metadata.json",
+                allocation.batch_fd,
+                current_metadata,
+            )
+            quarantine_parent = batch_root / "leaf"
+            allocation.create_leaf()
+            quarantine_setup_complete = True
+        except BaseException as error:
+            raise SyncError(
+                "created managed regular file was retained under a non-loadable "
+                "alias because private quarantine setup failed: "
+                f"{active_path}: {error}"
+            ) from error
+
+        assert allocation is not None
+        _require_ephemeral_quarantine_private_boundary(allocation)
         if _directory_identity(parent_fd) != parent_identity:
             raise SyncError(
                 f"created managed regular-file parent binding changed: {target.parent}"
@@ -11449,10 +11562,12 @@ def _evacuate_created_regular_leaf_after_failure(
                 f"{secrets.token_hex(16)}.evidence"
             )
             try:
+                _require_ephemeral_quarantine_private_boundary(allocation)
+                allocation.revoke_reclaim()
                 _rename_noreplace_at(
                     parent_fd,
                     active_name,
-                    quarantine_parent_fd,
+                    allocation.leaf_fd,
                     destination_name,
                 )
             except FileExistsError:
@@ -11470,25 +11585,16 @@ def _evacuate_created_regular_leaf_after_failure(
             )
         try:
             os.fsync(parent_fd)
-            os.fsync(quarantine_parent_fd)
+            os.fsync(allocation.leaf_fd)
             moved = _regular_file_snapshot_at(
-                quarantine_parent_fd,
+                allocation.leaf_fd,
                 destination.name,
                 destination,
             )
-            _require_pending_cleanup_fd_access_policy(
-                quarantine_parent_fd,
-                quarantine_parent,
-                expected_mode=0o700,
+            _require_ephemeral_quarantine_private_boundary(
+                allocation,
+                expected_leaf_members=(destination.name,),
             )
-            if not _bound_directory_matches(
-                home,
-                quarantine_parent,
-                quarantine_parent_fd,
-            ):
-                raise SyncError(
-                    f"created-leaf private quarantine changed: {quarantine_parent}"
-                )
         except BaseException as error:
             raise SyncError(
                 "created managed regular-file evidence was retained in private "
@@ -11534,16 +11640,36 @@ def _evacuate_created_regular_leaf_after_failure(
                 "created managed regular-file parent changed during evacuation; "
                 f"private evidence was retained: {destination}"
             )
+        allocation.retire_allocation_fence_after_private_use(
+            expected_leaf_members=(destination.name,),
+        )
         return destination, moved
-    except BaseException as error:
-        if destination is None:
+    except BaseException as original_error:
+        if allocation is not None and allocation.reclaim_authorized:
+            try:
+                allocation.reclaim_empty()
+            except (OSError, SyncError) as cleanup_error:
+                cleanup_note = (
+                    "created-leaf quarantine setup failed and its empty scaffold "
+                    f"could not be safely reclaimed: {cleanup_error}"
+                )
+                add_note = getattr(original_error, "add_note", None)
+                if callable(add_note):
+                    add_note(cleanup_note)
+                else:
+                    raise SyncError(
+                        f"{cleanup_note}; original setup failure: {original_error}"
+                    ) from cleanup_error
+        if quarantine_setup_complete and destination is None:
             raise SyncError(
                 "created managed regular file remained under its non-loadable "
-                f"alias after private isolation failed: {active_path}: {error}"
-            ) from error
+                "alias after private isolation failed: "
+                f"{active_path}: {original_error}"
+            ) from original_error
         raise
     finally:
-        _close_fd_quietly(quarantine_parent_fd)
+        if allocation is not None:
+            allocation.close()
 
 
 def _create_regular_file_beneath(
@@ -11995,6 +12121,7 @@ def _pending_cleanup_ticket_matches(
         and actual.metadata_file_identity == expected.metadata_file_identity
         and actual.metadata_mode == expected.metadata_mode
         and actual.metadata_sha256 == expected.metadata_sha256
+        and actual.metadata_size == expected.metadata_size
         and actual.public_target == expected.public_target
         and actual.public_parent_identity == expected.public_parent_identity
         and actual.payload_file_identity == expected.payload_file_identity
@@ -12124,6 +12251,34 @@ def _require_pending_cleanup_file_snapshot_access_policy(
     finally:
         if file_fd >= 0:
             _close_fd_quietly(file_fd)
+
+
+def _require_pending_cleanup_file_snapshot_unchanged(
+    home: Path,
+    path: Path,
+    parent_fd: int,
+    expected: ManagedStateFileSnapshot,
+    *,
+    label: str,
+    maximum_bytes: int = MAX_MANAGED_STATE_BYTES,
+) -> ManagedStateFileSnapshot:
+    """Rebind one exact control file's identity, bytes, and access policy."""
+    current = _read_managed_state_file_snapshot(
+        home,
+        path,
+        parent_fd,
+        expected_identity=expected.file_identity,
+        maximum_bytes=maximum_bytes,
+    )
+    if not _managed_state_snapshot_matches_bound_file_evidence(current, expected):
+        raise SyncError(f"{label} changed")
+    _require_pending_cleanup_file_snapshot_access_policy(
+        home,
+        path,
+        parent_fd,
+        current,
+    )
+    return current
 
 
 def _read_managed_state_bytes(
@@ -15319,12 +15474,86 @@ def _plan_reconciliation(
     return actions
 
 
+def _snapshot_ephemeral_quarantine_metadata_fd(
+    home: Path,
+    batch_root: Path,
+    batch_fd: int,
+    metadata_fd: int,
+) -> ManagedStateFileSnapshot:
+    """Capture stable cleanup evidence from the allocator's retained file FD."""
+    metadata_path = batch_root / "metadata.json"
+    original_offset = 0
+    try:
+        original_offset = os.lseek(metadata_fd, 0, os.SEEK_CUR)
+        before = _require_pending_cleanup_fd_access_policy(
+            metadata_fd,
+            metadata_path,
+            expected_mode=0o600,
+        )
+        os.lseek(metadata_fd, 0, os.SEEK_SET)
+        payload = _read_managed_state_bytes(
+            metadata_fd,
+            metadata_path,
+            MAX_MANAGED_STATE_BYTES,
+        )
+        os.lseek(metadata_fd, 0, os.SEEK_SET)
+        confirmed_payload = _read_managed_state_bytes(
+            metadata_fd,
+            metadata_path,
+            MAX_MANAGED_STATE_BYTES,
+        )
+        after = _require_pending_cleanup_fd_access_policy(
+            metadata_fd,
+            metadata_path,
+            expected_mode=0o600,
+        )
+        named = os.stat(
+            "metadata.json",
+            dir_fd=batch_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not _regular_stat_metadata_matches(after, before)
+            or not _regular_stat_metadata_matches(named, before)
+            or payload != confirmed_payload
+            or after.st_size != len(payload)
+            or not _bound_directory_matches(home, batch_root, batch_fd)
+        ):
+            raise SyncError(
+                f"ephemeral quarantine metadata changed while binding: {batch_root}"
+            )
+        return ManagedStateFileSnapshot(
+            exists=True,
+            payload=payload,
+            mode=stat.S_IMODE(after.st_mode),
+            parent_identity=_directory_identity(batch_fd),
+            file_identity=(after.st_dev, after.st_ino),
+            file_type=stat.S_IFMT(after.st_mode),
+            size=after.st_size,
+            uid=after.st_uid,
+            gid=after.st_gid,
+        )
+    except (OSError, SyncError) as error:
+        raise SyncError(
+            f"ephemeral quarantine metadata is unreadable while binding: {batch_root}"
+        ) from error
+    finally:
+        try:
+            os.lseek(metadata_fd, original_offset, os.SEEK_SET)
+        except OSError:
+            pass
+
+
 def _quarantine_batch_root(
     home: Path,
     actions: list[ReconcileAction],
     *,
     retain_binding: bool = False,
-) -> Path | tuple[Path, int, tuple[int, int]]:
+    retain_scaffold_binding: bool = False,
+) -> Path | tuple[Path, int, tuple[int, int]] | EphemeralQuarantineBatchAllocation:
+    if retain_scaffold_binding and not retain_binding:
+        raise ValueError("scaffold binding requires a retained batch binding")
     quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     batch_name = f"{stamp}-{os.getpid()}-{time.time_ns()}"
@@ -15345,6 +15574,9 @@ def _quarantine_batch_root(
             for action in actions
         ],
     }
+    metadata_payload = (json.dumps(metadata, indent=2, sort_keys=False) + "\n").encode(
+        "utf-8"
+    )
     quarantine_fd = _open_or_create_directory_beneath(
         home,
         quarantine_root,
@@ -15354,17 +15586,29 @@ def _quarantine_batch_root(
     metadata_fd = -1
     created_batch = False
     batch_identity: tuple[int, int] | None = None
-    metadata_empty_snapshot: ManagedStateFileSnapshot | None = None
-    metadata_isolated_after_access_failure = False
+    metadata_snapshot: ManagedStateFileSnapshot | None = None
+    metadata_cleanup_snapshot: ManagedStateFileSnapshot | None = None
+    quarantine_root_identity: tuple[int, int] | None = None
+    allocation_ticket: PendingQuarantineAllocationTicket | None = None
+    scaffold_allocation: EphemeralQuarantineBatchAllocation | None = None
     try:
+        quarantine_root_identity = _directory_identity(quarantine_fd)
         if not _bound_directory_matches(home, quarantine_root, quarantine_fd):
             raise SyncError(f"quarantine root changed: {quarantine_root}")
-        retained_batches = _quarantine_batch_count_from_fd(quarantine_fd)
+        retained_batches = _quarantine_capacity_batch_count(home, quarantine_fd)
         if retained_batches >= MAX_RETAINED_QUARANTINE_BATCHES:
             raise SyncError(
                 "quarantine retains too many transaction batches: "
                 f"{retained_batches} >= {MAX_RETAINED_QUARANTINE_BATCHES}",
                 code="quarantine-saturated",
+            )
+        if retain_scaffold_binding:
+            allocation_ticket = _publish_pending_quarantine_allocation_ticket(
+                home,
+                quarantine_root,
+                quarantine_fd,
+                batch_name,
+                metadata_payload,
             )
         os.mkdir(batch_root.name, mode=0o700, dir_fd=quarantine_fd)
         created_batch = True
@@ -15374,7 +15618,9 @@ def _quarantine_batch_root(
         directory_flags |= getattr(os, "O_NOFOLLOW", 0)
         batch_fd = os.open(batch_root.name, directory_flags, dir_fd=quarantine_fd)
         batch_identity = _directory_identity(batch_fd)
-        metadata_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        # Keep a readable allocation-owned descriptor so any ambiguous write,
+        # flush, or fsync failure can be rebound to the bytes actually present.
+        metadata_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
         metadata_flags |= getattr(os, "O_CLOEXEC", 0)
         metadata_flags |= getattr(os, "O_NOFOLLOW", 0)
         metadata_fd = os.open(
@@ -15383,86 +15629,165 @@ def _quarantine_batch_root(
             0o600,
             dir_fd=batch_fd,
         )
-        metadata_stat = os.fstat(metadata_fd)
-        metadata_empty_snapshot = ManagedStateFileSnapshot(
-            exists=True,
-            payload=b"",
-            mode=stat.S_IMODE(metadata_stat.st_mode),
-            parent_identity=_directory_identity(batch_fd),
-            file_identity=(metadata_stat.st_dev, metadata_stat.st_ino),
-            file_type=stat.S_IFMT(metadata_stat.st_mode),
-            size=metadata_stat.st_size,
-            uid=metadata_stat.st_uid,
-            gid=metadata_stat.st_gid,
-        )
         try:
             os.fchmod(metadata_fd, 0o600)
-        except BaseException as error:
+            metadata_cleanup_snapshot = _snapshot_ephemeral_quarantine_metadata_fd(
+                home,
+                batch_root,
+                batch_fd,
+                metadata_fd,
+            )
+            written = 0
+            while written < len(metadata_payload):
+                count = os.write(metadata_fd, metadata_payload[written:])
+                if count <= 0:
+                    raise OSError("quarantine metadata write made no progress")
+                written += count
+            os.fsync(metadata_fd)
+            metadata_snapshot = _snapshot_ephemeral_quarantine_metadata_fd(
+                home,
+                batch_root,
+                batch_fd,
+                metadata_fd,
+            )
+            if metadata_snapshot.payload != metadata_payload:
+                raise SyncError(
+                    f"quarantine metadata write was incomplete: {batch_root}"
+                )
+            metadata_cleanup_snapshot = metadata_snapshot
+        except BaseException:
+            # A write/fsync wrapper may raise after the kernel committed bytes.
+            # Re-read the retained FD; only exact stable bytes become cleanup
+            # authority.  If revalidation itself is uncertain, retain the full
+            # scaffold instead of guessing from the intended payload.
+            try:
+                metadata_cleanup_snapshot = _snapshot_ephemeral_quarantine_metadata_fd(
+                    home,
+                    batch_root,
+                    batch_fd,
+                    metadata_fd,
+                )
+            except (OSError, SyncError):
+                metadata_cleanup_snapshot = None
+            raise
+        finally:
             _close_fd_quietly(metadata_fd)
             metadata_fd = -1
-            try:
-                _isolate_and_delete_pending_cleanup_file(
-                    home,
-                    batch_root / "metadata.json",
-                    batch_fd,
-                    metadata_empty_snapshot,
-                    label="quarantine metadata after access-policy failure",
-                )
-            except (OSError, SyncError) as cleanup_error:
-                raise SyncError(
-                    "quarantine metadata access-policy setup failed and its "
-                    "final name could not be safely cleared"
-                ) from cleanup_error
-            metadata_isolated_after_access_failure = True
-            raise error
-        with os.fdopen(metadata_fd, "w", encoding="utf-8", closefd=True) as file:
-            metadata_fd = -1
-            json.dump(metadata, file, indent=2, sort_keys=False)
-            file.write("\n")
-            file.flush()
-            os.fsync(file.fileno())
         os.fsync(batch_fd)
         if not _bound_directory_matches(home, batch_root, batch_fd):
             raise SyncError(f"quarantine batch changed: {batch_root}")
-    except BaseException:
+        if retain_scaffold_binding:
+            assert metadata_snapshot is not None
+            assert allocation_ticket is not None
+            current_metadata = _read_managed_state_file_snapshot(
+                home,
+                batch_root / "metadata.json",
+                batch_fd,
+                expected_identity=metadata_snapshot.file_identity,
+                maximum_bytes=MAX_MANAGED_STATE_BYTES,
+            )
+            if not _managed_state_snapshot_matches_bound_file_evidence(
+                current_metadata,
+                metadata_snapshot,
+            ):
+                raise SyncError(
+                    f"quarantine metadata changed before binding: {batch_root}"
+                )
+            assert quarantine_root_identity is not None
+            retained_quarantine_fd = os.dup(quarantine_fd)
+            retained_batch_fd = -1
+            try:
+                retained_batch_fd = os.dup(batch_fd)
+                scaffold_allocation = EphemeralQuarantineBatchAllocation(
+                    home=home,
+                    quarantine_root=quarantine_root,
+                    quarantine_fd=retained_quarantine_fd,
+                    batch_fd=retained_batch_fd,
+                    binding=EphemeralQuarantineBatchBinding(
+                        batch_root=batch_root,
+                        quarantine_root_identity=quarantine_root_identity,
+                        batch_identity=batch_identity,
+                        leaf_identity=None,
+                        metadata=metadata_snapshot,
+                        allocation_ticket=allocation_ticket,
+                    ),
+                )
+            except BaseException:
+                _close_fd_quietly(retained_batch_fd)
+                _close_fd_quietly(retained_quarantine_fd)
+                raise
+    except BaseException as original_error:
         if metadata_fd >= 0:
             _close_fd_quietly(metadata_fd)
+            metadata_fd = -1
+        cleanup_binding: EphemeralQuarantineBatchBinding | None = None
+        if (
+            created_batch
+            and batch_fd >= 0
+            and quarantine_root_identity is not None
+            and batch_identity is not None
+            and metadata_cleanup_snapshot is not None
+            and _managed_state_snapshot_has_complete_file_evidence(
+                metadata_cleanup_snapshot
+            )
+            and metadata_cleanup_snapshot.parent_identity == batch_identity
+            and metadata_cleanup_snapshot.file_type == stat.S_IFREG
+            and metadata_cleanup_snapshot.mode == 0o600
+            and metadata_cleanup_snapshot.uid == os.geteuid()
+        ):
+            cleanup_binding = EphemeralQuarantineBatchBinding(
+                batch_root=batch_root,
+                quarantine_root_identity=quarantine_root_identity,
+                batch_identity=batch_identity,
+                leaf_identity=None,
+                metadata=metadata_cleanup_snapshot,
+                allocation_ticket=allocation_ticket,
+            )
         if batch_fd >= 0:
-            if not metadata_isolated_after_access_failure:
-                try:
-                    os.unlink("metadata.json", dir_fd=batch_fd)
-                except OSError:
-                    pass
             _close_fd_quietly(batch_fd)
             batch_fd = -1
-        if created_batch:
+        if scaffold_allocation is not None:
             try:
-                current_batch = os.stat(
-                    batch_root.name,
-                    dir_fd=quarantine_fd,
-                    follow_symlinks=False,
+                scaffold_allocation.reclaim_empty()
+            except (OSError, SyncError) as cleanup_error:
+                cleanup_note = (
+                    "quarantine allocation handoff failed and its bound empty "
+                    f"scaffold was retained: {cleanup_error}"
                 )
-            except OSError:
-                pass
-            else:
-                if (
-                    batch_identity is not None
-                    and stat.S_ISDIR(current_batch.st_mode)
-                    and (current_batch.st_dev, current_batch.st_ino) == batch_identity
-                ):
-                    try:
-                        os.rmdir(batch_root.name, dir_fd=quarantine_fd)
-                        os.fsync(quarantine_fd)
-                    except OSError:
-                        pass
+                add_note = getattr(original_error, "add_note", None)
+                if callable(add_note):
+                    add_note(cleanup_note)
+                else:
+                    raise SyncError(
+                        f"{cleanup_note}; original allocation failure: {original_error}"
+                    ) from cleanup_error
+            cleanup_binding = None
+        if cleanup_binding is not None:
+            try:
+                _discard_empty_ephemeral_quarantine_batch(home, cleanup_binding)
+            except (OSError, SyncError) as cleanup_error:
+                cleanup_note = (
+                    "quarantine allocation failed and its bound empty scaffold "
+                    f"was retained: {cleanup_error}"
+                )
+                add_note = getattr(original_error, "add_note", None)
+                if callable(add_note):
+                    add_note(cleanup_note)
+                else:
+                    raise SyncError(
+                        f"{cleanup_note}; original allocation failure: {original_error}"
+                    ) from cleanup_error
         raise
     finally:
-        if batch_fd >= 0 and not retain_binding:
+        if batch_fd >= 0 and (not retain_binding or retain_scaffold_binding):
             _close_fd_quietly(batch_fd)
         _close_fd_quietly(quarantine_fd)
     if retain_binding:
         assert batch_fd >= 0
         assert batch_identity is not None
+        if retain_scaffold_binding:
+            assert scaffold_allocation is not None
+            return scaffold_allocation
         return batch_root, batch_fd, batch_identity
     return batch_root
 
@@ -15500,6 +15825,47 @@ def _create_quarantine_batch_directory_at(
     except BaseException:
         _close_fd_quietly(directory_fd)
         raise
+
+
+def _create_ephemeral_quarantine_leaf_at(
+    allocation: EphemeralQuarantineBatchAllocation,
+) -> None:
+    """Exclusively create and transfer the fallback leaf to its owner.
+
+    ``mkdir`` cannot return a directory descriptor.  Capture the new named
+    directory's identity and store it in the allocation before the first fsync
+    or open that can raise.  Once the descriptor exists, transfer it to the
+    allocation before validating it.  Thus every later exception leaves either
+    an exact leaf identity or an exact retained FD for the v5 cleanup protocol;
+    the owner never falls back to a leaf-absent v7 claim after creation.
+    """
+    batch_fd = allocation.batch_fd
+    if _directory_member_names(batch_fd, maximum_entries=2) != ("metadata.json",):
+        raise SyncError("ephemeral quarantine batch changed before leaf creation")
+    os.mkdir("leaf", mode=0o700, dir_fd=batch_fd)
+    leaf_stat = os.stat("leaf", dir_fd=batch_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(leaf_stat.st_mode):
+        raise SyncError("ephemeral quarantine leaf changed during creation")
+    leaf_identity = (leaf_stat.st_dev, leaf_stat.st_ino)
+    allocation.binding = replace(allocation.binding, leaf_identity=leaf_identity)
+    os.fsync(batch_fd)
+    leaf_fd = os.open(
+        "leaf",
+        _directory_open_flags(nofollow=True),
+        dir_fd=batch_fd,
+    )
+    # Transfer descriptor ownership before validation/fsync.  The allocation's
+    # error path, rather than this helper, then has the complete v5 authority.
+    allocation.leaf_fd = leaf_fd
+    if (
+        _directory_identity(leaf_fd) != leaf_identity
+        or _named_entry_identity(batch_fd, "leaf") != leaf_identity
+        or _directory_member_names(batch_fd, maximum_entries=3)
+        != ("leaf", "metadata.json")
+    ):
+        raise SyncError("ephemeral quarantine leaf changed during creation")
+    os.fsync(leaf_fd)
+    os.fsync(batch_fd)
 
 
 def _snapshot_payload_digest(snapshot: ManagedStateFileSnapshot) -> str | None:
@@ -16695,6 +17061,7 @@ def _publish_pending_ephemeral_quarantine_cleanup_ticket(
     home: Path,
     binding: EphemeralQuarantineBatchBinding,
 ) -> PendingBatchCleanupTicket:
+    _require_quarantine_allocation_matches_binding(home, binding)
     if binding.leaf_identity is None:
         raise SyncError("ephemeral quarantine cleanup leaf identity is missing")
     batch_root = binding.batch_root
@@ -16711,9 +17078,12 @@ def _publish_pending_ephemeral_quarantine_cleanup_ticket(
             quarantine_root,
             expected_mode=0o700,
         )
-        if not _bound_directory_matches(home, quarantine_root, quarantine_fd):
+        if _directory_identity(
+            quarantine_fd
+        ) != binding.quarantine_root_identity or not _bound_directory_matches(
+            home, quarantine_root, quarantine_fd
+        ):
             raise SyncError(f"ephemeral quarantine root changed: {quarantine_root}")
-        quarantine_root_identity = _directory_identity(quarantine_fd)
         batch_fd = os.open(batch_name, directory_flags, dir_fd=quarantine_fd)
         if _directory_identity(
             batch_fd
@@ -16764,7 +17134,7 @@ def _publish_pending_ephemeral_quarantine_cleanup_ticket(
         )
         payload = _pending_ephemeral_quarantine_cleanup_ticket_payload(
             replace(binding, metadata=current_metadata),
-            quarantine_root_identity,
+            binding.quarantine_root_identity,
         )
         _publish_pending_batch_cleanup_ticket_for_root(
             home,
@@ -16786,21 +17156,206 @@ def _publish_pending_ephemeral_quarantine_cleanup_ticket(
         _close_fd_quietly(quarantine_fd)
 
 
+def _publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+    home: Path,
+    binding: EphemeralQuarantineBatchBinding,
+) -> PendingBatchCleanupTicket:
+    """Durably bind an allocation whose ``leaf`` member is proven absent."""
+    _require_quarantine_allocation_matches_binding(home, binding)
+    if binding.leaf_identity is not None:
+        raise SyncError("ephemeral quarantine scaffold leaf must be absent")
+    batch_root = binding.batch_root
+    quarantine_root = batch_root.parent
+    batch_name = batch_root.name
+    directory_flags = _directory_open_flags(nofollow=True)
+    quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    batch_fd = -1
+    try:
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd,
+            quarantine_root,
+            expected_mode=0o700,
+        )
+        if (
+            _directory_identity(quarantine_fd) != binding.quarantine_root_identity
+            or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+            or _named_entry_identity(quarantine_fd, batch_name)
+            != binding.batch_identity
+        ):
+            raise SyncError(f"ephemeral quarantine root changed: {quarantine_root}")
+        batch_fd = os.open(batch_name, directory_flags, dir_fd=quarantine_fd)
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd,
+            batch_root,
+            expected_mode=0o700,
+        )
+        if (
+            _directory_identity(batch_fd) != binding.batch_identity
+            or not _bound_directory_matches(home, batch_root, batch_fd)
+            or _directory_member_names(batch_fd, maximum_entries=2)
+            != ("metadata.json",)
+        ):
+            raise SyncError(f"ephemeral quarantine batch changed: {batch_root}")
+        current_metadata = _read_managed_state_file_snapshot(
+            home,
+            batch_root / "metadata.json",
+            batch_fd,
+            expected_identity=binding.metadata.file_identity,
+            maximum_bytes=MAX_MANAGED_STATE_BYTES,
+        )
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            current_metadata,
+            binding.metadata,
+        ):
+            raise SyncError(f"ephemeral quarantine metadata changed: {batch_root}")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            batch_root / "metadata.json",
+            batch_fd,
+            current_metadata,
+        )
+        # Repeat root/batch/path/member checks immediately before ticket
+        # publication.  Root or batch replacement is a namespace change, while
+        # ordinary directory timestamps are deliberately not compared.
+        if (
+            _directory_identity(quarantine_fd) != binding.quarantine_root_identity
+            or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+            or _named_entry_identity(quarantine_fd, batch_name)
+            != binding.batch_identity
+            or _directory_identity(batch_fd) != binding.batch_identity
+            or not _bound_directory_matches(home, batch_root, batch_fd)
+            or _directory_member_names(batch_fd, maximum_entries=2)
+            != ("metadata.json",)
+        ):
+            raise SyncError(
+                f"ephemeral quarantine scaffold changed before ticket: {batch_root}"
+            )
+        payload = _pending_ephemeral_quarantine_scaffold_cleanup_ticket_payload(
+            replace(binding, metadata=current_metadata)
+        )
+        _publish_pending_batch_cleanup_ticket_for_root(home, batch_root, payload)
+        ticket = _read_pending_cleanup_ticket(
+            home,
+            _pending_cleanup_ticket_path(home, batch_name),
+        )
+        if ticket is None or ticket.snapshot.payload != payload:
+            raise SyncError(
+                f"ephemeral quarantine scaffold ticket changed: {batch_name}"
+            )
+        return ticket
+    finally:
+        _close_fd_quietly(batch_fd)
+        _close_fd_quietly(quarantine_fd)
+
+
+def _require_ephemeral_quarantine_private_boundary(
+    allocation: EphemeralQuarantineBatchAllocation,
+    *,
+    expected_leaf_members: tuple[str, ...] = (),
+) -> None:
+    """Reprove one exact empty leaf immediately before a private rename.
+
+    Protected properties are root/batch/leaf object identity, canonical path
+    membership, metadata object and byte stability, exact member sets, and
+    current-euid access policy.  Directory timestamp or link-count churn is not
+    compared because it does not change any of those properties.
+    """
+    binding = allocation.binding
+    if binding.leaf_identity is None or allocation.leaf_fd < 0:
+        raise SyncError("ephemeral quarantine private leaf is not bound")
+    batch_root = binding.batch_root
+    quarantine_root = allocation.quarantine_root
+    leaf_path = batch_root / "leaf"
+    # Establish the complete namespace first.  Metadata content and every
+    # access policy are then sampled last, immediately before the caller's
+    # rename.  The old ordering ended on member checks, leaving a final window
+    # in which already-sampled policy/content could become unsafe unnoticed.
+    if (
+        _directory_identity(allocation.quarantine_fd)
+        != binding.quarantine_root_identity
+        or not _bound_directory_matches(
+            allocation.home,
+            quarantine_root,
+            allocation.quarantine_fd,
+        )
+        or _named_entry_identity(allocation.quarantine_fd, batch_root.name)
+        != binding.batch_identity
+        or _directory_identity(allocation.batch_fd) != binding.batch_identity
+        or not _bound_directory_matches(
+            allocation.home,
+            batch_root,
+            allocation.batch_fd,
+        )
+        or _directory_member_names(allocation.batch_fd, maximum_entries=3)
+        != ("leaf", "metadata.json")
+        or _named_entry_identity(allocation.batch_fd, "leaf") != binding.leaf_identity
+        or _directory_identity(allocation.leaf_fd) != binding.leaf_identity
+        or not _bound_directory_matches(
+            allocation.home,
+            leaf_path,
+            allocation.leaf_fd,
+        )
+        or _directory_member_names(
+            allocation.leaf_fd,
+            maximum_entries=len(expected_leaf_members) + 1,
+        )
+        != expected_leaf_members
+    ):
+        raise SyncError(
+            f"ephemeral quarantine namespace changed before private rename: "
+            f"{batch_root}"
+        )
+    current_metadata = _read_managed_state_file_snapshot(
+        allocation.home,
+        batch_root / "metadata.json",
+        allocation.batch_fd,
+        expected_identity=binding.metadata.file_identity,
+        maximum_bytes=MAX_MANAGED_STATE_BYTES,
+    )
+    if not _managed_state_snapshot_matches_bound_file_evidence(
+        current_metadata,
+        binding.metadata,
+    ):
+        raise SyncError(f"ephemeral quarantine metadata changed: {batch_root}")
+    _require_pending_cleanup_file_snapshot_access_policy(
+        allocation.home,
+        batch_root / "metadata.json",
+        allocation.batch_fd,
+        current_metadata,
+    )
+    _require_pending_cleanup_fd_access_policy(
+        allocation.quarantine_fd,
+        quarantine_root,
+        expected_mode=0o700,
+    )
+    _require_pending_cleanup_fd_access_policy(
+        allocation.batch_fd,
+        batch_root,
+        expected_mode=0o700,
+    )
+    _require_pending_cleanup_fd_access_policy(
+        allocation.leaf_fd,
+        leaf_path,
+        expected_mode=0o700,
+    )
+
+
 def _discard_empty_ephemeral_quarantine_batch(
     home: Path,
     binding: EphemeralQuarantineBatchBinding,
 ) -> None:
     """Reclaim only the exact empty scaffold allocated for fallback cleanup.
 
-    Object identity, content stability and access policy of ``metadata.json``
-    are bound at allocation time. The batch and leaf directory identities are
-    independently rebound before deletion. Child-entry churn is not itself a
-    mutation signal, but any extra entry prevents reclamation and leaves the
-    private batch intact for inspection. A durable v5 ticket is published
-    before deleting the bound leaf directory, so every later mutation can be
-    resumed by the ordinary pending-cleanup scanner. This is deliberately not
-    an orphan sweep: no batch without an exact ticket or this in-process
-    binding is eligible for removal.
+    The quarantine root, batch and leaf directory identities plus the object
+    identity, content stability and access policy of ``metadata.json`` are
+    bound at allocation time and independently rebound before deletion.
+    Child-entry churn is not itself a mutation signal, but any extra entry
+    prevents reclamation and leaves the private batch intact for inspection.
+    Durable v5 (empty leaf) or v7 (leaf proven absent) authority is published
+    before any destructive cleanup, so every later mutation can be resumed by
+    the ordinary pending-cleanup scanner. This is deliberately not an orphan
+    sweep: no batch without an exact ticket or this in-process binding is
+    eligible for removal.
     """
     batch_root = binding.batch_root
     leaf_path = batch_root / "leaf"
@@ -16808,6 +17363,7 @@ def _discard_empty_ephemeral_quarantine_batch(
     batch_name = batch_root.name
     if _pending_cleanup_batch_name_from_quarantine_entry(batch_name) != batch_name:
         raise SyncError(f"ephemeral quarantine batch name is invalid: {batch_root}")
+    _require_quarantine_allocation_matches_binding(home, binding)
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     directory_flags |= getattr(os, "O_CLOEXEC", 0)
     directory_flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -16821,7 +17377,11 @@ def _discard_empty_ephemeral_quarantine_batch(
             quarantine_root,
             expected_mode=0o700,
         )
-        if not _bound_directory_matches(home, quarantine_root, quarantine_fd):
+        if _directory_identity(
+            quarantine_fd
+        ) != binding.quarantine_root_identity or not _bound_directory_matches(
+            home, quarantine_root, quarantine_fd
+        ):
             raise SyncError(f"ephemeral quarantine root changed: {quarantine_root}")
         batch_fd = os.open(batch_name, directory_flags, dir_fd=quarantine_fd)
         if _directory_identity(
@@ -16903,64 +17463,30 @@ def _discard_empty_ephemeral_quarantine_batch(
                 replace(binding, metadata=current_metadata),
             )
         else:
-            # Leaf setup failed before any quarantined payload existed. No
-            # durable authority is necessary because this call still retains
-            # the allocation-time binding and performs the complete cleanup.
-            _isolate_and_delete_pending_cleanup_file(
-                home,
-                batch_root / "metadata.json",
-                batch_fd,
-                current_metadata,
-                label=f"ephemeral quarantine metadata {batch_name}",
-            )
-            if _directory_member_names(batch_fd, maximum_entries=1) != ():
-                raise SyncError(
-                    f"ephemeral quarantine batch is not empty: {batch_root}"
-                )
-            _require_pending_cleanup_fd_access_policy(
-                batch_fd,
-                batch_root,
-                expected_mode=0o700,
-            )
-            current_batch = os.stat(
-                batch_name,
-                dir_fd=quarantine_fd,
-                follow_symlinks=False,
-            )
+            # Leaf absence is itself a protected property.  Publish v7 durable
+            # authority before metadata isolation, batch isolation, or rmdir so
+            # every post-mutation crash can resume from the ticket/tombstone,
+            # deterministic isolated name, and empty-proof protocol.
             if (
-                not stat.S_ISDIR(current_batch.st_mode)
-                or (current_batch.st_dev, current_batch.st_ino)
-                != binding.batch_identity
+                _directory_identity(quarantine_fd) != binding.quarantine_root_identity
+                or not _bound_directory_matches(
+                    home,
+                    quarantine_root,
+                    quarantine_fd,
+                )
+                or _directory_identity(batch_fd) != binding.batch_identity
                 or not _bound_directory_matches(home, batch_root, batch_fd)
+                or _directory_member_names(batch_fd, maximum_entries=2)
+                != ("metadata.json",)
             ):
                 raise SyncError(
-                    f"ephemeral quarantine batch changed before cleanup: {batch_root}"
+                    "ephemeral quarantine namespace changed before cleanup: "
+                    f"{batch_root}"
                 )
-            isolated_name = _pending_cleanup_isolated_batch_name(batch_name)
-            if _named_entry_identity(quarantine_fd, isolated_name) is not None:
-                raise SyncError(
-                    f"ephemeral quarantine isolated batch already exists: {batch_root}"
-                )
-            _rename_noreplace_at(
-                quarantine_fd,
-                batch_name,
-                quarantine_fd,
-                isolated_name,
+            ticket = _publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+                home,
+                replace(binding, metadata=current_metadata),
             )
-            os.fsync(quarantine_fd)
-            isolated_root = batch_root.with_name(isolated_name)
-            if _directory_identity(
-                batch_fd
-            ) != binding.batch_identity or not _bound_directory_matches(
-                home, isolated_root, batch_fd
-            ):
-                raise SyncError(
-                    f"ephemeral quarantine batch changed after isolation: {batch_root}"
-                )
-            os.rmdir(isolated_name, dir_fd=quarantine_fd)
-            os.fsync(quarantine_fd)
-            if _named_entry_identity(quarantine_fd, isolated_name) is not None:
-                raise SyncError(f"ephemeral quarantine batch reappeared: {batch_root}")
     finally:
         _close_fd_quietly(leaf_fd)
         _close_fd_quietly(batch_fd)
@@ -22927,6 +23453,398 @@ def _pending_cleanup_isolated_batch_name(batch_name: str) -> str:
     return PENDING_CLEANUP_ISOLATED_BATCH_PREFIX + batch_name
 
 
+def _pending_quarantine_allocation_path(home: Path, batch_name: str) -> Path:
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        raise SyncError("pending quarantine allocation has an invalid batch name")
+    return _pending_cleanup_index_path(home) / (
+        batch_name + PENDING_QUARANTINE_ALLOCATION_SUFFIX
+    )
+
+
+def _pending_quarantine_allocation_payload(
+    batch_name: str,
+    quarantine_root_identity: tuple[int, int],
+    metadata_payload: bytes,
+) -> bytes:
+    return _pending_quarantine_allocation_payload_from_plan(
+        batch_name,
+        quarantine_root_identity,
+        hashlib.sha256(metadata_payload).hexdigest(),
+        len(metadata_payload),
+    )
+
+
+def _pending_quarantine_allocation_payload_from_plan(
+    batch_name: str,
+    quarantine_root_identity: tuple[int, int],
+    metadata_sha256: str,
+    metadata_size: int,
+) -> bytes:
+    return _bounded_json_document(
+        {
+            "version": 8,
+            "kind": "ephemeral-quarantine-allocation",
+            "batch": batch_name,
+            "quarantine_root_identity": _identity_payload(quarantine_root_identity),
+            "isolated_name": _pending_cleanup_isolated_batch_name(batch_name),
+            "batch_mode": 0o700,
+            "metadata": {
+                "path": "metadata.json",
+                "sha256": metadata_sha256,
+                "size": metadata_size,
+                "mode": 0o600,
+            },
+            "leaf": {"path": "leaf", "mode": 0o700},
+            "capacity_units": 1,
+            "batch_initial_state": "absent",
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending quarantine allocation exceeds the size limit",
+    )
+
+
+def _pending_quarantine_allocation_batch_name(name: str) -> str | None:
+    if not name.endswith(PENDING_QUARANTINE_ALLOCATION_SUFFIX):
+        return None
+    batch_name = name[: -len(PENDING_QUARANTINE_ALLOCATION_SUFFIX)]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        return None
+    return batch_name
+
+
+def _pending_quarantine_allocation_temp_batch_name(name: str) -> str | None:
+    if not name.endswith(PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX):
+        return None
+    batch_name = name[: -len(PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX)]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        return None
+    return batch_name
+
+
+def _pending_quarantine_retained_allocation_name(
+    name: str,
+) -> tuple[str, str] | None:
+    canonical = _pending_cleanup_retained_canonical_name(name)
+    if canonical is None:
+        return None
+    batch_name = _pending_quarantine_allocation_batch_name(canonical)
+    if batch_name is None:
+        return None
+    return canonical, batch_name
+
+
+def _pending_quarantine_retained_allocation_temp_name(
+    name: str,
+) -> tuple[str, str] | None:
+    canonical = _pending_cleanup_retained_canonical_name(name)
+    if canonical is None:
+        return None
+    batch_name = _pending_quarantine_allocation_temp_batch_name(canonical)
+    if batch_name is None:
+        return None
+    return canonical, batch_name
+
+
+def _read_pending_quarantine_allocation_ticket(
+    home: Path,
+    path: Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> PendingQuarantineAllocationTicket | None:
+    batch_name = _pending_quarantine_allocation_batch_name(path.name)
+    if batch_name is None:
+        raise SyncError("pending quarantine allocation has an invalid file name")
+    index_fd = _open_directory_beneath(home, path.parent)
+    try:
+        snapshot = _read_managed_state_file_snapshot(
+            home,
+            path,
+            index_fd,
+            expected_identity=expected_identity,
+            maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        )
+        if not snapshot.exists:
+            return None
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+            or snapshot.file_type != stat.S_IFREG
+            or snapshot.mode != 0o600
+            or snapshot.uid != os.geteuid()
+            or snapshot.payload is None
+        ):
+            raise SyncError(f"pending quarantine allocation changed: {batch_name}")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            path,
+            index_fd,
+            snapshot,
+        )
+    finally:
+        _close_fd_quietly(index_fd)
+    data = _decode_managed_state_json(snapshot.payload, path)
+    expected_fields = {
+        "version",
+        "kind",
+        "batch",
+        "quarantine_root_identity",
+        "isolated_name",
+        "batch_mode",
+        "metadata",
+        "leaf",
+        "capacity_units",
+        "batch_initial_state",
+    }
+    metadata = data.get("metadata")
+    leaf = data.get("leaf")
+    root_identity = _parse_pending_identity(
+        data.get("quarantine_root_identity"),
+        "pending quarantine allocation root identity",
+    )
+    metadata_sha256 = metadata.get("sha256") if isinstance(metadata, dict) else None
+    metadata_size = metadata.get("size") if isinstance(metadata, dict) else None
+    if (
+        set(data) != expected_fields
+        or data.get("version") != 8
+        or data.get("kind") != "ephemeral-quarantine-allocation"
+        or data.get("batch") != batch_name
+        or root_identity is None
+        or data.get("isolated_name") != _pending_cleanup_isolated_batch_name(batch_name)
+        or data.get("batch_mode") != 0o700
+        or not isinstance(metadata, dict)
+        or set(metadata) != {"path", "sha256", "size", "mode"}
+        or metadata.get("path") != "metadata.json"
+        or not isinstance(metadata_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", metadata_sha256) is None
+        or type(metadata_size) is not int
+        or metadata_size < 0
+        or metadata_size > MAX_MANAGED_STATE_BYTES
+        or metadata.get("mode") != 0o600
+        or leaf != {"path": "leaf", "mode": 0o700}
+        or data.get("capacity_units") != 1
+        or data.get("batch_initial_state") != "absent"
+    ):
+        raise SyncError(f"pending quarantine allocation changed: {batch_name}")
+    canonical_payload = _pending_quarantine_allocation_payload_from_plan(
+        batch_name,
+        root_identity,
+        metadata_sha256,
+        metadata_size,
+    )
+    if snapshot.payload != canonical_payload:
+        raise SyncError(f"pending quarantine allocation changed: {batch_name}")
+    return PendingQuarantineAllocationTicket(
+        path=path,
+        snapshot=snapshot,
+        batch_root=(_personal_sync_root(home) / QUARANTINE_RELATIVE_PATH / batch_name),
+        quarantine_root_identity=root_identity,
+        isolated_name=_pending_cleanup_isolated_batch_name(batch_name),
+        batch_mode=0o700,
+        metadata_sha256=metadata_sha256,
+        metadata_size=metadata_size,
+        metadata_mode=0o600,
+        leaf_mode=0o700,
+    )
+
+
+def _pending_quarantine_allocation_ticket_matches(
+    actual: PendingQuarantineAllocationTicket,
+    expected: PendingQuarantineAllocationTicket,
+) -> bool:
+    # A supplementary-group-equivalent gid transition does not weaken a 0600
+    # file.  Compare the protected identity/content/access properties through
+    # the shared evidence predicate instead of raw dataclass equality.
+    matches = (
+        actual.path == expected.path
+        and _managed_state_snapshot_matches_bound_file_evidence(
+            actual.snapshot,
+            expected.snapshot,
+        )
+        and actual.batch_root == expected.batch_root
+        and actual.quarantine_root_identity == expected.quarantine_root_identity
+        and actual.isolated_name == expected.isolated_name
+        and actual.batch_mode == expected.batch_mode
+        and actual.metadata_sha256 == expected.metadata_sha256
+        and actual.metadata_size == expected.metadata_size
+        and actual.metadata_mode == expected.metadata_mode
+        and actual.leaf_mode == expected.leaf_mode
+    )
+    return matches
+
+
+def _require_quarantine_allocation_matches_binding(
+    home: Path,
+    binding: EphemeralQuarantineBatchBinding,
+) -> PendingQuarantineAllocationTicket | None:
+    ticket = binding.allocation_ticket
+    if ticket is None:
+        return None
+    current = _read_pending_quarantine_allocation_ticket(
+        home,
+        ticket.path,
+        expected_identity=ticket.snapshot.file_identity,
+    )
+    metadata = binding.metadata
+    # The durable reread binds ticket identity and bytes.  The remaining fields
+    # join the append-only reservation to cleanup authority: exact root and
+    # names prevent namespace substitution, while mode/size/digest prevent a
+    # different scaffold shape or metadata body from borrowing the fence.
+    comparisons = {
+        "durable ticket": current is not None
+        and _pending_quarantine_allocation_ticket_matches(current, ticket),
+        "batch path": ticket.batch_root == binding.batch_root,
+        "root identity": ticket.quarantine_root_identity
+        == binding.quarantine_root_identity,
+        "isolated name": ticket.isolated_name
+        == _pending_cleanup_isolated_batch_name(binding.batch_root.name),
+        "batch mode": ticket.batch_mode == 0o700,
+        "metadata mode": ticket.metadata_mode == metadata.mode,
+        "metadata size": ticket.metadata_size == metadata.size,
+        "metadata digest": metadata.payload is not None
+        and ticket.metadata_sha256 == hashlib.sha256(metadata.payload).hexdigest(),
+        "leaf mode": ticket.leaf_mode == 0o700,
+    }
+    mismatch = next(
+        (name for name, matches in comparisons.items() if not matches), None
+    )
+    if mismatch is not None:
+        raise SyncError(
+            f"pending quarantine allocation does not join exact cleanup "
+            f"authority ({mismatch}): {binding.batch_root.name}"
+        )
+    return current
+
+
+def _cleanup_ticket_matches_quarantine_allocation(
+    cleanup: PendingBatchCleanupTicket,
+    allocation: PendingQuarantineAllocationTicket,
+) -> bool:
+    return (
+        cleanup.version in {5, 7}
+        and cleanup.batch_root == allocation.batch_root
+        and cleanup.quarantine_root_identity == allocation.quarantine_root_identity
+        and cleanup.isolated_name == allocation.isolated_name
+        and cleanup.metadata_mode == allocation.metadata_mode
+        # Persisted v5 authority predates the redundant metadata size field.
+        # Its canonical digest still binds the complete byte content; v7 adds
+        # the explicit size without changing the historical v5 schema.
+        and (cleanup.version == 5 or cleanup.metadata_size == allocation.metadata_size)
+        and cleanup.metadata_sha256 == allocation.metadata_sha256
+    )
+
+
+def _delete_pending_quarantine_allocation_ticket(
+    home: Path,
+    ticket: PendingQuarantineAllocationTicket,
+    *,
+    boundary_revalidator: Callable[[], None],
+) -> None:
+    index_fd = _open_directory_beneath(home, ticket.path.parent)
+    try:
+        current = _read_pending_quarantine_allocation_ticket(
+            home,
+            ticket.path,
+            expected_identity=ticket.snapshot.file_identity,
+        )
+        if current is None or not _pending_quarantine_allocation_ticket_matches(
+            current,
+            ticket,
+        ):
+            raise SyncError(
+                f"pending quarantine allocation changed: {ticket.batch_root.name}"
+            )
+
+        def revalidate_ticket_and_boundary(current_name: str) -> None:
+            current_path = ticket.path.with_name(current_name)
+            snapshot = _read_managed_state_file_snapshot(
+                home,
+                current_path,
+                index_fd,
+                expected_identity=ticket.snapshot.file_identity,
+                maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+            )
+            if not _managed_state_snapshot_matches_bound_file_evidence(
+                snapshot,
+                ticket.snapshot,
+            ):
+                raise SyncError(
+                    "pending quarantine allocation changed before retirement: "
+                    f"{ticket.batch_root.name}"
+                )
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                current_path,
+                index_fd,
+                snapshot,
+            )
+            boundary_revalidator()
+
+        _isolate_and_delete_pending_cleanup_file(
+            home,
+            ticket.path,
+            index_fd,
+            ticket.snapshot,
+            label=f"pending quarantine allocation {ticket.batch_root.name}",
+            mutation_revalidator=revalidate_ticket_and_boundary,
+        )
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _retire_quarantine_allocation_after_batch_absent(
+    home: Path,
+    ticket: PendingQuarantineAllocationTicket,
+) -> None:
+    quarantine_root = ticket.batch_root.parent
+    quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    try:
+
+        def require_absent_reservation() -> None:
+            _require_quarantine_allocation_root_absent(
+                home,
+                quarantine_root,
+                quarantine_fd,
+                ticket.batch_root.name,
+                ticket.quarantine_root_identity,
+            )
+
+        require_absent_reservation()
+        _delete_pending_quarantine_allocation_ticket(
+            home,
+            ticket,
+            boundary_revalidator=require_absent_reservation,
+        )
+    finally:
+        _close_fd_quietly(quarantine_fd)
+
+
+def _retire_joined_quarantine_allocation(
+    home: Path,
+    cleanup: PendingBatchCleanupTicket,
+) -> None:
+    path = _pending_quarantine_allocation_path(
+        home,
+        cleanup.batch_root.name,
+    )
+    allocation = _read_pending_quarantine_allocation_ticket(home, path)
+    if allocation is None:
+        return
+    if not _cleanup_ticket_matches_quarantine_allocation(cleanup, allocation):
+        raise SyncError(
+            "pending quarantine allocation does not join cleanup authority: "
+            f"{cleanup.batch_root.name}"
+        )
+    _retire_quarantine_allocation_after_batch_absent(home, allocation)
+
+
 def _pending_cleanup_batch_name_from_quarantine_entry(
     entry_name: str,
 ) -> str | None:
@@ -22941,15 +23859,16 @@ def _pending_cleanup_batch_name_from_quarantine_entry(
     return batch_name
 
 
-def _quarantine_batch_count_from_fd(quarantine_fd: int) -> int:
+def _quarantine_batch_names_from_fd(quarantine_fd: int) -> set[str]:
     names = _directory_member_names(
         quarantine_fd,
         maximum_entries=MAX_PENDING_CLEANUP_BATCH_SCAN,
         overflow_message="quarantine batch scan exceeds the size limit",
     )
-    retained_batches = 0
+    retained_batches: set[str] = set()
     for name in names:
-        if _pending_cleanup_batch_name_from_quarantine_entry(name) is None:
+        batch_name = _pending_cleanup_batch_name_from_quarantine_entry(name)
+        if batch_name is None:
             continue
         try:
             metadata = os.stat(
@@ -22960,8 +23879,50 @@ def _quarantine_batch_count_from_fd(quarantine_fd: int) -> int:
         except OSError as error:
             raise SyncError(f"quarantine batch changed during audit: {name}") from error
         if stat.S_ISDIR(metadata.st_mode):
-            retained_batches += 1
+            retained_batches.add(batch_name)
     return retained_batches
+
+
+def _pending_quarantine_allocation_batch_names(home: Path) -> set[str]:
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return set()
+    try:
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending quarantine allocation scan exceeds the limit",
+        )
+        batches: set[str] = set()
+        for name in names:
+            direct = _pending_quarantine_allocation_batch_name(name)
+            temp = _pending_quarantine_allocation_temp_batch_name(name)
+            retained = _pending_quarantine_retained_allocation_name(name)
+            retained_temp = _pending_quarantine_retained_allocation_temp_name(name)
+            batch_name = direct or temp
+            if batch_name is None and retained is not None:
+                batch_name = retained[1]
+            if batch_name is None and retained_temp is not None:
+                batch_name = retained_temp[1]
+            if batch_name is not None:
+                batches.add(batch_name)
+        if not _bound_directory_matches(home, index_root, index_fd):
+            raise SyncError("pending quarantine allocation index changed")
+        return batches
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _quarantine_capacity_batch_count(home: Path, quarantine_fd: int) -> int:
+    batches = _quarantine_batch_names_from_fd(quarantine_fd)
+    batches.update(_pending_quarantine_allocation_batch_names(home))
+    return len(batches)
+
+
+def _quarantine_batch_count_from_fd(quarantine_fd: int) -> int:
+    return len(_quarantine_batch_names_from_fd(quarantine_fd))
 
 
 def _quarantine_batch_count(home: Path) -> int:
@@ -22969,9 +23930,9 @@ def _quarantine_batch_count(home: Path) -> int:
     try:
         quarantine_fd = _open_directory_beneath(home, quarantine_root)
     except FileNotFoundError:
-        return 0
+        return len(_pending_quarantine_allocation_batch_names(home))
     try:
-        retained_batches = _quarantine_batch_count_from_fd(quarantine_fd)
+        retained_batches = _quarantine_capacity_batch_count(home, quarantine_fd)
         if not _bound_directory_matches(home, quarantine_root, quarantine_fd):
             raise SyncError("quarantine root changed during audit")
         return retained_batches
@@ -23235,6 +24196,7 @@ def _isolate_and_delete_pending_cleanup_file(
     *,
     label: str,
     maximum_bytes: int = MAX_MANAGED_STATE_BYTES,
+    mutation_revalidator: Callable[[str], None] | None = None,
 ) -> None:
     if (
         not _managed_state_snapshot_has_complete_file_evidence(expected)
@@ -23279,6 +24241,12 @@ def _isolate_and_delete_pending_cleanup_file(
 
     retained_name: str | None = None
     for candidate in _retained_pending_cleanup_names(path):
+        if mutation_revalidator is not None:
+            # The caller's authority can include sibling absence, external
+            # tickets, and ancestor policy that this generic file helper cannot
+            # infer.  Revalidate it inside the syscall loop so failed
+            # no-replace candidates do not create an unchecked retry window.
+            mutation_revalidator(path.name)
         try:
             _rename_noreplace_at(
                 parent_fd,
@@ -23298,53 +24266,76 @@ def _isolate_and_delete_pending_cleanup_file(
     retained_path = path.with_name(retained_name)
     file_fd = -1
     try:
+
+        def require_open_file_unchanged(stage: str) -> None:
+            try:
+                before = _require_release_identity_fd_access_policy(
+                    file_fd,
+                    retained_path,
+                    os.geteuid(),
+                )
+                os.lseek(file_fd, 0, os.SEEK_SET)
+                payload = _read_managed_state_bytes(
+                    file_fd,
+                    retained_path,
+                    maximum_bytes,
+                )
+                os.lseek(file_fd, 0, os.SEEK_SET)
+                confirmed_payload = _read_managed_state_bytes(
+                    file_fd,
+                    retained_path,
+                    maximum_bytes,
+                )
+                after = _require_release_identity_fd_access_policy(
+                    file_fd,
+                    retained_path,
+                    os.geteuid(),
+                )
+                named = os.stat(
+                    retained_name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except (OSError, SyncError) as error:
+                raise SyncError(
+                    f"{label} changed {stage}; preserved as {retained_name}"
+                ) from error
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or not _regular_stat_metadata_matches(after, before)
+                or not _regular_stat_metadata_matches(named, before)
+                or not _regular_stat_matches_managed_state_file_snapshot(
+                    after,
+                    expected,
+                )
+                or payload != expected.payload
+                or confirmed_payload != expected.payload
+                or not _bound_directory_matches(home, path.parent, parent_fd)
+            ):
+                raise SyncError(
+                    f"{label} changed {stage}; preserved as {retained_name}"
+                )
+
         try:
             file_fd = os.open(retained_name, flags, dir_fd=parent_fd)
-            before = _require_release_identity_fd_access_policy(
-                file_fd,
-                retained_path,
-                os.geteuid(),
-            )
-            payload = _read_managed_state_bytes(
-                file_fd,
-                retained_path,
-                maximum_bytes,
-            )
-            os.lseek(file_fd, 0, os.SEEK_SET)
-            confirmed_payload = _read_managed_state_bytes(
-                file_fd,
-                retained_path,
-                maximum_bytes,
-            )
-            after = _require_release_identity_fd_access_policy(
-                file_fd,
-                retained_path,
-                os.geteuid(),
-            )
-            named = os.stat(
-                retained_name,
-                dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
         except OSError as error:
             raise SyncError(
                 f"{label} changed before deletion; preserved as {retained_name}"
             ) from error
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or not _regular_stat_metadata_matches(after, before)
-            or not _regular_stat_metadata_matches(named, before)
-            or not _regular_stat_matches_managed_state_file_snapshot(
-                after,
-                expected,
-            )
-            or payload != expected.payload
-            or confirmed_payload != expected.payload
-            or not _bound_directory_matches(home, path.parent, parent_fd)
-        ):
-            raise SyncError(
-                f"{label} changed before deletion; preserved as {retained_name}"
-            )
+        require_open_file_unchanged("before deletion")
+        if mutation_revalidator is not None:
+            # The canonical-to-tombstone rename may have committed before an
+            # injected exception or concurrent namespace change.  Reprove the
+            # broader authority with the retained name immediately before the
+            # irreversible unlink.
+            mutation_revalidator(retained_name)
+            # The broader callback may itself run arbitrary filesystem probes.
+            # Re-read through the descriptor it could not replace, then bind
+            # the retained name back to that exact identity before unlinking.
+            # Same-inode content changes and access-policy changes therefore
+            # fail closed, while unrelated child-entry timestamp churn remains
+            # outside the protected property set.
+            require_open_file_unchanged("after mutation revalidation")
         os.unlink(retained_name, dir_fd=parent_fd)
         os.fsync(parent_fd)
         if _named_entry_identity(
@@ -23416,6 +24407,48 @@ def _pending_ephemeral_quarantine_cleanup_ticket_payload(
                 "path": "metadata.json",
                 "file_identity": _identity_payload(metadata.file_identity),
                 "mode": metadata.mode,
+                "sha256": hashlib.sha256(metadata.payload).hexdigest(),
+            },
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending cleanup ticket exceeds the size limit",
+    )
+
+
+def _pending_ephemeral_quarantine_scaffold_cleanup_ticket_payload(
+    binding: EphemeralQuarantineBatchBinding,
+) -> bytes:
+    metadata = binding.metadata
+    if (
+        binding.leaf_identity is not None
+        or metadata.parent_identity != binding.batch_identity
+        or metadata.file_identity is None
+        or metadata.payload is None
+        or metadata.file_type != stat.S_IFREG
+        or metadata.mode != 0o600
+        or metadata.uid != os.geteuid()
+    ):
+        raise SyncError("ephemeral quarantine scaffold authority is incomplete")
+    batch_name = binding.batch_root.name
+    return _bounded_json_document(
+        {
+            "version": 7,
+            "kind": "ephemeral-quarantine-scaffold",
+            "batch": batch_name,
+            "batch_root_identity": _identity_payload(binding.batch_identity),
+            "quarantine_root_identity": _identity_payload(
+                binding.quarantine_root_identity
+            ),
+            "isolated_name": _pending_cleanup_isolated_batch_name(batch_name),
+            # Absence is an explicit protected property.  Recovery rejects a
+            # leaf that appears after publication instead of treating it as an
+            # empty v5 leaf eligible for deletion.
+            "leaf": None,
+            "metadata": {
+                "path": "metadata.json",
+                "file_identity": _identity_payload(metadata.file_identity),
+                "mode": metadata.mode,
+                "size": metadata.size,
                 "sha256": hashlib.sha256(metadata.payload).hexdigest(),
             },
         },
@@ -23940,24 +24973,51 @@ def _read_pending_cleanup_ticket(
     ticket_path: Path,
     *,
     expected_ticket_identity: tuple[int, int] | None = None,
+    allow_temporary: bool = False,
+    _captured_snapshot: ManagedStateFileSnapshot | None = None,
 ) -> PendingBatchCleanupTicket | None:
-    suffix = PENDING_CLEANUP_TICKET_SUFFIX
-    if not ticket_path.name.endswith(suffix):
-        raise SyncError("pending cleanup ticket has an invalid file name")
-    batch_name = ticket_path.name[: -len(suffix)]
+    """Read and parse one ticket, or purely parse an admitted temp snapshot.
+
+    ``_captured_snapshot`` is restricted to temp recovery.  Its caller must
+    have already read the exact object and admitted its access policy.  This
+    mode performs no filesystem revalidation, so a schema rejection can be
+    distinguished from uncertain I/O or identity/policy drift during capture.
+    """
+    if allow_temporary:
+        batch_name = _pending_cleanup_ticket_temp_batch_name(ticket_path.name)
+        if batch_name is None:
+            raise SyncError("pending cleanup ticket temp has an invalid file name")
+    else:
+        suffix = PENDING_CLEANUP_TICKET_SUFFIX
+        if not ticket_path.name.endswith(suffix):
+            raise SyncError("pending cleanup ticket has an invalid file name")
+        batch_name = ticket_path.name[: -len(suffix)]
     if (
         len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
         or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
     ):
         raise SyncError("pending cleanup ticket has an invalid batch name")
-    index_fd = _open_directory_beneath(home, ticket_path.parent)
+    if _captured_snapshot is not None and not allow_temporary:
+        raise ValueError("captured cleanup ticket parsing is limited to temp files")
+    index_fd = -1
     try:
-        snapshot = _read_managed_state_file_snapshot(
-            home,
-            ticket_path,
-            index_fd,
-            expected_identity=expected_ticket_identity,
-        )
+        if _captured_snapshot is None:
+            index_fd = _open_directory_beneath(home, ticket_path.parent)
+            snapshot = _read_managed_state_file_snapshot(
+                home,
+                ticket_path,
+                index_fd,
+                expected_identity=expected_ticket_identity,
+            )
+        else:
+            snapshot = _captured_snapshot
+            if (
+                expected_ticket_identity is not None
+                and snapshot.file_identity != expected_ticket_identity
+            ):
+                raise SyncError(
+                    f"pending cleanup ticket identity changed: {batch_name}"
+                )
         if not snapshot.exists:
             return None
         if snapshot.payload is None or (
@@ -23968,15 +25028,16 @@ def _read_pending_cleanup_ticket(
             raise SyncError(f"pending cleanup ticket mode changed: {batch_name}")
         if snapshot.uid != os.geteuid():
             raise SyncError(f"pending cleanup ticket owner changed: {batch_name}")
-        _require_pending_cleanup_file_snapshot_access_policy(
-            home,
-            ticket_path,
-            index_fd,
-            snapshot,
-        )
+        if _captured_snapshot is None:
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                ticket_path,
+                index_fd,
+                snapshot,
+            )
         data = _decode_managed_state_json(snapshot.payload, ticket_path)
         version = data.get("version")
-        if type(version) is not int or version not in {1, 2, 3, 4, 5, 6}:
+        if type(version) is not int or version not in {1, 2, 3, 4, 5, 6, 7}:
             raise SyncError(
                 f"pending cleanup ticket has unsupported fields: {batch_name}"
             )
@@ -23996,7 +25057,7 @@ def _read_pending_cleanup_ticket(
             }
             if version == 4:
                 expected_top_level_fields.add("terminal_regular_targets")
-        elif version == 5:
+        elif version in {5, 7}:
             expected_top_level_fields = {
                 "version",
                 "kind",
@@ -24112,12 +25173,13 @@ def _read_pending_cleanup_ticket(
             )
             if snapshot.payload != expected_payload:
                 raise SyncError(f"pending cleanup ticket changed: {batch_name}")
-            _require_pending_cleanup_file_snapshot_access_policy(
-                home,
-                ticket_path,
-                index_fd,
-                snapshot,
-            )
+            if _captured_snapshot is None:
+                _require_pending_cleanup_file_snapshot_access_policy(
+                    home,
+                    ticket_path,
+                    index_fd,
+                    snapshot,
+                )
             quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
             return PendingBatchCleanupTicket(
                 version=version,
@@ -24150,7 +25212,7 @@ def _read_pending_cleanup_ticket(
         if batch_identity is None:
             raise SyncError(f"pending cleanup batch identity is missing: {batch_name}")
         batch_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH / batch_name
-        if version == 5:
+        if version in {5, 7}:
             if len(snapshot.payload) > MAX_PENDING_CLEANUP_TICKET_BYTES:
                 raise SyncError(
                     f"pending cleanup ticket exceeds its limit: {batch_name}"
@@ -24161,76 +25223,121 @@ def _read_pending_cleanup_ticket(
             )
             leaf = data.get("leaf")
             metadata = data.get("metadata")
+            expected_kind = (
+                "ephemeral-quarantine"
+                if version == 5
+                else "ephemeral-quarantine-scaffold"
+            )
+            leaf_fields_valid = (
+                isinstance(leaf, dict)
+                and set(leaf) == {"path", "directory_identity"}
+                and leaf.get("path") == "leaf"
+                if version == 5
+                else leaf is None
+            )
+            expected_metadata_fields = (
+                {"path", "file_identity", "mode", "sha256"}
+                if version == 5
+                else {"path", "file_identity", "mode", "size", "sha256"}
+            )
             if (
-                data.get("kind") != "ephemeral-quarantine"
+                data.get("kind") != expected_kind
                 or quarantine_root_identity is None
                 or data.get("isolated_name")
                 != _pending_cleanup_isolated_batch_name(batch_name)
-                or not isinstance(leaf, dict)
-                or set(leaf) != {"path", "directory_identity"}
-                or leaf.get("path") != "leaf"
+                or not leaf_fields_valid
                 or not isinstance(metadata, dict)
-                or set(metadata) != {"path", "file_identity", "mode", "sha256"}
+                or set(metadata) != expected_metadata_fields
                 or metadata.get("path") != "metadata.json"
             ):
                 raise SyncError(
                     f"pending cleanup ephemeral authority changed: {batch_name}"
                 )
-            leaf_identity = _parse_pending_identity(
-                leaf.get("directory_identity"),
-                "pending cleanup ephemeral leaf identity",
+            leaf_identity = (
+                _parse_pending_identity(
+                    leaf.get("directory_identity"),
+                    "pending cleanup ephemeral leaf identity",
+                )
+                if isinstance(leaf, dict)
+                else None
             )
             metadata_file_identity = _parse_pending_identity(
                 metadata.get("file_identity"),
                 "pending cleanup ephemeral metadata identity",
             )
             metadata_mode = metadata.get("mode")
+            metadata_size = metadata.get("size") if version == 7 else None
             metadata_sha256 = metadata.get("sha256")
             if (
-                leaf_identity is None
+                (version == 5 and leaf_identity is None)
+                or (version == 7 and leaf_identity is not None)
                 or metadata_file_identity is None
                 or metadata_mode != 0o600
+                or (
+                    version == 7
+                    and (
+                        type(metadata_size) is not int
+                        or metadata_size < 0
+                        or metadata_size > MAX_MANAGED_STATE_BYTES
+                    )
+                )
                 or not isinstance(metadata_sha256, str)
                 or re.fullmatch(r"[0-9a-f]{64}", metadata_sha256) is None
             ):
                 raise SyncError(
                     f"pending cleanup ephemeral authority changed: {batch_name}"
                 )
+            expected_metadata: dict[str, object] = (
+                {
+                    "path": "metadata.json",
+                    "file_identity": _identity_payload(metadata_file_identity),
+                    "mode": metadata_mode,
+                    "sha256": metadata_sha256,
+                }
+                if version == 5
+                else {
+                    "path": "metadata.json",
+                    "file_identity": _identity_payload(metadata_file_identity),
+                    "mode": metadata_mode,
+                    "size": metadata_size,
+                    "sha256": metadata_sha256,
+                }
+            )
             expected_payload = _bounded_json_document(
                 {
-                    "version": 5,
-                    "kind": "ephemeral-quarantine",
+                    "version": version,
+                    "kind": expected_kind,
                     "batch": batch_name,
                     "batch_root_identity": _identity_payload(batch_identity),
                     "quarantine_root_identity": _identity_payload(
                         quarantine_root_identity
                     ),
                     "isolated_name": _pending_cleanup_isolated_batch_name(batch_name),
-                    "leaf": {
-                        "path": "leaf",
-                        "directory_identity": _identity_payload(leaf_identity),
-                    },
-                    "metadata": {
-                        "path": "metadata.json",
-                        "file_identity": _identity_payload(metadata_file_identity),
-                        "mode": metadata_mode,
-                        "sha256": metadata_sha256,
-                    },
+                    "leaf": (
+                        {
+                            "path": "leaf",
+                            "directory_identity": _identity_payload(leaf_identity),
+                        }
+                        if version == 5
+                        else None
+                    ),
+                    "metadata": expected_metadata,
                 },
                 max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
                 overflow_error="pending cleanup ticket exceeds the size limit",
             )
             if snapshot.payload != expected_payload:
                 raise SyncError(f"pending cleanup ticket changed: {batch_name}")
-            _require_pending_cleanup_file_snapshot_access_policy(
-                home,
-                ticket_path,
-                index_fd,
-                snapshot,
-            )
+            if _captured_snapshot is None:
+                _require_pending_cleanup_file_snapshot_access_policy(
+                    home,
+                    ticket_path,
+                    index_fd,
+                    snapshot,
+                )
             return PendingBatchCleanupTicket(
                 version=version,
-                phase="ephemeral-quarantine",
+                phase=expected_kind,
                 path=ticket_path,
                 snapshot=snapshot,
                 batch_root=batch_root,
@@ -24240,13 +25347,14 @@ def _read_pending_cleanup_ticket(
                 marker_file_identity=None,
                 marker_mode=None,
                 marker_sha256=None,
-                kind="ephemeral-quarantine",
+                kind=expected_kind,
                 quarantine_root_identity=quarantine_root_identity,
                 isolated_name=_pending_cleanup_isolated_batch_name(batch_name),
                 leaf_identity=leaf_identity,
                 metadata_file_identity=metadata_file_identity,
                 metadata_mode=metadata_mode,
                 metadata_sha256=metadata_sha256,
+                metadata_size=metadata_size,
             )
         marker = data.get("commit_marker" if version == 1 else "finalization_marker")
         expected_marker_fields = {
@@ -24365,12 +25473,13 @@ def _read_pending_cleanup_ticket(
             )
         if snapshot.payload != expected_payload:
             raise SyncError(f"pending cleanup ticket changed: {batch_name}")
-        _require_pending_cleanup_file_snapshot_access_policy(
-            home,
-            ticket_path,
-            index_fd,
-            snapshot,
-        )
+        if _captured_snapshot is None:
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                ticket_path,
+                index_fd,
+                snapshot,
+            )
         return PendingBatchCleanupTicket(
             version=version,
             phase=phase,
@@ -24394,6 +25503,7 @@ def _discard_incomplete_pending_cleanup_ticket(
     temp_path: Path,
     *,
     max_actions: int = MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+    expected_snapshot: ManagedStateFileSnapshot | None = None,
 ) -> int:
     if max_actions < 0:
         raise SyncError("pending cleanup temp action budget is invalid")
@@ -24406,7 +25516,23 @@ def _discard_incomplete_pending_cleanup_ticket(
                 home,
                 temp_path,
                 index_fd,
+                expected_identity=(
+                    expected_snapshot.file_identity
+                    if expected_snapshot is not None
+                    else None
+                ),
             )
+            if expected_snapshot is not None and (
+                not snapshot.exists
+                or not _managed_state_snapshot_matches_bound_file_evidence(
+                    snapshot,
+                    expected_snapshot,
+                )
+            ):
+                raise SyncError(
+                    "incomplete pending cleanup ticket changed after "
+                    f"classification: {temp_path.name}"
+                )
             if snapshot.exists:
                 if (
                     snapshot.file_type != stat.S_IFREG
@@ -24431,7 +25557,28 @@ def _discard_incomplete_pending_cleanup_ticket(
                     label=label,
                 )
                 discarded += 1
+                if expected_snapshot is not None:
+                    # Classification authorized at most the exact captured
+                    # object.  A new object that appears under the temp name is
+                    # left for a fresh scanner pass rather than being consumed
+                    # by this stale decision.
+                    replacement = _read_managed_state_file_snapshot(
+                        home,
+                        temp_path,
+                        index_fd,
+                    )
+                    if replacement.exists:
+                        raise SyncError(
+                            "pending cleanup ticket temp replacement appeared "
+                            f"after classified discard: {temp_path.name}"
+                        )
+                    break
                 continue
+            if expected_snapshot is not None:
+                raise SyncError(
+                    "incomplete pending cleanup ticket disappeared after "
+                    f"classification: {temp_path.name}"
+                )
             retained_names = _retained_pending_cleanup_names_for_path(
                 home,
                 temp_path,
@@ -24603,6 +25750,114 @@ def _publish_pending_cleanup_ticket(
         return published
     finally:
         _close_fd_quietly(index_fd)
+
+
+def _require_quarantine_allocation_root_absent(
+    home: Path,
+    quarantine_root: Path,
+    quarantine_fd: int,
+    batch_name: str,
+    root_identity: tuple[int, int],
+) -> None:
+    _require_pending_cleanup_fd_access_policy(
+        quarantine_fd,
+        quarantine_root,
+        expected_mode=0o700,
+    )
+    if (
+        _directory_identity(quarantine_fd) != root_identity
+        or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+        or _named_entry_identity(quarantine_fd, batch_name) is not None
+        or _named_entry_identity(
+            quarantine_fd,
+            _pending_cleanup_isolated_batch_name(batch_name),
+        )
+        is not None
+    ):
+        raise SyncError(
+            f"pending quarantine allocation reservation changed: {batch_name}"
+        )
+
+
+def _publish_pending_quarantine_allocation_ticket(
+    home: Path,
+    quarantine_root: Path,
+    quarantine_fd: int,
+    batch_name: str,
+    metadata_payload: bytes,
+) -> PendingQuarantineAllocationTicket:
+    """Durably reserve an absent batch without granting deletion authority."""
+    root_identity = _directory_identity(quarantine_fd)
+    _require_quarantine_allocation_root_absent(
+        home,
+        quarantine_root,
+        quarantine_fd,
+        batch_name,
+        root_identity,
+    )
+    expected_payload = _pending_quarantine_allocation_payload(
+        batch_name,
+        root_identity,
+        metadata_payload,
+    )
+    index_root = _pending_cleanup_index_path(home)
+    index_fd = _open_or_create_directory_beneath(home, index_root, mode=0o700)
+    _close_fd_quietly(index_fd)
+    path = _pending_quarantine_allocation_path(home, batch_name)
+    index_fd = _open_directory_beneath(home, index_root)
+    try:
+        retained = _retained_pending_cleanup_file(
+            home,
+            path,
+            index_fd,
+            expected=None,
+            label=f"pending quarantine allocation {batch_name}",
+        )
+        if retained is not None:
+            raise SyncError(
+                "pending quarantine allocation retained evidence must be "
+                f"recovered before publication: {batch_name}"
+            )
+        existing = _read_pending_quarantine_allocation_ticket(home, path)
+        if existing is not None:
+            if existing.snapshot.payload != expected_payload:
+                raise SyncError(
+                    f"pending quarantine allocation payload changed: {batch_name}"
+                )
+            published = existing.snapshot
+        else:
+            published = _publish_pending_cleanup_ticket(
+                home,
+                path,
+                expected_payload,
+            )
+        os.fsync(index_fd)
+    finally:
+        _close_fd_quietly(index_fd)
+    index_parent_fd = _open_directory_beneath(home, index_root.parent)
+    try:
+        os.fsync(index_parent_fd)
+    finally:
+        _close_fd_quietly(index_parent_fd)
+    verified = _read_pending_quarantine_allocation_ticket(
+        home,
+        path,
+        expected_identity=published.file_identity,
+    )
+    if verified is None or verified.snapshot.payload != expected_payload:
+        raise SyncError(
+            f"pending quarantine allocation changed after fsync: {batch_name}"
+        )
+    # The durable ticket describes an initially absent reservation.  Reprove
+    # both possible batch names after its durable reread before mkdir.
+    _require_quarantine_allocation_root_absent(
+        home,
+        quarantine_root,
+        quarantine_fd,
+        batch_name,
+        root_identity,
+    )
+    return verified
 
 
 def _verify_pending_cleanup_ticket_durable(
@@ -26802,6 +28057,7 @@ def _read_pending_ephemeral_metadata_snapshot(
         or snapshot.parent_identity != ticket.batch_root_identity
         or snapshot.file_type != stat.S_IFREG
         or snapshot.mode != ticket.metadata_mode
+        or (ticket.metadata_size is not None and snapshot.size != ticket.metadata_size)
         or snapshot.uid != os.geteuid()
         or snapshot.payload is None
         or hashlib.sha256(snapshot.payload).hexdigest() != ticket.metadata_sha256
@@ -26853,6 +28109,74 @@ def _pending_ephemeral_batch_members(
             f"names: {batch_name}"
         )
     return names, retained_name
+
+
+def _require_pending_ephemeral_metadata_cleanup_boundary(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root: Path,
+    quarantine_fd: int,
+    bound_batch_root: Path,
+    bound_name: str,
+    batch_fd: int,
+    metadata_name: str,
+) -> None:
+    """Reprove v5/v7 authority at a metadata rename or unlink boundary.
+
+    Protected properties are ticket identity/content, root and batch identity,
+    canonical-or-isolated path membership, owner-only access policy, and exact
+    batch members.  In particular, leaf absence is rechecked here rather than
+    only by the recovery caller before entering the generic deletion helper.
+    """
+    batch_name = ticket.batch_root.name
+    isolated_name = ticket.isolated_name
+    if isolated_name is None:
+        raise SyncError("pending ephemeral cleanup isolated name is missing")
+    _require_pending_cleanup_ticket_unchanged(home, ticket)
+    _require_pending_cleanup_fd_access_policy(
+        quarantine_fd,
+        quarantine_root,
+        expected_mode=0o700,
+    )
+    _require_pending_cleanup_fd_access_policy(
+        batch_fd,
+        bound_batch_root,
+        expected_mode=0o700,
+    )
+    canonical_identity = _named_entry_identity(quarantine_fd, batch_name)
+    isolated_identity = _named_entry_identity(quarantine_fd, isolated_name)
+    expected_root_names = (
+        canonical_identity == ticket.batch_root_identity and isolated_identity is None
+        if bound_name == batch_name
+        else canonical_identity is None
+        and isolated_identity == ticket.batch_root_identity
+    )
+    names, retained_metadata_name = _pending_ephemeral_batch_members(
+        batch_fd,
+        batch_name,
+    )
+    expected_retained_name = None if metadata_name == "metadata.json" else metadata_name
+    if "leaf" in names:
+        raise SyncError(
+            f"pending ephemeral scaffold leaf appeared before metadata mutation: "
+            f"{batch_name}"
+        )
+    if (
+        not expected_root_names
+        or _directory_identity(quarantine_fd) != ticket.quarantine_root_identity
+        or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+        or _directory_identity(batch_fd) != ticket.batch_root_identity
+        or not _bound_directory_matches(home, bound_batch_root, batch_fd)
+        or names != (metadata_name,)
+        or retained_metadata_name != expected_retained_name
+    ):
+        raise SyncError(
+            "pending ephemeral quarantine namespace changed before metadata "
+            f"mutation: {batch_name}"
+        )
+    # Ticket policy/content may change while the filesystem namespace is being
+    # sampled.  Make its exact second read the final external authority check.
+    _require_pending_cleanup_ticket_unchanged(home, ticket)
 
 
 def _require_pending_cleanup_ticket_unchanged(
@@ -27177,14 +28501,20 @@ def _remove_pending_ephemeral_quarantine_batch(
     home: Path,
     ticket: PendingBatchCleanupTicket,
 ) -> bool:
-    """Resume only the exact empty scaffold authorized by a v5 ticket."""
+    """Resume only the exact empty scaffold authorized by a v5/v7 ticket."""
+    expected_kind = (
+        "ephemeral-quarantine"
+        if ticket.version == 5
+        else "ephemeral-quarantine-scaffold"
+    )
     if (
-        ticket.version != 5
-        or ticket.kind != "ephemeral-quarantine"
+        ticket.version not in {5, 7}
+        or ticket.kind != expected_kind
         or ticket.quarantine_root_identity is None
         or ticket.isolated_name
         != _pending_cleanup_isolated_batch_name(ticket.batch_root.name)
-        or ticket.leaf_identity is None
+        or (ticket.version == 5 and ticket.leaf_identity is None)
+        or (ticket.version == 7 and ticket.leaf_identity is not None)
     ):
         raise SyncError("pending ephemeral cleanup authority is incomplete")
     quarantine_root = ticket.batch_root.parent
@@ -27235,6 +28565,7 @@ def _remove_pending_ephemeral_quarantine_batch(
                 ticket,
                 quarantine_root_identity,
             )
+            _retire_joined_quarantine_allocation(home, ticket)
             return True
         if canonical_identity is None:
             bound_batch_root = ticket.batch_root.with_name(isolated_name)
@@ -27262,6 +28593,8 @@ def _remove_pending_ephemeral_quarantine_batch(
             batch_fd,
             batch_name,
         )
+        if ticket.version == 7 and "leaf" in names:
+            raise SyncError(f"pending ephemeral scaffold leaf appeared: {batch_name}")
         if "leaf" in names:
             leaf_path = bound_batch_root / "leaf"
             leaf_fd = os.open("leaf", directory_flags, dir_fd=batch_fd)
@@ -27350,6 +28683,11 @@ def _remove_pending_ephemeral_quarantine_batch(
         if metadata_name is not None:
             _require_pending_cleanup_ticket_unchanged(home, ticket)
             _require_pending_cleanup_fd_access_policy(
+                quarantine_fd,
+                quarantine_root,
+                expected_mode=0o700,
+            )
+            _require_pending_cleanup_fd_access_policy(
                 batch_fd,
                 bound_batch_root,
                 expected_mode=0o700,
@@ -27370,12 +28708,55 @@ def _remove_pending_ephemeral_quarantine_batch(
                     metadata,
                     label=f"pending ephemeral quarantine metadata {batch_name}",
                 )
+                names = tuple(
+                    "metadata.json" if name == metadata_name else name for name in names
+                )
+                retained_metadata_name = None
+            canonical_identity = _named_entry_identity(quarantine_fd, batch_name)
+            isolated_identity = _named_entry_identity(quarantine_fd, isolated_name)
+            expected_root_names = (
+                canonical_identity == ticket.batch_root_identity
+                and isolated_identity is None
+                if bound_name == batch_name
+                else canonical_identity is None
+                and isolated_identity == ticket.batch_root_identity
+            )
+            current_names, current_retained_metadata = _pending_ephemeral_batch_members(
+                batch_fd, batch_name
+            )
+            if (
+                not expected_root_names
+                or _directory_identity(quarantine_fd) != quarantine_root_identity
+                or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+                or _directory_identity(batch_fd) != ticket.batch_root_identity
+                or not _bound_directory_matches(home, bound_batch_root, batch_fd)
+                or current_names != names
+                or current_retained_metadata != retained_metadata_name
+            ):
+                raise SyncError(
+                    "pending ephemeral quarantine namespace changed before "
+                    f"metadata removal: {batch_name}"
+                )
+
+            def require_metadata_mutation_boundary(metadata_member: str) -> None:
+                _require_pending_ephemeral_metadata_cleanup_boundary(
+                    home,
+                    ticket,
+                    quarantine_root,
+                    quarantine_fd,
+                    bound_batch_root,
+                    bound_name,
+                    batch_fd,
+                    metadata_member,
+                )
+
             _isolate_and_delete_pending_cleanup_file(
                 home,
                 bound_batch_root / "metadata.json",
                 batch_fd,
                 metadata,
                 label=f"pending ephemeral quarantine metadata {batch_name}",
+                mutation_revalidator=require_metadata_mutation_boundary,
             )
         names, _retained_metadata_name = _pending_ephemeral_batch_members(
             batch_fd,
@@ -27395,7 +28776,16 @@ def _remove_pending_ephemeral_quarantine_batch(
         isolated_identity = _named_entry_identity(quarantine_fd, isolated_name)
         if bound_name == batch_name:
             if (
-                canonical_identity != ticket.batch_root_identity
+                _directory_identity(quarantine_fd) != quarantine_root_identity
+                or not _bound_directory_matches(
+                    home,
+                    quarantine_root,
+                    quarantine_fd,
+                )
+                or _directory_identity(batch_fd) != ticket.batch_root_identity
+                or not _bound_directory_matches(home, bound_batch_root, batch_fd)
+                or _directory_member_names(batch_fd, maximum_entries=1) != ()
+                or canonical_identity != ticket.batch_root_identity
                 or isolated_identity is not None
             ):
                 raise SyncError(
@@ -27473,6 +28863,7 @@ def _remove_pending_ephemeral_quarantine_batch(
         ticket,
         quarantine_root_identity,
     )
+    _retire_joined_quarantine_allocation(home, ticket)
     return True
 
 
@@ -27492,7 +28883,7 @@ def _remove_cleanup_ready_batch(
         ticket,
     ):
         raise SyncError(f"pending cleanup ticket changed: {ticket.batch_root.name}")
-    if ticket.version == 5:
+    if ticket.version in {5, 7}:
         return _remove_pending_ephemeral_quarantine_batch(home, ticket)
     if ticket.version == 6:
         return _remove_pending_ephemeral_quarantine_leaf(home, ticket)
@@ -27871,6 +29262,7 @@ def _pending_cleanup_retained_control_name(
     if canonical is None:
         return None
     for suffix in (
+        PENDING_QUARANTINE_ALLOCATION_SUFFIX,
         PENDING_CLEANUP_TICKET_SUFFIX,
         PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
         PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
@@ -27978,7 +29370,17 @@ def _restore_pending_cleanup_control_tombstones(
                 raise SyncError(
                     f"pending cleanup retained control disappeared: {canonical}"
                 )
-            if canonical.endswith(PENDING_CLEANUP_TICKET_SUFFIX):
+            if canonical.endswith(PENDING_QUARANTINE_ALLOCATION_SUFFIX):
+                allocation = _read_pending_quarantine_allocation_ticket(
+                    home,
+                    canonical_path,
+                    expected_identity=recovered.file_identity,
+                )
+                if allocation is None:
+                    raise SyncError(
+                        f"pending quarantine allocation recovery failed: {canonical}"
+                    )
+            elif canonical.endswith(PENDING_CLEANUP_TICKET_SUFFIX):
                 ticket = _read_pending_cleanup_ticket(
                     home,
                     canonical_path,
@@ -27999,29 +29401,36 @@ def _restore_pending_cleanup_control_tombstones(
 def _promote_pending_ephemeral_cleanup_ticket_temp(
     home: Path,
     temp_path: Path,
+    *,
+    classified_snapshot: ManagedStateFileSnapshot | None = None,
 ) -> bool:
-    """Promote a complete v6 ticket temp instead of discarding its authority."""
+    """Promote a canonical v5/v6/v7 ticket temp instead of discarding authority."""
     batch_name = _pending_cleanup_ticket_temp_batch_name(temp_path.name)
     if batch_name is None:
         return False
     index_fd = _open_directory_beneath(home, temp_path.parent)
     try:
-        staged = _read_managed_state_file_snapshot(
-            home,
-            temp_path,
-            index_fd,
-            maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        staged = (
+            classified_snapshot
+            if classified_snapshot is not None
+            else _read_managed_state_file_snapshot(
+                home,
+                temp_path,
+                index_fd,
+                maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+            )
         )
         if not staged.exists:
             return False
         if (
             not _managed_state_snapshot_has_complete_file_evidence(staged)
             or staged.file_type != stat.S_IFREG
-            or staged.mode != 0o600
-            or staged.uid != os.geteuid()
             or staged.payload is None
         ):
-            return False
+            raise SyncError(
+                "pending cleanup ticket temp could not be safely classified: "
+                f"{batch_name}"
+            )
         _require_pending_cleanup_file_snapshot_access_policy(
             home,
             temp_path,
@@ -28029,13 +29438,26 @@ def _promote_pending_ephemeral_cleanup_ticket_temp(
             staged,
         )
         try:
-            data = _decode_managed_state_json(staged.payload, temp_path)
+            staged_ticket = _read_pending_cleanup_ticket(
+                home,
+                temp_path,
+                expected_ticket_identity=staged.file_identity,
+                allow_temporary=True,
+                _captured_snapshot=staged,
+            )
         except SyncError:
+            # Only the pure parser runs inside this catch.  A rejection proves
+            # the already captured bytes are noncanonical residue.  Capture,
+            # identity/content revalidation and policy failures occur outside
+            # it and must propagate so recovery retains durable authority.
             return False
         if (
-            data.get("version") != 6
-            or data.get("kind") != "ephemeral-quarantine-leaf"
-            or data.get("batch") != batch_name
+            staged_ticket is None
+            or staged_ticket.version not in {5, 6, 7}
+            or not _managed_state_snapshot_matches_bound_file_evidence(
+                staged_ticket.snapshot,
+                staged,
+            )
         ):
             return False
         ticket_path = _pending_cleanup_ticket_path(home, batch_name)
@@ -28045,18 +29467,41 @@ def _promote_pending_ephemeral_cleanup_ticket_temp(
             index_fd,
         )
         if existing.exists:
-            ticket = _read_pending_cleanup_ticket(home, ticket_path)
-            if ticket is None or existing.payload != staged.payload:
+            ticket = _read_pending_cleanup_ticket(
+                home,
+                ticket_path,
+                expected_ticket_identity=existing.file_identity,
+            )
+            if (
+                ticket is None
+                or not _managed_state_snapshot_matches_bound_file_evidence(
+                    ticket.snapshot,
+                    existing,
+                )
+                or ticket.snapshot.payload != staged.payload
+            ):
                 raise SyncError(
                     f"pending cleanup ticket temp conflicts with its canonical "
                     f"ticket: {batch_name}"
                 )
+
+            def require_canonical_unchanged(_temp_member: str) -> None:
+                _require_pending_cleanup_file_snapshot_unchanged(
+                    home,
+                    ticket_path,
+                    index_fd,
+                    existing,
+                    label=f"pending cleanup canonical ticket {batch_name}",
+                    maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+                )
+
             _isolate_and_delete_pending_cleanup_file(
                 home,
                 temp_path,
                 index_fd,
                 staged,
                 label=f"published pending cleanup ticket temp {batch_name}",
+                mutation_revalidator=require_canonical_unchanged,
             )
             return True
         current = _read_managed_state_file_snapshot(
@@ -28092,6 +29537,160 @@ def _promote_pending_ephemeral_cleanup_ticket_temp(
         _close_fd_quietly(index_fd)
 
 
+def _promote_pending_quarantine_allocation_temp(
+    home: Path,
+    temp_path: Path,
+    *,
+    classified_snapshot: ManagedStateFileSnapshot | None = None,
+) -> bool:
+    """Promote only a complete v8 reservation while its batch is absent."""
+    batch_name = _pending_quarantine_allocation_temp_batch_name(temp_path.name)
+    if batch_name is None:
+        return False
+    index_fd = _open_directory_beneath(home, temp_path.parent)
+    quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
+    quarantine_fd = -1
+    try:
+        staged = (
+            classified_snapshot
+            if classified_snapshot is not None
+            else _read_managed_state_file_snapshot(
+                home,
+                temp_path,
+                index_fd,
+                maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+            )
+        )
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(staged)
+            or staged.file_type != stat.S_IFREG
+            or staged.payload is None
+        ):
+            raise SyncError(
+                "pending quarantine allocation temp could not be safely "
+                f"classified: {batch_name}"
+            )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            temp_path,
+            index_fd,
+            staged,
+        )
+        try:
+            data = _decode_managed_state_json(staged.payload, temp_path)
+            metadata = data.get("metadata")
+            root_identity = _parse_pending_identity(
+                data.get("quarantine_root_identity"),
+                "pending quarantine allocation root identity",
+            )
+            metadata_sha256 = (
+                metadata.get("sha256") if isinstance(metadata, dict) else None
+            )
+            metadata_size = metadata.get("size") if isinstance(metadata, dict) else None
+            expected = (
+                _pending_quarantine_allocation_payload_from_plan(
+                    batch_name,
+                    root_identity,
+                    metadata_sha256,
+                    metadata_size,
+                )
+                if root_identity is not None
+                and isinstance(metadata_sha256, str)
+                and re.fullmatch(r"[0-9a-f]{64}", metadata_sha256) is not None
+                and type(metadata_size) is int
+                and 0 <= metadata_size <= MAX_MANAGED_STATE_BYTES
+                else None
+            )
+        except SyncError:
+            return False
+        if staged.payload != expected:
+            return False
+        path = _pending_quarantine_allocation_path(home, batch_name)
+        existing = _read_managed_state_file_snapshot(home, path, index_fd)
+        if existing.exists:
+            allocation = _read_pending_quarantine_allocation_ticket(
+                home,
+                path,
+                expected_identity=existing.file_identity,
+            )
+            if (
+                allocation is None
+                or not _managed_state_snapshot_matches_bound_file_evidence(
+                    allocation.snapshot,
+                    existing,
+                )
+                or allocation.snapshot.payload != staged.payload
+            ):
+                raise SyncError(
+                    "pending quarantine allocation temp conflicts with canonical "
+                    f"ticket: {batch_name}"
+                )
+
+            def require_canonical_unchanged(_temp_member: str) -> None:
+                _require_pending_cleanup_file_snapshot_unchanged(
+                    home,
+                    path,
+                    index_fd,
+                    existing,
+                    label=f"pending quarantine allocation {batch_name}",
+                    maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+                )
+
+            _isolate_and_delete_pending_cleanup_file(
+                home,
+                temp_path,
+                index_fd,
+                staged,
+                label=f"published pending quarantine allocation temp {batch_name}",
+                mutation_revalidator=require_canonical_unchanged,
+            )
+            return True
+        quarantine_fd = _open_directory_beneath(home, quarantine_root)
+        _require_quarantine_allocation_root_absent(
+            home,
+            quarantine_root,
+            quarantine_fd,
+            batch_name,
+            root_identity,
+        )
+        current = _read_managed_state_file_snapshot(
+            home,
+            temp_path,
+            index_fd,
+            expected_identity=staged.file_identity,
+            maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        )
+        if not _managed_state_snapshot_matches_bound_file_evidence(current, staged):
+            raise SyncError(f"pending quarantine allocation temp changed: {batch_name}")
+        _rename_noreplace_at(index_fd, temp_path.name, index_fd, path.name)
+        os.fsync(index_fd)
+        index_parent_fd = _open_directory_beneath(home, path.parent.parent)
+        try:
+            os.fsync(index_parent_fd)
+        finally:
+            _close_fd_quietly(index_parent_fd)
+        allocation = _read_pending_quarantine_allocation_ticket(
+            home,
+            path,
+            expected_identity=staged.file_identity,
+        )
+        if allocation is None or allocation.snapshot.payload != staged.payload:
+            raise SyncError(
+                f"pending quarantine allocation changed after promotion: {batch_name}"
+            )
+        _require_quarantine_allocation_root_absent(
+            home,
+            quarantine_root,
+            quarantine_fd,
+            batch_name,
+            root_identity,
+        )
+        return True
+    finally:
+        _close_fd_quietly(quarantine_fd)
+        _close_fd_quietly(index_fd)
+
+
 def _cleanup_pending_cleanup_ticket_temps(
     home: Path,
     *,
@@ -28118,27 +29717,92 @@ def _cleanup_pending_cleanup_ticket_temps(
             if _pending_cleanup_ticket_temp_batch_name(name) is not None:
                 temp_names.add(name)
                 continue
+            if _pending_quarantine_allocation_temp_batch_name(name) is not None:
+                temp_names.add(name)
+                continue
             retained = _pending_cleanup_retained_ticket_temp_name(name)
             if retained is not None:
                 temp_names.add(retained[0])
+                continue
+            retained_allocation = _pending_quarantine_retained_allocation_temp_name(
+                name
+            )
+            if retained_allocation is not None:
+                temp_names.add(retained_allocation[0])
     finally:
         _close_fd_quietly(index_fd)
     action_budget = budget or PendingCleanupActionBudget(limit)
     discarded = 0
     for temp_name in sorted(temp_names):
         batch_name = _pending_cleanup_ticket_temp_batch_name(temp_name)
+        allocation_batch_name = _pending_quarantine_allocation_temp_batch_name(
+            temp_name
+        )
+        if batch_name is None:
+            batch_name = allocation_batch_name
         assert batch_name is not None
         if not action_budget.charge_batch(batch_name):
             continue
+        temp_path = index_root / temp_name
+        index_fd = _open_directory_beneath(home, index_root)
+        try:
+            current = _read_managed_state_file_snapshot(
+                home,
+                temp_path,
+                index_fd,
+            )
+            retained = _retained_pending_cleanup_file(
+                home,
+                temp_path,
+                index_fd,
+                expected=None,
+                label=f"pending cleanup ticket temp {batch_name}",
+            )
+            if retained is not None:
+                if current.exists:
+                    raise SyncError(
+                        "pending cleanup ticket temp overlaps retained evidence: "
+                        f"{batch_name}"
+                    )
+                retained_name, retained_snapshot = retained
+                _restore_exact_retained_pending_cleanup_file(
+                    home,
+                    temp_path,
+                    index_fd,
+                    retained_name,
+                    retained_snapshot,
+                    label=f"pending cleanup ticket temp {batch_name}",
+                )
+            classified = _read_managed_state_file_snapshot(
+                home,
+                temp_path,
+                index_fd,
+                maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+            )
+            if not classified.exists:
+                raise SyncError(
+                    "pending cleanup ticket temp disappeared before "
+                    f"classification: {batch_name}"
+                )
+        finally:
+            _close_fd_quietly(index_fd)
         if _promote_pending_ephemeral_cleanup_ticket_temp(
             home,
-            index_root / temp_name,
+            temp_path,
+            classified_snapshot=classified,
+        ):
+            continue
+        if _promote_pending_quarantine_allocation_temp(
+            home,
+            temp_path,
+            classified_snapshot=classified,
         ):
             continue
         discarded_for_batch = _discard_incomplete_pending_cleanup_ticket(
             home,
-            index_root / temp_name,
+            temp_path,
             max_actions=MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+            expected_snapshot=classified,
         )
         discarded += discarded_for_batch
         if discarded_for_batch > 0:
@@ -28608,11 +30272,16 @@ def _pending_cleanup_ready_batch_is_observed(home: Path) -> bool:
                     _pending_cleanup_ticket_temp_batch_name(entry.name) is not None
                     or _pending_cleanup_retained_ticket_temp_name(entry.name)
                     is not None
+                    or _pending_quarantine_allocation_temp_batch_name(entry.name)
+                    is not None
+                    or _pending_quarantine_retained_allocation_temp_name(entry.name)
+                    is not None
                     or _pending_cleanup_cursor_temp_canonical_name(entry.name)
                     is not None
                 ):
                     return True
                 for suffix in (
+                    PENDING_QUARANTINE_ALLOCATION_SUFFIX,
                     PENDING_CLEANUP_TICKET_SUFFIX,
                     PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
                     PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
@@ -28628,6 +30297,95 @@ def _pending_cleanup_ready_batch_is_observed(home: Path) -> bool:
         return False
     finally:
         _close_fd_quietly(index_fd)
+
+
+def _cleanup_pending_quarantine_allocations(
+    home: Path,
+    *,
+    budget: PendingCleanupActionBudget,
+) -> int:
+    """Retire ticket-only v8 fences; never delete an allocation entity."""
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return 0
+    try:
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending quarantine allocation scan exceeds the limit",
+        )
+        allocation_names = sorted(
+            name
+            for name in names
+            if _pending_quarantine_allocation_batch_name(name) is not None
+        )
+    finally:
+        _close_fd_quietly(index_fd)
+    cleaned = 0
+    for name in allocation_names:
+        batch_name = _pending_quarantine_allocation_batch_name(name)
+        assert batch_name is not None
+        if not budget.charge_batch(batch_name):
+            continue
+        allocation = _read_pending_quarantine_allocation_ticket(
+            home,
+            index_root / name,
+        )
+        if allocation is None:
+            continue
+        quarantine_root = allocation.batch_root.parent
+        quarantine_fd = _open_directory_beneath(home, quarantine_root)
+        try:
+            _require_pending_cleanup_fd_access_policy(
+                quarantine_fd,
+                quarantine_root,
+                expected_mode=0o700,
+            )
+            if _directory_identity(
+                quarantine_fd
+            ) != allocation.quarantine_root_identity or not _bound_directory_matches(
+                home,
+                quarantine_root,
+                quarantine_fd,
+            ):
+                raise SyncError(
+                    f"pending quarantine allocation root changed: {batch_name}"
+                )
+            canonical = _named_entry_identity(quarantine_fd, batch_name)
+            isolated = _named_entry_identity(
+                quarantine_fd,
+                allocation.isolated_name,
+            )
+        finally:
+            _close_fd_quietly(quarantine_fd)
+        if canonical is None and isolated is None:
+            _retire_quarantine_allocation_after_batch_absent(home, allocation)
+            cleaned += 1
+            budget.mark_batch_completed(batch_name)
+            continue
+        if canonical is not None and isolated is not None:
+            raise SyncError(
+                f"pending quarantine allocation has canonical and isolated "
+                f"entities: {batch_name}"
+            )
+        cleanup = _read_pending_cleanup_ticket(
+            home,
+            _pending_cleanup_ticket_path(home, batch_name),
+        )
+        if cleanup is not None and _cleanup_ticket_matches_quarantine_allocation(
+            cleanup,
+            allocation,
+        ):
+            # The exact v5/v7 cleanup protocol owns the entity.  Its scanner may
+            # be budget-deferred; v8 remains as a mutation fence until removal.
+            continue
+        raise SyncError(
+            "pending quarantine allocation remains incomplete and was retained: "
+            f"{batch_name}"
+        )
+    return cleaned
 
 
 def _cleanup_ready_pending_batches(
@@ -28700,6 +30458,7 @@ def _cleanup_ready_pending_batches(
 
     ordered = sorted(candidates)
     if not ordered:
+        _cleanup_pending_quarantine_allocations(home, budget=action_budget)
         return action_budget.completed - completed_before
     cursor = _read_pending_cleanup_cursor(home, index_root)
     start = 0
@@ -28737,7 +30496,7 @@ def _cleanup_ready_pending_batches(
                     "pending terminal regular-file validation was retained: "
                     f"{batch_name}: {error}"
                 ) from error
-            if ticket.version in {5, 6}:
+            if ticket.version in {5, 6, 7}:
                 raise SyncError(
                     "pending ephemeral quarantine cleanup authority was retained: "
                     f"{batch_name}: {error}"
@@ -28754,6 +30513,7 @@ def _cleanup_ready_pending_batches(
             max_temp_cleanup_actions=action_budget.remaining,
         )
         action_budget.consume_control_actions(cursor_cleanup_actions)
+    _cleanup_pending_quarantine_allocations(home, budget=action_budget)
     return action_budget.completed - completed_before
 
 
@@ -28786,6 +30546,43 @@ def _require_no_pending_terminal_mutation_authority(home: Path) -> None:
     finally:
         _close_fd_quietly(index_fd)
     for name in names:
+        allocation_batch_name = _pending_quarantine_allocation_batch_name(name)
+        allocation_temp_batch_name = _pending_quarantine_allocation_temp_batch_name(
+            name
+        )
+        retained_allocation = _pending_quarantine_retained_allocation_name(name)
+        retained_allocation_temp = _pending_quarantine_retained_allocation_temp_name(
+            name
+        )
+        if (
+            allocation_batch_name is not None
+            or allocation_temp_batch_name is not None
+            or retained_allocation is not None
+            or retained_allocation_temp is not None
+        ):
+            blocked_batch_name = allocation_batch_name or allocation_temp_batch_name
+            if blocked_batch_name is None and retained_allocation is not None:
+                blocked_batch_name = retained_allocation[1]
+            if blocked_batch_name is None:
+                assert retained_allocation_temp is not None
+                blocked_batch_name = retained_allocation_temp[1]
+            raise SyncError(
+                "pending quarantine allocation must be reconciled before new "
+                f"mutation: {blocked_batch_name}"
+            )
+        temp_batch_name = _pending_cleanup_ticket_temp_batch_name(name)
+        retained_temp = _pending_cleanup_retained_ticket_temp_name(name)
+        if temp_batch_name is not None or retained_temp is not None:
+            # Complete v6/v7 temps are durable authority awaiting promotion;
+            # incomplete or unreadable temps are unresolved state.  Neither is
+            # safe to ignore merely because this run spent its cleanup budget.
+            blocked_batch_name = (
+                temp_batch_name if temp_batch_name is not None else retained_temp[1]
+            )
+            raise SyncError(
+                "pending cleanup ticket temp must be reconciled before new "
+                f"mutation: {blocked_batch_name}"
+            )
         retained = _pending_cleanup_retained_control_name(name)
         if retained is not None and retained[0].endswith(
             (
@@ -28825,7 +30622,7 @@ def _require_no_pending_terminal_mutation_authority(home: Path) -> None:
                 batch_name,
                 error,
             ) from error
-        if ticket is not None and ticket.version in {3, 4, 5, 6}:
+        if ticket is not None and ticket.version in {3, 4, 5, 6, 7}:
             raise SyncError(
                 "pending cleanup authority must reach terminal validation before "
                 f"new mutation: {batch_name} (ticket v{ticket.version})"

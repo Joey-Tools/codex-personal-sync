@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from dataclasses import replace
 import hashlib
 import io
 import json
@@ -227,16 +228,73 @@ class PendingStagingCleanupTests(unittest.TestCase):
         finally:
             MODULE._close_fd_quietly(parent_fd)
         quarantine_path, _moved, binding = result
+        # This helper models a v5 ticket created before v8 allocation fences
+        # existed.  A current allocation keeps its (now retired) v8 binding so
+        # production code rejects any fallback reclaim after a private move.
+        binding = replace(binding, allocation_ticket=None)
         leaf_fd = MODULE._open_directory_beneath(home, quarantine_path.parent)
         try:
             os.unlink(quarantine_path.name, dir_fd=leaf_fd)
             os.fsync(leaf_fd)
         finally:
             MODULE._close_fd_quietly(leaf_fd)
-        return MODULE._publish_pending_ephemeral_quarantine_cleanup_ticket(
-            home,
-            binding,
+        metadata = binding.metadata
+        self.assertIsNotNone(metadata.file_identity)
+        self.assertIsNotNone(metadata.payload)
+        assert metadata.file_identity is not None
+        assert metadata.payload is not None
+        legacy_payload = MODULE._bounded_json_document(
+            {
+                "version": 5,
+                "kind": "ephemeral-quarantine",
+                "batch": binding.batch_root.name,
+                "batch_root_identity": MODULE._identity_payload(binding.batch_identity),
+                "quarantine_root_identity": MODULE._identity_payload(
+                    binding.quarantine_root_identity
+                ),
+                "isolated_name": MODULE._pending_cleanup_isolated_batch_name(
+                    binding.batch_root.name
+                ),
+                "leaf": {
+                    "path": "leaf",
+                    "directory_identity": MODULE._identity_payload(
+                        binding.leaf_identity
+                    ),
+                },
+                "metadata": {
+                    "path": "metadata.json",
+                    "file_identity": MODULE._identity_payload(metadata.file_identity),
+                    "mode": metadata.mode,
+                    "sha256": hashlib.sha256(metadata.payload).hexdigest(),
+                },
+            },
+            max_bytes=MODULE.MAX_PENDING_CLEANUP_TICKET_BYTES,
+            overflow_error="pending cleanup ticket exceeds the size limit",
         )
+        self.assertNotIn(b'"size"', legacy_payload)
+        self.assertEqual(
+            MODULE._pending_ephemeral_quarantine_cleanup_ticket_payload(
+                binding,
+                binding.quarantine_root_identity,
+            ),
+            legacy_payload,
+        )
+        index_fd = MODULE._open_or_create_directory_beneath(
+            home,
+            MODULE._pending_cleanup_index_path(home),
+            mode=0o700,
+        )
+        MODULE._close_fd_quietly(index_fd)
+        ticket_path = MODULE._pending_cleanup_ticket_path(
+            home,
+            binding.batch_root.name,
+        )
+        MODULE._publish_pending_cleanup_ticket(home, ticket_path, legacy_payload)
+        ticket = MODULE._read_pending_cleanup_ticket(home, ticket_path)
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertIsNone(ticket.metadata_size)
+        return ticket
 
     def _alternate_gid(self, current_gid: int) -> int:
         alternate_gid = next(
@@ -2683,6 +2741,790 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     Path,
                 )
 
+    def test_v5_ticket_temp_before_rename_recovers_with_v8_allocation(self) -> None:
+        case_home = self.root / "ephemeral-v5-temp-with-allocation"
+        case_home.mkdir()
+        allocation = MODULE._quarantine_batch_root(
+            case_home,
+            [],
+            retain_binding=True,
+            retain_scaffold_binding=True,
+        )
+        self.assertIsInstance(
+            allocation,
+            MODULE.EphemeralQuarantineBatchAllocation,
+        )
+        assert isinstance(allocation, MODULE.EphemeralQuarantineBatchAllocation)
+        allocation.create_leaf()
+        batch_root = allocation.batch_root
+        allocation_path = allocation.binding.allocation_ticket.path
+        try:
+            with (
+                self._receiptless_cleanup_crash_patch("ticket-temp"),
+                self.assertRaisesRegex(SystemExit, "before ticket temp rename"),
+            ):
+                MODULE._publish_pending_ephemeral_quarantine_cleanup_ticket(
+                    case_home,
+                    allocation.binding,
+                )
+        finally:
+            allocation.revoke_reclaim()
+            allocation.close()
+
+        ticket_path = MODULE._pending_cleanup_ticket_path(
+            case_home,
+            batch_root.name,
+        )
+        temp_path = ticket_path.with_name(
+            batch_root.name + MODULE.PENDING_CLEANUP_TICKET_TEMP_SUFFIX
+        )
+        self.assertTrue(temp_path.is_file())
+        self.assertFalse(ticket_path.exists())
+        self.assertTrue(allocation_path.is_file())
+        staged_payload = temp_path.read_bytes()
+        staged_identity = (temp_path.stat().st_dev, temp_path.stat().st_ino)
+        staged = json.loads(staged_payload)
+        self.assertEqual(staged["version"], 5)
+        self.assertNotIn("size", staged["metadata"])
+
+        self.assertTrue(
+            MODULE._promote_pending_ephemeral_cleanup_ticket_temp(
+                case_home,
+                temp_path,
+            )
+        )
+        self.assertFalse(temp_path.exists())
+        self.assertEqual(ticket_path.read_bytes(), staged_payload)
+        self.assertEqual(
+            (ticket_path.stat().st_dev, ticket_path.stat().st_ino),
+            staged_identity,
+        )
+        promoted = MODULE._read_pending_cleanup_ticket(case_home, ticket_path)
+        self.assertIsNotNone(promoted)
+        assert promoted is not None
+        self.assertEqual(promoted.version, 5)
+        self.assertIsNone(promoted.metadata_size)
+
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(case_home), 1)
+
+        self.assertFalse(temp_path.exists())
+        self.assertFalse(ticket_path.exists())
+        self.assertFalse(allocation_path.exists())
+        self.assertFalse(batch_root.exists())
+
+    def test_v5_ticket_temp_with_noncanonical_size_is_not_promoted(self) -> None:
+        case_home = self.root / "ephemeral-v5-malformed-temp"
+        install(self.first_release, case_home, SHA_A)
+        ticket = self._make_v5_empty_ticket(case_home, case_home / ROLE_TARGET)
+        malformed = json.loads(ticket.snapshot.payload or b"{}")
+        malformed["metadata"]["size"] = (
+            (ticket.batch_root / "metadata.json").stat().st_size
+        )
+        malformed_payload = MODULE._bounded_json_document(
+            malformed,
+            max_bytes=MODULE.MAX_PENDING_CLEANUP_TICKET_BYTES,
+            overflow_error="pending cleanup ticket exceeds the size limit",
+        )
+        ticket.path.unlink()
+        temp_path = ticket.path.with_name(
+            ticket.batch_root.name + MODULE.PENDING_CLEANUP_TICKET_TEMP_SUFFIX
+        )
+        temp_path.write_bytes(malformed_payload)
+        temp_path.chmod(0o600)
+        temp_identity = (temp_path.stat().st_dev, temp_path.stat().st_ino)
+
+        self.assertFalse(
+            MODULE._promote_pending_ephemeral_cleanup_ticket_temp(
+                case_home,
+                temp_path,
+            )
+        )
+        self.assertFalse(ticket.path.exists())
+        self.assertEqual(temp_path.read_bytes(), malformed_payload)
+        self.assertEqual(
+            (temp_path.stat().st_dev, temp_path.stat().st_ino),
+            temp_identity,
+        )
+
+        self.assertEqual(
+            MODULE._cleanup_pending_cleanup_ticket_temps(case_home),
+            1,
+        )
+        self.assertFalse(temp_path.exists())
+        self.assertFalse(ticket.path.exists())
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_v5_ticket_temp_revalidation_failure_is_retained(self) -> None:
+        case_home = self.root / "ephemeral-v5-temp-revalidation-failure"
+        install(self.first_release, case_home, SHA_A)
+        ticket = self._make_v5_empty_ticket(case_home, case_home / ROLE_TARGET)
+        temp_path = ticket.path.with_name(
+            ticket.batch_root.name + MODULE.PENDING_CLEANUP_TICKET_TEMP_SUFFIX
+        )
+        ticket.path.rename(temp_path)
+        expected_payload = temp_path.read_bytes()
+        expected_identity = (temp_path.stat().st_dev, temp_path.stat().st_ino)
+        real_read = MODULE._read_managed_state_file_snapshot
+
+        def fail_bound_temp_reread(
+            home: Path,
+            path: Path,
+            parent_fd: int,
+            *,
+            expected_identity=None,
+            maximum_bytes: int = MODULE.MAX_MANAGED_STATE_BYTES,
+        ):
+            if path == temp_path and expected_identity is not None:
+                raise OSError("injected bound temp reread failure")
+            return real_read(
+                home,
+                path,
+                parent_fd,
+                expected_identity=expected_identity,
+                maximum_bytes=maximum_bytes,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_read_managed_state_file_snapshot",
+                side_effect=fail_bound_temp_reread,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_discard_incomplete_pending_cleanup_ticket",
+                side_effect=AssertionError("destructive cleanup was attempted"),
+            ) as discard,
+            self.assertRaisesRegex(OSError, "bound temp reread failure"),
+        ):
+            MODULE._cleanup_pending_cleanup_ticket_temps(case_home)
+
+        discard.assert_not_called()
+        self.assertFalse(ticket.path.exists())
+        self.assertTrue(temp_path.is_file())
+        self.assertEqual(temp_path.read_bytes(), expected_payload)
+        self.assertEqual(
+            (temp_path.stat().st_dev, temp_path.stat().st_ino),
+            expected_identity,
+        )
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_v5_ticket_temp_policy_failure_is_retained(self) -> None:
+        case_home = self.root / "ephemeral-v5-temp-policy-failure"
+        install(self.first_release, case_home, SHA_A)
+        ticket = self._make_v5_empty_ticket(case_home, case_home / ROLE_TARGET)
+        temp_path = ticket.path.with_name(
+            ticket.batch_root.name + MODULE.PENDING_CLEANUP_TICKET_TEMP_SUFFIX
+        )
+        ticket.path.rename(temp_path)
+        temp_path.chmod(0o640)
+        expected_payload = temp_path.read_bytes()
+        expected_identity = (temp_path.stat().st_dev, temp_path.stat().st_ino)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_discard_incomplete_pending_cleanup_ticket",
+                side_effect=AssertionError("destructive cleanup was attempted"),
+            ) as discard,
+            self.assertRaisesRegex(
+                MODULE._PendingCleanupAccessPolicyError,
+                "mode 0640",
+            ),
+        ):
+            MODULE._cleanup_pending_cleanup_ticket_temps(case_home)
+
+        discard.assert_not_called()
+        self.assertFalse(ticket.path.exists())
+        self.assertTrue(temp_path.is_file())
+        self.assertEqual(temp_path.read_bytes(), expected_payload)
+        self.assertEqual(
+            (temp_path.stat().st_dev, temp_path.stat().st_ino),
+            expected_identity,
+        )
+        self.assertEqual(MODULE.stat.S_IMODE(temp_path.stat().st_mode), 0o640)
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_malformed_temp_classification_never_discards_valid_replacement(
+        self,
+    ) -> None:
+        case_home = self.root / "ephemeral-temp-classification-replacement"
+        install(self.first_release, case_home, SHA_A)
+        ticket = self._make_v5_empty_ticket(case_home, case_home / ROLE_TARGET)
+        valid_payload = ticket.snapshot.payload
+        self.assertIsNotNone(valid_payload)
+        assert valid_payload is not None
+        malformed = json.loads(valid_payload)
+        malformed["metadata"]["size"] = (
+            (ticket.batch_root / "metadata.json").stat().st_size
+        )
+        malformed_payload = MODULE._bounded_json_document(
+            malformed,
+            max_bytes=MODULE.MAX_PENDING_CLEANUP_TICKET_BYTES,
+            overflow_error="pending cleanup ticket exceeds the size limit",
+        )
+        ticket.path.unlink()
+        temp_path = ticket.path.with_name(
+            ticket.batch_root.name + MODULE.PENDING_CLEANUP_TICKET_TEMP_SUFFIX
+        )
+        temp_path.write_bytes(malformed_payload)
+        temp_path.chmod(0o600)
+        classified_identity = (temp_path.stat().st_dev, temp_path.stat().st_ino)
+        real_promote = MODULE._promote_pending_ephemeral_cleanup_ticket_temp
+        replacement_identity: tuple[int, int] | None = None
+
+        def replace_after_classification(
+            home: Path,
+            path: Path,
+            *,
+            classified_snapshot=None,
+        ) -> bool:
+            nonlocal replacement_identity
+            promoted = real_promote(
+                home,
+                path,
+                classified_snapshot=classified_snapshot,
+            )
+            self.assertFalse(promoted)
+            replacement_path = path.with_name(path.name + ".replacement")
+            replacement_path.write_bytes(valid_payload)
+            replacement_path.chmod(0o600)
+            replacement_metadata = replacement_path.stat()
+            replacement_identity = (
+                replacement_metadata.st_dev,
+                replacement_metadata.st_ino,
+            )
+            self.assertNotEqual(replacement_identity, classified_identity)
+            os.replace(replacement_path, path)
+            return False
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_promote_pending_ephemeral_cleanup_ticket_temp",
+                side_effect=replace_after_classification,
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "changed before read"),
+        ):
+            MODULE._cleanup_pending_cleanup_ticket_temps(case_home)
+
+        self.assertIsNotNone(replacement_identity)
+        self.assertFalse(ticket.path.exists())
+        self.assertTrue(temp_path.is_file())
+        self.assertEqual(temp_path.read_bytes(), valid_payload)
+        self.assertEqual(
+            (temp_path.stat().st_dev, temp_path.stat().st_ino),
+            replacement_identity,
+        )
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_malformed_v8_classification_never_discards_valid_replacement(
+        self,
+    ) -> None:
+        case_home = self.root / "allocation-temp-classification-replacement"
+        case_home.mkdir()
+        quarantine_root = (
+            MODULE._personal_sync_root(case_home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        quarantine_fd = MODULE._open_or_create_directory_beneath(
+            case_home,
+            quarantine_root,
+            mode=0o700,
+        )
+        try:
+            root_identity = MODULE._directory_identity(quarantine_fd)
+        finally:
+            MODULE._close_fd_quietly(quarantine_fd)
+        batch_name = "20260905T000000Z-3-1"
+        valid_payload = MODULE._pending_quarantine_allocation_payload(
+            batch_name,
+            root_identity,
+            b"valid replacement metadata\n",
+        )
+        malformed = json.loads(valid_payload)
+        malformed["unexpected"] = True
+        malformed_payload = MODULE._bounded_json_document(
+            malformed,
+            max_bytes=MODULE.MAX_PENDING_CLEANUP_TICKET_BYTES,
+            overflow_error="pending quarantine allocation exceeds the size limit",
+        )
+        index_fd = MODULE._open_or_create_directory_beneath(
+            case_home,
+            MODULE._pending_cleanup_index_path(case_home),
+            mode=0o700,
+        )
+        MODULE._close_fd_quietly(index_fd)
+        canonical_path = MODULE._pending_quarantine_allocation_path(
+            case_home,
+            batch_name,
+        )
+        temp_path = canonical_path.with_name(
+            batch_name + MODULE.PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX
+        )
+        temp_path.write_bytes(malformed_payload)
+        temp_path.chmod(0o600)
+        classified_identity = (temp_path.stat().st_dev, temp_path.stat().st_ino)
+        real_promote = MODULE._promote_pending_quarantine_allocation_temp
+        replacement_identity: tuple[int, int] | None = None
+
+        def replace_after_classification(
+            home: Path,
+            path: Path,
+            *,
+            classified_snapshot=None,
+        ) -> bool:
+            nonlocal replacement_identity
+            promoted = real_promote(
+                home,
+                path,
+                classified_snapshot=classified_snapshot,
+            )
+            self.assertFalse(promoted)
+            replacement_path = path.with_name(path.name + ".replacement")
+            replacement_path.write_bytes(valid_payload)
+            replacement_path.chmod(0o600)
+            replacement_metadata = replacement_path.stat()
+            replacement_identity = (
+                replacement_metadata.st_dev,
+                replacement_metadata.st_ino,
+            )
+            self.assertNotEqual(replacement_identity, classified_identity)
+            os.replace(replacement_path, path)
+            return False
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_promote_pending_quarantine_allocation_temp",
+                side_effect=replace_after_classification,
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "changed before read"),
+        ):
+            MODULE._cleanup_pending_cleanup_ticket_temps(case_home)
+
+        self.assertIsNotNone(replacement_identity)
+        self.assertFalse(canonical_path.exists())
+        self.assertTrue(temp_path.is_file())
+        self.assertEqual(temp_path.read_bytes(), valid_payload)
+        self.assertEqual(
+            (temp_path.stat().st_dev, temp_path.stat().st_ino),
+            replacement_identity,
+        )
+        self.assertFalse((quarantine_root / batch_name).exists())
+
+    def test_duplicate_v5_v6_v7_temp_revalidates_canonical_at_delete_boundary(
+        self,
+    ) -> None:
+        for version, mutation in ((5, "content"), (6, "identity"), (7, "policy")):
+            with self.subTest(ticket_version=version, mutation=mutation):
+                case_home = self.root / f"duplicate-v{version}-{mutation}"
+                allocation = None
+                if version == 5:
+                    install(self.first_release, case_home, SHA_A)
+                    ticket = self._make_v5_empty_ticket(
+                        case_home,
+                        case_home / ROLE_TARGET,
+                    )
+                elif version == 6:
+                    install(self.first_release, case_home, SHA_A)
+                    target = case_home / ROLE_TARGET
+                    expected = MODULE._read_regular_file_snapshot_beneath(
+                        case_home,
+                        target,
+                        require_managed_access=False,
+                    )
+                    ticket = MODULE._publish_pending_ephemeral_quarantine_leaf_cleanup_ticket(
+                        case_home,
+                        target,
+                        expected,
+                    )
+                else:
+                    case_home.mkdir()
+                    allocation = MODULE._quarantine_batch_root(
+                        case_home,
+                        [],
+                        retain_binding=True,
+                        retain_scaffold_binding=True,
+                    )
+                    self.assertIsInstance(
+                        allocation,
+                        MODULE.EphemeralQuarantineBatchAllocation,
+                    )
+                    assert isinstance(
+                        allocation,
+                        MODULE.EphemeralQuarantineBatchAllocation,
+                    )
+                    ticket = MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+                        case_home,
+                        allocation.binding,
+                    )
+                    allocation.revoke_reclaim()
+                    allocation.close()
+
+                temp_path = ticket.path.with_name(
+                    ticket.batch_root.name + MODULE.PENDING_CLEANUP_TICKET_TEMP_SUFFIX
+                )
+                temp_path.write_bytes(ticket.snapshot.payload or b"")
+                temp_path.chmod(0o600)
+                temp_identity = (temp_path.stat().st_dev, temp_path.stat().st_ino)
+                canonical_identity = (
+                    ticket.path.stat().st_dev,
+                    ticket.path.stat().st_ino,
+                )
+                canonical_payload = ticket.path.read_bytes()
+                real_delete = MODULE._isolate_and_delete_pending_cleanup_file
+                mutated_identity: tuple[int, int] | None = None
+                mutated_payload: bytes | None = None
+
+                def mutate_canonical_then_delete(
+                    home: Path,
+                    path: Path,
+                    parent_fd: int,
+                    expected_snapshot,
+                    *,
+                    label: str,
+                    maximum_bytes: int = MODULE.MAX_MANAGED_STATE_BYTES,
+                    mutation_revalidator=None,
+                ) -> None:
+                    nonlocal mutated_identity, mutated_payload
+                    if path == temp_path and mutated_identity is None:
+                        if mutation == "content":
+                            replacement = (
+                                bytes([canonical_payload[0] ^ 1])
+                                + canonical_payload[1:]
+                            )
+                            with ticket.path.open("r+b") as canonical_file:
+                                canonical_file.write(replacement)
+                                canonical_file.truncate()
+                                canonical_file.flush()
+                                os.fsync(canonical_file.fileno())
+                        elif mutation == "identity":
+                            replacement_path = ticket.path.with_name(
+                                ticket.path.name + ".replacement"
+                            )
+                            replacement_path.write_bytes(canonical_payload)
+                            replacement_path.chmod(0o600)
+                            os.replace(replacement_path, ticket.path)
+                        else:
+                            ticket.path.chmod(0o640)
+                        canonical_metadata = ticket.path.stat()
+                        mutated_identity = (
+                            canonical_metadata.st_dev,
+                            canonical_metadata.st_ino,
+                        )
+                        mutated_payload = ticket.path.read_bytes()
+                    real_delete(
+                        home,
+                        path,
+                        parent_fd,
+                        expected_snapshot,
+                        label=label,
+                        maximum_bytes=maximum_bytes,
+                        mutation_revalidator=mutation_revalidator,
+                    )
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_isolate_and_delete_pending_cleanup_file",
+                        side_effect=mutate_canonical_then_delete,
+                    ),
+                    self.assertRaises(MODULE.SyncError),
+                ):
+                    MODULE._promote_pending_ephemeral_cleanup_ticket_temp(
+                        case_home,
+                        temp_path,
+                    )
+
+                self.assertIsNotNone(mutated_identity)
+                self.assertTrue(temp_path.is_file())
+                self.assertEqual(
+                    (temp_path.stat().st_dev, temp_path.stat().st_ino),
+                    temp_identity,
+                )
+                self.assertEqual(temp_path.read_bytes(), ticket.snapshot.payload)
+                self.assertTrue(ticket.path.is_file())
+                self.assertEqual(ticket.path.read_bytes(), mutated_payload)
+                if mutation == "identity":
+                    self.assertNotEqual(mutated_identity, canonical_identity)
+                else:
+                    self.assertEqual(mutated_identity, canonical_identity)
+                if mutation == "policy":
+                    self.assertEqual(
+                        MODULE.stat.S_IMODE(ticket.path.stat().st_mode),
+                        0o640,
+                    )
+
+    def test_duplicate_v8_temp_retained_when_canonical_disappears(self) -> None:
+        case_home = self.root / "duplicate-v8-disappearance"
+        case_home.mkdir()
+        quarantine_root = (
+            MODULE._personal_sync_root(case_home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        quarantine_fd = MODULE._open_or_create_directory_beneath(
+            case_home,
+            quarantine_root,
+            mode=0o700,
+        )
+        try:
+            ticket = MODULE._publish_pending_quarantine_allocation_ticket(
+                case_home,
+                quarantine_root,
+                quarantine_fd,
+                "20260905T000000Z-2-1",
+                b"duplicate allocation fixture\n",
+            )
+        finally:
+            MODULE._close_fd_quietly(quarantine_fd)
+        temp_path = ticket.path.with_name(
+            ticket.batch_root.name + MODULE.PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX
+        )
+        temp_path.write_bytes(ticket.snapshot.payload or b"")
+        temp_path.chmod(0o600)
+        temp_identity = (temp_path.stat().st_dev, temp_path.stat().st_ino)
+        real_delete = MODULE._isolate_and_delete_pending_cleanup_file
+        disappeared = False
+
+        def remove_canonical_then_delete(
+            home: Path,
+            path: Path,
+            parent_fd: int,
+            expected_snapshot,
+            *,
+            label: str,
+            maximum_bytes: int = MODULE.MAX_MANAGED_STATE_BYTES,
+            mutation_revalidator=None,
+        ) -> None:
+            nonlocal disappeared
+            if path == temp_path and not disappeared:
+                ticket.path.unlink()
+                disappeared = True
+            real_delete(
+                home,
+                path,
+                parent_fd,
+                expected_snapshot,
+                label=label,
+                maximum_bytes=maximum_bytes,
+                mutation_revalidator=mutation_revalidator,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_isolate_and_delete_pending_cleanup_file",
+                side_effect=remove_canonical_then_delete,
+            ),
+            self.assertRaises(MODULE.SyncError),
+        ):
+            MODULE._promote_pending_quarantine_allocation_temp(
+                case_home,
+                temp_path,
+            )
+
+        self.assertTrue(disappeared)
+        self.assertFalse(ticket.path.exists())
+        self.assertTrue(temp_path.is_file())
+        self.assertEqual(temp_path.read_bytes(), ticket.snapshot.payload)
+        self.assertEqual(
+            (temp_path.stat().st_dev, temp_path.stat().st_ino),
+            temp_identity,
+        )
+
+    def test_duplicate_temp_tombstone_revalidates_canonical_before_unlink(
+        self,
+    ) -> None:
+        case_home = self.root / "duplicate-v5-second-boundary"
+        install(self.first_release, case_home, SHA_A)
+        ticket = self._make_v5_empty_ticket(case_home, case_home / ROLE_TARGET)
+        canonical_payload = ticket.path.read_bytes()
+        canonical_identity = (
+            ticket.path.stat().st_dev,
+            ticket.path.stat().st_ino,
+        )
+        temp_path = ticket.path.with_name(
+            ticket.batch_root.name + MODULE.PENDING_CLEANUP_TICKET_TEMP_SUFFIX
+        )
+        temp_path.write_bytes(canonical_payload)
+        temp_path.chmod(0o600)
+        temp_identity = (temp_path.stat().st_dev, temp_path.stat().st_ino)
+        real_require = MODULE._require_pending_cleanup_file_snapshot_unchanged
+        boundary_checks = 0
+        replacement_identity: tuple[int, int] | None = None
+
+        def replace_canonical_at_second_boundary(
+            home: Path,
+            path: Path,
+            parent_fd: int,
+            expected_snapshot,
+            *,
+            label: str,
+            maximum_bytes: int = MODULE.MAX_MANAGED_STATE_BYTES,
+        ):
+            nonlocal boundary_checks, replacement_identity
+            if path == ticket.path:
+                boundary_checks += 1
+                if boundary_checks == 2:
+                    replacement_path = path.with_name(path.name + ".replacement")
+                    replacement_path.write_bytes(canonical_payload)
+                    replacement_path.chmod(0o600)
+                    replacement_metadata = replacement_path.stat()
+                    replacement_identity = (
+                        replacement_metadata.st_dev,
+                        replacement_metadata.st_ino,
+                    )
+                    self.assertNotEqual(replacement_identity, canonical_identity)
+                    os.replace(replacement_path, path)
+            return real_require(
+                home,
+                path,
+                parent_fd,
+                expected_snapshot,
+                label=label,
+                maximum_bytes=maximum_bytes,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_require_pending_cleanup_file_snapshot_unchanged",
+                side_effect=replace_canonical_at_second_boundary,
+            ),
+            self.assertRaises(MODULE.SyncError),
+        ):
+            MODULE._promote_pending_ephemeral_cleanup_ticket_temp(
+                case_home,
+                temp_path,
+            )
+
+        self.assertEqual(boundary_checks, 2)
+        self.assertIsNotNone(replacement_identity)
+        self.assertFalse(temp_path.exists())
+        retained = tuple(
+            temp_path.parent.glob(
+                f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}{temp_path.name}-*"
+            )
+        )
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), canonical_payload)
+        self.assertEqual(
+            (retained[0].stat().st_dev, retained[0].stat().st_ino),
+            temp_identity,
+        )
+        self.assertEqual(ticket.path.read_bytes(), canonical_payload)
+        self.assertEqual(
+            (ticket.path.stat().st_dev, ticket.path.stat().st_ino),
+            replacement_identity,
+        )
+
+    def test_duplicate_canonical_replacement_between_capture_and_parser_is_retained(
+        self,
+    ) -> None:
+        case_home = self.root / "duplicate-v6-capture-parser-replacement"
+        install(self.first_release, case_home, SHA_A)
+        target = case_home / ROLE_TARGET
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            case_home,
+            target,
+            require_managed_access=False,
+        )
+        ticket = MODULE._publish_pending_ephemeral_quarantine_leaf_cleanup_ticket(
+            case_home,
+            target,
+            expected,
+        )
+        canonical_payload = ticket.path.read_bytes()
+        canonical_identity = (
+            ticket.path.stat().st_dev,
+            ticket.path.stat().st_ino,
+        )
+        temp_path = ticket.path.with_name(
+            ticket.batch_root.name + MODULE.PENDING_CLEANUP_TICKET_TEMP_SUFFIX
+        )
+        temp_path.write_bytes(canonical_payload)
+        temp_path.chmod(0o600)
+        temp_identity = (temp_path.stat().st_dev, temp_path.stat().st_ino)
+        real_read_ticket = MODULE._read_pending_cleanup_ticket
+        replacement_identity: tuple[int, int] | None = None
+
+        def replace_before_bound_parser(
+            home: Path,
+            path: Path,
+            *,
+            expected_ticket_identity=None,
+            allow_temporary: bool = False,
+            _captured_snapshot=None,
+        ):
+            nonlocal replacement_identity
+            if (
+                path == ticket.path
+                and expected_ticket_identity is not None
+                and replacement_identity is None
+            ):
+                replacement_path = path.with_name(path.name + ".replacement")
+                replacement_path.write_bytes(canonical_payload)
+                replacement_path.chmod(0o600)
+                replacement_metadata = replacement_path.stat()
+                replacement_identity = (
+                    replacement_metadata.st_dev,
+                    replacement_metadata.st_ino,
+                )
+                self.assertNotEqual(replacement_identity, canonical_identity)
+                os.replace(replacement_path, path)
+            return real_read_ticket(
+                home,
+                path,
+                expected_ticket_identity=expected_ticket_identity,
+                allow_temporary=allow_temporary,
+                _captured_snapshot=_captured_snapshot,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_read_pending_cleanup_ticket",
+                side_effect=replace_before_bound_parser,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_isolate_and_delete_pending_cleanup_file",
+                side_effect=AssertionError("temp deletion was attempted"),
+            ) as delete,
+            self.assertRaisesRegex(MODULE.SyncError, "changed before read"),
+        ):
+            MODULE._promote_pending_ephemeral_cleanup_ticket_temp(
+                case_home,
+                temp_path,
+            )
+
+        delete.assert_not_called()
+        self.assertIsNotNone(replacement_identity)
+        self.assertTrue(temp_path.is_file())
+        self.assertEqual(temp_path.read_bytes(), canonical_payload)
+        self.assertEqual(
+            (temp_path.stat().st_dev, temp_path.stat().st_ino),
+            temp_identity,
+        )
+        self.assertTrue(ticket.path.is_file())
+        self.assertEqual(ticket.path.read_bytes(), canonical_payload)
+        self.assertEqual(
+            (ticket.path.stat().st_dev, ticket.path.stat().st_ino),
+            replacement_identity,
+        )
+
+    def test_v5_legacy_ticket_without_metadata_size_recovers(self) -> None:
+        case_home = self.root / "ephemeral-v5-no-metadata-size"
+        install(self.first_release, case_home, SHA_A)
+        ticket = self._make_v5_empty_ticket(case_home, case_home / ROLE_TARGET)
+        payload = json.loads(ticket.snapshot.payload or b"{}")
+
+        self.assertEqual(payload["version"], 5)
+        self.assertNotIn("size", payload["metadata"])
+        self.assertIsNone(ticket.metadata_size)
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(case_home), 1)
+        self.assertFalse(ticket.path.exists())
+        self.assertFalse(ticket.batch_root.exists())
+
     def test_v5_ephemeral_ticket_never_authorizes_a_retained_payload(self) -> None:
         case_home = self.root / "ephemeral-retained-payload"
         install(self.first_release, case_home, SHA_A)
@@ -2706,6 +3548,9 @@ class PendingStagingCleanupTests(unittest.TestCase):
         finally:
             MODULE._close_fd_quietly(parent_fd)
         _quarantine_path, _moved, binding = result
+        # Exercise historical v5 recovery semantics independently from the v8
+        # fence that current private moves retire before returning.
+        binding = replace(binding, allocation_ticket=None)
         ticket = MODULE._publish_pending_ephemeral_quarantine_cleanup_ticket(
             case_home,
             binding,
@@ -3031,6 +3876,185 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 self.assertTrue(changed)
                 self.assertTrue(ticket.batch_root.is_dir())
                 self.assertTrue(ticket.path.is_file())
+
+    def test_v5_v7_metadata_unlink_rechecks_same_inode_after_callback(self) -> None:
+        for version in (5, 7):
+            with self.subTest(ticket_version=version):
+                case_home = self.root / f"ephemeral-v{version}-metadata-in-place"
+                if version == 5:
+                    install(self.first_release, case_home, SHA_A)
+                    ticket = self._make_v5_empty_ticket(
+                        case_home,
+                        case_home / ROLE_TARGET,
+                    )
+                else:
+                    case_home.mkdir()
+                    allocation = MODULE._quarantine_batch_root(
+                        case_home,
+                        [],
+                        retain_binding=True,
+                        retain_scaffold_binding=True,
+                    )
+                    self.assertIsInstance(
+                        allocation,
+                        MODULE.EphemeralQuarantineBatchAllocation,
+                    )
+                    assert isinstance(
+                        allocation,
+                        MODULE.EphemeralQuarantineBatchAllocation,
+                    )
+                    ticket = MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+                        case_home,
+                        allocation.binding,
+                    )
+                    allocation.revoke_reclaim()
+                    allocation.close()
+
+                real_boundary = (
+                    MODULE._require_pending_ephemeral_metadata_cleanup_boundary
+                )
+                changed_path: Path | None = None
+                changed_identity: tuple[int, int] | None = None
+                changed_payload: bytes | None = None
+
+                def mutate_same_inode_after_boundary(
+                    home: Path,
+                    current_ticket,
+                    quarantine_root: Path,
+                    quarantine_fd: int,
+                    bound_batch_root: Path,
+                    bound_name: str,
+                    batch_fd: int,
+                    metadata_name: str,
+                ) -> None:
+                    nonlocal changed_path, changed_identity, changed_payload
+                    real_boundary(
+                        home,
+                        current_ticket,
+                        quarantine_root,
+                        quarantine_fd,
+                        bound_batch_root,
+                        bound_name,
+                        batch_fd,
+                        metadata_name,
+                    )
+                    if metadata_name == "metadata.json" or changed_path is not None:
+                        return
+                    retained_path = bound_batch_root / metadata_name
+                    original = retained_path.read_bytes()
+                    replacement = bytes([original[0] ^ 1]) + original[1:]
+                    before = retained_path.stat()
+                    with retained_path.open("r+b") as retained_file:
+                        retained_file.write(replacement)
+                        retained_file.truncate()
+                        retained_file.flush()
+                        os.fsync(retained_file.fileno())
+                    after = retained_path.stat()
+                    self.assertEqual(
+                        (after.st_dev, after.st_ino),
+                        (before.st_dev, before.st_ino),
+                    )
+                    changed_path = retained_path
+                    changed_identity = (after.st_dev, after.st_ino)
+                    changed_payload = replacement
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_require_pending_ephemeral_metadata_cleanup_boundary",
+                        side_effect=mutate_same_inode_after_boundary,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "after mutation revalidation",
+                    ),
+                ):
+                    MODULE._cleanup_ready_pending_batches(case_home)
+
+                self.assertIsNotNone(changed_path)
+                assert changed_path is not None
+                self.assertTrue(changed_path.is_file())
+                self.assertEqual(
+                    (changed_path.stat().st_dev, changed_path.stat().st_ino),
+                    changed_identity,
+                )
+                self.assertEqual(changed_path.read_bytes(), changed_payload)
+                self.assertTrue(ticket.path.is_file())
+
+    def test_v8_ticket_unlink_rechecks_same_inode_after_callback(self) -> None:
+        case_home = self.root / "ephemeral-v8-ticket-in-place"
+        case_home.mkdir()
+        quarantine_root = (
+            MODULE._personal_sync_root(case_home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        quarantine_fd = MODULE._open_or_create_directory_beneath(
+            case_home,
+            quarantine_root,
+            mode=0o700,
+        )
+        batch_name = "20260905T000000Z-1-1"
+        try:
+            ticket = MODULE._publish_pending_quarantine_allocation_ticket(
+                case_home,
+                quarantine_root,
+                quarantine_fd,
+                batch_name,
+                b"allocation metadata fixture\n",
+            )
+        finally:
+            MODULE._close_fd_quietly(quarantine_fd)
+
+        changed_path: Path | None = None
+        changed_identity: tuple[int, int] | None = None
+        changed_payload: bytes | None = None
+
+        def mutate_same_inode_after_boundary() -> None:
+            nonlocal changed_path, changed_identity, changed_payload
+            if ticket.path.exists() or changed_path is not None:
+                return
+            retained = tuple(
+                ticket.path.parent.glob(
+                    f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}{ticket.path.name}-*"
+                )
+            )
+            self.assertEqual(len(retained), 1)
+            retained_path = retained[0]
+            original = retained_path.read_bytes()
+            replacement = bytes([original[0] ^ 1]) + original[1:]
+            before = retained_path.stat()
+            with retained_path.open("r+b") as retained_file:
+                retained_file.write(replacement)
+                retained_file.truncate()
+                retained_file.flush()
+                os.fsync(retained_file.fileno())
+            after = retained_path.stat()
+            self.assertEqual(
+                (after.st_dev, after.st_ino),
+                (before.st_dev, before.st_ino),
+            )
+            changed_path = retained_path
+            changed_identity = (after.st_dev, after.st_ino)
+            changed_payload = replacement
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "after mutation revalidation",
+        ):
+            MODULE._delete_pending_quarantine_allocation_ticket(
+                case_home,
+                ticket,
+                boundary_revalidator=mutate_same_inode_after_boundary,
+            )
+
+        self.assertIsNotNone(changed_path)
+        assert changed_path is not None
+        self.assertTrue(changed_path.is_file())
+        self.assertEqual(
+            (changed_path.stat().st_dev, changed_path.stat().st_ino),
+            changed_identity,
+        )
+        self.assertEqual(changed_path.read_bytes(), changed_payload)
+        self.assertFalse(ticket.path.exists())
 
     def test_v5_ephemeral_cleanup_revalidates_leaf_at_rmdir_boundary(self) -> None:
         case_home = self.root / "ephemeral-v5-leaf-rmdir-boundary"
