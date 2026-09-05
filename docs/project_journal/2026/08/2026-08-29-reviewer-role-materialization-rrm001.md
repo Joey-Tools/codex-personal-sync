@@ -91,6 +91,8 @@ superseded_by:
 
 ## Next Steps
 
+- Create a new signed frozen head and repeat the full-range fresh-context
+  GPT-5.6 Sol Ultra review after the latest publication-cleanup race repair.
 - Propagate the actual squash-landed canonical commit through toolbox and the
   private overlay using the receipt-bound release chain.
 - Smoke-test the installed reviewer role without a path override on every
@@ -458,3 +460,30 @@ superseded_by:
   compatibility tests passed locally. The new cleanup path preserves a failed
   exclusive-file creation error where `add_note` exists and uses a chained,
   fail-closed `SyncError` on Python 3.9 when final-name cleanup fails.
+- The first fresh frozen-range GPT-5.6 Sol Ultra review of the reconstructed
+  signed candidate found two final-boundary cleanup races: a public parent
+  access-policy check was incomplete immediately before a legacy cleanup
+  mutation, and a final public-path unlink could delete a name replacement.
+  The repair distinguishes protected leaf identity, content stability, and
+  access policy from harmless child-entry churn. It revalidates the complete
+  managed parent chain before a public-to-private rename, validates the exact
+  leaf inside a mode-`0700` private cleanup namespace, and only then deletes
+  the private alias. A replacement is first atomically removed from the
+  Codex-loadable canonical name; it is then retained as private quarantine
+  evidence whenever it cannot re-prove the authorized publication identity,
+  content, and access policy.
+- Receiptless compatibility cleanup first atomically moves the observed
+  canonical leaf to a generated non-TOML active alias. A regular leaf is then
+  moved into private quarantine for exact validation; a non-regular or
+  unreadable replacement remains fail-closed under the non-loadable retained
+  alias. New interleavings cover an already-replaced canonical leaf, a private
+  authority retained when the public target reappears, and a replacement that
+  appears while the private alias is being deleted. None of those paths unlinks
+  through the public target name.
+- The final affected six-module suite passed 848 tests with one expected skip
+  in 211.260 seconds. Final repository-private discovery passed 1,459 tests
+  with three expected skips in 939.908 seconds, and the actual local Python
+  3.9.6 regular-materialization suite passed 104/104 in 51.347 seconds. Ruff
+  `E4/E7/E9/F`, Ruff formatting, `actionlint`, `git diff --check`, and a
+  Python 3.9 compile check passed; the ten-source lock was refreshed after the
+  final source and test changes.

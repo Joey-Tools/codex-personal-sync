@@ -15710,13 +15710,31 @@ def _delete_exact_regular_publication_beneath(
     home: Path,
     target: Path,
     expected: RegularFileSnapshot,
+    *,
+    pending_batch: PendingLinkBatch | None = None,
+    pending_record: PendingLinkRecord | None = None,
+    cleanup_phase: str | None = None,
 ) -> None:
+    if pending_batch is None:
+        _delete_exact_regular_publication_without_pending_receipt(
+            home,
+            target,
+            expected,
+        )
+        return
+    if pending_record is None or cleanup_phase is None:
+        raise SyncError("pending regular publication cleanup authority is incomplete")
     parent_fd = _open_directory_beneath(home, target.parent)
     try:
         planned = (
             expected.file_identity[0],
             expected.file_identity[1],
             stat.S_IFREG,
+        )
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=parent_fd,
         )
         active_name, isolated = _isolate_pending_cleanup_entry(
             parent_fd,
@@ -15761,14 +15779,499 @@ def _delete_exact_regular_publication_beneath(
                     f"the isolated replacement was retained: {target}"
                 ),
             )
-        os.unlink(active_name, dir_fd=parent_fd)
-        os.fsync(parent_fd)
+        _isolate_and_delete_pending_regular_publication_candidate(
+            home,
+            pending_batch,
+            pending_record,
+            cleanup_phase,
+            target.parent,
+            parent_fd,
+            active_name,
+            expected,
+            expected_link_count=expected.link_count,
+            label="published regular-file destination",
+        )
         if _named_entry_identity(parent_fd, active_name) is not None:
             raise SyncError(f"published regular-file cleanup name reappeared: {target}")
         if not _bound_directory_matches(home, target.parent, parent_fd):
             raise SyncError(f"managed target parent changed: {target.parent}")
     finally:
         _close_fd_quietly(parent_fd)
+
+
+def _delete_exact_regular_publication_without_pending_receipt(
+    home: Path,
+    target: Path,
+    expected: RegularFileSnapshot,
+) -> None:
+    """Delete an exact publication leaf through the private quarantine.
+
+    This compatibility path has no durable pending receipt, so a crash after
+    the public-to-private move deliberately leaves the exact leaf as retained
+    quarantine evidence. The protected public properties are leaf identity,
+    content stability and access policy; in the private mode-0700 namespace,
+    a same-uid actor already has equivalent authority over synchronizer state.
+    """
+    parent_fd = _open_directory_beneath(home, target.parent)
+    try:
+        planned = (
+            expected.file_identity[0],
+            expected.file_identity[1],
+            stat.S_IFREG,
+        )
+        # First remove every observed object from the Codex-loadable canonical
+        # name. This operation is deliberately identity-agnostic: an object
+        # replacement is evidence to retain, not a reason to leave a foreign
+        # TOML at its active pathname. The generated alias is not a TOML name,
+        # so an unreadable or non-regular replacement cannot become loadable
+        # while the subsequent private isolation fails closed.
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=parent_fd,
+        )
+        active_name, active = _isolate_pending_cleanup_entry(
+            parent_fd,
+            target.name,
+            expected.parent_identity,
+            planned,
+            retain_mismatch=False,
+        )
+        if not stat.S_ISREG(active.st_mode):
+            _retain_pending_cleanup_entry(
+                parent_fd,
+                active_name,
+                expected.parent_identity,
+                planned,
+                label=(
+                    "published regular-file destination changed to a non-regular "
+                    f"entry before private isolation: {target}"
+                ),
+            )
+        quarantine_path, moved = _move_regular_leaf_to_unique_quarantine(
+            home,
+            target.parent,
+            parent_fd,
+            active_name,
+            label="publication-cleanup",
+            # The active alias has already removed the leaf from its
+            # Codex-loadable pathname. Snapshot the object that was actually
+            # isolated, then retain it privately if it cannot re-prove the
+            # authorized publication identity/content/access policy.
+            expected=None,
+        )
+        if (
+            not _regular_snapshot_leaf_matches(moved, expected)
+            or moved.link_count != expected.link_count
+        ):
+            raise SyncError(
+                "published regular-file destination changed during private "
+                f"isolation and was retained: {target} -> {quarantine_path}"
+            )
+        if _named_entry_identity(parent_fd, target.name) is not None:
+            raise SyncError(
+                "published regular-file destination reappeared during private "
+                f"isolation and was retained: {target} -> {quarantine_path}"
+            )
+        if not _bound_directory_matches(home, target.parent, parent_fd):
+            raise SyncError(f"managed target parent changed: {target.parent}")
+    finally:
+        _close_fd_quietly(parent_fd)
+
+    quarantine_parent = quarantine_path.parent
+    quarantine_parent_fd = _open_directory_beneath(home, quarantine_parent)
+    public_parent_fd = -1
+    try:
+        _require_current_user_cleanup_fd_access_policy(
+            quarantine_parent_fd,
+            quarantine_parent,
+        )
+        if not _bound_directory_matches(home, quarantine_parent, quarantine_parent_fd):
+            raise SyncError(
+                f"published regular-file quarantine changed: {quarantine_parent}"
+            )
+        final_snapshot = _regular_file_snapshot_at(
+            quarantine_parent_fd,
+            quarantine_path.name,
+            quarantine_path,
+            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+        )
+        if (
+            not _regular_snapshot_leaf_matches(final_snapshot, expected)
+            or final_snapshot.link_count != expected.link_count
+        ):
+            raise SyncError(
+                "published regular-file quarantine leaf changed and was retained: "
+                f"{quarantine_path}"
+            )
+        public_parent_fd = _open_directory_beneath(home, target.parent)
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=public_parent_fd,
+        )
+        if _named_entry_identity(public_parent_fd, target.name) is not None:
+            raise SyncError(
+                "published regular-file destination reappeared before private "
+                f"cleanup and was retained: {target} -> {quarantine_path}"
+            )
+        _require_current_user_cleanup_fd_access_policy(
+            quarantine_parent_fd,
+            quarantine_parent,
+        )
+        os.unlink(quarantine_path.name, dir_fd=quarantine_parent_fd)
+        os.fsync(quarantine_parent_fd)
+        if (
+            _named_entry_identity(quarantine_parent_fd, quarantine_path.name)
+            is not None
+        ):
+            raise SyncError(
+                f"published regular-file quarantine name reappeared: {quarantine_path}"
+            )
+        # A portable Unix unlink cannot bind the separate public name to this
+        # private alias. Recheck afterward so a same-uid reappearance is
+        # reported, while never deleting or moving that public replacement.
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=public_parent_fd,
+        )
+        if _named_entry_identity(public_parent_fd, target.name) is not None:
+            raise SyncError(
+                "published regular-file destination reappeared while private "
+                f"cleanup completed: {target}"
+            )
+    finally:
+        _close_fd_quietly(public_parent_fd)
+        _close_fd_quietly(quarantine_parent_fd)
+
+
+def _isolate_and_delete_pending_regular_publication_candidate(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    source_parent: Path,
+    source_parent_fd: int,
+    source_name: str,
+    expected: RegularFileSnapshot,
+    *,
+    expected_link_count: int,
+    label: str,
+) -> None:
+    """Delete an exact regular leaf only after private batch isolation.
+
+    The protected leaf properties are object identity, stable content and
+    access policy. Parent directory timestamps and link counts are deliberately
+    ignored so ordinary child-entry churn remains valid. The public source
+    parent's complete access policy is revalidated after the final leaf
+    snapshot and immediately before the rename. After that atomic boundary,
+    only the mode-0700 batch cleanup namespace is mutated.
+    """
+    cleanup_parent = batch.batch_root / "pending" / "cleanup"
+    cleanup_parent_fd = _open_directory_beneath(home, cleanup_parent)
+    planned = (
+        expected.file_identity[0],
+        expected.file_identity[1],
+        stat.S_IFREG,
+    )
+    try:
+        cleanup_parent_identity = _directory_identity(cleanup_parent_fd)
+        _require_pending_cleanup_fd_access_policy(
+            cleanup_parent_fd,
+            cleanup_parent,
+            expected_mode=0o700,
+        )
+        if not _bound_directory_matches(
+            home,
+            cleanup_parent,
+            cleanup_parent_fd,
+        ):
+            raise SyncError("pending regular publication cleanup namespace changed")
+        isolated_name = _pending_regular_publication_private_alias_name(
+            cleanup_parent_identity,
+            planned,
+            record.index,
+            phase,
+        )
+        if _named_entry_identity(cleanup_parent_fd, isolated_name) is not None:
+            raise SyncError(
+                "pending regular publication cleanup has both public and private "
+                "active aliases"
+            )
+        source_snapshot = _regular_file_snapshot_at(
+            source_parent_fd,
+            source_name,
+            source_parent / source_name,
+            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+        )
+        if (
+            not _regular_snapshot_matches(
+                source_snapshot,
+                expected.parent_identity,
+                expected,
+                expected_link_count=expected_link_count,
+            )
+            or _pending_cleanup_internal_entry_plan(
+                source_name,
+                PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                expected.parent_identity,
+            )
+            != planned
+        ):
+            raise SyncError(f"{label} active entry changed")
+        _require_managed_regular_parent_chain_access(
+            home,
+            source_parent,
+            bound_parent_fd=source_parent_fd,
+        )
+        _require_pending_cleanup_fd_access_policy(
+            cleanup_parent_fd,
+            cleanup_parent,
+            expected_mode=0o700,
+        )
+        _rename_noreplace_at(
+            source_parent_fd,
+            source_name,
+            cleanup_parent_fd,
+            isolated_name,
+        )
+        os.fsync(source_parent_fd)
+        os.fsync(cleanup_parent_fd)
+        if _named_entry_identity(source_parent_fd, source_name) is not None:
+            raise SyncError(
+                f"{label} public active name reappeared; exact private evidence "
+                "was retained"
+            )
+        try:
+            _delete_pending_regular_publication_private_alias(
+                home,
+                batch,
+                record,
+                phase,
+                cleanup_parent_fd,
+                cleanup_parent_identity,
+                expected,
+                expected_link_count=expected_link_count,
+                label=label,
+            )
+        except BaseException:
+            # If validation discovers that the moved leaf was not the authorized
+            # object, restore it without replacement when the public name is
+            # still free. Otherwise keep the private evidence for manual or
+            # later batch cleanup.
+            if _named_entry_identity(cleanup_parent_fd, isolated_name) is not None:
+                try:
+                    _require_managed_regular_parent_chain_access(
+                        home,
+                        source_parent,
+                        bound_parent_fd=source_parent_fd,
+                    )
+                    _rename_noreplace_at(
+                        cleanup_parent_fd,
+                        isolated_name,
+                        source_parent_fd,
+                        source_name,
+                    )
+                    os.fsync(source_parent_fd)
+                    os.fsync(cleanup_parent_fd)
+                except BaseException:
+                    _retain_pending_cleanup_entry(
+                        cleanup_parent_fd,
+                        isolated_name,
+                        cleanup_parent_identity,
+                        planned,
+                        label=f"{label} private evidence could not be restored",
+                    )
+            raise
+    finally:
+        _close_fd_quietly(cleanup_parent_fd)
+
+
+def _pending_regular_publication_private_alias_name(
+    cleanup_parent_identity: tuple[int, int],
+    planned: tuple[int, int, int],
+    record_index: int,
+    phase: str,
+) -> str:
+    if phase not in {"produced", "before"}:
+        raise SyncError("pending regular publication cleanup phase is invalid")
+    token = hashlib.sha256(f"{record_index}:{phase}".encode("ascii")).hexdigest()[:16]
+    return (
+        f"{PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX}"
+        f"{cleanup_parent_identity[0]:x}-{cleanup_parent_identity[1]:x}-"
+        f"{planned[0]:x}-{planned[1]:x}-{planned[2]:x}-{token}"
+    )
+
+
+def _pending_regular_publication_private_alias_snapshot(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    file_identity: tuple[int, int],
+) -> RegularFileSnapshot | None:
+    cleanup_parent = batch.batch_root / "pending" / "cleanup"
+    cleanup_parent_fd = _open_directory_beneath(home, cleanup_parent)
+    try:
+        cleanup_parent_identity = _directory_identity(cleanup_parent_fd)
+        _require_pending_cleanup_fd_access_policy(
+            cleanup_parent_fd,
+            cleanup_parent,
+            expected_mode=0o700,
+        )
+        if not _bound_directory_matches(
+            home,
+            cleanup_parent,
+            cleanup_parent_fd,
+        ):
+            raise SyncError("pending regular publication cleanup namespace changed")
+        planned = (file_identity[0], file_identity[1], stat.S_IFREG)
+        private_name = _pending_regular_publication_private_alias_name(
+            cleanup_parent_identity,
+            planned,
+            record.index,
+            phase,
+        )
+        try:
+            os.stat(private_name, dir_fd=cleanup_parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        return _regular_file_snapshot_at(
+            cleanup_parent_fd,
+            private_name,
+            cleanup_parent / private_name,
+            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+        )
+    finally:
+        _close_fd_quietly(cleanup_parent_fd)
+
+
+def _delete_pending_regular_publication_private_alias(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    cleanup_parent_fd: int,
+    cleanup_parent_identity: tuple[int, int],
+    expected: RegularFileSnapshot,
+    *,
+    expected_link_count: int,
+    label: str,
+) -> None:
+    cleanup_parent = batch.batch_root / "pending" / "cleanup"
+    planned = (
+        expected.file_identity[0],
+        expected.file_identity[1],
+        stat.S_IFREG,
+    )
+    isolated_name = _pending_regular_publication_private_alias_name(
+        cleanup_parent_identity,
+        planned,
+        record.index,
+        phase,
+    )
+    isolated_path = cleanup_parent / isolated_name
+    try:
+        isolated_snapshot = _regular_file_snapshot_at(
+            cleanup_parent_fd,
+            isolated_name,
+            isolated_path,
+            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+        )
+    except BaseException:
+        _retain_pending_cleanup_entry(
+            cleanup_parent_fd,
+            isolated_name,
+            cleanup_parent_identity,
+            planned,
+            label=f"{label} became unreadable after private isolation",
+        )
+    if (
+        not _regular_snapshot_leaf_matches(isolated_snapshot, expected)
+        or isolated_snapshot.link_count != expected_link_count
+        or _pending_cleanup_internal_entry_plan(
+            isolated_name,
+            PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+            cleanup_parent_identity,
+        )
+        != planned
+    ):
+        _retain_pending_cleanup_entry(
+            cleanup_parent_fd,
+            isolated_name,
+            cleanup_parent_identity,
+            planned,
+            label=f"{label} changed during private isolation",
+        )
+    _require_pending_cleanup_fd_access_policy(
+        cleanup_parent_fd,
+        cleanup_parent,
+        expected_mode=0o700,
+    )
+    os.unlink(isolated_name, dir_fd=cleanup_parent_fd)
+    os.fsync(cleanup_parent_fd)
+
+
+def _recover_pending_regular_publication_private_alias(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    public_parent: Path,
+    public_parent_fd: int,
+    public_names: tuple[str, ...],
+    expected: RegularFileSnapshot,
+    *,
+    expected_link_count: int,
+    label: str,
+) -> bool:
+    private_snapshot = _pending_regular_publication_private_alias_snapshot(
+        home,
+        batch,
+        record,
+        phase,
+        expected.file_identity,
+    )
+    if private_snapshot is None:
+        return False
+    if (
+        not _regular_snapshot_leaf_matches(private_snapshot, expected)
+        or private_snapshot.link_count != expected_link_count
+    ):
+        raise SyncError(f"{label} private active entry changed")
+    _require_managed_regular_parent_chain_access(
+        home,
+        public_parent,
+        bound_parent_fd=public_parent_fd,
+    )
+    if any(
+        _named_entry_identity(public_parent_fd, name) is not None
+        for name in public_names
+    ):
+        raise SyncError(
+            f"{label} public name reappeared; exact private evidence was retained"
+        )
+    cleanup_parent = batch.batch_root / "pending" / "cleanup"
+    cleanup_parent_fd = _open_directory_beneath(home, cleanup_parent)
+    try:
+        cleanup_parent_identity = _directory_identity(cleanup_parent_fd)
+        if cleanup_parent_identity != private_snapshot.parent_identity:
+            raise SyncError("pending regular publication cleanup namespace changed")
+        _delete_pending_regular_publication_private_alias(
+            home,
+            batch,
+            record,
+            phase,
+            cleanup_parent_fd,
+            cleanup_parent_identity,
+            expected,
+            expected_link_count=expected_link_count,
+            label=label,
+        )
+    finally:
+        _close_fd_quietly(cleanup_parent_fd)
+    return True
 
 
 def _pending_regular_publication_cleanup_payload(
@@ -16002,7 +16505,14 @@ def _delete_pending_regular_publication_beneath(
         # Metadata v6/v7 predates the durable publication receipt. Preserve its
         # exact deletion protocol for those versions and for the v8/v9 managed
         # regular-removal shape whose closed writers emitted a null receipt.
-        _delete_exact_regular_publication_beneath(home, target, expected)
+        _delete_exact_regular_publication_beneath(
+            home,
+            target,
+            expected,
+            pending_batch=batch,
+            pending_record=record,
+            cleanup_phase=phase,
+        )
         return
     existing = _read_pending_regular_publication_cleanup(home, batch, record, phase)
     if existing is not None:
@@ -16038,6 +16548,11 @@ def _delete_pending_regular_publication_beneath(
         # canonical name. A crash can therefore leave only one of two authorized
         # states: the exact target named in the intent, or its fully bound
         # non-.toml active alias. Recovery accepts either and converges.
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=parent_fd,
+        )
         _rename_noreplace_at(parent_fd, target.name, parent_fd, active_name)
         os.fsync(parent_fd)
         try:
@@ -16071,8 +16586,18 @@ def _delete_pending_regular_publication_beneath(
                 planned,
                 label=f"pending regular publication active entry changed: {target}",
             )
-        os.unlink(active_name, dir_fd=parent_fd)
-        os.fsync(parent_fd)
+        _isolate_and_delete_pending_regular_publication_candidate(
+            home,
+            batch,
+            record,
+            phase,
+            target.parent,
+            parent_fd,
+            active_name,
+            expected,
+            expected_link_count=expected.link_count,
+            label="pending regular publication",
+        )
         # Keep this immutable receipt until whole-batch finalization. Isolating
         # and deleting it here would require another crash-recovery protocol.
     finally:
@@ -16253,8 +16778,6 @@ def _recover_legacy_pending_regular_publication_active_entry(
             _build_legacy_pending_regular_publication_active_entry_index(home, batch)
         )
     candidates = active_entry_index.names(target.parent, parent_identity, planned)
-    if not candidates:
-        return
     parent_fd = _open_directory_beneath(home, target.parent)
     try:
         if _directory_identity(
@@ -16268,8 +16791,20 @@ def _recover_legacy_pending_regular_publication_active_entry(
             target.parent,
             bound_parent_fd=parent_fd,
         )
+        private_snapshot = _pending_regular_publication_private_alias_snapshot(
+            home,
+            batch,
+            record,
+            phase,
+            file_identity,
+        )
+        if not candidates and private_snapshot is None:
+            return
         target_identity = _named_entry_identity(parent_fd, target.name)
-        if len(candidates) != 1 or target_identity == file_identity:
+        if (
+            len(candidates) + (private_snapshot is not None) != 1
+            or target_identity == file_identity
+        ):
             raise SyncError("pending legacy regular publication cleanup is ambiguous")
         evidence = batch.batch_root / Path(*evidence_path.parts)
         evidence_snapshot = _read_regular_file_snapshot_beneath(
@@ -16305,36 +16840,65 @@ def _recover_legacy_pending_regular_publication_active_entry(
         expected_link_count = bound_alias_count + 1
         if evidence_snapshot.link_count != expected_link_count:
             raise SyncError("pending legacy regular publication link count changed")
-        active_name = candidates[0]
-        active = _regular_file_snapshot_at(
-            parent_fd,
-            active_name,
-            target.with_name(active_name),
-            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
-        )
-        if phase == "produced":
-            matches = _pending_regular_publication_snapshot_matches(
-                active,
-                record,
-                expected_link_count=expected_link_count,
-            )
+        if private_snapshot is not None:
+            active_name = None
+            active = private_snapshot
+            if phase == "produced":
+                matches = (
+                    _regular_snapshot_leaf_matches(active, evidence_snapshot)
+                    and active.link_count == expected_link_count
+                )
+            else:
+                assert planned_regular is not None
+                matches = (
+                    _regular_snapshot_leaf_matches(active, planned_regular)
+                    and active.link_count == expected_link_count
+                )
         else:
-            assert planned_regular is not None
-            matches = _regular_snapshot_matches(
-                active,
-                parent_identity,
-                planned_regular,
-                expected_link_count=expected_link_count,
+            active_name = candidates[0]
+            active = _regular_file_snapshot_at(
+                parent_fd,
+                active_name,
+                target.with_name(active_name),
+                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
             )
+            if phase == "produced":
+                matches = _pending_regular_publication_snapshot_matches(
+                    active,
+                    record,
+                    expected_link_count=expected_link_count,
+                )
+            else:
+                assert planned_regular is not None
+                matches = _regular_snapshot_matches(
+                    active,
+                    parent_identity,
+                    planned_regular,
+                    expected_link_count=expected_link_count,
+                )
         if not matches:
             raise SyncError("pending legacy regular publication active entry changed")
-        # Child-entry churn is allowed, but the complete managed parent-chain
-        # access policy and exact active leaf must still match at unlink time.
-        _require_managed_regular_parent_chain_access(
-            home,
-            target.parent,
-            bound_parent_fd=parent_fd,
-        )
+        if private_snapshot is not None:
+            if not _recover_pending_regular_publication_private_alias(
+                home,
+                batch,
+                record,
+                phase,
+                target.parent,
+                parent_fd,
+                (target.name, *candidates),
+                active,
+                expected_link_count=expected_link_count,
+                label="pending legacy regular publication",
+            ):
+                raise SyncError(
+                    "pending legacy regular publication private active entry "
+                    "disappeared"
+                )
+            return
+        # Child-entry churn is allowed. Move the exact active leaf out of the
+        # public managed parent before deleting it so a pathname replacement at
+        # the final boundary is preserved instead of unlinked.
         destructive_snapshot = _regular_file_snapshot_at(
             parent_fd,
             active_name,
@@ -16365,8 +16929,18 @@ def _recover_legacy_pending_regular_publication_active_entry(
             != planned
         ):
             raise SyncError("pending legacy regular publication active entry changed")
-        os.unlink(active_name, dir_fd=parent_fd)
-        os.fsync(parent_fd)
+        _isolate_and_delete_pending_regular_publication_candidate(
+            home,
+            batch,
+            record,
+            phase,
+            target.parent,
+            parent_fd,
+            active_name,
+            destructive_snapshot,
+            expected_link_count=expected_link_count,
+            label="pending legacy regular publication",
+        )
         _require_managed_regular_parent_chain_access(
             home,
             target.parent,
@@ -16456,6 +17030,19 @@ def _recover_pending_regular_publication_cleanup(
             or not _bound_directory_matches(home, target.parent, parent_fd)
         ):
             raise SyncError("pending regular publication cleanup parent changed")
+        if _recover_pending_regular_publication_private_alias(
+            home,
+            batch,
+            record,
+            phase,
+            target.parent,
+            parent_fd,
+            (target.name, active_name),
+            expected,
+            expected_link_count=expected.link_count,
+            label="pending regular publication",
+        ):
+            return
         target_snapshot: RegularFileSnapshot | None
         active_snapshot: RegularFileSnapshot | None
         try:
@@ -16495,6 +17082,24 @@ def _recover_pending_regular_publication_cleanup(
                     verify_completed_cleanup()
                     return
                 raise SyncError("pending regular publication target changed")
+            destructive_target_snapshot = _regular_file_snapshot_at(
+                parent_fd,
+                target.name,
+                target,
+                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+            )
+            if not _regular_snapshot_matches(
+                destructive_target_snapshot,
+                expected.parent_identity,
+                expected,
+                expected_link_count=expected.link_count,
+            ):
+                raise SyncError("pending regular publication target changed")
+            _require_managed_regular_parent_chain_access(
+                home,
+                target.parent,
+                bound_parent_fd=parent_fd,
+            )
             _rename_noreplace_at(parent_fd, target.name, parent_fd, active_name)
             os.fsync(parent_fd)
             active_snapshot = _regular_file_snapshot_at(
@@ -16511,8 +17116,18 @@ def _recover_pending_regular_publication_cleanup(
                 expected_link_count=expected.link_count,
             ):
                 raise SyncError("pending regular publication active entry changed")
-            os.unlink(active_name, dir_fd=parent_fd)
-            os.fsync(parent_fd)
+            _isolate_and_delete_pending_regular_publication_candidate(
+                home,
+                batch,
+                record,
+                phase,
+                target.parent,
+                parent_fd,
+                active_name,
+                expected,
+                expected_link_count=expected.link_count,
+                label="pending regular publication",
+            )
         else:
             verify_completed_cleanup()
     finally:

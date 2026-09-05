@@ -1821,7 +1821,7 @@ class ReconciliationOrderingTests(unittest.TestCase):
             (target.stat().st_dev, target.stat().st_ino), original_identity
         )
 
-    def test_regular_rollback_cleanup_retains_name_replacement_out_of_path(
+    def test_regular_rollback_cleanup_retains_final_window_replacement_in_private_quarantine(
         self,
     ) -> None:
         old_source = self._agent_source(SHA_A, b"old = true\n")
@@ -1901,9 +1901,7 @@ class ReconciliationOrderingTests(unittest.TestCase):
         self.assertTrue(replaced)
         self.assertIsNotNone(replacement_identity)
         self.assertFalse(os.path.lexists(target))
-        retained = list(
-            target.parent.glob(f"{MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX}*")
-        )
+        retained = list((self.home / "personal-sync" / "quarantine").glob("*/leaf/*"))
         self.assertEqual(len(retained), 1)
         self.assertEqual(retained[0].read_bytes(), b"foreign = true\n")
         self.assertEqual(

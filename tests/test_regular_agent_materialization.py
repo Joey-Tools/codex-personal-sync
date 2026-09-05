@@ -582,27 +582,46 @@ class PublicRegularAgentTests(unittest.TestCase):
             target,
             require_managed_access=False,
         )
-        real_isolate = MODULE._isolate_pending_cleanup_entry
+        real_snapshot = MODULE._regular_file_snapshot_at
         replaced = False
 
-        def replace_target_before_isolation(
+        def replace_active_alias_after_final_snapshot(
+            directory_fd: int,
+            name: str,
+            path: Path,
             *args: object,
             **kwargs: object,
-        ) -> tuple[str, os.stat_result]:
+        ) -> MODULE.RegularFileSnapshot:
             nonlocal replaced
-            target.unlink()
-            target.write_bytes(b"foreign")
-            target.chmod(0o600)
-            replaced = True
-            return real_isolate(*args, **kwargs)
+            snapshot = real_snapshot(directory_fd, name, path, *args, **kwargs)
+            if (
+                name.startswith(MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+                and not replaced
+            ):
+                os.unlink(name, dir_fd=directory_fd)
+                replacement_fd = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+                try:
+                    os.write(replacement_fd, b"foreign")
+                finally:
+                    os.close(replacement_fd)
+                replaced = True
+            return snapshot
 
         with (
             mock.patch.object(
                 MODULE,
-                "_isolate_pending_cleanup_entry",
-                side_effect=replace_target_before_isolation,
+                "_regular_file_snapshot_at",
+                side_effect=replace_active_alias_after_final_snapshot,
             ),
-            self.assertRaisesRegex(MODULE.SyncError, "preserved as"),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "retained as isolated evidence",
+            ),
         ):
             MODULE._delete_exact_regular_publication_beneath(
                 self.home,
@@ -612,13 +631,150 @@ class PublicRegularAgentTests(unittest.TestCase):
 
         self.assertTrue(replaced)
         self.assertFalse(os.path.lexists(target))
-        retained = tuple(
-            child
-            for child in target.parent.iterdir()
-            if child.name.startswith(MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX)
-        )
+        retained = tuple((self.home / "personal-sync" / "quarantine").glob("*/leaf/*"))
         self.assertEqual(len(retained), 1)
         self.assertEqual(retained[0].read_bytes(), b"foreign")
+        self.assertEqual(source.read_bytes(), b"authority")
+        self.assertEqual(source.stat().st_nlink, 1)
+
+    def test_exact_publication_cleanup_retains_private_authority_when_target_reappears(
+        self,
+    ) -> None:
+        source = self.home / "personal-sync" / "source" / "authority"
+        target = self.home / ROLE_TARGET
+        source.parent.mkdir(parents=True)
+        target.parent.mkdir(parents=True)
+        source.write_bytes(b"authority")
+        source.chmod(0o600)
+        os.link(source, target, follow_symlinks=False)
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            self.home,
+            target,
+            require_managed_access=False,
+        )
+        real_rename_noreplace = MODULE._rename_noreplace_at
+        reappeared = False
+        replacement_identity: tuple[int, int] | None = None
+
+        def recreate_target_after_public_isolation(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal reappeared, replacement_identity
+            real_rename_noreplace(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+            if source_name != target.name or reappeared:
+                return
+            replacement_fd = os.open(
+                target.name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=source_parent_fd,
+            )
+            try:
+                os.write(replacement_fd, b"foreign")
+                metadata = os.fstat(replacement_fd)
+                replacement_identity = (metadata.st_dev, metadata.st_ino)
+            finally:
+                os.close(replacement_fd)
+            reappeared = True
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=recreate_target_after_public_isolation,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "reappeared during private isolation",
+            ),
+        ):
+            MODULE._delete_exact_regular_publication_beneath(
+                self.home,
+                target,
+                expected,
+            )
+
+        self.assertTrue(reappeared)
+        self.assertIsNotNone(replacement_identity)
+        self.assertEqual(target.read_bytes(), b"foreign")
+        self.assertEqual(
+            (target.stat().st_dev, target.stat().st_ino), replacement_identity
+        )
+        retained = tuple((self.home / "personal-sync" / "quarantine").glob("*/leaf/*"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), b"authority")
+        self.assertEqual(
+            (retained[0].stat().st_dev, retained[0].stat().st_ino),
+            (source.stat().st_dev, source.stat().st_ino),
+        )
+        self.assertEqual(source.stat().st_nlink, 2)
+
+    def test_exact_publication_cleanup_reports_reappearance_during_private_delete(
+        self,
+    ) -> None:
+        source = self.home / "personal-sync" / "source" / "authority"
+        target = self.home / ROLE_TARGET
+        source.parent.mkdir(parents=True)
+        target.parent.mkdir(parents=True)
+        source.write_bytes(b"authority")
+        source.chmod(0o600)
+        os.link(source, target, follow_symlinks=False)
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            self.home,
+            target,
+            require_managed_access=False,
+        )
+        real_unlink = MODULE.os.unlink
+        reappeared = False
+        replacement_identity: tuple[int, int] | None = None
+
+        def recreate_target_before_private_delete(
+            name: str,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal reappeared, replacement_identity
+            if name.startswith("publication-cleanup-") and not reappeared:
+                target.write_bytes(b"foreign")
+                target.chmod(0o600)
+                metadata = target.stat()
+                replacement_identity = (metadata.st_dev, metadata.st_ino)
+                reappeared = True
+            real_unlink(name, *args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            mock.patch.object(
+                MODULE.os,
+                "unlink",
+                side_effect=recreate_target_before_private_delete,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "reappeared while private cleanup completed",
+            ),
+        ):
+            MODULE._delete_exact_regular_publication_beneath(
+                self.home,
+                target,
+                expected,
+            )
+
+        self.assertTrue(reappeared)
+        self.assertIsNotNone(replacement_identity)
+        self.assertEqual(target.read_bytes(), b"foreign")
+        self.assertEqual(
+            (target.stat().st_dev, target.stat().st_ino), replacement_identity
+        )
+        retained = tuple((self.home / "personal-sync" / "quarantine").glob("*/leaf/*"))
+        self.assertEqual(retained, ())
         self.assertEqual(source.read_bytes(), b"authority")
         self.assertEqual(source.stat().st_nlink, 1)
 
@@ -2414,6 +2570,213 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self.assertEqual(active.read_text(encoding="utf-8"), "foreign = true\n")
         self.assertTrue(MODULE._pending_link_pointer_path(self.home).is_file())
 
+    def test_v7_active_alias_parent_policy_change_after_final_snapshot_fails_closed(
+        self,
+    ) -> None:
+        batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
+        parsed = self._downgrade_pending_regular_metadata(batch, 7)
+        record = next(
+            candidate for candidate in parsed.records if candidate.is_regular()
+        )
+        target = self.home / Path(*record.target.parts)
+        active = self._isolate_legacy_regular_publication(parsed, record, target)
+        active_identity = (active.stat().st_dev, active.stat().st_ino)
+        active_entry_index = (
+            MODULE._build_legacy_pending_regular_publication_active_entry_index(
+                self.home,
+                parsed,
+            )
+        )
+        real_snapshot = MODULE._regular_file_snapshot_at
+        active_snapshots = 0
+
+        def make_parent_writable_after_final_snapshot(
+            directory_fd: int,
+            name: str,
+            path: Path,
+            *args: object,
+            **kwargs: object,
+        ) -> MODULE.RegularFileSnapshot:
+            nonlocal active_snapshots
+            snapshot = real_snapshot(directory_fd, name, path, *args, **kwargs)
+            if path == active:
+                active_snapshots += 1
+                if active_snapshots == 3:
+                    active.parent.chmod(0o775)
+            return snapshot
+
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_regular_file_snapshot_at",
+                    side_effect=make_parent_writable_after_final_snapshot,
+                ),
+                mock.patch.object(
+                    MODULE.os, "unlink", wraps=MODULE.os.unlink
+                ) as unlink,
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "managed regular-file parent access policy mismatch",
+                ),
+            ):
+                MODULE._recover_legacy_pending_regular_publication_active_entry(
+                    self.home,
+                    parsed,
+                    record,
+                    "produced",
+                    active_entry_index=active_entry_index,
+                )
+            unlink.assert_not_called()
+            self.assertEqual(active_snapshots, 3)
+            self.assertEqual(
+                (active.stat().st_dev, active.stat().st_ino), active_identity
+            )
+            self.assertFalse(os.path.lexists(target))
+        finally:
+            active.parent.chmod(0o755)
+
+    def test_v7_private_active_alias_recovers_public_to_private_rename_crash(
+        self,
+    ) -> None:
+        batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
+        parsed = self._downgrade_pending_regular_metadata(batch, 7)
+        record = next(
+            candidate for candidate in parsed.records if candidate.is_regular()
+        )
+        target = self.home / Path(*record.target.parts)
+        active = self._isolate_legacy_regular_publication(parsed, record, target)
+        index = MODULE._build_legacy_pending_regular_publication_active_entry_index(
+            self.home,
+            parsed,
+        )
+        real_rename = MODULE._rename_noreplace_at
+
+        def crash_after_private_rename(
+            source_fd: int,
+            source_name: str,
+            destination_fd: int,
+            destination_name: str,
+        ) -> None:
+            real_rename(source_fd, source_name, destination_fd, destination_name)
+            if source_name == active.name and source_fd != destination_fd:
+                raise MODULE.SyncError("injected private rename crash")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=crash_after_private_rename,
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "private rename crash"),
+        ):
+            MODULE._recover_legacy_pending_regular_publication_active_entry(
+                self.home,
+                parsed,
+                record,
+                "produced",
+                active_entry_index=index,
+            )
+
+        cleanup = parsed.batch_root / "pending" / "cleanup"
+        cleanup_metadata = cleanup.stat()
+        cleanup_identity = (cleanup_metadata.st_dev, cleanup_metadata.st_ino)
+        assert record.evidence_identity is not None
+        planned = (*record.evidence_identity, stat.S_IFREG)
+        private_name = MODULE._pending_regular_publication_private_alias_name(
+            cleanup_identity,
+            planned,
+            record.index,
+            "produced",
+        )
+        self.assertTrue(
+            MODULE._pending_batch_cleanup_name_is_authorized(
+                ("pending", "cleanup"),
+                private_name,
+                cleanup_identity,
+            )
+        )
+        self.assertFalse(os.path.lexists(active))
+        self.assertTrue((cleanup / private_name).is_file())
+
+        fresh_index = (
+            MODULE._build_legacy_pending_regular_publication_active_entry_index(
+                self.home,
+                parsed,
+            )
+        )
+        MODULE._recover_legacy_pending_regular_publication_active_entry(
+            self.home,
+            parsed,
+            record,
+            "produced",
+            active_entry_index=fresh_index,
+        )
+        self.assertFalse(os.path.lexists(cleanup / private_name))
+
+    def test_v7_final_public_snapshot_replacement_is_preserved_privately(
+        self,
+    ) -> None:
+        batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
+        parsed = self._downgrade_pending_regular_metadata(batch, 7)
+        record = next(
+            candidate for candidate in parsed.records if candidate.is_regular()
+        )
+        target = self.home / Path(*record.target.parts)
+        active = self._isolate_legacy_regular_publication(parsed, record, target)
+        index = MODULE._build_legacy_pending_regular_publication_active_entry_index(
+            self.home,
+            parsed,
+        )
+        real_snapshot = MODULE._regular_file_snapshot_at
+        active_snapshots = 0
+
+        def replace_after_final_public_snapshot(
+            directory_fd: int,
+            name: str,
+            path: Path,
+            *args: object,
+            **kwargs: object,
+        ) -> MODULE.RegularFileSnapshot:
+            nonlocal active_snapshots
+            snapshot = real_snapshot(directory_fd, name, path, *args, **kwargs)
+            if path == active:
+                active_snapshots += 1
+                if active_snapshots == 3:
+                    active.unlink()
+                    active.write_text("foreign = true\n", encoding="utf-8")
+                    active.chmod(0o600)
+            return snapshot
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_regular_file_snapshot_at",
+                side_effect=replace_after_final_public_snapshot,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "changed during private isolation",
+            ),
+        ):
+            MODULE._recover_legacy_pending_regular_publication_active_entry(
+                self.home,
+                parsed,
+                record,
+                "produced",
+                active_entry_index=index,
+            )
+
+        self.assertEqual(active_snapshots, 3)
+        self.assertFalse(os.path.lexists(active))
+        retained = tuple(
+            child
+            for child in (parsed.batch_root / "pending" / "cleanup").iterdir()
+            if child.name.startswith(MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX)
+        )
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_text(encoding="utf-8"), "foreign = true\n")
+
     def test_v9_receiptless_remove_active_alias_rejects_writable_parent(
         self,
     ) -> None:
@@ -2731,7 +3094,59 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                 self.assertIsNotNone(journal)
                 assert journal is not None
                 _snapshot, active_name, _journal_phase, _journal_expected = journal
-                self.assertTrue(target.with_name(active_name).is_file())
+                active = target.with_name(active_name)
+                self.assertTrue(active.is_file())
+
+                def crash_after_private_rename(
+                    source_fd: int,
+                    source_name: str,
+                    destination_fd: int,
+                    destination_name: str,
+                ) -> None:
+                    real_rename(
+                        source_fd,
+                        source_name,
+                        destination_fd,
+                        destination_name,
+                    )
+                    if source_name == active_name and source_fd != destination_fd:
+                        raise MODULE.SyncError(
+                            f"injected {phase} crash after private rename"
+                        )
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_rename_noreplace_at",
+                        side_effect=crash_after_private_rename,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        f"injected {phase} crash after private rename",
+                    ),
+                ):
+                    MODULE._recover_pending_regular_publication_cleanup(
+                        self.home,
+                        batch,
+                        record,
+                        phase,
+                    )
+                self.assertFalse(os.path.lexists(active))
+                cleanup = batch.batch_root / "pending" / "cleanup"
+                cleanup_metadata = cleanup.stat()
+                cleanup_identity = (cleanup_metadata.st_dev, cleanup_metadata.st_ino)
+                planned = (
+                    _journal_expected.file_identity[0],
+                    _journal_expected.file_identity[1],
+                    stat.S_IFREG,
+                )
+                private_name = MODULE._pending_regular_publication_private_alias_name(
+                    cleanup_identity,
+                    planned,
+                    record.index,
+                    phase,
+                )
+                self.assertTrue((cleanup / private_name).is_file())
 
                 MODULE._recover_pending_regular_publication_cleanup(
                     self.home,
@@ -2739,7 +3154,106 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                     record,
                     phase,
                 )
-                self.assertFalse(os.path.lexists(target.with_name(active_name)))
+                self.assertFalse(os.path.lexists(cleanup / private_name))
+
+    def test_durable_active_alias_parent_policy_change_after_final_snapshot_fails_closed(
+        self,
+    ) -> None:
+        batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
+        record = next(
+            candidate for candidate in batch.records if candidate.is_regular()
+        )
+        target = self.home / Path(*record.target.parts)
+        expected, exists = MODULE._pending_target_snapshot(self.home, target)
+        self.assertTrue(exists)
+        assert isinstance(expected, MODULE.RegularFileSnapshot)
+        real_rename = MODULE._rename_noreplace_at
+
+        def stop_after_public_active_rename(
+            source_fd: int,
+            source_name: str,
+            destination_fd: int,
+            destination_name: str,
+        ) -> None:
+            real_rename(source_fd, source_name, destination_fd, destination_name)
+            if source_name == target.name and destination_name.startswith(
+                MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+            ):
+                raise MODULE.SyncError("injected public active rename stop")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=stop_after_public_active_rename,
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "public active rename stop"),
+        ):
+            MODULE._delete_pending_regular_publication_beneath(
+                self.home,
+                batch,
+                record,
+                target,
+                expected,
+                phase="produced",
+            )
+        journal = MODULE._read_pending_regular_publication_cleanup(
+            self.home,
+            batch,
+            record,
+            "produced",
+        )
+        assert journal is not None
+        _snapshot, active_name, _journal_phase, _journal_expected = journal
+        active = target.with_name(active_name)
+        active_identity = (active.stat().st_dev, active.stat().st_ino)
+        real_snapshot = MODULE._regular_file_snapshot_at
+        active_snapshots = 0
+
+        def make_parent_writable_after_final_snapshot(
+            directory_fd: int,
+            name: str,
+            path: Path,
+            *args: object,
+            **kwargs: object,
+        ) -> MODULE.RegularFileSnapshot:
+            nonlocal active_snapshots
+            snapshot = real_snapshot(directory_fd, name, path, *args, **kwargs)
+            if path == active:
+                active_snapshots += 1
+                if active_snapshots == 2:
+                    active.parent.chmod(0o775)
+            return snapshot
+
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_regular_file_snapshot_at",
+                    side_effect=make_parent_writable_after_final_snapshot,
+                ),
+                mock.patch.object(
+                    MODULE.os, "unlink", wraps=MODULE.os.unlink
+                ) as unlink,
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "managed regular-file parent access policy mismatch",
+                ),
+            ):
+                MODULE._recover_pending_regular_publication_cleanup(
+                    self.home,
+                    batch,
+                    record,
+                    "produced",
+                )
+            unlink.assert_not_called()
+            self.assertEqual(active_snapshots, 2)
+            self.assertEqual(
+                (active.stat().st_dev, active.stat().st_ino), active_identity
+            )
+            self.assertFalse(os.path.lexists(target))
+        finally:
+            active.parent.chmod(0o755)
 
     def test_pending_cleanup_isolates_before_canonical_snapshot(self) -> None:
         batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)

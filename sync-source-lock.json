@@ -22,12 +22,12 @@
     "engine": {
       "mode": "0755",
       "path": "scripts/codex_personal_sync.py",
-      "sha256": "2c073ee6e04411b44a96997b1581bd3489757828ab0acaebe5359a9f22d15348"
+      "sha256": "b72312bd558f6a55adf7147387d59662d99881a56fc8a684f2b2ee3dbd4ccbc4"
     },
     "engine_tests": {
       "mode": "0644",
       "path": "tests/test_codex_personal_sync.py",
-      "sha256": "1c5c7d65fa9e46d518c5940f5f1e46ee6ea0fc254c1cb2714971877fd535a118"
+      "sha256": "1abf088d3b8e9c4b9fd6cb51e2282dba289f47b542e081306439337dad9f85c6"
     },
     "manifest_schema": {
       "mode": "0644",
@@ -47,12 +47,12 @@
     "reconciliation_safety_tests": {
       "mode": "0644",
       "path": "tests/test_personal_sync_reconciliation_safety.py",
-      "sha256": "51c0433b7896925f38fca73109ed7591e62c17700ce9ea514036a74bc239e9cb"
+      "sha256": "218a224e5a8cfd12c43a14d4a896a75346aa6597be80ef2ce44253165d495175"
     },
     "regular_agent_materialization_tests": {
       "mode": "0644",
       "path": "tests/test_regular_agent_materialization.py",
-      "sha256": "a1322f1fca7ccd631f87f52e74eb09d1c9e78decd2837567407702d091f247d0"
+      "sha256": "78fa8f5aa0beece08e6e76b9e5ac0ee1cee06fa9bb4ce08ffa1c5d9b16deda81"
     },
     "regular_overlay_uninstall_status_regressions_tests": {
       "mode": "0644",
