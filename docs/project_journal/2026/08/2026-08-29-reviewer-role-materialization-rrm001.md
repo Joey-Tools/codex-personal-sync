@@ -487,3 +487,34 @@ superseded_by:
   `E4/E7/E9/F`, Ruff formatting, `actionlint`, `git diff --check`, and a
   Python 3.9 compile check passed; the ten-source lock was refreshed after the
   final source and test changes.
+- A subsequent whole-range fresh reviewer exceeded its fixed 30-minute bound
+  without a final result, so the range was not treated as clean. Its bounded
+  trace led to two independently reproduced repairs: receiptless successful
+  publication cleanup had retained an otherwise empty private quarantine batch
+  that could consume the bounded batch capacity, and durable receipt cleanup
+  lacked a canonical-name recheck immediately around private-alias deletion.
+  The new fallback-only reclamation keeps exact batch, leaf, metadata identity,
+  content, and access-policy bindings; it removes only a fully empty private
+  scaffold and leaves every unexpected child or replacement intact. Durable
+  cleanup now checks the relevant public aliases both before and after private
+  deletion, while legacy active-alias recovery keeps its valid restored
+  preimage behavior. Focused validation passed 108 regular-materialization
+  tests and 324 reconciliation-safety tests. A new final full suite and a
+  short, fresh final reviewer still remain required before PR creation.
+- A follow-up independent audit found three further recovery-boundary issues
+  before the final gate. The repair keeps the v6/v7 before-phase exception
+  narrow: an exact canonical preimage restored after the legacy private alias
+  has passed its initial absence check is not treated as a new canonical race,
+  while current durable receipt paths still recheck both canonical and active
+  names. A private alias that reappears after unlink is now re-snapshotted for
+  object identity, content, access policy, link count, and internal-name plan
+  before any attempted public restoration; a mismatch remains private retained
+  evidence. Finally, an in-process fallback batch is rebound as soon as its
+  metadata is proven; a later empty leaf-setup failure closes the captured
+  descriptor and reclaims only the exact metadata-only scaffold. An unreadable
+  or changed metadata file remains fail-closed evidence rather than being
+  guessed safe to remove. Post-repair validation passed 111 regular-
+  materialization tests in 47.618 seconds and 324 reconciliation-safety tests
+  in 84.892 seconds. The final repository-private discovery then passed 1,466
+  tests with three expected skips in 945.508 seconds. A fresh exact-head review
+  remains pending.

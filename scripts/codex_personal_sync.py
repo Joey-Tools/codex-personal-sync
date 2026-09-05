@@ -5182,6 +5182,16 @@ class FailedMoveRecoveryReceipt:
 
 
 @dataclass(frozen=True)
+class EphemeralQuarantineBatchBinding:
+    """Exact authority retained solely to reclaim a successful fallback batch."""
+
+    batch_root: Path
+    batch_identity: tuple[int, int]
+    leaf_identity: tuple[int, int] | None
+    metadata: ManagedStateFileSnapshot
+
+
+@dataclass(frozen=True)
 class ManagedStateFileSnapshot:
     exists: bool
     payload: bytes | None = None
@@ -10798,7 +10808,11 @@ def _move_regular_leaf_to_unique_quarantine(
     label: str,
     expected: RegularFileSnapshot | None = None,
     expected_identity: tuple[int, int] | None = None,
-) -> tuple[Path, RegularFileSnapshot]:
+    retain_batch_binding: bool = False,
+) -> (
+    tuple[Path, RegularFileSnapshot]
+    | tuple[Path, RegularFileSnapshot, EphemeralQuarantineBatchBinding]
+):
     source_path = Path(source_name)
     source_snapshot = _regular_file_snapshot_at(
         source_parent_fd,
@@ -10817,15 +10831,66 @@ def _move_regular_leaf_to_unique_quarantine(
         and source_snapshot.file_identity != expected_identity
     ):
         raise SyncError(f"regular file changed before quarantine: {source_name}")
-    batch_root = _quarantine_batch_root(home, [])
-    quarantine_parent = batch_root / "leaf"
-    quarantine_parent_fd = _open_or_create_directory_beneath(
-        home,
-        quarantine_parent,
-        mode=0o700,
-    )
+    batch_fd = -1
+    batch_identity: tuple[int, int] | None = None
+    metadata: ManagedStateFileSnapshot | None = None
+    batch_root: Path | None = None
+    quarantine_parent: Path | None = None
+    quarantine_parent_fd = -1
     destination: Path | None = None
+    batch_binding: EphemeralQuarantineBatchBinding | None = None
     try:
+        allocation = _quarantine_batch_root(
+            home,
+            [],
+            retain_binding=retain_batch_binding,
+        )
+        if retain_batch_binding:
+            assert isinstance(allocation, tuple)
+            batch_root, batch_fd, batch_identity = allocation
+            metadata = _read_managed_state_file_snapshot(
+                home,
+                batch_root / "metadata.json",
+                batch_fd,
+                maximum_bytes=MAX_MANAGED_STATE_BYTES,
+            )
+            if (
+                not _managed_state_snapshot_has_complete_file_evidence(metadata)
+                or metadata.file_type != stat.S_IFREG
+                or metadata.mode != 0o600
+                or metadata.uid != os.geteuid()
+            ):
+                raise SyncError(
+                    f"ephemeral quarantine metadata is unsafe: {batch_root}"
+                )
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                batch_root / "metadata.json",
+                batch_fd,
+                metadata,
+            )
+            assert batch_identity is not None
+            batch_binding = EphemeralQuarantineBatchBinding(
+                batch_root=batch_root,
+                batch_identity=batch_identity,
+                leaf_identity=None,
+                metadata=metadata,
+            )
+        else:
+            assert isinstance(allocation, Path)
+            batch_root = allocation
+        quarantine_parent = batch_root / "leaf"
+        quarantine_parent_fd = _open_or_create_directory_beneath(
+            home,
+            quarantine_parent,
+            mode=0o700,
+        )
+        if retain_batch_binding:
+            assert batch_binding is not None
+            batch_binding = replace(
+                batch_binding,
+                leaf_identity=_directory_identity(quarantine_parent_fd),
+            )
         if not _bound_directory_matches(
             home,
             quarantine_parent,
@@ -10887,9 +10952,53 @@ def _move_regular_leaf_to_unique_quarantine(
                 "regular file changed during quarantine and was retained as "
                 f"isolated evidence at {destination}"
             )
-        return destination, moved
+        if not retain_batch_binding:
+            return destination, moved
+        assert batch_binding is not None
+        if (
+            _directory_member_names(
+                batch_fd,
+                maximum_entries=3,
+                overflow_message="ephemeral quarantine batch has too many entries",
+            )
+            != ("leaf", "metadata.json")
+            or not _bound_directory_matches(home, batch_root, batch_fd)
+            or not _bound_directory_matches(
+                home,
+                quarantine_parent,
+                quarantine_parent_fd,
+            )
+        ):
+            raise SyncError(f"ephemeral quarantine batch changed: {batch_root}")
+        return (
+            destination,
+            moved,
+            batch_binding,
+        )
+    except BaseException as original_error:
+        _close_fd_quietly(quarantine_parent_fd)
+        quarantine_parent_fd = -1
+        _close_fd_quietly(batch_fd)
+        batch_fd = -1
+        if retain_batch_binding and batch_binding is not None and destination is None:
+            try:
+                _discard_empty_ephemeral_quarantine_batch(home, batch_binding)
+            except (OSError, SyncError) as cleanup_error:
+                cleanup_note = (
+                    "fallback quarantine setup failed and its empty scaffold could "
+                    f"not be safely reclaimed: {cleanup_error}"
+                )
+                add_note = getattr(original_error, "add_note", None)
+                if callable(add_note):
+                    add_note(cleanup_note)
+                else:
+                    raise SyncError(
+                        f"{cleanup_note}; original setup failure: {original_error}"
+                    ) from cleanup_error
+        raise
     finally:
         _close_fd_quietly(quarantine_parent_fd)
+        _close_fd_quietly(batch_fd)
 
 
 def _publish_reconcile_directory_noreplace(
@@ -15848,7 +15957,7 @@ def _delete_exact_regular_publication_without_pending_receipt(
                     f"entry before private isolation: {target}"
                 ),
             )
-        quarantine_path, moved = _move_regular_leaf_to_unique_quarantine(
+        quarantine_result = _move_regular_leaf_to_unique_quarantine(
             home,
             target.parent,
             parent_fd,
@@ -15859,7 +15968,10 @@ def _delete_exact_regular_publication_without_pending_receipt(
             # isolated, then retain it privately if it cannot re-prove the
             # authorized publication identity/content/access policy.
             expected=None,
+            retain_batch_binding=True,
         )
+        assert len(quarantine_result) == 3
+        quarantine_path, moved, batch_binding = quarantine_result
         if (
             not _regular_snapshot_leaf_matches(moved, expected)
             or moved.link_count != expected.link_count
@@ -15941,9 +16053,164 @@ def _delete_exact_regular_publication_without_pending_receipt(
                 "published regular-file destination reappeared while private "
                 f"cleanup completed: {target}"
             )
+        _discard_empty_ephemeral_quarantine_batch(home, batch_binding)
     finally:
         _close_fd_quietly(public_parent_fd)
         _close_fd_quietly(quarantine_parent_fd)
+
+
+def _discard_empty_ephemeral_quarantine_batch(
+    home: Path,
+    binding: EphemeralQuarantineBatchBinding,
+) -> None:
+    """Reclaim only the exact empty scaffold allocated for fallback cleanup.
+
+    Object identity, content stability and access policy of ``metadata.json``
+    are bound at allocation time. The batch and leaf directory identities are
+    independently rebound before deletion. Child-entry churn is not itself a
+    mutation signal, but any extra entry prevents reclamation and leaves the
+    private batch intact for inspection. This is deliberately not an orphan
+    sweep: no batch without this in-process binding is eligible for removal.
+    """
+    batch_root = binding.batch_root
+    leaf_path = batch_root / "leaf"
+    quarantine_root = batch_root.parent
+    batch_name = batch_root.name
+    if _pending_cleanup_batch_name_from_quarantine_entry(batch_name) != batch_name:
+        raise SyncError(f"ephemeral quarantine batch name is invalid: {batch_root}")
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    batch_fd = -1
+    leaf_fd = -1
+    try:
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd,
+            quarantine_root,
+            expected_mode=0o700,
+        )
+        if not _bound_directory_matches(home, quarantine_root, quarantine_fd):
+            raise SyncError(f"ephemeral quarantine root changed: {quarantine_root}")
+        batch_fd = os.open(batch_name, directory_flags, dir_fd=quarantine_fd)
+        if _directory_identity(
+            batch_fd
+        ) != binding.batch_identity or not _bound_directory_matches(
+            home, batch_root, batch_fd
+        ):
+            raise SyncError(f"ephemeral quarantine batch changed: {batch_root}")
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd,
+            batch_root,
+            expected_mode=0o700,
+        )
+        expected_batch_members = (
+            ("metadata.json",)
+            if binding.leaf_identity is None
+            else ("leaf", "metadata.json")
+        )
+        if (
+            _directory_member_names(
+                batch_fd,
+                maximum_entries=3,
+                overflow_message="ephemeral quarantine batch has too many entries",
+            )
+            != expected_batch_members
+        ):
+            raise SyncError(f"ephemeral quarantine batch is not empty: {batch_root}")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            batch_root / "metadata.json",
+            batch_fd,
+            binding.metadata,
+        )
+        if binding.leaf_identity is not None:
+            leaf_fd = os.open("leaf", directory_flags, dir_fd=batch_fd)
+            if _directory_identity(
+                leaf_fd
+            ) != binding.leaf_identity or not _bound_directory_matches(
+                home, leaf_path, leaf_fd
+            ):
+                raise SyncError(f"ephemeral quarantine leaf changed: {leaf_path}")
+            _require_pending_cleanup_fd_access_policy(
+                leaf_fd,
+                leaf_path,
+                expected_mode=0o700,
+            )
+            if _directory_member_names(leaf_fd, maximum_entries=1) != ():
+                raise SyncError(f"ephemeral quarantine leaf is not empty: {leaf_path}")
+            _close_fd_quietly(leaf_fd)
+            leaf_fd = -1
+            leaf_stat = os.stat("leaf", dir_fd=batch_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(leaf_stat.st_mode)
+                or (leaf_stat.st_dev, leaf_stat.st_ino) != binding.leaf_identity
+                or _directory_member_names(
+                    batch_fd,
+                    maximum_entries=3,
+                    overflow_message="ephemeral quarantine batch has too many entries",
+                )
+                != ("leaf", "metadata.json")
+            ):
+                raise SyncError(
+                    f"ephemeral quarantine leaf changed before cleanup: {leaf_path}"
+                )
+            os.rmdir("leaf", dir_fd=batch_fd)
+            os.fsync(batch_fd)
+            if _named_entry_identity(batch_fd, "leaf") is not None:
+                raise SyncError(f"ephemeral quarantine leaf reappeared: {leaf_path}")
+        _isolate_and_delete_pending_cleanup_file(
+            home,
+            batch_root / "metadata.json",
+            batch_fd,
+            binding.metadata,
+            label=f"ephemeral quarantine metadata {batch_name}",
+        )
+        if _directory_member_names(batch_fd, maximum_entries=1) != ():
+            raise SyncError(f"ephemeral quarantine batch is not empty: {batch_root}")
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd,
+            batch_root,
+            expected_mode=0o700,
+        )
+        current_batch = os.stat(batch_name, dir_fd=quarantine_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(current_batch.st_mode)
+            or (current_batch.st_dev, current_batch.st_ino) != binding.batch_identity
+            or not _bound_directory_matches(home, batch_root, batch_fd)
+        ):
+            raise SyncError(
+                f"ephemeral quarantine batch changed before cleanup: {batch_root}"
+            )
+        isolated_name = _pending_cleanup_isolated_batch_name(batch_name)
+        if _named_entry_identity(quarantine_fd, isolated_name) is not None:
+            raise SyncError(
+                f"ephemeral quarantine isolated batch already exists: {batch_root}"
+            )
+        _rename_noreplace_at(
+            quarantine_fd,
+            batch_name,
+            quarantine_fd,
+            isolated_name,
+        )
+        os.fsync(quarantine_fd)
+        isolated_root = batch_root.with_name(isolated_name)
+        if _directory_identity(
+            batch_fd
+        ) != binding.batch_identity or not _bound_directory_matches(
+            home, isolated_root, batch_fd
+        ):
+            raise SyncError(
+                f"ephemeral quarantine batch changed after isolation: {batch_root}"
+            )
+        os.rmdir(isolated_name, dir_fd=quarantine_fd)
+        os.fsync(quarantine_fd)
+        if _named_entry_identity(quarantine_fd, isolated_name) is not None:
+            raise SyncError(f"ephemeral quarantine batch reappeared: {batch_root}")
+    finally:
+        _close_fd_quietly(leaf_fd)
+        _close_fd_quietly(batch_fd)
+        _close_fd_quietly(quarantine_fd)
 
 
 def _isolate_and_delete_pending_regular_publication_candidate(
@@ -15956,6 +16223,7 @@ def _isolate_and_delete_pending_regular_publication_candidate(
     source_name: str,
     expected: RegularFileSnapshot,
     *,
+    public_names: tuple[str, ...] | None = None,
     expected_link_count: int,
     label: str,
 ) -> None:
@@ -15969,6 +16237,8 @@ def _isolate_and_delete_pending_regular_publication_candidate(
     only the mode-0700 batch cleanup namespace is mutated.
     """
     cleanup_parent = batch.batch_root / "pending" / "cleanup"
+    if public_names is None:
+        public_names = (source_name,)
     cleanup_parent_fd = _open_directory_beneath(home, cleanup_parent)
     planned = (
         expected.file_identity[0],
@@ -16052,6 +16322,9 @@ def _isolate_and_delete_pending_regular_publication_candidate(
                 cleanup_parent_fd,
                 cleanup_parent_identity,
                 expected,
+                public_parent=source_parent,
+                public_parent_fd=source_parent_fd,
+                public_names=public_names,
                 expected_link_count=expected_link_count,
                 label=label,
             )
@@ -16061,6 +16334,53 @@ def _isolate_and_delete_pending_regular_publication_candidate(
             # still free. Otherwise keep the private evidence for manual or
             # later batch cleanup.
             if _named_entry_identity(cleanup_parent_fd, isolated_name) is not None:
+                try:
+                    restored_snapshot = _regular_file_snapshot_at(
+                        cleanup_parent_fd,
+                        isolated_name,
+                        cleanup_parent / isolated_name,
+                        maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                    )
+                except BaseException:
+                    _retain_pending_cleanup_entry(
+                        cleanup_parent_fd,
+                        isolated_name,
+                        cleanup_parent_identity,
+                        planned,
+                        label=f"{label} private evidence became unreadable",
+                    )
+                if (
+                    not _regular_snapshot_leaf_matches(restored_snapshot, expected)
+                    or restored_snapshot.link_count != expected_link_count
+                    or _pending_cleanup_internal_entry_plan(
+                        isolated_name,
+                        PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                        cleanup_parent_identity,
+                    )
+                    != planned
+                ):
+                    _retain_pending_cleanup_entry(
+                        cleanup_parent_fd,
+                        isolated_name,
+                        cleanup_parent_identity,
+                        planned,
+                        label=f"{label} private evidence changed before restoration",
+                    )
+                if any(
+                    name != source_name
+                    and _named_entry_identity(source_parent_fd, name) is not None
+                    for name in public_names
+                ):
+                    _retain_pending_cleanup_entry(
+                        cleanup_parent_fd,
+                        isolated_name,
+                        cleanup_parent_identity,
+                        planned,
+                        label=(
+                            f"{label} public canonical name reappeared while "
+                            "private evidence was retained"
+                        ),
+                    )
                 try:
                     _require_managed_regular_parent_chain_access(
                         home,
@@ -16156,6 +16476,10 @@ def _delete_pending_regular_publication_private_alias(
     cleanup_parent_identity: tuple[int, int],
     expected: RegularFileSnapshot,
     *,
+    public_parent: Path,
+    public_parent_fd: int,
+    public_names: tuple[str, ...],
+    post_delete_public_names: tuple[str, ...] | None = None,
     expected_link_count: int,
     label: str,
 ) -> None:
@@ -16172,6 +16496,8 @@ def _delete_pending_regular_publication_private_alias(
         phase,
     )
     isolated_path = cleanup_parent / isolated_name
+    if post_delete_public_names is None:
+        post_delete_public_names = public_names
     try:
         isolated_snapshot = _regular_file_snapshot_at(
             cleanup_parent_fd,
@@ -16204,6 +16530,18 @@ def _delete_pending_regular_publication_private_alias(
             planned,
             label=f"{label} changed during private isolation",
         )
+    _require_managed_regular_parent_chain_access(
+        home,
+        public_parent,
+        bound_parent_fd=public_parent_fd,
+    )
+    if any(
+        _named_entry_identity(public_parent_fd, name) is not None
+        for name in public_names
+    ):
+        raise SyncError(
+            f"{label} public name reappeared; exact private evidence was retained"
+        )
     _require_pending_cleanup_fd_access_policy(
         cleanup_parent_fd,
         cleanup_parent,
@@ -16211,6 +16549,20 @@ def _delete_pending_regular_publication_private_alias(
     )
     os.unlink(isolated_name, dir_fd=cleanup_parent_fd)
     os.fsync(cleanup_parent_fd)
+    if _named_entry_identity(cleanup_parent_fd, isolated_name) is not None:
+        raise SyncError(f"{label} private name reappeared after deletion")
+    _require_managed_regular_parent_chain_access(
+        home,
+        public_parent,
+        bound_parent_fd=public_parent_fd,
+    )
+    if any(
+        _named_entry_identity(public_parent_fd, name) is not None
+        for name in post_delete_public_names
+    ):
+        raise SyncError(
+            f"{label} public name reappeared while private cleanup completed"
+        )
 
 
 def _recover_pending_regular_publication_private_alias(
@@ -16223,6 +16575,7 @@ def _recover_pending_regular_publication_private_alias(
     public_names: tuple[str, ...],
     expected: RegularFileSnapshot,
     *,
+    post_delete_public_names: tuple[str, ...] | None = None,
     expected_link_count: int,
     label: str,
 ) -> bool:
@@ -16266,6 +16619,10 @@ def _recover_pending_regular_publication_private_alias(
             cleanup_parent_fd,
             cleanup_parent_identity,
             expected,
+            public_parent=public_parent,
+            public_parent_fd=public_parent_fd,
+            public_names=public_names,
+            post_delete_public_names=post_delete_public_names,
             expected_link_count=expected_link_count,
             label=label,
         )
@@ -16595,6 +16952,7 @@ def _delete_pending_regular_publication_beneath(
             parent_fd,
             active_name,
             expected,
+            public_names=(target.name, active_name),
             expected_link_count=expected.link_count,
             label="pending regular publication",
         )
@@ -16888,6 +17246,11 @@ def _recover_legacy_pending_regular_publication_active_entry(
                 parent_fd,
                 (target.name, *candidates),
                 active,
+                # A v6/v7 before-phase recovery may restore the exact canonical
+                # preimage while its private active alias is being retired.
+                # Recheck the legacy active aliases after deletion, but do not
+                # reinterpret that valid preimage as a fresh canonical race.
+                post_delete_public_names=tuple(candidates),
                 expected_link_count=expected_link_count,
                 label="pending legacy regular publication",
             ):
@@ -17125,6 +17488,7 @@ def _recover_pending_regular_publication_cleanup(
                 parent_fd,
                 active_name,
                 expected,
+                public_names=(target.name, active_name),
                 expected_link_count=expected.link_count,
                 label="pending regular publication",
             )
