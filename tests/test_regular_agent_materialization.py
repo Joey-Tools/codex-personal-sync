@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import stat
 import sys
 import tempfile
@@ -1993,18 +1994,6 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         release: Path,
         sha: str,
     ) -> MODULE.PendingLinkBatch:
-        real_unlink = os.unlink
-
-        def fail_after_active_rename(
-            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
-            *args: object,
-            **kwargs: object,
-        ) -> None:
-            name = os.fsdecode(path)
-            if name.startswith(MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX):
-                raise MODULE.SyncError("injected active publication cleanup crash")
-            real_unlink(path, *args, **kwargs)
-
         with (
             mock.patch.object(
                 MODULE,
@@ -2012,7 +2001,11 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                 side_effect=MODULE.SyncError("injected precommit crash"),
             ),
             mock.patch.object(
-                MODULE.os, "unlink", side_effect=fail_after_active_rename
+                MODULE,
+                "_isolate_and_delete_pending_regular_publication_candidate",
+                side_effect=MODULE.SyncError(
+                    "injected active publication cleanup crash"
+                ),
             ),
             self.assertRaisesRegex(MODULE.SyncError, "rollback was incomplete"),
         ):
@@ -2347,6 +2340,339 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         )
         self.assertTrue(cleanup_path.is_file())
 
+    def test_private_deleted_authority_does_not_reauthorize_relinked_public_name(
+        self,
+    ) -> None:
+        for public_name in ("canonical", "active"):
+            with self.subTest(public_name=public_name):
+                self.home = self.root / f"home-private-deleted-{public_name}"
+                batch = self._interrupt_regular_publication_cleanup(
+                    self.release,
+                    SHA_A,
+                )
+                record, active = self._assert_active_publication_journal(batch)
+                target = self.home / Path(*record.target.parts)
+                assert record.evidence is not None
+                evidence = batch.batch_root / Path(*record.evidence.parts)
+
+                MODULE._recover_pending_regular_publication_cleanup(
+                    self.home,
+                    batch,
+                    record,
+                    "produced",
+                )
+
+                journal = MODULE._read_pending_regular_publication_cleanup(
+                    self.home,
+                    batch,
+                    record,
+                    "produced",
+                )
+                assert journal is not None
+                self.assertEqual(
+                    MODULE._pending_regular_publication_cleanup_lifecycle(journal[0]),
+                    "private-authority",
+                )
+                self.assertFalse(os.path.lexists(target))
+                self.assertFalse(os.path.lexists(active))
+
+                restarted = MODULE._load_pending_link_batch(self.home)
+                self.assertIsNotNone(restarted)
+                assert restarted is not None
+                restarted_record = next(
+                    candidate
+                    for candidate in restarted.records
+                    if candidate.index == record.index
+                )
+                public = target if public_name == "canonical" else active
+                os.link(evidence, public, follow_symlinks=False)
+                public_identity = (public.stat().st_dev, public.stat().st_ino)
+
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "public cleanup authority was revoked",
+                ):
+                    MODULE._recover_pending_regular_publication_cleanup(
+                        self.home,
+                        restarted,
+                        restarted_record,
+                        "produced",
+                    )
+
+                self.assertTrue(public.is_file())
+                self.assertEqual(
+                    (public.stat().st_dev, public.stat().st_ino),
+                    public_identity,
+                )
+                self.assertEqual(public.read_bytes(), evidence.read_bytes())
+
+    def test_private_unlink_failure_retries_from_private_authority(self) -> None:
+        batch = self._interrupt_regular_publication_cleanup(self.release, SHA_A)
+        record, active = self._assert_active_publication_journal(batch)
+        target = self.home / Path(*record.target.parts)
+        journal = MODULE._read_pending_regular_publication_cleanup(
+            self.home,
+            batch,
+            record,
+            "produced",
+        )
+        assert journal is not None
+        _snapshot, _active_name, _phase, expected = journal
+        cleanup = batch.batch_root / "pending" / "cleanup"
+        cleanup_metadata = cleanup.stat()
+        cleanup_identity = (cleanup_metadata.st_dev, cleanup_metadata.st_ino)
+        private_name = MODULE._pending_regular_publication_private_alias_name(
+            cleanup_identity,
+            (*expected.file_identity, stat.S_IFREG),
+            record.index,
+            "produced",
+        )
+        private = cleanup / private_name
+        real_unlink = MODULE.os.unlink
+        failed = False
+
+        def fail_first_private_unlink(
+            name: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal failed
+            if os.fsdecode(name) == private_name and not failed:
+                failed = True
+                raise MODULE.SyncError("injected private unlink failure")
+            real_unlink(name, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE.os,
+                "unlink",
+                side_effect=fail_first_private_unlink,
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "private unlink failure"),
+        ):
+            MODULE._recover_pending_regular_publication_cleanup(
+                self.home,
+                batch,
+                record,
+                "produced",
+            )
+
+        self.assertTrue(failed)
+        self.assertTrue(private.is_file())
+        self.assertFalse(os.path.lexists(target))
+        self.assertFalse(os.path.lexists(active))
+        journal = MODULE._read_pending_regular_publication_cleanup(
+            self.home,
+            batch,
+            record,
+            "produced",
+        )
+        assert journal is not None
+        self.assertEqual(
+            MODULE._pending_regular_publication_cleanup_lifecycle(journal[0]),
+            "private-authority",
+        )
+        self.assertTrue(
+            MODULE._pending_regular_publication_private_authority_path(
+                batch,
+                record,
+                "produced",
+            ).is_file()
+        )
+
+        restarted = MODULE._load_pending_link_batch(self.home)
+        assert restarted is not None
+        restarted_record = next(
+            candidate
+            for candidate in restarted.records
+            if candidate.index == record.index
+        )
+        MODULE._recover_pending_regular_publication_cleanup(
+            self.home,
+            restarted,
+            restarted_record,
+            "produced",
+        )
+        self.assertFalse(os.path.lexists(private))
+        self.assertFalse(os.path.lexists(target))
+        self.assertFalse(os.path.lexists(active))
+
+    def test_private_authority_anchor_rejects_v2_journal_replay(self) -> None:
+        for public_name in ("canonical", "active"):
+            with self.subTest(public_name=public_name):
+                self.home = self.root / f"home-v2-replay-{public_name}"
+                batch = self._interrupt_regular_publication_cleanup(
+                    self.release,
+                    SHA_A,
+                )
+                record, active = self._assert_active_publication_journal(batch)
+                target = self.home / Path(*record.target.parts)
+                assert record.evidence is not None
+                evidence = batch.batch_root / Path(*record.evidence.parts)
+                journal_path = MODULE._pending_regular_publication_cleanup_path(
+                    batch,
+                    record,
+                    "produced",
+                )
+                saved_v2 = journal_path.read_bytes()
+
+                MODULE._recover_pending_regular_publication_cleanup(
+                    self.home,
+                    batch,
+                    record,
+                    "produced",
+                )
+                anchor_path = (
+                    MODULE._pending_regular_publication_private_authority_path(
+                        batch,
+                        record,
+                        "produced",
+                    )
+                )
+                self.assertTrue(anchor_path.is_file())
+                journal_path.write_bytes(saved_v2)
+                public = target if public_name == "canonical" else active
+                os.link(evidence, public, follow_symlinks=False)
+                public_identity = (public.stat().st_dev, public.stat().st_ino)
+
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "public cleanup authority was revoked",
+                ):
+                    MODULE._recover_pending_regular_publication_cleanup(
+                        self.home,
+                        batch,
+                        record,
+                        "produced",
+                    )
+
+                self.assertEqual(
+                    (public.stat().st_dev, public.stat().st_ino),
+                    public_identity,
+                )
+                self.assertTrue(anchor_path.is_file())
+
+    def test_v1_cleanup_journal_missing_lifecycle_fails_closed(self) -> None:
+        batch = self._interrupt_regular_publication_cleanup(self.release, SHA_A)
+        record, active = self._assert_active_publication_journal(batch)
+        journal = MODULE._read_pending_regular_publication_cleanup(
+            self.home,
+            batch,
+            record,
+            "produced",
+        )
+        assert journal is not None
+        _snapshot, active_name, _phase, expected = journal
+        journal_path = MODULE._pending_regular_publication_cleanup_path(
+            batch,
+            record,
+            "produced",
+        )
+        journal_path.write_bytes(
+            MODULE._pending_regular_publication_cleanup_payload(
+                batch,
+                record,
+                expected,
+                "produced",
+                active_name,
+                version=1,
+            )
+        )
+        active_identity = (active.stat().st_dev, active.stat().st_ino)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "public cleanup authority was revoked",
+        ):
+            MODULE._recover_pending_regular_publication_cleanup(
+                self.home,
+                batch,
+                record,
+                "produced",
+            )
+
+        self.assertEqual(
+            (active.stat().st_dev, active.stat().st_ino),
+            active_identity,
+        )
+
+    def test_cleanup_journal_unhashable_version_fails_closed(self) -> None:
+        batch = self._interrupt_regular_publication_cleanup(self.release, SHA_A)
+        record, active = self._assert_active_publication_journal(batch)
+        journal_path = MODULE._pending_regular_publication_cleanup_path(
+            batch,
+            record,
+            "produced",
+        )
+        payload = json.loads(journal_path.read_text(encoding="utf-8"))
+        payload["version"] = []
+        journal_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        active_identity = (active.stat().st_dev, active.stat().st_ino)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "cleanup journal changed",
+        ):
+            MODULE._recover_pending_regular_publication_cleanup(
+                self.home,
+                batch,
+                record,
+                "produced",
+            )
+
+        self.assertEqual(
+            (active.stat().st_dev, active.stat().st_ino),
+            active_identity,
+        )
+
+    def test_private_authority_journal_corruption_preserves_public_name(self) -> None:
+        for corruption in ("missing-lifecycle", "invalid-json"):
+            with self.subTest(corruption=corruption):
+                self.home = self.root / f"home-private-journal-{corruption}"
+                batch = self._interrupt_regular_publication_cleanup(
+                    self.release,
+                    SHA_A,
+                )
+                record, _active = self._assert_active_publication_journal(batch)
+                target = self.home / Path(*record.target.parts)
+                assert record.evidence is not None
+                evidence = batch.batch_root / Path(*record.evidence.parts)
+                MODULE._recover_pending_regular_publication_cleanup(
+                    self.home,
+                    batch,
+                    record,
+                    "produced",
+                )
+                os.link(evidence, target, follow_symlinks=False)
+                target_identity = (target.stat().st_dev, target.stat().st_ino)
+                journal_path = MODULE._pending_regular_publication_cleanup_path(
+                    batch,
+                    record,
+                    "produced",
+                )
+                if corruption == "missing-lifecycle":
+                    payload = json.loads(journal_path.read_text(encoding="utf-8"))
+                    payload.pop("lifecycle")
+                    journal_path.write_text(
+                        json.dumps(payload) + "\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    journal_path.write_bytes(b"{")
+
+                with self.assertRaises(MODULE.SyncError):
+                    MODULE._recover_pending_regular_publication_cleanup(
+                        self.home,
+                        batch,
+                        record,
+                        "produced",
+                    )
+
+                self.assertEqual(
+                    (target.stat().st_dev, target.stat().st_ino),
+                    target_identity,
+                )
+
     def test_durable_private_cleanup_retains_authority_when_canonical_reappears(
         self,
     ) -> None:
@@ -2398,7 +2724,7 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
-                "public canonical name reappeared while private evidence was retained",
+                "public name reappeared; exact private evidence was retained",
             ),
         ):
             MODULE._recover_pending_regular_publication_cleanup(
@@ -2416,13 +2742,22 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
             replacement_identity,
         )
         cleanup = batch.batch_root / "pending" / "cleanup"
-        retained = tuple(
-            child
-            for child in cleanup.iterdir()
-            if child.name.startswith(MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX)
+        journal = MODULE._read_pending_regular_publication_cleanup(
+            self.home,
+            batch,
+            record,
+            "produced",
         )
-        self.assertEqual(len(retained), 1)
-        self.assertEqual(retained[0].read_bytes(), b'name = "reviewer"\n')
+        assert journal is not None
+        expected = journal[3]
+        cleanup_metadata = cleanup.stat()
+        private = cleanup / MODULE._pending_regular_publication_private_alias_name(
+            (cleanup_metadata.st_dev, cleanup_metadata.st_ino),
+            (*expected.file_identity, stat.S_IFREG),
+            record.index,
+            "produced",
+        )
+        self.assertEqual(private.read_bytes(), b'name = "reviewer"\n')
         self.assertTrue(MODULE._pending_link_pointer_path(self.home).is_file())
 
     def test_durable_private_cleanup_reports_canonical_reappearance_after_unlink(
@@ -2904,7 +3239,7 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         )
         source = batch.batch_root / Path(*record.before_evidence.parts)
         real_bound = MODULE._bound_directory_matches
-        real_unlink = os.unlink
+        real_isolate = MODULE._isolate_and_delete_pending_regular_publication_candidate
         before_publish_started = False
 
         def fail_after_before_publication(
@@ -2918,17 +3253,24 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                 return False
             return real_bound(home, path, directory_fd)
 
-        def fail_before_active_unlink(
-            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        def fail_before_private_isolation(
+            home: Path,
+            pending_batch: MODULE.PendingLinkBatch,
+            pending_record: MODULE.PendingLinkRecord,
+            cleanup_phase: str,
             *args: object,
             **kwargs: object,
         ) -> None:
-            name = os.fsdecode(path)
-            if before_publish_started and name.startswith(
-                MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
-            ):
+            if before_publish_started and cleanup_phase == "before":
                 raise MODULE.SyncError("injected before publication cleanup crash")
-            real_unlink(path, *args, **kwargs)
+            real_isolate(
+                home,
+                pending_batch,
+                pending_record,
+                cleanup_phase,
+                *args,
+                **kwargs,
+            )
 
         with (
             mock.patch.object(
@@ -2937,7 +3279,9 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                 side_effect=fail_after_before_publication,
             ),
             mock.patch.object(
-                MODULE.os, "unlink", side_effect=fail_before_active_unlink
+                MODULE,
+                "_isolate_and_delete_pending_regular_publication_candidate",
+                side_effect=fail_before_private_isolation,
             ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
@@ -6086,6 +6430,242 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
             ),
             'name = "security-reviewer"\n',
         )
+
+
+class PendingRegularSourceEvidenceCacheTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.home = self.root / "home"
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _retain_committed_batch(
+        self,
+        release: Path,
+        *,
+        sha: str = SHA_A,
+    ) -> MODULE.PendingLinkBatch:
+        real_clear = MODULE._clear_pending_link_pointer
+
+        def retain_committed_pointer(
+            home: Path,
+            batch: MODULE.PendingLinkBatch,
+            *,
+            phase: str = "before",
+        ) -> None:
+            if phase == "after":
+                raise MODULE.SyncError("injected committed pointer retention")
+            real_clear(home, batch, phase=phase)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_clear_pending_link_pointer",
+                side_effect=retain_committed_pointer,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "committed managed state but finalization failed",
+            ),
+        ):
+            install(release, self.home, sha)
+        batch = MODULE._load_pending_link_batch(self.home)
+        self.assertIsNotNone(batch)
+        assert batch is not None
+        return batch
+
+    def _installed_release_root(self, sha: str = SHA_A) -> Path:
+        return MODULE._releases_root(self.home, MODULE.PUBLIC_OWNER) / sha
+
+    def _replace_installed_source(
+        self,
+        source: Path,
+        payload: str,
+    ) -> None:
+        mode = stat.S_IMODE(source.stat().st_mode)
+        replacement = source.with_name(f".{source.name}.replacement")
+        replacement.write_text(payload, encoding="utf-8")
+        replacement.chmod(mode)
+        os.replace(replacement, source)
+
+    def _mutate_installed_source(self, source: Path, payload: str) -> None:
+        mode = stat.S_IMODE(source.stat().st_mode)
+        source.chmod(mode | stat.S_IWUSR)
+        source.write_text(payload, encoding="utf-8")
+        source.chmod(mode)
+
+    def test_shared_release_is_captured_once_and_finally_revalidated_once(
+        self,
+    ) -> None:
+        release = self.root / "shared-release"
+        write_release(release, role_payload='name = "reviewer"\n')
+        append_regular_link(
+            release,
+            target="agents/reviewer-copy.toml",
+        )
+        append_regular_link(
+            release,
+            target="agents/security-reviewer.toml",
+            source="personal_codex/agents/security-reviewer.toml",
+            payload='name = "security-reviewer"\n',
+        )
+        self._retain_committed_batch(release)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_capture_pending_regular_release_receipt",
+                wraps=MODULE._capture_pending_regular_release_receipt,
+            ) as capture_release,
+            mock.patch.object(
+                MODULE,
+                "_require_pending_regular_release_receipt",
+                wraps=MODULE._require_pending_regular_release_receipt,
+            ) as revalidate_release,
+        ):
+            parsed = MODULE._load_pending_link_batch(self.home)
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(capture_release.call_count, 1)
+        self.assertEqual(revalidate_release.call_count, 1)
+
+    def test_release_mutation_after_first_evidence_fails_final_revalidation(
+        self,
+    ) -> None:
+        release = self.root / "mutated-release"
+        write_release(release, role_payload='name = "reviewer"\n')
+        self._retain_committed_batch(release)
+        source = (
+            self._installed_release_root()
+            / "personal_codex"
+            / "agents"
+            / "reviewer.toml"
+        )
+        real_evidence = MODULE._PendingRegularSourceEvidenceBudget.evidence
+        mutated = False
+
+        def mutate_after_first_evidence(
+            budget: MODULE._PendingRegularSourceEvidenceBudget,
+            home: Path,
+            record: MODULE.ManagedLinkRecord,
+            expectation: MODULE.PendingReleaseExpectation,
+        ) -> MODULE._PendingRegularSourceEvidence:
+            nonlocal mutated
+            evidence = real_evidence(budget, home, record, expectation)
+            if not mutated:
+                self._mutate_installed_source(source, 'name = "mutated"\n')
+                mutated = True
+            return evidence
+
+        with (
+            mock.patch.object(
+                MODULE._PendingRegularSourceEvidenceBudget,
+                "evidence",
+                new=mutate_after_first_evidence,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "source evidence receipt no longer matches",
+            ),
+        ):
+            MODULE._load_pending_link_batch(self.home)
+        self.assertTrue(mutated)
+
+    def test_source_replacement_is_rejected_on_source_cache_hit(self) -> None:
+        release = self.root / "source-cache-hit-release"
+        write_release(release, role_payload='name = "reviewer"\n')
+        append_regular_link(
+            release,
+            target="agents/reviewer-copy.toml",
+        )
+        self._retain_committed_batch(release)
+        source = (
+            self._installed_release_root()
+            / "personal_codex"
+            / "agents"
+            / "reviewer.toml"
+        )
+        real_evidence = MODULE._PendingRegularSourceEvidenceBudget.evidence
+        replaced = False
+
+        def replace_after_first_evidence(
+            budget: MODULE._PendingRegularSourceEvidenceBudget,
+            home: Path,
+            record: MODULE.ManagedLinkRecord,
+            expectation: MODULE.PendingReleaseExpectation,
+        ) -> MODULE._PendingRegularSourceEvidence:
+            nonlocal replaced
+            evidence = real_evidence(budget, home, record, expectation)
+            if not replaced:
+                self._replace_installed_source(source, 'name = "replacement"\n')
+                replaced = True
+            return evidence
+
+        with (
+            mock.patch.object(
+                MODULE._PendingRegularSourceEvidenceBudget,
+                "evidence",
+                new=replace_after_first_evidence,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "source evidence receipt no longer matches",
+            ),
+        ):
+            MODULE._load_pending_link_batch(self.home)
+        self.assertTrue(replaced)
+
+    def test_release_directory_replacement_before_finalization_is_rejected(
+        self,
+    ) -> None:
+        release = self.root / "release-directory-replacement"
+        write_release(release, role_payload='name = "reviewer"\n')
+        self._retain_committed_batch(release)
+        release_root = self._installed_release_root()
+        parked_root = release_root.with_name(f"{release_root.name}.parked")
+        real_evidence = MODULE._PendingRegularSourceEvidenceBudget.evidence
+        replaced = False
+
+        def replace_after_first_evidence(
+            budget: MODULE._PendingRegularSourceEvidenceBudget,
+            home: Path,
+            record: MODULE.ManagedLinkRecord,
+            expectation: MODULE.PendingReleaseExpectation,
+        ) -> MODULE._PendingRegularSourceEvidence:
+            nonlocal replaced
+            evidence = real_evidence(budget, home, record, expectation)
+            if not replaced:
+                release_root.rename(parked_root)
+                shutil.copytree(parked_root, release_root)
+                replaced = True
+            return evidence
+
+        with (
+            mock.patch.object(
+                MODULE._PendingRegularSourceEvidenceBudget,
+                "evidence",
+                new=replace_after_first_evidence,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "source release directory changed",
+            ),
+        ):
+            MODULE._load_pending_link_batch(self.home)
+        self.assertTrue(replaced)
+
+    def test_finalized_budget_rejects_later_evidence(self) -> None:
+        budget = MODULE._PendingRegularSourceEvidenceBudget()
+        budget.finalize(self.home)
+
+        with self.assertRaisesRegex(MODULE.SyncError, "evidence budget is sealed"):
+            budget.evidence(
+                self.home,
+                SimpleNamespace(),
+                SimpleNamespace(),
+            )
 
 
 if __name__ == "__main__":

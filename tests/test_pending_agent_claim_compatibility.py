@@ -1085,7 +1085,7 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
         self.assertEqual(read_source.call_count, 1)
         self.assertEqual(budget.evidence_read_bytes, first.size)
 
-    def test_pending_regular_source_cache_revalidates_release_tree_receipt(
+    def test_pending_regular_source_cache_defers_release_tree_revalidation_until_finalize(
         self,
     ) -> None:
         home = self.root / "home-v10-release-cache-revalidation"
@@ -1111,12 +1111,26 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
         )
         budget = MODULE._PendingRegularSourceEvidenceBudget()
 
-        with mock.patch.object(
-            MODULE,
-            "_read_pending_regular_source_payload",
-            wraps=MODULE._read_pending_regular_source_payload,
-        ) as read_source:
+        with (
+            mock.patch.object(
+                MODULE,
+                "_read_pending_regular_source_payload",
+                wraps=MODULE._read_pending_regular_source_payload,
+            ) as read_source,
+            mock.patch.object(
+                MODULE,
+                "_capture_pending_regular_release_receipt",
+                wraps=MODULE._capture_pending_regular_release_receipt,
+            ) as capture_release,
+            mock.patch.object(
+                MODULE,
+                "_require_pending_regular_release_receipt",
+                wraps=MODULE._require_pending_regular_release_receipt,
+            ) as revalidate_release,
+        ):
             first = budget.evidence(home, record, expectation)
+            self.assertEqual(capture_release.call_count, 1)
+            self.assertEqual(revalidate_release.call_count, 0)
             release_root = MODULE._releases_root(home, MODULE.PUBLIC_OWNER) / SHA_A
             manifest = release_root / MODULE.MANIFEST_RELATIVE_PATH
             replacement = manifest.with_name("replacement-manifest.json")
@@ -1124,15 +1138,21 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
             replacement.chmod(manifest.stat().st_mode & 0o777)
             os.replace(replacement, manifest)
 
+            cached = budget.evidence(home, record, expectation)
+            self.assertIs(cached, first)
+            self.assertEqual(revalidate_release.call_count, 0)
             with self.assertRaisesRegex(
                 MODULE.SyncError,
                 "release source .*pending regular-file source evidence cache "
                 "revalidation",
             ):
-                budget.evidence(home, record, expectation)
+                budget.finalize(home)
 
         self.assertEqual(read_source.call_count, 1)
+        self.assertEqual(capture_release.call_count, 1)
+        self.assertEqual(revalidate_release.call_count, 1)
         self.assertEqual(budget.evidence_read_bytes, first.size)
+        self.assertTrue(budget.sealed)
 
     def test_pending_regular_source_budget_read_stays_on_preflight_fd(self) -> None:
         home = self.root / "home-v10-source-budget-binding"

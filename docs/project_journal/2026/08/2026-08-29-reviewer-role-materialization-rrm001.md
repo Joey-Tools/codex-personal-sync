@@ -567,3 +567,33 @@ superseded_by:
   and retained-evidence diagnostic context. Ruff `E4/E7/E9/F`, Ruff format,
   `actionlint`, Python compilation, and `git diff --check` passed after the
   final source-lock refresh. A fresh exact-head review remains pending.
+- A subsequent fresh frozen-range review of `c87d6c4..04044ec` found two
+  additional pre-PR issues and they were repaired before opening a PR. First,
+  modern pending-publication cleanup now advances from a public-authorized
+  journal state to private authority through an independent exclusive,
+  identity-bound anchor before private unlink. The anchor makes that lifecycle
+  monotonic across crashes: a later public canonical or active-alias
+  reappearance is retained in place, a failed private unlink remains private
+  for retry, and replaying an earlier valid v2 journal cannot recreate public
+  deletion authority. Old v1 journals that cannot prove their lifecycle remain
+  fail-closed. Second, v10 pending parsing now caches immutable release
+  receipts by owner, release SHA, directory identity, and tree digest. It
+  captures and verifies a release once, revalidates every cached release before
+  returning cleanup authority, then seals the budget; cache hits still verify
+  source and parent-chain evidence but do not repeat a full release-tree walk.
+  This removes the proven repeated-tree recovery amplification without using a
+  mutable manifest as authority. A follow-up integration review caught and
+  closed the private-unlink retry, v2 journal replay, and malformed-version
+  boundaries. Its second pass returned clean. The affected cross-module suite
+  passed 864 tests with one expected skip in 229.273 seconds; Ruff lint and
+  formatting, `actionlint`, Python compilation, `git diff --check`, and
+  source-lock regeneration passed. A new full discovery and fresh exact-head
+  review remain required before PR creation.
+- The required post-repair full repository-private discovery completed under
+  the same 30-minute process-group deadline and 128 MiB log ceiling: 1,505
+  tests passed with three expected skips in 967.447 seconds. The retained log
+  reported no deadline or output-budget event. This test result covers the
+  monotonic private-authority anchor, v2-replay rejection, malformed journal
+  versions, release-receipt cache finalization, and the revised cache-hit
+  compatibility contract. The next gate is a fresh exact-head whole-range
+  review after a signed frozen commit; no PR has been created yet.

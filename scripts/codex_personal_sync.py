@@ -14271,6 +14271,38 @@ def _require_pending_regular_source_receipt(
         )
 
 
+def _require_pending_regular_cached_source_evidence(
+    home: Path,
+    source: Path,
+    parent_fd: int,
+    file_fd: int,
+    metadata: os.stat_result,
+    evidence: _PendingRegularSourceEvidence,
+) -> None:
+    _require_pending_regular_source_receipt(
+        file_fd,
+        source,
+        evidence.source_receipt,
+    )
+    _require_bounded_regular_file_unchanged(
+        source,
+        parent_fd,
+        file_fd,
+        metadata,
+        "pending regular-file source evidence",
+    )
+    _require_managed_regular_parent_chain_access(
+        home,
+        source.parent,
+        bound_parent_fd=parent_fd,
+    )
+    _require_pending_regular_source_receipt(
+        file_fd,
+        source,
+        evidence.source_receipt,
+    )
+
+
 def _capture_pending_regular_release_receipt(
     release_fd: int,
     release_root: Path,
@@ -14338,7 +14370,12 @@ class _PendingRegularSourceEvidenceBudget:
         tuple[str, str, PurePosixPath, tuple[int, int], str],
         _PendingRegularSourceEvidence,
     ] = dataclass_field(default_factory=dict)
+    release_receipt_by_authority: dict[
+        tuple[str, str, tuple[int, int], str],
+        _PendingRegularReleaseReceipt,
+    ] = dataclass_field(default_factory=dict)
     evidence_read_bytes: int = 0
+    sealed: bool = False
 
     def evidence(
         self,
@@ -14346,6 +14383,8 @@ class _PendingRegularSourceEvidenceBudget:
         record: ManagedLinkRecord,
         expectation: PendingReleaseExpectation,
     ) -> _PendingRegularSourceEvidence:
+        if self.sealed:
+            raise SyncError("pending regular-file source evidence budget is sealed")
         if expectation.owner != record.owner or expectation.sha != record.release_sha:
             raise SyncError(
                 "pending regular-file source release binding changed: "
@@ -14360,6 +14399,13 @@ class _PendingRegularSourceEvidenceBudget:
             expectation.directory_identity,
             expectation.tree_sha256,
         )
+        release_cache_key = (
+            expectation.owner,
+            expectation.sha,
+            expectation.directory_identity,
+            expectation.tree_sha256,
+        )
+        release_receipt = self.release_receipt_by_authority.get(release_cache_key)
         release_fd = _open_installed_release_directory_fd(
             home,
             expectation.owner,
@@ -14380,32 +14426,17 @@ class _PendingRegularSourceEvidenceBudget:
             )
             cached = self.evidence_by_source.get(cache_key)
             if cached is not None:
-                _require_pending_regular_source_receipt(
-                    file_fd,
-                    source,
-                    cached.source_receipt,
-                )
-                _require_bounded_regular_file_unchanged(
+                if release_receipt is not cached.release_receipt:
+                    raise SyncError(
+                        "pending regular-file source evidence cache is incomplete"
+                    )
+                _require_pending_regular_cached_source_evidence(
+                    home,
                     source,
                     parent_fd,
                     file_fd,
                     metadata,
-                    "pending regular-file source evidence",
-                )
-                _require_managed_regular_parent_chain_access(
-                    home,
-                    source.parent,
-                    bound_parent_fd=parent_fd,
-                )
-                _require_pending_regular_source_receipt(
-                    file_fd,
-                    source,
-                    cached.source_receipt,
-                )
-                _require_pending_regular_release_receipt(
-                    release_fd,
-                    release_root,
-                    cached.release_receipt,
+                    cached,
                 )
                 if _directory_identity(
                     release_fd
@@ -14435,11 +14466,12 @@ class _PendingRegularSourceEvidenceBudget:
                 metadata,
                 "pending regular-file source evidence",
             )
-            release_receipt = _capture_pending_regular_release_receipt(
-                release_fd,
-                release_root,
-                expectation,
-            )
+            if release_receipt is None:
+                release_receipt = _capture_pending_regular_release_receipt(
+                    release_fd,
+                    release_root,
+                    expectation,
+                )
             _require_bounded_regular_file_unchanged(
                 source,
                 parent_fd,
@@ -14471,6 +14503,8 @@ class _PendingRegularSourceEvidenceBudget:
             _close_fd_quietly(file_fd)
             _close_fd_quietly(parent_fd)
             _close_fd_quietly(release_fd)
+        if release_receipt is None:
+            raise SyncError("pending regular-file source evidence cache is incomplete")
         evidence = _PendingRegularSourceEvidence(
             sha256=hashlib.sha256(payload).hexdigest(),
             size=len(payload),
@@ -14478,8 +14512,110 @@ class _PendingRegularSourceEvidenceBudget:
             release_receipt=release_receipt,
         )
         self.evidence_read_bytes += len(payload)
+        self.release_receipt_by_authority.setdefault(
+            release_cache_key,
+            release_receipt,
+        )
         self.evidence_by_source[cache_key] = evidence
         return evidence
+
+    def finalize(self, home: Path) -> None:
+        if self.sealed:
+            raise SyncError("pending regular-file source evidence budget is sealed")
+        try:
+            for (
+                owner,
+                sha,
+                source_relative,
+                directory_identity,
+                tree_sha256,
+            ), evidence in self.evidence_by_source.items():
+                release_cache_key = (
+                    owner,
+                    sha,
+                    directory_identity,
+                    tree_sha256,
+                )
+                if (
+                    self.release_receipt_by_authority.get(release_cache_key)
+                    is not evidence.release_receipt
+                ):
+                    raise SyncError(
+                        "pending regular-file source evidence cache is incomplete"
+                    )
+                release_root = _releases_root(home, owner) / sha
+                source = release_root / Path(*source_relative.parts)
+                release_fd = _open_installed_release_directory_fd(home, owner, sha)
+                parent_fd = -1
+                file_fd = -1
+                try:
+                    if _directory_identity(release_fd) != directory_identity:
+                        raise SyncError(
+                            "pending regular-file source release directory changed: "
+                            f"{owner}@{sha}"
+                        )
+                    parent_fd, file_fd, metadata = _open_bounded_regular_file(
+                        source,
+                        maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                        description="pending regular-file source evidence",
+                    )
+                    _require_pending_regular_cached_source_evidence(
+                        home,
+                        source,
+                        parent_fd,
+                        file_fd,
+                        metadata,
+                        evidence,
+                    )
+                    if _directory_identity(
+                        release_fd
+                    ) != directory_identity or not _bound_directory_matches(
+                        home, release_root, release_fd
+                    ):
+                        raise SyncError(
+                            "pending regular-file source release directory changed: "
+                            f"{owner}@{sha}"
+                        )
+                finally:
+                    _close_fd_quietly(file_fd)
+                    _close_fd_quietly(parent_fd)
+                    _close_fd_quietly(release_fd)
+            for (
+                owner,
+                sha,
+                directory_identity,
+                _tree_sha256,
+            ), receipt in self.release_receipt_by_authority.items():
+                release_root = _releases_root(home, owner) / sha
+                release_fd = _open_installed_release_directory_fd(home, owner, sha)
+                try:
+                    if _directory_identity(
+                        release_fd
+                    ) != directory_identity or not _bound_directory_matches(
+                        home, release_root, release_fd
+                    ):
+                        raise SyncError(
+                            "pending regular-file source release directory changed: "
+                            f"{owner}@{sha}"
+                        )
+                    _require_pending_regular_release_receipt(
+                        release_fd,
+                        release_root,
+                        receipt,
+                    )
+                    if _directory_identity(
+                        release_fd
+                    ) != directory_identity or not _bound_directory_matches(
+                        home, release_root, release_fd
+                    ):
+                        raise SyncError(
+                            "pending regular-file source release directory changed: "
+                            f"{owner}@{sha}"
+                        )
+                finally:
+                    _close_fd_quietly(release_fd)
+        finally:
+            self.sealed = True
 
 
 def _pending_regular_to_symlink_transition_is_authorized(
@@ -16928,6 +17064,21 @@ def _isolate_and_delete_pending_regular_publication_candidate(
         )
         os.fsync(source_parent_fd)
         os.fsync(cleanup_parent_fd)
+        if not _pending_regular_publication_uses_receiptless_cleanup(
+            batch,
+            record,
+            phase,
+        ):
+            _advance_pending_regular_publication_private_authority(
+                home,
+                batch,
+                record,
+                phase,
+                expected,
+                source_name,
+                cleanup_parent_fd=cleanup_parent_fd,
+                cleanup_parent_identity=cleanup_parent_identity,
+            )
         if _named_entry_identity(source_parent_fd, source_name) is not None:
             raise SyncError(
                 f"{label} public active name reappeared; exact private evidence "
@@ -16949,10 +17100,9 @@ def _isolate_and_delete_pending_regular_publication_candidate(
                 label=label,
             )
         except BaseException:
-            # If validation discovers that the moved leaf was not the authorized
-            # object, restore it without replacement when the public name is
-            # still free. Otherwise keep the private evidence for manual or
-            # later batch cleanup.
+            # Modern cleanup advances an independent private-authority anchor
+            # and never restores this inode to a public name. Receiptless
+            # legacy cleanup retains its original best-effort restoration.
             if _named_entry_identity(cleanup_parent_fd, isolated_name) is not None:
                 try:
                     restored_snapshot = _regular_file_snapshot_at(
@@ -16986,6 +17136,40 @@ def _isolate_and_delete_pending_regular_publication_candidate(
                         planned,
                         label=f"{label} private evidence changed before restoration",
                     )
+                if not _pending_regular_publication_uses_receiptless_cleanup(
+                    batch,
+                    record,
+                    phase,
+                ):
+                    journal = _read_pending_regular_publication_cleanup(
+                        home,
+                        batch,
+                        record,
+                        phase,
+                    )
+                    if journal is None:
+                        _retain_pending_cleanup_entry(
+                            cleanup_parent_fd,
+                            isolated_name,
+                            cleanup_parent_identity,
+                            planned,
+                            label=f"{label} cleanup journal disappeared",
+                        )
+                    _journal, active_name, _journal_phase, _expected = journal
+                    _advance_pending_regular_publication_private_authority(
+                        home,
+                        batch,
+                        record,
+                        phase,
+                        expected,
+                        active_name,
+                        cleanup_parent_fd=cleanup_parent_fd,
+                        cleanup_parent_identity=cleanup_parent_identity,
+                    )
+                    # The durable anchor makes this private-only authority.
+                    # Moving the same inode back to a public alias would make
+                    # a later retry indistinguishable from hostile replay.
+                    raise
                 if any(
                     name != source_name
                     and _named_entry_identity(source_parent_fd, name) is not None
@@ -17213,6 +17397,30 @@ def _delete_pending_regular_publication_private_alias(
             planned,
             label=f"{label} changed during private isolation",
         )
+    if not _pending_regular_publication_uses_receiptless_cleanup(
+        batch,
+        record,
+        phase,
+    ):
+        journal = _read_pending_regular_publication_cleanup(
+            home,
+            batch,
+            record,
+            phase,
+        )
+        if journal is None:
+            raise SyncError("pending regular publication cleanup journal is missing")
+        _journal_snapshot, active_name, _journal_phase, _journal_expected = journal
+        _advance_pending_regular_publication_private_authority(
+            home,
+            batch,
+            record,
+            phase,
+            expected,
+            active_name,
+            cleanup_parent_fd=cleanup_parent_fd,
+            cleanup_parent_identity=cleanup_parent_identity,
+        )
     _require_managed_regular_parent_chain_access(
         home,
         public_parent,
@@ -17333,6 +17541,9 @@ def _pending_regular_publication_cleanup_payload(
     expected: RegularFileSnapshot,
     phase: str,
     active_name: str,
+    *,
+    version: int = 2,
+    cleanup_parent_identity: tuple[int, int] | None = None,
 ) -> bytes:
     if (
         batch.metadata_version < 8
@@ -17375,21 +17586,55 @@ def _pending_regular_publication_cleanup_payload(
         != planned
     ):
         raise SyncError("pending regular publication cleanup name is invalid")
+    if version not in {1, 2, 3}:
+        raise SyncError(
+            "pending regular publication cleanup journal version is invalid"
+        )
+    if version == 3 and cleanup_parent_identity is None:
+        raise SyncError(
+            "pending regular publication private cleanup authority is incomplete"
+        )
+    private_name = None
+    if cleanup_parent_identity is not None:
+        private_name = _pending_regular_publication_private_alias_name(
+            cleanup_parent_identity,
+            planned,
+            record.index,
+            phase,
+        )
+    payload: dict[str, object] = {
+        "version": version,
+        "record": record.index,
+        "phase": phase,
+        "target": record.target.as_posix(),
+        "parent_identity": _identity_payload(expected.parent_identity),
+        "file_identity": _identity_payload(expected.file_identity),
+        "sha256": expected.sha256,
+        "size": expected.size,
+        "mode": expected.mode,
+        "uid": expected.uid,
+        "link_count": expected.link_count,
+        "active": active_name,
+    }
+    if version >= 2:
+        payload.update(
+            {
+                "batch": batch.batch_root.name,
+                "batch_root_identity": _identity_payload(batch.batch_root_identity),
+                "lifecycle": (
+                    "public-authorized" if version == 2 else "private-authority"
+                ),
+            }
+        )
+    if version == 3:
+        payload.update(
+            {
+                "cleanup_parent_identity": _identity_payload(cleanup_parent_identity),
+                "private": private_name,
+            }
+        )
     return _bounded_json_document(
-        {
-            "version": 1,
-            "record": record.index,
-            "phase": phase,
-            "target": record.target.as_posix(),
-            "parent_identity": _identity_payload(expected.parent_identity),
-            "file_identity": _identity_payload(expected.file_identity),
-            "sha256": expected.sha256,
-            "size": expected.size,
-            "mode": expected.mode,
-            "uid": expected.uid,
-            "link_count": expected.link_count,
-            "active": active_name,
-        },
+        payload,
         max_bytes=4096,
         overflow_error="pending regular publication cleanup journal exceeds the size limit",
     )
@@ -17459,6 +17704,13 @@ def _read_pending_regular_publication_cleanup(
     ):
         raise SyncError("pending regular publication cleanup journal changed")
     data = _decode_managed_state_json(snapshot.payload, path)
+    journal_version = data.get("version")
+    if (
+        not isinstance(journal_version, int)
+        or isinstance(journal_version, bool)
+        or journal_version not in {1, 2, 3}
+    ):
+        raise SyncError("pending regular publication cleanup journal changed")
     expected_fields = {
         "version",
         "record",
@@ -17473,7 +17725,11 @@ def _read_pending_regular_publication_cleanup(
         "link_count",
         "active",
     }
-    if set(data) != expected_fields or data.get("version") != 1:
+    if journal_version in {2, 3}:
+        expected_fields.update({"batch", "batch_root_identity", "lifecycle"})
+    if journal_version == 3:
+        expected_fields.update({"cleanup_parent_identity", "private"})
+    if set(data) != expected_fields:
         raise SyncError("pending regular publication cleanup journal changed")
     parent_identity = _parse_pending_identity(
         data.get("parent_identity"),
@@ -17486,6 +17742,22 @@ def _read_pending_regular_publication_cleanup(
     journal_phase = data.get("phase")
     active_name = data.get("active")
     link_count = data.get("link_count")
+    batch_root_identity = (
+        _parse_pending_identity(
+            data.get("batch_root_identity"),
+            "pending regular publication cleanup batch identity",
+        )
+        if journal_version in {2, 3}
+        else None
+    )
+    cleanup_parent_identity = (
+        _parse_pending_identity(
+            data.get("cleanup_parent_identity"),
+            "pending regular publication cleanup namespace identity",
+        )
+        if journal_version == 3
+        else None
+    )
     if (
         parent_identity is None
         or file_identity is None
@@ -17510,22 +17782,308 @@ def _read_pending_regular_publication_cleanup(
         gid=0,
         link_count=link_count,
     )
+    if journal_version == 3:
+        if (
+            cleanup_parent_identity is None
+            or cleanup_parent_identity != snapshot.parent_identity
+            or data.get("private")
+            != _pending_regular_publication_private_alias_name(
+                cleanup_parent_identity,
+                (file_identity[0], file_identity[1], stat.S_IFREG),
+                record.index,
+                journal_phase,
+            )
+        ):
+            raise SyncError("pending regular publication cleanup journal changed")
     if (
         data.get("record") != record.index
         or data.get("target") != record.target.as_posix()
         or journal_phase != requested_phase
         or not isinstance(active_name, str)
+        or (
+            journal_version in {2, 3}
+            and (
+                data.get("batch") != batch.batch_root.name
+                or batch_root_identity != batch.batch_root_identity
+                or data.get("lifecycle")
+                != (
+                    "public-authorized" if journal_version == 2 else "private-authority"
+                )
+            )
+        )
         or _pending_regular_publication_cleanup_payload(
             batch,
             record,
             expected,
             journal_phase,
             active_name,
+            version=journal_version,
+            cleanup_parent_identity=cleanup_parent_identity,
         )
         != snapshot.payload
     ):
         raise SyncError("pending regular publication cleanup journal changed")
     return snapshot, active_name, journal_phase, expected
+
+
+def _pending_regular_publication_cleanup_lifecycle(
+    journal: ManagedStateFileSnapshot,
+) -> str | None:
+    if journal.payload is None:
+        raise SyncError("pending regular publication cleanup journal changed")
+    data = _decode_managed_state_json(
+        journal.payload,
+        Path("pending regular publication cleanup journal"),
+    )
+    version = data.get("version")
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise SyncError("pending regular publication cleanup journal changed")
+    if version == 1:
+        return None
+    lifecycle = data.get("lifecycle")
+    if version not in {2, 3} or lifecycle not in {
+        "public-authorized",
+        "private-authority",
+    }:
+        raise SyncError("pending regular publication cleanup journal changed")
+    return lifecycle
+
+
+def _pending_regular_publication_private_authority_path(
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+) -> Path:
+    journal_path = _pending_regular_publication_cleanup_path(batch, record, phase)
+    return journal_path.with_name(journal_path.stem + ".private-authority.json")
+
+
+def _read_pending_regular_publication_private_authority(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    expected: RegularFileSnapshot,
+    active_name: str,
+    cleanup_parent_identity: tuple[int, int],
+) -> ManagedStateFileSnapshot | None:
+    path = _pending_regular_publication_private_authority_path(
+        batch,
+        record,
+        phase,
+    )
+    parent_fd = _open_directory_beneath(home, path.parent)
+    try:
+        snapshot = _read_managed_state_file_snapshot(
+            home,
+            path,
+            parent_fd,
+            maximum_bytes=4096,
+        )
+        if not snapshot.exists:
+            return None
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+            or snapshot.file_type != stat.S_IFREG
+            or snapshot.mode != 0o600
+            or snapshot.uid != os.geteuid()
+            or snapshot.parent_identity != cleanup_parent_identity
+            or _directory_identity(parent_fd) != cleanup_parent_identity
+            or not _bound_directory_matches(home, path.parent, parent_fd)
+            or snapshot.payload
+            != _pending_regular_publication_cleanup_payload(
+                batch,
+                record,
+                expected,
+                phase,
+                active_name,
+                version=3,
+                cleanup_parent_identity=cleanup_parent_identity,
+            )
+        ):
+            raise SyncError(
+                "pending regular publication private authority anchor changed"
+            )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            path,
+            parent_fd,
+            snapshot,
+        )
+        return snapshot
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _publish_pending_regular_publication_private_authority(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    expected: RegularFileSnapshot,
+    active_name: str,
+    cleanup_parent_identity: tuple[int, int],
+) -> ManagedStateFileSnapshot:
+    path = _pending_regular_publication_private_authority_path(
+        batch,
+        record,
+        phase,
+    )
+    published = _publish_atomic_exclusive_internal_file(
+        home,
+        path,
+        _pending_regular_publication_cleanup_payload(
+            batch,
+            record,
+            expected,
+            phase,
+            active_name,
+            version=3,
+            cleanup_parent_identity=cleanup_parent_identity,
+        ),
+    )
+    verified = _read_pending_regular_publication_private_authority(
+        home,
+        batch,
+        record,
+        phase,
+        expected,
+        active_name,
+        cleanup_parent_identity,
+    )
+    if verified is None or not _managed_state_snapshot_matches_bound_file_evidence(
+        verified,
+        published,
+    ):
+        raise SyncError("pending regular publication private authority anchor changed")
+    return verified
+
+
+def _advance_pending_regular_publication_private_authority(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    expected: RegularFileSnapshot,
+    active_name: str,
+    cleanup_parent_fd: int,
+    cleanup_parent_identity: tuple[int, int],
+) -> ManagedStateFileSnapshot:
+    """Durably revoke public cleanup authority before private deletion.
+
+    The protected property is the monotonic cleanup-authority lifecycle for
+    the exact batch, record phase and regular-file inode. The old and staged
+    journal identities plus their payloads prove content stability; the bound
+    cleanup-parent identity and access-policy checks prove namespace policy.
+    Ordinary child-entry churn is not compared. Missing or unreadable journal
+    evidence remains distinct from an identity or payload mismatch, and every
+    such failure occurs before the private inode can be unlinked.
+    """
+    current = _read_pending_regular_publication_cleanup(home, batch, record, phase)
+    if current is None:
+        raise SyncError("pending regular publication cleanup journal is missing")
+    current_snapshot, current_active_name, _journal_phase, current_expected = current
+    if (
+        current_active_name != active_name
+        or not _regular_snapshot_leaf_matches(current_expected, expected)
+        or current_expected.link_count != expected.link_count
+        or current_snapshot.parent_identity != cleanup_parent_identity
+    ):
+        raise SyncError("pending regular publication cleanup journal changed")
+    lifecycle = _pending_regular_publication_cleanup_lifecycle(current_snapshot)
+    _publish_pending_regular_publication_private_authority(
+        home,
+        batch,
+        record,
+        phase,
+        expected,
+        active_name,
+        cleanup_parent_identity,
+    )
+    if lifecycle == "private-authority":
+        return current_snapshot
+
+    journal_path = _pending_regular_publication_cleanup_path(batch, record, phase)
+    payload = _pending_regular_publication_cleanup_payload(
+        batch,
+        record,
+        expected,
+        phase,
+        active_name,
+        version=3,
+        cleanup_parent_identity=cleanup_parent_identity,
+    )
+    temp_path = journal_path.with_name(
+        journal_path.name + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+    )
+    _discard_incomplete_pending_cleanup_ticket(home, temp_path)
+    if _pending_cleanup_temp_residue_is_observed(home, temp_path):
+        raise SyncError(
+            "pending regular publication private authority temp was retained"
+        )
+    staged = _write_exclusive_internal_file(home, temp_path, payload)
+    current_bound = _read_managed_state_file_snapshot(
+        home,
+        journal_path,
+        cleanup_parent_fd,
+        expected_identity=current_snapshot.file_identity,
+    )
+    staged_bound = _read_managed_state_file_snapshot(
+        home,
+        temp_path,
+        cleanup_parent_fd,
+        expected_identity=staged.file_identity,
+    )
+    if (
+        not _managed_state_snapshot_matches_bound_file_evidence(
+            current_bound,
+            current_snapshot,
+        )
+        or not _managed_state_snapshot_matches_bound_file_evidence(
+            staged_bound,
+            staged,
+        )
+        or staged_bound.payload != payload
+        or _directory_identity(cleanup_parent_fd) != cleanup_parent_identity
+        or not _bound_directory_matches(
+            home,
+            journal_path.parent,
+            cleanup_parent_fd,
+        )
+    ):
+        raise SyncError(
+            "pending regular publication private authority changed before publication"
+        )
+    os.replace(
+        temp_path.name,
+        journal_path.name,
+        src_dir_fd=cleanup_parent_fd,
+        dst_dir_fd=cleanup_parent_fd,
+    )
+    os.fsync(cleanup_parent_fd)
+    published = _read_pending_regular_publication_cleanup(
+        home,
+        batch,
+        record,
+        phase,
+    )
+    if published is None:
+        raise SyncError("pending regular publication private authority is missing")
+    published_snapshot, published_active, _published_phase, published_expected = (
+        published
+    )
+    if (
+        published_snapshot.file_identity != staged.file_identity
+        or published_active != active_name
+        or not _regular_snapshot_leaf_matches(published_expected, expected)
+        or published_expected.link_count != expected.link_count
+        or _pending_regular_publication_cleanup_lifecycle(published_snapshot)
+        != "private-authority"
+    ):
+        raise SyncError(
+            "pending regular publication private authority changed during publication"
+        )
+    return published_snapshot
 
 
 def _delete_pending_regular_publication_beneath(
@@ -17590,17 +18148,65 @@ def _delete_pending_regular_publication_beneath(
             planned,
         )
         journal_path = _pending_regular_publication_cleanup_path(batch, record, phase)
-        _publish_atomic_exclusive_internal_file(
+        cleanup_parent_fd = _open_directory_beneath(home, journal_path.parent)
+        try:
+            cleanup_parent_identity = _directory_identity(cleanup_parent_fd)
+            _require_pending_cleanup_fd_access_policy(
+                cleanup_parent_fd,
+                journal_path.parent,
+                expected_mode=0o700,
+            )
+            if not _bound_directory_matches(
+                home,
+                journal_path.parent,
+                cleanup_parent_fd,
+            ):
+                raise SyncError("pending regular publication cleanup namespace changed")
+        finally:
+            _close_fd_quietly(cleanup_parent_fd)
+        if (
+            _read_pending_regular_publication_private_authority(
+                home,
+                batch,
+                record,
+                phase,
+                expected,
+                active_name,
+                cleanup_parent_identity,
+            )
+            is not None
+        ):
+            raise SyncError(
+                "pending regular publication public cleanup authority was revoked"
+            )
+        prepared_journal = _publish_atomic_exclusive_internal_file(
             home,
             journal_path,
             _pending_regular_publication_cleanup_payload(
                 batch, record, expected, phase, active_name
             ),
         )
-        # Publish the complete immutable intent before removing a Codex-loadable
-        # canonical name. A crash can therefore leave only one of two authorized
-        # states: the exact target named in the intent, or its fully bound
-        # non-.toml active alias. Recovery accepts either and converges.
+        current_journal = _read_pending_regular_publication_cleanup(
+            home,
+            batch,
+            record,
+            phase,
+        )
+        if (
+            current_journal is None
+            or not _managed_state_snapshot_matches_bound_file_evidence(
+                current_journal[0],
+                prepared_journal,
+            )
+            or _pending_regular_publication_cleanup_lifecycle(current_journal[0])
+            != "public-authorized"
+        ):
+            raise SyncError(
+                "pending regular publication public cleanup authority changed"
+            )
+        # Publish the complete public-authorized phase before removing a
+        # Codex-loadable canonical name. The same receipt is advanced atomically
+        # to private-authority before the private alias can be deleted.
         _require_managed_regular_parent_chain_access(
             home,
             target.parent,
@@ -17652,8 +18258,7 @@ def _delete_pending_regular_publication_beneath(
             expected_link_count=expected.link_count,
             label="pending regular publication",
         )
-        # Keep this immutable receipt until whole-batch finalization. Isolating
-        # and deleting it here would require another crash-recovery protocol.
+        # Keep this lifecycle receipt until whole-batch finalization.
     finally:
         _close_fd_quietly(parent_fd)
 
@@ -18054,7 +18659,22 @@ def _recover_pending_regular_publication_cleanup(
     journal = _read_pending_regular_publication_cleanup(home, batch, record, phase)
     if journal is None:
         return
-    _, active_name, journal_phase, expected = journal
+    journal_snapshot, active_name, journal_phase, expected = journal
+    lifecycle = _pending_regular_publication_cleanup_lifecycle(journal_snapshot)
+    if journal_snapshot.parent_identity is None:
+        raise SyncError("pending regular publication cleanup journal changed")
+    private_authority_anchor = _read_pending_regular_publication_private_authority(
+        home,
+        batch,
+        record,
+        phase,
+        expected,
+        active_name,
+        journal_snapshot.parent_identity,
+    )
+    private_authority = (
+        lifecycle == "private-authority" or private_authority_anchor is not None
+    )
 
     def verify_completed_cleanup() -> None:
         evidence_path = (
@@ -18096,6 +18716,32 @@ def _recover_pending_regular_publication_cleanup(
             expected_link_count=expected.link_count,
             label="pending regular publication",
         ):
+            return
+        if lifecycle != "public-authorized" or private_authority:
+            _require_managed_regular_parent_chain_access(
+                home,
+                target.parent,
+                bound_parent_fd=parent_fd,
+            )
+            if not _pending_regular_publication_public_names_are_allowed(
+                home,
+                batch,
+                record,
+                phase,
+                target.parent,
+                parent_fd,
+                (target.name, active_name),
+            ):
+                raise SyncError(
+                    "pending regular publication public cleanup authority was "
+                    "revoked; the public object was retained"
+                )
+            # Version 1 receipts predate the monotonic lifecycle. With no
+            # surviving private alias they cannot distinguish an untouched
+            # public candidate from evidence relinked after private deletion.
+            # Only absence or the independently recorded rollback preimage is
+            # therefore admissible, and neither is mutated here.
+            verify_completed_cleanup()
             return
         target_snapshot: RegularFileSnapshot | None
         active_snapshot: RegularFileSnapshot | None
@@ -18154,6 +18800,24 @@ def _recover_pending_regular_publication_cleanup(
                 target.parent,
                 bound_parent_fd=parent_fd,
             )
+            current_journal = _read_pending_regular_publication_cleanup(
+                home,
+                batch,
+                record,
+                phase,
+            )
+            if (
+                current_journal is None
+                or not _managed_state_snapshot_matches_bound_file_evidence(
+                    current_journal[0],
+                    journal_snapshot,
+                )
+                or _pending_regular_publication_cleanup_lifecycle(current_journal[0])
+                != "public-authorized"
+            ):
+                raise SyncError(
+                    "pending regular publication public cleanup authority changed"
+                )
             _rename_noreplace_at(parent_fd, target.name, parent_fd, active_name)
             os.fsync(parent_fd)
             active_snapshot = _regular_file_snapshot_at(
@@ -18187,8 +18851,7 @@ def _recover_pending_regular_publication_cleanup(
             verify_completed_cleanup()
     finally:
         _close_fd_quietly(parent_fd)
-    # Keep this immutable receipt until whole-batch finalization. Isolating
-    # and deleting it here would require another crash-recovery protocol.
+    # Keep this lifecycle receipt until whole-batch finalization.
 
 
 def _pending_current_owner(
@@ -21896,6 +22559,8 @@ def _parse_pending_link_batch(
             raise SyncError(
                 f"pending removed target still has an after-state claim: {record.target}"
             )
+    if version >= 10:
+        regular_source_evidence.finalize(home)
     assert state_after_evidence is not None
     batch = PendingLinkBatch(
         metadata_version=version,
@@ -25075,7 +25740,8 @@ def _pending_batch_cleanup_name_is_authorized(
         return re.fullmatch(r"[0-9]{8}", name) is not None
     if relative_parent == ("pending", "cleanup"):
         canonical = re.fullmatch(
-            r"[0-9]{8}(?:\.before)?\.json(?:\.publish-tmp)?",
+            r"[0-9]{8}(?:\.before)?(?:\.private-authority)?"
+            r"\.json(?:\.publish-tmp)?",
             name,
         )
         if canonical is not None:
@@ -25084,7 +25750,8 @@ def _pending_batch_cleanup_name_is_authorized(
         return (
             retained_canonical is not None
             and re.fullmatch(
-                r"[0-9]{8}(?:\.before)?\.json(?:\.publish-tmp)?",
+                r"[0-9]{8}(?:\.before)?(?:\.private-authority)?"
+                r"\.json(?:\.publish-tmp)?",
                 retained_canonical,
             )
             is not None
