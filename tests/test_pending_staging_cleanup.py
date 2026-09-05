@@ -268,6 +268,8 @@ class PendingStagingCleanupTests(unittest.TestCase):
         data.pop("terminal_regular_before", None)
         data.pop("terminal_regular_after", None)
         for record in data["records"]:
+            record.pop("before_materialization")
+            record.pop("removed_link")
             record.pop("publication_cleanup")
         if metadata_version < 6:
             for record in data["records"]:
@@ -1058,7 +1060,41 @@ class PendingStagingCleanupTests(unittest.TestCase):
         content_parent.chmod(0o755)
         content = content_parent / "role.toml"
         content.write_bytes(b'name = "retained"\n')
-        content.chmod(0o600)
+        content.chmod(0o644)
+
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
+
+        self.assertFalse(ticket.path.exists())
+        self.assertFalse(ticket.batch_root.exists())
+
+    def test_pending_cleanup_accepts_typed_active_links_regular_file_mode_0644(
+        self,
+    ) -> None:
+        ticket = self._publish_legacy_cleanup_ticket(version=2)
+        content = ticket.batch_root / "links"
+        content.write_bytes(b'name = "retained"\n')
+        content.chmod(0o644)
+        batch_fd = os.open(
+            ticket.batch_root,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            metadata = content.stat()
+            active_name, _active_metadata = MODULE._isolate_pending_cleanup_entry(
+                batch_fd,
+                content.name,
+                MODULE._directory_identity(batch_fd),
+                (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    MODULE.stat.S_IFREG,
+                ),
+                links_content_root=True,
+            )
+        finally:
+            os.close(batch_fd)
+        active = ticket.batch_root / active_name
+        self.assertEqual(MODULE.stat.S_IMODE(active.stat().st_mode), 0o644)
 
         self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
 

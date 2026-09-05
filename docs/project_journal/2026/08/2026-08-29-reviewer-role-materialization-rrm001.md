@@ -3,7 +3,7 @@ id: 20260829-rrm001
 title: Reviewer Role Regular-File Materialization
 status: active
 created: 2026-08-29
-updated: 2026-09-02
+updated: 2026-09-05
 branch: codex/daily-skill-friction-20260829-codex-personal-sync-reviewer-role-regular-install
 pr:
 supersedes: []
@@ -91,12 +91,10 @@ superseded_by:
 
 ## Next Steps
 
-- Complete a frozen whole-range fresh-context local review of the signed head.
-- Open and merge the canonical pull request after CI and current-head GitHub
-  Codex evidence pass.
-- Propagate the accepted canonical source through toolbox and the private
-  overlay, then smoke-test the installed reviewer role without a path override
-  on every target host.
+- Propagate the actual squash-landed canonical commit through toolbox and the
+  private overlay using the receipt-bound release chain.
+- Smoke-test the installed reviewer role without a path override on every
+  target host.
 
 ## Evidence
 
@@ -445,3 +443,18 @@ superseded_by:
   `compileall`, and `git diff --check` passed. The same affected test also
   passed under the local Xcode Python 3.9.6 interpreter; the new GitHub matrix
   lane keeps that runtime coverage durable.
+- Pending metadata version 10 now records both the prior materialization and
+  the exact removed-link key for a same-target regular-to-symlink migration.
+  Recovery derives removal authority only from a receipt-bound release tree:
+  an owner that remains in the after state uses only its after-state release,
+  while a departed owner uses only its before-state release. Versions 4 through
+  9 retain their closed legacy schemas; receiptless active-alias recovery is
+  limited to versions 6 through 9 and revalidates the complete managed parent
+  chain and exact leaf immediately before deletion.
+- The pre-PR gate on 2026-09-05 passed 1,453 tests in 973.647 seconds with
+  three expected skips. The same source passed source-lock refresh/check, Ruff
+  lint and formatting, Python 3.9 `compileall`, `actionlint`, and
+  `git diff --check`; the two macOS Python 3.9 CI-targeted pending-regular
+  compatibility tests passed locally. The new cleanup path preserves a failed
+  exclusive-file creation error where `add_note` exists and uses a chained,
+  fail-closed `SyncError` on Python 3.9 when final-name cleanup fails.

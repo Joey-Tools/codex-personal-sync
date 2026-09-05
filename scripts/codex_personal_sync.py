@@ -190,7 +190,7 @@ FAILED_MOVE_ISOLATION_DIRECTORY_NAME = "failed-move"
 FAILED_MOVE_ISOLATION_ENTRY_NAME = "entry"
 PENDING_LINK_POINTER_NAME = ".personal-sync-pending-transaction.json"
 PENDING_LINK_METADATA_NAME = "pending-transaction.json"
-PENDING_LINK_METADATA_VERSION = 9
+PENDING_LINK_METADATA_VERSION = 10
 PENDING_RELINQUISH_FOREIGN_ACTION = "relinquish-foreign"
 PENDING_LINK_V4_ACTIONS = frozenset(
     {
@@ -209,6 +209,7 @@ PENDING_LINK_ACTIONS_BY_METADATA_VERSION = {
     7: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
     8: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
     9: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
+    10: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
 }
 SUPPORTED_PENDING_LINK_METADATA_VERSIONS = frozenset(
     PENDING_LINK_ACTIONS_BY_METADATA_VERSION
@@ -4666,7 +4667,9 @@ class PendingLinkRecord:
     owner: str | None
     link_target: str | None
     release_sha: str | None
+    before_materialization: str | None
     materialization: str
+    removed_link_key: str | None
     regular_sha256: str | None
     regular_size: int | None
     regular_mode: int | None
@@ -4684,6 +4687,12 @@ class PendingLinkRecord:
 
     def is_regular(self) -> bool:
         return self.materialization == "regular"
+
+    def before_is_regular(self) -> bool:
+        return self.before_materialization == "regular"
+
+    def has_regular_authority(self) -> bool:
+        return self.is_regular() or self.before_is_regular()
 
     def managed_record(self) -> ManagedLinkRecord:
         if (
@@ -10195,6 +10204,12 @@ def _atomic_move_beneath_home(
                             "failed-move isolated evidence changed before exact "
                             f"restoration and was retained at {isolated}"
                         )
+                if source_regular_for_restore is not None:
+                    _require_managed_regular_parent_chain_access(
+                        home,
+                        source.parent,
+                        bound_parent_fd=rollback_source_parent_fd,
+                    )
                 _rename_noreplace_at(
                     isolated_parent_fd,
                     isolated.name,
@@ -10459,6 +10474,7 @@ def _remove_expected_regular_file_beneath(
     try:
         quarantine_path, moved = _move_regular_leaf_to_unique_quarantine(
             home,
+            target.parent,
             parent_fd,
             target.name,
             label="remove",
@@ -10775,6 +10791,7 @@ def _move_symlink_leaf_to_unique_quarantine(
 
 def _move_regular_leaf_to_unique_quarantine(
     home: Path,
+    source_parent: Path,
     source_parent_fd: int,
     source_name: str,
     *,
@@ -10818,6 +10835,11 @@ def _move_regular_leaf_to_unique_quarantine(
         for attempt in range(100):
             destination_name = f"{label}-{os.getpid()}-{time.time_ns()}-{attempt}"
             try:
+                _require_managed_regular_parent_chain_access(
+                    home,
+                    source_parent,
+                    bound_parent_fd=source_parent_fd,
+                )
                 _rename_noreplace_at(
                     source_parent_fd,
                     source_name,
@@ -11284,6 +11306,7 @@ def _create_regular_file_beneath(
             try:
                 quarantine_path, moved = _move_regular_leaf_to_unique_quarantine(
                     home,
+                    target.parent,
                     parent_fd,
                     target.name,
                     label="create-cleanup",
@@ -13155,10 +13178,10 @@ def _build_pending_regular_alias_authority_index(
         return mutable_authorities.setdefault(identity, (set(), set()))
 
     for record in batch.records:
-        if not record.is_regular():
+        if not record.has_regular_authority():
             continue
         target = home / Path(*record.target.parts)
-        if record.evidence_identity is not None:
+        if record.is_regular() and record.evidence_identity is not None:
             if record.stage is None or record.evidence is None:
                 raise SyncError(
                     f"pending regular-file alias authority is incomplete: {record.target}"
@@ -13168,7 +13191,7 @@ def _build_pending_regular_alias_authority_index(
             evidence = batch.batch_root / Path(*record.evidence.parts)
             authorized_paths.update((stage, evidence, target))
             required_paths.update((stage, evidence))
-        if record.before_evidence_identity is not None:
+        if record.before_is_regular() and record.before_evidence_identity is not None:
             if record.before_evidence is None:
                 raise SyncError(
                     f"pending regular-file preimage authority is incomplete: {record.target}"
@@ -13780,6 +13803,178 @@ def _removed_link_target(home: Path, removed: RemovedLink) -> str:
     return _desired_link_target(home, entry)
 
 
+def _removed_link_exactly_matches_managed_record(
+    removed: RemovedLink,
+    record: ManagedLinkRecord,
+) -> bool:
+    return (
+        removed.source == record.source
+        and removed.target == record.target
+        and removed.kind == record.kind
+        and removed.owner == record.owner
+    )
+
+
+def _same_target_regular_to_symlink_removal(
+    removed_links: list[RemovedLink] | tuple[RemovedLink, ...],
+    record: ManagedLinkRecord,
+    desired_entry: LinkEntry,
+    *,
+    removed_link_key: str | None = None,
+) -> RemovedLink | None:
+    if (
+        not _record_materializes_regular_file(record)
+        or _entry_materializes_regular_file(desired_entry)
+        or desired_entry.kind not in {"directory", "skill"}
+        or desired_entry.target != record.target
+    ):
+        return None
+    matches = [
+        removed
+        for removed in removed_links
+        if _removed_link_exactly_matches_managed_record(removed, record)
+        and removed.replacement_target == desired_entry.target
+        and (removed_link_key is None or _removed_link_key(removed) == removed_link_key)
+    ]
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _regular_to_symlink_reconcile_action_is_typed(
+    action: ReconcileAction,
+) -> bool:
+    return (
+        action.action == "quarantine-replace"
+        and action.materialization == "symlink"
+        and action.kind in {"directory", "skill"}
+        and action.regular_source is None
+        and action.regular_size is None
+        and action.expected_link_target is not None
+        and action.removed_link_key is not None
+        and bool(action.link_target)
+        and action.planned_snapshot is not None
+        and _regular_snapshot_from_reconcile(action.planned_snapshot) is not None
+    )
+
+
+def _pending_release_removal_authority(
+    home: Path,
+    expectation: PendingReleaseExpectation,
+) -> dict[str, RemovedLink]:
+    """Return removal authority from one exact receipt-bound release snapshot."""
+    identity, directory_identity = _installed_release_identity_and_directory_identity(
+        home,
+        expectation.owner,
+        expectation.sha,
+    )
+    if (
+        directory_identity != expectation.directory_identity
+        or identity[2] != expectation.tree_sha256
+    ):
+        raise SyncError(
+            "pending removal-authority release tree changed: "
+            f"{expectation.owner}@{expectation.sha}"
+        )
+    removal_by_key: dict[str, RemovedLink] = {}
+    for removed in identity[1].removed_links:
+        key = _removed_link_key(removed)
+        if key in removal_by_key:
+            raise SyncError(f"pending release has duplicate removal authority: {key}")
+        removal_by_key[key] = removed
+    return removal_by_key
+
+
+def _pending_regular_to_symlink_transition_is_authorized(
+    home: Path,
+    record: PendingLinkRecord,
+    state_before: ManagedState,
+    state_after: ManagedState,
+    before_expectations_by_owner: dict[str, PendingReleaseExpectation],
+    after_expectations_by_owner: dict[str, PendingReleaseExpectation],
+    removal_authority_by_release: dict[tuple[str, str], dict[str, RemovedLink]],
+) -> bool:
+    if (
+        record.scope != "managed"
+        or record.action != "quarantine-replace"
+        or record.before_materialization != "regular"
+        or record.materialization != "symlink"
+        or record.kind not in {"directory", "skill"}
+        or record.removed_link_key is None
+        or record.link_target is None
+        or any(
+            value is not None
+            for value in (
+                record.regular_sha256,
+                record.regular_size,
+                record.regular_mode,
+                record.regular_uid,
+                record.regular_gid,
+                record.regular_link_count,
+            )
+        )
+    ):
+        return False
+    before_record = state_before.links.get(record.target)
+    after_record = state_after.links.get(record.target)
+    planned = _regular_snapshot_from_reconcile(record.planned_snapshot)
+    if (
+        before_record is None
+        or after_record is None
+        or planned is None
+        or not _record_materializes_regular_file(before_record)
+        or _record_materializes_regular_file(after_record)
+        or after_record.kind != record.kind
+        or after_record.source != record.source
+        or after_record.owner != record.owner
+        or after_record.release_sha != record.release_sha
+        or after_record.link_target != record.link_target
+        or planned.mode != 0o600
+        or planned.uid != os.geteuid()
+        or planned.link_count != 2
+    ):
+        return False
+    removal_owner, _removed_id = record.removed_link_key.split(":", 1)
+    if (
+        removal_owner != before_record.owner
+        or state_before.owners.get(removal_owner) != before_record.release_sha
+    ):
+        return False
+    expectation = (
+        after_expectations_by_owner.get(removal_owner)
+        if removal_owner in state_after.owners
+        else before_expectations_by_owner.get(removal_owner)
+    )
+    if expectation is None:
+        return False
+    try:
+        prior_source = _record_regular_source_path(home, before_record)
+        if planned.sha256 != _regular_source_sha256(home, prior_source):
+            return False
+        desired_entry = LinkEntry(
+            source=after_record.source,
+            target=after_record.target,
+            kind=after_record.kind,
+            owner=after_record.owner,
+        )
+        cache_key = (expectation.owner, expectation.sha)
+        removal_by_key = removal_authority_by_release.get(cache_key)
+        if removal_by_key is None:
+            removal_by_key = _pending_release_removal_authority(home, expectation)
+            removal_authority_by_release[cache_key] = removal_by_key
+    except OSError as error:
+        raise SyncError(
+            "cannot revalidate pending regular-to-symlink removal authority: "
+            f"{record.target}: {error}"
+        ) from error
+    removed = removal_by_key.get(record.removed_link_key)
+    return (
+        removed is not None
+        and _removed_link_exactly_matches_managed_record(removed, before_record)
+        and removed.replacement_target == desired_entry.target
+    )
+
+
 def _combine_entries(
     public_entries: list[LinkEntry],
     overlay_manifests: list[ManifestData],
@@ -14146,6 +14341,57 @@ def _plan_reconciliation(
                         materialization="regular",
                         regular_source=regular_source,
                         regular_size=desired_regular_size,
+                    )
+                )
+                continue
+            if regular_source is None and planned_regular is not None:
+                if record is None:
+                    if _allows_optional_claim_relinquishment(
+                        relative_target,
+                        desired_entry,
+                    ):
+                        continue
+                    raise SyncError(
+                        "refusing to migrate unproven regular-file non-symlink "
+                        f"target: {target}"
+                    )
+                if not _record_materializes_regular_file(record):
+                    raise SyncError(
+                        f"managed state target type mismatch for regular file: {target}"
+                    )
+                if not _regular_snapshot_has_managed_access(planned_regular):
+                    raise SyncError(
+                        f"managed regular file access policy mismatch: {target}"
+                    )
+                prior_source = _record_regular_source_path(home, record)
+                if planned_regular.sha256 != regular_budget.digest(home, prior_source):
+                    raise SyncError(
+                        f"refusing to replace modified managed regular file: {target}"
+                    )
+                removed_match = _same_target_regular_to_symlink_removal(
+                    removed_by_target.get(relative_target, []),
+                    record,
+                    desired_entry,
+                )
+                if removed_match is None:
+                    raise SyncError(
+                        "refusing to migrate managed regular file without an exact "
+                        f"same-target removal: {target}"
+                    )
+                if removed_match.owner != desired_entry.owner and not allow_cross_owner:
+                    raise SyncError(
+                        f"cross-owner migration requires install-private: {target}"
+                    )
+                actions.append(
+                    ReconcileAction(
+                        "quarantine-replace",
+                        target,
+                        desired,
+                        desired_entry.kind,
+                        expected_link_target=record.link_target,
+                        removed_link_key=_removed_link_key(removed_match),
+                        planned_snapshot=planned_snapshot,
+                        materialization="symlink",
                     )
                 )
                 continue
@@ -14977,7 +15223,9 @@ def _pending_link_metadata_payload(
                 "owner": record.owner,
                 "link_target": record.link_target,
                 "release_sha": record.release_sha,
+                "before_materialization": record.before_materialization,
                 "materialization": record.materialization,
+                "removed_link": record.removed_link_key,
                 "regular_sha256": record.regular_sha256,
                 "regular_size": record.regular_size,
                 "regular_mode": record.regular_mode,
@@ -15024,43 +15272,25 @@ def _write_exclusive_internal_file(
 ) -> ManagedStateFileSnapshot:
     parent_fd = _open_directory_beneath(home, path.parent)
     file_fd = -1
-    empty_snapshot: ManagedStateFileSnapshot | None = None
+    parent_identity: tuple[int, int] | None = None
+    created_identity: tuple[int, int, int] | None = None
     try:
+        parent_identity = _directory_identity(parent_fd)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         flags |= getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         file_fd = os.open(path.name, flags, 0o600, dir_fd=parent_fd)
         created = os.fstat(file_fd)
-        empty_snapshot = ManagedStateFileSnapshot(
-            exists=True,
-            payload=b"",
-            mode=stat.S_IMODE(created.st_mode),
-            parent_identity=_directory_identity(parent_fd),
-            file_identity=(created.st_dev, created.st_ino),
-            file_type=stat.S_IFMT(created.st_mode),
-            size=created.st_size,
-            uid=created.st_uid,
-            gid=created.st_gid,
-        )
+        created_identity = _exclusive_internal_object_identity(created)
+        if created_identity[2] != stat.S_IFREG:
+            raise SyncError(f"exclusive internal authority is not regular: {path}")
         os.fchmod(file_fd, 0o600)
-        admitted = _require_pending_cleanup_fd_access_policy(
+        _require_pending_cleanup_fd_access_policy(
             file_fd,
             path,
             expected_mode=0o600,
         )
-        empty_snapshot = ManagedStateFileSnapshot(
-            exists=True,
-            payload=b"",
-            mode=stat.S_IMODE(admitted.st_mode),
-            parent_identity=_directory_identity(parent_fd),
-            file_identity=(admitted.st_dev, admitted.st_ino),
-            file_type=stat.S_IFMT(admitted.st_mode),
-            size=admitted.st_size,
-            uid=admitted.st_uid,
-            gid=admitted.st_gid,
-        )
-        with os.fdopen(file_fd, "wb", closefd=True) as file:
-            file_fd = -1
+        with os.fdopen(file_fd, "wb", closefd=False) as file:
             file.write(payload)
             file.flush()
             os.fsync(file.fileno())
@@ -15072,24 +15302,34 @@ def _write_exclusive_internal_file(
         os.fsync(parent_fd)
         return _read_managed_state_file_snapshot(home, path, parent_fd)
     except BaseException as original_error:
-        if file_fd >= 0:
-            _close_fd_quietly(file_fd)
-            file_fd = -1
-        if empty_snapshot is not None:
+        if (
+            file_fd >= 0
+            and parent_identity is not None
+            and created_identity is not None
+        ):
             try:
-                _isolate_and_delete_pending_cleanup_file(
+                _cleanup_created_exclusive_internal_file(
                     home,
                     path,
                     parent_fd,
-                    empty_snapshot,
+                    file_fd,
+                    parent_identity,
+                    created_identity,
                     label="exclusive internal authority",
                 )
             except (OSError, SyncError) as cleanup_error:
-                original_error.add_note(
+                cleanup_note = (
                     "exclusive internal authority creation failed and its "
                     "final name could not be safely cleared: "
                     f"{cleanup_error}"
                 )
+                add_note = getattr(original_error, "add_note", None)
+                if callable(add_note):
+                    add_note(cleanup_note)
+                else:
+                    raise SyncError(
+                        f"{cleanup_note}; original creation failure: {original_error}"
+                    ) from cleanup_error
         raise
     finally:
         if file_fd >= 0:
@@ -15741,16 +15981,27 @@ def _delete_pending_regular_publication_beneath(
     *,
     phase: str,
 ) -> None:
-    if not record.is_regular() or record.action not in {
-        "create",
-        "replace",
-        "quarantine-replace",
-    }:
+    produced_authority = (
+        phase == "produced"
+        and record.is_regular()
+        and record.action in {"create", "replace", "quarantine-replace"}
+    )
+    before_authority = (
+        phase == "before"
+        and record.before_is_regular()
+        and record.action
+        in {"replace", "quarantine-replace", "remove", "quarantine-remove"}
+    )
+    if not (produced_authority or before_authority):
         raise SyncError("pending regular publication cleanup has an invalid record")
-    if batch.metadata_version < 8:
+    if _pending_regular_publication_uses_receiptless_cleanup(
+        batch,
+        record,
+        phase,
+    ):
         # Metadata v6/v7 predates the durable publication receipt. Preserve its
-        # exact deletion protocol instead of routing legacy recovery through a
-        # receipt path that those closed metadata versions cannot name.
+        # exact deletion protocol for those versions and for the v8/v9 managed
+        # regular-removal shape whose closed writers emitted a null receipt.
         _delete_exact_regular_publication_beneath(home, target, expected)
         return
     existing = _read_pending_regular_publication_cleanup(home, batch, record, phase)
@@ -15828,6 +16079,20 @@ def _delete_pending_regular_publication_beneath(
         _close_fd_quietly(parent_fd)
 
 
+def _pending_regular_publication_uses_receiptless_cleanup(
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+) -> bool:
+    if batch.metadata_version < 8:
+        return True
+    return (
+        phase == "before"
+        and batch.metadata_version in {8, 9}
+        and record.publication_cleanup is None
+    )
+
+
 def _legacy_pending_regular_publication_phase_authority(
     record: PendingLinkRecord,
     phase: str,
@@ -15871,21 +16136,32 @@ def _build_legacy_pending_regular_publication_active_entry_index(
     home: Path,
     batch: PendingLinkBatch,
 ) -> _LegacyPendingRegularPublicationActiveEntryIndex:
-    if batch.metadata_version not in {6, 7}:
+    if batch.metadata_version not in {6, 7, 8, 9}:
         return _LegacyPendingRegularPublicationActiveEntryIndex({})
     planned_by_parent: dict[
         tuple[Path, tuple[int, int]], set[tuple[int, int, int]]
     ] = {}
     for record in batch.records:
-        if not record.is_regular() or record.action not in {
-            "create",
-            "replace",
-            "quarantine-replace",
-        }:
+        phases: list[str] = []
+        if (
+            record.is_regular()
+            and record.action in {"create", "replace", "quarantine-replace"}
+            and _pending_regular_publication_uses_receiptless_cleanup(
+                batch, record, "produced"
+            )
+        ):
+            phases.append("produced")
+        if (
+            record.before_is_regular()
+            and record.action
+            in {"replace", "quarantine-replace", "remove", "quarantine-remove"}
+            and _pending_regular_publication_uses_receiptless_cleanup(
+                batch, record, "before"
+            )
+        ):
+            phases.append("before")
+        if not phases:
             continue
-        phases = ("produced",)
-        if record.action in {"replace", "quarantine-replace"}:
-            phases += ("before",)
         target = home / Path(*record.target.parts)
         for phase in phases:
             (
@@ -15915,6 +16191,11 @@ def _build_legacy_pending_regular_publication_active_entry_index(
                 home, parent, parent_fd
             ):
                 raise SyncError("pending legacy regular publication parent changed")
+            _require_managed_regular_parent_chain_access(
+                home,
+                parent,
+                bound_parent_fd=parent_fd,
+            )
             with os.scandir(parent_fd) as entries:
                 for entry in entries:
                     scanned_entries += 1
@@ -15932,6 +16213,11 @@ def _build_legacy_pending_regular_publication_active_entry_index(
                         names_by_parent_plan.setdefault(
                             (parent, parent_identity, planned), set()
                         ).add(entry.name)
+            _require_managed_regular_parent_chain_access(
+                home,
+                parent,
+                bound_parent_fd=parent_fd,
+            )
             if not _bound_directory_matches(home, parent, parent_fd):
                 raise SyncError("pending legacy regular publication parent changed")
         finally:
@@ -15947,7 +16233,11 @@ def _recover_legacy_pending_regular_publication_active_entry(
     *,
     active_entry_index: _LegacyPendingRegularPublicationActiveEntryIndex | None = None,
 ) -> None:
-    if batch.metadata_version not in {6, 7}:
+    if not _pending_regular_publication_uses_receiptless_cleanup(
+        batch,
+        record,
+        phase,
+    ):
         return
     (
         parent_identity,
@@ -15973,6 +16263,11 @@ def _recover_legacy_pending_regular_publication_active_entry(
             home, target.parent, parent_fd
         ):
             raise SyncError("pending legacy regular publication parent changed")
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=parent_fd,
+        )
         target_identity = _named_entry_identity(parent_fd, target.name)
         if len(candidates) != 1 or target_identity == file_identity:
             raise SyncError("pending legacy regular publication cleanup is ambiguous")
@@ -16033,8 +16328,50 @@ def _recover_legacy_pending_regular_publication_active_entry(
             )
         if not matches:
             raise SyncError("pending legacy regular publication active entry changed")
+        # Child-entry churn is allowed, but the complete managed parent-chain
+        # access policy and exact active leaf must still match at unlink time.
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=parent_fd,
+        )
+        destructive_snapshot = _regular_file_snapshot_at(
+            parent_fd,
+            active_name,
+            target.with_name(active_name),
+            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+        )
+        if phase == "produced":
+            destructive_matches = _pending_regular_publication_snapshot_matches(
+                destructive_snapshot,
+                record,
+                expected_link_count=expected_link_count,
+            )
+        else:
+            assert planned_regular is not None
+            destructive_matches = _regular_snapshot_matches(
+                destructive_snapshot,
+                parent_identity,
+                planned_regular,
+                expected_link_count=expected_link_count,
+            )
+        if (
+            not destructive_matches
+            or _pending_cleanup_internal_entry_plan(
+                active_name,
+                PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                parent_identity,
+            )
+            != planned
+        ):
+            raise SyncError("pending legacy regular publication active entry changed")
         os.unlink(active_name, dir_fd=parent_fd)
         os.fsync(parent_fd)
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=parent_fd,
+        )
         if _named_entry_identity(
             parent_fd, active_name
         ) is not None or not _bound_directory_matches(home, target.parent, parent_fd):
@@ -16060,13 +16397,24 @@ def _recover_pending_regular_publication_cleanup(
     legacy_active_entry_index: _LegacyPendingRegularPublicationActiveEntryIndex
     | None = None,
 ) -> None:
-    if not record.is_regular() or record.action not in {
-        "create",
-        "replace",
-        "quarantine-replace",
-    }:
+    produced_authority = (
+        phase == "produced"
+        and record.is_regular()
+        and record.action in {"create", "replace", "quarantine-replace"}
+    )
+    before_authority = (
+        phase == "before"
+        and record.before_is_regular()
+        and record.action
+        in {"replace", "quarantine-replace", "remove", "quarantine-remove"}
+    )
+    if not (produced_authority or before_authority):
         return
-    if batch.metadata_version < 8:
+    if _pending_regular_publication_uses_receiptless_cleanup(
+        batch,
+        record,
+        phase,
+    ):
         _recover_legacy_pending_regular_publication_active_entry(
             home,
             batch,
@@ -16556,6 +16904,26 @@ def _pending_link_record_for_action(
         raise SyncError(f"unsupported pending materialization: {materialization}")
     if materialization == "regular" and scope != "managed":
         raise SyncError("only managed targets may materialize as regular files")
+    removed_link_key = action.removed_link_key
+    if removed_link_key is not None:
+        removed_link_key = _validate_removed_link_key(
+            removed_link_key,
+            "pending removed link",
+        )
+    planned_regular = _regular_snapshot_from_reconcile(action.planned_snapshot)
+    before_materialization = (
+        ("regular" if planned_regular is not None else "symlink")
+        if destructive
+        else None
+    )
+    if (
+        before_materialization == "regular"
+        and materialization == "symlink"
+        and not _regular_to_symlink_reconcile_action_is_typed(action)
+    ):
+        raise SyncError(
+            f"regular-file preimage has an untyped symlink action: {target}"
+        )
     if scope == "managed" and relinquishing_foreign:
         entry = desired_by_target.get(target)
         state_record = current_owner_state.links.get(target)
@@ -16622,7 +16990,9 @@ def _pending_link_record_for_action(
         owner=owner,
         link_target=link_target,
         release_sha=release_sha,
+        before_materialization=before_materialization,
         materialization=materialization,
+        removed_link_key=removed_link_key,
         regular_sha256=None,
         regular_size=None,
         regular_mode=None,
@@ -16642,7 +17012,8 @@ def _pending_link_record_for_action(
         evidence_identity=None,
         publication_cleanup=(
             PurePosixPath("pending", "cleanup", leaf + ".json")
-            if producing and materialization == "regular"
+            if (producing and materialization == "regular")
+            or (destructive and before_materialization == "regular")
             else None
         ),
     )
@@ -16738,9 +17109,19 @@ def _projected_pending_record_payload(
         "owner": owner,
         "link_target": action.link_target if producing else None,
         "release_sha": release_sha if producing else None,
+        "before_materialization": (
+            "regular"
+            if destructive
+            and action.planned_snapshot is not None
+            and _regular_snapshot_from_reconcile(action.planned_snapshot) is not None
+            else "symlink"
+            if destructive
+            else None
+        ),
         "materialization": (
             action.materialization if producing or destructive else "symlink"
         ),
+        "removed_link": action.removed_link_key,
         "regular_sha256": "f" * 64
         if producing and action.materialization == "regular"
         else None,
@@ -16780,7 +17161,13 @@ def _projected_pending_record_payload(
         ),
         "publication_cleanup": (
             PurePosixPath("pending", "cleanup", leaf + ".json").as_posix()
-            if producing and action.materialization == "regular"
+            if (producing and action.materialization == "regular")
+            or (
+                destructive
+                and action.planned_snapshot is not None
+                and _regular_snapshot_from_reconcile(action.planned_snapshot)
+                is not None
+            )
             else None
         ),
     }
@@ -16807,7 +17194,9 @@ def _projected_retired_absence_record_payload(
         "owner": None,
         "link_target": None,
         "release_sha": None,
+        "before_materialization": None,
         "materialization": "symlink",
+        "removed_link": None,
         "regular_sha256": None,
         "regular_size": None,
         "regular_mode": None,
@@ -16846,7 +17235,9 @@ def _projected_retired_current_absence_record_payload(
         "owner": owner,
         "link_target": None,
         "release_sha": None,
+        "before_materialization": None,
         "materialization": "symlink",
+        "removed_link": None,
         "regular_sha256": None,
         "regular_size": None,
         "regular_mode": None,
@@ -18236,7 +18627,9 @@ def _stage_pending_link_batch(
                 owner=None,
                 link_target=None,
                 release_sha=None,
+                before_materialization=None,
                 materialization="symlink",
+                removed_link_key=None,
                 regular_sha256=None,
                 regular_size=None,
                 regular_mode=None,
@@ -18284,7 +18677,9 @@ def _stage_pending_link_batch(
                 owner=owner,
                 link_target=None,
                 release_sha=None,
+                before_materialization=None,
                 materialization="symlink",
+                removed_link_key=None,
                 regular_sha256=None,
                 regular_size=None,
                 regular_mode=None,
@@ -19094,6 +19489,12 @@ def _parse_pending_link_batch(
                 "pending transaction reused release expectation changed between "
                 f"phases: {expectation.owner}@{expectation.sha}"
             )
+    before_expectations_by_owner = {
+        expectation.owner: expectation for expectation in releases_before
+    }
+    after_expectations_by_owner = {
+        expectation.owner: expectation for expectation in releases_after
+    }
     commit_evidence, commit_evidence_path = _read_pending_commit_evidence(
         home,
         batch_root,
@@ -19109,6 +19510,7 @@ def _parse_pending_link_batch(
         raise SyncError("pending transaction records must be a bounded array")
     records: list[PendingLinkRecord] = []
     seen: set[tuple[str, PurePosixPath]] = set()
+    removal_authority_by_release: dict[tuple[str, str], dict[str, RemovedLink]] = {}
     relinquishment_desired_by_target: dict[PurePosixPath, LinkEntry] | None = None
     expected_fields = {
         "index",
@@ -19142,6 +19544,8 @@ def _parse_pending_link_batch(
         expected_fields.update(v6_fields)
     if version >= 8:
         expected_fields.add("publication_cleanup")
+    if version >= 10:
+        expected_fields.update({"before_materialization", "removed_link"})
     for index, raw_record in enumerate(raw_records):
         if not isinstance(raw_record, dict) or set(raw_record) != expected_fields:
             raise SyncError(f"pending transaction record #{index + 1} is invalid")
@@ -19217,6 +19621,34 @@ def _parse_pending_link_batch(
         )
         all_regular_values = (*regular_values, regular_gid)
         planned_regular = _regular_snapshot_from_reconcile(planned)
+        before_materialization = (
+            raw_record.get("before_materialization")
+            if version >= 10
+            else (
+                "regular"
+                if destructive and planned_regular is not None
+                else "symlink"
+                if destructive
+                else None
+            )
+        )
+        expected_before_materialization = (
+            "regular"
+            if destructive and planned_regular is not None
+            else "symlink"
+            if destructive
+            else None
+        )
+        if before_materialization != expected_before_materialization:
+            raise SyncError(
+                f"pending target {target} has invalid before materialization"
+            )
+        raw_removed_link = raw_record.get("removed_link") if version >= 10 else None
+        removed_link_key = (
+            None
+            if raw_removed_link is None
+            else _validate_removed_link_key(raw_removed_link, "pending removed link")
+        )
         if materialization == "regular":
             produced_regular_is_invalid = producing and (
                 not isinstance(regular_sha256, str)
@@ -19256,7 +19688,18 @@ def _parse_pending_link_batch(
             raise SyncError(
                 f"pending symlink target {target} has regular-file evidence"
             )
-        elif planned_regular is not None and not relinquishing_foreign:
+        elif (
+            planned_regular is not None
+            and not relinquishing_foreign
+            and not (
+                version >= 10
+                and action == "quarantine-replace"
+                and scope == "managed"
+                and kind in {"directory", "skill"}
+                and before_materialization == "regular"
+                and removed_link_key is not None
+            )
+        ):
             raise SyncError(
                 f"pending regular-file preimage {target} has symlink materialization"
             )
@@ -19296,10 +19739,21 @@ def _parse_pending_link_batch(
         )
         expected_cleanup = (
             PurePosixPath("pending", "cleanup", leaf + ".json")
-            if version >= 8 and producing and materialization == "regular"
+            if version >= 8
+            and (
+                (producing and materialization == "regular")
+                or (destructive and before_materialization == "regular")
+            )
             else None
         )
-        if publication_cleanup != expected_cleanup:
+        receiptless_v8_v9_before = (
+            version in {8, 9}
+            and destructive
+            and before_materialization == "regular"
+            and not (producing and materialization == "regular")
+            and publication_cleanup is None
+        )
+        if publication_cleanup != expected_cleanup and not receiptless_v8_v9_before:
             raise SyncError(
                 f"pending target {target} has invalid publication cleanup path"
             )
@@ -19547,35 +20001,53 @@ def _parse_pending_link_batch(
         if key in seen:
             raise SyncError(f"duplicate pending transaction target: {target}")
         seen.add(key)
-        records.append(
-            PendingLinkRecord(
-                index=index,
-                scope=scope,
-                action=action,
-                target=target,
-                kind=kind,
-                planned_snapshot=planned,
-                source=source,
-                owner=owner,
-                link_target=link_target,
-                release_sha=release_sha,
-                materialization=materialization,
-                regular_sha256=regular_sha256,
-                regular_size=regular_size,
-                regular_mode=regular_mode,
-                regular_uid=regular_uid,
-                regular_gid=regular_gid,
-                regular_link_count=regular_link_count,
-                before_evidence=before_evidence,
-                before_evidence_identity=before_identity,
-                backup=backup,
-                stage=stage,
-                stage_identity=stage_identity,
-                evidence=evidence,
-                evidence_identity=evidence_identity,
-                publication_cleanup=publication_cleanup,
-            )
+        pending_record = PendingLinkRecord(
+            index=index,
+            scope=scope,
+            action=action,
+            target=target,
+            kind=kind,
+            planned_snapshot=planned,
+            source=source,
+            owner=owner,
+            link_target=link_target,
+            release_sha=release_sha,
+            before_materialization=before_materialization,
+            materialization=materialization,
+            removed_link_key=removed_link_key,
+            regular_sha256=regular_sha256,
+            regular_size=regular_size,
+            regular_mode=regular_mode,
+            regular_uid=regular_uid,
+            regular_gid=regular_gid,
+            regular_link_count=regular_link_count,
+            before_evidence=before_evidence,
+            before_evidence_identity=before_identity,
+            backup=backup,
+            stage=stage,
+            stage_identity=stage_identity,
+            evidence=evidence,
+            evidence_identity=evidence_identity,
+            publication_cleanup=publication_cleanup,
         )
+        if (
+            pending_record.before_is_regular()
+            and not pending_record.is_regular()
+            and not _pending_regular_to_symlink_transition_is_authorized(
+                home,
+                pending_record,
+                state_before_value,
+                state_after_value,
+                before_expectations_by_owner,
+                after_expectations_by_owner,
+                removal_authority_by_release,
+            )
+        ):
+            raise SyncError(
+                "pending regular-to-symlink transition lacks exact removal "
+                f"authority: {target}"
+            )
+        records.append(pending_record)
     for record in records:
         if record.action == "create":
             _require_pending_record_bound_create_absence(record)
@@ -20310,6 +20782,100 @@ def _retained_pending_cleanup_names_for_path(
     if not _bound_directory_matches(home, path.parent, parent_fd):
         raise SyncError(f"{label} parent changed while scanning retained evidence")
     return tuple(sorted(matches))
+
+
+def _exclusive_internal_object_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int]:
+    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+
+def _cleanup_created_exclusive_internal_file(
+    home: Path,
+    path: Path,
+    parent_fd: int,
+    file_fd: int,
+    parent_identity: tuple[int, int],
+    created_identity: tuple[int, int, int],
+    *,
+    label: str,
+) -> None:
+    """Remove only the inode retained from this function's O_EXCL create."""
+
+    def require_parent_binding(stage: str) -> None:
+        try:
+            descriptor_parent_identity = _directory_identity(parent_fd)
+        except (OSError, SyncError) as error:
+            raise SyncError(f"{label} parent is unreadable {stage}") from error
+        if (
+            descriptor_parent_identity != parent_identity
+            or not _bound_directory_matches(home, path.parent, parent_fd)
+        ):
+            raise SyncError(f"{label} parent changed {stage}")
+
+    def require_descriptor_identity(stage: str) -> None:
+        try:
+            identity = _exclusive_internal_object_identity(os.fstat(file_fd))
+        except OSError as error:
+            raise SyncError(
+                f"{label} retained descriptor is unreadable {stage}"
+            ) from error
+        if identity != created_identity:
+            raise SyncError(f"{label} retained descriptor changed {stage}")
+
+    def named_identity(name: str, stage: str) -> tuple[int, int, int] | None:
+        try:
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise SyncError(f"{label} name is unreadable {stage}: {name}") from error
+        return _exclusive_internal_object_identity(metadata)
+
+    if created_identity[2] != stat.S_IFREG:
+        raise SyncError(f"{label} has no regular-file creation identity")
+    require_parent_binding("before isolation")
+    require_descriptor_identity("before isolation")
+    final_identity = named_identity(path.name, "before isolation")
+    if final_identity is None:
+        raise SyncError(f"{label} disappeared before isolation")
+    if final_identity != created_identity:
+        raise SyncError(f"{label} was replaced before isolation")
+
+    retained_name: str | None = None
+    for candidate in _retained_pending_cleanup_names(path):
+        try:
+            _rename_noreplace_at(parent_fd, path.name, parent_fd, candidate)
+        except FileExistsError:
+            continue
+        except FileNotFoundError as error:
+            raise SyncError(f"{label} disappeared during isolation") from error
+        retained_name = candidate
+        break
+    assert retained_name is not None
+    os.fsync(parent_fd)
+
+    require_parent_binding("after isolation")
+    require_descriptor_identity("after isolation")
+    retained_identity = named_identity(retained_name, "after isolation")
+    if retained_identity is None:
+        raise SyncError(f"{label} retained name disappeared after isolation")
+    if retained_identity != created_identity:
+        raise SyncError(
+            f"{label} retained name was replaced after isolation: {retained_name}"
+        )
+    if named_identity(path.name, "after isolation") == created_identity:
+        raise SyncError(f"{label} final name rebound to the created object")
+
+    os.unlink(retained_name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+    require_parent_binding("after deletion")
+    require_descriptor_identity("after deletion")
+    if named_identity(retained_name, "after deletion") is not None:
+        raise SyncError(f"{label} retained name reappeared after deletion")
+    if named_identity(path.name, "after deletion") == created_identity:
+        raise SyncError(f"{label} final name rebound after deletion")
 
 
 def _isolate_and_delete_pending_cleanup_file(
@@ -22567,6 +23133,20 @@ def _cleanup_directory_expected_mode(
     return configured_expected_mode
 
 
+def _cleanup_regular_file_expected_mode(
+    configured_expected_mode: int | None,
+    relative_parts: tuple[str, ...],
+    *,
+    links_content_root: bool,
+) -> int | None:
+    """Select exact control-file or flexible typed links-content policy."""
+    if configured_expected_mode is None:
+        return None
+    if links_content_root or (relative_parts and relative_parts[0] == "links"):
+        return None
+    return configured_expected_mode
+
+
 def _capture_pending_cleanup_identity_ledger(
     directory_fd: int,
     directory_identity: tuple[int, int],
@@ -22976,7 +23556,14 @@ def _remove_pending_batch_directory_contents(
                     display_path = (
                         Path("<pending-cleanup-file>") / Path(*relative_parts) / name
                     )
-                    if regular_file_expected_mode is None:
+                    effective_regular_file_expected_mode = (
+                        _cleanup_regular_file_expected_mode(
+                            regular_file_expected_mode,
+                            relative_parts,
+                            links_content_root=links_content_root,
+                        )
+                    )
+                    if effective_regular_file_expected_mode is None:
                         opened = _require_current_user_cleanup_fd_access_policy(
                             file_fd,
                             display_path,
@@ -22985,7 +23572,7 @@ def _remove_pending_batch_directory_contents(
                         opened = _require_pending_cleanup_fd_access_policy(
                             file_fd,
                             display_path,
-                            expected_mode=regular_file_expected_mode,
+                            expected_mode=effective_regular_file_expected_mode,
                         )
                     if _pending_cleanup_entry_plan(opened) != planned:
                         raise SyncError(f"pending cleanup regular file changed: {name}")
@@ -25283,7 +25870,7 @@ def _verify_committed_pending_link_records(
 
 
 def _batch_has_regular_records(batch: PendingLinkBatch) -> bool:
-    return any(record.is_regular() for record in batch.records)
+    return any(record.has_regular_authority() for record in batch.records)
 
 
 def _verify_final_regular_targets(
@@ -25427,7 +26014,7 @@ def _recover_pending_link_transaction(
     legacy_active_entry_index: (
         _LegacyPendingRegularPublicationActiveEntryIndex | None
     ) = None
-    if batch.metadata_version in {6, 7} and _batch_has_regular_records(batch):
+    if batch.metadata_version in {6, 7, 8, 9} and _batch_has_regular_records(batch):
         # The immutable batch metadata defines all legitimate hard-link aliases;
         # cache that authority once before any recovery mutation. Likewise, scan
         # each legacy active-entry parent once under one batch-wide budget.
@@ -25454,8 +26041,8 @@ def _recover_pending_link_transaction(
             "remove",
             "quarantine-remove",
         }
-        if record.is_regular():
-            if producing:
+        if record.has_regular_authority():
+            if producing and record.is_regular():
                 _recover_pending_regular_publication_cleanup(
                     home,
                     batch,
@@ -25463,7 +26050,7 @@ def _recover_pending_link_transaction(
                     "produced",
                     legacy_active_entry_index=legacy_active_entry_index,
                 )
-            if destructive:
+            if destructive and record.before_is_regular():
                 _recover_pending_regular_publication_cleanup(
                     home,
                     batch,
@@ -25706,6 +26293,7 @@ def _apply_reconcile_actions(
             action.planned_snapshot is not None
             and _regular_snapshot_from_reconcile(action.planned_snapshot) is not None
             and action.materialization != "regular"
+            and not _regular_to_symlink_reconcile_action_is_typed(action)
         ):
             raise SyncError(
                 f"regular-file preimage has a symlink action: {action.target}"
@@ -25811,6 +26399,7 @@ def _apply_reconcile_actions(
                 or record.kind != action.kind
                 or record.planned_snapshot != action.planned_snapshot
                 or record.materialization != action.materialization
+                or record.removed_link_key != action.removed_link_key
                 or record.link_target
                 != (
                     action.link_target
@@ -30659,29 +31248,41 @@ def _preflight_pending_recovery(
     action_budget = cleanup_budget or PendingCleanupActionBudget(
         MAX_PENDING_CLEANUP_BATCHES_PER_RUN
     )
-    observed_retention_transaction = _recover_release_retention_transaction(
+    observed_failed_move_isolation = _recover_failed_move_isolation(
         home,
         dry_run=True,
     )
-    observed_cleanup_ready_batch = _pending_cleanup_ready_batch_is_observed(home)
-    loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(home)
-    (
-        _loaded_state,
-        _initial_state_snapshot,
-        observed_pending_transaction,
-    ) = _recover_pending_link_transaction(
-        home,
-        loaded_state,
-        initial_state_snapshot,
-        dry_run=True,
-    )
+    observed_retention_transaction = None
+    observed_cleanup_ready_batch = False
+    observed_pending_transaction = False
+    if not observed_failed_move_isolation:
+        observed_retention_transaction = _recover_release_retention_transaction(
+            home,
+            dry_run=True,
+        )
+        observed_cleanup_ready_batch = _pending_cleanup_ready_batch_is_observed(home)
+        loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(home)
+        (
+            _loaded_state,
+            _initial_state_snapshot,
+            observed_pending_transaction,
+        ) = _recover_pending_link_transaction(
+            home,
+            loaded_state,
+            initial_state_snapshot,
+            dry_run=True,
+        )
     if (
-        not observed_retention_transaction
+        not observed_failed_move_isolation
+        and not observed_retention_transaction
         and not observed_pending_transaction
         and not observed_cleanup_ready_batch
     ):
         return False
     if dry_run:
+        if observed_failed_move_isolation:
+            print("would recover failed move isolation under the install lock")
+            return True
         if observed_pending_transaction:
             print(
                 "would recover pending personal sync transaction under the install lock"
@@ -30693,6 +31294,10 @@ def _preflight_pending_recovery(
             )
         return True
     with installation_lock(home):
+        recovered_failed_move_isolation = _recover_failed_move_isolation(
+            home,
+            dry_run=False,
+        )
         recovered_retention_transaction = _recover_release_retention_transaction(
             home,
             dry_run=False,
@@ -30713,7 +31318,8 @@ def _preflight_pending_recovery(
             dry_run=False,
         )
     return bool(
-        recovered_retention_transaction is not None
+        recovered_failed_move_isolation
+        or recovered_retention_transaction is not None
         or recovered_pending_transaction
         or cleaned_pending_batches
     )

@@ -81,6 +81,45 @@ def write_release(
     manifest.write_text(json.dumps(payload) + "\n", encoding="utf-8")
 
 
+def write_regular_to_symlink_release(
+    root: Path,
+    *,
+    kind: str = "skill",
+    removed_source: str = "personal_codex/agents/reviewer.toml",
+    removed_kind: str = "file",
+    replacement_target: str = "agents/reviewer.toml",
+    include_removal: bool = True,
+) -> None:
+    source = root / "personal_codex" / "skills" / "reviewer"
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "SKILL.md").write_text("# Reviewer\n", encoding="utf-8")
+    payload: dict[str, object] = {
+        "version": 1,
+        "owner": MODULE.PUBLIC_OWNER,
+        "links": [
+            {
+                "source": "personal_codex/skills/reviewer",
+                "target": ROLE_TARGET.as_posix(),
+                "kind": kind,
+                "owner": MODULE.PUBLIC_OWNER,
+            }
+        ],
+    }
+    if include_removal:
+        payload["removed_links"] = [
+            {
+                "id": "regular-agent-to-symlink",
+                "source": removed_source,
+                "target": ROLE_TARGET.as_posix(),
+                "kind": removed_kind,
+                "replacement_target": replacement_target,
+            }
+        ]
+    manifest = root / MODULE.MANIFEST_RELATIVE_PATH
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+
 def append_regular_link(
     root: Path,
     *,
@@ -138,12 +177,14 @@ def legacy_v6_writer_metadata_payload(
     assert isinstance(records, list)
     for raw_record in records:
         assert isinstance(raw_record, dict)
+        raw_record.pop("before_materialization")
+        raw_record.pop("removed_link")
         raw_record.pop("publication_cleanup")
-        if (
-            raw_record["materialization"] == "regular"
-            and raw_record["action"]
-            in {"create", "replace", "quarantine-replace"}
-        ):
+        if raw_record["materialization"] == "regular" and raw_record["action"] in {
+            "create",
+            "replace",
+            "quarantine-replace",
+        }:
             stage = raw_record["stage"]
             evidence = raw_record["evidence"]
             assert isinstance(stage, str)
@@ -216,6 +257,83 @@ class PublicRegularAgentTests(unittest.TestCase):
     def _install(self) -> Path:
         install(self.release, self.home, SHA_A)
         return self.home / ROLE_TARGET
+
+    def test_exact_same_target_removal_migrates_regular_agent_to_symlink(self) -> None:
+        for kind in ("directory", "skill"):
+            with self.subTest(kind=kind):
+                home = self.root / f"home-{kind}"
+                replacement = self.root / f"replacement-{kind}"
+                write_regular_to_symlink_release(replacement, kind=kind)
+                install(self.release, home, SHA_A)
+                target = home / ROLE_TARGET
+                old_identity = (target.stat().st_dev, target.stat().st_ino)
+
+                install(replacement, home, SHA_B)
+
+                expected_entry = MODULE.load_manifest_data(replacement).entries[0]
+                self.assertTrue(target.is_symlink())
+                self.assertEqual(
+                    target.readlink().as_posix(),
+                    MODULE._desired_link_target(home, expected_entry),
+                )
+                self.assertNotEqual(
+                    (target.lstat().st_dev, target.lstat().st_ino),
+                    old_identity,
+                )
+                state = MODULE._load_managed_state(home)
+                self.assertEqual(state.links[ROLE_TARGET].kind, kind)
+                self.assertFalse(
+                    os.path.lexists(MODULE._pending_link_pointer_path(home))
+                )
+
+    def test_regular_to_symlink_migration_requires_exact_removal_authority(
+        self,
+    ) -> None:
+        cases = (
+            ("missing", {"include_removal": False}),
+            ("source", {"removed_source": "personal_codex/agents/other.toml"}),
+            ("kind", {"removed_kind": "directory"}),
+        )
+        for label, options in cases:
+            with self.subTest(label=label):
+                home = self.root / f"home-refusal-{label}"
+                replacement = self.root / f"replacement-refusal-{label}"
+                write_regular_to_symlink_release(replacement, **options)
+                install(self.release, home, SHA_A)
+                target = home / ROLE_TARGET
+
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "without an exact same-target removal",
+                ):
+                    install(replacement, home, SHA_B)
+
+                self.assertTrue(target.is_file())
+                self.assertFalse(target.is_symlink())
+                self.assertEqual(target.read_text(encoding="utf-8"), self.payload)
+
+    def test_regular_to_symlink_migration_rejects_content_and_access_drift(
+        self,
+    ) -> None:
+        replacement = self.root / "replacement-drift"
+        write_regular_to_symlink_release(replacement)
+        for drift in ("content", "access"):
+            with self.subTest(drift=drift):
+                home = self.root / f"home-drift-{drift}"
+                install(self.release, home, SHA_A)
+                target = home / ROLE_TARGET
+                if drift == "content":
+                    target.write_text('name = "modified"\n', encoding="utf-8")
+                    expected = "modified managed regular file"
+                else:
+                    target.chmod(0o644)
+                    expected = "access policy mismatch"
+
+                with self.assertRaisesRegex(MODULE.SyncError, expected):
+                    install(replacement, home, SHA_B)
+
+                self.assertTrue(target.is_file())
+                self.assertFalse(target.is_symlink())
 
     def test_public_install_and_status_accept_exact_independent_file(self) -> None:
         target = self._install()
@@ -512,13 +630,16 @@ class PublicRegularAgentTests(unittest.TestCase):
         target.unlink()
         target.symlink_to(MODULE._desired_link_target(self.home, entry))
 
-        with mock.patch.object(
-            MODULE,
-            "_read_optional_symlink_target_beneath",
-            wraps=MODULE._read_optional_symlink_target_beneath,
-        ) as read_symlink, self.assertRaisesRegex(
-            MODULE.SyncError,
-            "managed link verification failed",
+        with (
+            mock.patch.object(
+                MODULE,
+                "_read_optional_symlink_target_beneath",
+                wraps=MODULE._read_optional_symlink_target_beneath,
+            ) as read_symlink,
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "managed link verification failed",
+            ),
         ):
             MODULE._verify_desired_entries(self.home, [entry])
 
@@ -532,13 +653,16 @@ class PublicRegularAgentTests(unittest.TestCase):
         target.unlink()
         target.symlink_to(MODULE._desired_link_target(self.home, entry))
 
-        with mock.patch.object(
-            MODULE,
-            "_read_optional_symlink_target_beneath",
-            wraps=MODULE._read_optional_symlink_target_beneath,
-        ) as read_symlink, self.assertRaisesRegex(
-            MODULE.SyncError,
-            "mandatory desired regular file drifted",
+        with (
+            mock.patch.object(
+                MODULE,
+                "_read_optional_symlink_target_beneath",
+                wraps=MODULE._read_optional_symlink_target_beneath,
+            ) as read_symlink,
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "mandatory desired regular file drifted",
+            ),
         ):
             MODULE._committed_state(
                 self.home,
@@ -1147,9 +1271,7 @@ class RegularAccessPolicyTests(unittest.TestCase):
                 mock.patch.object(
                     MODULE,
                     "_darwin_extended_acl_entries",
-                    return_value=(
-                        (MODULE._DARWIN_ACL_EXTENDED_ALLOW, foreign_uuid),
-                    ),
+                    return_value=((MODULE._DARWIN_ACL_EXTENDED_ALLOW, foreign_uuid),),
                 ),
                 mock.patch.object(
                     MODULE,
@@ -1295,7 +1417,9 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                 "_publish_pending_commit_marker",
                 side_effect=MODULE.SyncError("injected precommit crash"),
             ),
-            mock.patch.object(MODULE.os, "unlink", side_effect=fail_after_active_rename),
+            mock.patch.object(
+                MODULE.os, "unlink", side_effect=fail_after_active_rename
+            ),
             self.assertRaisesRegex(MODULE.SyncError, "rollback was incomplete"),
         ):
             install(release, self.home, sha)
@@ -1380,6 +1504,9 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         assert isinstance(records, list)
         for raw_record in records:
             assert isinstance(raw_record, dict)
+            if version < 10:
+                raw_record.pop("before_materialization", None)
+                raw_record.pop("removed_link", None)
             raw_record.pop("publication_cleanup", None)
         metadata.write_text(json.dumps(payload) + "\n", encoding="utf-8")
         parsed = MODULE._load_pending_link_batch(self.home)
@@ -1417,6 +1544,177 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(target))
         self.assertTrue(active.is_file())
         return active
+
+    def test_regular_to_symlink_precommit_recovery_restores_exact_regular_file(
+        self,
+    ) -> None:
+        install(self.release, self.home, SHA_A)
+        target = self.home / ROLE_TARGET
+        original_identity = (target.stat().st_dev, target.stat().st_ino)
+        replacement = self.root / "regular-to-symlink-precommit"
+        write_regular_to_symlink_release(replacement)
+
+        batch = self._interrupt_uncommitted_regular_publication(
+            replacement,
+            SHA_B,
+        )
+        record = next(
+            candidate for candidate in batch.records if candidate.target == ROLE_TARGET
+        )
+        self.assertEqual(batch.metadata_version, 10)
+        self.assertTrue(record.before_is_regular())
+        self.assertFalse(record.is_regular())
+        self.assertEqual(record.action, "quarantine-replace")
+        self.assertEqual(
+            record.removed_link_key,
+            "public:regular-agent-to-symlink",
+        )
+        self.assertIsNotNone(record.publication_cleanup)
+        self.assertTrue(target.is_symlink())
+
+        install(self.release, self.home, SHA_A)
+
+        self.assertTrue(target.is_file())
+        self.assertFalse(target.is_symlink())
+        self.assertEqual(
+            (target.stat().st_dev, target.stat().st_ino),
+            original_identity,
+        )
+        self.assertEqual(target.read_text(encoding="utf-8"), 'name = "reviewer"\n')
+        self.assertEqual(target.stat().st_nlink, 1)
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
+
+    def test_same_owner_update_rejects_before_only_removal_authority(self) -> None:
+        before_release = self.root / "same-owner-before-only-removal"
+        write_release(before_release, role_payload='name = "reviewer"\n')
+        before_manifest_path = before_release / MODULE.MANIFEST_RELATIVE_PATH
+        before_manifest = json.loads(before_manifest_path.read_text(encoding="utf-8"))
+        before_manifest["removed_links"] = [
+            {
+                "id": "before-only-removal",
+                "source": "personal_codex/agents/reviewer.toml",
+                "target": ROLE_TARGET.as_posix(),
+                "kind": "file",
+                "replacement_target": ROLE_TARGET.as_posix(),
+            }
+        ]
+        before_manifest_path.write_text(
+            json.dumps(before_manifest) + "\n",
+            encoding="utf-8",
+        )
+        install(before_release, self.home, SHA_A)
+
+        after_release = self.root / "same-owner-after-release"
+        write_regular_to_symlink_release(after_release)
+        batch = self._interrupt_uncommitted_regular_publication(
+            after_release,
+            SHA_B,
+        )
+        metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        payload = json.loads(metadata.read_text(encoding="utf-8"))
+        transition = next(
+            record
+            for record in payload["records"]
+            if record.get("target") == ROLE_TARGET.as_posix()
+        )
+        transition["removed_link"] = "public:before-only-removal"
+        write_pending_metadata_payload(batch, payload)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending regular-to-symlink transition lacks exact removal authority",
+        ):
+            MODULE._load_pending_link_batch(self.home)
+
+        self.assertTrue(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
+
+    def test_v10_regular_to_symlink_authority_error_contract(self) -> None:
+        install(self.release, self.home, SHA_A)
+        replacement = self.root / "regular-to-symlink-operational-error"
+        write_regular_to_symlink_release(replacement)
+        self._interrupt_uncommitted_regular_publication(replacement, SHA_B)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_pending_release_removal_authority",
+                side_effect=OSError("injected unreadable receipt release"),
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "cannot revalidate pending regular-to-symlink removal authority",
+            ),
+        ):
+            MODULE._load_pending_link_batch(self.home)
+
+        semantic_error = MODULE.SyncError("injected semantic release failure")
+        with (
+            mock.patch.object(
+                MODULE,
+                "_pending_release_removal_authority",
+                side_effect=semantic_error,
+            ),
+            self.assertRaises(MODULE.SyncError) as raised,
+        ):
+            MODULE._load_pending_link_batch(self.home)
+        self.assertIs(raised.exception, semantic_error)
+
+    def test_v8_v9_managed_regular_remove_accepts_null_publication_cleanup(
+        self,
+    ) -> None:
+        for version in (8, 9):
+            with self.subTest(version=version):
+                self.home = self.root / f"home-v{version}-null-cleanup"
+                install(self.release, self.home, SHA_A)
+                removal_release = self.root / f"release-v{version}-remove"
+                write_release(removal_release)
+                batch = self._interrupt_uncommitted_regular_publication(
+                    removal_release,
+                    SHA_B,
+                )
+                metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+                payload = json.loads(metadata.read_text(encoding="utf-8"))
+                payload["version"] = version
+                downgrade_pending_state_evidence_metadata(payload, version)
+                for raw_record in payload["records"]:
+                    raw_record.pop("before_materialization")
+                    raw_record.pop("removed_link")
+                removal_record = next(
+                    raw_record
+                    for raw_record in payload["records"]
+                    if raw_record["target"] == ROLE_TARGET.as_posix()
+                )
+                removal_record["publication_cleanup"] = None
+                write_pending_metadata_payload(batch, payload)
+
+                parsed = MODULE._load_pending_link_batch(self.home)
+                self.assertIsNotNone(parsed)
+                assert parsed is not None
+                self.assertEqual(parsed.metadata_version, version)
+
+    def test_v10_managed_regular_remove_rejects_null_publication_cleanup(self) -> None:
+        install(self.release, self.home, SHA_A)
+        removal_release = self.root / "release-v10-remove-null-cleanup"
+        write_release(removal_release)
+        batch = self._interrupt_uncommitted_regular_publication(
+            removal_release,
+            SHA_B,
+        )
+        metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        payload = json.loads(metadata.read_text(encoding="utf-8"))
+        removal_record = next(
+            raw_record
+            for raw_record in payload["records"]
+            if raw_record["target"] == ROLE_TARGET.as_posix()
+        )
+        removal_record["publication_cleanup"] = None
+        write_pending_metadata_payload(batch, payload)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "invalid publication cleanup path",
+        ):
+            MODULE._load_pending_link_batch(self.home)
 
     def test_create_rollback_recovers_durable_active_publication_cleanup(self) -> None:
         batch = self._interrupt_regular_publication_cleanup(self.release, SHA_A)
@@ -1457,7 +1755,9 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         next_release = self.root / "next-release"
         write_release(next_release, role_payload='name = "updated"\n')
         batch = self._interrupt_regular_publication_cleanup(next_release, SHA_B)
-        record = next(candidate for candidate in batch.records if candidate.is_regular())
+        record = next(
+            candidate for candidate in batch.records if candidate.is_regular()
+        )
         _record, active = self._assert_active_publication_journal(batch)
         real_restore = MODULE._restore_pending_record_before
         restored = False
@@ -1514,7 +1814,9 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         next_release = self.root / "next-release"
         write_release(next_release, role_payload='name = "updated"\n')
         batch = self._interrupt_regular_publication_cleanup(next_release, SHA_B)
-        record = next(candidate for candidate in batch.records if candidate.is_regular())
+        record = next(
+            candidate for candidate in batch.records if candidate.is_regular()
+        )
         source = batch.batch_root / Path(*record.before_evidence.parts)
         real_bound = MODULE._bound_directory_matches
         real_unlink = os.unlink
@@ -1537,9 +1839,8 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
             **kwargs: object,
         ) -> None:
             name = os.fsdecode(path)
-            if (
-                before_publish_started
-                and name.startswith(MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+            if before_publish_started and name.startswith(
+                MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
             ):
                 raise MODULE.SyncError("injected before publication cleanup crash")
             real_unlink(path, *args, **kwargs)
@@ -1550,7 +1851,9 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                 "_bound_directory_matches",
                 side_effect=fail_after_before_publication,
             ),
-            mock.patch.object(MODULE.os, "unlink", side_effect=fail_before_active_unlink),
+            mock.patch.object(
+                MODULE.os, "unlink", side_effect=fail_before_active_unlink
+            ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
                 "exact cleanup could not be verified",
@@ -1664,8 +1967,7 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                 regular_record = next(
                     record
                     for record in batch.records
-                    if record.is_regular()
-                    and record.action in {"create", "replace"}
+                    if record.is_regular() and record.action in {"create", "replace"}
                 )
                 assert regular_record.stage is not None
                 stage = batch.batch_root / Path(*regular_record.stage.parts)
@@ -1801,6 +2103,8 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         foreign_record = None
         for raw_record in records:
             assert isinstance(raw_record, dict)
+            raw_record.pop("before_materialization")
+            raw_record.pop("removed_link")
             raw_record.pop("publication_cleanup")
             if raw_record["action"] == MODULE.PENDING_RELINQUISH_FOREIGN_ACTION:
                 foreign_record = raw_record
@@ -1892,7 +2196,9 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
         parsed = self._downgrade_pending_regular_metadata(batch, 7)
         records = tuple(record for record in parsed.records if record.is_regular())
-        self.assertEqual({record.target for record in records}, {ROLE_TARGET, secondary_target})
+        self.assertEqual(
+            {record.target for record in records}, {ROLE_TARGET, secondary_target}
+        )
         with mock.patch.object(
             MODULE,
             "_build_pending_regular_alias_authority_index",
@@ -1909,9 +2215,7 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
             )
             for record in records
         ]
-        parent_identity = (
-            self.home / Path(*ROLE_TARGET.parts)
-        ).parent.stat()
+        parent_identity = (self.home / Path(*ROLE_TARGET.parts)).parent.stat()
         expected_identity = (parent_identity.st_dev, parent_identity.st_ino)
         real_scandir = MODULE.os.scandir
         agent_parent_scans = 0
@@ -1920,7 +2224,10 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
             path: str | bytes | os.PathLike[str] | os.PathLike[bytes] | int,
         ) -> object:
             nonlocal agent_parent_scans
-            if isinstance(path, int) and MODULE._directory_identity(path) == expected_identity:
+            if (
+                isinstance(path, int)
+                and MODULE._directory_identity(path) == expected_identity
+            ):
                 agent_parent_scans += 1
             return real_scandir(path)
 
@@ -2025,7 +2332,9 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
     def test_v7_produced_active_alias_foreign_replacement_fails_closed(self) -> None:
         batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
         parsed = self._downgrade_pending_regular_metadata(batch, 7)
-        record = next(candidate for candidate in parsed.records if candidate.is_regular())
+        record = next(
+            candidate for candidate in parsed.records if candidate.is_regular()
+        )
         target = self.home / Path(*record.target.parts)
         active = self._isolate_legacy_regular_publication(parsed, record, target)
         active.unlink()
@@ -2041,6 +2350,123 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self.assertEqual(active.read_text(encoding="utf-8"), "foreign = true\n")
         self.assertTrue(MODULE._pending_link_pointer_path(self.home).is_file())
 
+    def test_v7_active_alias_replacement_during_revalidation_is_retained(
+        self,
+    ) -> None:
+        batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
+        parsed = self._downgrade_pending_regular_metadata(batch, 7)
+        record = next(
+            candidate for candidate in parsed.records if candidate.is_regular()
+        )
+        target = self.home / Path(*record.target.parts)
+        active = self._isolate_legacy_regular_publication(parsed, record, target)
+        active_entry_index = (
+            MODULE._build_legacy_pending_regular_publication_active_entry_index(
+                self.home,
+                parsed,
+            )
+        )
+        real_snapshot = MODULE._regular_file_snapshot_at
+        replaced = False
+
+        def replace_after_first_active_snapshot(
+            directory_fd: int,
+            name: str,
+            path: Path,
+            *args: object,
+            **kwargs: object,
+        ) -> MODULE.RegularFileSnapshot:
+            nonlocal replaced
+            snapshot = real_snapshot(
+                directory_fd,
+                name,
+                path,
+                *args,
+                **kwargs,
+            )
+            if path == active and not replaced:
+                active.unlink()
+                active.write_text("foreign = true\n", encoding="utf-8")
+                active.chmod(0o600)
+                replaced = True
+            return snapshot
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_regular_file_snapshot_at",
+                side_effect=replace_after_first_active_snapshot,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending legacy regular publication active entry changed",
+            ),
+        ):
+            MODULE._recover_legacy_pending_regular_publication_active_entry(
+                self.home,
+                parsed,
+                record,
+                "produced",
+                active_entry_index=active_entry_index,
+            )
+
+        self.assertTrue(replaced)
+        self.assertEqual(active.read_text(encoding="utf-8"), "foreign = true\n")
+        self.assertTrue(MODULE._pending_link_pointer_path(self.home).is_file())
+
+    def test_v9_receiptless_remove_active_alias_rejects_writable_parent(
+        self,
+    ) -> None:
+        install(self.release, self.home, SHA_A)
+        removal_release = self.root / "release-v9-remove-writable-parent"
+        write_release(removal_release)
+        batch = self._interrupt_uncommitted_regular_publication(
+            removal_release,
+            SHA_B,
+        )
+        metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        payload = json.loads(metadata.read_text(encoding="utf-8"))
+        payload["version"] = 9
+        records = payload["records"]
+        assert isinstance(records, list)
+        for raw_record in records:
+            assert isinstance(raw_record, dict)
+            raw_record.pop("before_materialization")
+            raw_record.pop("removed_link")
+        removal_record = next(
+            raw_record
+            for raw_record in records
+            if raw_record["target"] == ROLE_TARGET.as_posix()
+        )
+        removal_record["publication_cleanup"] = None
+        write_pending_metadata_payload(batch, payload)
+        parsed = MODULE._load_pending_link_batch(self.home)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        record = next(
+            candidate for candidate in parsed.records if candidate.target == ROLE_TARGET
+        )
+        before = MODULE._pending_record_before_evidence_snapshot(
+            self.home,
+            parsed,
+            record,
+        )
+        self.assertIsInstance(before, MODULE.RegularFileSnapshot)
+        assert isinstance(before, MODULE.RegularFileSnapshot)
+        MODULE._restore_pending_record_before(self.home, parsed, record, before)
+        target = self.home / ROLE_TARGET
+        active = self._isolate_legacy_regular_publication(parsed, record, target)
+        target.parent.chmod(0o775)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "managed regular-file parent access policy mismatch",
+        ):
+            install(self.release, self.home, SHA_A)
+
+        self.assertTrue(active.is_file())
+        self.assertTrue(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
+
     def test_v7_before_active_alias_residue_recovers_exact_preimage(self) -> None:
         install(self.release, self.home, SHA_A)
         target = self.home / ROLE_TARGET
@@ -2049,7 +2475,9 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         write_release(next_release, role_payload='name = "updated"\n')
         batch = self._interrupt_uncommitted_regular_publication(next_release, SHA_B)
         parsed = self._downgrade_pending_regular_metadata(batch, 7)
-        record = next(candidate for candidate in parsed.records if candidate.is_regular())
+        record = next(
+            candidate for candidate in parsed.records if candidate.is_regular()
+        )
         assert record.before_evidence is not None
         before = parsed.batch_root / Path(*record.before_evidence.parts)
         parent_fd = MODULE._open_directory_beneath(self.home, target.parent)
@@ -2078,7 +2506,9 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
 
     def test_publication_receipt_recovers_truncated_atomic_temp(self) -> None:
         batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
-        record = next(candidate for candidate in batch.records if candidate.is_regular())
+        record = next(
+            candidate for candidate in batch.records if candidate.is_regular()
+        )
         target = self.home / Path(*record.target.parts)
         expected, exists = MODULE._pending_target_snapshot(self.home, target)
         self.assertTrue(exists)
@@ -2091,18 +2521,13 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         temp = journal.with_name(
             journal.name + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
         )
-        cleanup_parent_identity = (
-            batch.batch_root / "pending" / "cleanup"
-        ).stat()
+        cleanup_parent_identity = (batch.batch_root / "pending" / "cleanup").stat()
         parent_identity = (
             cleanup_parent_identity.st_dev,
             cleanup_parent_identity.st_ino,
         )
         retained_temp_name = (
-            MODULE.PENDING_CLEANUP_RETAINED_PREFIX
-            + temp.name
-            + "-1-"
-            + "a" * 16
+            MODULE.PENDING_CLEANUP_RETAINED_PREFIX + temp.name + "-1-" + "a" * 16
         )
         self.assertTrue(
             MODULE._pending_batch_cleanup_name_is_authorized(
@@ -2152,7 +2577,9 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self,
     ) -> None:
         batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
-        record = next(candidate for candidate in batch.records if candidate.is_regular())
+        record = next(
+            candidate for candidate in batch.records if candidate.is_regular()
+        )
         target = self.home / Path(*record.target.parts)
         expected, exists = MODULE._pending_target_snapshot(self.home, target)
         self.assertTrue(exists)
@@ -2226,7 +2653,9 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         next_release = self.root / "next-release-prepared-receipt"
         write_release(next_release, role_payload='name = "updated"\n')
         batch = self._interrupt_uncommitted_regular_publication(next_release, SHA_B)
-        record = next(candidate for candidate in batch.records if candidate.is_regular())
+        record = next(
+            candidate for candidate in batch.records if candidate.is_regular()
+        )
         target = self.home / Path(*record.target.parts)
 
         for phase in ("produced", "before"):
@@ -2263,11 +2692,8 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                         destination_fd,
                         destination_name,
                     )
-                    if (
-                        source_name == target.name
-                        and destination_name.startswith(
-                            MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
-                        )
+                    if source_name == target.name and destination_name.startswith(
+                        MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
                     ):
                         crashed = True
                         raise MODULE.SyncError(
@@ -2317,7 +2743,9 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
 
     def test_pending_cleanup_isolates_before_canonical_snapshot(self) -> None:
         batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
-        record = next(candidate for candidate in batch.records if candidate.is_regular())
+        record = next(
+            candidate for candidate in batch.records if candidate.is_regular()
+        )
         target = self.home / Path(*record.target.parts)
         expected, exists = MODULE._pending_target_snapshot(self.home, target)
         self.assertTrue(exists)
@@ -2373,7 +2801,9 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self,
     ) -> None:
         batch = self._interrupt_uncommitted_regular_publication(self.release, SHA_A)
-        record = next(candidate for candidate in batch.records if candidate.is_regular())
+        record = next(
+            candidate for candidate in batch.records if candidate.is_regular()
+        )
         target = self.home / Path(*record.target.parts)
         expected, exists = MODULE._pending_target_snapshot(self.home, target)
         self.assertTrue(exists)
@@ -2396,9 +2826,7 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         retained = tuple(
             child
             for child in target.parent.iterdir()
-            if child.name.startswith(
-                MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX
-            )
+            if child.name.startswith(MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX)
         )
         self.assertEqual(len(retained), 1)
         self.assertEqual(
@@ -2713,13 +3141,7 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
 
     def test_replace_rollback_tolerates_mode_0600_backup_gid_churn(self) -> None:
         target = self.home / ROLE_TARGET
-        backup = (
-            self.home
-            / "personal-sync"
-            / "quarantine"
-            / "rollback"
-            / ROLE_TARGET
-        )
+        backup = self.home / "personal-sync" / "quarantine" / "rollback" / ROLE_TARGET
         target.parent.mkdir(parents=True)
         backup.parent.mkdir(parents=True)
         target.write_text('name = "reviewer"\n', encoding="utf-8")
@@ -3363,9 +3785,7 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
                 staging_ticket,
             )
 
-        proof_ticket = SimpleNamespace(
-            batch_root=self.home / "20000101T000000Z-1-3"
-        )
+        proof_ticket = SimpleNamespace(batch_root=self.home / "20000101T000000Z-1-3")
         with (
             mock.patch.object(
                 MODULE,
@@ -3769,7 +4189,9 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
         parsed = MODULE._load_pending_link_batch(self.home)
         self.assertIsNotNone(parsed)
         assert parsed is not None
-        record = next(candidate for candidate in parsed.records if candidate.is_regular())
+        record = next(
+            candidate for candidate in parsed.records if candidate.is_regular()
+        )
         self.assertEqual(parsed.metadata_version, 6)
         self.assertEqual(record.action, "remove")
         self.assertIsNone(record.regular_gid)
@@ -3812,6 +4234,9 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
                 payload = json.loads(json.dumps(current_payload))
                 payload["version"] = version
                 downgrade_pending_state_evidence_metadata(payload, version)
+                for raw_record in payload["records"]:
+                    raw_record.pop("before_materialization")
+                    raw_record.pop("removed_link")
                 if version == 7:
                     for raw_record in payload["records"]:
                         raw_record.pop("publication_cleanup")
@@ -3842,6 +4267,8 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
             assert isinstance(records, list)
             for raw_record in records:
                 assert isinstance(raw_record, dict)
+                raw_record.pop("before_materialization")
+                raw_record.pop("removed_link")
                 raw_record.pop("publication_cleanup")
                 for field in (
                     "materialization",
@@ -3870,7 +4297,9 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
         parsed = MODULE._load_pending_link_batch(self.home)
         self.assertIsNotNone(parsed)
         assert parsed is not None
-        self.assertTrue(all(record.materialization == "symlink" for record in parsed.records))
+        self.assertTrue(
+            all(record.materialization == "symlink" for record in parsed.records)
+        )
 
     def test_v6_pending_metadata_rejects_unknown_closed_field(self) -> None:
         release = self.root / "regular-release"

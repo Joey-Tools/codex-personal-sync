@@ -161,6 +161,10 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
         metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
         payload = json.loads(metadata.read_text(encoding="utf-8"))
         payload["version"] = version
+        if version < 10:
+            for raw_record in payload["records"]:
+                raw_record.pop("before_materialization", None)
+                raw_record.pop("removed_link", None)
         if version < 7:
             payload.pop("terminal_regular_before")
             payload.pop("terminal_regular_after")
@@ -173,11 +177,9 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
                 payload[field].pop("gid")
         if version == 6 and not preserve_v6_null_gid:
             for raw_record in payload["records"]:
-                if (
-                    raw_record["materialization"] == "regular"
-                    and raw_record["action"]
-                    in {"create", "replace", "quarantine-replace"}
-                ):
+                if raw_record["materialization"] == "regular" and raw_record[
+                    "action"
+                ] in {"create", "replace", "quarantine-replace"}:
                     stage = raw_record["stage"]
                     assert isinstance(stage, str)
                     stage_metadata = os.stat(batch.batch_root / stage)
@@ -284,8 +286,7 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
                 owners={MODULE.PUBLIC_OWNER: SHA_A},
                 links=links,
             ),
-            len(reviewer_payload.encode("utf-8"))
-            + len(worker_payload.encode("utf-8")),
+            len(reviewer_payload.encode("utf-8")) + len(worker_payload.encode("utf-8")),
         )
 
     def test_v4_v5_agent_symlink_claims_parse_and_recover(self) -> None:
@@ -353,11 +354,7 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
         self.assertEqual(parsed.metadata_version, 6)
         self.assertNotIn(
             ROLE_TARGET,
-            {
-                claim.target
-                for claim in parsed.claims_after
-                if claim.scope == "managed"
-            },
+            {claim.target for claim in parsed.claims_after if claim.scope == "managed"},
         )
 
         state_record = parsed.state_after_value.links[ROLE_TARGET]
@@ -376,9 +373,7 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
                 "release_sha": state_record.release_sha,
                 "parent_identity": [0, 0],
                 "link_identity": [0, 0],
-                "evidence": (
-                    f"pending/claims/after/{len(claims_after) - 1:08d}"
-                ),
+                "evidence": (f"pending/claims/after/{len(claims_after) - 1:08d}"),
             }
         )
         metadata.write_text(json.dumps(payload) + "\n", encoding="utf-8")
@@ -487,6 +482,7 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
             committed=True,
             legacy_symlink=False,
         )
+        self._downgrade_metadata(batch, 9)
         metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
         payload = json.loads(metadata.read_text(encoding="utf-8"))
 
@@ -602,9 +598,7 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
             committed=True,
         )
         assert batch.state_before_evidence is not None
-        evidence_path = batch.batch_root / Path(
-            *batch.state_before_evidence.parts
-        )
+        evidence_path = batch.batch_root / Path(*batch.state_before_evidence.parts)
         state_path = MODULE._state_path(home)
         state_path.unlink()
         real_read = MODULE._read_managed_state_file_snapshot
@@ -639,11 +633,7 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
 
     def test_state_before_restore_uses_gid_only_for_group_access(self) -> None:
         alternate_gid = next(
-            (
-                gid
-                for gid in os.getgroups()
-                if gid != os.stat(self.root).st_gid
-            ),
+            (gid for gid in os.getgroups() if gid != os.stat(self.root).st_gid),
             None,
         )
         if alternate_gid is None:
@@ -1124,9 +1114,7 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
         self.assertTrue(os.path.lexists(MODULE._pending_link_pointer_path(home)))
 
         backup.rename(backup.with_name(backup.name + ".missing"))
-        self.assertIsNone(
-            MODULE._pending_record_backup_snapshot(home, batch, record)
-        )
+        self.assertIsNone(MODULE._pending_record_backup_snapshot(home, batch, record))
 
     def test_private_regular_files_override_a_fully_restrictive_umask(self) -> None:
         home = self.root / "home-umask-0777"
@@ -1189,6 +1177,39 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
             MODULE._write_exclusive_internal_file(home, path, b"authority\n")
 
         self.assertFalse(os.path.lexists(path))
+
+    def test_internal_file_fchmod_and_cleanup_failure_remains_fail_closed(self) -> None:
+        home = self.root / "home-internal-fchmod-and-cleanup-failure"
+        home.mkdir()
+        path = home / "authority.json"
+        creation_error = "injected fchmod failure"
+        cleanup_error = "injected cleanup failure"
+
+        with (
+            mock.patch.object(MODULE.os, "fchmod", side_effect=OSError(creation_error)),
+            mock.patch.object(
+                MODULE,
+                "_cleanup_created_exclusive_internal_file",
+                side_effect=MODULE.SyncError(cleanup_error),
+            ),
+        ):
+            if callable(getattr(OSError(), "add_note", None)):
+                with self.assertRaisesRegex(OSError, creation_error) as raised:
+                    MODULE._write_exclusive_internal_file(home, path, b"authority\n")
+                notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+                self.assertIn("final name could not be safely cleared", notes)
+                self.assertIn(cleanup_error, notes)
+            else:
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "final name could not be safely cleared",
+                ) as raised:
+                    MODULE._write_exclusive_internal_file(home, path, b"authority\n")
+                self.assertIn(cleanup_error, str(raised.exception))
+                self.assertIn(creation_error, str(raised.exception))
+                self.assertIsInstance(raised.exception.__cause__, MODULE.SyncError)
+
+        self.assertTrue(os.path.lexists(path))
 
 
 if __name__ == "__main__":
