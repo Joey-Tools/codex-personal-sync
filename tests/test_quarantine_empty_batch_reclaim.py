@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import contextlib
 import gc
 import importlib.util
+import io
+import json
 import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -208,6 +212,22 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         )
         MODULE._write_exclusive_internal_file(self.home, temp_path, payload)
         return temp_path
+
+    def _rewrite_v8_metadata_size(
+        self,
+        ticket: MODULE.PendingQuarantineAllocationTicket,
+    ) -> None:
+        assert ticket.snapshot.payload is not None
+        payload = json.loads(ticket.path.read_bytes())
+        payload["metadata"]["size"] += 1
+        ticket.path.write_bytes(
+            MODULE._bounded_json_document(
+                payload,
+                max_bytes=MODULE.MAX_PENDING_CLEANUP_TICKET_BYTES,
+                overflow_error="test allocation exceeds the size limit",
+            )
+        )
+        ticket.path.chmod(0o600)
 
     def _exercise_metadata_cleanup_boundary_mutation(
         self,
@@ -1489,7 +1509,12 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             nonlocal metadata_fd_to_fail
             file_descriptor = real_open(path, *args, **kwargs)
             flags = args[0] if args else 0
-            if failure_armed and path == "metadata.json" and int(flags) & os.O_CREAT:
+            if (
+                failure_armed
+                and isinstance(path, str)
+                and path.endswith(MODULE.PENDING_QUARANTINE_METADATA_STAGE_SUFFIX)
+                and int(flags) & os.O_CREAT
+            ):
                 metadata_fd_to_fail = file_descriptor
             return file_descriptor
 
@@ -1531,6 +1556,196 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
                 self.assertFalse(failure_armed)
                 self.assertIsNone(metadata_fd_to_fail)
                 self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
+
+    def test_metadata_stage_short_write_failure_reclaims_repeatedly(self) -> None:
+        real_open = os.open
+        real_write = os.write
+        metadata_fd_to_fail: int | None = None
+        wrote_prefix = False
+
+        def track_metadata_stage(
+            path: str | bytes,
+            *args: object,
+            **kwargs: object,
+        ) -> int:
+            nonlocal metadata_fd_to_fail
+            file_descriptor = real_open(path, *args, **kwargs)
+            flags = args[0] if args else 0
+            if (
+                isinstance(path, str)
+                and path.endswith(MODULE.PENDING_QUARANTINE_METADATA_STAGE_SUFFIX)
+                and int(flags) & os.O_CREAT
+            ):
+                metadata_fd_to_fail = file_descriptor
+            return file_descriptor
+
+        def short_write_then_fail(file_descriptor: int, payload: bytes) -> int:
+            nonlocal metadata_fd_to_fail, wrote_prefix
+            if file_descriptor != metadata_fd_to_fail:
+                return real_write(file_descriptor, payload)
+            if not wrote_prefix:
+                wrote_prefix = True
+                prefix_size = max(1, len(payload) // 2)
+                return real_write(file_descriptor, payload[:prefix_size])
+            metadata_fd_to_fail = None
+            raise OSError("injected partial metadata stage write failure")
+
+        with (
+            mock.patch.object(os, "open", side_effect=track_metadata_stage),
+            mock.patch.object(os, "write", side_effect=short_write_then_fail),
+        ):
+            for _attempt in range(MODULE.MAX_RETAINED_QUARANTINE_BATCHES + 1):
+                metadata_fd_to_fail = None
+                wrote_prefix = False
+                with self.assertRaisesRegex(
+                    OSError,
+                    "partial metadata stage write failure",
+                ) as raised:
+                    MODULE._quarantine_batch_root(
+                        self.home,
+                        [],
+                        retain_binding=True,
+                        retain_scaffold_binding=True,
+                    )
+                self.assertEqual(getattr(raised.exception, "__notes__", []), [])
+                self.assertTrue(wrote_prefix)
+                self.assertIsNone(metadata_fd_to_fail)
+                self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
+                index = MODULE._pending_cleanup_index_path(self.home)
+                self.assertFalse(list(index.iterdir()))
+
+    def test_partial_metadata_stage_survives_cleanup_crash_and_recovers(self) -> None:
+        real_open = os.open
+        real_write = os.write
+        real_discard = MODULE._discard_incomplete_pending_cleanup_ticket
+        metadata_fd_to_fail: int | None = None
+        cleanup_crashed = False
+
+        def track_metadata_stage(
+            path: str | bytes,
+            *args: object,
+            **kwargs: object,
+        ) -> int:
+            nonlocal metadata_fd_to_fail
+            file_descriptor = real_open(path, *args, **kwargs)
+            flags = args[0] if args else 0
+            if (
+                isinstance(path, str)
+                and path.endswith(MODULE.PENDING_QUARANTINE_METADATA_STAGE_SUFFIX)
+                and int(flags) & os.O_CREAT
+            ):
+                metadata_fd_to_fail = file_descriptor
+            return file_descriptor
+
+        def short_write_then_fail(file_descriptor: int, payload: bytes) -> int:
+            nonlocal metadata_fd_to_fail
+            if file_descriptor != metadata_fd_to_fail:
+                return real_write(file_descriptor, payload)
+            real_write(file_descriptor, payload[: max(1, len(payload) // 2)])
+            metadata_fd_to_fail = None
+            raise OSError("injected partial metadata stage write failure")
+
+        def crash_before_stage_cleanup(home: Path, path: Path, **kwargs: object) -> int:
+            nonlocal cleanup_crashed
+            if path.name.endswith(MODULE.PENDING_QUARANTINE_METADATA_STAGE_SUFFIX):
+                cleanup_crashed = True
+                raise SystemExit("injected metadata stage cleanup crash")
+            return real_discard(home, path, **kwargs)
+
+        with (
+            mock.patch.object(os, "open", side_effect=track_metadata_stage),
+            mock.patch.object(os, "write", side_effect=short_write_then_fail),
+            mock.patch.object(
+                MODULE,
+                "_discard_incomplete_pending_cleanup_ticket",
+                side_effect=crash_before_stage_cleanup,
+            ),
+            self.assertRaisesRegex(SystemExit, "metadata stage cleanup crash"),
+        ):
+            MODULE._quarantine_batch_root(
+                self.home,
+                [],
+                retain_binding=True,
+                retain_scaffold_binding=True,
+            )
+
+        self.assertTrue(cleanup_crashed)
+        index = MODULE._pending_cleanup_index_path(self.home)
+        stages = list(index.glob(f"*{MODULE.PENDING_QUARANTINE_METADATA_STAGE_SUFFIX}"))
+        self.assertEqual(len(stages), 1)
+        self.assertGreater(stages[0].stat().st_size, 0)
+        self.assertFalse(
+            list(
+                MODULE._personal_sync_root(self.home)
+                .joinpath(MODULE.QUARANTINE_RELATIVE_PATH)
+                .iterdir()
+            )
+        )
+        self.assertTrue(MODULE._pending_cleanup_ready_batch_is_observed(self.home))
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+        self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
+        self.assertFalse(list(index.iterdir()))
+
+    def test_v8_with_metadata_stage_and_empty_batch_recovers_after_crash(
+        self,
+    ) -> None:
+        quarantine_root = (
+            MODULE._personal_sync_root(self.home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        quarantine_fd = MODULE._open_or_create_directory_beneath(
+            self.home,
+            quarantine_root,
+            mode=0o700,
+        )
+        stage_fd = -1
+        try:
+            batch_name = f"20260905T005959Z-{os.getpid()}-{time.time_ns()}"
+            payload = b'{"actions": []}\n'
+            stage_path = MODULE._pending_quarantine_metadata_stage_path(
+                self.home,
+                batch_name,
+            )
+            index_fd = MODULE._open_or_create_directory_beneath(
+                self.home,
+                stage_path.parent,
+                mode=0o700,
+            )
+            try:
+                stage_fd = os.open(
+                    stage_path.name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=index_fd,
+                )
+                os.write(stage_fd, payload)
+                os.fsync(stage_fd)
+                os.fsync(index_fd)
+            finally:
+                MODULE._close_fd_quietly(stage_fd)
+                stage_fd = -1
+                MODULE._close_fd_quietly(index_fd)
+            allocation = MODULE._publish_pending_quarantine_allocation_ticket(
+                self.home,
+                quarantine_root,
+                quarantine_fd,
+                batch_name,
+                payload,
+            )
+            os.mkdir(batch_name, mode=0o700, dir_fd=quarantine_fd)
+            os.fsync(quarantine_fd)
+        finally:
+            MODULE._close_fd_quietly(stage_fd)
+            MODULE._close_fd_quietly(quarantine_fd)
+
+        self.assertTrue(stage_path.is_file())
+        self.assertTrue(allocation.path.is_file())
+        self.assertTrue(allocation.batch_root.is_dir())
+        self.assertTrue(MODULE._pending_cleanup_ready_batch_is_observed(self.home))
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+        self.assertFalse(stage_path.exists())
+        self.assertFalse(allocation.path.exists())
+        self.assertFalse(allocation.batch_root.exists())
+        self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
 
     def test_python39_allocator_cleanup_error_chains_both_failures(self) -> None:
         class LegacyBaseException(BaseException):
@@ -1581,6 +1796,16 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             MODULE._close_fd_quietly(quarantine_fd)
 
         self.assertEqual(MODULE._quarantine_batch_count(self.home), 1)
+        self.assertTrue(MODULE._pending_cleanup_ready_batch_is_observed(self.home))
+        dry_run_output = io.StringIO()
+        with contextlib.redirect_stdout(dry_run_output):
+            self.assertTrue(
+                MODULE._preflight_pending_recovery(
+                    self.home,
+                    dry_run=True,
+                )
+            )
+        self.assertIn("would clean", dry_run_output.getvalue())
         budget = MODULE.PendingCleanupActionBudget(4)
         self.assertEqual(
             MODULE._cleanup_pending_quarantine_allocations(
@@ -1591,6 +1816,618 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         )
         self.assertFalse(allocation.path.exists())
         self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
+
+    def test_v8_recovers_empty_canonical_and_isolated_batches(self) -> None:
+        for initial_state in ("canonical", "isolated"):
+            with self.subTest(initial_state=initial_state):
+                case_home = self.home / initial_state
+                case_home.mkdir(mode=0o700)
+                quarantine_root = (
+                    MODULE._personal_sync_root(case_home)
+                    / MODULE.QUARANTINE_RELATIVE_PATH
+                )
+                quarantine_fd = MODULE._open_or_create_directory_beneath(
+                    case_home,
+                    quarantine_root,
+                    mode=0o700,
+                )
+                try:
+                    batch_name = (
+                        f"20260905T01010{len(initial_state)}Z-"
+                        f"{os.getpid()}-{time.time_ns()}"
+                    )
+                    allocation = MODULE._publish_pending_quarantine_allocation_ticket(
+                        case_home,
+                        quarantine_root,
+                        quarantine_fd,
+                        batch_name,
+                        b"{}\n",
+                    )
+                    directory_name = (
+                        batch_name
+                        if initial_state == "canonical"
+                        else allocation.isolated_name
+                    )
+                    os.mkdir(directory_name, mode=0o700, dir_fd=quarantine_fd)
+                    os.fsync(quarantine_fd)
+                finally:
+                    MODULE._close_fd_quietly(quarantine_fd)
+
+                self.assertTrue(
+                    MODULE._pending_cleanup_ready_batch_is_observed(case_home)
+                )
+                self.assertEqual(
+                    MODULE._cleanup_pending_quarantine_allocations(
+                        case_home,
+                        budget=MODULE.PendingCleanupActionBudget(4),
+                    ),
+                    1,
+                )
+                self.assertFalse(allocation.path.exists())
+                self.assertFalse(quarantine_root.joinpath(directory_name).exists())
+                self.assertEqual(MODULE._quarantine_batch_count(case_home), 0)
+
+    def test_v8_recovers_exact_planned_leafless_metadata_scaffold(self) -> None:
+        allocation = MODULE._quarantine_batch_root(
+            self.home,
+            [],
+            retain_binding=True,
+            retain_scaffold_binding=True,
+        )
+        assert isinstance(allocation, MODULE.EphemeralQuarantineBatchAllocation)
+        allocation.revoke_reclaim()
+        allocation.close()
+        assert allocation.binding.allocation_ticket is not None
+
+        self.assertTrue(MODULE._pending_cleanup_ready_batch_is_observed(self.home))
+        self.assertEqual(
+            MODULE._cleanup_pending_quarantine_allocations(
+                self.home,
+                budget=MODULE.PendingCleanupActionBudget(4),
+            ),
+            1,
+        )
+        self.assertFalse(allocation.batch_root.exists())
+        self.assertFalse(allocation.binding.allocation_ticket.path.exists())
+        self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
+
+    def test_v8_recovery_rejects_partial_planned_metadata(self) -> None:
+        allocation = MODULE._quarantine_batch_root(
+            self.home,
+            [],
+            retain_binding=True,
+            retain_scaffold_binding=True,
+        )
+        assert isinstance(allocation, MODULE.EphemeralQuarantineBatchAllocation)
+        allocation.revoke_reclaim()
+        allocation.close()
+        metadata_path = allocation.batch_root / "metadata.json"
+        original = metadata_path.read_bytes()
+        metadata_path.write_bytes(original[: max(1, len(original) // 2)])
+        metadata_path.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "metadata does not match its plan",
+        ):
+            MODULE._pending_cleanup_ready_batch_is_observed(self.home)
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "metadata does not match its plan",
+        ):
+            MODULE._cleanup_pending_quarantine_allocations(
+                self.home,
+                budget=MODULE.PendingCleanupActionBudget(4),
+            )
+        self.assertEqual(
+            metadata_path.read_bytes(), original[: max(1, len(original) // 2)]
+        )
+        self.assertTrue(allocation.batch_root.exists())
+        assert allocation.binding.allocation_ticket is not None
+        self.assertTrue(allocation.binding.allocation_ticket.path.exists())
+
+    def test_v8_empty_recovery_rejects_identity_drift_after_classification(
+        self,
+    ) -> None:
+        quarantine_root = (
+            MODULE._personal_sync_root(self.home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        quarantine_fd = MODULE._open_or_create_directory_beneath(
+            self.home,
+            quarantine_root,
+            mode=0o700,
+        )
+        try:
+            batch_name = f"20260905T020202Z-{os.getpid()}-{time.time_ns()}"
+            allocation = MODULE._publish_pending_quarantine_allocation_ticket(
+                self.home,
+                quarantine_root,
+                quarantine_fd,
+                batch_name,
+                b"{}\n",
+            )
+            os.mkdir(batch_name, mode=0o700, dir_fd=quarantine_fd)
+            os.fsync(quarantine_fd)
+        finally:
+            MODULE._close_fd_quietly(quarantine_fd)
+        original = allocation.batch_root.with_name(batch_name + ".original")
+        real_classify = MODULE._pending_quarantine_allocation_recovery_state
+        replaced = False
+
+        def replace_after_classification(home: Path, current):
+            nonlocal replaced
+            result = real_classify(home, current)
+            if not replaced:
+                replaced = True
+                allocation.batch_root.rename(original)
+                allocation.batch_root.mkdir(mode=0o700)
+            return result
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_pending_quarantine_allocation_recovery_state",
+                side_effect=replace_after_classification,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "empty quarantine allocation changed",
+            ),
+        ):
+            MODULE._cleanup_pending_quarantine_allocations(
+                self.home,
+                budget=MODULE.PendingCleanupActionBudget(4),
+            )
+
+        self.assertTrue(replaced)
+        self.assertTrue(original.is_dir())
+        self.assertTrue(allocation.batch_root.is_dir())
+        self.assertTrue(allocation.path.is_file())
+
+    def test_v8_entity_with_matching_v7_is_observed_as_cleanup_ready(self) -> None:
+        allocation = MODULE._quarantine_batch_root(
+            self.home,
+            [],
+            retain_binding=True,
+            retain_scaffold_binding=True,
+        )
+        assert isinstance(allocation, MODULE.EphemeralQuarantineBatchAllocation)
+        ticket = MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+            self.home,
+            allocation.binding,
+        )
+        allocation.revoke_reclaim()
+        allocation.close()
+
+        self.assertTrue(MODULE._pending_cleanup_ready_batch_is_observed(self.home))
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+        self.assertFalse(ticket.path.exists())
+        self.assertFalse(allocation.batch_root.exists())
+        assert allocation.binding.allocation_ticket is not None
+        self.assertFalse(allocation.binding.allocation_ticket.path.exists())
+
+    def test_v8_entity_with_mismatched_v7_blocks_observation_and_cleanup(
+        self,
+    ) -> None:
+        allocation = MODULE._quarantine_batch_root(
+            self.home,
+            [],
+            retain_binding=True,
+            retain_scaffold_binding=True,
+        )
+        assert isinstance(allocation, MODULE.EphemeralQuarantineBatchAllocation)
+        cleanup = MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+            self.home,
+            allocation.binding,
+        )
+        allocation.revoke_reclaim()
+        allocation.close()
+        payload = json.loads(cleanup.snapshot.payload)
+        payload["metadata"]["size"] += 1
+        cleanup.path.write_bytes(
+            MODULE._bounded_json_document(
+                payload,
+                max_bytes=MODULE.MAX_PENDING_CLEANUP_TICKET_BYTES,
+                overflow_error="test ticket exceeds the size limit",
+            )
+        )
+        cleanup.path.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "does not join cleanup authority",
+        ):
+            MODULE._pending_cleanup_ready_batch_is_observed(self.home)
+
+        dry_run_output = io.StringIO()
+        with (
+            contextlib.redirect_stdout(dry_run_output),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "does not join cleanup authority",
+            ),
+        ):
+            MODULE._preflight_pending_recovery(self.home, dry_run=True)
+        self.assertNotIn("would clean", dry_run_output.getvalue())
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "does not join cleanup authority",
+        ):
+            MODULE._cleanup_pending_quarantine_allocations(
+                self.home,
+                budget=MODULE.PendingCleanupActionBudget(4),
+            )
+
+        self.assertTrue(allocation.batch_root.is_dir())
+        self.assertTrue(cleanup.path.is_file())
+        assert allocation.binding.allocation_ticket is not None
+        self.assertTrue(allocation.binding.allocation_ticket.path.is_file())
+
+    def test_main_v7_cleanup_rejects_mismatched_v8_before_mutation(self) -> None:
+        batch_root, binding = self._allocate_unowned_scaffold()
+        cleanup = MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+            self.home,
+            binding,
+        )
+        allocation = binding.allocation_ticket
+        assert allocation is not None
+        metadata = batch_root / "metadata.json"
+        expected_metadata = metadata.read_bytes()
+        self._rewrite_v8_metadata_size(allocation)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "does not join cleanup authority",
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertEqual(metadata.read_bytes(), expected_metadata)
+        self.assertTrue(batch_root.is_dir())
+        self.assertTrue(cleanup.path.is_file())
+        self.assertTrue(allocation.path.is_file())
+
+    def test_main_v7_cleanup_revalidates_v8_before_metadata_mutation(self) -> None:
+        batch_root, binding = self._allocate_unowned_scaffold()
+        cleanup = MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+            self.home,
+            binding,
+        )
+        allocation = binding.allocation_ticket
+        assert allocation is not None
+        metadata = batch_root / "metadata.json"
+        expected_metadata = metadata.read_bytes()
+        real_revalidate = MODULE._require_joined_quarantine_allocation_unchanged
+        boundary_calls = 0
+
+        def change_v8_at_metadata_boundary(
+            home: Path,
+            ticket: MODULE.PendingBatchCleanupTicket,
+            expected: MODULE.PendingQuarantineAllocationTicket | None,
+        ) -> None:
+            nonlocal boundary_calls
+            boundary_calls += 1
+            if boundary_calls == 2:
+                self._rewrite_v8_metadata_size(allocation)
+            real_revalidate(home, ticket, expected)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_require_joined_quarantine_allocation_unchanged",
+                side_effect=change_v8_at_metadata_boundary,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "does not join cleanup authority",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertEqual(boundary_calls, 2)
+        self.assertEqual(metadata.read_bytes(), expected_metadata)
+        self.assertTrue(batch_root.is_dir())
+        self.assertTrue(cleanup.path.is_file())
+        self.assertTrue(allocation.path.is_file())
+
+    def test_absent_v8_with_matching_v7_is_delegated(self) -> None:
+        batch_root, binding = self._allocate_unowned_scaffold()
+        cleanup = MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+            self.home,
+            binding,
+        )
+        allocation = binding.allocation_ticket
+        assert allocation is not None
+        (batch_root / "metadata.json").unlink()
+        batch_root.rmdir()
+
+        self.assertEqual(
+            MODULE._cleanup_pending_quarantine_allocations(
+                self.home,
+                budget=MODULE.PendingCleanupActionBudget(4),
+            ),
+            0,
+        )
+        self.assertTrue(cleanup.path.is_file())
+        self.assertTrue(allocation.path.is_file())
+
+    def test_absent_v8_with_conflicting_v7_fails_closed(self) -> None:
+        batch_root, binding = self._allocate_unowned_scaffold()
+        cleanup = MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+            self.home,
+            binding,
+        )
+        allocation = binding.allocation_ticket
+        assert allocation is not None
+        (batch_root / "metadata.json").unlink()
+        batch_root.rmdir()
+        self._rewrite_v8_metadata_size(allocation)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "does not join cleanup authority",
+        ):
+            MODULE._cleanup_pending_quarantine_allocations(
+                self.home,
+                budget=MODULE.PendingCleanupActionBudget(4),
+            )
+
+        self.assertTrue(cleanup.path.is_file())
+        self.assertTrue(allocation.path.is_file())
+
+    def test_v8_empty_recovery_rechecks_all_control_residue_at_four_boundaries(
+        self,
+    ) -> None:
+        residue_names = {
+            1: lambda batch: batch + MODULE.PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
+            2: lambda batch: (
+                batch
+                + MODULE.PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX
+                + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+            ),
+            3: lambda batch: (batch + MODULE.PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX),
+            4: lambda batch: (
+                batch + MODULE.PENDING_CLEANUP_EMPTY_PROOF_SUFFIX + ".residue"
+            ),
+        }
+        for boundary_call, residue_name in residue_names.items():
+            with self.subTest(boundary_call=boundary_call):
+                case_home = self.home / f"v8-empty-boundary-{boundary_call}"
+                case_home.mkdir(mode=0o700)
+                quarantine_root = (
+                    MODULE._personal_sync_root(case_home)
+                    / MODULE.QUARANTINE_RELATIVE_PATH
+                )
+                quarantine_fd = MODULE._open_or_create_directory_beneath(
+                    case_home,
+                    quarantine_root,
+                    mode=0o700,
+                )
+                try:
+                    batch_name = (
+                        f"20260905T03030{boundary_call}Z-{os.getpid()}-{time.time_ns()}"
+                    )
+                    allocation = MODULE._publish_pending_quarantine_allocation_ticket(
+                        case_home,
+                        quarantine_root,
+                        quarantine_fd,
+                        batch_name,
+                        b"{}\n",
+                    )
+                    os.mkdir(batch_name, mode=0o700, dir_fd=quarantine_fd)
+                    os.fsync(quarantine_fd)
+                finally:
+                    MODULE._close_fd_quietly(quarantine_fd)
+                residue_path = allocation.path.with_name(residue_name(batch_name))
+                real_require_absent = MODULE._require_pending_quarantine_allocation_cleanup_controls_absent
+                observed_boundaries = 0
+
+                def inject_cleanup_control_residue(
+                    home: Path,
+                    index_root: Path,
+                    index_fd: int,
+                    ticket: MODULE.PendingQuarantineAllocationTicket,
+                    *,
+                    allowed_allocation_name: str,
+                ) -> None:
+                    nonlocal observed_boundaries
+                    observed_boundaries += 1
+                    if observed_boundaries == boundary_call:
+                        MODULE._write_exclusive_internal_file(
+                            case_home,
+                            residue_path,
+                            b"{}\n",
+                        )
+                    real_require_absent(
+                        home,
+                        index_root,
+                        index_fd,
+                        ticket,
+                        allowed_allocation_name=allowed_allocation_name,
+                    )
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_require_pending_quarantine_allocation_cleanup_controls_absent",
+                        side_effect=inject_cleanup_control_residue,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "cleanup control remained",
+                    ),
+                ):
+                    MODULE._cleanup_pending_quarantine_allocations(
+                        case_home,
+                        budget=MODULE.PendingCleanupActionBudget(4),
+                    )
+
+                if boundary_call == 1:
+                    self.assertTrue(quarantine_root.joinpath(batch_name).is_dir())
+                elif boundary_call == 2:
+                    self.assertTrue(
+                        quarantine_root.joinpath(allocation.isolated_name).is_dir()
+                    )
+                else:
+                    self.assertFalse(quarantine_root.joinpath(batch_name).exists())
+                    self.assertFalse(
+                        quarantine_root.joinpath(allocation.isolated_name).exists()
+                    )
+                self.assertTrue(residue_path.is_file())
+                if boundary_call < 4:
+                    self.assertTrue(allocation.path.is_file())
+                else:
+                    retained = tuple(
+                        allocation.path.parent.glob(
+                            f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}"
+                            f"{allocation.path.name}-*"
+                        )
+                    )
+                    self.assertEqual(len(retained), 1)
+                    self.assertTrue(retained[0].is_file())
+
+    def test_absent_v8_rechecks_control_residue_before_direct_retirement(
+        self,
+    ) -> None:
+        quarantine_root = (
+            MODULE._personal_sync_root(self.home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        quarantine_fd = MODULE._open_or_create_directory_beneath(
+            self.home,
+            quarantine_root,
+            mode=0o700,
+        )
+        try:
+            batch_name = f"20260905T030305Z-{os.getpid()}-{time.time_ns()}"
+            allocation = MODULE._publish_pending_quarantine_allocation_ticket(
+                self.home,
+                quarantine_root,
+                quarantine_fd,
+                batch_name,
+                b"{}\n",
+            )
+        finally:
+            MODULE._close_fd_quietly(quarantine_fd)
+        residue_path = allocation.path.with_name(
+            batch_name + MODULE.PENDING_QUARANTINE_METADATA_STAGE_SUFFIX
+        )
+        real_require_absent = (
+            MODULE._require_pending_quarantine_allocation_cleanup_controls_absent
+        )
+        injected = False
+
+        def inject_metadata_stage(
+            home: Path,
+            index_root: Path,
+            index_fd: int,
+            ticket: MODULE.PendingQuarantineAllocationTicket,
+            *,
+            allowed_allocation_name: str,
+        ) -> None:
+            nonlocal injected
+            if not injected:
+                injected = True
+                MODULE._write_exclusive_internal_file(
+                    self.home,
+                    residue_path,
+                    b"{}\n",
+                )
+            real_require_absent(
+                home,
+                index_root,
+                index_fd,
+                ticket,
+                allowed_allocation_name=allowed_allocation_name,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_require_pending_quarantine_allocation_cleanup_controls_absent",
+                side_effect=inject_metadata_stage,
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "cleanup control remained"),
+        ):
+            MODULE._cleanup_pending_quarantine_allocations(
+                self.home,
+                budget=MODULE.PendingCleanupActionBudget(4),
+            )
+
+        self.assertTrue(injected)
+        self.assertTrue(residue_path.is_file())
+        self.assertTrue(allocation.path.is_file())
+
+    def test_v8_retained_and_temp_controls_fail_closed_in_read_only_paths(
+        self,
+    ) -> None:
+        for representation in ("retained", "temp", "retained-temp"):
+            with self.subTest(representation=representation):
+                case_home = self.home / representation
+                case_home.mkdir(mode=0o700)
+                quarantine_root = (
+                    MODULE._personal_sync_root(case_home)
+                    / MODULE.QUARANTINE_RELATIVE_PATH
+                )
+                quarantine_fd = MODULE._open_or_create_directory_beneath(
+                    case_home,
+                    quarantine_root,
+                    mode=0o700,
+                )
+                try:
+                    batch_name = f"20260905T040404Z-{os.getpid()}-{time.time_ns()}"
+                    allocation = MODULE._publish_pending_quarantine_allocation_ticket(
+                        case_home,
+                        quarantine_root,
+                        quarantine_fd,
+                        batch_name,
+                        b"{}\n",
+                    )
+                finally:
+                    MODULE._close_fd_quietly(quarantine_fd)
+                if representation == "retained":
+                    control_path = allocation.path.with_name(
+                        next(MODULE._retained_pending_cleanup_names(allocation.path))
+                    )
+                    allocation.path.rename(control_path)
+                else:
+                    temp_path = allocation.path.with_name(
+                        batch_name + MODULE.PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX
+                    )
+                    allocation.path.rename(temp_path)
+                    control_path = temp_path
+                    if representation == "retained-temp":
+                        control_path = temp_path.with_name(
+                            next(MODULE._retained_pending_cleanup_names(temp_path))
+                        )
+                        temp_path.rename(control_path)
+
+                for observe in (
+                    lambda: MODULE._pending_cleanup_ready_batch_is_observed(case_home),
+                    lambda: MODULE.status(case_home),
+                ):
+                    with self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "requires mutation recovery",
+                    ):
+                        observe()
+                dry_run_output = io.StringIO()
+                with (
+                    contextlib.redirect_stdout(dry_run_output),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "requires mutation recovery",
+                    ),
+                ):
+                    MODULE._preflight_pending_recovery(case_home, dry_run=True)
+                self.assertNotIn("would clean", dry_run_output.getvalue())
+                self.assertTrue(control_path.is_file())
+
+                self.assertTrue(
+                    MODULE._preflight_pending_recovery(case_home, dry_run=False)
+                )
+                self.assertFalse(control_path.exists())
+                self.assertFalse(allocation.path.exists())
+                self.assertEqual(MODULE._quarantine_batch_count(case_home), 0)
 
     def test_private_move_retires_v8_fence_after_double_verification(self) -> None:
         parent_fd = MODULE._open_directory_beneath(self.home, self.source_parent)
@@ -1666,7 +2503,7 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         self.assertTrue((batch_root / "metadata.json").is_file())
         self.assertTrue(binding.allocation_ticket.path.is_file())
 
-    def test_v8_entity_without_cleanup_authority_blocks_recovery(self) -> None:
+    def test_v8_entity_with_extra_member_blocks_recovery(self) -> None:
         allocation = MODULE._quarantine_batch_root(
             self.home,
             [],
@@ -1676,6 +2513,27 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         assert isinstance(allocation, MODULE.EphemeralQuarantineBatchAllocation)
         allocation.revoke_reclaim()
         allocation.close()
+        (allocation.batch_root / "foreign").write_bytes(b"foreign\n")
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "allocation remains incomplete",
+        ):
+            MODULE._pending_cleanup_ready_batch_is_observed(self.home)
+
+        dry_run_output = io.StringIO()
+        with (
+            contextlib.redirect_stdout(dry_run_output),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "allocation remains incomplete",
+            ),
+        ):
+            MODULE._preflight_pending_recovery(
+                self.home,
+                dry_run=True,
+            )
+        self.assertNotIn("would clean", dry_run_output.getvalue())
 
         with self.assertRaisesRegex(
             MODULE.SyncError,

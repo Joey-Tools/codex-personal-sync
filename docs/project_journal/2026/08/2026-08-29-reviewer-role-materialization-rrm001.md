@@ -91,9 +91,9 @@ superseded_by:
 
 ## Next Steps
 
-- Commit the Python 3.9 cleanup-assertion compatibility repair, then repeat
-  the full-range fresh-context GPT-5.6 Sol Ultra review of the resulting
-  signed frozen head.
+- Commit the completed allocation-scaffold recovery and control-boundary
+  repairs, then repeat the full-range fresh-context GPT-5.6 Sol Ultra review
+  of the resulting signed frozen head.
 - Propagate the actual squash-landed canonical commit through toolbox and the
   private overlay using the receipt-bound release chain.
 - Smoke-test the installed reviewer role without a path override on every
@@ -784,3 +784,28 @@ superseded_by:
   discovery passed 1,585 tests with two expected skips in 1,091.404 seconds.
   A signed amended head and a wholly new frozen exact-head review are required
   before remote publication.
+- The next frozen review identified three related fail-closed gaps. A v8
+  allocation fence could bind planned full metadata while a direct partial
+  write remained after a hard crash; metadata is now staged and fsynced under
+  the private index before the fence and batch enter the recoverable namespace.
+  The v8 dry-run classifier now distinguishes an exact v5/v7 joined scaffold
+  from an unowned or conflicting entity, so it cannot promise cleanup that the
+  mutating path would reject. A malformed v3 regular-publication `phase` is
+  rejected as managed-state drift before path-derived alias construction.
+- Recovery permits only an empty batch or a canonical metadata scaffold whose
+  bytes, identity, mode, ownership, and digest exactly match the v8 plan;
+  legacy partial, replacement, or extra-member states remain retained. The
+  subsequent boundary audit also found that v8-only retirement ignored sibling
+  durable cleanup controls. Its bounded, index-FD-bound scan now allows only
+  the exact current allocation at each mutation boundary and blocks same-batch
+  ticket, proof, terminal receipt, temporary, retained, metadata-stage, and
+  suffix residue. Normal v5/v7 joined cleanup still deletes its exact proof
+  before retiring its matching v8 fence; the orphan-proof regression fixture
+  explicitly holds that final retirement to model the crash window.
+- The affected reclaim, pending-staging, and regular-materialization modules
+  passed 291 tests in 129.047 seconds. The refreshed eleven-source lock check
+  passed, followed by 280 source-lock regressions in 580.265 seconds. Ruff
+  lint/format, in-memory syntax compilation, and `git diff --check` passed.
+  Complete repository-private discovery then passed 1,602 tests with two
+  expected skips in 1,092.322 seconds. A new frozen exact-head review remains
+  required before remote publication.

@@ -227,6 +227,7 @@ PENDING_CLEANUP_TICKET_SUFFIX = ".json"
 PENDING_CLEANUP_TICKET_TEMP_SUFFIX = ".json.tmp"
 PENDING_QUARANTINE_ALLOCATION_SUFFIX = ".allocation.json"
 PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX = ".allocation.json.tmp"
+PENDING_QUARANTINE_METADATA_STAGE_SUFFIX = ".allocation-metadata.tmp"
 PENDING_CLEANUP_EMPTY_PROOF_SUFFIX = ".empty-proof"
 PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX = ".terminal-validation"
 PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX = ".publish-tmp"
@@ -15656,6 +15657,9 @@ def _quarantine_batch_root(
     batch_identity: tuple[int, int] | None = None
     metadata_snapshot: ManagedStateFileSnapshot | None = None
     metadata_cleanup_snapshot: ManagedStateFileSnapshot | None = None
+    metadata_stage_path: Path | None = None
+    metadata_stage_snapshot: ManagedStateFileSnapshot | None = None
+    metadata_stage_parent_fd = -1
     quarantine_root_identity: tuple[int, int] | None = None
     allocation_ticket: PendingQuarantineAllocationTicket | None = None
     scaffold_allocation: EphemeralQuarantineBatchAllocation | None = None
@@ -15671,6 +15675,75 @@ def _quarantine_batch_root(
                 code="quarantine-saturated",
             )
         if retain_scaffold_binding:
+            index_root = _pending_cleanup_index_path(home)
+            index_fd = _open_or_create_directory_beneath(home, index_root, mode=0o700)
+            _close_fd_quietly(index_fd)
+            metadata_stage_parent_fd = _open_directory_beneath(home, index_root)
+            metadata_stage_path = _pending_quarantine_metadata_stage_path(
+                home,
+                batch_name,
+            )
+            metadata_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+            metadata_flags |= getattr(os, "O_CLOEXEC", 0)
+            metadata_flags |= getattr(os, "O_NOFOLLOW", 0)
+            metadata_fd = os.open(
+                metadata_stage_path.name,
+                metadata_flags,
+                0o600,
+                dir_fd=metadata_stage_parent_fd,
+            )
+            try:
+                os.fchmod(metadata_fd, 0o600)
+                _require_pending_cleanup_fd_access_policy(
+                    metadata_fd,
+                    metadata_stage_path,
+                    expected_mode=0o600,
+                )
+                written = 0
+                while written < len(metadata_payload):
+                    count = os.write(metadata_fd, metadata_payload[written:])
+                    if count <= 0:
+                        raise OSError(
+                            "quarantine metadata stage write made no progress"
+                        )
+                    written += count
+                os.fsync(metadata_fd)
+                os.fsync(metadata_stage_parent_fd)
+                metadata_fd_stat = os.fstat(metadata_fd)
+                metadata_stage_snapshot = _read_managed_state_file_snapshot(
+                    home,
+                    metadata_stage_path,
+                    metadata_stage_parent_fd,
+                    expected_identity=(
+                        metadata_fd_stat.st_dev,
+                        metadata_fd_stat.st_ino,
+                    ),
+                    maximum_bytes=MAX_MANAGED_STATE_BYTES,
+                )
+                if (
+                    metadata_stage_snapshot.payload != metadata_payload
+                    or metadata_stage_snapshot.mode != 0o600
+                    or metadata_stage_snapshot.uid != os.geteuid()
+                ):
+                    raise SyncError(
+                        f"quarantine metadata stage write was incomplete: {batch_root}"
+                    )
+            except BaseException:
+                try:
+                    metadata_fd_stat = os.fstat(metadata_fd)
+                    metadata_stage_snapshot = _read_managed_state_file_snapshot(
+                        home,
+                        metadata_stage_path,
+                        metadata_stage_parent_fd,
+                        expected_identity=(
+                            metadata_fd_stat.st_dev,
+                            metadata_fd_stat.st_ino,
+                        ),
+                        maximum_bytes=MAX_MANAGED_STATE_BYTES,
+                    )
+                except (OSError, SyncError):
+                    metadata_stage_snapshot = None
+                raise
             allocation_ticket = _publish_pending_quarantine_allocation_ticket(
                 home,
                 quarantine_root,
@@ -15686,25 +15759,64 @@ def _quarantine_batch_root(
         directory_flags |= getattr(os, "O_NOFOLLOW", 0)
         batch_fd = os.open(batch_root.name, directory_flags, dir_fd=quarantine_fd)
         batch_identity = _directory_identity(batch_fd)
-        # Keep a readable allocation-owned descriptor so any ambiguous write,
-        # flush, or fsync failure can be rebound to the bytes actually present.
-        metadata_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
-        metadata_flags |= getattr(os, "O_CLOEXEC", 0)
-        metadata_flags |= getattr(os, "O_NOFOLLOW", 0)
-        metadata_fd = os.open(
-            "metadata.json",
-            metadata_flags,
-            0o600,
-            dir_fd=batch_fd,
-        )
-        try:
-            os.fchmod(metadata_fd, 0o600)
-            metadata_cleanup_snapshot = _snapshot_ephemeral_quarantine_metadata_fd(
+        if retain_scaffold_binding:
+            assert metadata_stage_path is not None
+            assert metadata_stage_snapshot is not None
+            assert allocation_ticket is not None
+            current_stage = _require_pending_cleanup_file_snapshot_unchanged(
                 home,
-                batch_root,
-                batch_fd,
-                metadata_fd,
+                metadata_stage_path,
+                metadata_stage_parent_fd,
+                metadata_stage_snapshot,
+                label=f"quarantine metadata stage {batch_name}",
             )
+            _require_pending_quarantine_allocation_ticket_unchanged(
+                home,
+                allocation_ticket,
+            )
+            if (
+                _directory_identity(batch_fd) != batch_identity
+                or not _bound_directory_matches(home, batch_root, batch_fd)
+                or _directory_member_names(batch_fd, maximum_entries=1) != ()
+            ):
+                raise SyncError(
+                    f"quarantine batch changed before metadata: {batch_root}"
+                )
+            _rename_noreplace_at(
+                metadata_stage_parent_fd,
+                metadata_stage_path.name,
+                batch_fd,
+                "metadata.json",
+            )
+            metadata_stage_path = None
+            metadata_stage_snapshot = None
+            os.fsync(batch_fd)
+            os.fsync(metadata_stage_parent_fd)
+            named_metadata = os.stat(
+                "metadata.json",
+                dir_fd=batch_fd,
+                follow_symlinks=False,
+            )
+            if current_stage.file_identity != (
+                named_metadata.st_dev,
+                named_metadata.st_ino,
+            ) or _directory_member_names(batch_fd, maximum_entries=2) != (
+                "metadata.json",
+            ):
+                raise SyncError(
+                    f"quarantine metadata changed during publication: {batch_root}"
+                )
+        else:
+            metadata_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+            metadata_flags |= getattr(os, "O_CLOEXEC", 0)
+            metadata_flags |= getattr(os, "O_NOFOLLOW", 0)
+            metadata_fd = os.open(
+                "metadata.json",
+                metadata_flags,
+                0o600,
+                dir_fd=batch_fd,
+            )
+            os.fchmod(metadata_fd, 0o600)
             written = 0
             while written < len(metadata_payload):
                 count = os.write(metadata_fd, metadata_payload[written:])
@@ -15712,32 +15824,15 @@ def _quarantine_batch_root(
                     raise OSError("quarantine metadata write made no progress")
                 written += count
             os.fsync(metadata_fd)
-            metadata_snapshot = _snapshot_ephemeral_quarantine_metadata_fd(
-                home,
-                batch_root,
-                batch_fd,
-                metadata_fd,
-            )
-            if metadata_snapshot.payload != metadata_payload:
-                raise SyncError(
-                    f"quarantine metadata write was incomplete: {batch_root}"
-                )
-            metadata_cleanup_snapshot = metadata_snapshot
-        except BaseException:
-            # A write/fsync wrapper may raise after the kernel committed bytes.
-            # Re-read the retained FD; only exact stable bytes become cleanup
-            # authority.  If revalidation itself is uncertain, retain the full
-            # scaffold instead of guessing from the intended payload.
-            try:
-                metadata_cleanup_snapshot = _snapshot_ephemeral_quarantine_metadata_fd(
-                    home,
-                    batch_root,
-                    batch_fd,
-                    metadata_fd,
-                )
-            except (OSError, SyncError):
-                metadata_cleanup_snapshot = None
-            raise
+        metadata_snapshot = _snapshot_ephemeral_quarantine_metadata_fd(
+            home,
+            batch_root,
+            batch_fd,
+            metadata_fd,
+        )
+        if metadata_snapshot.payload != metadata_payload:
+            raise SyncError(f"quarantine metadata write was incomplete: {batch_root}")
+        metadata_cleanup_snapshot = metadata_snapshot
         os.fsync(batch_fd)
         if not _bound_directory_matches(home, batch_root, batch_fd):
             raise SyncError(f"quarantine batch changed: {batch_root}")
@@ -15758,6 +15853,10 @@ def _quarantine_batch_root(
                 raise SyncError(
                     f"quarantine metadata changed before binding: {batch_root}"
                 )
+            _require_pending_quarantine_allocation_ticket_unchanged(
+                home,
+                allocation_ticket,
+            )
             assert quarantine_root_identity is not None
             retained_quarantine_fd = os.dup(quarantine_fd)
             retained_batch_fd = -1
@@ -15786,6 +15885,32 @@ def _quarantine_batch_root(
                 _close_fd_quietly(retained_quarantine_fd)
                 raise
     except BaseException as original_error:
+        if metadata_stage_path is not None:
+            try:
+                if metadata_stage_snapshot is None:
+                    raise SyncError(
+                        "quarantine metadata stage could not be rebound for cleanup: "
+                        f"{batch_name}"
+                    )
+                _discard_incomplete_pending_cleanup_ticket(
+                    home,
+                    metadata_stage_path,
+                    expected_snapshot=metadata_stage_snapshot,
+                )
+                metadata_stage_path = None
+                metadata_stage_snapshot = None
+            except (OSError, SyncError) as cleanup_error:
+                cleanup_note = (
+                    "quarantine metadata staging failed and its exact temporary "
+                    f"file was retained: {cleanup_error}"
+                )
+                add_note = getattr(original_error, "add_note", None)
+                if callable(add_note):
+                    add_note(cleanup_note)
+                else:
+                    raise SyncError(
+                        f"{cleanup_note}; original allocation failure: {original_error}"
+                    ) from cleanup_error
         cleanup_binding: EphemeralQuarantineBatchBinding | None = None
         if (
             created_batch
@@ -15857,6 +15982,7 @@ def _quarantine_batch_root(
         raise
     finally:
         _close_fd_quietly(metadata_fd)
+        _close_fd_quietly(metadata_stage_parent_fd)
         if batch_fd >= 0 and (not retain_binding or retain_scaffold_binding):
             _close_fd_quietly(batch_fd)
         _close_fd_quietly(quarantine_fd)
@@ -18811,6 +18937,8 @@ def _read_pending_regular_publication_cleanup(
     if (
         parent_identity is None
         or file_identity is None
+        or not isinstance(journal_phase, str)
+        or journal_phase not in {"produced", "before"}
         or not isinstance(data.get("sha256"), str)
         or not isinstance(data.get("size"), int)
         or isinstance(data.get("size"), bool)
@@ -23908,6 +24036,17 @@ def _pending_quarantine_allocation_path(home: Path, batch_name: str) -> Path:
     )
 
 
+def _pending_quarantine_metadata_stage_path(home: Path, batch_name: str) -> Path:
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        raise SyncError("pending quarantine metadata stage has an invalid batch name")
+    return _pending_cleanup_index_path(home) / (
+        batch_name + PENDING_QUARANTINE_METADATA_STAGE_SUFFIX
+    )
+
+
 def _pending_quarantine_allocation_payload(
     batch_name: str,
     quarantine_root_identity: tuple[int, int],
@@ -23974,6 +24113,18 @@ def _pending_quarantine_allocation_temp_batch_name(name: str) -> str | None:
     return batch_name
 
 
+def _pending_quarantine_metadata_stage_batch_name(name: str) -> str | None:
+    if not name.endswith(PENDING_QUARANTINE_METADATA_STAGE_SUFFIX):
+        return None
+    batch_name = name[: -len(PENDING_QUARANTINE_METADATA_STAGE_SUFFIX)]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        return None
+    return batch_name
+
+
 def _pending_quarantine_retained_allocation_name(
     name: str,
 ) -> tuple[str, str] | None:
@@ -23996,6 +24147,120 @@ def _pending_quarantine_retained_allocation_temp_name(
     if batch_name is None:
         return None
     return canonical, batch_name
+
+
+def _pending_quarantine_retained_metadata_stage_name(
+    name: str,
+) -> tuple[str, str] | None:
+    canonical = _pending_cleanup_retained_canonical_name(name)
+    if canonical is None:
+        return None
+    batch_name = _pending_quarantine_metadata_stage_batch_name(canonical)
+    if batch_name is None:
+        return None
+    return canonical, batch_name
+
+
+def _pending_quarantine_allocation_control_batch_name(name: str) -> str | None:
+    """Return the batch reserved by any strict v8 allocation control name."""
+    direct = _pending_quarantine_allocation_batch_name(name)
+    temporary = _pending_quarantine_allocation_temp_batch_name(name)
+    metadata_stage = _pending_quarantine_metadata_stage_batch_name(name)
+    if direct is not None or temporary is not None or metadata_stage is not None:
+        return direct or temporary or metadata_stage
+    for retained in (
+        _pending_quarantine_retained_allocation_name(name),
+        _pending_quarantine_retained_allocation_temp_name(name),
+        _pending_quarantine_retained_metadata_stage_name(name),
+    ):
+        if retained is not None:
+            return retained[1]
+    return None
+
+
+def _pending_quarantine_allocation_cleanup_control_batch_name(
+    name: str,
+) -> str | None:
+    """Classify any durable cleanup-control residue for a v8 batch.
+
+    This is deliberately broader than the recovery parsers.  Canonical,
+    publication-temp, retained, and suffix-added descendants can all preserve
+    competing cleanup evidence, so none may be ignored at a v8-only deletion
+    boundary merely because it cannot itself be recovered automatically.
+    """
+    candidate = name
+    if candidate.startswith(PENDING_CLEANUP_RETAINED_PREFIX):
+        candidate = candidate[len(PENDING_CLEANUP_RETAINED_PREFIX) :]
+    for marker in (
+        PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX,
+        PENDING_QUARANTINE_ALLOCATION_SUFFIX,
+        PENDING_QUARANTINE_METADATA_STAGE_SUFFIX,
+        PENDING_CLEANUP_TICKET_SUFFIX,
+        PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
+        PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
+    ):
+        marker_index = candidate.find(marker)
+        if marker_index <= 0:
+            continue
+        batch_name = candidate[:marker_index]
+        if (
+            len(batch_name) <= MAX_PENDING_LINK_BATCH_NAME_BYTES
+            and PENDING_LINK_BATCH_RE.fullmatch(batch_name) is not None
+        ):
+            return batch_name
+    return None
+
+
+def _require_pending_quarantine_allocation_cleanup_controls_absent(
+    home: Path,
+    index_root: Path,
+    index_fd: int,
+    ticket: PendingQuarantineAllocationTicket,
+    *,
+    allowed_allocation_name: str,
+) -> None:
+    """Require the exact v8 allocation to be the batch's sole control.
+
+    The protected index property is its bound directory identity and owner-only
+    access policy.  The bounded complete scan rejects every same-batch durable
+    cleanup-control representation except the exact current allocation name.
+    During allocation retirement that name may be the helper's exact isolated
+    tombstone; its inode, content, and policy are rebound separately through the
+    retained ticket snapshot immediately before this boundary is called.
+    """
+    _require_pending_cleanup_fd_access_policy(
+        index_fd,
+        index_root,
+        expected_mode=0o700,
+    )
+    if not _bound_directory_matches(home, index_root, index_fd):
+        raise SyncError("pending quarantine allocation cleanup index changed")
+    names = _directory_member_names(
+        index_fd,
+        maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+        overflow_message=(
+            "pending quarantine allocation cleanup control scan exceeds the limit"
+        ),
+    )
+    batch_name = ticket.batch_root.name
+    for name in names:
+        if (
+            _pending_quarantine_allocation_cleanup_control_batch_name(name)
+            != batch_name
+            or name == allowed_allocation_name
+        ):
+            continue
+        raise SyncError(
+            "pending quarantine allocation cleanup control remained before "
+            f"v8-only mutation: {batch_name}: {name}"
+        )
+    _require_pending_cleanup_fd_access_policy(
+        index_fd,
+        index_root,
+        expected_mode=0o700,
+    )
+    if not _bound_directory_matches(home, index_root, index_fd):
+        raise SyncError("pending quarantine allocation cleanup index changed")
 
 
 def _read_pending_quarantine_allocation_ticket(
@@ -24124,6 +24389,25 @@ def _pending_quarantine_allocation_ticket_matches(
     return matches
 
 
+def _require_pending_quarantine_allocation_ticket_unchanged(
+    home: Path,
+    ticket: PendingQuarantineAllocationTicket,
+) -> PendingQuarantineAllocationTicket:
+    current = _read_pending_quarantine_allocation_ticket(
+        home,
+        ticket.path,
+        expected_identity=ticket.snapshot.file_identity,
+    )
+    if current is None or not _pending_quarantine_allocation_ticket_matches(
+        current,
+        ticket,
+    ):
+        raise SyncError(
+            f"pending quarantine allocation changed: {ticket.batch_root.name}"
+        )
+    return current
+
+
 def _require_quarantine_allocation_matches_binding(
     home: Path,
     binding: EphemeralQuarantineBatchBinding,
@@ -24185,6 +24469,97 @@ def _cleanup_ticket_matches_quarantine_allocation(
     )
 
 
+def _read_joined_quarantine_allocation_for_cleanup(
+    home: Path,
+    cleanup: PendingBatchCleanupTicket,
+) -> PendingQuarantineAllocationTicket | None:
+    """Read the sole canonical v8 control and require its exact v5/v7 join."""
+    if cleanup.version not in {5, 7}:
+        raise SyncError("pending quarantine allocation join requires v5/v7 cleanup")
+    batch_name = cleanup.batch_root.name
+    index_root = _pending_cleanup_index_path(home)
+    index_fd = _open_directory_beneath(home, index_root)
+    try:
+        _require_pending_cleanup_fd_access_policy(
+            index_fd,
+            index_root,
+            expected_mode=0o700,
+        )
+        if not _bound_directory_matches(home, index_root, index_fd):
+            raise SyncError("pending quarantine allocation index changed")
+
+        def control_names() -> tuple[str, ...]:
+            names = _directory_member_names(
+                index_fd,
+                maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+                overflow_message=(
+                    "pending quarantine allocation control scan exceeds the limit"
+                ),
+            )
+            return tuple(
+                name
+                for name in names
+                if _pending_quarantine_allocation_control_batch_name(name) == batch_name
+            )
+
+        before_names = control_names()
+        allocation_path = _pending_quarantine_allocation_path(home, batch_name)
+        allocation = _read_pending_quarantine_allocation_ticket(
+            home,
+            allocation_path,
+        )
+        after_names = control_names()
+        if before_names != after_names or not _bound_directory_matches(
+            home,
+            index_root,
+            index_fd,
+        ):
+            raise SyncError(
+                f"pending quarantine allocation control changed: {batch_name}"
+            )
+        expected_names = (allocation_path.name,) if allocation is not None else ()
+        if after_names != expected_names:
+            raise SyncError(
+                "pending quarantine allocation control does not join cleanup "
+                f"authority: {batch_name}: {', '.join(after_names)}"
+            )
+        if allocation is not None and not _cleanup_ticket_matches_quarantine_allocation(
+            cleanup,
+            allocation,
+        ):
+            raise SyncError(
+                "pending quarantine allocation does not join cleanup authority: "
+                f"{batch_name}"
+            )
+        return allocation
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _require_joined_quarantine_allocation_unchanged(
+    home: Path,
+    cleanup: PendingBatchCleanupTicket,
+    expected: PendingQuarantineAllocationTicket | None,
+) -> None:
+    """Revalidate the original v8 join immediately before cleanup mutation."""
+    current = _read_joined_quarantine_allocation_for_cleanup(home, cleanup)
+    if expected is None:
+        if current is not None:
+            raise SyncError(
+                "pending quarantine allocation appeared during cleanup: "
+                f"{cleanup.batch_root.name}"
+            )
+        return
+    if current is None or not _pending_quarantine_allocation_ticket_matches(
+        current,
+        expected,
+    ):
+        raise SyncError(
+            "pending quarantine allocation changed during cleanup: "
+            f"{cleanup.batch_root.name}"
+        )
+
+
 def _delete_pending_quarantine_allocation_ticket(
     home: Path,
     ticket: PendingQuarantineAllocationTicket,
@@ -24229,6 +24604,13 @@ def _delete_pending_quarantine_allocation_ticket(
                 index_fd,
                 snapshot,
             )
+            _require_pending_quarantine_allocation_cleanup_controls_absent(
+                home,
+                ticket.path.parent,
+                index_fd,
+                ticket,
+                allowed_allocation_name=current_name,
+            )
             boundary_revalidator()
 
         _isolate_and_delete_pending_cleanup_file(
@@ -24260,7 +24642,6 @@ def _retire_quarantine_allocation_after_batch_absent(
                 ticket.quarantine_root_identity,
             )
 
-        require_absent_reservation()
         _delete_pending_quarantine_allocation_ticket(
             home,
             ticket,
@@ -24273,15 +24654,31 @@ def _retire_quarantine_allocation_after_batch_absent(
 def _retire_joined_quarantine_allocation(
     home: Path,
     cleanup: PendingBatchCleanupTicket,
+    expected: PendingQuarantineAllocationTicket | None,
 ) -> None:
     path = _pending_quarantine_allocation_path(
         home,
         cleanup.batch_root.name,
     )
-    allocation = _read_pending_quarantine_allocation_ticket(home, path)
-    if allocation is None:
+    allocation = _read_pending_quarantine_allocation_ticket(
+        home,
+        path,
+        expected_identity=(
+            expected.snapshot.file_identity if expected is not None else None
+        ),
+    )
+    if expected is None:
+        if allocation is not None:
+            raise SyncError(
+                "pending quarantine allocation appeared during cleanup: "
+                f"{cleanup.batch_root.name}"
+            )
         return
-    if not _cleanup_ticket_matches_quarantine_allocation(cleanup, allocation):
+    if (
+        allocation is None
+        or not _pending_quarantine_allocation_ticket_matches(allocation, expected)
+        or not _cleanup_ticket_matches_quarantine_allocation(cleanup, allocation)
+    ):
         raise SyncError(
             "pending quarantine allocation does not join cleanup authority: "
             f"{cleanup.batch_root.name}"
@@ -24345,11 +24742,17 @@ def _pending_quarantine_allocation_batch_names(home: Path) -> set[str]:
             temp = _pending_quarantine_allocation_temp_batch_name(name)
             retained = _pending_quarantine_retained_allocation_name(name)
             retained_temp = _pending_quarantine_retained_allocation_temp_name(name)
-            batch_name = direct or temp
+            metadata_stage = _pending_quarantine_metadata_stage_batch_name(name)
+            retained_metadata_stage = _pending_quarantine_retained_metadata_stage_name(
+                name
+            )
+            batch_name = direct or temp or metadata_stage
             if batch_name is None and retained is not None:
                 batch_name = retained[1]
             if batch_name is None and retained_temp is not None:
                 batch_name = retained_temp[1]
+            if batch_name is None and retained_metadata_stage is not None:
+                batch_name = retained_metadata_stage[1]
             if batch_name is not None:
                 batches.add(batch_name)
         if not _bound_directory_matches(home, index_root, index_fd):
@@ -28495,6 +28898,11 @@ def _delete_pending_cleanup_empty_proof(
         ticket.batch_root.name,
     )
     index_fd = _open_directory_beneath(home, proof_path.parent)
+    joined_allocation = (
+        _read_joined_quarantine_allocation_for_cleanup(home, ticket)
+        if ticket.version in {5, 7}
+        else None
+    )
     try:
         # v5/v7 retire an allocation after the proof is gone.  A canonical
         # ticket may have just been deleted while a retained or suffix-added
@@ -28511,6 +28919,11 @@ def _delete_pending_cleanup_empty_proof(
                     proof_path.parent,
                     index_fd,
                     ticket.batch_root.name,
+                )
+                _require_joined_quarantine_allocation_unchanged(
+                    home,
+                    ticket,
+                    joined_allocation,
                 )
 
             mutation_revalidator = revalidate_ticket_representations
@@ -29231,6 +29644,16 @@ def _remove_pending_ephemeral_quarantine_batch(
         or (ticket.version == 7 and ticket.leaf_identity is not None)
     ):
         raise SyncError("pending ephemeral cleanup authority is incomplete")
+    joined_allocation = _read_joined_quarantine_allocation_for_cleanup(home, ticket)
+
+    def require_allocation_join() -> None:
+        _require_joined_quarantine_allocation_unchanged(
+            home,
+            ticket,
+            joined_allocation,
+        )
+
+    require_allocation_join()
     quarantine_root = ticket.batch_root.parent
     try:
         quarantine_fd = _open_directory_beneath(home, quarantine_root)
@@ -29279,7 +29702,12 @@ def _remove_pending_ephemeral_quarantine_batch(
                 ticket,
                 quarantine_root_identity,
             )
-            _retire_joined_quarantine_allocation(home, ticket)
+            require_allocation_join()
+            _retire_joined_quarantine_allocation(
+                home,
+                ticket,
+                joined_allocation,
+            )
             return True
         if canonical_identity is None:
             bound_batch_root = ticket.batch_root.with_name(isolated_name)
@@ -29377,6 +29805,7 @@ def _remove_pending_ephemeral_quarantine_batch(
                     f"pending ephemeral quarantine leaf changed before removal: "
                     f"{batch_name}"
                 )
+            require_allocation_join()
             os.rmdir("leaf", dir_fd=batch_fd)
             os.fsync(batch_fd)
             if _named_entry_identity(batch_fd, "leaf") is not None:
@@ -29414,6 +29843,7 @@ def _remove_pending_ephemeral_quarantine_batch(
                 metadata_name,
             )
             if metadata_name != "metadata.json":
+                require_allocation_join()
                 metadata = _restore_exact_retained_pending_cleanup_file(
                     home,
                     bound_batch_root / "metadata.json",
@@ -29463,6 +29893,7 @@ def _remove_pending_ephemeral_quarantine_batch(
                     batch_fd,
                     metadata_member,
                 )
+                require_allocation_join()
 
             _isolate_and_delete_pending_cleanup_file(
                 home,
@@ -29514,6 +29945,7 @@ def _remove_pending_ephemeral_quarantine_batch(
                 quarantine_root,
                 expected_mode=0o700,
             )
+            require_allocation_join()
             _rename_noreplace_at(
                 quarantine_fd,
                 batch_name,
@@ -29536,6 +29968,7 @@ def _remove_pending_ephemeral_quarantine_batch(
                 f"pending ephemeral quarantine batch changed after isolation: "
                 f"{batch_name}"
             )
+        require_allocation_join()
         _publish_pending_cleanup_empty_proof(
             home,
             ticket,
@@ -29567,6 +30000,7 @@ def _remove_pending_ephemeral_quarantine_batch(
                 f"pending ephemeral quarantine batch changed before removal: "
                 f"{batch_name}"
             )
+        require_allocation_join()
         os.rmdir(isolated_name, dir_fd=quarantine_fd)
         os.fsync(quarantine_fd)
         if (
@@ -29586,7 +30020,12 @@ def _remove_pending_ephemeral_quarantine_batch(
         ticket,
         quarantine_root_identity,
     )
-    _retire_joined_quarantine_allocation(home, ticket)
+    require_allocation_join()
+    _retire_joined_quarantine_allocation(
+        home,
+        ticket,
+        joined_allocation,
+    )
     return True
 
 
@@ -29765,6 +30204,11 @@ def _delete_pending_cleanup_ticket(
     ticket: PendingBatchCleanupTicket,
 ) -> None:
     index_fd = _open_directory_beneath(home, ticket.path.parent)
+    joined_allocation = (
+        _read_joined_quarantine_allocation_for_cleanup(home, ticket)
+        if ticket.version in {5, 7}
+        else None
+    )
     try:
         current = _read_managed_state_file_snapshot(
             home,
@@ -29777,13 +30221,36 @@ def _delete_pending_cleanup_ticket(
             ticket.snapshot,
         ):
             raise SyncError(f"pending cleanup ticket changed: {ticket.batch_root.name}")
-        _isolate_and_delete_pending_cleanup_file(
-            home,
-            ticket.path,
-            index_fd,
-            ticket.snapshot,
-            label=f"pending cleanup ticket {ticket.batch_root.name}",
-        )
+        mutation_revalidator: Callable[[str], None] | None = None
+        if ticket.version in {5, 7}:
+
+            def revalidate_allocation_join(_ticket_member: str) -> None:
+                _require_joined_quarantine_allocation_unchanged(
+                    home,
+                    ticket,
+                    joined_allocation,
+                )
+
+            mutation_revalidator = revalidate_allocation_join
+            mutation_revalidator(ticket.path.name)
+        label = f"pending cleanup ticket {ticket.batch_root.name}"
+        if mutation_revalidator is None:
+            _isolate_and_delete_pending_cleanup_file(
+                home,
+                ticket.path,
+                index_fd,
+                ticket.snapshot,
+                label=label,
+            )
+        else:
+            _isolate_and_delete_pending_cleanup_file(
+                home,
+                ticket.path,
+                index_fd,
+                ticket.snapshot,
+                label=label,
+                mutation_revalidator=mutation_revalidator,
+            )
         remaining = _read_managed_state_file_snapshot(
             home,
             ticket.path,
@@ -30545,6 +31012,9 @@ def _cleanup_pending_cleanup_ticket_temps(
             if _pending_quarantine_allocation_temp_batch_name(name) is not None:
                 temp_names.add(name)
                 continue
+            if _pending_quarantine_metadata_stage_batch_name(name) is not None:
+                temp_names.add(name)
+                continue
             retained = _pending_cleanup_retained_ticket_temp_name(name)
             if retained is not None:
                 temp_names.add(retained[0])
@@ -30554,6 +31024,12 @@ def _cleanup_pending_cleanup_ticket_temps(
             )
             if retained_allocation is not None:
                 temp_names.add(retained_allocation[0])
+                continue
+            retained_metadata_stage = _pending_quarantine_retained_metadata_stage_name(
+                name
+            )
+            if retained_metadata_stage is not None:
+                temp_names.add(retained_metadata_stage[0])
     finally:
         _close_fd_quietly(index_fd)
     action_budget = budget or PendingCleanupActionBudget(limit)
@@ -30563,8 +31039,13 @@ def _cleanup_pending_cleanup_ticket_temps(
         allocation_batch_name = _pending_quarantine_allocation_temp_batch_name(
             temp_name
         )
+        metadata_stage_batch_name = _pending_quarantine_metadata_stage_batch_name(
+            temp_name
+        )
         if batch_name is None:
             batch_name = allocation_batch_name
+        if batch_name is None:
+            batch_name = metadata_stage_batch_name
         assert batch_name is not None
         if not action_budget.charge_batch(batch_name):
             continue
@@ -30602,7 +31083,11 @@ def _cleanup_pending_cleanup_ticket_temps(
                 home,
                 temp_path,
                 index_fd,
-                maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+                maximum_bytes=(
+                    MAX_MANAGED_STATE_BYTES
+                    if metadata_stage_batch_name is not None
+                    else MAX_PENDING_CLEANUP_TICKET_BYTES
+                ),
             )
             if not classified.exists:
                 raise SyncError(
@@ -30611,6 +31096,17 @@ def _cleanup_pending_cleanup_ticket_temps(
                 )
         finally:
             _close_fd_quietly(index_fd)
+        if metadata_stage_batch_name is not None:
+            discarded_for_batch = _discard_incomplete_pending_cleanup_ticket(
+                home,
+                temp_path,
+                max_actions=MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+                expected_snapshot=classified,
+            )
+            discarded += discarded_for_batch
+            if discarded_for_batch > 0:
+                action_budget.mark_batch_completed(batch_name)
+            continue
         if _promote_pending_ephemeral_cleanup_ticket_temp(
             home,
             temp_path,
@@ -31062,7 +31558,258 @@ def _cleanup_orphan_pending_ephemeral_private_phases(
     return cleaned
 
 
-def _pending_cleanup_ready_batch_is_observed(home: Path) -> bool:
+def _pending_quarantine_allocation_recovery_state(
+    home: Path,
+    allocation: PendingQuarantineAllocationTicket,
+) -> tuple[
+    str,
+    EphemeralQuarantineBatchBinding | None,
+    str | None,
+    tuple[int, int] | None,
+]:
+    """Classify one v8 fence into the exact states execution can recover.
+
+    Empty canonical or isolated directories contain no content to lose.  A
+    canonical leafless scaffold is recoverable only when its metadata bytes,
+    size, type and owner-only policy exactly match the immutable v8 plan.  Any
+    other entity remains ambiguous and is retained.
+    """
+    batch_name = allocation.batch_root.name
+    quarantine_root = allocation.batch_root.parent
+    quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    batch_fd = -1
+    try:
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd,
+            quarantine_root,
+            expected_mode=0o700,
+        )
+        if _directory_identity(
+            quarantine_fd
+        ) != allocation.quarantine_root_identity or not _bound_directory_matches(
+            home,
+            quarantine_root,
+            quarantine_fd,
+        ):
+            raise SyncError(f"pending quarantine allocation root changed: {batch_name}")
+        canonical = _named_entry_identity(quarantine_fd, batch_name)
+        isolated = _named_entry_identity(
+            quarantine_fd,
+            allocation.isolated_name,
+        )
+        if canonical is not None and isolated is not None:
+            raise SyncError(
+                f"pending quarantine allocation has canonical and isolated "
+                f"entities: {batch_name}"
+            )
+        cleanup = _read_pending_cleanup_ticket(
+            home,
+            _pending_cleanup_ticket_path(home, batch_name),
+        )
+        if cleanup is not None:
+            if _cleanup_ticket_matches_quarantine_allocation(cleanup, allocation):
+                return "delegated", None, None, None
+            # The v8 fence has reserved this exact batch name.  A same-name
+            # v5/v7 record that does not bind the identical root, metadata and
+            # isolated-name authority is not an alternative cleanup plan.  In
+            # particular, dry-run must not describe the scaffold as removable
+            # when the real publisher would reject the conflicting ticket.
+            raise SyncError(
+                "pending quarantine allocation does not join cleanup authority: "
+                f"{batch_name}"
+            )
+        if canonical is None and isolated is None:
+            _require_pending_quarantine_allocation_ticket_unchanged(home, allocation)
+            return "absent", None, None, None
+        current_name = batch_name if canonical is not None else allocation.isolated_name
+        expected_identity = canonical if canonical is not None else isolated
+        assert expected_identity is not None
+        bound_root = allocation.batch_root.with_name(current_name)
+        batch_fd = os.open(
+            current_name,
+            _directory_open_flags(nofollow=True),
+            dir_fd=quarantine_fd,
+        )
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd,
+            bound_root,
+            expected_mode=allocation.batch_mode,
+        )
+        if _directory_identity(
+            batch_fd
+        ) != expected_identity or not _bound_directory_matches(
+            home, bound_root, batch_fd
+        ):
+            raise SyncError(
+                f"pending quarantine allocation batch changed: {batch_name}"
+            )
+        names = _directory_member_names(
+            batch_fd,
+            maximum_entries=2,
+            overflow_message="pending quarantine allocation has too many entries",
+        )
+        if names == ():
+            _require_pending_quarantine_allocation_ticket_unchanged(home, allocation)
+            return "empty", None, current_name, expected_identity
+        if current_name != batch_name or names != ("metadata.json",):
+            raise SyncError(
+                "pending quarantine allocation remains incomplete and was retained: "
+                f"{batch_name}"
+            )
+        metadata = _read_managed_state_file_snapshot(
+            home,
+            allocation.batch_root / "metadata.json",
+            batch_fd,
+            maximum_bytes=MAX_MANAGED_STATE_BYTES,
+        )
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(metadata)
+            or metadata.file_type != stat.S_IFREG
+            or metadata.mode != allocation.metadata_mode
+            or metadata.uid != os.geteuid()
+            or metadata.size != allocation.metadata_size
+            or metadata.payload is None
+            or hashlib.sha256(metadata.payload).hexdigest()
+            != allocation.metadata_sha256
+        ):
+            raise SyncError(
+                "pending quarantine allocation metadata does not match its plan "
+                f"and was retained: {batch_name}"
+            )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            allocation.batch_root / "metadata.json",
+            batch_fd,
+            metadata,
+        )
+        _require_pending_quarantine_allocation_ticket_unchanged(home, allocation)
+        return (
+            "exact-scaffold",
+            EphemeralQuarantineBatchBinding(
+                batch_root=allocation.batch_root,
+                quarantine_root_identity=allocation.quarantine_root_identity,
+                batch_identity=expected_identity,
+                leaf_identity=None,
+                metadata=metadata,
+                allocation_ticket=allocation,
+            ),
+            current_name,
+            expected_identity,
+        )
+    finally:
+        _close_fd_quietly(batch_fd)
+        _close_fd_quietly(quarantine_fd)
+
+
+def _pending_quarantine_allocation_fence_is_cleanup_ready(
+    home: Path,
+    allocation: PendingQuarantineAllocationTicket,
+) -> bool:
+    state, _binding, _current_name, _expected_identity = (
+        _pending_quarantine_allocation_recovery_state(home, allocation)
+    )
+    return state in {"absent", "empty", "exact-scaffold"}
+
+
+def _remove_empty_pending_quarantine_allocation(
+    home: Path,
+    allocation: PendingQuarantineAllocationTicket,
+    current_name: str,
+    expected_identity: tuple[int, int],
+) -> None:
+    """Remove only an exact empty v8 entity, preserving crash resumability."""
+    quarantine_root = allocation.batch_root.parent
+    index_root = allocation.path.parent
+    quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    index_fd = -1
+    batch_fd = -1
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+        batch_fd = os.open(
+            current_name,
+            _directory_open_flags(nofollow=True),
+            dir_fd=quarantine_fd,
+        )
+        batch_identity = _directory_identity(batch_fd)
+        if batch_identity != expected_identity:
+            raise SyncError(
+                f"pending empty quarantine allocation changed: "
+                f"{allocation.batch_root.name}"
+            )
+
+        def require_empty_boundary(name: str) -> None:
+            bound_root = allocation.batch_root.with_name(name)
+            _require_pending_cleanup_fd_access_policy(
+                quarantine_fd,
+                quarantine_root,
+                expected_mode=0o700,
+            )
+            _require_pending_cleanup_fd_access_policy(
+                batch_fd,
+                bound_root,
+                expected_mode=allocation.batch_mode,
+            )
+            if (
+                _directory_identity(quarantine_fd)
+                != allocation.quarantine_root_identity
+                or not _bound_directory_matches(
+                    home,
+                    quarantine_root,
+                    quarantine_fd,
+                )
+                or _named_entry_identity(quarantine_fd, name) != batch_identity
+                or _directory_identity(batch_fd) != batch_identity
+                or not _bound_directory_matches(home, bound_root, batch_fd)
+                or _directory_member_names(batch_fd, maximum_entries=1) != ()
+            ):
+                raise SyncError(
+                    f"pending empty quarantine allocation changed: "
+                    f"{allocation.batch_root.name}"
+                )
+            _require_pending_quarantine_allocation_cleanup_controls_absent(
+                home,
+                index_root,
+                index_fd,
+                allocation,
+                allowed_allocation_name=allocation.path.name,
+            )
+            _require_pending_quarantine_allocation_ticket_unchanged(home, allocation)
+
+        if current_name == allocation.batch_root.name:
+            require_empty_boundary(current_name)
+            if (
+                _named_entry_identity(quarantine_fd, allocation.isolated_name)
+                is not None
+            ):
+                raise SyncError(
+                    "pending empty quarantine allocation isolated name is occupied: "
+                    f"{allocation.batch_root.name}"
+                )
+            _rename_noreplace_at(
+                quarantine_fd,
+                current_name,
+                quarantine_fd,
+                allocation.isolated_name,
+            )
+            os.fsync(quarantine_fd)
+            current_name = allocation.isolated_name
+        elif current_name != allocation.isolated_name:
+            raise SyncError("pending empty quarantine allocation name is invalid")
+        require_empty_boundary(current_name)
+        os.rmdir(current_name, dir_fd=quarantine_fd)
+        os.fsync(quarantine_fd)
+    finally:
+        _close_fd_quietly(batch_fd)
+        _close_fd_quietly(index_fd)
+        _close_fd_quietly(quarantine_fd)
+    _retire_quarantine_allocation_after_batch_absent(home, allocation)
+
+
+def _pending_cleanup_ready_batch_is_observed(
+    home: Path,
+    *,
+    allow_v8_control_recovery: bool = False,
+) -> bool:
     if not _pending_link_pointer_is_absent(home):
         return False
     cleanup_ready = bool(_discover_pending_staging_markers(home))
@@ -31092,6 +31839,51 @@ def _pending_cleanup_ready_batch_is_observed(home: Path) -> bool:
                     raise _pending_cleanup_unresolved_ticket_representation_error(
                         unresolved
                     )
+                allocation_batch_name = _pending_quarantine_allocation_batch_name(
+                    entry.name
+                )
+                if allocation_batch_name is not None:
+                    allocation = _read_pending_quarantine_allocation_ticket(
+                        home,
+                        index_root / entry.name,
+                    )
+                    if allocation is not None:
+                        cleanup_ready = (
+                            _pending_quarantine_allocation_fence_is_cleanup_ready(
+                                home,
+                                allocation,
+                            )
+                            or cleanup_ready
+                        )
+                    continue
+                allocation_temp_batch_name = (
+                    _pending_quarantine_allocation_temp_batch_name(entry.name)
+                )
+                retained_allocation = _pending_quarantine_retained_allocation_name(
+                    entry.name
+                )
+                retained_allocation_temp = (
+                    _pending_quarantine_retained_allocation_temp_name(entry.name)
+                )
+                if (
+                    allocation_temp_batch_name is not None
+                    or retained_allocation is not None
+                    or retained_allocation_temp is not None
+                ):
+                    blocked_batch_name = allocation_temp_batch_name
+                    if blocked_batch_name is None and retained_allocation is not None:
+                        blocked_batch_name = retained_allocation[1]
+                    if blocked_batch_name is None:
+                        assert retained_allocation_temp is not None
+                        blocked_batch_name = retained_allocation_temp[1]
+                    if not allow_v8_control_recovery:
+                        raise SyncError(
+                            "pending quarantine allocation control requires mutation "
+                            "recovery before cleanup readiness can be classified: "
+                            f"{blocked_batch_name}: {entry.name}"
+                        )
+                    cleanup_ready = True
+                    continue
                 retained = _pending_cleanup_retained_control_name(entry.name)
                 if retained is not None:
                     cleanup_ready = True
@@ -31099,16 +31891,15 @@ def _pending_cleanup_ready_batch_is_observed(home: Path) -> bool:
                     _pending_cleanup_ticket_temp_batch_name(entry.name) is not None
                     or _pending_cleanup_retained_ticket_temp_name(entry.name)
                     is not None
-                    or _pending_quarantine_allocation_temp_batch_name(entry.name)
+                    or _pending_quarantine_metadata_stage_batch_name(entry.name)
                     is not None
-                    or _pending_quarantine_retained_allocation_temp_name(entry.name)
+                    or _pending_quarantine_retained_metadata_stage_name(entry.name)
                     is not None
                     or _pending_cleanup_cursor_temp_canonical_name(entry.name)
                     is not None
                 ):
                     cleanup_ready = True
                 for suffix in (
-                    PENDING_QUARANTINE_ALLOCATION_SUFFIX,
                     PENDING_CLEANUP_TICKET_SUFFIX,
                     PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
                     PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
@@ -31131,7 +31922,7 @@ def _cleanup_pending_quarantine_allocations(
     *,
     budget: PendingCleanupActionBudget,
 ) -> int:
-    """Retire ticket-only v8 fences; never delete an allocation entity."""
+    """Recover only exact v8 states with independently proven cleanup authority."""
     index_root = _pending_cleanup_index_path(home)
     try:
         index_fd = _open_directory_beneath(home, index_root)
@@ -31162,56 +31953,37 @@ def _cleanup_pending_quarantine_allocations(
         )
         if allocation is None:
             continue
-        quarantine_root = allocation.batch_root.parent
-        quarantine_fd = _open_directory_beneath(home, quarantine_root)
-        try:
-            _require_pending_cleanup_fd_access_policy(
-                quarantine_fd,
-                quarantine_root,
-                expected_mode=0o700,
-            )
-            if _directory_identity(
-                quarantine_fd
-            ) != allocation.quarantine_root_identity or not _bound_directory_matches(
+        state, binding, current_name, expected_identity = (
+            _pending_quarantine_allocation_recovery_state(
                 home,
-                quarantine_root,
-                quarantine_fd,
-            ):
-                raise SyncError(
-                    f"pending quarantine allocation root changed: {batch_name}"
-                )
-            canonical = _named_entry_identity(quarantine_fd, batch_name)
-            isolated = _named_entry_identity(
-                quarantine_fd,
-                allocation.isolated_name,
+                allocation,
             )
-        finally:
-            _close_fd_quietly(quarantine_fd)
-        if canonical is None and isolated is None:
+        )
+        if state == "absent":
             _retire_quarantine_allocation_after_batch_absent(home, allocation)
             cleaned += 1
             budget.mark_batch_completed(batch_name)
             continue
-        if canonical is not None and isolated is not None:
-            raise SyncError(
-                f"pending quarantine allocation has canonical and isolated "
-                f"entities: {batch_name}"
+        if state == "empty":
+            assert current_name is not None
+            assert expected_identity is not None
+            _remove_empty_pending_quarantine_allocation(
+                home,
+                allocation,
+                current_name,
+                expected_identity,
             )
-        cleanup = _read_pending_cleanup_ticket(
-            home,
-            _pending_cleanup_ticket_path(home, batch_name),
-        )
-        if cleanup is not None and _cleanup_ticket_matches_quarantine_allocation(
-            cleanup,
-            allocation,
-        ):
-            # The exact v5/v7 cleanup protocol owns the entity.  Its scanner may
-            # be budget-deferred; v8 remains as a mutation fence until removal.
+            cleaned += 1
+            budget.mark_batch_completed(batch_name)
             continue
-        raise SyncError(
-            "pending quarantine allocation remains incomplete and was retained: "
-            f"{batch_name}"
-        )
+        if state == "exact-scaffold":
+            assert binding is not None
+            _discard_empty_ephemeral_quarantine_batch(home, binding)
+            cleaned += 1
+            budget.mark_batch_completed(batch_name)
+            continue
+        # The exact v5/v7 cleanup protocol owns the entity.  Its scanner may be
+        # budget-deferred; v8 remains as a mutation fence until removal.
     return cleaned
 
 
@@ -31383,18 +32155,27 @@ def _require_no_pending_terminal_mutation_authority(home: Path) -> None:
         retained_allocation_temp = _pending_quarantine_retained_allocation_temp_name(
             name
         )
+        metadata_stage_batch_name = _pending_quarantine_metadata_stage_batch_name(name)
+        retained_metadata_stage = _pending_quarantine_retained_metadata_stage_name(name)
         if (
             allocation_batch_name is not None
             or allocation_temp_batch_name is not None
             or retained_allocation is not None
             or retained_allocation_temp is not None
+            or metadata_stage_batch_name is not None
+            or retained_metadata_stage is not None
         ):
             blocked_batch_name = allocation_batch_name or allocation_temp_batch_name
             if blocked_batch_name is None and retained_allocation is not None:
                 blocked_batch_name = retained_allocation[1]
             if blocked_batch_name is None:
-                assert retained_allocation_temp is not None
-                blocked_batch_name = retained_allocation_temp[1]
+                if retained_allocation_temp is not None:
+                    blocked_batch_name = retained_allocation_temp[1]
+                elif metadata_stage_batch_name is not None:
+                    blocked_batch_name = metadata_stage_batch_name
+                else:
+                    assert retained_metadata_stage is not None
+                    blocked_batch_name = retained_metadata_stage[1]
             raise SyncError(
                 "pending quarantine allocation must be reconciled before new "
                 f"mutation: {blocked_batch_name}"
@@ -37697,7 +38478,10 @@ def _preflight_pending_recovery(
             home,
             dry_run=True,
         )
-        observed_cleanup_ready_batch = _pending_cleanup_ready_batch_is_observed(home)
+        observed_cleanup_ready_batch = _pending_cleanup_ready_batch_is_observed(
+            home,
+            allow_v8_control_recovery=not dry_run,
+        )
         loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(home)
         (
             _loaded_state,
@@ -37792,7 +38576,10 @@ def _install_release_set_unlocked(
     )
     if recovered_retention_transaction and (dry_run or preflight_only):
         return
-    observed_cleanup_ready_batch = _pending_cleanup_ready_batch_is_observed(home)
+    observed_cleanup_ready_batch = _pending_cleanup_ready_batch_is_observed(
+        home,
+        allow_v8_control_recovery=not (dry_run or preflight_only),
+    )
     if observed_cleanup_ready_batch and (dry_run or preflight_only):
         if not preflight_only:
             print(

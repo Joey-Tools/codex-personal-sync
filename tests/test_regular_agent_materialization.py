@@ -3132,6 +3132,68 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
             active_identity,
         )
 
+    def test_v3_cleanup_journal_unhashable_phase_fails_closed(self) -> None:
+        for malformed_phase in ([], {}):
+            with self.subTest(malformed_phase=malformed_phase):
+                self.home = self.root / (
+                    "home-v3-unhashable-phase-" + type(malformed_phase).__name__
+                )
+                batch = self._interrupt_regular_publication_cleanup(
+                    self.release,
+                    SHA_A,
+                )
+                record, active = self._assert_active_publication_journal(batch)
+                journal = MODULE._read_pending_regular_publication_cleanup(
+                    self.home,
+                    batch,
+                    record,
+                    "produced",
+                )
+                assert journal is not None
+                _snapshot, active_name, _phase, expected = journal
+                journal_path = MODULE._pending_regular_publication_cleanup_path(
+                    batch,
+                    record,
+                    "produced",
+                )
+                cleanup_parent = journal_path.parent.stat()
+                payload = json.loads(
+                    MODULE._pending_regular_publication_cleanup_payload(
+                        batch,
+                        record,
+                        expected,
+                        "produced",
+                        active_name,
+                        version=3,
+                        cleanup_parent_identity=(
+                            cleanup_parent.st_dev,
+                            cleanup_parent.st_ino,
+                        ),
+                    )
+                )
+                payload["phase"] = malformed_phase
+                journal_path.write_text(
+                    json.dumps(payload) + "\n",
+                    encoding="utf-8",
+                )
+                active_identity = (active.stat().st_dev, active.stat().st_ino)
+
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "pending regular publication cleanup journal changed",
+                ):
+                    MODULE._recover_pending_regular_publication_cleanup(
+                        self.home,
+                        batch,
+                        record,
+                        "produced",
+                    )
+
+                self.assertEqual(
+                    (active.stat().st_dev, active.stat().st_ino),
+                    active_identity,
+                )
+
     def test_private_authority_journal_corruption_preserves_public_name(self) -> None:
         for corruption in ("missing-lifecycle", "invalid-json"):
             with self.subTest(corruption=corruption):

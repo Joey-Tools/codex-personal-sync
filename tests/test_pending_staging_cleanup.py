@@ -4447,10 +4447,21 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     (hold_path.stat().st_dev, hold_path.stat().st_ino),
                     ticket.snapshot.file_identity,
                 )
-                with mock.patch.object(
-                    MODULE,
-                    "_delete_pending_cleanup_empty_proof",
-                    return_value=None,
+                # Preserve an orphan proof deliberately.  Production retires
+                # the joined v8 allocation only after that proof is deleted;
+                # suspend the matching final step here so this fixture models
+                # the crash window without weakening the v8-only control gate.
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_delete_pending_cleanup_empty_proof",
+                        return_value=None,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_retire_joined_quarantine_allocation",
+                        return_value=None,
+                    ),
                 ):
                     self.assertTrue(
                         MODULE._remove_cleanup_ready_batch(case_home, ticket)
