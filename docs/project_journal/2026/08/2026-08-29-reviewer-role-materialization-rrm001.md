@@ -700,3 +700,10 @@ superseded_by:
   derivative, exact tombstone recovery, and the complete 133-test regular
   materialization module passed locally. A new full discovery and frozen review
   are required for the amended head.
+- The amended signed head passed the complete repository-private discovery:
+  1,577 tests passed with three expected skips in 975.408 seconds, under the
+  retained 30-minute process-group deadline and 128 MiB log ceiling. The
+  affected cross-module suite then passed 936 tests with one expected skip in
+  243.090 seconds. The remaining pre-push gate is one fresh isolated
+  whole-range review of this exact final head; the journal-only evidence update
+  does not require another complete discovery run.
