@@ -230,6 +230,7 @@ PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX = ".allocation.json.tmp"
 PENDING_QUARANTINE_METADATA_STAGE_SUFFIX = ".allocation-metadata.tmp"
 PENDING_CLEANUP_EMPTY_PROOF_SUFFIX = ".empty-proof"
 PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX = ".terminal-validation"
+PENDING_PRIVATE_USE_RETIREMENT_SUFFIX = ".private-use-retirement"
 PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX = ".publish-tmp"
 PENDING_CLEANUP_CURSOR_NAME = ".scan-cursor"
 PENDING_CLEANUP_CURSOR_TEMP_NAME = ".scan-cursor.tmp"
@@ -4876,6 +4877,48 @@ class PendingQuarantineAllocationTicket:
     leaf_mode: int
 
 
+@dataclass(frozen=True)
+class PendingPrivateUseControlEvidence:
+    name: str
+    file_identity: tuple[int, int]
+    sha256: str
+    size: int
+    mode: int
+    uid: int
+    gid: int
+
+
+@dataclass(frozen=True)
+class PendingPrivateUseDirectoryEvidence:
+    identity: tuple[int, int]
+    mode: int
+    uid: int
+    gid: int
+
+
+@dataclass(frozen=True)
+class PendingPrivateUseRetirementReceipt:
+    path: Path
+    snapshot: ManagedStateFileSnapshot
+    batch_root: Path
+    canonical_name: str
+    isolated_name: str
+    cleanup_control: PendingPrivateUseControlEvidence
+    allocation_control: PendingPrivateUseControlEvidence
+    cleanup_index: PendingPrivateUseDirectoryEvidence
+    quarantine_root: PendingPrivateUseDirectoryEvidence
+    batch: PendingPrivateUseDirectoryEvidence
+    leaf: PendingPrivateUseDirectoryEvidence
+    metadata_file_identity: tuple[int, int]
+    metadata_sha256: str
+    metadata_size: int
+    metadata_mode: int
+    metadata_uid: int
+    metadata_gid: int
+    private_member_name: str
+    private_member: RegularFileSnapshot
+
+
 @dataclass
 class PendingCleanupActionBudget:
     limit: int
@@ -5227,6 +5270,7 @@ class EphemeralQuarantineBatchBinding:
     leaf_identity: tuple[int, int] | None
     metadata: ManagedStateFileSnapshot
     allocation_ticket: PendingQuarantineAllocationTicket | None = None
+    cleanup_ticket: PendingBatchCleanupTicket | None = None
 
 
 @dataclass(frozen=True)
@@ -5282,32 +5326,43 @@ class EphemeralQuarantineBatchAllocation:
     def retire_allocation_fence_after_private_use(
         self,
         *,
-        expected_leaf_members: tuple[str, ...],
+        private_member_name: str,
+        private_member: RegularFileSnapshot,
     ) -> None:
-        ticket = self.binding.allocation_ticket
-        if ticket is None:
+        allocation_ticket = self.binding.allocation_ticket
+        cleanup_ticket = self.binding.cleanup_ticket
+        if allocation_ticket is None:
             raise SyncError("ephemeral quarantine allocation fence is missing")
-        # Two fsync/verification passes separate the private rename from fence
-        # retirement.  The ticket deletion helper repeats this exact boundary
-        # inside both its tombstone rename and unlink transitions.
-        for _pass in range(2):
-            os.fsync(self.leaf_fd)
-            os.fsync(self.batch_fd)
-            os.fsync(self.quarantine_fd)
+        if cleanup_ticket is None or cleanup_ticket.version != 5:
+            raise SyncError("ephemeral quarantine cleanup authority is missing")
+
+        expected_leaf_members = (private_member_name,)
+
+        # Two fsync/verification passes separate the private rename from
+        # receipt publication. The immutable receipt binds the caller-captured
+        # payload snapshot before either control is retired, so a crash after
+        # v5 deletion cannot strand an otherwise unverifiable v8 fence.
+        def require_cleanup_retirement_boundary() -> None:
             _require_ephemeral_quarantine_private_boundary(
                 self,
                 expected_leaf_members=expected_leaf_members,
             )
-        _delete_pending_quarantine_allocation_ticket(
-            self.home,
-            ticket,
-            boundary_revalidator=lambda: (
-                _require_ephemeral_quarantine_private_boundary(
-                    self,
-                    expected_leaf_members=expected_leaf_members,
-                )
-            ),
+            _require_pending_quarantine_allocation_ticket_unchanged(
+                self.home,
+                allocation_ticket,
+            )
+
+        for _pass in range(2):
+            os.fsync(self.leaf_fd)
+            os.fsync(self.batch_fd)
+            os.fsync(self.quarantine_fd)
+            require_cleanup_retirement_boundary()
+        receipt = _publish_pending_private_use_retirement_receipt(
+            self,
+            private_member_name,
+            private_member,
         )
+        _retire_pending_private_use_controls(self.home, receipt)
 
     def close(self) -> None:
         leaf_fd = self.leaf_fd
@@ -11131,7 +11186,8 @@ def _move_regular_leaf_to_unique_quarantine(
                 f"isolated evidence at {destination}"
             )
         allocation.retire_allocation_fence_after_private_use(
-            expected_leaf_members=(destination.name,),
+            private_member_name=destination.name,
+            private_member=moved,
         )
         if not retain_batch_binding:
             return destination, moved
@@ -11710,7 +11766,8 @@ def _evacuate_created_regular_leaf_after_failure(
                 f"private evidence was retained: {destination}"
             )
         allocation.retire_allocation_fence_after_private_use(
-            expected_leaf_members=(destination.name,),
+            private_member_name=destination.name,
+            private_member=moved,
         )
         return destination, moved
     except BaseException as original_error:
@@ -16039,9 +16096,11 @@ def _create_ephemeral_quarantine_leaf_at(
     ``mkdir`` cannot return a directory descriptor.  Capture the new named
     directory's identity and store it in the allocation before the first fsync
     or open that can raise.  Once the descriptor exists, transfer it to the
-    allocation before validating it.  Thus every later exception leaves either
-    an exact leaf identity or an exact retained FD for the v5 cleanup protocol;
-    the owner never falls back to a leaf-absent v7 claim after creation.
+    allocation before validating it.  Before returning, publish durable v5
+    authority over the exact batch, metadata, and leaf identities.  Thus a
+    crash after successful publication is recoverable without promoting a v8
+    reservation into deletion authority.  A physical crash before publication
+    intentionally leaves the present entity fail-closed.
     """
     batch_fd = allocation.batch_fd
     if _directory_member_names(batch_fd, maximum_entries=2) != ("metadata.json",):
@@ -16070,6 +16129,16 @@ def _create_ephemeral_quarantine_leaf_at(
         raise SyncError("ephemeral quarantine leaf changed during creation")
     os.fsync(leaf_fd)
     os.fsync(batch_fd)
+    cleanup_ticket = _publish_pending_ephemeral_quarantine_cleanup_ticket(
+        allocation.home,
+        allocation.binding,
+    )
+    allocation.binding = replace(
+        allocation.binding,
+        cleanup_ticket=cleanup_ticket,
+    )
+    _require_ephemeral_quarantine_private_boundary(allocation)
+    _require_pending_cleanup_ticket_unchanged(allocation.home, cleanup_ticket)
 
 
 def _snapshot_payload_digest(snapshot: ManagedStateFileSnapshot) -> str | None:
@@ -17529,6 +17598,582 @@ def _publish_pending_ephemeral_quarantine_cleanup_ticket(
         _close_fd_quietly(quarantine_fd)
 
 
+def _pending_private_use_control_evidence(
+    name: str,
+    snapshot: ManagedStateFileSnapshot,
+) -> PendingPrivateUseControlEvidence:
+    if (
+        not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+        or snapshot.payload is None
+        or snapshot.file_identity is None
+        or snapshot.file_type != stat.S_IFREG
+        or snapshot.mode != 0o600
+        or snapshot.uid != os.geteuid()
+        or snapshot.gid is None
+        or snapshot.size is None
+    ):
+        raise SyncError(f"private-use retirement control is incomplete: {name}")
+    return PendingPrivateUseControlEvidence(
+        name=name,
+        file_identity=snapshot.file_identity,
+        sha256=hashlib.sha256(snapshot.payload).hexdigest(),
+        size=snapshot.size,
+        mode=snapshot.mode,
+        uid=snapshot.uid,
+        gid=snapshot.gid,
+    )
+
+
+def _pending_private_use_directory_evidence(
+    descriptor: int,
+    path: Path,
+) -> PendingPrivateUseDirectoryEvidence:
+    metadata = _require_pending_cleanup_fd_access_policy(
+        descriptor, path, expected_mode=0o700
+    )
+    return PendingPrivateUseDirectoryEvidence(
+        identity=_directory_identity(descriptor),
+        mode=stat.S_IMODE(metadata.st_mode),
+        uid=metadata.st_uid,
+        gid=metadata.st_gid,
+    )
+
+
+def _pending_private_use_control_matches(
+    snapshot: ManagedStateFileSnapshot,
+    expected: PendingPrivateUseControlEvidence,
+) -> bool:
+    return (
+        _managed_state_snapshot_has_complete_file_evidence(snapshot)
+        and snapshot.payload is not None
+        and snapshot.file_type == stat.S_IFREG
+        and snapshot.file_identity == expected.file_identity
+        and hashlib.sha256(snapshot.payload).hexdigest() == expected.sha256
+        and snapshot.size == expected.size
+        and snapshot.mode == expected.mode
+        and snapshot.uid == expected.uid
+        and _gid_matches_regular_file_access_policy(
+            snapshot.gid, expected.gid, expected.mode
+        )
+    )
+
+
+def _pending_private_use_retirement_control_state(
+    home: Path,
+    receipt: PendingPrivateUseRetirementReceipt,
+    *,
+    receipt_member: str,
+) -> tuple[PendingBatchCleanupTicket | None, PendingQuarantineAllocationTicket | None]:
+    """Bind the complete same-batch control namespace at a mutation boundary."""
+    index_root = _pending_cleanup_index_path(home)
+    index_fd = _open_directory_beneath(home, index_root)
+    try:
+        _require_pending_cleanup_fd_access_policy(
+            index_fd, index_root, expected_mode=0o700
+        )
+        if _directory_identity(
+            index_fd
+        ) != receipt.cleanup_index.identity or not _bound_directory_matches(
+            home, index_root, index_fd
+        ):
+            raise SyncError("private-use retirement cleanup index changed")
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="private-use retirement control scan exceeds the limit",
+        )
+        batch_name = receipt.batch_root.name
+        expected_receipt_canonical = batch_name + PENDING_PRIVATE_USE_RETIREMENT_SUFFIX
+        expected_receipt_temp = (
+            expected_receipt_canonical + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+        )
+        cleanup_representations: list[str] = []
+        allocation_representations: list[str] = []
+        receipt_representations: list[str] = []
+        for name in names:
+            related_batch = _pending_quarantine_allocation_cleanup_control_batch_name(
+                name
+            )
+            receipt_related = _pending_private_use_retirement_representation_batch_name(
+                name
+            )
+            if related_batch != batch_name and receipt_related != batch_name:
+                continue
+            retained_canonical = _pending_cleanup_retained_canonical_name(name)
+            canonical = retained_canonical or name
+            if canonical == receipt.cleanup_control.name:
+                cleanup_representations.append(name)
+            elif canonical == receipt.allocation_control.name:
+                allocation_representations.append(name)
+            elif canonical in {expected_receipt_canonical, expected_receipt_temp}:
+                receipt_representations.append(name)
+            else:
+                raise SyncError(
+                    "private-use retirement has competing control evidence: "
+                    f"{batch_name}: {name}"
+                )
+        if len(cleanup_representations) > 1 or len(allocation_representations) > 1:
+            raise SyncError(
+                f"private-use retirement has overlapping controls: {batch_name}"
+            )
+        if receipt_representations != [receipt_member]:
+            raise SyncError(
+                f"private-use retirement receipt representation changed: {batch_name}"
+            )
+        current_receipt = _read_managed_state_file_snapshot(
+            home,
+            index_root / receipt_member,
+            index_fd,
+            expected_identity=receipt.snapshot.file_identity,
+            maximum_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+        )
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            current_receipt, receipt.snapshot
+        ):
+            raise SyncError(f"private-use retirement receipt changed: {batch_name}")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home, index_root / receipt_member, index_fd, current_receipt
+        )
+
+        cleanup: PendingBatchCleanupTicket | None = None
+        if cleanup_representations:
+            cleanup_name = cleanup_representations[0]
+            cleanup_snapshot = _read_managed_state_file_snapshot(
+                home,
+                index_root / cleanup_name,
+                index_fd,
+                expected_identity=receipt.cleanup_control.file_identity,
+                maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+            )
+            if not _pending_private_use_control_matches(
+                cleanup_snapshot, receipt.cleanup_control
+            ):
+                raise SyncError(
+                    f"private-use retirement cleanup control changed: {batch_name}"
+                )
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home, index_root / cleanup_name, index_fd, cleanup_snapshot
+            )
+            if cleanup_name == receipt.cleanup_control.name:
+                cleanup = _read_pending_cleanup_ticket(
+                    home,
+                    index_root / cleanup_name,
+                    expected_ticket_identity=receipt.cleanup_control.file_identity,
+                )
+            else:
+                cleanup = _read_pending_cleanup_ticket(
+                    home,
+                    index_root / (batch_name + PENDING_CLEANUP_TICKET_TEMP_SUFFIX),
+                    expected_ticket_identity=receipt.cleanup_control.file_identity,
+                    allow_temporary=True,
+                    _captured_snapshot=cleanup_snapshot,
+                )
+            if cleanup is None or cleanup.version != 5:
+                raise SyncError(
+                    f"private-use retirement cleanup authority changed: {batch_name}"
+                )
+
+        allocation: PendingQuarantineAllocationTicket | None = None
+        if allocation_representations:
+            allocation_name = allocation_representations[0]
+            allocation_snapshot = _read_managed_state_file_snapshot(
+                home,
+                index_root / allocation_name,
+                index_fd,
+                expected_identity=receipt.allocation_control.file_identity,
+                maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+            )
+            if not _pending_private_use_control_matches(
+                allocation_snapshot, receipt.allocation_control
+            ):
+                raise SyncError(
+                    f"private-use retirement allocation control changed: {batch_name}"
+                )
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home, index_root / allocation_name, index_fd, allocation_snapshot
+            )
+            if allocation_name == receipt.allocation_control.name:
+                allocation = _read_pending_quarantine_allocation_ticket(
+                    home,
+                    index_root / allocation_name,
+                    expected_identity=receipt.allocation_control.file_identity,
+                )
+            else:
+                # The immutable receipt binds the exact v8 bytes and inode.  A
+                # retained tombstone is not promoted here because the deletion
+                # helper may be between its rename and unlink boundaries.
+                original = _read_pending_quarantine_allocation_ticket(
+                    home,
+                    index_root / receipt.allocation_control.name,
+                )
+                if original is not None:
+                    raise SyncError(
+                        f"private-use retirement allocation overlaps: {batch_name}"
+                    )
+                allocation = PendingQuarantineAllocationTicket(
+                    path=index_root / receipt.allocation_control.name,
+                    snapshot=allocation_snapshot,
+                    batch_root=receipt.batch_root,
+                    quarantine_root_identity=receipt.quarantine_root.identity,
+                    isolated_name=receipt.isolated_name,
+                    batch_mode=receipt.batch.mode,
+                    metadata_sha256=receipt.metadata_sha256,
+                    metadata_size=receipt.metadata_size,
+                    metadata_mode=receipt.metadata_mode,
+                    leaf_mode=receipt.leaf.mode,
+                )
+        if cleanup is not None:
+            if (
+                cleanup.batch_root != receipt.batch_root
+                or cleanup.quarantine_root_identity != receipt.quarantine_root.identity
+                or cleanup.isolated_name != receipt.isolated_name
+                or cleanup.batch_root_identity != receipt.batch.identity
+                or cleanup.leaf_identity != receipt.leaf.identity
+                or cleanup.metadata_file_identity != receipt.metadata_file_identity
+                or cleanup.metadata_sha256 != receipt.metadata_sha256
+                or cleanup.metadata_mode != receipt.metadata_mode
+            ):
+                raise SyncError(
+                    f"private-use retirement cleanup authority changed: {batch_name}"
+                )
+        if allocation is not None and (
+            allocation.batch_root != receipt.batch_root
+            or allocation.quarantine_root_identity != receipt.quarantine_root.identity
+            or allocation.isolated_name != receipt.isolated_name
+            or allocation.batch_mode != receipt.batch.mode
+            or allocation.metadata_sha256 != receipt.metadata_sha256
+            or allocation.metadata_size != receipt.metadata_size
+            or allocation.metadata_mode != receipt.metadata_mode
+            or allocation.leaf_mode != receipt.leaf.mode
+        ):
+            raise SyncError(
+                f"private-use retirement allocation authority changed: {batch_name}"
+            )
+        _require_pending_cleanup_fd_access_policy(
+            index_fd, index_root, expected_mode=0o700
+        )
+        if _directory_identity(
+            index_fd
+        ) != receipt.cleanup_index.identity or not _bound_directory_matches(
+            home, index_root, index_fd
+        ):
+            raise SyncError("private-use retirement cleanup index changed")
+        return cleanup, allocation
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _require_pending_private_use_retirement_boundary(
+    home: Path,
+    receipt: PendingPrivateUseRetirementReceipt,
+    *,
+    receipt_member: str,
+) -> tuple[PendingBatchCleanupTicket | None, PendingQuarantineAllocationTicket | None]:
+    quarantine_root = receipt.batch_root.parent
+    leaf_path = receipt.batch_root / "leaf"
+    directory_flags = _directory_open_flags(nofollow=True)
+    quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    batch_fd = -1
+    leaf_fd = -1
+    try:
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd, quarantine_root, expected_mode=receipt.quarantine_root.mode
+        )
+        if (
+            _directory_identity(quarantine_fd) != receipt.quarantine_root.identity
+            or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+            or _named_entry_identity(quarantine_fd, receipt.canonical_name)
+            != receipt.batch.identity
+            or _named_entry_identity(quarantine_fd, receipt.isolated_name) is not None
+        ):
+            raise SyncError("private-use retirement quarantine namespace changed")
+        batch_fd = os.open(
+            receipt.canonical_name, directory_flags, dir_fd=quarantine_fd
+        )
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd, receipt.batch_root, expected_mode=receipt.batch.mode
+        )
+        if (
+            _directory_identity(batch_fd) != receipt.batch.identity
+            or not _bound_directory_matches(home, receipt.batch_root, batch_fd)
+            or _directory_member_names(batch_fd, maximum_entries=3)
+            != ("leaf", "metadata.json")
+            or _named_entry_identity(batch_fd, "leaf") != receipt.leaf.identity
+        ):
+            raise SyncError("private-use retirement batch changed")
+        metadata = _read_managed_state_file_snapshot(
+            home,
+            receipt.batch_root / "metadata.json",
+            batch_fd,
+            expected_identity=receipt.metadata_file_identity,
+            maximum_bytes=MAX_MANAGED_STATE_BYTES,
+        )
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(metadata)
+            or metadata.payload is None
+            or metadata.file_identity != receipt.metadata_file_identity
+            or hashlib.sha256(metadata.payload).hexdigest() != receipt.metadata_sha256
+            or metadata.size != receipt.metadata_size
+            or metadata.mode != receipt.metadata_mode
+            or metadata.uid != receipt.metadata_uid
+            or not _gid_matches_regular_file_access_policy(
+                metadata.gid, receipt.metadata_gid, receipt.metadata_mode
+            )
+        ):
+            raise SyncError("private-use retirement metadata changed")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home, receipt.batch_root / "metadata.json", batch_fd, metadata
+        )
+        leaf_fd = os.open("leaf", directory_flags, dir_fd=batch_fd)
+        _require_pending_cleanup_fd_access_policy(
+            leaf_fd, leaf_path, expected_mode=receipt.leaf.mode
+        )
+        if (
+            _directory_identity(leaf_fd) != receipt.leaf.identity
+            or not _bound_directory_matches(home, leaf_path, leaf_fd)
+            or _directory_member_names(leaf_fd, maximum_entries=2)
+            != (receipt.private_member_name,)
+        ):
+            raise SyncError("private-use retirement leaf changed")
+        private = _regular_file_snapshot_at(
+            leaf_fd,
+            receipt.private_member_name,
+            leaf_path / receipt.private_member_name,
+        )
+        if not _regular_snapshot_matches(
+            private,
+            receipt.leaf.identity,
+            receipt.private_member,
+            expected_link_count=receipt.private_member.link_count,
+        ):
+            raise SyncError("private-use retirement private member changed")
+        controls = _pending_private_use_retirement_control_state(
+            home, receipt, receipt_member=receipt_member
+        )
+        # Repeat the complete private namespace after the index scan.  The
+        # receipt is about to authorize a control mutation, so its protected
+        # object identity, content stability, and access policy must still
+        # hold—not merely the identities of the held directory descriptors.
+        # Benign 0700 gid transitions are not identity or access-policy
+        # changes, while replacement, mode/owner/ACL drift and extra members
+        # remain protected properties.
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd, quarantine_root, expected_mode=receipt.quarantine_root.mode
+        )
+        if (
+            _directory_identity(quarantine_fd) != receipt.quarantine_root.identity
+            or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+            or _named_entry_identity(quarantine_fd, receipt.canonical_name)
+            != receipt.batch.identity
+            or _named_entry_identity(quarantine_fd, receipt.isolated_name) is not None
+        ):
+            raise SyncError("private-use retirement quarantine namespace changed")
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd, receipt.batch_root, expected_mode=receipt.batch.mode
+        )
+        if (
+            _directory_identity(batch_fd) != receipt.batch.identity
+            or not _bound_directory_matches(home, receipt.batch_root, batch_fd)
+            or _directory_member_names(batch_fd, maximum_entries=3)
+            != ("leaf", "metadata.json")
+            or _named_entry_identity(batch_fd, "leaf") != receipt.leaf.identity
+        ):
+            raise SyncError("private-use retirement batch changed")
+        metadata_after = _read_managed_state_file_snapshot(
+            home,
+            receipt.batch_root / "metadata.json",
+            batch_fd,
+            expected_identity=receipt.metadata_file_identity,
+            maximum_bytes=MAX_MANAGED_STATE_BYTES,
+        )
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(metadata_after)
+            or metadata_after.payload is None
+            or metadata_after.file_identity != receipt.metadata_file_identity
+            or hashlib.sha256(metadata_after.payload).hexdigest()
+            != receipt.metadata_sha256
+            or metadata_after.size != receipt.metadata_size
+            or metadata_after.mode != receipt.metadata_mode
+            or metadata_after.uid != receipt.metadata_uid
+            or not _gid_matches_regular_file_access_policy(
+                metadata_after.gid, receipt.metadata_gid, receipt.metadata_mode
+            )
+        ):
+            raise SyncError("private-use retirement metadata changed")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home, receipt.batch_root / "metadata.json", batch_fd, metadata_after
+        )
+        _require_pending_cleanup_fd_access_policy(
+            leaf_fd, leaf_path, expected_mode=receipt.leaf.mode
+        )
+        if (
+            _directory_identity(leaf_fd) != receipt.leaf.identity
+            or not _bound_directory_matches(home, leaf_path, leaf_fd)
+            or _directory_member_names(leaf_fd, maximum_entries=2)
+            != (receipt.private_member_name,)
+        ):
+            raise SyncError("private-use retirement leaf changed")
+        private_after = _regular_file_snapshot_at(
+            leaf_fd,
+            receipt.private_member_name,
+            leaf_path / receipt.private_member_name,
+        )
+        if not _regular_snapshot_matches(
+            private_after,
+            receipt.leaf.identity,
+            receipt.private_member,
+            expected_link_count=receipt.private_member.link_count,
+        ):
+            raise SyncError("private-use retirement private member changed")
+        return controls
+    finally:
+        _close_fd_quietly(leaf_fd)
+        _close_fd_quietly(batch_fd)
+        _close_fd_quietly(quarantine_fd)
+
+
+def _publish_pending_private_use_retirement_receipt(
+    allocation: EphemeralQuarantineBatchAllocation,
+    private_member_name: str,
+    private_member: RegularFileSnapshot,
+) -> PendingPrivateUseRetirementReceipt:
+    """Publish control-only retirement authority from caller-captured evidence."""
+    binding = allocation.binding
+    cleanup_ticket = binding.cleanup_ticket
+    allocation_ticket = binding.allocation_ticket
+    if (
+        cleanup_ticket is None
+        or cleanup_ticket.version != 5
+        or allocation_ticket is None
+        or binding.leaf_identity is None
+        or private_member.parent_identity != binding.leaf_identity
+    ):
+        raise SyncError("private-use retirement authority is incomplete")
+    _require_ephemeral_quarantine_private_boundary(
+        allocation, expected_leaf_members=(private_member_name,)
+    )
+    current_cleanup = _read_pending_cleanup_ticket(
+        allocation.home,
+        cleanup_ticket.path,
+        expected_ticket_identity=cleanup_ticket.snapshot.file_identity,
+    )
+    current_allocation = _read_pending_quarantine_allocation_ticket(
+        allocation.home,
+        allocation_ticket.path,
+        expected_identity=allocation_ticket.snapshot.file_identity,
+    )
+    if (
+        current_cleanup is None
+        or current_cleanup.version != 5
+        or not _managed_state_snapshot_matches_bound_file_evidence(
+            current_cleanup.snapshot, cleanup_ticket.snapshot
+        )
+        or current_allocation is None
+        or not _pending_quarantine_allocation_ticket_matches(
+            current_allocation, allocation_ticket
+        )
+        or not _cleanup_ticket_matches_quarantine_allocation(
+            current_cleanup, current_allocation
+        )
+    ):
+        raise SyncError("private-use retirement controls changed before publication")
+    current_private = _regular_file_snapshot_at(
+        allocation.leaf_fd,
+        private_member_name,
+        binding.batch_root / "leaf" / private_member_name,
+    )
+    if not _regular_snapshot_matches(
+        current_private,
+        binding.leaf_identity,
+        private_member,
+        expected_link_count=private_member.link_count,
+    ):
+        raise SyncError("private-use retirement private member changed")
+    current_metadata = _read_managed_state_file_snapshot(
+        allocation.home,
+        binding.batch_root / "metadata.json",
+        allocation.batch_fd,
+        expected_identity=binding.metadata.file_identity,
+        maximum_bytes=MAX_MANAGED_STATE_BYTES,
+    )
+    if (
+        not _managed_state_snapshot_matches_bound_file_evidence(
+            current_metadata, binding.metadata
+        )
+        or current_metadata.payload is None
+        or current_metadata.file_identity is None
+        or current_metadata.size is None
+        or current_metadata.mode is None
+        or current_metadata.uid is None
+        or current_metadata.gid is None
+    ):
+        raise SyncError("private-use retirement metadata changed")
+    index_root = _pending_cleanup_index_path(allocation.home)
+    index_fd = _open_directory_beneath(allocation.home, index_root)
+    try:
+        cleanup_index = _pending_private_use_directory_evidence(index_fd, index_root)
+        if (
+            cleanup_ticket.snapshot.parent_identity != cleanup_index.identity
+            or allocation_ticket.snapshot.parent_identity != cleanup_index.identity
+        ):
+            raise SyncError("private-use retirement cleanup index changed")
+    finally:
+        _close_fd_quietly(index_fd)
+    prototype = PendingPrivateUseRetirementReceipt(
+        path=_pending_private_use_retirement_path(
+            allocation.home, binding.batch_root.name
+        ),
+        snapshot=ManagedStateFileSnapshot(exists=False),
+        batch_root=binding.batch_root,
+        canonical_name=binding.batch_root.name,
+        isolated_name=_pending_cleanup_isolated_batch_name(binding.batch_root.name),
+        cleanup_control=_pending_private_use_control_evidence(
+            cleanup_ticket.path.name, cleanup_ticket.snapshot
+        ),
+        allocation_control=_pending_private_use_control_evidence(
+            allocation_ticket.path.name, allocation_ticket.snapshot
+        ),
+        cleanup_index=cleanup_index,
+        quarantine_root=_pending_private_use_directory_evidence(
+            allocation.quarantine_fd, allocation.quarantine_root
+        ),
+        batch=_pending_private_use_directory_evidence(
+            allocation.batch_fd, binding.batch_root
+        ),
+        leaf=_pending_private_use_directory_evidence(
+            allocation.leaf_fd, binding.batch_root / "leaf"
+        ),
+        metadata_file_identity=current_metadata.file_identity,
+        metadata_sha256=hashlib.sha256(current_metadata.payload).hexdigest(),
+        metadata_size=current_metadata.size,
+        metadata_mode=current_metadata.mode,
+        metadata_uid=current_metadata.uid,
+        metadata_gid=current_metadata.gid,
+        private_member_name=private_member_name,
+        # This must remain the caller's pre-publication snapshot.  The current
+        # read above is only a comparison and never becomes recovery authority.
+        private_member=private_member,
+    )
+    payload = _pending_private_use_retirement_receipt_payload(prototype)
+    _require_ephemeral_quarantine_private_boundary(
+        allocation, expected_leaf_members=(private_member_name,)
+    )
+    published = _publish_atomic_exclusive_internal_file(
+        allocation.home, prototype.path, payload
+    )
+    receipt = _read_pending_private_use_retirement_receipt(
+        allocation.home,
+        prototype.path,
+        expected_identity=published.file_identity,
+    )
+    if receipt is None or receipt.snapshot.payload != payload:
+        raise SyncError("private-use retirement receipt changed during publication")
+    _require_pending_private_use_retirement_boundary(
+        allocation.home, receipt, receipt_member=receipt.path.name
+    )
+    return receipt
+
+
 def _publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
     home: Path,
     binding: EphemeralQuarantineBatchBinding,
@@ -17831,10 +18476,26 @@ def _discard_empty_ephemeral_quarantine_batch(
                 raise SyncError(
                     f"ephemeral quarantine leaf changed before cleanup: {leaf_path}"
                 )
-            ticket = _publish_pending_ephemeral_quarantine_cleanup_ticket(
-                home,
-                replace(binding, metadata=current_metadata),
-            )
+            cleanup_binding = replace(binding, metadata=current_metadata)
+            if binding.cleanup_ticket is None:
+                ticket = _publish_pending_ephemeral_quarantine_cleanup_ticket(
+                    home,
+                    cleanup_binding,
+                )
+            else:
+                ticket = binding.cleanup_ticket
+                if (
+                    ticket.version != 5
+                    or ticket.snapshot.payload
+                    != _pending_ephemeral_quarantine_cleanup_ticket_payload(
+                        cleanup_binding,
+                        binding.quarantine_root_identity,
+                    )
+                ):
+                    raise SyncError(
+                        f"ephemeral quarantine cleanup authority changed: {batch_name}"
+                    )
+                _require_pending_cleanup_ticket_unchanged(home, ticket)
         else:
             # Leaf absence is itself a protected property.  Publish v7 durable
             # authority before metadata isolation, batch isolation, or rmdir so
@@ -24021,6 +24682,17 @@ def _pending_cleanup_terminal_validation_path(
     )
 
 
+def _pending_private_use_retirement_path(home: Path, batch_name: str) -> Path:
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        raise SyncError("private-use retirement receipt has an invalid batch name")
+    return _pending_cleanup_index_path(home) / (
+        batch_name + PENDING_PRIVATE_USE_RETIREMENT_SUFFIX
+    )
+
+
 def _pending_cleanup_isolated_batch_name(batch_name: str) -> str:
     return PENDING_CLEANUP_ISOLATED_BATCH_PREFIX + batch_name
 
@@ -24178,6 +24850,86 @@ def _pending_quarantine_allocation_control_batch_name(name: str) -> str | None:
     return None
 
 
+def _pending_quarantine_allocation_representation_batch_name(
+    name: str,
+) -> str | None:
+    """Classify v8-derived residue as blocking evidence, never authority.
+
+    The exact parsers above recognize only names that the durable recovery
+    protocol can bind and reread.  This deliberately broader classifier also
+    recognizes suffix-added descendants of those names.  Its result proves
+    only that bytes occupy the v8 control namespace for a syntactically valid
+    batch; callers must use it to stop rather than to recover, promote, or
+    delete an entry.
+    """
+    candidate = name
+    if candidate.startswith(PENDING_CLEANUP_RETAINED_PREFIX):
+        candidate = candidate[len(PENDING_CLEANUP_RETAINED_PREFIX) :]
+    for marker in (
+        PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX,
+        PENDING_QUARANTINE_ALLOCATION_SUFFIX,
+        PENDING_QUARANTINE_METADATA_STAGE_SUFFIX,
+    ):
+        marker_index = candidate.find(marker)
+        if marker_index <= 0:
+            continue
+        batch_name = candidate[:marker_index]
+        if (
+            len(batch_name) <= MAX_PENDING_LINK_BATCH_NAME_BYTES
+            and PENDING_LINK_BATCH_RE.fullmatch(batch_name) is not None
+        ):
+            return batch_name
+    return None
+
+
+def _pending_quarantine_unresolved_allocation_representation(
+    name: str,
+) -> tuple[str, str] | None:
+    """Return v8-derived residue which cannot enter automatic recovery."""
+    batch_name = _pending_quarantine_allocation_representation_batch_name(name)
+    if batch_name is None:
+        return None
+    if _pending_quarantine_allocation_control_batch_name(name) == batch_name:
+        return None
+    return batch_name, name
+
+
+def _pending_quarantine_unresolved_allocation_representation_error(
+    unresolved: tuple[str, str],
+) -> SyncError:
+    batch_name, name = unresolved
+    return SyncError(
+        "pending quarantine allocation representation must be reconciled before "
+        f"new mutation: {batch_name}: {name}"
+    )
+
+
+def _pending_quarantine_unresolved_allocation_representation_issue(
+    home: Path,
+) -> tuple[str, str] | None:
+    """Observe malformed v8 control residue without granting it authority."""
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return None
+    try:
+        if not _bound_directory_matches(home, index_root, index_fd):
+            raise SyncError("pending quarantine allocation index changed")
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending quarantine allocation scan exceeds the limit",
+        )
+        for name in names:
+            unresolved = _pending_quarantine_unresolved_allocation_representation(name)
+            if unresolved is not None:
+                return unresolved
+        return None
+    finally:
+        _close_fd_quietly(index_fd)
+
+
 def _pending_quarantine_allocation_cleanup_control_batch_name(
     name: str,
 ) -> str | None:
@@ -24198,6 +24950,7 @@ def _pending_quarantine_allocation_cleanup_control_batch_name(
         PENDING_CLEANUP_TICKET_SUFFIX,
         PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
         PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
+        PENDING_PRIVATE_USE_RETIREMENT_SUFFIX,
     ):
         marker_index = candidate.find(marker)
         if marker_index <= 0:
@@ -24218,6 +24971,7 @@ def _require_pending_quarantine_allocation_cleanup_controls_absent(
     ticket: PendingQuarantineAllocationTicket,
     *,
     allowed_allocation_name: str,
+    allowed_companion_names: tuple[str, ...] = (),
 ) -> None:
     """Require the exact v8 allocation to be the batch's sole control.
 
@@ -24248,6 +25002,7 @@ def _require_pending_quarantine_allocation_cleanup_controls_absent(
             _pending_quarantine_allocation_cleanup_control_batch_name(name)
             != batch_name
             or name == allowed_allocation_name
+            or name in allowed_companion_names
         ):
             continue
         raise SyncError(
@@ -24268,19 +25023,46 @@ def _read_pending_quarantine_allocation_ticket(
     path: Path,
     *,
     expected_identity: tuple[int, int] | None = None,
+    _captured_snapshot: ManagedStateFileSnapshot | None = None,
 ) -> PendingQuarantineAllocationTicket | None:
     batch_name = _pending_quarantine_allocation_batch_name(path.name)
     if batch_name is None:
         raise SyncError("pending quarantine allocation has an invalid file name")
-    index_fd = _open_directory_beneath(home, path.parent)
-    try:
-        snapshot = _read_managed_state_file_snapshot(
-            home,
-            path,
-            index_fd,
-            expected_identity=expected_identity,
-            maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
-        )
+    if _captured_snapshot is None:
+        index_fd = _open_directory_beneath(home, path.parent)
+        try:
+            snapshot = _read_managed_state_file_snapshot(
+                home,
+                path,
+                index_fd,
+                expected_identity=expected_identity,
+                maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+            )
+            if not snapshot.exists:
+                return None
+            if (
+                not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+                or snapshot.file_type != stat.S_IFREG
+                or snapshot.mode != 0o600
+                or snapshot.uid != os.geteuid()
+                or snapshot.payload is None
+            ):
+                raise SyncError(f"pending quarantine allocation changed: {batch_name}")
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                path,
+                index_fd,
+                snapshot,
+            )
+        finally:
+            _close_fd_quietly(index_fd)
+    else:
+        snapshot = _captured_snapshot
+        if (
+            expected_identity is not None
+            and snapshot.file_identity != expected_identity
+        ):
+            raise SyncError(f"pending quarantine allocation changed: {batch_name}")
         if not snapshot.exists:
             return None
         if (
@@ -24291,14 +25073,6 @@ def _read_pending_quarantine_allocation_ticket(
             or snapshot.payload is None
         ):
             raise SyncError(f"pending quarantine allocation changed: {batch_name}")
-        _require_pending_cleanup_file_snapshot_access_policy(
-            home,
-            path,
-            index_fd,
-            snapshot,
-        )
-    finally:
-        _close_fd_quietly(index_fd)
     data = _decode_managed_state_json(snapshot.payload, path)
     expected_fields = {
         "version",
@@ -24485,7 +25259,11 @@ def _read_joined_quarantine_allocation_for_cleanup(
             index_root,
             expected_mode=0o700,
         )
-        if not _bound_directory_matches(home, index_root, index_fd):
+        if _directory_identity(
+            index_fd
+        ) != cleanup.snapshot.parent_identity or not _bound_directory_matches(
+            home, index_root, index_fd
+        ):
             raise SyncError("pending quarantine allocation index changed")
 
         def control_names() -> tuple[str, ...]:
@@ -24496,6 +25274,14 @@ def _read_joined_quarantine_allocation_for_cleanup(
                     "pending quarantine allocation control scan exceeds the limit"
                 ),
             )
+            for name in names:
+                unresolved = _pending_quarantine_unresolved_allocation_representation(
+                    name
+                )
+                if unresolved is not None and unresolved[0] == batch_name:
+                    raise _pending_quarantine_unresolved_allocation_representation_error(
+                        unresolved
+                    )
             return tuple(
                 name
                 for name in names
@@ -24504,15 +25290,46 @@ def _read_joined_quarantine_allocation_for_cleanup(
 
         before_names = control_names()
         allocation_path = _pending_quarantine_allocation_path(home, batch_name)
+        allocation_snapshot = _read_managed_state_file_snapshot(
+            home,
+            allocation_path,
+            index_fd,
+            maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        )
+        if allocation_snapshot.exists:
+            if (
+                not _managed_state_snapshot_has_complete_file_evidence(
+                    allocation_snapshot
+                )
+                or allocation_snapshot.file_type != stat.S_IFREG
+                or allocation_snapshot.mode != 0o600
+                or allocation_snapshot.uid != os.geteuid()
+                or allocation_snapshot.payload is None
+                or allocation_snapshot.parent_identity
+                != cleanup.snapshot.parent_identity
+            ):
+                raise SyncError(f"pending quarantine allocation changed: {batch_name}")
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                allocation_path,
+                index_fd,
+                allocation_snapshot,
+            )
         allocation = _read_pending_quarantine_allocation_ticket(
             home,
             allocation_path,
+            _captured_snapshot=allocation_snapshot,
         )
         after_names = control_names()
-        if before_names != after_names or not _bound_directory_matches(
-            home,
-            index_root,
+        _require_pending_cleanup_fd_access_policy(
             index_fd,
+            index_root,
+            expected_mode=0o700,
+        )
+        if (
+            before_names != after_names
+            or _directory_identity(index_fd) != cleanup.snapshot.parent_identity
+            or not _bound_directory_matches(home, index_root, index_fd)
         ):
             raise SyncError(
                 f"pending quarantine allocation control changed: {batch_name}"
@@ -24565,6 +25382,7 @@ def _delete_pending_quarantine_allocation_ticket(
     ticket: PendingQuarantineAllocationTicket,
     *,
     boundary_revalidator: Callable[[], None],
+    allowed_companion_names: tuple[str, ...] = (),
 ) -> None:
     index_fd = _open_directory_beneath(home, ticket.path.parent)
     try:
@@ -24604,12 +25422,19 @@ def _delete_pending_quarantine_allocation_ticket(
                 index_fd,
                 snapshot,
             )
+            cleanup_control_kwargs: dict[str, object] = {
+                "allowed_allocation_name": current_name,
+            }
+            if allowed_companion_names:
+                cleanup_control_kwargs["allowed_companion_names"] = (
+                    allowed_companion_names
+                )
             _require_pending_quarantine_allocation_cleanup_controls_absent(
                 home,
                 ticket.path.parent,
                 index_fd,
                 ticket,
-                allowed_allocation_name=current_name,
+                **cleanup_control_kwargs,
             )
             boundary_revalidator()
 
@@ -24620,6 +25445,73 @@ def _delete_pending_quarantine_allocation_ticket(
             ticket.snapshot,
             label=f"pending quarantine allocation {ticket.batch_root.name}",
             mutation_revalidator=revalidate_ticket_and_boundary,
+        )
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _retire_pending_private_use_controls(
+    home: Path,
+    receipt: PendingPrivateUseRetirementReceipt,
+) -> None:
+    """Retire v5, v8, then this receipt without mutating private evidence."""
+    batch_name = receipt.batch_root.name
+    receipt_name = receipt.path.name
+
+    def require_receipt_boundary() -> tuple[
+        PendingBatchCleanupTicket | None,
+        PendingQuarantineAllocationTicket | None,
+    ]:
+        return _require_pending_private_use_retirement_boundary(
+            home, receipt, receipt_member=receipt_name
+        )
+
+    cleanup, allocation = require_receipt_boundary()
+    if cleanup is not None:
+        _delete_pending_cleanup_ticket(
+            home,
+            cleanup,
+            boundary_revalidator=lambda: require_receipt_boundary(),
+        )
+    cleanup, allocation = require_receipt_boundary()
+    if cleanup is not None:
+        raise SyncError(
+            f"private-use retirement cleanup control remained: {batch_name}"
+        )
+    if allocation is not None:
+        _delete_pending_quarantine_allocation_ticket(
+            home,
+            allocation,
+            boundary_revalidator=lambda: require_receipt_boundary(),
+            allowed_companion_names=(receipt_name,),
+        )
+    cleanup, allocation = require_receipt_boundary()
+    if cleanup is not None or allocation is not None:
+        raise SyncError(f"private-use retirement controls remained: {batch_name}")
+    index_fd = _open_directory_beneath(home, receipt.path.parent)
+    try:
+
+        def require_final_receipt_boundary(current_name: str) -> None:
+            current_receipt = replace(
+                receipt,
+                path=receipt.path.with_name(current_name),
+            )
+            controls = _require_pending_private_use_retirement_boundary(
+                home, current_receipt, receipt_member=current_name
+            )
+            if controls != (None, None):
+                raise SyncError(
+                    f"private-use retirement controls reappeared: {batch_name}"
+                )
+
+        _isolate_and_delete_pending_cleanup_file(
+            home,
+            receipt.path,
+            index_fd,
+            receipt.snapshot,
+            label=f"private-use retirement receipt {batch_name}",
+            maximum_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+            mutation_revalidator=require_final_receipt_boundary,
         )
     finally:
         _close_fd_quietly(index_fd)
@@ -24738,6 +25630,11 @@ def _pending_quarantine_allocation_batch_names(home: Path) -> set[str]:
         )
         batches: set[str] = set()
         for name in names:
+            unresolved = _pending_quarantine_unresolved_allocation_representation(name)
+            if unresolved is not None:
+                raise _pending_quarantine_unresolved_allocation_representation_error(
+                    unresolved
+                )
             direct = _pending_quarantine_allocation_batch_name(name)
             temp = _pending_quarantine_allocation_temp_batch_name(name)
             retained = _pending_quarantine_retained_allocation_name(name)
@@ -25260,6 +26157,357 @@ def _pending_ephemeral_quarantine_cleanup_ticket_payload(
         max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
         overflow_error="pending cleanup ticket exceeds the size limit",
     )
+
+
+def _pending_private_use_control_payload(
+    evidence: PendingPrivateUseControlEvidence,
+) -> dict[str, object]:
+    return {
+        "name": evidence.name,
+        "file_identity": _identity_payload(evidence.file_identity),
+        "sha256": evidence.sha256,
+        "size": evidence.size,
+        "mode": evidence.mode,
+        "uid": evidence.uid,
+        "gid": evidence.gid,
+    }
+
+
+def _pending_private_use_directory_payload(
+    evidence: PendingPrivateUseDirectoryEvidence,
+) -> dict[str, object]:
+    return {
+        "identity": _identity_payload(evidence.identity),
+        "mode": evidence.mode,
+        "uid": evidence.uid,
+        "gid": evidence.gid,
+    }
+
+
+def _pending_private_use_retirement_receipt_payload(
+    receipt: PendingPrivateUseRetirementReceipt,
+) -> bytes:
+    private = receipt.private_member
+    return _bounded_json_document(
+        {
+            "version": 1,
+            "kind": "ephemeral-quarantine-private-use-retirement",
+            "batch": receipt.batch_root.name,
+            "canonical_name": receipt.canonical_name,
+            "isolated_name": receipt.isolated_name,
+            "cleanup_control": _pending_private_use_control_payload(
+                receipt.cleanup_control
+            ),
+            "allocation_control": _pending_private_use_control_payload(
+                receipt.allocation_control
+            ),
+            "cleanup_index": _pending_private_use_directory_payload(
+                receipt.cleanup_index
+            ),
+            "quarantine_root": _pending_private_use_directory_payload(
+                receipt.quarantine_root
+            ),
+            "batch_directory": _pending_private_use_directory_payload(receipt.batch),
+            "leaf_directory": _pending_private_use_directory_payload(receipt.leaf),
+            "metadata": {
+                "file_identity": _identity_payload(receipt.metadata_file_identity),
+                "sha256": receipt.metadata_sha256,
+                "size": receipt.metadata_size,
+                "mode": receipt.metadata_mode,
+                "uid": receipt.metadata_uid,
+                "gid": receipt.metadata_gid,
+            },
+            "private_member": {
+                "name": receipt.private_member_name,
+                "parent_identity": _identity_payload(private.parent_identity),
+                "file_identity": _identity_payload(private.file_identity),
+                "sha256": private.sha256,
+                "size": private.size,
+                "mode": private.mode,
+                "uid": private.uid,
+                "gid": private.gid,
+                "link_count": private.link_count,
+            },
+        },
+        max_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+        overflow_error="private-use retirement receipt exceeds the size limit",
+    )
+
+
+def _pending_private_use_control_from_payload(
+    value: object,
+    *,
+    expected_name: str,
+    label: str,
+) -> PendingPrivateUseControlEvidence:
+    fields = {"name", "file_identity", "sha256", "size", "mode", "uid", "gid"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise SyncError(f"private-use retirement {label} changed")
+    identity = _parse_pending_identity(
+        value.get("file_identity"),
+        f"private-use retirement {label} identity",
+    )
+    digest = value.get("sha256")
+    size = value.get("size")
+    mode = value.get("mode")
+    uid = value.get("uid")
+    gid = value.get("gid")
+    if (
+        value.get("name") != expected_name
+        or identity is None
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or type(size) is not int
+        or not 0 <= size <= MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES
+        or mode != 0o600
+        or uid != os.geteuid()
+        or type(gid) is not int
+        or gid < 0
+    ):
+        raise SyncError(f"private-use retirement {label} changed")
+    return PendingPrivateUseControlEvidence(
+        name=expected_name,
+        file_identity=identity,
+        sha256=digest,
+        size=size,
+        mode=mode,
+        uid=uid,
+        gid=gid,
+    )
+
+
+def _pending_private_use_directory_from_payload(
+    value: object,
+    *,
+    label: str,
+) -> PendingPrivateUseDirectoryEvidence:
+    if not isinstance(value, dict) or set(value) != {"identity", "mode", "uid", "gid"}:
+        raise SyncError(f"private-use retirement {label} changed")
+    identity = _parse_pending_identity(
+        value.get("identity"), f"private-use retirement {label} identity"
+    )
+    gid = value.get("gid")
+    if (
+        identity is None
+        or value.get("mode") != 0o700
+        or value.get("uid") != os.geteuid()
+        or type(gid) is not int
+        or gid < 0
+    ):
+        raise SyncError(f"private-use retirement {label} changed")
+    return PendingPrivateUseDirectoryEvidence(
+        identity=identity,
+        mode=0o700,
+        uid=os.geteuid(),
+        gid=gid,
+    )
+
+
+def _read_pending_private_use_retirement_receipt(
+    home: Path,
+    path: Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+    allow_temporary: bool = False,
+    _captured_snapshot: ManagedStateFileSnapshot | None = None,
+) -> PendingPrivateUseRetirementReceipt | None:
+    if allow_temporary:
+        batch_name = _pending_private_use_retirement_temp_batch_name(path.name)
+    else:
+        batch_name = _pending_private_use_retirement_batch_name(path.name)
+    if batch_name is None:
+        raise SyncError("private-use retirement receipt has an invalid file name")
+    if _captured_snapshot is not None and not allow_temporary:
+        raise ValueError("captured retirement parsing is limited to temp files")
+    index_fd = -1
+    try:
+        if _captured_snapshot is None:
+            index_fd = _open_directory_beneath(home, path.parent)
+            snapshot = _read_managed_state_file_snapshot(
+                home,
+                path,
+                index_fd,
+                expected_identity=expected_identity,
+                maximum_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+            )
+        else:
+            snapshot = _captured_snapshot
+            if (
+                expected_identity is not None
+                and snapshot.file_identity != expected_identity
+            ):
+                raise SyncError(f"private-use retirement receipt changed: {batch_name}")
+        if not snapshot.exists:
+            return None
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+            or snapshot.file_type != stat.S_IFREG
+            or snapshot.payload is None
+            or snapshot.mode != 0o600
+            or snapshot.uid != os.geteuid()
+        ):
+            raise SyncError(f"private-use retirement receipt changed: {batch_name}")
+        if _captured_snapshot is None:
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home, path, index_fd, snapshot
+            )
+    finally:
+        if index_fd >= 0:
+            _close_fd_quietly(index_fd)
+    data = _decode_managed_state_json(snapshot.payload, path)
+    fields = {
+        "version",
+        "kind",
+        "batch",
+        "canonical_name",
+        "isolated_name",
+        "cleanup_control",
+        "allocation_control",
+        "cleanup_index",
+        "quarantine_root",
+        "batch_directory",
+        "leaf_directory",
+        "metadata",
+        "private_member",
+    }
+    canonical_name = data.get("canonical_name")
+    isolated_name = data.get("isolated_name")
+    if (
+        set(data) != fields
+        or data.get("version") != 1
+        or data.get("kind") != "ephemeral-quarantine-private-use-retirement"
+        or data.get("batch") != batch_name
+        or canonical_name != batch_name
+        or isolated_name != _pending_cleanup_isolated_batch_name(batch_name)
+    ):
+        raise SyncError(f"private-use retirement receipt changed: {batch_name}")
+    cleanup = _pending_private_use_control_from_payload(
+        data.get("cleanup_control"),
+        expected_name=batch_name + PENDING_CLEANUP_TICKET_SUFFIX,
+        label="cleanup control",
+    )
+    allocation = _pending_private_use_control_from_payload(
+        data.get("allocation_control"),
+        expected_name=batch_name + PENDING_QUARANTINE_ALLOCATION_SUFFIX,
+        label="allocation control",
+    )
+    cleanup_index = _pending_private_use_directory_from_payload(
+        data.get("cleanup_index"), label="cleanup index"
+    )
+    quarantine_root = _pending_private_use_directory_from_payload(
+        data.get("quarantine_root"), label="quarantine root"
+    )
+    batch = _pending_private_use_directory_from_payload(
+        data.get("batch_directory"), label="batch directory"
+    )
+    leaf = _pending_private_use_directory_from_payload(
+        data.get("leaf_directory"), label="leaf directory"
+    )
+    metadata = data.get("metadata")
+    metadata_fields = {"file_identity", "sha256", "size", "mode", "uid", "gid"}
+    if not isinstance(metadata, dict) or set(metadata) != metadata_fields:
+        raise SyncError(f"private-use retirement metadata changed: {batch_name}")
+    metadata_identity = _parse_pending_identity(
+        metadata.get("file_identity"),
+        "private-use retirement metadata identity",
+    )
+    metadata_sha256 = metadata.get("sha256")
+    metadata_size = metadata.get("size")
+    metadata_gid = metadata.get("gid")
+    if (
+        metadata_identity is None
+        or not isinstance(metadata_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", metadata_sha256) is None
+        or type(metadata_size) is not int
+        or not 0 <= metadata_size <= MAX_MANAGED_STATE_BYTES
+        or metadata.get("mode") != 0o600
+        or metadata.get("uid") != os.geteuid()
+        or type(metadata_gid) is not int
+        or metadata_gid < 0
+    ):
+        raise SyncError(f"private-use retirement metadata changed: {batch_name}")
+    private = data.get("private_member")
+    private_fields = {
+        "name",
+        "parent_identity",
+        "file_identity",
+        "sha256",
+        "size",
+        "mode",
+        "uid",
+        "gid",
+        "link_count",
+    }
+    if not isinstance(private, dict) or set(private) != private_fields:
+        raise SyncError(f"private-use retirement private member changed: {batch_name}")
+    private_name = private.get("name")
+    private_parent_identity = _parse_pending_identity(
+        private.get("parent_identity"),
+        "private-use retirement private parent identity",
+    )
+    private_identity = _parse_pending_identity(
+        private.get("file_identity"),
+        "private-use retirement private member identity",
+    )
+    private_digest = private.get("sha256")
+    private_size = private.get("size")
+    private_mode = private.get("mode")
+    private_uid = private.get("uid")
+    private_gid = private.get("gid")
+    private_links = private.get("link_count")
+    if (
+        not isinstance(private_name, str)
+        or private_name in {"", ".", ".."}
+        or "/" in private_name
+        or private_parent_identity != leaf.identity
+        or private_identity is None
+        or not isinstance(private_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", private_digest) is None
+        or type(private_size) is not int
+        or not 0 <= private_size <= MAX_ARCHIVE_MEMBER_BYTES
+        or type(private_mode) is not int
+        or not 0 <= private_mode <= 0o7777
+        or private_uid != os.geteuid()
+        or type(private_gid) is not int
+        or private_gid < 0
+        or type(private_links) is not int
+        or private_links < 1
+    ):
+        raise SyncError(f"private-use retirement private member changed: {batch_name}")
+    private_snapshot = RegularFileSnapshot(
+        parent_identity=private_parent_identity,
+        file_identity=private_identity,
+        sha256=private_digest,
+        size=private_size,
+        mode=private_mode,
+        uid=private_uid,
+        gid=private_gid,
+        link_count=private_links,
+    )
+    receipt = PendingPrivateUseRetirementReceipt(
+        path=path,
+        snapshot=snapshot,
+        batch_root=(_personal_sync_root(home) / QUARANTINE_RELATIVE_PATH / batch_name),
+        canonical_name=canonical_name,
+        isolated_name=isolated_name,
+        cleanup_control=cleanup,
+        allocation_control=allocation,
+        cleanup_index=cleanup_index,
+        quarantine_root=quarantine_root,
+        batch=batch,
+        leaf=leaf,
+        metadata_file_identity=metadata_identity,
+        metadata_sha256=metadata_sha256,
+        metadata_size=metadata_size,
+        metadata_mode=0o600,
+        metadata_uid=os.geteuid(),
+        metadata_gid=metadata_gid,
+        private_member_name=private_name,
+        private_member=private_snapshot,
+    )
+    if _pending_private_use_retirement_receipt_payload(receipt) != snapshot.payload:
+        raise SyncError(f"private-use retirement receipt changed: {batch_name}")
+    return receipt
 
 
 def _pending_ephemeral_quarantine_scaffold_cleanup_ticket_payload(
@@ -30202,6 +31450,8 @@ def _remove_cleanup_ready_batch(
 def _delete_pending_cleanup_ticket(
     home: Path,
     ticket: PendingBatchCleanupTicket,
+    *,
+    boundary_revalidator: Callable[[], None] | None = None,
 ) -> None:
     index_fd = _open_directory_beneath(home, ticket.path.parent)
     joined_allocation = (
@@ -30230,8 +31480,17 @@ def _delete_pending_cleanup_ticket(
                     ticket,
                     joined_allocation,
                 )
+                if boundary_revalidator is not None:
+                    boundary_revalidator()
 
             mutation_revalidator = revalidate_allocation_join
+            mutation_revalidator(ticket.path.name)
+        elif boundary_revalidator is not None:
+
+            def revalidate_boundary(_ticket_member: str) -> None:
+                boundary_revalidator()
+
+            mutation_revalidator = revalidate_boundary
             mutation_revalidator(ticket.path.name)
         label = f"pending cleanup ticket {ticket.batch_root.name}"
         if mutation_revalidator is None:
@@ -30450,6 +31709,70 @@ def _pending_cleanup_ticket_temp_batch_name(name: str) -> str | None:
     return batch_name
 
 
+def _pending_private_use_retirement_batch_name(name: str) -> str | None:
+    if not name.endswith(PENDING_PRIVATE_USE_RETIREMENT_SUFFIX):
+        return None
+    batch_name = name[: -len(PENDING_PRIVATE_USE_RETIREMENT_SUFFIX)]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        return None
+    return batch_name
+
+
+def _pending_private_use_retirement_temp_batch_name(name: str) -> str | None:
+    suffix = (
+        PENDING_PRIVATE_USE_RETIREMENT_SUFFIX + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+    )
+    if not name.endswith(suffix):
+        return None
+    batch_name = name[: -len(suffix)]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        return None
+    return batch_name
+
+
+def _pending_private_use_retirement_representation_batch_name(
+    name: str,
+) -> str | None:
+    candidate = name
+    if candidate.startswith(PENDING_CLEANUP_RETAINED_PREFIX):
+        candidate = candidate[len(PENDING_CLEANUP_RETAINED_PREFIX) :]
+    marker_index = candidate.find(PENDING_PRIVATE_USE_RETIREMENT_SUFFIX)
+    if marker_index <= 0:
+        return None
+    batch_name = candidate[:marker_index]
+    if (
+        len(batch_name) <= MAX_PENDING_LINK_BATCH_NAME_BYTES
+        and PENDING_LINK_BATCH_RE.fullmatch(batch_name) is not None
+    ):
+        return batch_name
+    return None
+
+
+def _pending_private_use_retirement_unresolved_representation(
+    name: str,
+) -> tuple[str, str] | None:
+    batch_name = _pending_private_use_retirement_representation_batch_name(name)
+    if batch_name is None:
+        return None
+    canonical = batch_name + PENDING_PRIVATE_USE_RETIREMENT_SUFFIX
+    temporary = canonical + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+    if name in {canonical, temporary}:
+        return None
+    retained = _pending_cleanup_retained_control_name(name)
+    if retained is not None and retained[1] == batch_name and retained[0] == canonical:
+        return None
+    retained_canonical = _pending_cleanup_retained_canonical_name(name)
+    if retained_canonical == temporary:
+        return None
+    return batch_name, name
+
+
 def _pending_cleanup_retained_ticket_temp_name(
     name: str,
 ) -> tuple[str, str] | None:
@@ -30482,6 +31805,7 @@ def _pending_cleanup_retained_control_name(
         PENDING_CLEANUP_TICKET_SUFFIX,
         PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
         PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
+        PENDING_PRIVATE_USE_RETIREMENT_SUFFIX,
     ):
         if not canonical.endswith(suffix):
             continue
@@ -30565,9 +31889,38 @@ def _pending_cleanup_unresolved_ticket_representation_error(
 
 def _require_no_pending_unresolved_ticket_representations(home: Path) -> None:
     unresolved = _pending_cleanup_unresolved_ticket_representation_issue(home)
-    if unresolved is None:
+    if unresolved is not None:
+        raise _pending_cleanup_unresolved_ticket_representation_error(unresolved)
+    allocation_unresolved = (
+        _pending_quarantine_unresolved_allocation_representation_issue(home)
+    )
+    if allocation_unresolved is not None:
+        raise _pending_quarantine_unresolved_allocation_representation_error(
+            allocation_unresolved
+        )
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
         return
-    raise _pending_cleanup_unresolved_ticket_representation_error(unresolved)
+    try:
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="private-use retirement scan exceeds the size limit",
+        )
+        for name in names:
+            unresolved_receipt = (
+                _pending_private_use_retirement_unresolved_representation(name)
+            )
+            if unresolved_receipt is not None:
+                batch_name, representation = unresolved_receipt
+                raise SyncError(
+                    "private-use retirement receipt representation must be "
+                    f"reconciled before new mutation: {batch_name}: {representation}"
+                )
+    finally:
+        _close_fd_quietly(index_fd)
 
 
 def _restore_pending_cleanup_control_tombstones(
@@ -30651,6 +32004,15 @@ def _restore_pending_cleanup_control_tombstones(
                 index_fd,
                 retained_snapshot,
             )
+            retirement = _read_current_private_use_retirement_authority(
+                home, batch_name
+            )
+            if retirement is not None:
+                _require_pending_private_use_retirement_boundary(
+                    home,
+                    retirement,
+                    receipt_member=retirement.path.name,
+                )
             recovered = _restore_retained_pending_cleanup_file(
                 home,
                 canonical_path,
@@ -30661,6 +32023,15 @@ def _restore_pending_cleanup_control_tombstones(
             if recovered is None:
                 raise SyncError(
                     f"pending cleanup retained control disappeared: {canonical}"
+                )
+            retirement = _read_current_private_use_retirement_authority(
+                home, batch_name
+            )
+            if retirement is not None:
+                _require_pending_private_use_retirement_boundary(
+                    home,
+                    retirement,
+                    receipt_member=retirement.path.name,
                 )
             if canonical.endswith(PENDING_QUARANTINE_ALLOCATION_SUFFIX):
                 allocation = _read_pending_quarantine_allocation_ticket(
@@ -30681,6 +32052,16 @@ def _restore_pending_cleanup_control_tombstones(
                 if ticket is None:
                     raise SyncError(
                         f"pending cleanup ticket recovery failed: {canonical}"
+                    )
+            elif canonical.endswith(PENDING_PRIVATE_USE_RETIREMENT_SUFFIX):
+                receipt = _read_pending_private_use_retirement_receipt(
+                    home,
+                    canonical_path,
+                    expected_identity=recovered.file_identity,
+                )
+                if receipt is None:
+                    raise SyncError(
+                        f"private-use retirement recovery failed: {canonical}"
                     )
             restored += 1
         if not _bound_directory_matches(home, index_root, index_fd):
@@ -30983,6 +32364,83 @@ def _promote_pending_quarantine_allocation_temp(
         _close_fd_quietly(index_fd)
 
 
+def _promote_pending_private_use_retirement_temp(
+    home: Path,
+    temp_path: Path,
+    *,
+    classified_snapshot: ManagedStateFileSnapshot | None = None,
+) -> bool:
+    batch_name = _pending_private_use_retirement_temp_batch_name(temp_path.name)
+    if batch_name is None:
+        return False
+    index_fd = _open_directory_beneath(home, temp_path.parent)
+    try:
+        staged = (
+            classified_snapshot
+            if classified_snapshot is not None
+            else _read_managed_state_file_snapshot(
+                home,
+                temp_path,
+                index_fd,
+                maximum_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+            )
+        )
+        if not staged.exists:
+            return False
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home, temp_path, index_fd, staged
+        )
+        receipt = _read_pending_private_use_retirement_receipt(
+            home,
+            temp_path,
+            expected_identity=staged.file_identity,
+            allow_temporary=True,
+            _captured_snapshot=staged,
+        )
+        if receipt is None:
+            return False
+        _require_pending_private_use_retirement_boundary(
+            home, receipt, receipt_member=temp_path.name
+        )
+        canonical_path = _pending_private_use_retirement_path(home, batch_name)
+        canonical = _read_managed_state_file_snapshot(home, canonical_path, index_fd)
+        if canonical.exists:
+            raise SyncError(
+                f"private-use retirement temp overlaps canonical receipt: {batch_name}"
+            )
+        current = _read_managed_state_file_snapshot(
+            home,
+            temp_path,
+            index_fd,
+            expected_identity=staged.file_identity,
+            maximum_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+        )
+        if not _managed_state_snapshot_matches_bound_file_evidence(current, staged):
+            raise SyncError(
+                f"private-use retirement temp changed before promotion: {batch_name}"
+            )
+        _require_pending_private_use_retirement_boundary(
+            home, receipt, receipt_member=temp_path.name
+        )
+        _rename_noreplace_at(index_fd, temp_path.name, index_fd, canonical_path.name)
+        os.fsync(index_fd)
+        promoted = _read_pending_private_use_retirement_receipt(
+            home,
+            canonical_path,
+            expected_identity=staged.file_identity,
+        )
+        if promoted is None or promoted.snapshot.payload != staged.payload:
+            raise SyncError(
+                f"private-use retirement receipt changed after promotion: {batch_name}"
+            )
+        _require_pending_private_use_retirement_boundary(
+            home, promoted, receipt_member=canonical_path.name
+        )
+        return True
+    finally:
+        _close_fd_quietly(index_fd)
+
+
 def _cleanup_pending_cleanup_ticket_temps(
     home: Path,
     *,
@@ -31006,6 +32464,9 @@ def _cleanup_pending_cleanup_ticket_temps(
             overflow_message="pending cleanup control scan exceeds the size limit",
         )
         for name in names:
+            if _pending_private_use_retirement_temp_batch_name(name) is not None:
+                temp_names.add(name)
+                continue
             if _pending_cleanup_ticket_temp_batch_name(name) is not None:
                 temp_names.add(name)
                 continue
@@ -31030,6 +32491,14 @@ def _cleanup_pending_cleanup_ticket_temps(
             )
             if retained_metadata_stage is not None:
                 temp_names.add(retained_metadata_stage[0])
+                continue
+            retained_canonical = _pending_cleanup_retained_canonical_name(name)
+            if (
+                retained_canonical is not None
+                and _pending_private_use_retirement_temp_batch_name(retained_canonical)
+                is not None
+            ):
+                temp_names.add(retained_canonical)
     finally:
         _close_fd_quietly(index_fd)
     action_budget = budget or PendingCleanupActionBudget(limit)
@@ -31042,10 +32511,15 @@ def _cleanup_pending_cleanup_ticket_temps(
         metadata_stage_batch_name = _pending_quarantine_metadata_stage_batch_name(
             temp_name
         )
+        retirement_batch_name = _pending_private_use_retirement_temp_batch_name(
+            temp_name
+        )
         if batch_name is None:
             batch_name = allocation_batch_name
         if batch_name is None:
             batch_name = metadata_stage_batch_name
+        if batch_name is None:
+            batch_name = retirement_batch_name
         assert batch_name is not None
         if not action_budget.charge_batch(batch_name):
             continue
@@ -31071,6 +32545,28 @@ def _cleanup_pending_cleanup_ticket_temps(
                         f"{batch_name}"
                     )
                 retained_name, retained_snapshot = retained
+                if retirement_batch_name is not None:
+                    retained_receipt = _read_pending_private_use_retirement_receipt(
+                        home,
+                        temp_path,
+                        expected_identity=retained_snapshot.file_identity,
+                        allow_temporary=True,
+                        _captured_snapshot=retained_snapshot,
+                    )
+                    if retained_receipt is None:
+                        raise SyncError(
+                            "private-use retirement retained temp disappeared: "
+                            f"{batch_name}"
+                        )
+                    retained_receipt = replace(
+                        retained_receipt,
+                        path=temp_path.with_name(retained_name),
+                    )
+                    _require_pending_private_use_retirement_boundary(
+                        home,
+                        retained_receipt,
+                        receipt_member=retained_name,
+                    )
                 _restore_exact_retained_pending_cleanup_file(
                     home,
                     temp_path,
@@ -31079,6 +32575,23 @@ def _cleanup_pending_cleanup_ticket_temps(
                     retained_snapshot,
                     label=f"pending cleanup ticket temp {batch_name}",
                 )
+                if retirement_batch_name is not None:
+                    restored_receipt = _read_pending_private_use_retirement_receipt(
+                        home,
+                        temp_path,
+                        expected_identity=retained_snapshot.file_identity,
+                        allow_temporary=True,
+                    )
+                    if restored_receipt is None:
+                        raise SyncError(
+                            "private-use retirement temp restoration failed: "
+                            f"{batch_name}"
+                        )
+                    _require_pending_private_use_retirement_boundary(
+                        home,
+                        restored_receipt,
+                        receipt_member=temp_path.name,
+                    )
             classified = _read_managed_state_file_snapshot(
                 home,
                 temp_path,
@@ -31086,7 +32599,11 @@ def _cleanup_pending_cleanup_ticket_temps(
                 maximum_bytes=(
                     MAX_MANAGED_STATE_BYTES
                     if metadata_stage_batch_name is not None
-                    else MAX_PENDING_CLEANUP_TICKET_BYTES
+                    else (
+                        MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES
+                        if retirement_batch_name is not None
+                        else MAX_PENDING_CLEANUP_TICKET_BYTES
+                    )
                 ),
             )
             if not classified.exists:
@@ -31106,6 +32623,17 @@ def _cleanup_pending_cleanup_ticket_temps(
             discarded += discarded_for_batch
             if discarded_for_batch > 0:
                 action_budget.mark_batch_completed(batch_name)
+            continue
+        if retirement_batch_name is not None:
+            if not _promote_pending_private_use_retirement_temp(
+                home,
+                temp_path,
+                classified_snapshot=classified,
+            ):
+                raise SyncError(
+                    "private-use retirement temp could not be safely classified: "
+                    f"{batch_name}"
+                )
             continue
         if _promote_pending_ephemeral_cleanup_ticket_temp(
             home,
@@ -31558,6 +33086,159 @@ def _cleanup_orphan_pending_ephemeral_private_phases(
     return cleaned
 
 
+def _read_recoverable_joined_cleanup_representation(
+    home: Path,
+    allocation: PendingQuarantineAllocationTicket,
+) -> PendingBatchCleanupTicket | None:
+    """Strictly parse a v5/v7 temp or retained ticket before v8 classification."""
+    batch_name = allocation.batch_root.name
+    index_root = _pending_cleanup_index_path(home)
+    index_fd = _open_directory_beneath(home, index_root)
+    try:
+        _require_pending_cleanup_fd_access_policy(
+            index_fd, index_root, expected_mode=0o700
+        )
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending cleanup authority scan exceeds the size limit",
+        )
+        candidates: list[str] = []
+        canonical_name = batch_name + PENDING_CLEANUP_TICKET_SUFFIX
+        temp_name = batch_name + PENDING_CLEANUP_TICKET_TEMP_SUFFIX
+        for name in names:
+            retained = _pending_cleanup_retained_canonical_name(name)
+            represented = retained or name
+            if represented in {canonical_name, temp_name}:
+                candidates.append(name)
+        if canonical_name in candidates:
+            if len(candidates) != 1:
+                raise SyncError(
+                    "pending cleanup authority has overlapping representations: "
+                    f"{batch_name}"
+                )
+            return None
+        if not candidates:
+            return None
+        if len(candidates) != 1:
+            raise SyncError(
+                f"pending cleanup authority has overlapping representations: {batch_name}"
+            )
+        representation = candidates[0]
+        snapshot = _read_managed_state_file_snapshot(
+            home,
+            index_root / representation,
+            index_fd,
+            maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        )
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+            or snapshot.payload is None
+            or snapshot.file_type != stat.S_IFREG
+        ):
+            raise SyncError(
+                f"pending cleanup authority representation changed: {batch_name}"
+            )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home, index_root / representation, index_fd, snapshot
+        )
+        cleanup = _read_pending_cleanup_ticket(
+            home,
+            index_root / temp_name,
+            expected_ticket_identity=snapshot.file_identity,
+            allow_temporary=True,
+            _captured_snapshot=snapshot,
+        )
+        if (
+            cleanup is None
+            or cleanup.version not in {5, 7}
+            or not _cleanup_ticket_matches_quarantine_allocation(cleanup, allocation)
+        ):
+            raise SyncError(
+                "pending quarantine allocation does not join cleanup authority: "
+                f"{batch_name}"
+            )
+        _require_pending_cleanup_fd_access_policy(
+            index_fd, index_root, expected_mode=0o700
+        )
+        if _directory_identity(
+            index_fd
+        ) != allocation.snapshot.parent_identity or not _bound_directory_matches(
+            home, index_root, index_fd
+        ):
+            raise SyncError("pending quarantine allocation index changed")
+        return cleanup
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _read_recoverable_private_use_receipt_representation(
+    home: Path,
+    batch_name: str,
+) -> PendingPrivateUseRetirementReceipt | None:
+    index_root = _pending_cleanup_index_path(home)
+    index_fd = _open_directory_beneath(home, index_root)
+    try:
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="private-use retirement scan exceeds the size limit",
+        )
+        canonical = batch_name + PENDING_PRIVATE_USE_RETIREMENT_SUFFIX
+        temporary = canonical + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+        candidates = []
+        for name in names:
+            retained = _pending_cleanup_retained_canonical_name(name)
+            if (retained or name) in {canonical, temporary}:
+                candidates.append(name)
+        if canonical in candidates:
+            return None
+        if not candidates:
+            return None
+        if len(candidates) != 1:
+            raise SyncError(
+                f"private-use retirement has overlapping receipts: {batch_name}"
+            )
+        representation = candidates[0]
+        snapshot = _read_managed_state_file_snapshot(
+            home,
+            index_root / representation,
+            index_fd,
+            maximum_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+        )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home, index_root / representation, index_fd, snapshot
+        )
+        receipt = _read_pending_private_use_retirement_receipt(
+            home,
+            index_root / temporary,
+            expected_identity=snapshot.file_identity,
+            allow_temporary=True,
+            _captured_snapshot=snapshot,
+        )
+        if receipt is None:
+            raise SyncError(f"private-use retirement receipt disappeared: {batch_name}")
+        represented = replace(receipt, path=index_root / representation)
+        _require_pending_private_use_retirement_boundary(
+            home, represented, receipt_member=representation
+        )
+        return represented
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _read_current_private_use_retirement_authority(
+    home: Path,
+    batch_name: str,
+) -> PendingPrivateUseRetirementReceipt | None:
+    receipt = _read_pending_private_use_retirement_receipt(
+        home, _pending_private_use_retirement_path(home, batch_name)
+    )
+    if receipt is not None:
+        return receipt
+    return _read_recoverable_private_use_receipt_representation(home, batch_name)
+
+
 def _pending_quarantine_allocation_recovery_state(
     home: Path,
     allocation: PendingQuarantineAllocationTicket,
@@ -31567,17 +33248,17 @@ def _pending_quarantine_allocation_recovery_state(
     str | None,
     tuple[int, int] | None,
 ]:
-    """Classify one v8 fence into the exact states execution can recover.
+    """Classify one reservation-only v8 fence without adopting an entity.
 
-    Empty canonical or isolated directories contain no content to lose.  A
-    canonical leafless scaffold is recoverable only when its metadata bytes,
-    size, type and owner-only policy exactly match the immutable v8 plan.  Any
-    other entity remains ambiguous and is retained.
+    V8 proves only that both candidate names were absent when the reservation
+    was published.  It binds neither a later batch inode nor its metadata or
+    leaf, so any present canonical or isolated entity is foreign unless an
+    authoritative matching v5/v7 ticket owns cleanup.  Only double absence may
+    retire v8 directly.
     """
     batch_name = allocation.batch_root.name
     quarantine_root = allocation.batch_root.parent
     quarantine_fd = _open_directory_beneath(home, quarantine_root)
-    batch_fd = -1
     try:
         _require_pending_cleanup_fd_access_policy(
             quarantine_fd,
@@ -31592,6 +33273,24 @@ def _pending_quarantine_allocation_recovery_state(
             quarantine_fd,
         ):
             raise SyncError(f"pending quarantine allocation root changed: {batch_name}")
+        receipt = _read_pending_private_use_retirement_receipt(
+            home, _pending_private_use_retirement_path(home, batch_name)
+        )
+        if receipt is not None:
+            _require_pending_private_use_retirement_boundary(
+                home, receipt, receipt_member=receipt.path.name
+            )
+            return "delegated", None, None, None
+        represented_receipt = _read_recoverable_private_use_receipt_representation(
+            home, batch_name
+        )
+        if represented_receipt is not None:
+            return "delegated", None, None, None
+        represented_cleanup = _read_recoverable_joined_cleanup_representation(
+            home, allocation
+        )
+        if represented_cleanup is not None:
+            return "delegated", None, None, None
         canonical = _named_entry_identity(quarantine_fd, batch_name)
         isolated = _named_entry_identity(
             quarantine_fd,
@@ -31621,83 +33320,12 @@ def _pending_quarantine_allocation_recovery_state(
         if canonical is None and isolated is None:
             _require_pending_quarantine_allocation_ticket_unchanged(home, allocation)
             return "absent", None, None, None
-        current_name = batch_name if canonical is not None else allocation.isolated_name
-        expected_identity = canonical if canonical is not None else isolated
-        assert expected_identity is not None
-        bound_root = allocation.batch_root.with_name(current_name)
-        batch_fd = os.open(
-            current_name,
-            _directory_open_flags(nofollow=True),
-            dir_fd=quarantine_fd,
-        )
-        _require_pending_cleanup_fd_access_policy(
-            batch_fd,
-            bound_root,
-            expected_mode=allocation.batch_mode,
-        )
-        if _directory_identity(
-            batch_fd
-        ) != expected_identity or not _bound_directory_matches(
-            home, bound_root, batch_fd
-        ):
-            raise SyncError(
-                f"pending quarantine allocation batch changed: {batch_name}"
-            )
-        names = _directory_member_names(
-            batch_fd,
-            maximum_entries=2,
-            overflow_message="pending quarantine allocation has too many entries",
-        )
-        if names == ():
-            _require_pending_quarantine_allocation_ticket_unchanged(home, allocation)
-            return "empty", None, current_name, expected_identity
-        if current_name != batch_name or names != ("metadata.json",):
-            raise SyncError(
-                "pending quarantine allocation remains incomplete and was retained: "
-                f"{batch_name}"
-            )
-        metadata = _read_managed_state_file_snapshot(
-            home,
-            allocation.batch_root / "metadata.json",
-            batch_fd,
-            maximum_bytes=MAX_MANAGED_STATE_BYTES,
-        )
-        if (
-            not _managed_state_snapshot_has_complete_file_evidence(metadata)
-            or metadata.file_type != stat.S_IFREG
-            or metadata.mode != allocation.metadata_mode
-            or metadata.uid != os.geteuid()
-            or metadata.size != allocation.metadata_size
-            or metadata.payload is None
-            or hashlib.sha256(metadata.payload).hexdigest()
-            != allocation.metadata_sha256
-        ):
-            raise SyncError(
-                "pending quarantine allocation metadata does not match its plan "
-                f"and was retained: {batch_name}"
-            )
-        _require_pending_cleanup_file_snapshot_access_policy(
-            home,
-            allocation.batch_root / "metadata.json",
-            batch_fd,
-            metadata,
-        )
         _require_pending_quarantine_allocation_ticket_unchanged(home, allocation)
-        return (
-            "exact-scaffold",
-            EphemeralQuarantineBatchBinding(
-                batch_root=allocation.batch_root,
-                quarantine_root_identity=allocation.quarantine_root_identity,
-                batch_identity=expected_identity,
-                leaf_identity=None,
-                metadata=metadata,
-                allocation_ticket=allocation,
-            ),
-            current_name,
-            expected_identity,
+        raise SyncError(
+            "pending quarantine allocation has a present entity without exact "
+            f"cleanup authority and was retained: {batch_name}"
         )
     finally:
-        _close_fd_quietly(batch_fd)
         _close_fd_quietly(quarantine_fd)
 
 
@@ -31708,101 +33336,7 @@ def _pending_quarantine_allocation_fence_is_cleanup_ready(
     state, _binding, _current_name, _expected_identity = (
         _pending_quarantine_allocation_recovery_state(home, allocation)
     )
-    return state in {"absent", "empty", "exact-scaffold"}
-
-
-def _remove_empty_pending_quarantine_allocation(
-    home: Path,
-    allocation: PendingQuarantineAllocationTicket,
-    current_name: str,
-    expected_identity: tuple[int, int],
-) -> None:
-    """Remove only an exact empty v8 entity, preserving crash resumability."""
-    quarantine_root = allocation.batch_root.parent
-    index_root = allocation.path.parent
-    quarantine_fd = _open_directory_beneath(home, quarantine_root)
-    index_fd = -1
-    batch_fd = -1
-    try:
-        index_fd = _open_directory_beneath(home, index_root)
-        batch_fd = os.open(
-            current_name,
-            _directory_open_flags(nofollow=True),
-            dir_fd=quarantine_fd,
-        )
-        batch_identity = _directory_identity(batch_fd)
-        if batch_identity != expected_identity:
-            raise SyncError(
-                f"pending empty quarantine allocation changed: "
-                f"{allocation.batch_root.name}"
-            )
-
-        def require_empty_boundary(name: str) -> None:
-            bound_root = allocation.batch_root.with_name(name)
-            _require_pending_cleanup_fd_access_policy(
-                quarantine_fd,
-                quarantine_root,
-                expected_mode=0o700,
-            )
-            _require_pending_cleanup_fd_access_policy(
-                batch_fd,
-                bound_root,
-                expected_mode=allocation.batch_mode,
-            )
-            if (
-                _directory_identity(quarantine_fd)
-                != allocation.quarantine_root_identity
-                or not _bound_directory_matches(
-                    home,
-                    quarantine_root,
-                    quarantine_fd,
-                )
-                or _named_entry_identity(quarantine_fd, name) != batch_identity
-                or _directory_identity(batch_fd) != batch_identity
-                or not _bound_directory_matches(home, bound_root, batch_fd)
-                or _directory_member_names(batch_fd, maximum_entries=1) != ()
-            ):
-                raise SyncError(
-                    f"pending empty quarantine allocation changed: "
-                    f"{allocation.batch_root.name}"
-                )
-            _require_pending_quarantine_allocation_cleanup_controls_absent(
-                home,
-                index_root,
-                index_fd,
-                allocation,
-                allowed_allocation_name=allocation.path.name,
-            )
-            _require_pending_quarantine_allocation_ticket_unchanged(home, allocation)
-
-        if current_name == allocation.batch_root.name:
-            require_empty_boundary(current_name)
-            if (
-                _named_entry_identity(quarantine_fd, allocation.isolated_name)
-                is not None
-            ):
-                raise SyncError(
-                    "pending empty quarantine allocation isolated name is occupied: "
-                    f"{allocation.batch_root.name}"
-                )
-            _rename_noreplace_at(
-                quarantine_fd,
-                current_name,
-                quarantine_fd,
-                allocation.isolated_name,
-            )
-            os.fsync(quarantine_fd)
-            current_name = allocation.isolated_name
-        elif current_name != allocation.isolated_name:
-            raise SyncError("pending empty quarantine allocation name is invalid")
-        require_empty_boundary(current_name)
-        os.rmdir(current_name, dir_fd=quarantine_fd)
-        os.fsync(quarantine_fd)
-    finally:
-        _close_fd_quietly(batch_fd)
-        _close_fd_quietly(index_fd)
-        _close_fd_quietly(quarantine_fd)
-    _retire_quarantine_allocation_after_batch_absent(home, allocation)
+    return state == "absent"
 
 
 def _pending_cleanup_ready_batch_is_observed(
@@ -31839,6 +33373,42 @@ def _pending_cleanup_ready_batch_is_observed(
                     raise _pending_cleanup_unresolved_ticket_representation_error(
                         unresolved
                     )
+                unresolved_allocation = (
+                    _pending_quarantine_unresolved_allocation_representation(entry.name)
+                )
+                if unresolved_allocation is not None:
+                    # The same final scan also closes the interval after an
+                    # earlier preflight check. A malformed v8-derived name
+                    # remains evidence only; it cannot turn a read-only
+                    # observation into an automatic cleanup plan.
+                    raise _pending_quarantine_unresolved_allocation_representation_error(
+                        unresolved_allocation
+                    )
+                unresolved_receipt = (
+                    _pending_private_use_retirement_unresolved_representation(
+                        entry.name
+                    )
+                )
+                if unresolved_receipt is not None:
+                    receipt_batch, receipt_name = unresolved_receipt
+                    raise SyncError(
+                        "private-use retirement receipt representation must be "
+                        f"reconciled before new mutation: {receipt_batch}: "
+                        f"{receipt_name}"
+                    )
+                if _pending_private_use_retirement_batch_name(entry.name) is not None:
+                    receipt = _read_pending_private_use_retirement_receipt(
+                        home, index_root / entry.name
+                    )
+                    if receipt is None:
+                        raise SyncError(
+                            f"private-use retirement receipt disappeared: {entry.name}"
+                        )
+                    _require_pending_private_use_retirement_boundary(
+                        home, receipt, receipt_member=entry.name
+                    )
+                    cleanup_ready = True
+                    continue
                 allocation_batch_name = _pending_quarantine_allocation_batch_name(
                     entry.name
                 )
@@ -31897,12 +33467,15 @@ def _pending_cleanup_ready_batch_is_observed(
                     is not None
                     or _pending_cleanup_cursor_temp_canonical_name(entry.name)
                     is not None
+                    or _pending_private_use_retirement_temp_batch_name(entry.name)
+                    is not None
                 ):
                     cleanup_ready = True
                 for suffix in (
                     PENDING_CLEANUP_TICKET_SUFFIX,
                     PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
                     PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
+                    PENDING_PRIVATE_USE_RETIREMENT_SUFFIX,
                 ):
                     if not entry.name.endswith(suffix):
                         continue
@@ -31923,6 +33496,7 @@ def _cleanup_pending_quarantine_allocations(
     budget: PendingCleanupActionBudget,
 ) -> int:
     """Recover only exact v8 states with independently proven cleanup authority."""
+    _require_no_pending_unresolved_ticket_representations(home)
     index_root = _pending_cleanup_index_path(home)
     try:
         index_fd = _open_directory_beneath(home, index_root)
@@ -31934,6 +33508,12 @@ def _cleanup_pending_quarantine_allocations(
             maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
             overflow_message="pending quarantine allocation scan exceeds the limit",
         )
+        for name in names:
+            unresolved = _pending_quarantine_unresolved_allocation_representation(name)
+            if unresolved is not None:
+                raise _pending_quarantine_unresolved_allocation_representation_error(
+                    unresolved
+                )
         allocation_names = sorted(
             name
             for name in names
@@ -31953,7 +33533,7 @@ def _cleanup_pending_quarantine_allocations(
         )
         if allocation is None:
             continue
-        state, binding, current_name, expected_identity = (
+        state, _binding, _current_name, _expected_identity = (
             _pending_quarantine_allocation_recovery_state(
                 home,
                 allocation,
@@ -31964,26 +33544,53 @@ def _cleanup_pending_quarantine_allocations(
             cleaned += 1
             budget.mark_batch_completed(batch_name)
             continue
-        if state == "empty":
-            assert current_name is not None
-            assert expected_identity is not None
-            _remove_empty_pending_quarantine_allocation(
-                home,
-                allocation,
-                current_name,
-                expected_identity,
-            )
-            cleaned += 1
-            budget.mark_batch_completed(batch_name)
-            continue
-        if state == "exact-scaffold":
-            assert binding is not None
-            _discard_empty_ephemeral_quarantine_batch(home, binding)
-            cleaned += 1
-            budget.mark_batch_completed(batch_name)
-            continue
         # The exact v5/v7 cleanup protocol owns the entity.  Its scanner may be
         # budget-deferred; v8 remains as a mutation fence until removal.
+    return cleaned
+
+
+def _cleanup_pending_private_use_retirements(
+    home: Path,
+    *,
+    budget: PendingCleanupActionBudget,
+) -> int:
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return 0
+    try:
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="private-use retirement scan exceeds the size limit",
+        )
+        receipt_names = sorted(
+            name
+            for name in names
+            if _pending_private_use_retirement_batch_name(name) is not None
+        )
+    finally:
+        _close_fd_quietly(index_fd)
+    cleaned = 0
+    for name in receipt_names:
+        batch_name = _pending_private_use_retirement_batch_name(name)
+        assert batch_name is not None
+        if not budget.charge_batch(batch_name):
+            continue
+        try:
+            receipt = _read_pending_private_use_retirement_receipt(
+                home, index_root / name
+            )
+            if receipt is None:
+                continue
+            _retire_pending_private_use_controls(home, receipt)
+        except (FileNotFoundError, OSError, SyncError) as error:
+            raise _pending_cleanup_authority_classification_error(
+                batch_name, error
+            ) from error
+        cleaned += 1
+        budget.mark_batch_completed(batch_name)
     return cleaned
 
 
@@ -32004,6 +33611,10 @@ def _cleanup_ready_pending_batches(
         budget=action_budget,
     )
     _cleanup_pending_cleanup_ticket_temps(
+        home,
+        budget=action_budget,
+    )
+    _cleanup_pending_private_use_retirements(
         home,
         budget=action_budget,
     )
@@ -32147,6 +33758,21 @@ def _require_no_pending_terminal_mutation_authority(home: Path) -> None:
     finally:
         _close_fd_quietly(index_fd)
     for name in names:
+        retirement_batch_name = (
+            _pending_private_use_retirement_representation_batch_name(name)
+        )
+        if retirement_batch_name is not None:
+            raise SyncError(
+                "private-use retirement authority must be reconciled before new "
+                f"mutation: {retirement_batch_name}"
+            )
+        unresolved_allocation = (
+            _pending_quarantine_unresolved_allocation_representation(name)
+        )
+        if unresolved_allocation is not None:
+            raise _pending_quarantine_unresolved_allocation_representation_error(
+                unresolved_allocation
+            )
         allocation_batch_name = _pending_quarantine_allocation_batch_name(name)
         allocation_temp_batch_name = _pending_quarantine_allocation_temp_batch_name(
             name
@@ -41054,6 +42680,16 @@ def status(home: Path, owner: str = PUBLIC_OWNER) -> bool:
         pending_authority_issues.append(
             "pending cleanup ticket representation must be reconciled before new "
             f"mutation: {batch_name}: {member_name}"
+        )
+    elif (
+        unresolved_allocation_representation := (
+            _pending_quarantine_unresolved_allocation_representation_issue(home)
+        )
+    ) is not None:
+        batch_name, member_name = unresolved_allocation_representation
+        pending_authority_issues.append(
+            "pending quarantine allocation representation must be reconciled "
+            f"before new mutation: {batch_name}: {member_name}"
         )
     elif _pending_cleanup_ready_batch_is_observed(home):
         pending_authority_issues.append(

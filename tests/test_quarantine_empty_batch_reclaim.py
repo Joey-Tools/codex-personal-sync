@@ -229,6 +229,240 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         )
         ticket.path.chmod(0o600)
 
+    def _crash_after_private_use_receipt(
+        self,
+    ) -> tuple[
+        MODULE.PendingPrivateUseRetirementReceipt,
+        Path,
+    ]:
+        parent_fd = MODULE._open_directory_beneath(self.home, self.source_parent)
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_retire_pending_private_use_controls",
+                    side_effect=SystemExit("injected post-receipt crash"),
+                ),
+                self.assertRaisesRegex(SystemExit, "post-receipt crash"),
+            ):
+                MODULE._move_regular_leaf_to_unique_quarantine(
+                    self.home,
+                    self.source_parent,
+                    parent_fd,
+                    self.source.name,
+                    label="private-use-receipt-crash",
+                    expected_identity=self.source_identity,
+                )
+        finally:
+            MODULE._close_fd_quietly(parent_fd)
+        index = MODULE._pending_cleanup_index_path(self.home)
+        receipt_paths = list(
+            index.glob(f"*{MODULE.PENDING_PRIVATE_USE_RETIREMENT_SUFFIX}")
+        )
+        self.assertEqual(len(receipt_paths), 1)
+        receipt = MODULE._read_pending_private_use_retirement_receipt(
+            self.home, receipt_paths[0]
+        )
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        private_path = receipt.batch_root / "leaf" / receipt.private_member_name
+        self.assertTrue(private_path.is_file())
+        self.assertFalse(self.source.exists())
+        return receipt, private_path
+
+    def _allocate_v5_ticket_representation(
+        self,
+        *,
+        retained: bool,
+    ) -> tuple[Path, MODULE.EphemeralQuarantineBatchBinding, Path]:
+        allocation = MODULE._quarantine_batch_root(
+            self.home,
+            [],
+            retain_binding=True,
+            retain_scaffold_binding=True,
+        )
+        assert isinstance(allocation, MODULE.EphemeralQuarantineBatchAllocation)
+        allocation.create_leaf()
+        binding = allocation.binding
+        assert binding.cleanup_ticket is not None
+        canonical = binding.cleanup_ticket.path
+        temp = canonical.with_name(
+            binding.batch_root.name + MODULE.PENDING_CLEANUP_TICKET_TEMP_SUFFIX
+        )
+        canonical.rename(temp)
+        representation = temp
+        if retained:
+            retained_name = next(MODULE._retained_pending_cleanup_names(temp))
+            representation = temp.with_name(retained_name)
+            temp.rename(representation)
+        allocation.revoke_reclaim()
+        allocation.close()
+        return binding.batch_root, binding, representation
+
+    def _crash_before_private_use_receipt_publication(self) -> Path:
+        real_rename = MODULE._rename_noreplace_at
+
+        def crash_before_receipt_publication(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            if source_name.endswith(
+                MODULE.PENDING_PRIVATE_USE_RETIREMENT_SUFFIX
+                + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+            ) and destination_name.endswith(
+                MODULE.PENDING_PRIVATE_USE_RETIREMENT_SUFFIX
+            ):
+                raise SystemExit("injected receipt publication crash")
+            real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+
+        parent_fd = MODULE._open_directory_beneath(self.home, self.source_parent)
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_rename_noreplace_at",
+                    side_effect=crash_before_receipt_publication,
+                ),
+                self.assertRaisesRegex(SystemExit, "receipt publication crash"),
+            ):
+                MODULE._move_regular_leaf_to_unique_quarantine(
+                    self.home,
+                    self.source_parent,
+                    parent_fd,
+                    self.source.name,
+                    label="receipt-temp-crash",
+                    expected_identity=self.source_identity,
+                )
+        finally:
+            MODULE._close_fd_quietly(parent_fd)
+        index = MODULE._pending_cleanup_index_path(self.home)
+        return next(
+            index.glob(
+                "*"
+                + MODULE.PENDING_PRIVATE_USE_RETIREMENT_SUFFIX
+                + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+            )
+        )
+
+    def _exercise_private_control_tombstone_crash(self, suffix: str) -> None:
+        real_rename = MODULE._rename_noreplace_at
+
+        def isolate_control_then_crash(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+            if source_name.endswith(suffix) and destination_name.startswith(
+                MODULE.PENDING_CLEANUP_RETAINED_PREFIX + source_name + "-"
+            ):
+                raise SystemExit("injected control tombstone crash")
+
+        parent_fd = MODULE._open_directory_beneath(self.home, self.source_parent)
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_rename_noreplace_at",
+                    side_effect=isolate_control_then_crash,
+                ),
+                self.assertRaisesRegex(SystemExit, "control tombstone crash"),
+            ):
+                MODULE._move_regular_leaf_to_unique_quarantine(
+                    self.home,
+                    self.source_parent,
+                    parent_fd,
+                    self.source.name,
+                    label="control-tombstone-crash",
+                    expected_identity=self.source_identity,
+                )
+        finally:
+            MODULE._close_fd_quietly(parent_fd)
+        index = MODULE._pending_cleanup_index_path(self.home)
+        receipt_path = next(
+            index.glob(f"*{MODULE.PENDING_PRIVATE_USE_RETIREMENT_SUFFIX}")
+        )
+        receipt = MODULE._read_pending_private_use_retirement_receipt(
+            self.home, receipt_path
+        )
+        assert receipt is not None
+        private_path = receipt.batch_root / "leaf" / receipt.private_member_name
+        retained = list(
+            index.glob(MODULE.PENDING_CLEANUP_RETAINED_PREFIX + "*" + suffix + "-*")
+        )
+        self.assertEqual(len(retained), 1)
+
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+
+        self.assertEqual(private_path.read_bytes(), b'role = "reviewer"\n')
+        self.assertFalse(retained[0].exists())
+        self.assertFalse(receipt_path.exists())
+
+    def _exercise_late_v8_representation_injection(
+        self,
+        *,
+        retained: bool,
+    ) -> None:
+        batch_root, binding = self._allocate_unowned_scaffold()
+        cleanup = MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+            self.home, binding
+        )
+        allocation = binding.allocation_ticket
+        assert allocation is not None
+        metadata = batch_root / "metadata.json"
+        expected_metadata = metadata.read_bytes()
+        residue_path = allocation.path.with_name(allocation.path.name + ".extra")
+        if retained:
+            residue_path = residue_path.with_name(
+                next(MODULE._retained_pending_cleanup_names(residue_path))
+            )
+        real_revalidate = MODULE._require_joined_quarantine_allocation_unchanged
+        boundary_calls = 0
+
+        def inject_representation(
+            home: Path,
+            ticket: MODULE.PendingBatchCleanupTicket,
+            expected: MODULE.PendingQuarantineAllocationTicket | None,
+        ) -> None:
+            nonlocal boundary_calls
+            boundary_calls += 1
+            if boundary_calls == 2:
+                residue_path.write_bytes(b"foreign\n")
+                residue_path.chmod(0o600)
+            real_revalidate(home, ticket, expected)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_require_joined_quarantine_allocation_unchanged",
+                side_effect=inject_representation,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "allocation representation must be reconciled",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertEqual(boundary_calls, 2)
+        self.assertEqual(metadata.read_bytes(), expected_metadata)
+        self.assertEqual(residue_path.read_bytes(), b"foreign\n")
+        self.assertTrue(cleanup.path.exists())
+        self.assertTrue(allocation.path.exists())
+
     def _exercise_metadata_cleanup_boundary_mutation(
         self,
         *,
@@ -534,6 +768,7 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
     def test_created_leaf_pre_isolation_failure_does_not_leak_capacity(self) -> None:
         real_require_access = MODULE._require_pending_cleanup_fd_access_policy
         failed_batches: set[Path] = set()
+        post_ticket_checks: dict[Path, int] = {}
 
         def fail_each_leaf_once(
             directory_fd: int,
@@ -541,12 +776,23 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             *args: object,
             **kwargs: object,
         ) -> object:
+            batch_root = display_path.parent
             if (
                 display_path.name == "leaf"
-                and display_path.parent not in failed_batches
+                and MODULE._pending_cleanup_ticket_path(
+                    self.home,
+                    batch_root.name,
+                ).is_file()
             ):
-                failed_batches.add(display_path.parent)
-                raise MODULE.SyncError("injected pre-isolation validation failure")
+                post_ticket_checks[batch_root] = (
+                    post_ticket_checks.get(batch_root, 0) + 1
+                )
+                if (
+                    post_ticket_checks[batch_root] == 2
+                    and batch_root not in failed_batches
+                ):
+                    failed_batches.add(batch_root)
+                    raise MODULE.SyncError("injected pre-isolation validation failure")
             return real_require_access(directory_fd, display_path, *args, **kwargs)
 
         with mock.patch.object(
@@ -571,6 +817,7 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         real_require_access = MODULE._require_pending_cleanup_fd_access_policy
         replaced_batch: Path | None = None
         replacement_identity: tuple[int, int] | None = None
+        post_ticket_checks = 0
 
         def replace_leaf_then_fail(
             directory_fd: int,
@@ -578,8 +825,20 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             *args: object,
             **kwargs: object,
         ) -> object:
-            nonlocal replaced_batch, replacement_identity
-            if display_path.name == "leaf" and replaced_batch is None:
+            nonlocal post_ticket_checks, replaced_batch, replacement_identity
+            if (
+                display_path.name == "leaf"
+                and MODULE._pending_cleanup_ticket_path(
+                    self.home,
+                    display_path.parent.name,
+                ).is_file()
+            ):
+                post_ticket_checks += 1
+            if (
+                display_path.name == "leaf"
+                and post_ticket_checks == 2
+                and replaced_batch is None
+            ):
                 display_path.rmdir()
                 display_path.mkdir(mode=0o700)
                 foreign = display_path / "foreign-evidence"
@@ -737,6 +996,7 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         bound_root_identity: tuple[int, int] | None = None
         replaced_batch: Path | None = None
         discard_calls = 0
+        post_ticket_checks = 0
 
         def replace_quarantine_root_then_fail(
             directory_fd: int,
@@ -745,8 +1005,21 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             **kwargs: object,
         ) -> object:
             nonlocal original_root_identity, replacement_root_identity
+            nonlocal post_ticket_checks
             nonlocal replaced_batch
-            if display_path.name == "leaf" and replaced_batch is None:
+            if (
+                display_path.name == "leaf"
+                and MODULE._pending_cleanup_ticket_path(
+                    self.home,
+                    display_path.parent.name,
+                ).is_file()
+            ):
+                post_ticket_checks += 1
+            if (
+                display_path.name == "leaf"
+                and post_ticket_checks == 2
+                and replaced_batch is None
+            ):
                 batch_root = display_path.parent
                 quarantine_root = batch_root.parent
                 original_metadata = quarantine_root.stat()
@@ -1686,7 +1959,7 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
         self.assertFalse(list(index.iterdir()))
 
-    def test_v8_with_metadata_stage_and_empty_batch_recovers_after_crash(
+    def test_v8_with_metadata_stage_and_empty_batch_fails_closed(
         self,
     ) -> None:
         quarantine_root = (
@@ -1733,6 +2006,12 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             )
             os.mkdir(batch_name, mode=0o700, dir_fd=quarantine_fd)
             os.fsync(quarantine_fd)
+            batch_stat = os.stat(
+                batch_name,
+                dir_fd=quarantine_fd,
+                follow_symlinks=False,
+            )
+            batch_identity = (batch_stat.st_dev, batch_stat.st_ino)
         finally:
             MODULE._close_fd_quietly(stage_fd)
             MODULE._close_fd_quietly(quarantine_fd)
@@ -1740,12 +2019,27 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         self.assertTrue(stage_path.is_file())
         self.assertTrue(allocation.path.is_file())
         self.assertTrue(allocation.batch_root.is_dir())
-        self.assertTrue(MODULE._pending_cleanup_ready_batch_is_observed(self.home))
-        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
-        self.assertFalse(stage_path.exists())
-        self.assertFalse(allocation.path.exists())
-        self.assertFalse(allocation.batch_root.exists())
-        self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "present entity without exact cleanup authority",
+        ):
+            MODULE._pending_cleanup_ready_batch_is_observed(self.home)
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "present entity without exact cleanup authority",
+        ):
+            MODULE._cleanup_pending_quarantine_allocations(
+                self.home,
+                budget=MODULE.PendingCleanupActionBudget(4),
+            )
+        self.assertEqual(stage_path.read_bytes(), payload)
+        current_batch = allocation.batch_root.stat()
+        self.assertEqual(
+            (current_batch.st_dev, current_batch.st_ino),
+            batch_identity,
+        )
+        self.assertEqual(list(allocation.batch_root.iterdir()), [])
+        self.assertTrue(allocation.path.is_file())
 
     def test_python39_allocator_cleanup_error_chains_both_failures(self) -> None:
         class LegacyBaseException(BaseException):
@@ -1817,7 +2111,7 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         self.assertFalse(allocation.path.exists())
         self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
 
-    def test_v8_recovers_empty_canonical_and_isolated_batches(self) -> None:
+    def test_v8_retains_empty_canonical_and_isolated_batches(self) -> None:
         for initial_state in ("canonical", "isolated"):
             with self.subTest(initial_state=initial_state):
                 case_home = self.home / initial_state
@@ -1850,24 +2144,41 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
                     )
                     os.mkdir(directory_name, mode=0o700, dir_fd=quarantine_fd)
                     os.fsync(quarantine_fd)
+                    directory_stat = os.stat(
+                        directory_name,
+                        dir_fd=quarantine_fd,
+                        follow_symlinks=False,
+                    )
+                    directory_identity = (
+                        directory_stat.st_dev,
+                        directory_stat.st_ino,
+                    )
                 finally:
                     MODULE._close_fd_quietly(quarantine_fd)
 
-                self.assertTrue(
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "present entity without exact cleanup authority",
+                ):
                     MODULE._pending_cleanup_ready_batch_is_observed(case_home)
-                )
-                self.assertEqual(
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "present entity without exact cleanup authority",
+                ):
                     MODULE._cleanup_pending_quarantine_allocations(
                         case_home,
                         budget=MODULE.PendingCleanupActionBudget(4),
-                    ),
-                    1,
+                    )
+                retained = quarantine_root / directory_name
+                retained_stat = retained.stat()
+                self.assertEqual(
+                    (retained_stat.st_dev, retained_stat.st_ino),
+                    directory_identity,
                 )
-                self.assertFalse(allocation.path.exists())
-                self.assertFalse(quarantine_root.joinpath(directory_name).exists())
-                self.assertEqual(MODULE._quarantine_batch_count(case_home), 0)
+                self.assertEqual(list(retained.iterdir()), [])
+                self.assertTrue(allocation.path.is_file())
 
-    def test_v8_recovers_exact_planned_leafless_metadata_scaffold(self) -> None:
+    def test_v8_retains_exact_planned_leafless_metadata_scaffold(self) -> None:
         allocation = MODULE._quarantine_batch_root(
             self.home,
             [],
@@ -1878,18 +2189,141 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         allocation.revoke_reclaim()
         allocation.close()
         assert allocation.binding.allocation_ticket is not None
+        batch_stat = allocation.batch_root.stat()
+        batch_identity = (batch_stat.st_dev, batch_stat.st_ino)
+        metadata_path = allocation.batch_root / "metadata.json"
+        metadata_stat = metadata_path.stat()
+        metadata_identity = (metadata_stat.st_dev, metadata_stat.st_ino)
+        metadata_payload = metadata_path.read_bytes()
 
-        self.assertTrue(MODULE._pending_cleanup_ready_batch_is_observed(self.home))
-        self.assertEqual(
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "present entity without exact cleanup authority",
+        ):
+            MODULE._pending_cleanup_ready_batch_is_observed(self.home)
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "present entity without exact cleanup authority",
+        ):
             MODULE._cleanup_pending_quarantine_allocations(
                 self.home,
                 budget=MODULE.PendingCleanupActionBudget(4),
-            ),
-            1,
+            )
+        current_batch = allocation.batch_root.stat()
+        current_metadata = metadata_path.stat()
+        self.assertEqual(
+            (current_batch.st_dev, current_batch.st_ino),
+            batch_identity,
         )
+        self.assertEqual(
+            (current_metadata.st_dev, current_metadata.st_ino),
+            metadata_identity,
+        )
+        self.assertEqual(metadata_path.read_bytes(), metadata_payload)
+        self.assertTrue(allocation.binding.allocation_ticket.path.is_file())
+
+    def test_v5_and_v8_recover_exact_empty_leaf_after_crash(self) -> None:
+        allocation = MODULE._quarantine_batch_root(
+            self.home,
+            [],
+            retain_binding=True,
+            retain_scaffold_binding=True,
+        )
+        assert isinstance(allocation, MODULE.EphemeralQuarantineBatchAllocation)
+        allocation.create_leaf()
+        binding = allocation.binding
+        assert binding.allocation_ticket is not None
+        assert binding.cleanup_ticket is not None
+        self.assertEqual(binding.cleanup_ticket.version, 5)
+        batch_stat = allocation.batch_root.stat()
+        leaf_stat = (allocation.batch_root / "leaf").stat()
+        self.assertEqual(
+            (batch_stat.st_dev, batch_stat.st_ino),
+            binding.batch_identity,
+        )
+        self.assertEqual(
+            (leaf_stat.st_dev, leaf_stat.st_ino),
+            binding.leaf_identity,
+        )
+        allocation.revoke_reclaim()
+        allocation.close()
+
+        self.assertTrue(MODULE._pending_cleanup_ready_batch_is_observed(self.home))
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
         self.assertFalse(allocation.batch_root.exists())
-        self.assertFalse(allocation.binding.allocation_ticket.path.exists())
-        self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
+        self.assertFalse(binding.cleanup_ticket.path.exists())
+        self.assertFalse(binding.allocation_ticket.path.exists())
+
+    def test_v5_and_v8_refuse_nonempty_leaf_recovery(self) -> None:
+        allocation = MODULE._quarantine_batch_root(
+            self.home,
+            [],
+            retain_binding=True,
+            retain_scaffold_binding=True,
+        )
+        assert isinstance(allocation, MODULE.EphemeralQuarantineBatchAllocation)
+        allocation.create_leaf()
+        binding = allocation.binding
+        assert binding.allocation_ticket is not None
+        assert binding.cleanup_ticket is not None
+        allocation.revoke_reclaim()
+        allocation.close()
+        leaf = allocation.batch_root / "leaf"
+        foreign = leaf / "foreign"
+        foreign.write_bytes(b"foreign\n")
+        leaf_stat = leaf.stat()
+        leaf_identity = (leaf_stat.st_dev, leaf_stat.st_ino)
+
+        with self.assertRaisesRegex(MODULE.SyncError, "leaf is not empty"):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        current_leaf = leaf.stat()
+        self.assertEqual(
+            (current_leaf.st_dev, current_leaf.st_ino),
+            leaf_identity,
+        )
+        self.assertEqual(foreign.read_bytes(), b"foreign\n")
+        self.assertTrue(binding.cleanup_ticket.path.is_file())
+        self.assertTrue(binding.allocation_ticket.path.is_file())
+
+    def test_v5_and_v8_refuse_replaced_leaf_recovery(self) -> None:
+        allocation = MODULE._quarantine_batch_root(
+            self.home,
+            [],
+            retain_binding=True,
+            retain_scaffold_binding=True,
+        )
+        assert isinstance(allocation, MODULE.EphemeralQuarantineBatchAllocation)
+        allocation.create_leaf()
+        binding = allocation.binding
+        assert binding.allocation_ticket is not None
+        assert binding.cleanup_ticket is not None
+        held_leaf_fd = os.dup(allocation.leaf_fd)
+        allocation.revoke_reclaim()
+        allocation.close()
+        leaf = allocation.batch_root / "leaf"
+        try:
+            leaf.rmdir()
+            leaf.mkdir(mode=0o700)
+            replacement_stat = leaf.stat()
+            replacement_identity = (
+                replacement_stat.st_dev,
+                replacement_stat.st_ino,
+            )
+        finally:
+            os.close(held_leaf_fd)
+
+        with self.assertRaisesRegex(MODULE.SyncError, "leaf changed"):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        current_leaf = leaf.stat()
+        self.assertEqual(
+            (current_leaf.st_dev, current_leaf.st_ino),
+            replacement_identity,
+        )
+        self.assertNotEqual(replacement_identity, binding.leaf_identity)
+        self.assertTrue(binding.cleanup_ticket.path.is_file())
+        self.assertTrue(binding.allocation_ticket.path.is_file())
 
     def test_v8_recovery_rejects_partial_planned_metadata(self) -> None:
         allocation = MODULE._quarantine_batch_root(
@@ -1908,12 +2342,12 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             MODULE.SyncError,
-            "metadata does not match its plan",
+            "present entity without exact cleanup authority",
         ):
             MODULE._pending_cleanup_ready_batch_is_observed(self.home)
         with self.assertRaisesRegex(
             MODULE.SyncError,
-            "metadata does not match its plan",
+            "present entity without exact cleanup authority",
         ):
             MODULE._cleanup_pending_quarantine_allocations(
                 self.home,
@@ -1926,7 +2360,7 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         assert allocation.binding.allocation_ticket is not None
         self.assertTrue(allocation.binding.allocation_ticket.path.exists())
 
-    def test_v8_empty_recovery_rejects_identity_drift_after_classification(
+    def test_v8_retains_same_uid_replacement_created_after_reservation(
         self,
     ) -> None:
         quarantine_root = (
@@ -1951,37 +2385,29 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         finally:
             MODULE._close_fd_quietly(quarantine_fd)
         original = allocation.batch_root.with_name(batch_name + ".original")
-        real_classify = MODULE._pending_quarantine_allocation_recovery_state
-        replaced = False
+        allocation.batch_root.rename(original)
+        allocation.batch_root.mkdir(mode=0o700)
+        foreign = allocation.batch_root / "foreign"
+        foreign.write_bytes(b"foreign\n")
+        replacement_stat = allocation.batch_root.stat()
+        replacement_identity = (replacement_stat.st_dev, replacement_stat.st_ino)
 
-        def replace_after_classification(home: Path, current):
-            nonlocal replaced
-            result = real_classify(home, current)
-            if not replaced:
-                replaced = True
-                allocation.batch_root.rename(original)
-                allocation.batch_root.mkdir(mode=0o700)
-            return result
-
-        with (
-            mock.patch.object(
-                MODULE,
-                "_pending_quarantine_allocation_recovery_state",
-                side_effect=replace_after_classification,
-            ),
-            self.assertRaisesRegex(
-                MODULE.SyncError,
-                "empty quarantine allocation changed",
-            ),
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "present entity without exact cleanup authority",
         ):
             MODULE._cleanup_pending_quarantine_allocations(
                 self.home,
                 budget=MODULE.PendingCleanupActionBudget(4),
             )
 
-        self.assertTrue(replaced)
         self.assertTrue(original.is_dir())
-        self.assertTrue(allocation.batch_root.is_dir())
+        current_stat = allocation.batch_root.stat()
+        self.assertEqual(
+            (current_stat.st_dev, current_stat.st_ino),
+            replacement_identity,
+        )
+        self.assertEqual(foreign.read_bytes(), b"foreign\n")
         self.assertTrue(allocation.path.is_file())
 
     def test_v8_entity_with_matching_v7_is_observed_as_cleanup_ready(self) -> None:
@@ -2064,6 +2490,39 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         assert allocation.binding.allocation_ticket is not None
         self.assertTrue(allocation.binding.allocation_ticket.path.is_file())
 
+    def test_joined_v8_is_read_under_the_bound_cleanup_index_fd(self) -> None:
+        _batch_root, binding = self._allocate_unowned_scaffold()
+        cleanup = MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+            self.home,
+            binding,
+        )
+        allocation = binding.allocation_ticket
+        assert allocation is not None
+        real_read_allocation = MODULE._read_pending_quarantine_allocation_ticket
+        captured_snapshots: list[MODULE.ManagedStateFileSnapshot | None] = []
+
+        def record_captured_snapshot(*args: object, **kwargs: object):
+            captured_snapshots.append(kwargs.get("_captured_snapshot"))
+            return real_read_allocation(*args, **kwargs)
+
+        with mock.patch.object(
+            MODULE,
+            "_read_pending_quarantine_allocation_ticket",
+            side_effect=record_captured_snapshot,
+        ):
+            joined = MODULE._read_joined_quarantine_allocation_for_cleanup(
+                self.home,
+                cleanup,
+            )
+
+        self.assertIsNotNone(joined)
+        assert joined is not None
+        self.assertTrue(
+            MODULE._pending_quarantine_allocation_ticket_matches(joined, allocation)
+        )
+        self.assertEqual(len(captured_snapshots), 1)
+        self.assertIsNotNone(captured_snapshots[0])
+
     def test_main_v7_cleanup_rejects_mismatched_v8_before_mutation(self) -> None:
         batch_root, binding = self._allocate_unowned_scaffold()
         cleanup = MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
@@ -2130,6 +2589,12 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         self.assertTrue(cleanup.path.is_file())
         self.assertTrue(allocation.path.is_file())
 
+    def test_main_v7_cleanup_rejects_late_direct_v8_descendant(self) -> None:
+        self._exercise_late_v8_representation_injection(retained=False)
+
+    def test_main_v7_cleanup_rejects_late_retained_v8_descendant(self) -> None:
+        self._exercise_late_v8_representation_injection(retained=True)
+
     def test_absent_v8_with_matching_v7_is_delegated(self) -> None:
         batch_root, binding = self._allocate_unowned_scaffold()
         cleanup = MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
@@ -2175,116 +2640,52 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         self.assertTrue(cleanup.path.is_file())
         self.assertTrue(allocation.path.is_file())
 
-    def test_v8_empty_recovery_rechecks_all_control_residue_at_four_boundaries(
-        self,
-    ) -> None:
-        residue_names = {
-            1: lambda batch: batch + MODULE.PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
-            2: lambda batch: (
-                batch
-                + MODULE.PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX
-                + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+    def test_v8_present_entity_never_enters_v8_only_mutation(self) -> None:
+        quarantine_root = (
+            MODULE._personal_sync_root(self.home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        quarantine_fd = MODULE._open_or_create_directory_beneath(
+            self.home,
+            quarantine_root,
+            mode=0o700,
+        )
+        try:
+            batch_name = f"20260905T030301Z-{os.getpid()}-{time.time_ns()}"
+            allocation = MODULE._publish_pending_quarantine_allocation_ticket(
+                self.home,
+                quarantine_root,
+                quarantine_fd,
+                batch_name,
+                b"{}\n",
+            )
+            os.mkdir(batch_name, mode=0o700, dir_fd=quarantine_fd)
+            os.fsync(quarantine_fd)
+        finally:
+            MODULE._close_fd_quietly(quarantine_fd)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_delete_pending_quarantine_allocation_ticket",
+            ) as delete_allocation,
+            mock.patch.object(
+                MODULE,
+                "_discard_empty_ephemeral_quarantine_batch",
+            ) as discard_batch,
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "present entity without exact cleanup authority",
             ),
-            3: lambda batch: (batch + MODULE.PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX),
-            4: lambda batch: (
-                batch + MODULE.PENDING_CLEANUP_EMPTY_PROOF_SUFFIX + ".residue"
-            ),
-        }
-        for boundary_call, residue_name in residue_names.items():
-            with self.subTest(boundary_call=boundary_call):
-                case_home = self.home / f"v8-empty-boundary-{boundary_call}"
-                case_home.mkdir(mode=0o700)
-                quarantine_root = (
-                    MODULE._personal_sync_root(case_home)
-                    / MODULE.QUARANTINE_RELATIVE_PATH
-                )
-                quarantine_fd = MODULE._open_or_create_directory_beneath(
-                    case_home,
-                    quarantine_root,
-                    mode=0o700,
-                )
-                try:
-                    batch_name = (
-                        f"20260905T03030{boundary_call}Z-{os.getpid()}-{time.time_ns()}"
-                    )
-                    allocation = MODULE._publish_pending_quarantine_allocation_ticket(
-                        case_home,
-                        quarantine_root,
-                        quarantine_fd,
-                        batch_name,
-                        b"{}\n",
-                    )
-                    os.mkdir(batch_name, mode=0o700, dir_fd=quarantine_fd)
-                    os.fsync(quarantine_fd)
-                finally:
-                    MODULE._close_fd_quietly(quarantine_fd)
-                residue_path = allocation.path.with_name(residue_name(batch_name))
-                real_require_absent = MODULE._require_pending_quarantine_allocation_cleanup_controls_absent
-                observed_boundaries = 0
+        ):
+            MODULE._cleanup_pending_quarantine_allocations(
+                self.home,
+                budget=MODULE.PendingCleanupActionBudget(4),
+            )
 
-                def inject_cleanup_control_residue(
-                    home: Path,
-                    index_root: Path,
-                    index_fd: int,
-                    ticket: MODULE.PendingQuarantineAllocationTicket,
-                    *,
-                    allowed_allocation_name: str,
-                ) -> None:
-                    nonlocal observed_boundaries
-                    observed_boundaries += 1
-                    if observed_boundaries == boundary_call:
-                        MODULE._write_exclusive_internal_file(
-                            case_home,
-                            residue_path,
-                            b"{}\n",
-                        )
-                    real_require_absent(
-                        home,
-                        index_root,
-                        index_fd,
-                        ticket,
-                        allowed_allocation_name=allowed_allocation_name,
-                    )
-
-                with (
-                    mock.patch.object(
-                        MODULE,
-                        "_require_pending_quarantine_allocation_cleanup_controls_absent",
-                        side_effect=inject_cleanup_control_residue,
-                    ),
-                    self.assertRaisesRegex(
-                        MODULE.SyncError,
-                        "cleanup control remained",
-                    ),
-                ):
-                    MODULE._cleanup_pending_quarantine_allocations(
-                        case_home,
-                        budget=MODULE.PendingCleanupActionBudget(4),
-                    )
-
-                if boundary_call == 1:
-                    self.assertTrue(quarantine_root.joinpath(batch_name).is_dir())
-                elif boundary_call == 2:
-                    self.assertTrue(
-                        quarantine_root.joinpath(allocation.isolated_name).is_dir()
-                    )
-                else:
-                    self.assertFalse(quarantine_root.joinpath(batch_name).exists())
-                    self.assertFalse(
-                        quarantine_root.joinpath(allocation.isolated_name).exists()
-                    )
-                self.assertTrue(residue_path.is_file())
-                if boundary_call < 4:
-                    self.assertTrue(allocation.path.is_file())
-                else:
-                    retained = tuple(
-                        allocation.path.parent.glob(
-                            f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}"
-                            f"{allocation.path.name}-*"
-                        )
-                    )
-                    self.assertEqual(len(retained), 1)
-                    self.assertTrue(retained[0].is_file())
+        delete_allocation.assert_not_called()
+        discard_batch.assert_not_called()
+        self.assertTrue(allocation.batch_root.is_dir())
+        self.assertTrue(allocation.path.is_file())
 
     def test_absent_v8_rechecks_control_residue_before_direct_retirement(
         self,
@@ -2429,25 +2830,397 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
                 self.assertFalse(allocation.path.exists())
                 self.assertEqual(MODULE._quarantine_batch_count(case_home), 0)
 
-    def test_private_move_retires_v8_fence_after_double_verification(self) -> None:
+    def test_private_move_retires_v5_before_v8_after_double_verification(
+        self,
+    ) -> None:
+        real_delete_cleanup = MODULE._delete_pending_cleanup_ticket
+        real_delete_allocation = MODULE._delete_pending_quarantine_allocation_ticket
+        retirement_order: list[str] = []
+
+        def delete_cleanup(*args: object, **kwargs: object) -> None:
+            retirement_order.append("v5")
+            real_delete_cleanup(*args, **kwargs)
+
+        def delete_allocation(*args: object, **kwargs: object) -> None:
+            retirement_order.append("v8")
+            real_delete_allocation(*args, **kwargs)
+
         parent_fd = MODULE._open_directory_beneath(self.home, self.source_parent)
         try:
-            destination, moved = MODULE._move_regular_leaf_to_unique_quarantine(
-                self.home,
-                self.source_parent,
-                parent_fd,
-                self.source.name,
-                label="v8-retirement",
-                expected_identity=self.source_identity,
-            )
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_delete_pending_cleanup_ticket",
+                    side_effect=delete_cleanup,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_delete_pending_quarantine_allocation_ticket",
+                    side_effect=delete_allocation,
+                ),
+            ):
+                destination, moved, binding = (
+                    MODULE._move_regular_leaf_to_unique_quarantine(
+                        self.home,
+                        self.source_parent,
+                        parent_fd,
+                        self.source.name,
+                        label="v8-retirement",
+                        expected_identity=self.source_identity,
+                        retain_batch_binding=True,
+                    )
+                )
         finally:
             MODULE._close_fd_quietly(parent_fd)
 
         self.assertFalse(self.source.exists())
         self.assertEqual(moved.file_identity, self.source_identity)
         self.assertTrue(destination.is_file())
+        self.assertEqual(retirement_order, ["v5", "v8"])
+        assert binding.cleanup_ticket is not None
+        assert binding.allocation_ticket is not None
+        self.assertFalse(binding.cleanup_ticket.path.exists())
+        self.assertFalse(binding.allocation_ticket.path.exists())
+
+    def test_private_use_receipt_recovers_with_v5_and_v8_present(self) -> None:
+        receipt, private_path = self._crash_after_private_use_receipt()
+        self.assertEqual(MODULE._quarantine_batch_count(self.home), 1)
+
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+
+        self.assertEqual(private_path.read_bytes(), b'role = "reviewer"\n')
+        self.assertFalse(receipt.path.exists())
+        self.assertFalse(receipt.path.with_name(receipt.cleanup_control.name).exists())
+        self.assertFalse(
+            receipt.path.with_name(receipt.allocation_control.name).exists()
+        )
+
+    def test_private_use_receipt_rechecks_private_member_after_control_scan(
+        self,
+    ) -> None:
+        receipt, private_path = self._crash_after_private_use_receipt()
+        private_before = private_path.stat()
+        real_control_state = MODULE._pending_private_use_retirement_control_state
+        control_scans = 0
+
+        def mutate_private_member_after_control_scan(
+            *args: object,
+            **kwargs: object,
+        ) -> tuple[
+            MODULE.PendingBatchCleanupTicket | None,
+            MODULE.PendingQuarantineAllocationTicket | None,
+        ]:
+            nonlocal control_scans
+            controls = real_control_state(*args, **kwargs)
+            control_scans += 1
+            if control_scans == 1:
+                private_path.write_bytes(b"foreign\n")
+                private_path.chmod(0o600)
+            return controls
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_pending_private_use_retirement_control_state",
+                side_effect=mutate_private_member_after_control_scan,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "private-use retirement private member changed",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        private_after = private_path.stat()
+        self.assertEqual(
+            (private_after.st_dev, private_after.st_ino),
+            (private_before.st_dev, private_before.st_ino),
+        )
+        self.assertEqual(private_path.read_bytes(), b"foreign\n")
+        self.assertTrue(receipt.path.exists())
+        self.assertTrue(receipt.path.with_name(receipt.cleanup_control.name).exists())
+        self.assertTrue(
+            receipt.path.with_name(receipt.allocation_control.name).exists()
+        )
+
+    def test_private_use_receipt_recovers_after_v5_retirement_crash(self) -> None:
+        real_delete = MODULE._delete_pending_cleanup_ticket
+
+        def delete_v5_then_crash(*args: object, **kwargs: object) -> None:
+            real_delete(*args, **kwargs)
+            raise SystemExit("injected post-v5 crash")
+
+        parent_fd = MODULE._open_directory_beneath(self.home, self.source_parent)
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_delete_pending_cleanup_ticket",
+                    side_effect=delete_v5_then_crash,
+                ),
+                self.assertRaisesRegex(SystemExit, "post-v5 crash"),
+            ):
+                MODULE._move_regular_leaf_to_unique_quarantine(
+                    self.home,
+                    self.source_parent,
+                    parent_fd,
+                    self.source.name,
+                    label="post-v5-retirement-crash",
+                    expected_identity=self.source_identity,
+                )
+        finally:
+            MODULE._close_fd_quietly(parent_fd)
         index = MODULE._pending_cleanup_index_path(self.home)
-        self.assertFalse(list(index.glob("*.allocation.json*")))
+        receipt_path = next(
+            index.glob(f"*{MODULE.PENDING_PRIVATE_USE_RETIREMENT_SUFFIX}")
+        )
+        receipt = MODULE._read_pending_private_use_retirement_receipt(
+            self.home, receipt_path
+        )
+        assert receipt is not None
+        private_path = receipt.batch_root / "leaf" / receipt.private_member_name
+        self.assertFalse((index / receipt.cleanup_control.name).exists())
+        self.assertTrue((index / receipt.allocation_control.name).is_file())
+
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+
+        self.assertEqual(private_path.read_bytes(), b'role = "reviewer"\n')
+        self.assertFalse(receipt_path.exists())
+        self.assertFalse((index / receipt.allocation_control.name).exists())
+
+    def test_private_use_receipt_recovers_after_v8_retirement_crash(self) -> None:
+        real_delete = MODULE._delete_pending_quarantine_allocation_ticket
+
+        def delete_v8_then_crash(*args: object, **kwargs: object) -> None:
+            real_delete(*args, **kwargs)
+            raise SystemExit("injected post-v8 crash")
+
+        parent_fd = MODULE._open_directory_beneath(self.home, self.source_parent)
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_delete_pending_quarantine_allocation_ticket",
+                    side_effect=delete_v8_then_crash,
+                ),
+                self.assertRaisesRegex(SystemExit, "post-v8 crash"),
+            ):
+                MODULE._move_regular_leaf_to_unique_quarantine(
+                    self.home,
+                    self.source_parent,
+                    parent_fd,
+                    self.source.name,
+                    label="post-v8-retirement-crash",
+                    expected_identity=self.source_identity,
+                )
+        finally:
+            MODULE._close_fd_quietly(parent_fd)
+        index = MODULE._pending_cleanup_index_path(self.home)
+        receipt_path = next(
+            index.glob(f"*{MODULE.PENDING_PRIVATE_USE_RETIREMENT_SUFFIX}")
+        )
+        receipt = MODULE._read_pending_private_use_retirement_receipt(
+            self.home, receipt_path
+        )
+        assert receipt is not None
+        private_path = receipt.batch_root / "leaf" / receipt.private_member_name
+        self.assertFalse((index / receipt.cleanup_control.name).exists())
+        self.assertFalse((index / receipt.allocation_control.name).exists())
+
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+
+        self.assertEqual(private_path.read_bytes(), b'role = "reviewer"\n')
+        self.assertFalse(receipt_path.exists())
+
+    def test_private_use_receipt_recovers_v5_tombstone_crash(self) -> None:
+        self._exercise_private_control_tombstone_crash(
+            MODULE.PENDING_CLEANUP_TICKET_SUFFIX
+        )
+
+    def test_private_use_receipt_recovers_v8_tombstone_crash(self) -> None:
+        self._exercise_private_control_tombstone_crash(
+            MODULE.PENDING_QUARANTINE_ALLOCATION_SUFFIX
+        )
+
+    def test_private_use_receipt_temp_is_promoted_and_recovered(self) -> None:
+        temp_path = self._crash_before_private_use_receipt_publication()
+        batch_name = MODULE._pending_private_use_retirement_temp_batch_name(
+            temp_path.name
+        )
+        assert batch_name is not None
+
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+
+        self.assertFalse(temp_path.exists())
+        receipt_path = MODULE._pending_private_use_retirement_path(
+            self.home, batch_name
+        )
+        self.assertFalse(receipt_path.exists())
+        batch_root = (
+            MODULE._personal_sync_root(self.home)
+            / MODULE.QUARANTINE_RELATIVE_PATH
+            / batch_name
+        )
+        private_members = list((batch_root / "leaf").iterdir())
+        self.assertEqual(len(private_members), 1)
+        self.assertEqual(private_members[0].read_bytes(), b'role = "reviewer"\n')
+
+    def test_private_use_retained_receipt_temp_is_restored_and_recovered(
+        self,
+    ) -> None:
+        temp_path = self._crash_before_private_use_receipt_publication()
+        batch_name = MODULE._pending_private_use_retirement_temp_batch_name(
+            temp_path.name
+        )
+        assert batch_name is not None
+        retained_name = next(MODULE._retained_pending_cleanup_names(temp_path))
+        retained_path = temp_path.with_name(retained_name)
+        temp_path.rename(retained_path)
+
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+
+        self.assertFalse(temp_path.exists())
+        self.assertFalse(retained_path.exists())
+        self.assertFalse(
+            MODULE._pending_private_use_retirement_path(self.home, batch_name).exists()
+        )
+        batch_root = (
+            MODULE._personal_sync_root(self.home)
+            / MODULE.QUARANTINE_RELATIVE_PATH
+            / batch_name
+        )
+        private_members = list((batch_root / "leaf").iterdir())
+        self.assertEqual(len(private_members), 1)
+        self.assertEqual(private_members[0].read_bytes(), b'role = "reviewer"\n')
+
+    def test_private_use_retained_receipt_is_restored_and_recovered(self) -> None:
+        receipt, private_path = self._crash_after_private_use_receipt()
+        retained_name = next(MODULE._retained_pending_cleanup_names(receipt.path))
+        retained_path = receipt.path.with_name(retained_name)
+        receipt.path.rename(retained_path)
+
+        self.assertTrue(MODULE._pending_cleanup_ready_batch_is_observed(self.home))
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+
+        self.assertEqual(private_path.read_bytes(), b'role = "reviewer"\n')
+        self.assertFalse(retained_path.exists())
+        self.assertFalse(receipt.path.exists())
+
+    def test_private_use_receipt_tombstone_crash_recovers(self) -> None:
+        real_rename = MODULE._rename_noreplace_at
+
+        def isolate_receipt_then_crash(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+            if source_name.endswith(
+                MODULE.PENDING_PRIVATE_USE_RETIREMENT_SUFFIX
+            ) and destination_name.startswith(
+                MODULE.PENDING_CLEANUP_RETAINED_PREFIX + source_name + "-"
+            ):
+                raise SystemExit("injected receipt tombstone crash")
+
+        parent_fd = MODULE._open_directory_beneath(self.home, self.source_parent)
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_rename_noreplace_at",
+                    side_effect=isolate_receipt_then_crash,
+                ),
+                self.assertRaisesRegex(SystemExit, "receipt tombstone crash"),
+            ):
+                MODULE._move_regular_leaf_to_unique_quarantine(
+                    self.home,
+                    self.source_parent,
+                    parent_fd,
+                    self.source.name,
+                    label="receipt-tombstone-crash",
+                    expected_identity=self.source_identity,
+                )
+        finally:
+            MODULE._close_fd_quietly(parent_fd)
+        index = MODULE._pending_cleanup_index_path(self.home)
+        retained = list(
+            index.glob(
+                MODULE.PENDING_CLEANUP_RETAINED_PREFIX
+                + "*"
+                + MODULE.PENDING_PRIVATE_USE_RETIREMENT_SUFFIX
+                + "-*"
+            )
+        )
+        self.assertEqual(len(retained), 1)
+        batch_name = MODULE._pending_cleanup_retained_control_name(retained[0].name)[1]
+        batch_root = (
+            MODULE._personal_sync_root(self.home)
+            / MODULE.QUARANTINE_RELATIVE_PATH
+            / batch_name
+        )
+        private_path = next((batch_root / "leaf").iterdir())
+
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+
+        self.assertEqual(private_path.read_bytes(), b'role = "reviewer"\n')
+        self.assertFalse(retained[0].exists())
+
+    def test_private_use_receipt_rejects_replaced_private_member(self) -> None:
+        receipt, private_path = self._crash_after_private_use_receipt()
+        private_path.unlink()
+        private_path.write_bytes(b"foreign\n")
+        private_path.chmod(0o600)
+        replacement = private_path.stat()
+        replacement_identity = (replacement.st_dev, replacement.st_ino)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "private-use retirement.*private member changed",
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        current = private_path.stat()
+        self.assertEqual((current.st_dev, current.st_ino), replacement_identity)
+        self.assertEqual(private_path.read_bytes(), b"foreign\n")
+        self.assertTrue(receipt.path.exists())
+        self.assertTrue(receipt.path.with_name(receipt.cleanup_control.name).exists())
+        self.assertTrue(
+            receipt.path.with_name(receipt.allocation_control.name).exists()
+        )
+
+    def test_private_use_receipt_rejects_extra_private_member(self) -> None:
+        receipt, private_path = self._crash_after_private_use_receipt()
+        extra = private_path.parent / "foreign"
+        extra.write_bytes(b"foreign\n")
+
+        with self.assertRaisesRegex(MODULE.SyncError, "retirement leaf changed"):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertEqual(private_path.read_bytes(), b'role = "reviewer"\n')
+        self.assertEqual(extra.read_bytes(), b"foreign\n")
+        self.assertTrue(receipt.path.exists())
+
+    def test_private_use_receipt_malformed_descendant_blocks_recovery(self) -> None:
+        receipt, private_path = self._crash_after_private_use_receipt()
+        malformed = receipt.path.with_name(receipt.path.name + ".extra")
+        malformed.write_bytes(b"foreign\n")
+        malformed.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "retirement receipt representation must be reconciled",
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertEqual(private_path.read_bytes(), b'role = "reviewer"\n')
+        self.assertTrue(receipt.path.exists())
+        self.assertEqual(malformed.read_bytes(), b"foreign\n")
 
     def test_private_move_cannot_republish_reclaim_after_v8_retirement(self) -> None:
         parent_fd = MODULE._open_directory_beneath(self.home, self.source_parent)
@@ -2517,7 +3290,7 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             MODULE.SyncError,
-            "allocation remains incomplete",
+            "present entity without exact cleanup authority",
         ):
             MODULE._pending_cleanup_ready_batch_is_observed(self.home)
 
@@ -2526,7 +3299,7 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             contextlib.redirect_stdout(dry_run_output),
             self.assertRaisesRegex(
                 MODULE.SyncError,
-                "allocation remains incomplete",
+                "present entity without exact cleanup authority",
             ),
         ):
             MODULE._preflight_pending_recovery(
@@ -2537,7 +3310,7 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             MODULE.SyncError,
-            "allocation remains incomplete",
+            "present entity without exact cleanup authority",
         ):
             MODULE._cleanup_pending_quarantine_allocations(
                 self.home,
@@ -2629,6 +3402,83 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             1,
         )
         self.assertFalse(path.exists())
+
+    def test_v5_temp_with_present_v8_is_ready_in_status_and_preflight(self) -> None:
+        batch_root, binding, temp_path = self._allocate_v5_ticket_representation(
+            retained=False
+        )
+        assert binding.allocation_ticket is not None
+
+        self.assertTrue(MODULE._pending_cleanup_ready_batch_is_observed(self.home))
+        status_output = io.StringIO()
+        with contextlib.redirect_stdout(status_output):
+            self.assertFalse(MODULE.status(self.home))
+        self.assertIn("must be cleaned", status_output.getvalue())
+        dry_run_output = io.StringIO()
+        with contextlib.redirect_stdout(dry_run_output):
+            self.assertTrue(MODULE._preflight_pending_recovery(self.home, dry_run=True))
+        self.assertIn("would clean", dry_run_output.getvalue())
+
+        self.assertTrue(MODULE._preflight_pending_recovery(self.home, dry_run=False))
+
+        self.assertFalse(batch_root.exists())
+        self.assertFalse(temp_path.exists())
+        self.assertFalse(binding.allocation_ticket.path.exists())
+
+    def test_retained_v5_temp_with_present_v8_recovers_integrated(self) -> None:
+        batch_root, binding, retained_path = self._allocate_v5_ticket_representation(
+            retained=True
+        )
+        assert binding.allocation_ticket is not None
+
+        self.assertTrue(MODULE._pending_cleanup_ready_batch_is_observed(self.home))
+        dry_run_output = io.StringIO()
+        with contextlib.redirect_stdout(dry_run_output):
+            self.assertTrue(MODULE._preflight_pending_recovery(self.home, dry_run=True))
+        self.assertIn("would clean", dry_run_output.getvalue())
+
+        self.assertTrue(MODULE._preflight_pending_recovery(self.home, dry_run=False))
+
+        self.assertFalse(batch_root.exists())
+        self.assertFalse(retained_path.exists())
+        self.assertFalse(binding.allocation_ticket.path.exists())
+
+    def test_v7_temp_and_retained_ticket_precede_present_v8_classification(
+        self,
+    ) -> None:
+        for representation in ("temp", "retained"):
+            with self.subTest(representation=representation):
+                batch_root, binding = self._allocate_unowned_scaffold()
+                ticket = MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+                    self.home, binding
+                )
+                if representation == "temp":
+                    represented = ticket.path.with_name(
+                        batch_root.name + MODULE.PENDING_CLEANUP_TICKET_TEMP_SUFFIX
+                    )
+                else:
+                    represented = ticket.path.with_name(
+                        next(MODULE._retained_pending_cleanup_names(ticket.path))
+                    )
+                ticket.path.rename(represented)
+                assert binding.allocation_ticket is not None
+
+                self.assertTrue(
+                    MODULE._pending_cleanup_ready_batch_is_observed(self.home)
+                )
+                dry_run_output = io.StringIO()
+                with contextlib.redirect_stdout(dry_run_output):
+                    self.assertTrue(
+                        MODULE._preflight_pending_recovery(self.home, dry_run=True)
+                    )
+                self.assertIn("would clean", dry_run_output.getvalue())
+                self.assertTrue(
+                    MODULE._preflight_pending_recovery(self.home, dry_run=False)
+                )
+
+                self.assertFalse(batch_root.exists())
+                self.assertFalse(represented.exists())
+                self.assertFalse(binding.allocation_ticket.path.exists())
 
     def test_metadata_tombstone_boundary_rejects_leaf_appearance(self) -> None:
         self._exercise_metadata_cleanup_boundary_mutation(

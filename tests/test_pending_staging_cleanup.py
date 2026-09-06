@@ -2517,6 +2517,10 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     ),
                     mock.patch.object(
                         MODULE,
+                        "_cleanup_pending_private_use_retirements",
+                    ),
+                    mock.patch.object(
+                        MODULE,
                         "_publish_discovered_staging_cleanup_tickets",
                     ),
                     mock.patch.object(
@@ -2809,7 +2813,6 @@ class PendingStagingCleanupTests(unittest.TestCase):
             MODULE.EphemeralQuarantineBatchAllocation,
         )
         assert isinstance(allocation, MODULE.EphemeralQuarantineBatchAllocation)
-        allocation.create_leaf()
         batch_root = allocation.batch_root
         allocation_path = allocation.binding.allocation_ticket.path
         try:
@@ -2817,10 +2820,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 self._receiptless_cleanup_crash_patch("ticket-temp"),
                 self.assertRaisesRegex(SystemExit, "before ticket temp rename"),
             ):
-                MODULE._publish_pending_ephemeral_quarantine_cleanup_ticket(
-                    case_home,
-                    allocation.binding,
-                )
+                allocation.create_leaf()
         finally:
             allocation.revoke_reclaim()
             allocation.close()
@@ -5361,6 +5361,171 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 self.assertTrue(representation.is_file())
                 self.assertEqual(representation.read_bytes(), evidence_before)
                 representation.unlink()
+
+    def test_malformed_v8_control_representations_fail_closed_in_read_only_paths(
+        self,
+    ) -> None:
+        index_root = MODULE._pending_cleanup_index_path(self.home)
+        index_root.mkdir(parents=True, exist_ok=True)
+        batch_name = "20260901T000000Z-8-0"
+        canonical_names = (
+            batch_name + MODULE.PENDING_QUARANTINE_ALLOCATION_SUFFIX,
+            batch_name + MODULE.PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX,
+            batch_name + MODULE.PENDING_QUARANTINE_METADATA_STAGE_SUFFIX,
+        )
+        representations = tuple(
+            index_root / representation_name
+            for canonical_name in canonical_names
+            for representation_name in (
+                canonical_name + ".extra",
+                (
+                    f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}{canonical_name}-"
+                    "123-0000000000000001.extra"
+                ),
+            )
+        )
+
+        for representation in representations:
+            with self.subTest(representation=representation.name):
+                representation.write_bytes(b"malformed v8 control evidence\n")
+                representation.chmod(0o600)
+                before = representation.stat()
+                identity_before = (before.st_dev, before.st_ino)
+                evidence_before = representation.read_bytes()
+
+                status_output = io.StringIO()
+                with contextlib.redirect_stdout(status_output):
+                    healthy = MODULE.status(self.home)
+                self.assertFalse(healthy)
+                self.assertIn(
+                    "pending quarantine allocation representation must be reconciled",
+                    status_output.getvalue(),
+                )
+
+                install_output = io.StringIO()
+                with (
+                    contextlib.redirect_stdout(install_output),
+                    mock.patch.object(MODULE, "_source_release_identity") as source,
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "pending quarantine allocation representation must be "
+                        "reconciled",
+                    ),
+                ):
+                    MODULE.install_release_tree(
+                        self.next_release,
+                        self.home,
+                        SHA_B,
+                        dry_run=True,
+                    )
+                source.assert_not_called()
+                self.assertNotIn("would clean", install_output.getvalue())
+
+                uninstall_output = io.StringIO()
+                with (
+                    contextlib.redirect_stdout(uninstall_output),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "pending quarantine allocation representation must be "
+                        "reconciled",
+                    ),
+                ):
+                    MODULE.uninstall_overlay(
+                        self.home,
+                        "private",
+                        dry_run=True,
+                    )
+                self.assertNotIn("would clean", uninstall_output.getvalue())
+                self.assertTrue(representation.is_file())
+                after = representation.stat()
+                self.assertEqual((after.st_dev, after.st_ino), identity_before)
+                self.assertEqual(representation.read_bytes(), evidence_before)
+                representation.unlink()
+
+    def test_malformed_v8_control_representation_blocks_global_scans(
+        self,
+    ) -> None:
+        index_root = MODULE._pending_cleanup_index_path(self.home)
+        index_root.mkdir(parents=True, exist_ok=True)
+        batch_name = "20260901T000000Z-8-1"
+        representation = index_root / (
+            batch_name + MODULE.PENDING_QUARANTINE_ALLOCATION_SUFFIX + ".extra"
+        )
+        representation.write_bytes(b"malformed v8 allocation evidence\n")
+        representation.chmod(0o600)
+        before = representation.stat()
+        identity_before = (before.st_dev, before.st_ino)
+        evidence_before = representation.read_bytes()
+
+        for scan in (
+            MODULE._pending_cleanup_ready_batch_is_observed,
+            MODULE._require_no_pending_terminal_mutation_authority,
+            MODULE._pending_quarantine_allocation_batch_names,
+        ):
+            with (
+                self.subTest(scan=scan.__name__),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "pending quarantine allocation representation must be reconciled",
+                ),
+            ):
+                scan(self.home)
+
+        self.assertTrue(representation.is_file())
+        after = representation.stat()
+        self.assertEqual((after.st_dev, after.st_ino), identity_before)
+        self.assertEqual(representation.read_bytes(), evidence_before)
+
+    def test_read_only_ready_observation_rechecks_late_malformed_v8_control(
+        self,
+    ) -> None:
+        index_root = MODULE._pending_cleanup_index_path(self.home)
+        index_root.mkdir(parents=True, exist_ok=True)
+        batch_name = "20260901T000000Z-8-2"
+        representation = index_root / (
+            batch_name + MODULE.PENDING_QUARANTINE_METADATA_STAGE_SUFFIX + ".extra"
+        )
+        real_preflight_scan = (
+            MODULE._require_no_pending_unresolved_ticket_representations
+        )
+        injected = False
+
+        def scan_then_inject(home: Path) -> None:
+            nonlocal injected
+            real_preflight_scan(home)
+            if not injected:
+                representation.write_bytes(b"late malformed v8 control evidence\n")
+                representation.chmod(0o600)
+                injected = True
+
+        install_output = io.StringIO()
+        with (
+            mock.patch.object(
+                MODULE,
+                "_require_no_pending_unresolved_ticket_representations",
+                side_effect=scan_then_inject,
+            ),
+            mock.patch.object(MODULE, "_source_release_identity") as source,
+            contextlib.redirect_stdout(install_output),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending quarantine allocation representation must be reconciled",
+            ),
+        ):
+            MODULE.install_release_tree(
+                self.next_release,
+                self.home,
+                SHA_B,
+                dry_run=True,
+            )
+        source.assert_not_called()
+        self.assertNotIn("would clean", install_output.getvalue())
+        self.assertTrue(injected)
+        self.assertTrue(representation.is_file())
+        self.assertEqual(
+            representation.read_bytes(),
+            b"late malformed v8 control evidence\n",
+        )
 
     def test_read_only_ready_observation_rechecks_late_ticket_representation(
         self,

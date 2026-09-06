@@ -88,12 +88,24 @@ superseded_by:
   of eight logical batches or standalone cursor-control actions per installer
   run; cursor residue consumes that same budget before ticket selection so a
   persistent deferred prefix cannot starve later terminal validation.
+- Version-8 allocation is a reservation fence, not authority to adopt a later
+  batch inode. A present batch therefore remains fail closed unless an exact
+  version-5/version-7 cleanup authority joins it. Private use publishes a
+  separate immutable version-1 `private-use-retirement` receipt before either
+  joined control is retired. It binds the caller-captured moved file snapshot,
+  all control-file evidence, and the complete private root/batch/leaf/metadata
+  namespace; it authorizes only retirement of v5, v8, and itself.
+- Recovery accepts only strict receipt temporary or retained forms, resumes
+  retirement in v5 → v8 → receipt order, and revalidates the entire private
+  namespace after every control-index scan. The pre-identity construction
+  window deliberately remains fail closed: without a durable object identity,
+  recovery never guesses that a later inode belongs to this operation.
 
 ## Next Steps
 
-- Commit the completed allocation-scaffold recovery and control-boundary
-  repairs, then repeat the full-range fresh-context GPT-5.6 Sol Ultra review
-  of the resulting signed frozen head.
+- Commit the completed allocation-scaffold and private-use-retirement repairs,
+  then repeat the full-range fresh-context GPT-5.6 Sol Ultra review of the
+  resulting signed frozen head.
 - Propagate the actual squash-landed canonical commit through toolbox and the
   private overlay using the receipt-bound release chain.
 - Smoke-test the installed reviewer role without a path override on every
@@ -809,3 +821,23 @@ superseded_by:
   Complete repository-private discovery then passed 1,602 tests with two
   expected skips in 1,092.322 seconds. A new frozen exact-head review remains
   required before remote publication.
+- The next frozen review found three v8 control-boundary gaps: a v5→v8 crash
+  could strand a present private batch, legal v5/v7 temporary authority could
+  be blocked by the v8 classifier, and a late malformed v8 descendant could
+  escape a joined mutation boundary. The repair adds the private-use-retirement
+  receipt described above, strict temporary promotion before v8 classification,
+  and same-index-FD broad-representation checks at every joined boundary.
+  A second independent audit then found two TOCTOU details: private evidence
+  must be fully resampled after its control scan, and the joined v8 parser must
+  capture and parse on the same index FD as that scan. Both are now covered by
+  direct regressions.
+- The current affected suite passed 316 tests in 133.432 seconds. Source lock
+  was refreshed and checked for all eleven sources; its 280-test regression
+  suite passed in 568.903 seconds. Ruff lint/format, Python syntax compilation,
+  and `git diff --check` passed on the same implementation. Complete discovery
+  and a fresh frozen whole-range review remain required before remote
+  publication.
+- Complete repository-private discovery subsequently passed 1,627 tests with
+  two expected skips in 1,101.205 seconds. The journal-only evidence update
+  does not alter the reviewed production or test source range; it needs only
+  lightweight documentation and lock checks before the signed frozen commit.
