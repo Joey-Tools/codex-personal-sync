@@ -2871,6 +2871,139 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                 else:
                     self.assertEqual(retained_identity, expected.file_identity)
 
+    def test_final_private_deletion_rebinds_after_parent_policy_revalidation(
+        self,
+    ) -> None:
+        for drift in ("replacement", "symlink", "content", "policy"):
+            with self.subTest(drift=drift):
+                self.home = self.root / f"home-final-delete-{drift}"
+                batch = self._interrupt_regular_publication_cleanup(
+                    self.release,
+                    SHA_A,
+                )
+                record, _active = self._assert_active_publication_journal(batch)
+                journal = MODULE._read_pending_regular_publication_cleanup(
+                    self.home,
+                    batch,
+                    record,
+                    "produced",
+                )
+                assert journal is not None
+                expected = journal[3]
+                cleanup = batch.batch_root / "pending" / "cleanup"
+                real_require_policy = MODULE._require_pending_cleanup_fd_access_policy
+                drifted_name: str | None = None
+
+                def drift_after_final_parent_policy(
+                    file_descriptor: int,
+                    display_path: Path,
+                    *,
+                    expected_mode: int,
+                ) -> os.stat_result:
+                    nonlocal drifted_name
+                    result = real_require_policy(
+                        file_descriptor,
+                        display_path,
+                        expected_mode=expected_mode,
+                    )
+                    if drifted_name is not None or display_path != cleanup:
+                        return result
+                    deletion_names = tuple(
+                        name
+                        for name in os.listdir(file_descriptor)
+                        if MODULE._pending_regular_publication_private_deletion_alias_base(
+                            name
+                        )
+                        is not None
+                    )
+                    if len(deletion_names) != 1:
+                        return result
+                    drifted_name = deletion_names[0]
+                    if drift in {"replacement", "symlink"}:
+                        os.unlink(drifted_name, dir_fd=file_descriptor)
+                    if drift == "replacement":
+                        replacement_fd = os.open(
+                            drifted_name,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            0o600,
+                            dir_fd=file_descriptor,
+                        )
+                        try:
+                            os.write(replacement_fd, b"foreign replacement\n")
+                        finally:
+                            os.close(replacement_fd)
+                    elif drift == "symlink":
+                        os.symlink(
+                            "foreign-target",
+                            drifted_name,
+                            dir_fd=file_descriptor,
+                        )
+                    elif drift == "content":
+                        content_fd = os.open(
+                            drifted_name,
+                            os.O_WRONLY | os.O_TRUNC,
+                            dir_fd=file_descriptor,
+                        )
+                        try:
+                            os.write(content_fd, b"foreign content\n")
+                        finally:
+                            os.close(content_fd)
+                    else:
+                        os.chmod(
+                            drifted_name,
+                            0o640,
+                            dir_fd=file_descriptor,
+                            follow_symlinks=False,
+                        )
+                    return result
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_require_pending_cleanup_fd_access_policy",
+                        side_effect=drift_after_final_parent_policy,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "final private evidence changed after boundary revalidation",
+                    ),
+                ):
+                    MODULE._recover_pending_regular_publication_cleanup(
+                        self.home,
+                        batch,
+                        record,
+                        "produced",
+                    )
+
+                self.assertIsNotNone(drifted_name)
+                assert drifted_name is not None
+                drifted_path = cleanup / drifted_name
+                self.assertTrue(os.path.lexists(drifted_path))
+                if drift == "replacement":
+                    self.assertNotEqual(
+                        (drifted_path.stat().st_dev, drifted_path.stat().st_ino),
+                        expected.file_identity,
+                    )
+                    self.assertEqual(
+                        drifted_path.read_bytes(),
+                        b"foreign replacement\n",
+                    )
+                elif drift == "symlink":
+                    self.assertTrue(drifted_path.is_symlink())
+                    self.assertEqual(os.readlink(drifted_path), "foreign-target")
+                elif drift == "content":
+                    self.assertEqual(
+                        (drifted_path.stat().st_dev, drifted_path.stat().st_ino),
+                        expected.file_identity,
+                    )
+                    self.assertEqual(drifted_path.read_bytes(), b"foreign content\n")
+                else:
+                    self.assertEqual(
+                        (drifted_path.stat().st_dev, drifted_path.stat().st_ino),
+                        expected.file_identity,
+                    )
+                    self.assertEqual(stat.S_IMODE(drifted_path.stat().st_mode), 0o640)
+
     def test_private_authority_anchor_rejects_v2_journal_replay(self) -> None:
         for public_name in ("canonical", "active"):
             with self.subTest(public_name=public_name):

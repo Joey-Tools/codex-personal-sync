@@ -707,3 +707,19 @@ superseded_by:
   243.090 seconds. The remaining pre-push gate is one fresh isolated
   whole-range review of this exact final head; the journal-only evidence update
   does not require another complete discovery run.
+- A subsequent frozen review found one final-private deletion TOCTOU: the
+  regular-publication path released its leaf descriptor after the last snapshot,
+  then performed broad parent-policy checks and unlinked the tombstone by name.
+  A replacement in that interval could therefore be deleted without exact
+  authority. The repair keeps an `O_NOFOLLOW` descriptor for the exact
+  tombstone open through journal, public-name, and parent-policy revalidation,
+  then reproves descriptor identity, content, access policy, link count, name
+  binding, and parent binding immediately before unlink. Regular replacement,
+  symlink replacement, same-inode content drift, and same-inode mode drift all
+  remain as fail-closed evidence. The complete regular-materialization module
+  passed 134 tests, the eleven-source lock was refreshed and checked, and the
+  complete repository-private discovery passed 1,578 tests with two expected
+  skips in 1,072.844 seconds. Ruff lint/format, Python compilation, and
+  `git diff --check` passed. The attempted preceding CLI review was interrupted
+  by provider capacity and is not counted as a pass; a new fresh exact-head
+  whole-range review is required before remote publication.

@@ -18364,77 +18364,144 @@ def _delete_pending_regular_publication_private_alias(
     if isolation_error is not None:
         raise isolation_error
 
-    if not _pending_regular_publication_uses_receiptless_cleanup(
-        batch,
-        record,
-        phase,
-    ):
-        journal = _read_pending_regular_publication_cleanup(
-            home,
-            batch,
-            record,
-            phase,
-        )
-        if journal is None:
-            raise SyncError(
-                f"{label} cleanup journal disappeared after final isolation"
+    private_fd = -1
+    private_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    private_flags |= getattr(os, "O_NOFOLLOW", 0)
+    private_flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        try:
+            private_fd = os.open(
+                deletion_name,
+                private_flags,
+                dir_fd=cleanup_parent_fd,
             )
-        _journal_snapshot, active_name, _journal_phase, _journal_expected = journal
-        _advance_pending_regular_publication_private_authority(
+        except OSError as error:
+            raise SyncError(
+                f"{label} final private evidence became unreadable"
+            ) from error
+
+        def require_open_private_unchanged(stage: str) -> None:
+            try:
+                before = _require_release_identity_fd_access_policy(
+                    private_fd,
+                    deletion_path,
+                    expected.uid,
+                )
+                os.lseek(private_fd, 0, os.SEEK_SET)
+                payload = _read_managed_state_bytes(
+                    private_fd,
+                    deletion_path,
+                    MAX_ARCHIVE_MEMBER_BYTES,
+                )
+                os.lseek(private_fd, 0, os.SEEK_SET)
+                confirmed_payload = _read_managed_state_bytes(
+                    private_fd,
+                    deletion_path,
+                    MAX_ARCHIVE_MEMBER_BYTES,
+                )
+                after = _require_release_identity_fd_access_policy(
+                    private_fd,
+                    deletion_path,
+                    expected.uid,
+                )
+                named = os.stat(
+                    deletion_name,
+                    dir_fd=cleanup_parent_fd,
+                    follow_symlinks=False,
+                )
+            except (OSError, SyncError) as error:
+                raise SyncError(
+                    f"{label} final private evidence changed {stage}"
+                ) from error
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or not _regular_stat_metadata_matches(after, before)
+                or not _regular_stat_metadata_matches(named, before)
+                or (before.st_dev, before.st_ino) != expected.file_identity
+                or stat.S_IMODE(before.st_mode) != expected.mode
+                or before.st_uid != expected.uid
+                or not _gid_matches_regular_file_access_policy(
+                    before.st_gid,
+                    expected.gid,
+                    expected.mode,
+                )
+                or before.st_size != expected.size
+                or before.st_nlink != expected_link_count
+                or hashlib.sha256(payload).hexdigest() != expected.sha256
+                or hashlib.sha256(confirmed_payload).hexdigest() != expected.sha256
+                or _pending_regular_publication_private_deletion_alias_base(
+                    deletion_name
+                )
+                != canonical_private_name
+                or _directory_identity(cleanup_parent_fd) != cleanup_parent_identity
+                or not _bound_directory_matches(
+                    home,
+                    cleanup_parent,
+                    cleanup_parent_fd,
+                )
+            ):
+                raise SyncError(f"{label} final private evidence changed {stage}")
+
+        require_open_private_unchanged("before boundary revalidation")
+        if not _pending_regular_publication_uses_receiptless_cleanup(
+            batch,
+            record,
+            phase,
+        ):
+            journal = _read_pending_regular_publication_cleanup(
+                home,
+                batch,
+                record,
+                phase,
+            )
+            if journal is None:
+                raise SyncError(
+                    f"{label} cleanup journal disappeared after final isolation"
+                )
+            _journal_snapshot, active_name, _journal_phase, _journal_expected = journal
+            _advance_pending_regular_publication_private_authority(
+                home,
+                batch,
+                record,
+                phase,
+                expected,
+                active_name,
+                cleanup_parent_fd=cleanup_parent_fd,
+                cleanup_parent_identity=cleanup_parent_identity,
+            )
+        _require_managed_regular_parent_chain_access(
+            home,
+            public_parent,
+            bound_parent_fd=public_parent_fd,
+        )
+        if not _pending_regular_publication_public_names_are_allowed(
             home,
             batch,
             record,
             phase,
-            expected,
-            active_name,
-            cleanup_parent_fd=cleanup_parent_fd,
-            cleanup_parent_identity=cleanup_parent_identity,
-        )
-    _require_managed_regular_parent_chain_access(
-        home,
-        public_parent,
-        bound_parent_fd=public_parent_fd,
-    )
-    if not _pending_regular_publication_public_names_are_allowed(
-        home,
-        batch,
-        record,
-        phase,
-        public_parent,
-        public_parent_fd,
-        public_names,
-    ):
-        raise SyncError(
-            f"{label} public name reappeared; exact private evidence was retained"
-        )
-    final_snapshot = _regular_file_snapshot_at(
-        cleanup_parent_fd,
-        deletion_name,
-        deletion_path,
-        maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
-    )
-    if (
-        not _regular_snapshot_leaf_matches(final_snapshot, expected)
-        or final_snapshot.link_count != expected_link_count
-        or _pending_regular_publication_private_deletion_alias_base(deletion_name)
-        != canonical_private_name
-    ):
-        _retain_pending_cleanup_entry(
+            public_parent,
+            public_parent_fd,
+            public_names,
+        ):
+            raise SyncError(
+                f"{label} public name reappeared; exact private evidence was retained"
+            )
+        _require_pending_cleanup_fd_access_policy(
             cleanup_parent_fd,
-            deletion_name,
-            cleanup_parent_identity,
-            planned,
-            label=f"{label} changed before final private deletion",
+            cleanup_parent,
+            expected_mode=0o700,
         )
-    _require_pending_cleanup_fd_access_policy(
-        cleanup_parent_fd,
-        cleanup_parent,
-        expected_mode=0o700,
-    )
-    os.unlink(deletion_name, dir_fd=cleanup_parent_fd)
-    os.fsync(cleanup_parent_fd)
-    if _named_entry_identity(cleanup_parent_fd, deletion_name) is not None:
-        raise SyncError(f"{label} private name reappeared after deletion")
+        # Boundary probes above can race with the final pathname. Rebind the
+        # name to the still-open exact descriptor and repeat identity,
+        # content, access-policy, and link-count validation immediately before
+        # the irreversible unlink.
+        require_open_private_unchanged("after boundary revalidation")
+        os.unlink(deletion_name, dir_fd=cleanup_parent_fd)
+        os.fsync(cleanup_parent_fd)
+        if _named_entry_identity(cleanup_parent_fd, deletion_name) is not None:
+            raise SyncError(f"{label} private name reappeared after deletion")
+    finally:
+        _close_fd_quietly(private_fd)
     _require_managed_regular_parent_chain_access(
         home,
         public_parent,
