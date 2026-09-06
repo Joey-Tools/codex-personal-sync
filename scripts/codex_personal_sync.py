@@ -17040,11 +17040,28 @@ def _pending_ephemeral_quarantine_final_private_base(
     return None
 
 
+def _pending_ephemeral_quarantine_private_name_is_related(
+    batch_name: str,
+    name: str,
+) -> bool:
+    """Recognize the v6 private namespace without granting deletion authority.
+
+    Exact evidence slots and exact tombstones are authorized elsewhere. Their
+    malformed or suffixed descendants remain related evidence, while unrelated
+    quarantine-root child churn remains outside this batch's inventory.
+    """
+    primary = _pending_ephemeral_quarantine_leaf_name(batch_name)
+    return (
+        name == primary
+        or name.startswith(f"{primary}-retained-")
+        or name.startswith(f"{primary}.delete-")
+    )
+
+
 def _pending_ephemeral_quarantine_private_inventory(
     quarantine_fd: int,
     batch_name: str,
 ) -> tuple[tuple[str, tuple[int, int]], ...]:
-    evidence_names = frozenset(_pending_ephemeral_quarantine_evidence_names(batch_name))
     names = _directory_member_names(
         quarantine_fd,
         maximum_entries=MAX_PENDING_CLEANUP_BATCH_SCAN,
@@ -17052,10 +17069,9 @@ def _pending_ephemeral_quarantine_private_inventory(
     )
     private: list[tuple[str, tuple[int, int]]] = []
     for name in names:
-        if (
-            name not in evidence_names
-            and _pending_ephemeral_quarantine_final_private_base(batch_name, name)
-            is None
+        if not _pending_ephemeral_quarantine_private_name_is_related(
+            batch_name,
+            name,
         ):
             continue
         identity = _named_entry_identity(quarantine_fd, name)
@@ -28790,7 +28806,17 @@ def _remove_pending_ephemeral_quarantine_leaf(
             _require_pending_cleanup_ticket_unchanged(home, ticket)
             private = private_inventory()
             exact_private = tuple(
-                item for item in private if item[1] == expected.file_identity
+                item
+                for item in private
+                if item[1] == expected.file_identity
+                and (
+                    item[0] in evidence_names
+                    or _pending_ephemeral_quarantine_final_private_base(
+                        batch_name,
+                        item[0],
+                    )
+                    is not None
+                )
             )
             phase_receipt = _read_pending_cleanup_terminal_validation(
                 home,
@@ -28825,7 +28851,18 @@ def _remove_pending_ephemeral_quarantine_leaf(
                         f"{target.with_name(aliases[0][0])}"
                     )
                 if len(private) > 1 or (
-                    private and private[0][1] != expected.file_identity
+                    private
+                    and (
+                        private[0][1] != expected.file_identity
+                        or (
+                            private[0][0] not in evidence_names
+                            and _pending_ephemeral_quarantine_final_private_base(
+                                batch_name,
+                                private[0][0],
+                            )
+                            is None
+                        )
+                    )
                 ):
                     raise SyncError(
                         "pending ephemeral cleanup retained replacement as isolated "

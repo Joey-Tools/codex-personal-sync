@@ -686,3 +686,17 @@ superseded_by:
   Ruff lint/format, `actionlint`, Python compilation, and `git diff --check`
   also passed. A newly frozen signed exact-head whole-range review and full
   discovery remain required before pushing the repaired PR head.
+- That discovery subsequently exposed one receiptless-cleanup regression:
+  the new exact final-private tombstone changed a retained sibling from
+  `<evidence>-retained-*` to `<evidence>.delete-<token>-retained-*`, which the
+  tombstone parser mistakenly treated as unrelated child churn. It could then
+  retire the ticket and terminal receipt despite preserved residue. The shared
+  private inventory now classifies only an exact 32-character tombstone as a
+  candidate deletion object; related malformed or retained derivatives are
+  retained evidence, including when they are hard links to the expected inode.
+  This leaves unrelated quarantine-root churn unaffected while preserving the
+  exact-name authority boundary through normal cleanup, restart recovery, and
+  terminal receipt revalidation. The original sibling race, a same-inode
+  derivative, exact tombstone recovery, and the complete 133-test regular
+  materialization module passed locally. A new full discovery and frozen review
+  are required for the amended head.

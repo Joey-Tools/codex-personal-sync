@@ -1111,6 +1111,7 @@ class PublicRegularAgentTests(unittest.TestCase):
         )
         real_unlink = MODULE.os.unlink
         sibling_identity: tuple[int, int] | None = None
+        cleanup_batch_name: str | None = None
         added_sibling = False
 
         def add_sibling_after_leaf_unlink(
@@ -1118,12 +1119,15 @@ class PublicRegularAgentTests(unittest.TestCase):
             *args: object,
             **kwargs: object,
         ) -> None:
-            nonlocal added_sibling, sibling_identity
+            nonlocal added_sibling, cleanup_batch_name, sibling_identity
             real_unlink(name, *args, **kwargs)  # type: ignore[arg-type]
             if not name.startswith(".codex-ephemeral-cleanup-") or added_sibling:
                 return
             directory_fd = kwargs.get("dir_fd")
             assert isinstance(directory_fd, int)
+            cleanup_batch_name = name.removeprefix(".codex-ephemeral-cleanup-").split(
+                ".delete-", 1
+            )[0]
             sibling_name = f"{name}-retained-0"
             sibling_fd = os.open(
                 sibling_name,
@@ -1157,6 +1161,8 @@ class PublicRegularAgentTests(unittest.TestCase):
             )
 
         self.assertTrue(added_sibling)
+        self.assertIsNotNone(cleanup_batch_name)
+        assert cleanup_batch_name is not None
         self.assertIsNotNone(sibling_identity)
         self.assertFalse(os.path.lexists(target))
         siblings = tuple(
@@ -1171,6 +1177,98 @@ class PublicRegularAgentTests(unittest.TestCase):
         )
         self.assertEqual(siblings[0].read_bytes(), b"foreign")
         self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
+        self.assertTrue(
+            MODULE._pending_cleanup_ticket_path(
+                self.home,
+                cleanup_batch_name,
+            ).is_file()
+        )
+        self.assertTrue(
+            MODULE._pending_cleanup_terminal_validation_path(
+                self.home,
+                cleanup_batch_name,
+            ).is_file()
+        )
+
+    def test_receiptless_cleanup_retains_same_inode_tombstone_derivative(
+        self,
+    ) -> None:
+        self.home.mkdir()
+        source = self.home / "personal-sync" / "source" / "authority"
+        target = self.home / ROLE_TARGET
+        source.parent.mkdir(parents=True)
+        target.parent.mkdir(parents=True)
+        source.write_bytes(b"authority")
+        source.chmod(0o600)
+        os.link(source, target, follow_symlinks=False)
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            self.home,
+            target,
+            require_managed_access=False,
+        )
+        real_unlink = MODULE.os.unlink
+        retained_identity: tuple[int, int] | None = None
+        retained_name: str | None = None
+
+        def retain_same_inode_before_leaf_unlink(
+            name: str,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal retained_identity, retained_name
+            directory_fd = kwargs.get("dir_fd")
+            if (
+                ".delete-" in name
+                and retained_name is None
+                and isinstance(directory_fd, int)
+            ):
+                retained_name = f"{name}-retained-0"
+                os.link(
+                    name,
+                    retained_name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                retained = os.stat(
+                    retained_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                retained_identity = (retained.st_dev, retained.st_ino)
+            real_unlink(name, *args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            mock.patch.object(
+                MODULE.os,
+                "unlink",
+                side_effect=retain_same_inode_before_leaf_unlink,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "retained replacement as isolated evidence",
+            ),
+        ):
+            MODULE._delete_exact_regular_publication_beneath(
+                self.home,
+                target,
+                expected,
+            )
+
+        self.assertIsNotNone(retained_name)
+        assert retained_name is not None
+        self.assertIsNotNone(retained_identity)
+        retained_path = self.home / "personal-sync" / "quarantine" / retained_name
+        self.assertTrue(retained_path.is_file())
+        self.assertEqual(retained_path.read_bytes(), b"authority")
+        self.assertEqual(
+            (retained_path.stat().st_dev, retained_path.stat().st_ino),
+            retained_identity,
+        )
+        self.assertEqual(
+            retained_identity,
+            (source.stat().st_dev, source.stat().st_ino),
+        )
 
     def test_receiptless_cleanup_reclaims_empty_setup_batch_after_leaf_failure(
         self,
