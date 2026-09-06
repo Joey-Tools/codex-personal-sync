@@ -17754,13 +17754,29 @@ def _pending_regular_publication_private_alias_name(
     )
 
 
-def _pending_regular_publication_private_alias_snapshot(
+def _pending_regular_publication_private_deletion_alias_name(
+    private_name: str,
+) -> str:
+    return f"{private_name}.delete-{os.urandom(16).hex()}"
+
+
+def _pending_regular_publication_private_deletion_alias_base(
+    name: str,
+) -> str | None:
+    match = re.fullmatch(r"(.+)\.delete-[0-9a-f]{32}", name)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def _pending_regular_publication_private_alias_binding(
     home: Path,
     batch: PendingLinkBatch,
     record: PendingLinkRecord,
     phase: str,
     file_identity: tuple[int, int],
-) -> RegularFileSnapshot | None:
+) -> tuple[str, RegularFileSnapshot] | None:
+    """Locate exactly one canonical or final-isolation private alias."""
     cleanup_parent = batch.batch_root / "pending" / "cleanup"
     cleanup_parent_fd = _open_directory_beneath(home, cleanup_parent)
     try:
@@ -17777,17 +17793,40 @@ def _pending_regular_publication_private_alias_snapshot(
         ):
             raise SyncError("pending regular publication cleanup namespace changed")
         planned = (file_identity[0], file_identity[1], stat.S_IFREG)
-        private_name = _pending_regular_publication_private_alias_name(
+        canonical_name = _pending_regular_publication_private_alias_name(
             cleanup_parent_identity,
             planned,
             record.index,
             phase,
         )
-        try:
-            os.stat(private_name, dir_fd=cleanup_parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
+        deletion_prefix = f"{canonical_name}.delete-"
+        candidates: list[str] = []
+        with os.scandir(cleanup_parent_fd) as entries:
+            for scanned, entry in enumerate(entries, start=1):
+                if scanned > MAX_PENDING_CLEANUP_CONTROL_ENTRIES:
+                    raise SyncError(
+                        "pending regular publication private alias scan exceeds "
+                        "the batch limit"
+                    )
+                if entry.name == canonical_name:
+                    candidates.append(entry.name)
+                elif entry.name.startswith(deletion_prefix) and (
+                    _pending_regular_publication_private_deletion_alias_base(entry.name)
+                    == canonical_name
+                ):
+                    candidates.append(entry.name)
+        if not _bound_directory_matches(
+            home,
+            cleanup_parent,
+            cleanup_parent_fd,
+        ):
+            raise SyncError("pending regular publication cleanup namespace changed")
+        if not candidates:
             return None
-        return _regular_file_snapshot_at(
+        if len(candidates) != 1:
+            raise SyncError("pending regular publication private cleanup is ambiguous")
+        private_name = candidates[0]
+        return private_name, _regular_file_snapshot_at(
             cleanup_parent_fd,
             private_name,
             cleanup_parent / private_name,
@@ -17795,6 +17834,23 @@ def _pending_regular_publication_private_alias_snapshot(
         )
     finally:
         _close_fd_quietly(cleanup_parent_fd)
+
+
+def _pending_regular_publication_private_alias_snapshot(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    file_identity: tuple[int, int],
+) -> RegularFileSnapshot | None:
+    binding = _pending_regular_publication_private_alias_binding(
+        home,
+        batch,
+        record,
+        phase,
+        file_identity,
+    )
+    return None if binding is None else binding[1]
 
 
 def _pending_regular_publication_public_name_is_allowed(
@@ -17877,6 +17933,7 @@ def _delete_pending_regular_publication_private_alias(
     public_names: tuple[str, ...],
     expected_link_count: int,
     label: str,
+    private_name: str | None = None,
 ) -> None:
     cleanup_parent = batch.batch_root / "pending" / "cleanup"
     planned = (
@@ -17884,12 +17941,19 @@ def _delete_pending_regular_publication_private_alias(
         expected.file_identity[1],
         stat.S_IFREG,
     )
-    isolated_name = _pending_regular_publication_private_alias_name(
+    canonical_private_name = _pending_regular_publication_private_alias_name(
         cleanup_parent_identity,
         planned,
         record.index,
         phase,
     )
+    isolated_name = private_name or canonical_private_name
+    if (
+        isolated_name != canonical_private_name
+        and _pending_regular_publication_private_deletion_alias_base(isolated_name)
+        != canonical_private_name
+    ):
+        raise SyncError(f"{label} private isolation name is invalid")
     isolated_path = cleanup_parent / isolated_name
     try:
         isolated_snapshot = _regular_file_snapshot_at(
@@ -17910,7 +17974,7 @@ def _delete_pending_regular_publication_private_alias(
         not _regular_snapshot_leaf_matches(isolated_snapshot, expected)
         or isolated_snapshot.link_count != expected_link_count
         or _pending_cleanup_internal_entry_plan(
-            isolated_name,
+            canonical_private_name,
             PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
             cleanup_parent_identity,
         )
@@ -17969,9 +18033,153 @@ def _delete_pending_regular_publication_private_alias(
         cleanup_parent,
         expected_mode=0o700,
     )
-    os.unlink(isolated_name, dir_fd=cleanup_parent_fd)
+
+    deletion_name: str | None = None
+    isolation_error: BaseException | None = None
+    for _attempt in range(128):
+        candidate = _pending_regular_publication_private_deletion_alias_name(
+            canonical_private_name
+        )
+        try:
+            _rename_noreplace_at(
+                cleanup_parent_fd,
+                isolated_name,
+                cleanup_parent_fd,
+                candidate,
+            )
+        except FileExistsError:
+            continue
+        except BaseException as error:
+            source_identity = _named_entry_identity(
+                cleanup_parent_fd,
+                isolated_name,
+            )
+            candidate_identity = _named_entry_identity(
+                cleanup_parent_fd,
+                candidate,
+            )
+            if source_identity is None and candidate_identity is not None:
+                deletion_name = candidate
+                isolation_error = error
+                break
+            if source_identity is None:
+                raise SyncError(
+                    f"{label} private evidence disappeared during final isolation"
+                ) from error
+            raise SyncError(
+                f"{label} private evidence could not be finally isolated; "
+                f"retained as {isolated_name}"
+            ) from error
+        deletion_name = candidate
+        break
+    if deletion_name is None:
+        raise SyncError(f"{label} could not allocate a final private isolation name")
     os.fsync(cleanup_parent_fd)
-    if _named_entry_identity(cleanup_parent_fd, isolated_name) is not None:
+
+    deletion_path = cleanup_parent / deletion_name
+    try:
+        deletion_snapshot = _regular_file_snapshot_at(
+            cleanup_parent_fd,
+            deletion_name,
+            deletion_path,
+            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+        )
+    except BaseException:
+        _retain_pending_cleanup_entry(
+            cleanup_parent_fd,
+            deletion_name,
+            cleanup_parent_identity,
+            planned,
+            label=f"{label} became unreadable after final private isolation",
+        )
+    if (
+        not _regular_snapshot_leaf_matches(deletion_snapshot, expected)
+        or deletion_snapshot.link_count != expected_link_count
+        or _pending_regular_publication_private_deletion_alias_base(deletion_name)
+        != canonical_private_name
+        or _directory_identity(cleanup_parent_fd) != cleanup_parent_identity
+        or not _bound_directory_matches(home, cleanup_parent, cleanup_parent_fd)
+    ):
+        _retain_pending_cleanup_entry(
+            cleanup_parent_fd,
+            deletion_name,
+            cleanup_parent_identity,
+            planned,
+            label=f"{label} changed during final private isolation",
+        )
+    if isolation_error is not None:
+        raise isolation_error
+
+    if not _pending_regular_publication_uses_receiptless_cleanup(
+        batch,
+        record,
+        phase,
+    ):
+        journal = _read_pending_regular_publication_cleanup(
+            home,
+            batch,
+            record,
+            phase,
+        )
+        if journal is None:
+            raise SyncError(
+                f"{label} cleanup journal disappeared after final isolation"
+            )
+        _journal_snapshot, active_name, _journal_phase, _journal_expected = journal
+        _advance_pending_regular_publication_private_authority(
+            home,
+            batch,
+            record,
+            phase,
+            expected,
+            active_name,
+            cleanup_parent_fd=cleanup_parent_fd,
+            cleanup_parent_identity=cleanup_parent_identity,
+        )
+    _require_managed_regular_parent_chain_access(
+        home,
+        public_parent,
+        bound_parent_fd=public_parent_fd,
+    )
+    if not _pending_regular_publication_public_names_are_allowed(
+        home,
+        batch,
+        record,
+        phase,
+        public_parent,
+        public_parent_fd,
+        public_names,
+    ):
+        raise SyncError(
+            f"{label} public name reappeared; exact private evidence was retained"
+        )
+    final_snapshot = _regular_file_snapshot_at(
+        cleanup_parent_fd,
+        deletion_name,
+        deletion_path,
+        maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+    )
+    if (
+        not _regular_snapshot_leaf_matches(final_snapshot, expected)
+        or final_snapshot.link_count != expected_link_count
+        or _pending_regular_publication_private_deletion_alias_base(deletion_name)
+        != canonical_private_name
+    ):
+        _retain_pending_cleanup_entry(
+            cleanup_parent_fd,
+            deletion_name,
+            cleanup_parent_identity,
+            planned,
+            label=f"{label} changed before final private deletion",
+        )
+    _require_pending_cleanup_fd_access_policy(
+        cleanup_parent_fd,
+        cleanup_parent,
+        expected_mode=0o700,
+    )
+    os.unlink(deletion_name, dir_fd=cleanup_parent_fd)
+    os.fsync(cleanup_parent_fd)
+    if _named_entry_identity(cleanup_parent_fd, deletion_name) is not None:
         raise SyncError(f"{label} private name reappeared after deletion")
     _require_managed_regular_parent_chain_access(
         home,
@@ -18005,15 +18213,16 @@ def _recover_pending_regular_publication_private_alias(
     expected_link_count: int,
     label: str,
 ) -> bool:
-    private_snapshot = _pending_regular_publication_private_alias_snapshot(
+    private_binding = _pending_regular_publication_private_alias_binding(
         home,
         batch,
         record,
         phase,
         expected.file_identity,
     )
-    if private_snapshot is None:
+    if private_binding is None:
         return False
+    private_name, private_snapshot = private_binding
     if (
         not _regular_snapshot_leaf_matches(private_snapshot, expected)
         or private_snapshot.link_count != expected_link_count
@@ -18055,6 +18264,7 @@ def _recover_pending_regular_publication_private_alias(
             public_names=public_names,
             expected_link_count=expected_link_count,
             label=label,
+            private_name=private_name,
         )
     finally:
         _close_fd_quietly(cleanup_parent_fd)
@@ -18498,12 +18708,12 @@ def _advance_pending_regular_publication_private_authority(
     """Durably revoke public cleanup authority before private deletion.
 
     The protected property is the monotonic cleanup-authority lifecycle for
-    the exact batch, record phase and regular-file inode. The old and staged
-    journal identities plus their payloads prove content stability; the bound
-    cleanup-parent identity and access-policy checks prove namespace policy.
-    Ordinary child-entry churn is not compared. Missing or unreadable journal
-    evidence remains distinct from an identity or payload mismatch, and every
-    such failure occurs before the private inode can be unlinked.
+    the exact batch, record phase and regular-file inode. The original journal
+    identity and payload prove content stability; the exclusive v3 anchor,
+    bound cleanup-parent identity and access-policy checks prove private-only
+    authority. Ordinary child-entry churn is not compared. Missing or
+    unreadable evidence remains distinct from an identity or payload mismatch,
+    and every such failure occurs before the private inode can be unlinked.
     """
     current = _read_pending_regular_publication_cleanup(home, batch, record, phase)
     if current is None:
@@ -18516,7 +18726,6 @@ def _advance_pending_regular_publication_private_authority(
         or current_snapshot.parent_identity != cleanup_parent_identity
     ):
         raise SyncError("pending regular publication cleanup journal changed")
-    lifecycle = _pending_regular_publication_cleanup_lifecycle(current_snapshot)
     _publish_pending_regular_publication_private_authority(
         home,
         batch,
@@ -18526,90 +18735,11 @@ def _advance_pending_regular_publication_private_authority(
         active_name,
         cleanup_parent_identity,
     )
-    if lifecycle == "private-authority":
-        return current_snapshot
-
-    journal_path = _pending_regular_publication_cleanup_path(batch, record, phase)
-    payload = _pending_regular_publication_cleanup_payload(
-        batch,
-        record,
-        expected,
-        phase,
-        active_name,
-        version=3,
-        cleanup_parent_identity=cleanup_parent_identity,
-    )
-    temp_path = journal_path.with_name(
-        journal_path.name + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
-    )
-    _discard_incomplete_pending_cleanup_ticket(home, temp_path)
-    if _pending_cleanup_temp_residue_is_observed(home, temp_path):
-        raise SyncError(
-            "pending regular publication private authority temp was retained"
-        )
-    staged = _write_exclusive_internal_file(home, temp_path, payload)
-    current_bound = _read_managed_state_file_snapshot(
-        home,
-        journal_path,
-        cleanup_parent_fd,
-        expected_identity=current_snapshot.file_identity,
-    )
-    staged_bound = _read_managed_state_file_snapshot(
-        home,
-        temp_path,
-        cleanup_parent_fd,
-        expected_identity=staged.file_identity,
-    )
-    if (
-        not _managed_state_snapshot_matches_bound_file_evidence(
-            current_bound,
-            current_snapshot,
-        )
-        or not _managed_state_snapshot_matches_bound_file_evidence(
-            staged_bound,
-            staged,
-        )
-        or staged_bound.payload != payload
-        or _directory_identity(cleanup_parent_fd) != cleanup_parent_identity
-        or not _bound_directory_matches(
-            home,
-            journal_path.parent,
-            cleanup_parent_fd,
-        )
-    ):
-        raise SyncError(
-            "pending regular publication private authority changed before publication"
-        )
-    os.replace(
-        temp_path.name,
-        journal_path.name,
-        src_dir_fd=cleanup_parent_fd,
-        dst_dir_fd=cleanup_parent_fd,
-    )
-    os.fsync(cleanup_parent_fd)
-    published = _read_pending_regular_publication_cleanup(
-        home,
-        batch,
-        record,
-        phase,
-    )
-    if published is None:
-        raise SyncError("pending regular publication private authority is missing")
-    published_snapshot, published_active, _published_phase, published_expected = (
-        published
-    )
-    if (
-        published_snapshot.file_identity != staged.file_identity
-        or published_active != active_name
-        or not _regular_snapshot_leaf_matches(published_expected, expected)
-        or published_expected.link_count != expected.link_count
-        or _pending_regular_publication_cleanup_lifecycle(published_snapshot)
-        != "private-authority"
-    ):
-        raise SyncError(
-            "pending regular publication private authority changed during publication"
-        )
-    return published_snapshot
+    # The exclusive v3 anchor is the durable monotonic revocation record.
+    # Keeping the original journal inode and payload avoids an overwrite race
+    # entirely; recovery already treats either a private lifecycle journal or
+    # this independently validated anchor as private authority.
+    return current_snapshot
 
 
 def _delete_pending_regular_publication_beneath(
@@ -26936,6 +27066,17 @@ def _pending_batch_cleanup_name_is_authorized(
     name: str,
     parent_identity: tuple[int, int],
 ) -> bool:
+    deletion_alias_base = _pending_regular_publication_private_deletion_alias_base(name)
+    if deletion_alias_base is not None:
+        return (
+            relative_parent == ("pending", "cleanup")
+            and _pending_cleanup_internal_entry_plan(
+                deletion_alias_base,
+                PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                parent_identity,
+            )
+            is not None
+        )
     active_links_plan = _pending_cleanup_internal_entry_plan(
         name,
         PENDING_CLEANUP_ACTIVE_LINKS_ENTRY_PREFIX,
@@ -27179,8 +27320,12 @@ def _capture_pending_cleanup_identity_ledger(
                 raise SyncError(
                     f"pending cleanup found an unsupported entry: {entry.name}"
                 )
+            active_name = (
+                _pending_regular_publication_private_deletion_alias_base(entry.name)
+                or entry.name
+            )
             active_plan = _pending_cleanup_internal_entry_plan(
-                entry.name,
+                active_name,
                 PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
                 directory_identity,
             )
@@ -27320,8 +27465,12 @@ def _remove_pending_batch_directory_contents(
                 raise SyncError(
                     f"pending cleanup entry changed: {entry.name}"
                 ) from error
+            active_name = (
+                _pending_regular_publication_private_deletion_alias_base(entry.name)
+                or entry.name
+            )
             active_plan = _pending_cleanup_internal_entry_plan(
-                entry.name,
+                active_name,
                 PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
                 directory_identity,
             )

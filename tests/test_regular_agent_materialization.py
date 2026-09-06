@@ -2371,7 +2371,14 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                 assert journal is not None
                 self.assertEqual(
                     MODULE._pending_regular_publication_cleanup_lifecycle(journal[0]),
-                    "private-authority",
+                    "public-authorized",
+                )
+                self.assertTrue(
+                    MODULE._pending_regular_publication_private_authority_path(
+                        batch,
+                        record,
+                        "produced",
+                    ).is_file()
                 )
                 self.assertFalse(os.path.lexists(target))
                 self.assertFalse(os.path.lexists(active))
@@ -2437,7 +2444,13 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
             **kwargs: object,
         ) -> None:
             nonlocal failed
-            if os.fsdecode(name) == private_name and not failed:
+            if (
+                MODULE._pending_regular_publication_private_deletion_alias_base(
+                    os.fsdecode(name)
+                )
+                == private_name
+                and not failed
+            ):
                 failed = True
                 raise MODULE.SyncError("injected private unlink failure")
             real_unlink(name, *args, **kwargs)
@@ -2458,7 +2471,17 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
             )
 
         self.assertTrue(failed)
-        self.assertTrue(private.is_file())
+        self.assertFalse(os.path.lexists(private))
+        private_binding = MODULE._pending_regular_publication_private_alias_binding(
+            self.home,
+            batch,
+            record,
+            "produced",
+            expected.file_identity,
+        )
+        self.assertIsNotNone(private_binding)
+        assert private_binding is not None
+        self.assertTrue(private_binding[0].startswith(private_name + ".delete-"))
         self.assertFalse(os.path.lexists(target))
         self.assertFalse(os.path.lexists(active))
         journal = MODULE._read_pending_regular_publication_cleanup(
@@ -2470,7 +2493,7 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         assert journal is not None
         self.assertEqual(
             MODULE._pending_regular_publication_cleanup_lifecycle(journal[0]),
-            "private-authority",
+            "public-authorized",
         )
         self.assertTrue(
             MODULE._pending_regular_publication_private_authority_path(
@@ -2496,6 +2519,259 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(private))
         self.assertFalse(os.path.lexists(target))
         self.assertFalse(os.path.lexists(active))
+
+    def test_private_authority_retains_original_journal_identity_and_payload(
+        self,
+    ) -> None:
+        batch = self._interrupt_regular_publication_cleanup(self.release, SHA_A)
+        record, _active = self._assert_active_publication_journal(batch)
+        journal_path = MODULE._pending_regular_publication_cleanup_path(
+            batch,
+            record,
+            "produced",
+        )
+        journal_before = journal_path.stat()
+        payload_before = journal_path.read_bytes()
+
+        MODULE._recover_pending_regular_publication_cleanup(
+            self.home,
+            batch,
+            record,
+            "produced",
+        )
+
+        journal_after = journal_path.stat()
+        self.assertEqual(
+            (journal_after.st_dev, journal_after.st_ino),
+            (journal_before.st_dev, journal_before.st_ino),
+        )
+        self.assertEqual(journal_path.read_bytes(), payload_before)
+        self.assertEqual(stat.S_IMODE(journal_after.st_mode), 0o600)
+        self.assertTrue(
+            MODULE._pending_regular_publication_private_authority_path(
+                batch,
+                record,
+                "produced",
+            ).is_file()
+        )
+
+    def test_final_private_isolation_rename_crash_recovers_on_restart(self) -> None:
+        batch = self._interrupt_regular_publication_cleanup(self.release, SHA_A)
+        record, _active = self._assert_active_publication_journal(batch)
+        journal = MODULE._read_pending_regular_publication_cleanup(
+            self.home,
+            batch,
+            record,
+            "produced",
+        )
+        assert journal is not None
+        expected = journal[3]
+        cleanup = batch.batch_root / "pending" / "cleanup"
+        cleanup_stat = cleanup.stat()
+        private_name = MODULE._pending_regular_publication_private_alias_name(
+            (cleanup_stat.st_dev, cleanup_stat.st_ino),
+            (*expected.file_identity, stat.S_IFREG),
+            record.index,
+            "produced",
+        )
+        real_rename = MODULE._rename_noreplace_at
+        crashed = False
+
+        def crash_after_final_private_isolation(
+            source_fd: int,
+            source_name: str,
+            destination_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal crashed
+            real_rename(
+                source_fd,
+                source_name,
+                destination_fd,
+                destination_name,
+            )
+            if (
+                source_name == private_name
+                and MODULE._pending_regular_publication_private_deletion_alias_base(
+                    destination_name
+                )
+                == private_name
+            ):
+                crashed = True
+                raise MODULE.SyncError("injected final private isolation crash")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=crash_after_final_private_isolation,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "final private isolation crash",
+            ),
+        ):
+            MODULE._recover_pending_regular_publication_cleanup(
+                self.home,
+                batch,
+                record,
+                "produced",
+            )
+
+        self.assertTrue(crashed)
+        self.assertFalse(os.path.lexists(cleanup / private_name))
+        private_binding = MODULE._pending_regular_publication_private_alias_binding(
+            self.home,
+            batch,
+            record,
+            "produced",
+            expected.file_identity,
+        )
+        self.assertIsNotNone(private_binding)
+        assert private_binding is not None
+        self.assertTrue(private_binding[0].startswith(private_name + ".delete-"))
+
+        restarted = MODULE._load_pending_link_batch(self.home)
+        self.assertIsNotNone(restarted)
+        assert restarted is not None
+        restarted_record = next(
+            candidate
+            for candidate in restarted.records
+            if candidate.index == record.index
+        )
+        MODULE._recover_pending_regular_publication_cleanup(
+            self.home,
+            restarted,
+            restarted_record,
+            "produced",
+        )
+        self.assertIsNone(
+            MODULE._pending_regular_publication_private_alias_binding(
+                self.home,
+                restarted,
+                restarted_record,
+                "produced",
+                expected.file_identity,
+            )
+        )
+
+    def test_final_private_isolation_preserves_replacement_and_same_inode_drift(
+        self,
+    ) -> None:
+        for drift in ("replacement", "content", "policy"):
+            with self.subTest(drift=drift):
+                self.home = self.root / f"home-final-private-{drift}"
+                batch = self._interrupt_regular_publication_cleanup(
+                    self.release,
+                    SHA_A,
+                )
+                record, _active = self._assert_active_publication_journal(batch)
+                journal = MODULE._read_pending_regular_publication_cleanup(
+                    self.home,
+                    batch,
+                    record,
+                    "produced",
+                )
+                assert journal is not None
+                expected = journal[3]
+                cleanup = batch.batch_root / "pending" / "cleanup"
+                cleanup_stat = cleanup.stat()
+                private_name = MODULE._pending_regular_publication_private_alias_name(
+                    (cleanup_stat.st_dev, cleanup_stat.st_ino),
+                    (*expected.file_identity, stat.S_IFREG),
+                    record.index,
+                    "produced",
+                )
+                real_rename = MODULE._rename_noreplace_at
+                drifted = False
+
+                def drift_after_final_private_isolation(
+                    source_fd: int,
+                    source_name: str,
+                    destination_fd: int,
+                    destination_name: str,
+                ) -> None:
+                    nonlocal drifted
+                    real_rename(
+                        source_fd,
+                        source_name,
+                        destination_fd,
+                        destination_name,
+                    )
+                    if (
+                        source_name != private_name
+                        or MODULE._pending_regular_publication_private_deletion_alias_base(
+                            destination_name
+                        )
+                        != private_name
+                    ):
+                        return
+                    if drift == "replacement":
+                        os.unlink(destination_name, dir_fd=destination_fd)
+                        file_fd = os.open(
+                            destination_name,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            0o600,
+                            dir_fd=destination_fd,
+                        )
+                        try:
+                            os.write(file_fd, b"foreign\n")
+                        finally:
+                            os.close(file_fd)
+                    elif drift == "content":
+                        file_fd = os.open(
+                            destination_name,
+                            os.O_WRONLY | os.O_TRUNC,
+                            dir_fd=destination_fd,
+                        )
+                        try:
+                            os.write(file_fd, b"foreign\n")
+                        finally:
+                            os.close(file_fd)
+                    else:
+                        os.chmod(
+                            destination_name,
+                            0o640,
+                            dir_fd=destination_fd,
+                            follow_symlinks=False,
+                        )
+                    drifted = True
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_rename_noreplace_at",
+                        side_effect=drift_after_final_private_isolation,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "changed during final private isolation",
+                    ),
+                ):
+                    MODULE._recover_pending_regular_publication_cleanup(
+                        self.home,
+                        batch,
+                        record,
+                        "produced",
+                    )
+
+                self.assertTrue(drifted)
+                self.assertFalse(os.path.lexists(cleanup / private_name))
+                retained = tuple(
+                    child
+                    for child in cleanup.iterdir()
+                    if child.name.startswith(
+                        MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX
+                    )
+                )
+                self.assertEqual(len(retained), 1)
+                retained_stat = retained[0].stat()
+                retained_identity = (retained_stat.st_dev, retained_stat.st_ino)
+                if drift == "replacement":
+                    self.assertNotEqual(retained_identity, expected.file_identity)
+                    self.assertEqual(retained[0].read_bytes(), b"foreign\n")
+                else:
+                    self.assertEqual(retained_identity, expected.file_identity)
 
     def test_private_authority_anchor_rejects_v2_journal_replay(self) -> None:
         for public_name in ("canonical", "active"):
@@ -2792,7 +3068,11 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
             **kwargs: object,
         ) -> None:
             nonlocal reappeared, replacement_identity
-            if name == private_name and not reappeared:
+            if (
+                MODULE._pending_regular_publication_private_deletion_alias_base(name)
+                == private_name
+                and not reappeared
+            ):
                 target.write_bytes(b"foreign")
                 target.chmod(0o600)
                 replacement = target.stat()
@@ -2868,12 +3148,16 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         ) -> None:
             nonlocal reappeared, replacement_identity
             real_unlink(name, *args, **kwargs)  # type: ignore[arg-type]
-            if name != private_name or reappeared:
+            if (
+                MODULE._pending_regular_publication_private_deletion_alias_base(name)
+                != private_name
+                or reappeared
+            ):
                 return
             directory_fd = kwargs.get("dir_fd")
             assert isinstance(directory_fd, int)
             replacement_fd = os.open(
-                private_name,
+                name,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                 0o600,
                 dir_fd=directory_fd,
@@ -2894,7 +3178,7 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
-                "private evidence changed before restoration",
+                "private name reappeared after deletion",
             ),
         ):
             MODULE._recover_pending_regular_publication_cleanup(
@@ -2911,7 +3195,10 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         retained = tuple(
             child
             for child in cleanup.iterdir()
-            if child.name.startswith(MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX)
+            if MODULE._pending_regular_publication_private_deletion_alias_base(
+                child.name
+            )
+            == private_name
         )
         self.assertEqual(len(retained), 1)
         self.assertEqual(retained[0].read_bytes(), b"foreign")
@@ -3117,7 +3404,11 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
             **kwargs: object,
         ) -> None:
             nonlocal replaced
-            if name == private_name and not replaced:
+            if (
+                MODULE._pending_regular_publication_private_deletion_alias_base(name)
+                == private_name
+                and not replaced
+            ):
                 real_unlink(target)
                 target.write_text("foreign after validation\n", encoding="utf-8")
                 target.chmod(0o600)
@@ -4192,7 +4483,11 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         ) -> None:
             nonlocal restored
             real_unlink(name, *args, **kwargs)  # type: ignore[arg-type]
-            if name == private_name and not restored:
+            if (
+                MODULE._pending_regular_publication_private_deletion_alias_base(name)
+                == private_name
+                and not restored
+            ):
                 os.link(before, target, follow_symlinks=False)
                 restored = True
 

@@ -620,3 +620,21 @@ superseded_by:
   `actionlint`, Python compilation, `git diff --check`, and the refreshed
   ten-source lock check passed. A signed frozen exact-head whole-range review
   remains required before PR creation.
+- The ensuing frozen whole-range review identified two final lifecycle TOCTOU
+  boundaries. A legacy v2 journal is no longer overwritten in place after its
+  validation: the already-exclusive v3 private-authority anchor is the
+  monotonic authority transition, while the legacy journal keeps its exact
+  inode, content, and policy. Before private publication cleanup can unlink an
+  alias, it now moves the exact record-bound object with no-replace semantics
+  to a random private tombstone, fsyncs, and revalidates object identity,
+  content stability, access policy, link count, bound parents, journal, anchor,
+  and public authority. Recovery accepts exactly one canonical alias or one
+  valid tombstone; replacement, absence, or ambiguous tombstones remain
+  preserved fail-closed evidence.
+- A new fresh GPT-5.6 Sol Ultra review of the anchor/tombstone repair returned
+  PASS. The associated cross-module suite passed 924 tests with one expected
+  skip in 241.092 seconds. Complete discovery passed 1,565 tests with three
+  expected skips in 969.527 seconds under the same 30-minute process-group
+  deadline and 128 MiB log ceiling. The ten-source lock was refreshed before
+  that run. A new signed exact-head whole-range review remains required before
+  PR creation.
