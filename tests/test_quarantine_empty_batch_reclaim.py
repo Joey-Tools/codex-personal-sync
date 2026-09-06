@@ -569,6 +569,7 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         real_require_access = MODULE._require_pending_cleanup_fd_access_policy
         real_discard = MODULE._discard_empty_ephemeral_quarantine_batch
         allocated_batch: Path | None = None
+        allocation_metadata_fd = -1
         original_metadata_identity: tuple[int, int] | None = None
         replacement_metadata_identity: tuple[int, int] | None = None
         leaf_validation_failures = 0
@@ -578,7 +579,8 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             *args: object,
             **kwargs: object,
         ) -> object:
-            nonlocal allocated_batch, original_metadata_identity
+            nonlocal allocated_batch, allocation_metadata_fd
+            nonlocal original_metadata_identity
             nonlocal replacement_metadata_identity
             allocation = real_allocate(*args, **kwargs)
             if not kwargs.get("retain_scaffold_binding"):
@@ -588,9 +590,15 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
                 MODULE.EphemeralQuarantineBatchAllocation,
             )
             allocated_batch = allocation.batch_root
+            allocation_metadata_fd = allocation.metadata_fd
             metadata_snapshot = allocation.binding.metadata
             original_metadata_identity = metadata_snapshot.file_identity
             metadata_path = allocated_batch / "metadata.json"
+            original_stat = os.fstat(allocation_metadata_fd)
+            self.assertEqual(
+                (original_stat.st_dev, original_stat.st_ino),
+                original_metadata_identity,
+            )
             metadata_path.unlink()
             metadata_path.write_bytes(b'{"foreign": true}\n')
             metadata_path.chmod(0o600)
@@ -645,7 +653,7 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             self._evacuate_created_leaf("metadata-replacement.toml")
 
         self.assertEqual(leaf_validation_failures, 0)
-        self.assertEqual(discard_calls, 1)
+        self.assertEqual(discard_calls, 0)
         self.assertIsNotNone(allocated_batch)
         self.assertIsNotNone(original_metadata_identity)
         self.assertIsNotNone(replacement_metadata_identity)
@@ -653,6 +661,8 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             original_metadata_identity,
             replacement_metadata_identity,
         )
+        with self.assertRaises(OSError):
+            os.fstat(allocation_metadata_fd)
         assert allocated_batch is not None
         metadata_path = allocated_batch / "metadata.json"
         self.assertEqual(metadata_path.read_bytes(), b'{"foreign": true}\n')
@@ -853,11 +863,22 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             nonlocal mutated_batch, replacement_identity
             mutated_batch = binding.batch_root
             leaf = binding.batch_root / "leaf"
-            leaf.rmdir()
-            leaf.mkdir(mode=0o700)
-            metadata = leaf.stat()
-            replacement_identity = (metadata.st_dev, metadata.st_ino)
-            self.assertNotEqual(replacement_identity, binding.leaf_identity)
+            original_leaf_fd = os.open(
+                leaf,
+                MODULE._directory_open_flags(nofollow=True),
+            )
+            try:
+                self.assertEqual(
+                    MODULE._directory_identity(original_leaf_fd),
+                    binding.leaf_identity,
+                )
+                leaf.rmdir()
+                leaf.mkdir(mode=0o700)
+                metadata = leaf.stat()
+                replacement_identity = (metadata.st_dev, metadata.st_ino)
+                self.assertNotEqual(replacement_identity, binding.leaf_identity)
+            finally:
+                os.close(original_leaf_fd)
             real_discard(home, binding)
 
         with mock.patch.object(
@@ -966,7 +987,13 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
                 allocation,
                 MODULE.EphemeralQuarantineBatchAllocation,
             )
-            descriptors.extend([allocation.quarantine_fd, allocation.batch_fd])
+            descriptors.extend(
+                [
+                    allocation.quarantine_fd,
+                    allocation.batch_fd,
+                    allocation.metadata_fd,
+                ]
+            )
             raise SystemExit("injected allocation handoff failure")
 
         with self.assertRaisesRegex(SystemExit, "handoff failure") as raised:
@@ -976,6 +1003,61 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
 
         self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
         for descriptor in descriptors:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_reclaim_keeps_allocation_descriptors_through_batch_removal(
+        self,
+    ) -> None:
+        allocation = MODULE._quarantine_batch_root(
+            self.home,
+            [],
+            retain_binding=True,
+            retain_scaffold_binding=True,
+        )
+        assert isinstance(allocation, MODULE.EphemeralQuarantineBatchAllocation)
+        allocation.create_leaf()
+        directory_descriptors = (
+            allocation.quarantine_fd,
+            allocation.batch_fd,
+            allocation.leaf_fd,
+        )
+        metadata_fd = allocation.metadata_fd
+        expected_identities = (
+            allocation.binding.quarantine_root_identity,
+            allocation.binding.batch_identity,
+            allocation.binding.leaf_identity,
+        )
+        real_remove = MODULE._remove_cleanup_ready_batch
+        observed_removal = False
+
+        def observe_removal(
+            home: Path,
+            ticket: MODULE.PendingBatchCleanupTicket,
+        ) -> bool:
+            nonlocal observed_removal
+            observed_removal = True
+            self.assertEqual(
+                tuple(MODULE._directory_identity(fd) for fd in directory_descriptors),
+                expected_identities,
+            )
+            metadata = os.fstat(metadata_fd)
+            self.assertEqual(
+                (metadata.st_dev, metadata.st_ino),
+                allocation.binding.metadata.file_identity,
+            )
+            return real_remove(home, ticket)
+
+        with mock.patch.object(
+            MODULE,
+            "_remove_cleanup_ready_batch",
+            side_effect=observe_removal,
+        ):
+            allocation.reclaim_empty()
+
+        self.assertTrue(observed_removal)
+        self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
+        for descriptor in (*directory_descriptors, metadata_fd):
             with self.assertRaises(OSError):
                 os.fstat(descriptor)
 
@@ -999,6 +1081,85 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
 
         self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
 
+    def test_allocator_exception_keeps_original_fds_through_removal(
+        self,
+    ) -> None:
+        real_dup = os.dup
+        original_batch_fd = -1
+        original_metadata_fd = -1
+        expected_metadata_identity: tuple[int, int] | None = None
+        duplication_sources: dict[int, int] = {}
+        real_remove = MODULE._remove_cleanup_ready_batch
+        observed_removal = False
+
+        def track_dup(file_descriptor: int) -> int:
+            duplicate = real_dup(file_descriptor)
+            duplication_sources[duplicate] = file_descriptor
+            return duplicate
+
+        def interrupt_constructor(
+            *,
+            batch_fd: int,
+            metadata_fd: int,
+            binding: MODULE.EphemeralQuarantineBatchBinding,
+            **_kwargs: object,
+        ) -> object:
+            nonlocal original_batch_fd, original_metadata_fd
+            nonlocal expected_metadata_identity
+            original_batch_fd = duplication_sources[batch_fd]
+            original_metadata_fd = duplication_sources[metadata_fd]
+            expected_metadata_identity = binding.metadata.file_identity
+            raise SystemExit("injected constructor handoff failure")
+
+        def observe_removal(
+            home: Path,
+            ticket: MODULE.PendingBatchCleanupTicket,
+        ) -> bool:
+            nonlocal observed_removal
+            observed_removal = True
+            self.assertEqual(
+                MODULE._directory_identity(original_batch_fd),
+                ticket.batch_root_identity,
+            )
+            metadata = os.fstat(original_metadata_fd)
+            self.assertEqual(
+                (metadata.st_dev, metadata.st_ino),
+                expected_metadata_identity,
+            )
+            return real_remove(home, ticket)
+
+        with (
+            mock.patch.object(os, "dup", side_effect=track_dup),
+            mock.patch.object(
+                MODULE,
+                "EphemeralQuarantineBatchAllocation",
+                side_effect=interrupt_constructor,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_remove_cleanup_ready_batch",
+                side_effect=observe_removal,
+            ),
+            self.assertRaisesRegex(
+                SystemExit,
+                "constructor handoff failure",
+            ) as raised,
+        ):
+            MODULE._quarantine_batch_root(
+                self.home,
+                [],
+                retain_binding=True,
+                retain_scaffold_binding=True,
+            )
+
+        self.assertTrue(observed_removal)
+        self.assertEqual(getattr(raised.exception, "__notes__", []), [])
+        self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
+        with self.assertRaises(OSError):
+            os.fstat(original_batch_fd)
+        with self.assertRaises(OSError):
+            os.fstat(original_metadata_fd)
+
     def test_allocator_exception_cleanup_retains_scaffold_after_root_drift(
         self,
     ) -> None:
@@ -1010,9 +1171,10 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             quarantine_root: Path,
             quarantine_fd: int,
             batch_fd: int,
+            metadata_fd: int,
             binding: MODULE.EphemeralQuarantineBatchBinding,
         ) -> object:
-            del home, quarantine_fd, batch_fd
+            del home, quarantine_fd, batch_fd, metadata_fd
             nonlocal relocated_batch
             moved_root = quarantine_root.with_name(quarantine_root.name + ".original")
             quarantine_root.rename(moved_root)
@@ -1044,87 +1206,171 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         )
         self.assertEqual(MODULE._quarantine_batch_count(self.home), 1)
 
-    def test_leaf_initialization_open_failure_reclaims_repeatedly(self) -> None:
+    def test_leaf_open_failure_after_replacement_retains_scaffold(self) -> None:
+        real_allocate = MODULE._quarantine_batch_root
         real_open = os.open
-        failed_batches: set[tuple[int, int]] = set()
+        real_discard = MODULE._discard_empty_ephemeral_quarantine_batch
+        allocation: MODULE.EphemeralQuarantineBatchAllocation | None = None
+        failure_armed = False
+        discard_calls = 0
+        original_identity: tuple[int, int] | None = None
+        replacement_identity: tuple[int, int] | None = None
+
+        def capture_allocation(*args: object, **kwargs: object) -> object:
+            nonlocal allocation
+            result = real_allocate(*args, **kwargs)
+            if kwargs.get("retain_scaffold_binding"):
+                assert isinstance(
+                    result,
+                    MODULE.EphemeralQuarantineBatchAllocation,
+                )
+                allocation = result
+            return result
 
         def fail_first_leaf_open(
             path: str | bytes,
             *args: object,
             **kwargs: object,
         ) -> int:
-            dir_fd = kwargs.get("dir_fd")
-            if path == "leaf" and isinstance(dir_fd, int):
-                batch_identity = MODULE._directory_identity(dir_fd)
-                if batch_identity not in failed_batches:
-                    failed_batches.add(batch_identity)
-                    raise OSError("injected post-mkdir leaf open failure")
+            nonlocal failure_armed, original_identity, replacement_identity
+            if path == "leaf" and failure_armed:
+                failure_armed = False
+                assert allocation is not None
+                old_leaf_fd = real_open(path, *args, **kwargs)
+                try:
+                    original_identity = MODULE._directory_identity(old_leaf_fd)
+                    self.assertEqual(
+                        original_identity,
+                        allocation.binding.leaf_identity,
+                    )
+                    dir_fd = kwargs.get("dir_fd")
+                    assert isinstance(dir_fd, int)
+                    os.rmdir(path, dir_fd=dir_fd)
+                    os.mkdir(path, mode=0o700, dir_fd=dir_fd)
+                    replacement_identity = MODULE._named_entry_identity(dir_fd, path)
+                finally:
+                    os.close(old_leaf_fd)
+                raise OSError("injected post-mkdir leaf open failure")
             return real_open(path, *args, **kwargs)
 
-        with mock.patch.object(os, "open", side_effect=fail_first_leaf_open):
-            for attempt in range(MODULE.MAX_RETAINED_QUARANTINE_BATCHES + 1):
-                with self.assertRaisesRegex(
-                    MODULE.SyncError,
-                    "post-mkdir leaf open failure",
-                ):
-                    self._evacuate_created_leaf(f"leaf-open-{attempt}.toml")
-                self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
+        def observe_discard(
+            home: Path,
+            binding: MODULE.EphemeralQuarantineBatchBinding,
+        ) -> None:
+            nonlocal discard_calls
+            discard_calls += 1
+            real_discard(home, binding)
 
-    def test_leaf_initialization_fsync_failure_reclaims_repeatedly(self) -> None:
+        failure_armed = True
+        with (
+            mock.patch.object(
+                MODULE,
+                "_quarantine_batch_root",
+                side_effect=capture_allocation,
+            ),
+            mock.patch.object(os, "open", side_effect=fail_first_leaf_open),
+            mock.patch.object(
+                MODULE,
+                "_discard_empty_ephemeral_quarantine_batch",
+                side_effect=observe_discard,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "post-mkdir leaf open failure",
+            ),
+        ):
+            self._evacuate_created_leaf("leaf-open-replacement.toml")
+
+        self.assertFalse(failure_armed)
+        self.assertEqual(discard_calls, 0)
+        self.assertIsNotNone(allocation)
+        assert allocation is not None
+        self.assertEqual(allocation.leaf_fd, -1)
+        self.assertIsNotNone(original_identity)
+        self.assertIsNotNone(replacement_identity)
+        self.assertNotEqual(original_identity, replacement_identity)
+        self.assertEqual(MODULE._quarantine_batch_count(self.home), 1)
+        self.assertEqual(
+            {entry.name for entry in allocation.batch_root.iterdir()},
+            {"leaf", "metadata.json"},
+        )
+
+    def test_leaf_initialization_fsync_failure_retains_unbound_leaf(self) -> None:
         real_fsync = os.fsync
-        failed_batches: set[tuple[int, int]] = set()
+        failure_armed = False
+        real_discard = MODULE._discard_empty_ephemeral_quarantine_batch
+        discard_calls = 0
 
         def fail_first_bound_leaf_fsync(file_descriptor: int) -> None:
+            nonlocal failure_armed
             try:
                 names = MODULE._directory_member_names(
                     file_descriptor,
                     maximum_entries=3,
                 )
-                identity = MODULE._directory_identity(file_descriptor)
             except (OSError, MODULE.SyncError):
                 real_fsync(file_descriptor)
                 return
-            if names == ("leaf", "metadata.json") and identity not in failed_batches:
-                failed_batches.add(identity)
+            if names == ("leaf", "metadata.json") and failure_armed:
+                failure_armed = False
                 raise OSError("injected post-mkdir leaf fsync failure")
             real_fsync(file_descriptor)
 
-        with mock.patch.object(os, "fsync", side_effect=fail_first_bound_leaf_fsync):
-            for attempt in range(MODULE.MAX_RETAINED_QUARANTINE_BATCHES + 1):
-                with self.assertRaisesRegex(
-                    MODULE.SyncError,
-                    "post-mkdir leaf fsync failure",
-                ):
-                    self._evacuate_created_leaf(f"leaf-fsync-{attempt}.toml")
-                self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
+        def observe_discard(
+            home: Path,
+            binding: MODULE.EphemeralQuarantineBatchBinding,
+        ) -> None:
+            nonlocal discard_calls
+            discard_calls += 1
+            real_discard(home, binding)
+
+        failure_armed = True
+        with (
+            mock.patch.object(os, "fsync", side_effect=fail_first_bound_leaf_fsync),
+            mock.patch.object(
+                MODULE,
+                "_discard_empty_ephemeral_quarantine_batch",
+                side_effect=observe_discard,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "post-mkdir leaf fsync failure",
+            ),
+        ):
+            self._evacuate_created_leaf("leaf-fsync.toml")
+
+        self.assertFalse(failure_armed)
+        self.assertEqual(discard_calls, 0)
+        self.assertEqual(MODULE._quarantine_batch_count(self.home), 1)
 
     def test_metadata_post_write_fsync_failure_reclaims_repeatedly(self) -> None:
         real_open = os.open
         real_fsync = os.fsync
-        metadata_identities: set[tuple[int, int]] = set()
-        failed_identities: set[tuple[int, int]] = set()
+        failure_armed = False
+        metadata_fd_to_fail: int | None = None
 
         def track_metadata_create(
             path: str | bytes,
             *args: object,
             **kwargs: object,
         ) -> int:
+            nonlocal metadata_fd_to_fail
             file_descriptor = real_open(path, *args, **kwargs)
             flags = args[0] if args else 0
-            if path == "metadata.json" and int(flags) & os.O_CREAT:
-                metadata = os.fstat(file_descriptor)
-                metadata_identities.add((metadata.st_dev, metadata.st_ino))
+            if failure_armed and path == "metadata.json" and int(flags) & os.O_CREAT:
+                metadata_fd_to_fail = file_descriptor
             return file_descriptor
 
         def commit_then_fail_metadata_fsync(file_descriptor: int) -> None:
+            nonlocal failure_armed, metadata_fd_to_fail
             metadata = os.fstat(file_descriptor)
-            identity = (metadata.st_dev, metadata.st_ino)
             if (
-                identity in metadata_identities
-                and identity not in failed_identities
+                failure_armed
+                and file_descriptor == metadata_fd_to_fail
                 and metadata.st_size > 0
             ):
-                failed_identities.add(identity)
+                failure_armed = False
+                metadata_fd_to_fail = None
                 real_fsync(file_descriptor)
                 raise OSError("injected post-write metadata fsync failure")
             real_fsync(file_descriptor)
@@ -1138,6 +1384,8 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             ),
         ):
             for _attempt in range(MODULE.MAX_RETAINED_QUARANTINE_BATCHES + 1):
+                failure_armed = True
+                metadata_fd_to_fail = None
                 with self.assertRaisesRegex(
                     OSError,
                     "post-write metadata fsync failure",
@@ -1148,6 +1396,8 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
                         retain_binding=True,
                         retain_scaffold_binding=True,
                     )
+                self.assertFalse(failure_armed)
+                self.assertIsNone(metadata_fd_to_fail)
                 self.assertEqual(MODULE._quarantine_batch_count(self.home), 0)
 
     def test_python39_allocator_cleanup_error_chains_both_failures(self) -> None:

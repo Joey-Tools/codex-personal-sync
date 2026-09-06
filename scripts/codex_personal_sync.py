@@ -5245,19 +5245,22 @@ class ManagedStateFileSnapshot:
 class EphemeralQuarantineBatchAllocation:
     """Own one fully bound empty-scaffold allocation until private use begins.
 
-    The resource is constructed inside the allocator, with duplicated root and
-    batch descriptors, before control returns to a caller.  This closes the
-    otherwise unguarded return/unpack/binding window: abandoning the temporary
-    object closes every descriptor and attempts the same identity-bound durable
-    reclaim used by explicit error handling.  Reclaim authority is irrevocably
-    dropped before the first private rename, because an exception from rename
-    may arrive after the destination was created.
+    The resource is constructed inside the allocator, with duplicated root,
+    batch, and metadata descriptors, before control returns to a caller.  This
+    closes the otherwise unguarded return/unpack/binding window: abandoning the
+    temporary object closes every descriptor and attempts the same
+    identity-bound durable reclaim used by explicit error handling.  A created
+    leaf grants no reclaim authority until its identity is pinned by the owned
+    leaf descriptor.  Reclaim authority is irrevocably dropped before the first
+    private rename, because an exception from rename may arrive after the
+    destination was created.
     """
 
     home: Path
     quarantine_root: Path
     quarantine_fd: int
     batch_fd: int
+    metadata_fd: int
     binding: EphemeralQuarantineBatchBinding
     leaf_fd: int = -1
     reclaim_authorized: bool = True
@@ -5308,6 +5311,8 @@ class EphemeralQuarantineBatchAllocation:
     def close(self) -> None:
         _close_fd_quietly(self.leaf_fd)
         self.leaf_fd = -1
+        _close_fd_quietly(self.metadata_fd)
+        self.metadata_fd = -1
         _close_fd_quietly(self.batch_fd)
         self.batch_fd = -1
         _close_fd_quietly(self.quarantine_fd)
@@ -5321,8 +5326,52 @@ class EphemeralQuarantineBatchAllocation:
         # post-mutation; the durable ticket published by the cleanup protocol,
         # rather than a second in-process attempt, is then the only authority.
         self.reclaim_authorized = False
-        self.close()
-        _discard_empty_ephemeral_quarantine_batch(self.home, self.binding)
+        try:
+            leaf_identity = self.binding.leaf_identity
+            if (
+                self.quarantine_fd < 0
+                or self.batch_fd < 0
+                or self.metadata_fd < 0
+                or (leaf_identity is None and self.leaf_fd >= 0)
+                or (leaf_identity is not None and self.leaf_fd < 0)
+            ):
+                raise SyncError(
+                    "ephemeral quarantine allocation descriptor state is incomplete"
+                )
+            if (
+                _directory_identity(self.quarantine_fd)
+                != self.binding.quarantine_root_identity
+                or _directory_identity(self.batch_fd) != self.binding.batch_identity
+                or (
+                    leaf_identity is not None
+                    and _directory_identity(self.leaf_fd) != leaf_identity
+                )
+            ):
+                raise SyncError(
+                    "ephemeral quarantine allocation descriptor identity changed"
+                )
+            current_metadata = _snapshot_ephemeral_quarantine_metadata_fd(
+                self.home,
+                self.batch_root,
+                self.batch_fd,
+                self.metadata_fd,
+            )
+            if not _managed_state_snapshot_matches_bound_file_evidence(
+                current_metadata,
+                self.binding.metadata,
+            ):
+                raise SyncError(
+                    f"ephemeral quarantine metadata changed: {self.batch_root}"
+                )
+            # Keep the allocation-owned root, batch, and leaf descriptors live
+            # plus the metadata descriptor through ticket publication and
+            # cleanup completion.  Besides preserving the bound objects as
+            # evidence, the retained handles prevent their identities from
+            # being recycled into an ABA match while the cleanup protocol
+            # rebinds the namespace by name.
+            _discard_empty_ephemeral_quarantine_batch(self.home, self.binding)
+        finally:
+            self.close()
 
     def __del__(self) -> None:
         try:
@@ -15670,9 +15719,6 @@ def _quarantine_batch_root(
             except (OSError, SyncError):
                 metadata_cleanup_snapshot = None
             raise
-        finally:
-            _close_fd_quietly(metadata_fd)
-            metadata_fd = -1
         os.fsync(batch_fd)
         if not _bound_directory_matches(home, batch_root, batch_fd):
             raise SyncError(f"quarantine batch changed: {batch_root}")
@@ -15696,13 +15742,16 @@ def _quarantine_batch_root(
             assert quarantine_root_identity is not None
             retained_quarantine_fd = os.dup(quarantine_fd)
             retained_batch_fd = -1
+            retained_metadata_fd = -1
             try:
                 retained_batch_fd = os.dup(batch_fd)
+                retained_metadata_fd = os.dup(metadata_fd)
                 scaffold_allocation = EphemeralQuarantineBatchAllocation(
                     home=home,
                     quarantine_root=quarantine_root,
                     quarantine_fd=retained_quarantine_fd,
                     batch_fd=retained_batch_fd,
+                    metadata_fd=retained_metadata_fd,
                     binding=EphemeralQuarantineBatchBinding(
                         batch_root=batch_root,
                         quarantine_root_identity=quarantine_root_identity,
@@ -15713,13 +15762,11 @@ def _quarantine_batch_root(
                     ),
                 )
             except BaseException:
+                _close_fd_quietly(retained_metadata_fd)
                 _close_fd_quietly(retained_batch_fd)
                 _close_fd_quietly(retained_quarantine_fd)
                 raise
     except BaseException as original_error:
-        if metadata_fd >= 0:
-            _close_fd_quietly(metadata_fd)
-            metadata_fd = -1
         cleanup_binding: EphemeralQuarantineBatchBinding | None = None
         if (
             created_batch
@@ -15743,42 +15790,54 @@ def _quarantine_batch_root(
                 metadata=metadata_cleanup_snapshot,
                 allocation_ticket=allocation_ticket,
             )
-        if batch_fd >= 0:
-            _close_fd_quietly(batch_fd)
-            batch_fd = -1
-        if scaffold_allocation is not None:
-            try:
-                scaffold_allocation.reclaim_empty()
-            except (OSError, SyncError) as cleanup_error:
-                cleanup_note = (
-                    "quarantine allocation handoff failed and its bound empty "
-                    f"scaffold was retained: {cleanup_error}"
-                )
-                add_note = getattr(original_error, "add_note", None)
-                if callable(add_note):
-                    add_note(cleanup_note)
-                else:
-                    raise SyncError(
-                        f"{cleanup_note}; original allocation failure: {original_error}"
-                    ) from cleanup_error
-            cleanup_binding = None
-        if cleanup_binding is not None:
-            try:
-                _discard_empty_ephemeral_quarantine_batch(home, cleanup_binding)
-            except (OSError, SyncError) as cleanup_error:
-                cleanup_note = (
-                    "quarantine allocation failed and its bound empty scaffold "
-                    f"was retained: {cleanup_error}"
-                )
-                add_note = getattr(original_error, "add_note", None)
-                if callable(add_note):
-                    add_note(cleanup_note)
-                else:
-                    raise SyncError(
-                        f"{cleanup_note}; original allocation failure: {original_error}"
-                    ) from cleanup_error
+        try:
+            if scaffold_allocation is not None:
+                try:
+                    scaffold_allocation.reclaim_empty()
+                except (OSError, SyncError) as cleanup_error:
+                    cleanup_note = (
+                        "quarantine allocation handoff failed and its bound empty "
+                        f"scaffold was retained: {cleanup_error}"
+                    )
+                    add_note = getattr(original_error, "add_note", None)
+                    if callable(add_note):
+                        add_note(cleanup_note)
+                    else:
+                        raise SyncError(
+                            f"{cleanup_note}; original allocation failure: "
+                            f"{original_error}"
+                        ) from cleanup_error
+                cleanup_binding = None
+            if cleanup_binding is not None:
+                try:
+                    # Keep the allocator's original batch and metadata
+                    # descriptors live through the direct cleanup's durable
+                    # ticket publication and final removal, preventing identity
+                    # reuse while the cleanup helper independently rebinds.
+                    _discard_empty_ephemeral_quarantine_batch(home, cleanup_binding)
+                except (OSError, SyncError) as cleanup_error:
+                    cleanup_note = (
+                        "quarantine allocation failed and its bound empty scaffold "
+                        f"was retained: {cleanup_error}"
+                    )
+                    add_note = getattr(original_error, "add_note", None)
+                    if callable(add_note):
+                        add_note(cleanup_note)
+                    else:
+                        raise SyncError(
+                            f"{cleanup_note}; original allocation failure: "
+                            f"{original_error}"
+                        ) from cleanup_error
+        finally:
+            if metadata_fd >= 0:
+                _close_fd_quietly(metadata_fd)
+                metadata_fd = -1
+            if batch_fd >= 0:
+                _close_fd_quietly(batch_fd)
+                batch_fd = -1
         raise
     finally:
+        _close_fd_quietly(metadata_fd)
         if batch_fd >= 0 and (not retain_binding or retain_scaffold_binding):
             _close_fd_quietly(batch_fd)
         _close_fd_quietly(quarantine_fd)

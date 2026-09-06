@@ -3,7 +3,7 @@ id: 20260829-rrm001
 title: Reviewer Role Regular-File Materialization
 status: active
 created: 2026-08-29
-updated: 2026-09-05
+updated: 2026-09-06
 branch: codex/daily-skill-friction-20260829-codex-personal-sync-reviewer-role-regular-install
 pr:
 supersedes: []
@@ -91,8 +91,8 @@ superseded_by:
 
 ## Next Steps
 
-- Create a new signed frozen head and repeat the full-range fresh-context
-  GPT-5.6 Sol Ultra review after the latest publication-cleanup race repair.
+- Commit the allocation-owned descriptor repair, then repeat the full-range
+  fresh-context GPT-5.6 Sol Ultra review of the resulting signed frozen head.
 - Propagate the actual squash-landed canonical commit through toolbox and the
   private overlay using the receipt-bound release chain.
 - Smoke-test the installed reviewer role without a path override on every
@@ -638,3 +638,16 @@ superseded_by:
   deadline and 128 MiB log ceiling. The ten-source lock was refreshed before
   that run. A new signed exact-head whole-range review remains required before
   PR creation.
+- The PR #18 provider follow-up keeps allocation-owned root, batch, leaf, and
+  metadata descriptors live through empty-batch cleanup, so reopening names
+  cannot recreate deletion authority through inode reuse. It also makes
+  replacement and fault-injection tests portable without assuming inode
+  monotonicity, and locks `test_quarantine_empty_batch_reclaim.py` into both
+  sides of the eleven-source toolbox mirror. The focused reclaim module passed
+  51 tests; source-lock tests passed 2 tests; `refresh-lock --check` verified
+  all 11 sources. Complete discovery passed 1,567 tests with three expected
+  skips in 980.313 seconds, and the affected cross-module suite passed 926
+  tests with one expected skip in 253.504 seconds. Both runs used bounded
+  process-group deadlines and retained logs. A signed frozen exact-head
+  whole-range review remains required before the provider findings are
+  resolved.
