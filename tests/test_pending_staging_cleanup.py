@@ -4140,6 +4140,76 @@ class PendingStagingCleanupTests(unittest.TestCase):
             ).is_file()
         )
 
+    def test_v6_terminal_receipt_rejects_malformed_ticket_tombstone(
+        self,
+    ) -> None:
+        case_home = self.root / "ephemeral-v6-terminal-malformed-ticket"
+        install(self.first_release, case_home, SHA_A)
+        case_target = case_home / ROLE_TARGET
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            case_home,
+            case_target,
+            require_managed_access=False,
+        )
+        real_delete_ticket = MODULE._delete_pending_cleanup_ticket
+        malformed_ticket: Path | None = None
+        deleted_ticket = None
+
+        def retain_malformed_ticket_then_delete(home: Path, ticket) -> None:
+            nonlocal malformed_ticket, deleted_ticket
+            retained_name = next(MODULE._retained_pending_cleanup_names(ticket.path))
+            malformed_ticket = ticket.path.with_name(retained_name + ".extra")
+            os.link(ticket.path, malformed_ticket)
+            real_delete_ticket(home, ticket)
+            deleted_ticket = ticket
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_delete_pending_cleanup_ticket",
+                side_effect=retain_malformed_ticket_then_delete,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "ticket representation remained",
+            ),
+        ):
+            MODULE._delete_exact_regular_publication_without_pending_receipt(
+                case_home,
+                case_target,
+                expected,
+            )
+
+        self.assertIsNotNone(deleted_ticket)
+        self.assertIsNotNone(malformed_ticket)
+        assert deleted_ticket is not None
+        assert malformed_ticket is not None
+        self.assertFalse(deleted_ticket.path.exists())
+        self.assertTrue(malformed_ticket.is_file())
+        self.assertEqual(malformed_ticket.read_bytes(), deleted_ticket.snapshot.payload)
+        self.assertEqual(
+            (malformed_ticket.stat().st_dev, malformed_ticket.stat().st_ino),
+            deleted_ticket.snapshot.file_identity,
+        )
+        receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+            case_home,
+            deleted_ticket.batch_root.name,
+        )
+        self.assertTrue(receipt_path.is_file())
+
+        # This simulates the formerly unsafe outcome: the phase receipt was
+        # retired while a suffixed ticket tombstone still retained its bytes.
+        # That residue must independently block a later mutation.
+        receipt_path.unlink()
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "ticket representation must be reconciled before new mutation",
+        ):
+            MODULE._require_no_pending_terminal_mutation_authority(case_home)
+
+        self.assertTrue(malformed_ticket.is_file())
+        self.assertEqual(malformed_ticket.read_bytes(), deleted_ticket.snapshot.payload)
+
     def test_v6_ephemeral_cleanup_orphan_phase_preserves_foreign_after_ticket_delete(
         self,
     ) -> None:

@@ -723,3 +723,18 @@ superseded_by:
   `git diff --check` passed. The attempted preceding CLI review was interrupted
   by provider capacity and is not counted as a pass; a new fresh exact-head
   whole-range review is required before remote publication.
+- The next fresh review found a separate v6 terminal-control gap: strict
+  retained-ticket parsing ignored a suffix-added tombstone derivative, so a
+  same-inode `<ticket-tombstone>.extra` could retain valid ticket bytes while
+  terminal receipt deletion and a later mutation gate treated the ticket as
+  absent. A new blocking-only classifier recognizes a valid batch's ticket and
+  ticket-temp derivatives as retained evidence but cannot recover, delete, or
+  otherwise grant authority to them; exact canonical and strict retained forms
+  keep their existing recovery paths. The regression creates a same-inode
+  suffixed tombstone after ticket deletion, proves that the terminal receipt
+  remains, then simulates its unsafe retirement and proves the independent
+  mutation gate still blocks. Adjacent terminal/orphan regressions passed, the
+  eleven-source lock was refreshed and checked, Ruff and Python compilation
+  passed, and complete repository-private discovery passed 1,579 tests with
+  two expected skips in 1,076.901 seconds. A new frozen exact-head whole-range
+  review remains required before remote publication.

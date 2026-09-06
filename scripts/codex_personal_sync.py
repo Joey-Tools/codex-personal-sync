@@ -17176,15 +17176,8 @@ def _require_pending_ephemeral_ticket_representations_absent(
         maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
         overflow_message="pending cleanup control scan exceeds the size limit",
     )
-    ticket_name = batch_name + PENDING_CLEANUP_TICKET_SUFFIX
     for name in names:
-        retained_temp = _pending_cleanup_retained_ticket_temp_name(name)
-        if (
-            name == ticket_name
-            or _pending_cleanup_retained_canonical_name(name) == ticket_name
-            or _pending_cleanup_ticket_temp_batch_name(name) == batch_name
-            or (retained_temp is not None and retained_temp[1] == batch_name)
-        ):
+        if _pending_cleanup_ticket_representation_batch_name(name) == batch_name:
             raise SyncError(
                 "pending ephemeral cleanup ticket representation remained before "
                 f"terminal receipt deletion: {batch_name}: {name}"
@@ -29929,6 +29922,32 @@ def _pending_cleanup_retained_canonical_name(name: str) -> str | None:
     return match.group(1)
 
 
+def _pending_cleanup_ticket_representation_batch_name(name: str) -> str | None:
+    """Classify ticket-derived residue as blocking evidence, never authority.
+
+    A canonical ticket or its normal retained form has a strict parser elsewhere
+    that may restore only the exact, bound object.  This classifier is
+    intentionally broader: a suffix-added or otherwise malformed descendant of
+    a syntactically valid ``<batch>.json`` name retains recoverable ticket bytes
+    and must block terminal receipt retirement and subsequent mutations.  It is
+    not a recovery parser and callers must never use its result to authorize a
+    destructive action.
+    """
+    candidate = name
+    if candidate.startswith(PENDING_CLEANUP_RETAINED_PREFIX):
+        candidate = candidate[len(PENDING_CLEANUP_RETAINED_PREFIX) :]
+    marker_index = candidate.find(PENDING_CLEANUP_TICKET_SUFFIX)
+    if marker_index <= 0:
+        return None
+    batch_name = candidate[:marker_index]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        return None
+    return batch_name
+
+
 def _pending_cleanup_ticket_temp_batch_name(name: str) -> str | None:
     if not name.endswith(PENDING_CLEANUP_TICKET_TEMP_SUFFIX):
         return None
@@ -31278,6 +31297,17 @@ def _require_no_pending_terminal_mutation_authority(home: Path) -> None:
             raise SyncError(
                 "retained pending cleanup authority must be reconciled before "
                 f"new mutation: {retained[1]}"
+            )
+        related_ticket_batch_name = _pending_cleanup_ticket_representation_batch_name(
+            name
+        )
+        if (
+            related_ticket_batch_name is not None
+            and name != related_ticket_batch_name + PENDING_CLEANUP_TICKET_SUFFIX
+        ):
+            raise SyncError(
+                "pending cleanup ticket representation must be reconciled before "
+                f"new mutation: {related_ticket_batch_name}"
             )
         if name.endswith(PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX):
             batch_name = name[: -len(PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX)]
