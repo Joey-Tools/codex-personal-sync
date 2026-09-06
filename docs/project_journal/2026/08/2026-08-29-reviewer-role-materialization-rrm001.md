@@ -767,3 +767,20 @@ superseded_by:
   1,583 tests with two expected skips in 1,125.110 seconds. A new signed
   frozen exact-head whole-range review remains required before remote
   publication.
+- That review found two final repairable boundaries. Orphan empty-proof cleanup
+  now uses the same bound index descriptor to reject every recovered ticket
+  representation before proof isolation and again at each generic rename and
+  final-unlink boundary; canonical, strict retained, temp, and suffix-added
+  ticket forms therefore preserve the proof as blocking evidence rather than
+  losing the only durable empty-batch record. The v6 receiptless leaf-cleanup
+  path now owns both directory descriptors inside one `try`/`finally`, so a
+  `BaseException` while opening the quarantine root closes the already-open
+  public-parent descriptor without performing a mutation. New regressions
+  replay the exact ticket inode during the orphan proof's final unlink for both
+  canonical and retained representations, and inject a second-open
+  `SystemExit` while asserting descriptor release. The seven affected tests
+  passed in 4.325 seconds; source lock refresh/check verified 11 sources,
+  Ruff and syntax validation passed, and the repository-private complete
+  discovery passed 1,585 tests with two expected skips in 1,091.404 seconds.
+  A signed amended head and a wholly new frozen exact-head review are required
+  before remote publication.

@@ -2207,9 +2207,11 @@ class PendingStagingCleanupTests(unittest.TestCase):
             _expected,
             *,
             label: str,
+            mutation_revalidator=None,
         ) -> None:
             self.assertEqual(path, orphan_path)
             self.assertIn(orphan_batch, label)
+            self.assertIsNotNone(mutation_revalidator)
             path.unlink()
 
         with (
@@ -4404,6 +4406,179 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 ticket.quarantine_root_identity,
             ),
         )
+
+    def test_orphan_empty_proof_final_unlink_rechecks_ticket_representations(
+        self,
+    ) -> None:
+        for representation_kind in ("canonical", "retained"):
+            with self.subTest(representation_kind=representation_kind):
+                case_home = self.root / (
+                    f"orphan-empty-proof-{representation_kind}-ticket-replay"
+                )
+                case_home.mkdir()
+                allocation = MODULE._quarantine_batch_root(
+                    case_home,
+                    [],
+                    retain_binding=True,
+                    retain_scaffold_binding=True,
+                )
+                self.assertIsInstance(
+                    allocation,
+                    MODULE.EphemeralQuarantineBatchAllocation,
+                )
+                assert isinstance(
+                    allocation,
+                    MODULE.EphemeralQuarantineBatchAllocation,
+                )
+                ticket = MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+                    case_home,
+                    allocation.binding,
+                )
+                allocation.revoke_reclaim()
+                allocation.close()
+
+                proof_path = MODULE._pending_cleanup_empty_proof_path(
+                    case_home,
+                    ticket.batch_root.name,
+                )
+                hold_path = case_home / "preserved-ticket-bytes"
+                os.link(ticket.path, hold_path)
+                self.assertEqual(
+                    (hold_path.stat().st_dev, hold_path.stat().st_ino),
+                    ticket.snapshot.file_identity,
+                )
+                with mock.patch.object(
+                    MODULE,
+                    "_delete_pending_cleanup_empty_proof",
+                    return_value=None,
+                ):
+                    self.assertTrue(
+                        MODULE._remove_cleanup_ready_batch(case_home, ticket)
+                    )
+
+                self.assertFalse(ticket.path.exists())
+                self.assertFalse(ticket.batch_root.exists())
+                self.assertTrue(proof_path.is_file())
+                if representation_kind == "canonical":
+                    replay_path = ticket.path
+                else:
+                    replay_path = ticket.path.with_name(
+                        next(MODULE._retained_pending_cleanup_names(ticket.path))
+                    )
+                real_require = (
+                    MODULE._require_pending_ephemeral_ticket_representations_absent
+                )
+                injected = False
+
+                def replay_ticket_at_final_orphan_unlink(
+                    home: Path,
+                    index_root: Path,
+                    index_fd: int,
+                    batch_name: str,
+                ) -> None:
+                    nonlocal injected
+                    retained_proofs = tuple(
+                        index_root.glob(
+                            f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}"
+                            f"{proof_path.name}-*"
+                        )
+                    )
+                    if (
+                        batch_name == ticket.batch_root.name
+                        and not proof_path.exists()
+                        and len(retained_proofs) == 1
+                        and not injected
+                    ):
+                        os.link(hold_path, replay_path)
+                        injected = True
+                    real_require(home, index_root, index_fd, batch_name)
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_require_pending_ephemeral_ticket_representations_absent",
+                        side_effect=replay_ticket_at_final_orphan_unlink,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "ticket representation remained",
+                    ),
+                ):
+                    MODULE._cleanup_orphan_pending_cleanup_empty_proofs(case_home)
+
+                self.assertTrue(injected)
+                self.assertTrue(replay_path.is_file())
+                self.assertEqual(
+                    (replay_path.stat().st_dev, replay_path.stat().st_ino),
+                    ticket.snapshot.file_identity,
+                )
+                self.assertFalse(proof_path.exists())
+                retained_proofs = tuple(
+                    proof_path.parent.glob(
+                        f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}{proof_path.name}-*"
+                    )
+                )
+                self.assertEqual(len(retained_proofs), 1)
+                self.assertEqual(
+                    retained_proofs[0].read_bytes(),
+                    MODULE._pending_cleanup_empty_proof_payload(
+                        ticket,
+                        ticket.quarantine_root_identity,
+                    ),
+                )
+
+                hold_path.unlink()
+                self.assertEqual(MODULE._cleanup_ready_pending_batches(case_home), 1)
+                self.assertFalse(replay_path.exists())
+                self.assertFalse(retained_proofs[0].exists())
+
+    def test_v6_cleanup_closes_public_parent_when_quarantine_open_fails(
+        self,
+    ) -> None:
+        case_home = self.root / "ephemeral-v6-quarantine-open-failure"
+        install(self.first_release, case_home, SHA_A)
+        case_target = case_home / ROLE_TARGET
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            case_home,
+            case_target,
+            require_managed_access=False,
+        )
+        ticket = MODULE._publish_pending_ephemeral_quarantine_leaf_cleanup_ticket(
+            case_home,
+            case_target,
+            expected,
+        )
+        quarantine_root = (
+            MODULE._personal_sync_root(case_home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        public_parent_fd = 123
+
+        def fail_second_directory_open(home: Path, directory: Path) -> int:
+            self.assertEqual(home, case_home)
+            if directory == case_target.parent:
+                return public_parent_fd
+            self.assertEqual(directory, quarantine_root)
+            raise SystemExit("injected quarantine directory open failure")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_open_directory_beneath",
+                side_effect=fail_second_directory_open,
+            ) as open_bound,
+            mock.patch.object(MODULE, "_close_fd_quietly") as close_bound,
+            self.assertRaisesRegex(SystemExit, "quarantine directory open failure"),
+        ):
+            MODULE._remove_pending_ephemeral_quarantine_leaf(case_home, ticket)
+
+        open_bound.assert_has_calls(
+            [
+                mock.call(case_home, case_target.parent),
+                mock.call(case_home, quarantine_root),
+            ]
+        )
+        close_bound.assert_any_call(public_parent_fd)
+        self.assertTrue(ticket.path.is_file())
 
     def test_v6_ephemeral_cleanup_orphan_phase_preserves_foreign_after_ticket_delete(
         self,

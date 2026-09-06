@@ -17163,7 +17163,7 @@ def _require_pending_ephemeral_ticket_representations_absent(
     index_fd: int,
     batch_name: str,
 ) -> None:
-    """Reject every recoverable representation of one v6 cleanup ticket."""
+    """Reject every recoverable representation of one cleanup ticket."""
     _require_pending_cleanup_fd_access_policy(
         index_fd,
         index_root,
@@ -28750,8 +28750,8 @@ def _remove_pending_ephemeral_quarantine_leaf(
     evidence_names = _pending_ephemeral_quarantine_evidence_names(batch_name)
     target = home / Path(*ticket.public_target.parts)
     quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
-    public_parent_fd = _open_directory_beneath(home, target.parent)
-    quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    public_parent_fd = -1
+    quarantine_fd = -1
 
     def require_bound_parents() -> None:
         _require_managed_regular_parent_chain_access(
@@ -28882,6 +28882,8 @@ def _remove_pending_ephemeral_quarantine_leaf(
             )
 
     try:
+        public_parent_fd = _open_directory_beneath(home, target.parent)
+        quarantine_fd = _open_directory_beneath(home, quarantine_root)
         for _attempt in range(32):
             require_bound_parents()
             _require_pending_cleanup_ticket_unchanged(home, ticket)
@@ -30800,12 +30802,27 @@ def _cleanup_orphan_pending_cleanup_empty_proofs(
         proof = _read_orphan_pending_cleanup_empty_proof(home, proof_path)
         index_fd = _open_directory_beneath(home, index_root)
         try:
+
+            def revalidate_ticket_representations(_proof_member: str) -> None:
+                # A recovered canonical, retained, or suffix-added ticket can
+                # make this proof the only durable empty-batch evidence. Keep
+                # the proof unless every representation remains absent at both
+                # irreversible deletion boundaries on this exact index FD.
+                _require_pending_ephemeral_ticket_representations_absent(
+                    home,
+                    index_root,
+                    index_fd,
+                    batch_name,
+                )
+
+            revalidate_ticket_representations(proof_path.name)
             _isolate_and_delete_pending_cleanup_file(
                 home,
                 proof_path,
                 index_fd,
                 proof,
                 label=f"orphan pending cleanup empty proof {batch_name}",
+                mutation_revalidator=revalidate_ticket_representations,
             )
         finally:
             _close_fd_quietly(index_fd)
