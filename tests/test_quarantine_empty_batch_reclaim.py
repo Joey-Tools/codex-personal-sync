@@ -1046,6 +1046,70 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 os.fstat(descriptor)
 
+    def test_allocation_close_detaches_fds_before_post_close_baseexception(
+        self,
+    ) -> None:
+        allocation = MODULE._quarantine_batch_root(
+            self.home,
+            [],
+            retain_binding=True,
+            retain_scaffold_binding=True,
+        )
+        self.assertIsInstance(
+            allocation,
+            MODULE.EphemeralQuarantineBatchAllocation,
+        )
+        assert isinstance(
+            allocation,
+            MODULE.EphemeralQuarantineBatchAllocation,
+        )
+        allocation.revoke_reclaim()
+        metadata_fd = allocation.metadata_fd
+        probe_fd = os.open(self.source, os.O_RDONLY)
+        reused_fd = -1
+        real_close = MODULE._close_fd_quietly
+
+        class PostCloseAbort(BaseException):
+            pass
+
+        def close_then_reuse(file_descriptor: int) -> None:
+            nonlocal reused_fd
+            if file_descriptor == metadata_fd and reused_fd < 0:
+                real_close(file_descriptor)
+                os.dup2(probe_fd, file_descriptor)
+                reused_fd = file_descriptor
+                raise PostCloseAbort("injected failure after successful close")
+            real_close(file_descriptor)
+
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_close_fd_quietly",
+                    side_effect=close_then_reuse,
+                ),
+                self.assertRaisesRegex(PostCloseAbort, "successful close"),
+            ):
+                allocation.close()
+
+            self.assertEqual(reused_fd, metadata_fd)
+            self.assertEqual(
+                (
+                    allocation.leaf_fd,
+                    allocation.metadata_fd,
+                    allocation.batch_fd,
+                    allocation.quarantine_fd,
+                ),
+                (-1, -1, -1, -1),
+            )
+            allocation.close()
+            allocation.__del__()
+            self.assertEqual(os.fstat(reused_fd).st_ino, self.source.stat().st_ino)
+        finally:
+            if reused_fd >= 0:
+                os.close(reused_fd)
+            os.close(probe_fd)
+
     def test_reclaim_keeps_allocation_descriptors_through_batch_removal(
         self,
     ) -> None:

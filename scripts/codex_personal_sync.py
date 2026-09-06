@@ -5309,14 +5309,33 @@ class EphemeralQuarantineBatchAllocation:
         )
 
     def close(self) -> None:
-        _close_fd_quietly(self.leaf_fd)
+        leaf_fd = self.leaf_fd
+        metadata_fd = self.metadata_fd
+        batch_fd = self.batch_fd
+        quarantine_fd = self.quarantine_fd
         self.leaf_fd = -1
-        _close_fd_quietly(self.metadata_fd)
         self.metadata_fd = -1
-        _close_fd_quietly(self.batch_fd)
         self.batch_fd = -1
-        _close_fd_quietly(self.quarantine_fd)
         self.quarantine_fd = -1
+        first_error: BaseException | None = None
+        for file_descriptor in (
+            leaf_fd,
+            metadata_fd,
+            batch_fd,
+            quarantine_fd,
+        ):
+            try:
+                _close_fd_quietly(file_descriptor)
+            except BaseException as error:
+                # Detach every owned number before closing any of them.  A
+                # close wrapper can report an asynchronous failure after the
+                # kernel already released the descriptor; retaining that
+                # number would let a later close/finalizer hit an unrelated
+                # object that reused it.
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
 
     def reclaim_empty(self) -> None:
         if not self.reclaim_authorized:
@@ -17003,6 +17022,166 @@ def _pending_ephemeral_quarantine_evidence_names(
     return (primary,) + tuple(f"{primary}-retained-{index}" for index in range(8))
 
 
+def _pending_ephemeral_quarantine_final_private_name(private_name: str) -> str:
+    return f"{private_name}.delete-{os.urandom(16).hex()}"
+
+
+def _pending_ephemeral_quarantine_final_private_base(
+    batch_name: str,
+    name: str,
+) -> str | None:
+    for private_name in _pending_ephemeral_quarantine_evidence_names(batch_name):
+        prefix = f"{private_name}.delete-"
+        if not name.startswith(prefix):
+            continue
+        token = name[len(prefix) :]
+        if len(token) == 32 and re.fullmatch(r"[0-9a-f]{32}", token) is not None:
+            return private_name
+    return None
+
+
+def _pending_ephemeral_quarantine_private_inventory(
+    quarantine_fd: int,
+    batch_name: str,
+) -> tuple[tuple[str, tuple[int, int]], ...]:
+    evidence_names = frozenset(_pending_ephemeral_quarantine_evidence_names(batch_name))
+    names = _directory_member_names(
+        quarantine_fd,
+        maximum_entries=MAX_PENDING_CLEANUP_BATCH_SCAN,
+        overflow_message="ephemeral quarantine evidence scan exceeds the limit",
+    )
+    private: list[tuple[str, tuple[int, int]]] = []
+    for name in names:
+        if (
+            name not in evidence_names
+            and _pending_ephemeral_quarantine_final_private_base(batch_name, name)
+            is None
+        ):
+            continue
+        identity = _named_entry_identity(quarantine_fd, name)
+        if identity is not None:
+            private.append((name, identity))
+    return tuple(private)
+
+
+def _require_pending_ephemeral_terminal_names_absent(
+    home: Path,
+    target: Path,
+    public_parent_fd: int,
+    public_parent_identity: tuple[int, int],
+    quarantine_root: Path,
+    quarantine_fd: int,
+    quarantine_root_identity: tuple[int, int],
+    batch_name: str,
+) -> None:
+    """Reprove the exact parent policy and derived-name absence boundary.
+
+    The protected directory property is identity plus owner-only access policy;
+    ordinary child-entry churn is allowed.  Every public alias, deterministic
+    private evidence name, and high-entropy final-private tombstone derived from
+    this batch must remain absent before its terminal receipt can disappear.
+    """
+    _require_managed_regular_parent_chain_access(
+        home,
+        target.parent,
+        bound_parent_fd=public_parent_fd,
+    )
+    if _directory_identity(
+        public_parent_fd
+    ) != public_parent_identity or not _bound_directory_matches(
+        home,
+        target.parent,
+        public_parent_fd,
+    ):
+        raise SyncError(
+            f"pending ephemeral cleanup public parent changed: {target.parent}"
+        )
+    _require_pending_cleanup_fd_access_policy(
+        quarantine_fd,
+        quarantine_root,
+        expected_mode=0o700,
+    )
+    if _directory_identity(
+        quarantine_fd
+    ) != quarantine_root_identity or not _bound_directory_matches(
+        home,
+        quarantine_root,
+        quarantine_fd,
+    ):
+        raise SyncError("pending cleanup quarantine root changed")
+    public_names = (target.name,) + _pending_ephemeral_public_alias_names(batch_name)
+    if any(
+        _named_entry_identity(public_parent_fd, name) is not None
+        for name in public_names
+    ):
+        raise SyncError(
+            "pending ephemeral cleanup public entry was retained in place: "
+            f"{batch_name}"
+        )
+    if _pending_ephemeral_quarantine_private_inventory(quarantine_fd, batch_name):
+        raise SyncError(
+            f"pending ephemeral cleanup private evidence was retained: {batch_name}"
+        )
+    _require_managed_regular_parent_chain_access(
+        home,
+        target.parent,
+        bound_parent_fd=public_parent_fd,
+    )
+    _require_pending_cleanup_fd_access_policy(
+        quarantine_fd,
+        quarantine_root,
+        expected_mode=0o700,
+    )
+    if (
+        _directory_identity(public_parent_fd) != public_parent_identity
+        or not _bound_directory_matches(home, target.parent, public_parent_fd)
+        or _directory_identity(quarantine_fd) != quarantine_root_identity
+        or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+    ):
+        raise SyncError("pending ephemeral cleanup parent changed during name audit")
+
+
+def _require_pending_ephemeral_ticket_representations_absent(
+    home: Path,
+    index_root: Path,
+    index_fd: int,
+    batch_name: str,
+) -> None:
+    """Reject every recoverable representation of one v6 cleanup ticket."""
+    _require_pending_cleanup_fd_access_policy(
+        index_fd,
+        index_root,
+        expected_mode=0o700,
+    )
+    if not _bound_directory_matches(home, index_root, index_fd):
+        raise SyncError("pending ephemeral cleanup index changed")
+    names = _directory_member_names(
+        index_fd,
+        maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+        overflow_message="pending cleanup control scan exceeds the size limit",
+    )
+    ticket_name = batch_name + PENDING_CLEANUP_TICKET_SUFFIX
+    for name in names:
+        retained_temp = _pending_cleanup_retained_ticket_temp_name(name)
+        if (
+            name == ticket_name
+            or _pending_cleanup_retained_canonical_name(name) == ticket_name
+            or _pending_cleanup_ticket_temp_batch_name(name) == batch_name
+            or (retained_temp is not None and retained_temp[1] == batch_name)
+        ):
+            raise SyncError(
+                "pending ephemeral cleanup ticket representation remained before "
+                f"terminal receipt deletion: {batch_name}: {name}"
+            )
+    _require_pending_cleanup_fd_access_policy(
+        index_fd,
+        index_root,
+        expected_mode=0o700,
+    )
+    if not _bound_directory_matches(home, index_root, index_fd):
+        raise SyncError("pending ephemeral cleanup index changed")
+
+
 def _new_pending_ephemeral_cleanup_batch_name() -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     batch_name = f"{stamp}-{os.getpid()}-{time.time_ns()}"
@@ -28079,6 +28258,8 @@ def _delete_pending_cleanup_terminal_validation(
     home: Path,
     ticket: PendingBatchCleanupTicket,
     quarantine_root_identity: tuple[int, int],
+    *,
+    mutation_revalidator: Callable[[str, int], None] | None = None,
 ) -> None:
     receipt = _read_pending_cleanup_terminal_validation(
         home,
@@ -28093,13 +28274,31 @@ def _delete_pending_cleanup_terminal_validation(
     )
     index_fd = _open_directory_beneath(home, receipt_path.parent)
     try:
-        _isolate_and_delete_pending_cleanup_file(
-            home,
-            receipt_path,
-            index_fd,
-            receipt,
-            label=(f"pending cleanup terminal validation {ticket.batch_root.name}"),
-        )
+
+        def revalidate_mutation(receipt_member: str) -> None:
+            if mutation_revalidator is not None:
+                mutation_revalidator(receipt_member, index_fd)
+
+        label = f"pending cleanup terminal validation {ticket.batch_root.name}"
+        if mutation_revalidator is None:
+            # Preserve the historical generic-helper call shape for v4 and
+            # test/mirror compatibility; only v6 needs the expanded boundary.
+            _isolate_and_delete_pending_cleanup_file(
+                home,
+                receipt_path,
+                index_fd,
+                receipt,
+                label=label,
+            )
+        else:
+            _isolate_and_delete_pending_cleanup_file(
+                home,
+                receipt_path,
+                index_fd,
+                receipt,
+                label=label,
+                mutation_revalidator=revalidate_mutation,
+            )
     finally:
         _close_fd_quietly(index_fd)
 
@@ -28496,11 +28695,29 @@ def _remove_pending_ephemeral_quarantine_leaf(
         return canonical, aliases
 
     def private_inventory() -> tuple[tuple[str, tuple[int, int]], ...]:
-        return tuple(
-            (name, identity)
-            for name in evidence_names
-            if (identity := _named_entry_identity(quarantine_fd, name)) is not None
+        return _pending_ephemeral_quarantine_private_inventory(
+            quarantine_fd,
+            batch_name,
         )
+
+    def require_phase_receipt_unchanged(
+        expected_receipt: ManagedStateFileSnapshot,
+    ) -> None:
+        current_receipt = _read_pending_cleanup_terminal_validation(
+            home,
+            ticket,
+            ticket.quarantine_root_identity,
+        )
+        if current_receipt is None or not (
+            _managed_state_snapshot_matches_bound_file_evidence(
+                current_receipt,
+                expected_receipt,
+            )
+        ):
+            raise SyncError(
+                "pending ephemeral cleanup private-phase receipt changed before "
+                f"payload deletion: {batch_name}"
+            )
 
     def move_canonical_to_alias(identity: tuple[int, int]) -> None:
         destination = next(
@@ -28633,32 +28850,177 @@ def _remove_pending_ephemeral_quarantine_leaf(
                         f"pending ephemeral cleanup private payload changed: "
                         f"{batch_name}"
                     )
-                _require_pending_cleanup_ticket_unchanged(home, ticket)
-                require_bound_parents()
-                if public_inventory() != (None, ()):
-                    continue
-                final_snapshot = _regular_file_snapshot_at(
-                    quarantine_fd,
+                final_private_base = _pending_ephemeral_quarantine_final_private_base(
+                    batch_name,
                     quarantine_name,
-                    quarantine_path,
-                    maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
                 )
-                if (
-                    not _regular_snapshot_leaf_matches(final_snapshot, expected)
-                    or final_snapshot.link_count != expected.link_count
-                ):
-                    raise SyncError(
-                        f"pending ephemeral cleanup private payload changed: "
-                        f"{batch_name}"
-                    )
-                _require_pending_cleanup_ticket_unchanged(home, ticket)
-                require_bound_parents()
-                if public_inventory() != (None, ()) or private_inventory() != (
-                    (quarantine_name, expected.file_identity),
-                ):
+                if final_private_base is None:
+                    deletion_name: str | None = None
+                    for _isolation_attempt in range(128):
+                        candidate = _pending_ephemeral_quarantine_final_private_name(
+                            quarantine_name
+                        )
+                        require_bound_parents()
+                        final_snapshot = _regular_file_snapshot_at(
+                            quarantine_fd,
+                            quarantine_name,
+                            quarantine_path,
+                            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                        )
+                        if (
+                            not _regular_snapshot_leaf_matches(
+                                final_snapshot,
+                                expected,
+                            )
+                            or final_snapshot.link_count != expected.link_count
+                            or public_inventory() != (None, ())
+                            or private_inventory()
+                            != ((quarantine_name, expected.file_identity),)
+                        ):
+                            raise SyncError(
+                                "pending ephemeral cleanup private payload changed "
+                                f"before final isolation: {batch_name}"
+                            )
+                        require_bound_parents()
+                        _require_pending_cleanup_ticket_unchanged(home, ticket)
+                        require_phase_receipt_unchanged(phase_receipt)
+                        try:
+                            _rename_noreplace_at(
+                                quarantine_fd,
+                                quarantine_name,
+                                quarantine_fd,
+                                candidate,
+                            )
+                        except FileExistsError:
+                            continue
+                        except FileNotFoundError as error:
+                            raise SyncError(
+                                "pending ephemeral cleanup private payload "
+                                f"disappeared during final isolation: {batch_name}"
+                            ) from error
+                        deletion_name = candidate
+                        break
+                    if deletion_name is None:
+                        raise SyncError(
+                            "pending ephemeral cleanup could not allocate a final "
+                            f"private isolation name: {batch_name}"
+                        )
+                    os.fsync(quarantine_fd)
                     continue
-                os.unlink(quarantine_name, dir_fd=quarantine_fd)
-                os.fsync(quarantine_fd)
+
+                private_fd = -1
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                flags |= getattr(os, "O_NONBLOCK", 0)
+                try:
+                    try:
+                        private_fd = os.open(
+                            quarantine_name,
+                            flags,
+                            dir_fd=quarantine_fd,
+                        )
+                    except OSError as error:
+                        raise SyncError(
+                            "pending ephemeral cleanup final private payload "
+                            f"became unreadable: {batch_name}"
+                        ) from error
+
+                    def require_open_private_unchanged(stage: str) -> None:
+                        try:
+                            before = _require_release_identity_fd_access_policy(
+                                private_fd,
+                                quarantine_path,
+                                os.geteuid(),
+                            )
+                            os.lseek(private_fd, 0, os.SEEK_SET)
+                            payload = _read_managed_state_bytes(
+                                private_fd,
+                                quarantine_path,
+                                MAX_ARCHIVE_MEMBER_BYTES,
+                            )
+                            os.lseek(private_fd, 0, os.SEEK_SET)
+                            confirmed_payload = _read_managed_state_bytes(
+                                private_fd,
+                                quarantine_path,
+                                MAX_ARCHIVE_MEMBER_BYTES,
+                            )
+                            after = _require_release_identity_fd_access_policy(
+                                private_fd,
+                                quarantine_path,
+                                os.geteuid(),
+                            )
+                            named = os.stat(
+                                quarantine_name,
+                                dir_fd=quarantine_fd,
+                                follow_symlinks=False,
+                            )
+                        except (OSError, SyncError) as error:
+                            raise SyncError(
+                                "pending ephemeral cleanup final private payload "
+                                f"changed {stage}: {batch_name}"
+                            ) from error
+                        expected_mode = stat.S_IMODE(before.st_mode)
+                        if (
+                            not stat.S_ISREG(before.st_mode)
+                            or not _regular_stat_metadata_matches(after, before)
+                            or not _regular_stat_metadata_matches(named, before)
+                            or (before.st_dev, before.st_ino) != expected.file_identity
+                            or expected_mode != expected.mode
+                            or before.st_uid != expected.uid
+                            or not _gid_matches_regular_file_access_policy(
+                                before.st_gid,
+                                expected.gid,
+                                expected.mode,
+                            )
+                            or before.st_size != expected.size
+                            or before.st_nlink != expected.link_count
+                            or hashlib.sha256(payload).hexdigest() != expected.sha256
+                            or hashlib.sha256(confirmed_payload).hexdigest()
+                            != expected.sha256
+                            or _pending_ephemeral_quarantine_final_private_base(
+                                batch_name,
+                                quarantine_name,
+                            )
+                            != final_private_base
+                            or not _bound_directory_matches(
+                                home,
+                                quarantine_root,
+                                quarantine_fd,
+                            )
+                        ):
+                            raise SyncError(
+                                "pending ephemeral cleanup final private payload "
+                                f"changed {stage}: {batch_name}"
+                            )
+
+                    require_open_private_unchanged("before deletion")
+                    require_bound_parents()
+                    if public_inventory() != (None, ()) or private_inventory() != (
+                        (quarantine_name, expected.file_identity),
+                    ):
+                        continue
+                    # Close the namespace sample by proving both live bound
+                    # parents again after walking their child entries.
+                    require_bound_parents()
+                    _require_pending_cleanup_ticket_unchanged(home, ticket)
+                    require_phase_receipt_unchanged(phase_receipt)
+                    # The broader boundary probes can race with the final
+                    # pathname.  Rebind it to the still-open exact descriptor,
+                    # and repeat content/access/link-count validation, before
+                    # issuing the irreversible unlink.
+                    require_open_private_unchanged("after boundary revalidation")
+                    os.unlink(quarantine_name, dir_fd=quarantine_fd)
+                    os.fsync(quarantine_fd)
+                    if (
+                        _named_entry_identity(quarantine_fd, quarantine_name)
+                        is not None
+                    ):
+                        raise SyncError(
+                            "pending ephemeral cleanup final private name "
+                            f"reappeared: {batch_name}"
+                        )
+                finally:
+                    _close_fd_quietly(private_fd)
                 continue
 
             if len(private) > 1 or private:
@@ -28689,19 +29051,43 @@ def _remove_pending_ephemeral_quarantine_leaf(
             raise SyncError(
                 f"pending ephemeral cleanup payload reappeared: {batch_name}"
             )
+        # Delete the ticket first. The private-phase receipt remains durable
+        # across this boundary, so a crash cannot turn a completed private
+        # unlink into an apparent initial public state. Keep both bound parent
+        # descriptors live through receipt retirement and reprove every derived
+        # public/private name at each mutation boundary.
+        _delete_pending_cleanup_ticket(home, ticket)
+
+        def require_terminal_receipt_boundary(
+            _receipt_member: str,
+            index_fd: int,
+        ) -> None:
+            _require_pending_ephemeral_terminal_names_absent(
+                home,
+                target,
+                public_parent_fd,
+                expected.parent_identity,
+                quarantine_root,
+                quarantine_fd,
+                ticket.quarantine_root_identity,
+                batch_name,
+            )
+            _require_pending_ephemeral_ticket_representations_absent(
+                home,
+                ticket.path.parent,
+                index_fd,
+                batch_name,
+            )
+
+        _delete_pending_cleanup_terminal_validation(
+            home,
+            ticket,
+            ticket.quarantine_root_identity,
+            mutation_revalidator=require_terminal_receipt_boundary,
+        )
     finally:
         _close_fd_quietly(quarantine_fd)
         _close_fd_quietly(public_parent_fd)
-    # Delete the ticket first. The private-phase receipt remains durable across
-    # this boundary, so a crash cannot turn a completed private unlink into an
-    # apparent initial public state. Orphan receipt recovery revalidates every
-    # bound public/private name before removing the final receipt.
-    _delete_pending_cleanup_ticket(home, ticket)
-    _delete_pending_cleanup_terminal_validation(
-        home,
-        ticket,
-        ticket.quarantine_root_identity,
-    )
     return True
 
 
@@ -28999,6 +29385,15 @@ def _remove_pending_ephemeral_quarantine_batch(
                 raise SyncError(
                     f"pending ephemeral quarantine batch changed: {batch_name}"
                 )
+            # Identity alone does not preserve the root's access policy.  Recheck
+            # the exact bound FD immediately before the canonical namespace is
+            # renamed so same-inode mode, UID, or Darwin ACL drift cannot create
+            # an isolated root or a terminal empty proof.
+            _require_pending_cleanup_fd_access_policy(
+                quarantine_fd,
+                quarantine_root,
+                expected_mode=0o700,
+            )
             _rename_noreplace_at(
                 quarantine_fd,
                 batch_name,
@@ -30380,73 +30775,51 @@ def _cleanup_orphan_pending_ephemeral_private_phases(
                 _payload_identity,
             ) = _read_orphan_pending_ephemeral_private_phase(home, receipt_path)
             target = home / Path(*public_target.parts)
-            public_parent_fd = _open_directory_beneath(home, target.parent)
             quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
-            quarantine_fd = _open_directory_beneath(home, quarantine_root)
+            public_parent_fd = -1
+            quarantine_fd = -1
+            index_fd = -1
             try:
-                _require_managed_regular_parent_chain_access(
+                public_parent_fd = _open_directory_beneath(home, target.parent)
+                quarantine_fd = _open_directory_beneath(home, quarantine_root)
+                index_fd = _open_directory_beneath(home, index_root)
+
+                def require_orphan_receipt_boundary(_receipt_member: str) -> None:
+                    _require_pending_ephemeral_terminal_names_absent(
+                        home,
+                        target,
+                        public_parent_fd,
+                        public_parent_identity,
+                        quarantine_root,
+                        quarantine_fd,
+                        quarantine_identity,
+                        batch_name,
+                    )
+                    _require_pending_ephemeral_ticket_representations_absent(
+                        home,
+                        index_root,
+                        index_fd,
+                        batch_name,
+                    )
+
+                require_orphan_receipt_boundary(receipt_path.name)
+                _isolate_and_delete_pending_cleanup_file(
                     home,
-                    target.parent,
-                    bound_parent_fd=public_parent_fd,
+                    receipt_path,
+                    index_fd,
+                    receipt,
+                    label=f"orphan pending cleanup private phase {batch_name}",
+                    mutation_revalidator=require_orphan_receipt_boundary,
                 )
-                _require_pending_cleanup_fd_access_policy(
-                    quarantine_fd,
-                    quarantine_root,
-                    expected_mode=0o700,
-                )
-                if (
-                    _directory_identity(public_parent_fd) != public_parent_identity
-                    or not _bound_directory_matches(
-                        home, target.parent, public_parent_fd
-                    )
-                    or _directory_identity(quarantine_fd) != quarantine_identity
-                    or not _bound_directory_matches(
-                        home, quarantine_root, quarantine_fd
-                    )
-                ):
-                    raise SyncError(
-                        "orphan pending cleanup private-phase parent changed: "
-                        f"{batch_name}"
-                    )
-                public_names = (target.name,) + (
-                    _pending_ephemeral_public_alias_names(batch_name)
-                )
-                private_names = _pending_ephemeral_quarantine_evidence_names(batch_name)
-                if any(
-                    _named_entry_identity(public_parent_fd, name) is not None
-                    for name in public_names
-                ):
-                    raise SyncError(
-                        "orphan pending cleanup public entry was retained in place: "
-                        f"{batch_name}"
-                    )
-                if any(
-                    _named_entry_identity(quarantine_fd, name) is not None
-                    for name in private_names
-                ):
-                    raise SyncError(
-                        "orphan pending cleanup private evidence was retained: "
-                        f"{batch_name}"
-                    )
             finally:
-                _close_fd_quietly(quarantine_fd)
+                _close_fd_quietly(index_fd)
                 _close_fd_quietly(public_parent_fd)
+                _close_fd_quietly(quarantine_fd)
         except (FileNotFoundError, OSError, SyncError) as error:
             raise _pending_cleanup_authority_classification_error(
                 batch_name,
                 error,
             ) from error
-        index_fd = _open_directory_beneath(home, index_root)
-        try:
-            _isolate_and_delete_pending_cleanup_file(
-                home,
-                receipt_path,
-                index_fd,
-                receipt,
-                label=f"orphan pending cleanup private phase {batch_name}",
-            )
-        finally:
-            _close_fd_quietly(index_fd)
         cleaned += 1
         action_budget.mark_batch_completed(batch_name)
     return cleaned

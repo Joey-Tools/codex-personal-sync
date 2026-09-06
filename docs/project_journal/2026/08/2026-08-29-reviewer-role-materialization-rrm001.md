@@ -663,3 +663,26 @@ superseded_by:
   hard-link replay from retained evidence. Public v1 candidates therefore
   remain fail closed; only an already-bound private alias may advance through
   the existing private-authority anchor.
+- The next frozen audit closed four final mutation-boundary findings without
+  weakening that fail-closed contract. Allocation close now detaches all four
+  owned descriptors before the first close syscall and closes the saved values
+  best-effort before rethrowing the first `BaseException`; a reused descriptor
+  can therefore never be closed by a retry or finalizer. v5/v7 canonical batch
+  isolation rechecks the bound quarantine root access policy immediately before
+  its rename. v6 private payload cleanup moves the exact object to a random
+  final-private tombstone, binds an open descriptor through the unlink, and
+  rechecks identity, content, access policy, link count, parent bindings,
+  ticket, and phase receipt. Terminal receipt deletion in both the main and
+  orphan paths now revalidates the public/private namespace and every
+  recoverable ticket representation at its mutation boundary.
+- The associated regressions cover descriptor-number reuse after a post-close
+  `BaseException`, v5/v7 mode and Darwin ACL drift, final-private replacement
+  and restart recovery, phase-receipt replacement, public replay after ticket
+  deletion, retained ticket forms, and orphan receipt deletion. Local
+  `/usr/bin/python3` 3.9.6 passed the exact CI selections (56 tests), the
+  regular-to-symlink compatibility selections (2 tests), and the complete
+  pending-staging module (81 tests). The two cleanup modules passed 133 tests
+  on the default interpreter; source-lock tests, lock regeneration/check,
+  Ruff lint/format, `actionlint`, Python compilation, and `git diff --check`
+  also passed. A newly frozen signed exact-head whole-range review and full
+  discovery remain required before pushing the repaired PR head.

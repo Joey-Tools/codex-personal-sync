@@ -69,6 +69,8 @@ jobs:
           tests.test_quarantine_empty_batch_reclaim
           tests.test_pending_staging_cleanup.PendingStagingCleanupTests.test_atomic_authority_publisher_rejects_foreign_owner_uid
           tests.test_pending_staging_cleanup.PendingStagingCleanupTests.test_cleanup_ticket_file_exists_race_rejects_foreign_owner_uid
+          tests.test_pending_staging_cleanup.PendingStagingCleanupTests.test_v5_v7_batch_isolation_rechecks_quarantine_root_policy
+          tests.test_pending_staging_cleanup.PendingStagingCleanupTests.test_v7_batch_isolation_rechecks_quarantine_root_acl
       - name: Run Python 3.9 regular-to-symlink migration recovery tests
         if: matrix.python-version == '3.9'
         run: >-
