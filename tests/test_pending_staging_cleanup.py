@@ -36,6 +36,50 @@ class PendingStagingCleanupTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def _assert_internal_publication_cleanup_failure(
+        self,
+        publish,
+        *,
+        publication_failure: str,
+    ) -> None:
+        if callable(getattr(MODULE.SyncError("probe"), "add_note", None)):
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                publication_failure,
+            ) as raised:
+                publish()
+            creation_error = raised.exception.__cause__
+            self.assertIsInstance(
+                creation_error,
+                MODULE._PendingCleanupAccessPolicyError,
+            )
+            assert creation_error is not None
+            self.assertIn("access policy mismatch", str(creation_error))
+            notes = "\n".join(getattr(creation_error, "__notes__", ()))
+            self.assertIn("final name could not be safely cleared", notes)
+            self.assertIn(
+                "failed to allocate a retained pending cleanup name",
+                notes,
+            )
+        else:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "final name could not be safely cleared",
+            ) as raised:
+                publish()
+            self.assertIn("access policy mismatch", str(raised.exception))
+            self.assertIn(
+                "failed to allocate a retained pending cleanup name",
+                str(raised.exception),
+            )
+            cleanup_error = raised.exception.__cause__
+            self.assertIsInstance(cleanup_error, MODULE.SyncError)
+            assert cleanup_error is not None
+            self.assertIn(
+                "failed to allocate a retained pending cleanup name",
+                str(cleanup_error),
+            )
+
     def test_existing_quarantine_directory_is_opened_once(self) -> None:
         batch_root = self.root / "batch-existing-directory"
         child = batch_root / "pending"
@@ -1485,15 +1529,16 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 "_rename_noreplace_at",
                 side_effect=publish_foreign_owner_race,
             ),
-            self.assertRaisesRegex(
-                MODULE.SyncError,
-                "atomic internal authority appeared with changed content",
-            ),
         ):
-            MODULE._publish_atomic_exclusive_internal_file(
-                self.home,
-                raced_path,
-                payload,
+            self._assert_internal_publication_cleanup_failure(
+                lambda: MODULE._publish_atomic_exclusive_internal_file(
+                    self.home,
+                    raced_path,
+                    payload,
+                ),
+                publication_failure=(
+                    "atomic internal authority appeared with changed content"
+                ),
             )
 
     def test_cleanup_ticket_file_exists_race_rejects_foreign_owner_uid(
@@ -1525,15 +1570,16 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 "_rename_noreplace_at",
                 side_effect=publish_foreign_owner_race,
             ),
-            self.assertRaisesRegex(
-                MODULE.SyncError,
-                "pending cleanup ticket appeared with changed content",
-            ),
         ):
-            MODULE._publish_pending_cleanup_ticket(
-                self.home,
-                ticket_path,
-                payload,
+            self._assert_internal_publication_cleanup_failure(
+                lambda: MODULE._publish_pending_cleanup_ticket(
+                    self.home,
+                    ticket_path,
+                    payload,
+                ),
+                publication_failure=(
+                    "pending cleanup ticket appeared with changed content"
+                ),
             )
 
     def test_ticket_temp_publisher_recovers_truncated_rollback_and_staging_temps(

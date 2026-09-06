@@ -62,6 +62,13 @@ jobs:
         run: >-
           python3 -m unittest
           tests.test_pending_agent_claim_compatibility.PendingAgentClaimCompatibilityTests.test_internal_file_fchmod_and_cleanup_failure_remains_fail_closed
+      - name: Run Python 3.9 quarantine cleanup compatibility tests
+        if: matrix.python-version == '3.9'
+        run: >-
+          python3 -m unittest
+          tests.test_quarantine_empty_batch_reclaim
+          tests.test_pending_staging_cleanup.PendingStagingCleanupTests.test_atomic_authority_publisher_rejects_foreign_owner_uid
+          tests.test_pending_staging_cleanup.PendingStagingCleanupTests.test_cleanup_ticket_file_exists_race_rejects_foreign_owner_uid
       - name: Run Python 3.9 regular-to-symlink migration recovery tests
         if: matrix.python-version == '3.9'
         run: >-

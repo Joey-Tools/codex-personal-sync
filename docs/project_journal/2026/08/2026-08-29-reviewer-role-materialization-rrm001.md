@@ -91,8 +91,9 @@ superseded_by:
 
 ## Next Steps
 
-- Commit the allocation-owned descriptor repair, then repeat the full-range
-  fresh-context GPT-5.6 Sol Ultra review of the resulting signed frozen head.
+- Commit the Python 3.9 cleanup-assertion compatibility repair, then repeat
+  the full-range fresh-context GPT-5.6 Sol Ultra review of the resulting
+  signed frozen head.
 - Propagate the actual squash-landed canonical commit through toolbox and the
   private overlay using the receipt-bound release chain.
 - Smoke-test the installed reviewer role without a path override on every
@@ -651,3 +652,14 @@ superseded_by:
   process-group deadlines and retained logs. A signed frozen exact-head
   whole-range review remains required before the provider findings are
   resolved.
+- A later frozen review found that cleanup-race assertions only modeled the
+  Python 3.11 `BaseException.add_note` path. The tests now separately verify
+  the Python 3.9 combined-error fallback and the CI 3.9 lane runs the complete
+  quarantine reclaim module plus the two affected pending-publication races.
+  The same review proposed automatically completing an old v1 public cleanup
+  journal after a pre-unlink crash. An independent GPT-5.6 Sol Ultra
+  adjudication rejected that proposal: a v1 journal retained through batch
+  finalization cannot distinguish the genuine crash from a later exact
+  hard-link replay from retained evidence. Public v1 candidates therefore
+  remain fail closed; only an already-bound private alias may advance through
+  the existing private-authority anchor.

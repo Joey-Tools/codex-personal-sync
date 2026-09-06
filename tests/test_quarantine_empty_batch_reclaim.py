@@ -79,6 +79,39 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         metadata = self.source.stat()
         self.assertEqual((metadata.st_dev, metadata.st_ino), self.source_identity)
 
+    def _assert_created_leaf_cleanup_failure(
+        self,
+        name: str,
+        *,
+        original_failure: str,
+        cleanup_failure: str,
+    ) -> None:
+        if callable(getattr(MODULE.SyncError("probe"), "add_note", None)):
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "private isolation failed",
+            ) as raised:
+                self._evacuate_created_leaf(name)
+            original_error = raised.exception.__cause__
+            self.assertIsInstance(original_error, MODULE.SyncError)
+            assert original_error is not None
+            self.assertIn(original_failure, str(original_error))
+            notes = "\n".join(getattr(original_error, "__notes__", ()))
+            self.assertIn("could not be safely reclaimed", notes)
+            self.assertIn(cleanup_failure, notes)
+        else:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "could not be safely reclaimed",
+            ) as raised:
+                self._evacuate_created_leaf(name)
+            self.assertIn(original_failure, str(raised.exception))
+            self.assertIn(cleanup_failure, str(raised.exception))
+            cleanup_error = raised.exception.__cause__
+            self.assertIsInstance(cleanup_error, MODULE.SyncError)
+            assert cleanup_error is not None
+            self.assertIn(cleanup_failure, str(cleanup_error))
+
     def _evacuate_created_leaf(self, name: str) -> None:
         target = self.source_parent / name
         payload = b'role = "reviewer"\n'
@@ -332,15 +365,18 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
                 relocated_batch = quarantine_root / batch_root.name
                 (moved_root / batch_root.name).rename(relocated_batch)
 
-        with (
-            mock.patch.object(
-                MODULE,
-                "_create_ephemeral_quarantine_leaf_at",
-                side_effect=relocate_bound_batch_after_leaf_creation,
-            ),
-            self.assertRaisesRegex(MODULE.SyncError, "private isolation failed"),
+        with mock.patch.object(
+            MODULE,
+            "_create_ephemeral_quarantine_leaf_at",
+            side_effect=relocate_bound_batch_after_leaf_creation,
         ):
-            self._evacuate_created_leaf("created-root-replacement.toml")
+            self._assert_created_leaf_cleanup_failure(
+                "created-root-replacement.toml",
+                original_failure=(
+                    "ephemeral quarantine namespace changed before private rename"
+                ),
+                cleanup_failure="ephemeral quarantine root changed",
+            )
 
         self.assertIsNotNone(relocated_batch)
         assert relocated_batch is not None
@@ -537,15 +573,16 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
                 raise MODULE.SyncError("injected replaced-leaf validation failure")
             return real_require_access(directory_fd, display_path, *args, **kwargs)
 
-        with (
-            mock.patch.object(
-                MODULE,
-                "_require_pending_cleanup_fd_access_policy",
-                side_effect=replace_leaf_then_fail,
-            ),
-            self.assertRaisesRegex(MODULE.SyncError, "private isolation failed"),
+        with mock.patch.object(
+            MODULE,
+            "_require_pending_cleanup_fd_access_policy",
+            side_effect=replace_leaf_then_fail,
         ):
-            self._evacuate_created_leaf("replacement-race.toml")
+            self._assert_created_leaf_cleanup_failure(
+                "replacement-race.toml",
+                original_failure="injected replaced-leaf validation failure",
+                cleanup_failure="ephemeral quarantine leaf changed",
+            )
 
         self.assertIsNotNone(replaced_batch)
         self.assertIsNotNone(replacement_identity)
@@ -732,9 +769,12 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
                 "_discard_empty_ephemeral_quarantine_batch",
                 side_effect=observe_discard,
             ),
-            self.assertRaisesRegex(MODULE.SyncError, "private isolation failed"),
         ):
-            self._evacuate_created_leaf("root-replacement.toml")
+            self._assert_created_leaf_cleanup_failure(
+                "root-replacement.toml",
+                original_failure="injected quarantine root replacement",
+                cleanup_failure="ephemeral quarantine root changed",
+            )
 
         self.assertEqual(discard_calls, 1)
         self.assertIsNotNone(original_root_identity)
@@ -1183,20 +1223,48 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             (moved_root / binding.batch_root.name).rename(relocated_batch)
             raise SystemExit("injected allocator root drift")
 
-        with (
-            mock.patch.object(
-                MODULE,
-                "EphemeralQuarantineBatchAllocation",
-                side_effect=replace_root_then_interrupt,
-            ),
-            self.assertRaisesRegex(SystemExit, "allocator root drift"),
+        with mock.patch.object(
+            MODULE,
+            "EphemeralQuarantineBatchAllocation",
+            side_effect=replace_root_then_interrupt,
         ):
-            MODULE._quarantine_batch_root(
-                self.home,
-                [],
-                retain_binding=True,
-                retain_scaffold_binding=True,
-            )
+            if callable(getattr(SystemExit(), "add_note", None)):
+                with self.assertRaisesRegex(
+                    SystemExit,
+                    "allocator root drift",
+                ) as raised:
+                    MODULE._quarantine_batch_root(
+                        self.home,
+                        [],
+                        retain_binding=True,
+                        retain_scaffold_binding=True,
+                    )
+                notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+                self.assertIn("bound empty scaffold was retained", notes)
+                self.assertIn("ephemeral quarantine root changed", notes)
+            else:
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "bound empty scaffold was retained",
+                ) as raised:
+                    MODULE._quarantine_batch_root(
+                        self.home,
+                        [],
+                        retain_binding=True,
+                        retain_scaffold_binding=True,
+                    )
+                self.assertIn("allocator root drift", str(raised.exception))
+                self.assertIn(
+                    "ephemeral quarantine root changed",
+                    str(raised.exception),
+                )
+                cleanup_error = raised.exception.__cause__
+                self.assertIsInstance(cleanup_error, MODULE.SyncError)
+                assert cleanup_error is not None
+                self.assertIn(
+                    "ephemeral quarantine root changed",
+                    str(cleanup_error),
+                )
 
         self.assertIsNotNone(relocated_batch)
         assert relocated_batch is not None
