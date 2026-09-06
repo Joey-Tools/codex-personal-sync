@@ -738,3 +738,32 @@ superseded_by:
   passed, and complete repository-private discovery passed 1,579 tests with
   two expected skips in 1,076.901 seconds. A new frozen exact-head whole-range
   review remains required before remote publication.
+- The following fresh frozen review found two related P2 boundaries in that
+  blocking-only classifier. First, v5/v7 cleanup could delete its canonical
+  ticket and then retire the exact `.empty-proof` while a retained or
+  suffix-added ticket representation remained. The proof now revalidates the
+  representation absence on the same bound index descriptor before its
+  canonical-to-retained rename and again before its retained unlink; malformed
+  names remain blocking evidence only and never become restoration or deletion
+  authority. Second, a malformed representation could be invisible to status
+  and dry-run planning while the real mutation gate rejected it. A shared
+  unresolved-representation classifier now rejects every related noncanonical
+  form before planning, reports it as managed-state drift in ordinary status,
+  and prevents install and overlay-uninstall dry runs from claiming that it can
+  be auto-cleaned. The ready-state observer scans the entire control namespace
+  and raises the same error if residue appears after an earlier preflight scan,
+  so an ordinary ready marker cannot downgrade a late ambiguity to a
+  `would clean` plan.
+- New regressions cover v5 retained and v7 suffixed evidence after canonical
+  ticket deletion, the proof's final-unlink race, malformed direct and
+  retained forms in status/install/uninstall dry-run, and a late-residue race
+  coexisting with an ordinary ready marker. The complete discovery initially
+  exposed three test-harness compatibility errors from the new preflight and
+  callback: a cursor-FD fault injection now explicitly isolates the new gate,
+  and an existing empty-proof mock accepts and forwards the new revalidator.
+  The final focused selection passed 9 tests in 6.210 seconds. The 11-source
+  lock was refreshed and checked; Ruff lint, Python compilation, and
+  `git diff --check` passed. The final repository-private discovery passed
+  1,583 tests with two expected skips in 1,125.110 seconds. A new signed
+  frozen exact-head whole-range review remains required before remote
+  publication.

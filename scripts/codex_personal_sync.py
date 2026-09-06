@@ -28490,25 +28490,46 @@ def _delete_pending_cleanup_empty_proof(
     ticket: PendingBatchCleanupTicket,
     quarantine_root_identity: tuple[int, int],
 ) -> None:
-    proof = _read_pending_cleanup_empty_proof(
-        home,
-        ticket,
-        quarantine_root_identity,
-    )
-    if proof is None:
-        return
     proof_path = _pending_cleanup_empty_proof_path(
         home,
         ticket.batch_root.name,
     )
     index_fd = _open_directory_beneath(home, proof_path.parent)
     try:
+        # v5/v7 retire an allocation after the proof is gone.  A canonical
+        # ticket may have just been deleted while a retained or suffix-added
+        # representation of its exact bytes remains.  Such a representation is
+        # blocking evidence only: it must never gain recovery or deletion
+        # authority, but the proof must survive so canonical recovery does not
+        # lose its exact empty-batch evidence.
+        mutation_revalidator: Callable[[str], None] | None = None
+        if ticket.version in {5, 7}:
+
+            def revalidate_ticket_representations(_proof_member: str) -> None:
+                _require_pending_ephemeral_ticket_representations_absent(
+                    home,
+                    proof_path.parent,
+                    index_fd,
+                    ticket.batch_root.name,
+                )
+
+            mutation_revalidator = revalidate_ticket_representations
+            mutation_revalidator(proof_path.name)
+
+        proof = _read_pending_cleanup_empty_proof(
+            home,
+            ticket,
+            quarantine_root_identity,
+        )
+        if proof is None:
+            return
         _isolate_and_delete_pending_cleanup_file(
             home,
             proof_path,
             index_fd,
             proof,
             label=f"pending cleanup empty proof {ticket.batch_root.name}",
+            mutation_revalidator=mutation_revalidator,
         )
     finally:
         _close_fd_quietly(index_fd)
@@ -30004,6 +30025,82 @@ def _pending_cleanup_retained_control_name(
     return None
 
 
+def _pending_cleanup_unresolved_ticket_representation(
+    name: str,
+) -> tuple[str, str] | None:
+    """Return only ticket-derived residue that cannot enter auto-recovery.
+
+    The broad representation classifier deliberately recognizes suffix-added
+    descendants, because their bytes can be the only surviving ticket evidence.
+    Exact canonical tickets, their exact temporary form, and strict retained
+    forms remain eligible for the existing bound recovery protocol.  Every
+    other related name is a blocking ambiguity, never recovery authority.
+    """
+    batch_name = _pending_cleanup_ticket_representation_batch_name(name)
+    if batch_name is None:
+        return None
+    canonical_ticket_name = batch_name + PENDING_CLEANUP_TICKET_SUFFIX
+    if name in {
+        canonical_ticket_name,
+        batch_name + PENDING_CLEANUP_TICKET_TEMP_SUFFIX,
+    }:
+        return None
+    retained_control = _pending_cleanup_retained_control_name(name)
+    if (
+        retained_control is not None
+        and retained_control[1] == batch_name
+        and retained_control[0] == canonical_ticket_name
+    ):
+        return None
+    retained_temp = _pending_cleanup_retained_ticket_temp_name(name)
+    if retained_temp is not None and retained_temp[1] == batch_name:
+        return None
+    return batch_name, name
+
+
+def _pending_cleanup_unresolved_ticket_representation_issue(
+    home: Path,
+) -> tuple[str, str] | None:
+    """Observe blocking ticket residue without granting it any authority."""
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return None
+    try:
+        if not _bound_directory_matches(home, index_root, index_fd):
+            raise SyncError("pending cleanup index changed")
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending cleanup authority scan exceeds the size limit",
+        )
+        for name in names:
+            unresolved = _pending_cleanup_unresolved_ticket_representation(name)
+            if unresolved is not None:
+                return unresolved
+        return None
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _pending_cleanup_unresolved_ticket_representation_error(
+    unresolved: tuple[str, str],
+) -> SyncError:
+    batch_name, name = unresolved
+    return SyncError(
+        "pending cleanup ticket representation must be reconciled before new "
+        f"mutation: {batch_name}: {name}"
+    )
+
+
+def _require_no_pending_unresolved_ticket_representations(home: Path) -> None:
+    unresolved = _pending_cleanup_unresolved_ticket_representation_issue(home)
+    if unresolved is None:
+        return
+    raise _pending_cleanup_unresolved_ticket_representation_error(unresolved)
+
+
 def _restore_pending_cleanup_control_tombstones(
     home: Path,
     *,
@@ -30951,15 +31048,13 @@ def _cleanup_orphan_pending_ephemeral_private_phases(
 def _pending_cleanup_ready_batch_is_observed(home: Path) -> bool:
     if not _pending_link_pointer_is_absent(home):
         return False
-    if _discover_pending_staging_markers(home):
-        return True
-    if _discover_pending_staging_marker_temps(home):
-        return True
+    cleanup_ready = bool(_discover_pending_staging_markers(home))
+    cleanup_ready = bool(_discover_pending_staging_marker_temps(home)) or cleanup_ready
     index_root = _pending_cleanup_index_path(home)
     try:
         index_fd = _open_directory_beneath(home, index_root)
     except FileNotFoundError:
-        return False
+        return cleanup_ready
     try:
         if not _bound_directory_matches(home, index_root, index_fd):
             raise SyncError("pending cleanup index changed")
@@ -30969,9 +31064,20 @@ def _pending_cleanup_ready_batch_is_observed(home: Path) -> bool:
                     raise SyncError(
                         "pending cleanup ticket scan exceeds the size limit"
                     )
+                unresolved = _pending_cleanup_unresolved_ticket_representation(
+                    entry.name
+                )
+                if unresolved is not None:
+                    # Do not collapse unclassified ticket-derived bytes into a
+                    # generic cleanup plan.  A caller may have checked moments
+                    # earlier; this complete scan is the final observation
+                    # before status or dry-run reports a recoverable action.
+                    raise _pending_cleanup_unresolved_ticket_representation_error(
+                        unresolved
+                    )
                 retained = _pending_cleanup_retained_control_name(entry.name)
                 if retained is not None:
-                    return True
+                    cleanup_ready = True
                 if (
                     _pending_cleanup_ticket_temp_batch_name(entry.name) is not None
                     or _pending_cleanup_retained_ticket_temp_name(entry.name)
@@ -30983,7 +31089,7 @@ def _pending_cleanup_ready_batch_is_observed(home: Path) -> bool:
                     or _pending_cleanup_cursor_temp_canonical_name(entry.name)
                     is not None
                 ):
-                    return True
+                    cleanup_ready = True
                 for suffix in (
                     PENDING_QUARANTINE_ALLOCATION_SUFFIX,
                     PENDING_CLEANUP_TICKET_SUFFIX,
@@ -30997,8 +31103,8 @@ def _pending_cleanup_ready_batch_is_observed(home: Path) -> bool:
                         len(batch_name) <= MAX_PENDING_LINK_BATCH_NAME_BYTES
                         and PENDING_LINK_BATCH_RE.fullmatch(batch_name) is not None
                     ):
-                        return True
-        return False
+                        cleanup_ready = True
+        return cleanup_ready
     finally:
         _close_fd_quietly(index_fd)
 
@@ -31099,6 +31205,7 @@ def _cleanup_ready_pending_batches(
 ) -> int:
     if not _pending_link_pointer_is_absent(home):
         return 0
+    _require_no_pending_unresolved_ticket_representations(home)
     action_budget = budget or PendingCleanupActionBudget(
         MAX_PENDING_CLEANUP_BATCHES_PER_RUN
     )
@@ -31234,6 +31341,7 @@ def _require_no_pending_terminal_mutation_authority(home: Path) -> None:
         raise SyncError(
             "active pending transaction must be recovered before new mutation"
         )
+    _require_no_pending_unresolved_ticket_representations(home)
     index_root = _pending_cleanup_index_path(home)
     try:
         index_fd = _open_directory_beneath(home, index_root)
@@ -31298,13 +31406,13 @@ def _require_no_pending_terminal_mutation_authority(home: Path) -> None:
                 "retained pending cleanup authority must be reconciled before "
                 f"new mutation: {retained[1]}"
             )
-        related_ticket_batch_name = _pending_cleanup_ticket_representation_batch_name(
-            name
+        unresolved_ticket_representation = (
+            _pending_cleanup_unresolved_ticket_representation(name)
         )
-        if (
-            related_ticket_batch_name is not None
-            and name != related_ticket_batch_name + PENDING_CLEANUP_TICKET_SUFFIX
-        ):
+        if unresolved_ticket_representation is not None:
+            related_ticket_batch_name, _related_ticket_name = (
+                unresolved_ticket_representation
+            )
             raise SyncError(
                 "pending cleanup ticket representation must be reconciled before "
                 f"new mutation: {related_ticket_batch_name}"
@@ -37556,6 +37664,7 @@ def _preflight_pending_recovery(
     cleanup_budget: PendingCleanupActionBudget | None = None,
 ) -> bool:
     home = home.expanduser()
+    _require_no_pending_unresolved_ticket_representations(home)
     action_budget = cleanup_budget or PendingCleanupActionBudget(
         MAX_PENDING_CLEANUP_BATCHES_PER_RUN
     )
@@ -37655,6 +37764,7 @@ def _install_release_set_unlocked(
 ) -> None:
     releases = _normalize_install_releases(releases)
     home = home.expanduser()
+    _require_no_pending_unresolved_ticket_representations(home)
     action_budget = cleanup_budget or PendingCleanupActionBudget(
         MAX_PENDING_CLEANUP_BATCHES_PER_RUN
     )
@@ -40131,6 +40241,16 @@ def status(home: Path, owner: str = PUBLIC_OWNER) -> bool:
     pending_authority_issues: list[str] = []
     if not _pending_link_pointer_is_absent(home):
         pending_authority_issues.append("active pending transaction must be recovered")
+    elif (
+        unresolved_ticket_representation := (
+            _pending_cleanup_unresolved_ticket_representation_issue(home)
+        )
+    ) is not None:
+        batch_name, member_name = unresolved_ticket_representation
+        pending_authority_issues.append(
+            "pending cleanup ticket representation must be reconciled before new "
+            f"mutation: {batch_name}: {member_name}"
+        )
     elif _pending_cleanup_ready_batch_is_observed(home):
         pending_authority_issues.append(
             "finalized or interrupted pending transaction must be cleaned"
@@ -42360,6 +42480,7 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
     cleanup_budget = PendingCleanupActionBudget(MAX_PENDING_CLEANUP_BATCHES_PER_RUN)
 
     def apply_uninstall() -> None:
+        _require_no_pending_unresolved_ticket_representations(home)
         if dry_run and _pending_cleanup_ready_batch_is_observed(home):
             print(
                 "would clean a finalized or interrupted pending transaction under "

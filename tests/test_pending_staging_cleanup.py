@@ -2503,6 +2503,10 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     ),
                     mock.patch.object(
                         MODULE,
+                        "_require_no_pending_unresolved_ticket_representations",
+                    ),
+                    mock.patch.object(
+                        MODULE,
                         "_restore_pending_cleanup_control_tombstones",
                     ),
                     mock.patch.object(
@@ -4187,6 +4191,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
         self.assertFalse(deleted_ticket.path.exists())
         self.assertTrue(malformed_ticket.is_file())
         self.assertEqual(malformed_ticket.read_bytes(), deleted_ticket.snapshot.payload)
+
         self.assertEqual(
             (malformed_ticket.stat().st_dev, malformed_ticket.stat().st_ino),
             deleted_ticket.snapshot.file_identity,
@@ -4209,6 +4214,196 @@ class PendingStagingCleanupTests(unittest.TestCase):
 
         self.assertTrue(malformed_ticket.is_file())
         self.assertEqual(malformed_ticket.read_bytes(), deleted_ticket.snapshot.payload)
+
+    def test_v5_v7_empty_proof_survives_ticket_representation_after_delete(
+        self,
+    ) -> None:
+        for version, representation_kind in ((5, "retained"), (7, "suffixed")):
+            with self.subTest(
+                ticket_version=version,
+                representation_kind=representation_kind,
+            ):
+                case_home = self.root / (
+                    f"ephemeral-v{version}-{representation_kind}-ticket-proof"
+                )
+                if version == 5:
+                    install(self.first_release, case_home, SHA_A)
+                    ticket = self._make_v5_empty_ticket(
+                        case_home,
+                        case_home / ROLE_TARGET,
+                    )
+                else:
+                    case_home.mkdir()
+                    allocation = MODULE._quarantine_batch_root(
+                        case_home,
+                        [],
+                        retain_binding=True,
+                        retain_scaffold_binding=True,
+                    )
+                    self.assertIsInstance(
+                        allocation,
+                        MODULE.EphemeralQuarantineBatchAllocation,
+                    )
+                    assert isinstance(
+                        allocation,
+                        MODULE.EphemeralQuarantineBatchAllocation,
+                    )
+                    ticket = MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+                        case_home,
+                        allocation.binding,
+                    )
+                    allocation.revoke_reclaim()
+                    allocation.close()
+
+                proof_path = MODULE._pending_cleanup_empty_proof_path(
+                    case_home,
+                    ticket.batch_root.name,
+                )
+                retained_name = next(
+                    MODULE._retained_pending_cleanup_names(ticket.path)
+                )
+                if representation_kind == "suffixed":
+                    retained_name += ".extra"
+                representation = ticket.path.with_name(retained_name)
+                ticket_payload = ticket.snapshot.payload
+                real_delete_ticket = MODULE._delete_pending_cleanup_ticket
+                represented = False
+
+                def represent_then_delete(home: Path, current_ticket) -> None:
+                    nonlocal represented
+                    if current_ticket.path == ticket.path and not represented:
+                        os.link(current_ticket.path, representation)
+                        represented = True
+                    real_delete_ticket(home, current_ticket)
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_delete_pending_cleanup_ticket",
+                        side_effect=represent_then_delete,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "ticket representation",
+                    ),
+                ):
+                    MODULE._cleanup_ready_pending_batches(case_home)
+
+                self.assertTrue(represented)
+                self.assertFalse(ticket.path.exists())
+                self.assertFalse(ticket.batch_root.exists())
+                self.assertTrue(representation.is_file())
+                self.assertEqual(representation.read_bytes(), ticket_payload)
+                self.assertTrue(proof_path.is_file())
+
+                if representation_kind == "retained":
+                    self.assertEqual(
+                        MODULE._cleanup_ready_pending_batches(case_home),
+                        1,
+                    )
+                    self.assertFalse(representation.exists())
+                    self.assertFalse(proof_path.exists())
+                else:
+                    with self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "ticket representation",
+                    ):
+                        MODULE._cleanup_ready_pending_batches(case_home)
+                    self.assertTrue(representation.is_file())
+                    self.assertEqual(representation.read_bytes(), ticket_payload)
+                    self.assertTrue(proof_path.is_file())
+
+    def test_v7_empty_proof_final_unlink_rechecks_ticket_representations(
+        self,
+    ) -> None:
+        case_home = self.root / "ephemeral-v7-proof-final-unlink"
+        case_home.mkdir()
+        allocation = MODULE._quarantine_batch_root(
+            case_home,
+            [],
+            retain_binding=True,
+            retain_scaffold_binding=True,
+        )
+        self.assertIsInstance(
+            allocation,
+            MODULE.EphemeralQuarantineBatchAllocation,
+        )
+        assert isinstance(
+            allocation,
+            MODULE.EphemeralQuarantineBatchAllocation,
+        )
+        ticket = MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+            case_home,
+            allocation.binding,
+        )
+        allocation.revoke_reclaim()
+        allocation.close()
+
+        proof_path = MODULE._pending_cleanup_empty_proof_path(
+            case_home,
+            ticket.batch_root.name,
+        )
+        malformed_ticket = ticket.path.with_name(ticket.path.name + ".late")
+        real_require = MODULE._require_pending_ephemeral_ticket_representations_absent
+        boundary_checks = 0
+
+        def inject_ticket_at_final_proof_unlink(
+            home: Path,
+            index_root: Path,
+            index_fd: int,
+            batch_name: str,
+        ) -> None:
+            nonlocal boundary_checks
+            boundary_checks += 1
+            if boundary_checks == 3:
+                malformed_ticket.write_bytes(ticket.snapshot.payload or b"")
+                malformed_ticket.chmod(0o600)
+            real_require(
+                home,
+                index_root,
+                index_fd,
+                batch_name,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_require_pending_ephemeral_ticket_representations_absent",
+                side_effect=inject_ticket_at_final_proof_unlink,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "ticket representation remained",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(case_home)
+
+        self.assertEqual(boundary_checks, 3)
+        self.assertFalse(ticket.path.exists())
+        self.assertFalse(ticket.batch_root.exists())
+        self.assertTrue(malformed_ticket.is_file())
+        self.assertFalse(proof_path.exists())
+        retained_proofs = tuple(
+            proof_path.parent.glob(
+                f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}{proof_path.name}-*"
+            )
+        )
+        self.assertEqual(len(retained_proofs), 1)
+        parsed_retained = MODULE._pending_cleanup_retained_control_name(
+            retained_proofs[0].name
+        )
+        self.assertEqual(
+            parsed_retained,
+            (proof_path.name, ticket.batch_root.name),
+        )
+        self.assertEqual(retained_proofs[0].stat().st_mode & 0o777, 0o600)
+        self.assertEqual(
+            retained_proofs[0].read_bytes(),
+            MODULE._pending_cleanup_empty_proof_payload(
+                ticket,
+                ticket.quarantine_root_identity,
+            ),
+        )
 
     def test_v6_ephemeral_cleanup_orphan_phase_preserves_foreign_after_ticket_delete(
         self,
@@ -4914,6 +5109,167 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 ticket = self._publish_legacy_cleanup_ticket(version=version)
                 MODULE._require_no_pending_terminal_mutation_authority(self.home)
                 self.assertTrue(ticket.path.is_file())
+
+    def test_malformed_ticket_representations_fail_closed_in_read_only_paths(
+        self,
+    ) -> None:
+        index_root = MODULE._pending_cleanup_index_path(self.home)
+        index_root.mkdir(parents=True, exist_ok=True)
+        batch_name = "20260901T000000Z-5-0"
+        representations = (
+            index_root / f"{batch_name}.json.extra",
+            index_root
+            / (
+                f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}{batch_name}.json-"
+                "123-0000000000000001.extra"
+            ),
+        )
+
+        for representation in representations:
+            with self.subTest(representation=representation.name):
+                representation.write_bytes(b"retained ticket evidence\n")
+                representation.chmod(0o600)
+                evidence_before = representation.read_bytes()
+
+                status_output = io.StringIO()
+                with contextlib.redirect_stdout(status_output):
+                    healthy = MODULE.status(self.home)
+                self.assertFalse(healthy)
+                self.assertIn(
+                    "pending cleanup ticket representation must be reconciled",
+                    status_output.getvalue(),
+                )
+
+                install_output = io.StringIO()
+                with (
+                    contextlib.redirect_stdout(install_output),
+                    mock.patch.object(MODULE, "_source_release_identity") as source,
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "pending cleanup ticket representation must be reconciled",
+                    ),
+                ):
+                    MODULE.install_release_tree(
+                        self.next_release,
+                        self.home,
+                        SHA_B,
+                        dry_run=True,
+                    )
+                source.assert_not_called()
+                self.assertNotIn("would clean", install_output.getvalue())
+
+                uninstall_output = io.StringIO()
+                with (
+                    contextlib.redirect_stdout(uninstall_output),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "pending cleanup ticket representation must be reconciled",
+                    ),
+                ):
+                    MODULE.uninstall_overlay(
+                        self.home,
+                        "private",
+                        dry_run=True,
+                    )
+                self.assertNotIn("would clean", uninstall_output.getvalue())
+                self.assertTrue(representation.is_file())
+                self.assertEqual(representation.read_bytes(), evidence_before)
+                representation.unlink()
+
+    def test_read_only_ready_observation_rechecks_late_ticket_representation(
+        self,
+    ) -> None:
+        index_root = MODULE._pending_cleanup_index_path(self.home)
+        index_root.mkdir(parents=True, exist_ok=True)
+        ready_batch = "20260901T000000Z-5-1"
+        ready_marker = index_root / (
+            ready_batch + MODULE.PENDING_CLEANUP_EMPTY_PROOF_SUFFIX
+        )
+        ready_marker.write_bytes(b"ordinary cleanup-ready marker\n")
+        ready_marker.chmod(0o600)
+        unresolved_batch = "20260901T000000Z-5-2"
+        malformed_ticket = index_root / f"{unresolved_batch}.json.extra"
+        real_observe = MODULE._pending_cleanup_unresolved_ticket_representation_issue
+
+        def inject_after_first_blocker_observation():
+            observations = 0
+
+            def observe_then_inject(home: Path):
+                nonlocal observations
+                unresolved = real_observe(home)
+                observations += 1
+                if observations == 1:
+                    malformed_ticket.write_bytes(b"late ticket evidence\n")
+                    malformed_ticket.chmod(0o600)
+                return unresolved
+
+            return observe_then_inject
+
+        status_output = io.StringIO()
+        with (
+            mock.patch.object(
+                MODULE,
+                "_pending_cleanup_unresolved_ticket_representation_issue",
+                side_effect=inject_after_first_blocker_observation(),
+            ),
+            contextlib.redirect_stdout(status_output),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup ticket representation must be reconciled",
+            ),
+        ):
+            MODULE.status(self.home)
+        self.assertNotIn(
+            "finalized or interrupted pending transaction must be cleaned",
+            status_output.getvalue(),
+        )
+
+        malformed_ticket.unlink()
+        install_output = io.StringIO()
+        with (
+            mock.patch.object(
+                MODULE,
+                "_pending_cleanup_unresolved_ticket_representation_issue",
+                side_effect=inject_after_first_blocker_observation(),
+            ),
+            mock.patch.object(MODULE, "_source_release_identity") as source,
+            contextlib.redirect_stdout(install_output),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup ticket representation must be reconciled",
+            ),
+        ):
+            MODULE.install_release_tree(
+                self.next_release,
+                self.home,
+                SHA_B,
+                dry_run=True,
+            )
+        source.assert_not_called()
+        self.assertNotIn("would clean", install_output.getvalue())
+
+        malformed_ticket.unlink()
+        uninstall_output = io.StringIO()
+        with (
+            mock.patch.object(
+                MODULE,
+                "_pending_cleanup_unresolved_ticket_representation_issue",
+                side_effect=inject_after_first_blocker_observation(),
+            ),
+            contextlib.redirect_stdout(uninstall_output),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup ticket representation must be reconciled",
+            ),
+        ):
+            MODULE.uninstall_overlay(
+                self.home,
+                "private",
+                dry_run=True,
+            )
+        self.assertNotIn("would clean", uninstall_output.getvalue())
+        self.assertTrue(ready_marker.is_file())
+        self.assertTrue(malformed_ticket.is_file())
 
 
 if __name__ == "__main__":
