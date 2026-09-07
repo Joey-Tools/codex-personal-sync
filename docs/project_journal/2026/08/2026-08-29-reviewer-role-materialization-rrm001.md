@@ -841,3 +841,21 @@ superseded_by:
   two expected skips in 1,101.205 seconds. The journal-only evidence update
   does not alter the reviewed production or test source range; it needs only
   lightweight documentation and lock checks before the signed frozen commit.
+- A fresh whole-range review then found that the v5/v7 joined-allocation
+  classifier was called after either cleanup entry point had opened its index
+  directory descriptor but before that descriptor entered the existing
+  `try`/`finally`. A malformed, replaced, or mismatched v8 control could
+  therefore raise during the join and leak the descriptor. Both entry points
+  now perform the joined read inside their existing `try`/`finally`, preserving
+  the same fail-closed ordering while guaranteeing descriptor release on that
+  exception path. A direct v7/v8 metadata-size-mismatch regression exercises
+  ticket deletion and empty-proof deletion separately and verifies every
+  tracked index descriptor is closed (`EBADF`) after the expected `SyncError`.
+- The new regression passed alone, and the affected reclaim, pending-staging,
+  and regular-materialization suite passed 317 tests in 148.393 seconds. The
+  eleven-source lock was refreshed and checked; Ruff lint/format, Python
+  syntax compilation, and `git diff --check` passed. Complete
+  repository-private discovery then passed 1,628 tests with two expected
+  skips in 1,308.322 seconds. Because this repair changes the reviewed source
+  and tests, it still requires a new signed frozen head and fresh exact-head
+  whole-range review before remote publication.

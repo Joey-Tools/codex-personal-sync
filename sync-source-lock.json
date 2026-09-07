@@ -23,7 +23,7 @@
     "engine": {
       "mode": "0755",
       "path": "scripts/codex_personal_sync.py",
-      "sha256": "17276348d0bee73ef64d56d830d1641f7fa0cf70467dd072cec855ea4ca9797a"
+      "sha256": "12803380907c860d76d87db2fee05c7e5e6f211cd337eca2f23626e84f5cf828"
     },
     "engine_tests": {
       "mode": "0644",
@@ -48,7 +48,7 @@
     "quarantine_empty_batch_reclaim_tests": {
       "mode": "0644",
       "path": "tests/test_quarantine_empty_batch_reclaim.py",
-      "sha256": "d4a74608832a776c63f2bb1f070bdb15eed8ca5d9b970228c4700cf55d354f1c"
+      "sha256": "be2a8e3d46a928acfc267b3b98a2568e1e608c2607e0439265d9733397201f69"
     },
     "reconciliation_safety_tests": {
       "mode": "0644",

@@ -30146,12 +30146,12 @@ def _delete_pending_cleanup_empty_proof(
         ticket.batch_root.name,
     )
     index_fd = _open_directory_beneath(home, proof_path.parent)
-    joined_allocation = (
-        _read_joined_quarantine_allocation_for_cleanup(home, ticket)
-        if ticket.version in {5, 7}
-        else None
-    )
     try:
+        joined_allocation = (
+            _read_joined_quarantine_allocation_for_cleanup(home, ticket)
+            if ticket.version in {5, 7}
+            else None
+        )
         # v5/v7 retire an allocation after the proof is gone.  A canonical
         # ticket may have just been deleted while a retained or suffix-added
         # representation of its exact bytes remains.  Such a representation is
@@ -31454,12 +31454,12 @@ def _delete_pending_cleanup_ticket(
     boundary_revalidator: Callable[[], None] | None = None,
 ) -> None:
     index_fd = _open_directory_beneath(home, ticket.path.parent)
-    joined_allocation = (
-        _read_joined_quarantine_allocation_for_cleanup(home, ticket)
-        if ticket.version in {5, 7}
-        else None
-    )
     try:
+        joined_allocation = (
+            _read_joined_quarantine_allocation_for_cleanup(home, ticket)
+            if ticket.version in {5, 7}
+            else None
+        )
         current = _read_managed_state_file_snapshot(
             home,
             ticket.path,

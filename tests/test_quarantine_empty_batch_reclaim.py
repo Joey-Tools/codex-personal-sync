@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import gc
 import importlib.util
 import io
@@ -2545,6 +2546,60 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         self.assertTrue(batch_root.is_dir())
         self.assertTrue(cleanup.path.is_file())
         self.assertTrue(allocation.path.is_file())
+
+    def test_v7_cleanup_join_failure_closes_all_opened_index_fds(self) -> None:
+        _batch_root, binding = self._allocate_unowned_scaffold()
+        cleanup = MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+            self.home,
+            binding,
+        )
+        allocation = binding.allocation_ticket
+        assert allocation is not None
+        self._rewrite_v8_metadata_size(allocation)
+
+        actions = (
+            (
+                "ticket deletion",
+                lambda: MODULE._delete_pending_cleanup_ticket(self.home, cleanup),
+            ),
+            (
+                "empty-proof deletion",
+                lambda: MODULE._delete_pending_cleanup_empty_proof(
+                    self.home,
+                    cleanup,
+                    cleanup.quarantine_root_identity,
+                ),
+            ),
+        )
+        for label, action in actions:
+            with self.subTest(entry_point=label):
+                real_open_directory = MODULE._open_directory_beneath
+                opened_index_fds: list[int] = []
+
+                def track_index_open(home: Path, path: Path) -> int:
+                    fd = real_open_directory(home, path)
+                    if path == cleanup.path.parent:
+                        opened_index_fds.append(fd)
+                    return fd
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_open_directory_beneath",
+                        side_effect=track_index_open,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "does not join cleanup authority",
+                    ),
+                ):
+                    action()
+
+                self.assertGreaterEqual(len(opened_index_fds), 2)
+                for fd in opened_index_fds:
+                    with self.assertRaises(OSError) as raised:
+                        os.fstat(fd)
+                    self.assertEqual(raised.exception.errno, errno.EBADF)
 
     def test_main_v7_cleanup_revalidates_v8_before_metadata_mutation(self) -> None:
         batch_root, binding = self._allocate_unowned_scaffold()
