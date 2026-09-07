@@ -2644,6 +2644,222 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         self.assertTrue(cleanup.path.is_file())
         self.assertTrue(allocation.path.is_file())
 
+    def test_v5_leaf_rmdir_retains_replacement_during_private_isolation(
+        self,
+    ) -> None:
+        allocation = MODULE._quarantine_batch_root(
+            self.home,
+            [],
+            retain_binding=True,
+            retain_scaffold_binding=True,
+        )
+        assert isinstance(allocation, MODULE.EphemeralQuarantineBatchAllocation)
+        allocation.create_leaf()
+        binding = allocation.binding
+        cleanup = binding.cleanup_ticket
+        allocation_ticket = binding.allocation_ticket
+        assert cleanup is not None
+        assert allocation_ticket is not None
+        assert binding.leaf_identity is not None
+        leaf = binding.batch_root / "leaf"
+        retained_leaf = binding.batch_root / "authorized-leaf"
+        allocation.revoke_reclaim()
+        allocation.close()
+        real_rename = MODULE._rename_noreplace_at
+        replaced = False
+        replacement_identity: tuple[int, int] | None = None
+
+        def replace_leaf_before_atomic_isolation(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal replaced, replacement_identity
+            if (
+                not replaced
+                and source_name == "leaf"
+                and destination_name.startswith(
+                    MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+                )
+            ):
+                leaf.rename(retained_leaf)
+                leaf.mkdir(mode=0o700)
+                replacement = leaf.stat()
+                replacement_identity = (replacement.st_dev, replacement.st_ino)
+                replaced = True
+            real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=replace_leaf_before_atomic_isolation,
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "leaf changed before removal"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, cleanup)
+
+        self.assertTrue(replaced)
+        self.assertIsNotNone(replacement_identity)
+        retained_evidence = list(
+            binding.batch_root.glob(MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX + "*")
+        )
+        self.assertEqual(len(retained_evidence), 1)
+        self.assertEqual(
+            (
+                retained_evidence[0].stat().st_dev,
+                retained_evidence[0].stat().st_ino,
+            ),
+            replacement_identity,
+        )
+        self.assertEqual(
+            (retained_leaf.stat().st_dev, retained_leaf.stat().st_ino),
+            binding.leaf_identity,
+        )
+        self.assertFalse(leaf.exists())
+        self.assertEqual(tuple(retained_evidence[0].iterdir()), ())
+        self.assertTrue(cleanup.path.is_file())
+        self.assertTrue(allocation_ticket.path.is_file())
+
+    def test_v7_batch_rmdir_retains_replacement_during_private_isolation(
+        self,
+    ) -> None:
+        batch_root, binding = self._allocate_unowned_scaffold()
+        cleanup = MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+            self.home,
+            binding,
+        )
+        allocation_ticket = binding.allocation_ticket
+        assert allocation_ticket is not None
+        isolated = batch_root.with_name(cleanup.isolated_name or "")
+        retained_batch = isolated.with_name(isolated.name + ".authorized")
+        proof = MODULE._pending_cleanup_empty_proof_path(self.home, batch_root.name)
+        real_rename = MODULE._rename_noreplace_at
+        replaced = False
+        replacement_identity: tuple[int, int] | None = None
+
+        def replace_batch_before_atomic_isolation(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal replaced, replacement_identity
+            if (
+                not replaced
+                and source_name == isolated.name
+                and destination_name.startswith(
+                    MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+                )
+            ):
+                isolated.rename(retained_batch)
+                isolated.mkdir(mode=0o700)
+                replacement = isolated.stat()
+                replacement_identity = (replacement.st_dev, replacement.st_ino)
+                replaced = True
+            real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=replace_batch_before_atomic_isolation,
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "batch changed before removal"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, cleanup)
+
+        self.assertTrue(replaced)
+        self.assertIsNotNone(replacement_identity)
+        retained_evidence = list(
+            batch_root.parent.glob(MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX + "*")
+        )
+        self.assertEqual(len(retained_evidence), 1)
+        self.assertEqual(
+            (
+                retained_evidence[0].stat().st_dev,
+                retained_evidence[0].stat().st_ino,
+            ),
+            replacement_identity,
+        )
+        self.assertEqual(
+            (retained_batch.stat().st_dev, retained_batch.stat().st_ino),
+            binding.batch_identity,
+        )
+        self.assertFalse(isolated.exists())
+        self.assertEqual(tuple(retained_evidence[0].iterdir()), ())
+        self.assertTrue(proof.is_file())
+        self.assertTrue(cleanup.path.is_file())
+        self.assertTrue(allocation_ticket.path.is_file())
+
+    def test_v5_cleanup_recovers_final_private_leaf_isolation(self) -> None:
+        allocation = MODULE._quarantine_batch_root(
+            self.home,
+            [],
+            retain_binding=True,
+            retain_scaffold_binding=True,
+        )
+        assert isinstance(allocation, MODULE.EphemeralQuarantineBatchAllocation)
+        allocation.create_leaf()
+        binding = allocation.binding
+        cleanup = binding.cleanup_ticket
+        assert cleanup is not None
+        allocation.revoke_reclaim()
+        allocation.close()
+        real_rename = MODULE._rename_noreplace_at
+        private_path: Path | None = None
+
+        def isolate_private_leaf_then_crash(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal private_path
+            real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+            if source_name == "leaf" and destination_name.startswith(
+                MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+            ):
+                private_path = binding.batch_root / destination_name
+                raise SystemExit("injected final private leaf isolation crash")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=isolate_private_leaf_then_crash,
+            ),
+            self.assertRaisesRegex(
+                SystemExit,
+                "final private leaf isolation crash",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, cleanup)
+
+        self.assertIsNotNone(private_path)
+        assert private_path is not None
+        self.assertTrue(private_path.is_dir())
+        self.assertFalse((binding.batch_root / "leaf").exists())
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, cleanup))
+        self.assertFalse(private_path.exists())
+        self.assertFalse(binding.batch_root.exists())
+
     def test_main_v7_cleanup_rejects_late_direct_v8_descendant(self) -> None:
         self._exercise_late_v8_representation_injection(retained=False)
 
@@ -3690,6 +3906,52 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         self.assertTrue(batch_root.with_name(isolated_name).is_dir())
         self._resume_scaffold_cleanup(batch_root)
 
+    def test_leafless_cleanup_recovers_final_private_batch_isolation(self) -> None:
+        batch_root, binding = self._allocate_unowned_scaffold()
+        real_rename = MODULE._rename_noreplace_at
+        isolated_name = MODULE._pending_cleanup_isolated_batch_name(batch_root.name)
+        private_path: Path | None = None
+
+        def isolate_private_batch_then_crash(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal private_path
+            real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+            if source_name == isolated_name and destination_name.startswith(
+                MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+            ):
+                private_path = batch_root.parent / destination_name
+                raise SystemExit("injected final private batch isolation crash")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=isolate_private_batch_then_crash,
+            ),
+            self.assertRaisesRegex(
+                SystemExit,
+                "final private batch isolation crash",
+            ),
+        ):
+            MODULE._discard_empty_ephemeral_quarantine_batch(self.home, binding)
+
+        self.assertIsNotNone(private_path)
+        assert private_path is not None
+        self.assertTrue(private_path.is_dir())
+        self.assertFalse(batch_root.exists())
+        self.assertFalse(batch_root.with_name(isolated_name).exists())
+        self._resume_scaffold_cleanup(batch_root)
+        self.assertFalse(private_path.exists())
+
     def test_leafless_cleanup_recovers_after_batch_rmdir_crash(self) -> None:
         batch_root, binding = self._allocate_unowned_scaffold()
         real_rmdir = os.rmdir
@@ -3701,7 +3963,9 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             **kwargs: object,
         ) -> None:
             real_rmdir(path, *args, **kwargs)
-            if path == isolated_name:
+            if isinstance(path, str) and path.startswith(
+                MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+            ):
                 raise SystemExit("injected batch rmdir crash")
 
         with (

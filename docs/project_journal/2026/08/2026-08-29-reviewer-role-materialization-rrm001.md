@@ -859,3 +859,27 @@ superseded_by:
   skips in 1,308.322 seconds. Because this repair changes the reviewed source
   and tests, it still requires a new signed frozen head and fresh exact-head
   whole-range review before remote publication.
+- A second fresh whole-range review found a final pathname rebinding window in
+  v5/v7 leaf and batch directory cleanup: the joined allocation scan could
+  complete after the final identity check but before direct `rmdir`, allowing a
+  competing empty replacement to be deleted. Portable Unix has no
+  inode-conditional `rmdir`, so cleanup now atomically moves only the
+  identity-encoded, exact directory entry into the existing private active
+  tombstone namespace before reopening and jointly revalidating its held FD,
+  pathname identity, emptiness, ownership, and mode. A replacement that wins
+  the race is moved to retained evidence and is never deleted.
+- Exact active directory tombstones now have v5/v7 crash recovery. Ambiguous,
+  malformed, replaced, policy-incompatible, or non-exact representations stay
+  fail closed. The implementation deliberately does not classify benign
+  metadata churn as mutation: cleanup requires an actual identity, content, or
+  access-policy mismatch before it withholds authority.
+- New regressions cover v5 and v7 competing replacement retention and exact
+  private leaf/batch tombstone recovery. The focused six-regression set passed
+  in 0.551 seconds; the affected reclaim, pending-staging, and
+  regular-materialization suite passed 321 tests in 139.904 seconds. Source
+  lock refresh/check verified all eleven sources; Ruff lint/format, Python
+  syntax compilation, and `git diff --check` passed. Complete
+  repository-private discovery subsequently passed 1,632 tests with two
+  expected skips in 1,148.870 seconds. This changed source/test range still
+  requires a new signed frozen head and a fresh exact-head whole-range review
+  before remote publication.

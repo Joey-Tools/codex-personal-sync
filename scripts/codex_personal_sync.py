@@ -12297,6 +12297,171 @@ def _require_pending_cleanup_fd_access_policy(
     return metadata
 
 
+def _rmdir_bound_empty_pending_cleanup_directory(
+    home: Path,
+    parent_path: Path,
+    parent_fd: int,
+    expected_parent_identity: tuple[int, int],
+    member_name: str,
+    member_path: Path,
+    member_fd: int,
+    expected_member_identity: tuple[int, int],
+    *,
+    changed_message: str,
+    mutation_revalidator: Callable[[], None],
+) -> None:
+    """Privately isolate and remove only the bound empty directory.
+
+    The protected properties are the parent/member object identities, the
+    member's empty contents, and owner-only access policy on both directories.
+    Directory ctime and link count are intentionally not compared: child-entry
+    churn can change both without replacing either protected object.  Portable
+    Unix has no inode-conditional ``rmdir``, so atomically rename the current
+    source to an identity-encoded, high-entropy private name first.  A source
+    replacement is moved but then retained as evidence; only the expected
+    object is reopened with ``O_NOFOLLOW`` and removed.  No external authority
+    probe runs after that isolation boundary.
+    """
+    planned = (
+        expected_member_identity[0],
+        expected_member_identity[1],
+        stat.S_IFDIR,
+    )
+    boundary_fd = -1
+    try:
+        if _directory_identity(
+            parent_fd
+        ) != expected_parent_identity or not _bound_directory_matches(
+            home, parent_path, parent_fd
+        ):
+            raise SyncError(changed_message)
+        _require_pending_cleanup_fd_access_policy(
+            parent_fd,
+            parent_path,
+            expected_mode=0o700,
+        )
+        if (
+            _directory_identity(member_fd) != expected_member_identity
+            or not _bound_directory_matches(home, member_path, member_fd)
+            or _directory_member_names(member_fd, maximum_entries=1) != ()
+        ):
+            raise SyncError(changed_message)
+        _require_pending_cleanup_fd_access_policy(
+            member_fd,
+            member_path,
+            expected_mode=0o700,
+        )
+
+        private_name: str | None = None
+        isolation_error: BaseException | None = None
+        for _attempt in range(128):
+            mutation_revalidator()
+            candidate = _pending_cleanup_entry_name(
+                PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                expected_parent_identity,
+                planned,
+            )
+            try:
+                _rename_noreplace_at(
+                    parent_fd,
+                    member_name,
+                    parent_fd,
+                    candidate,
+                )
+            except FileExistsError:
+                continue
+            except BaseException as error:
+                source_identity = _named_entry_identity(parent_fd, member_name)
+                candidate_identity = _named_entry_identity(parent_fd, candidate)
+                if source_identity is None and candidate_identity is not None:
+                    private_name = candidate
+                    isolation_error = error
+                    break
+                if source_identity is None:
+                    raise SyncError(
+                        f"{changed_message}; directory disappeared during isolation"
+                    ) from error
+                raise SyncError(
+                    f"{changed_message}; directory could not be privately isolated"
+                ) from error
+            private_name = candidate
+            break
+        if private_name is None:
+            raise SyncError(
+                f"{changed_message}; could not allocate a private isolation name"
+            )
+        os.fsync(parent_fd)
+
+        private_path = parent_path / private_name
+        try:
+            boundary_fd = os.open(
+                private_name,
+                _directory_open_flags(nofollow=True),
+                dir_fd=parent_fd,
+            )
+        except OSError:
+            _retain_pending_cleanup_entry(
+                parent_fd,
+                private_name,
+                expected_parent_identity,
+                planned,
+                label=f"{changed_message}; private evidence became unreadable",
+            )
+        if (
+            _directory_identity(boundary_fd) != expected_member_identity
+            or _directory_identity(member_fd) != expected_member_identity
+            or _directory_identity(parent_fd) != expected_parent_identity
+            or not _bound_directory_matches(home, parent_path, parent_fd)
+            or not _bound_directory_matches(home, private_path, boundary_fd)
+        ):
+            _retain_pending_cleanup_entry(
+                parent_fd,
+                private_name,
+                expected_parent_identity,
+                planned,
+                label=f"{changed_message}; private evidence changed identity",
+            )
+        try:
+            _require_pending_cleanup_fd_access_policy(
+                boundary_fd,
+                private_path,
+                expected_mode=0o700,
+            )
+        except SyncError:
+            _retain_pending_cleanup_entry(
+                parent_fd,
+                private_name,
+                expected_parent_identity,
+                planned,
+                label=f"{changed_message}; private evidence changed access policy",
+            )
+        if (
+            _directory_member_names(boundary_fd, maximum_entries=1) != ()
+            or _named_entry_identity(parent_fd, private_name)
+            != expected_member_identity
+        ):
+            _retain_pending_cleanup_entry(
+                parent_fd,
+                private_name,
+                expected_parent_identity,
+                planned,
+                label=f"{changed_message}; private evidence changed contents",
+            )
+        if isolation_error is not None:
+            raise isolation_error
+        # The verified private name is fresh, high entropy, and exists only in
+        # this mode-0700 namespace.  Keep its exact descriptor live across the
+        # only pathname-based destructive syscall available on portable Unix.
+        os.rmdir(private_name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        if _named_entry_identity(parent_fd, private_name) is not None:
+            raise SyncError(f"{changed_message}; private name reappeared")
+    except OSError as error:
+        raise SyncError(changed_message) from error
+    finally:
+        _close_fd_quietly(boundary_fd)
+
+
 def _require_current_user_cleanup_fd_access_policy(
     file_descriptor: int,
     display_path: Path,
@@ -30258,10 +30423,37 @@ def _pending_ephemeral_batch_members(
             f"pending ephemeral quarantine metadata has multiple retained names: "
             f"{batch_name}"
         )
+    batch_identity = _directory_identity(batch_fd)
+    active_directories: list[str] = []
+    for name in names:
+        if name.startswith(PENDING_CLEANUP_RETAINED_ENTRY_PREFIX):
+            raise SyncError(
+                "pending ephemeral quarantine has retained directory evidence: "
+                f"{batch_name}: {name}"
+            )
+        if not name.startswith(PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX):
+            continue
+        active_plan = _pending_cleanup_internal_entry_plan(
+            name,
+            PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+            batch_identity,
+        )
+        if active_plan is None or active_plan[2] != stat.S_IFDIR:
+            raise SyncError(
+                "pending ephemeral quarantine has malformed directory evidence: "
+                f"{batch_name}: {name}"
+            )
+        active_directories.append(name)
+    if len(active_directories) > 1:
+        raise SyncError(
+            "pending ephemeral quarantine has ambiguous directory evidence: "
+            f"{batch_name}"
+        )
     retained_name = retained_metadata[0] if retained_metadata else None
     allowed = {"leaf", "metadata.json"}
     if retained_name is not None:
         allowed.add(retained_name)
+    allowed.update(active_directories)
     unknown = tuple(name for name in names if name not in allowed)
     if unknown:
         raise SyncError(
@@ -30274,6 +30466,116 @@ def _pending_ephemeral_batch_members(
             f"names: {batch_name}"
         )
     return names, retained_name
+
+
+def _pending_cleanup_directory_tombstone_name(
+    parent_fd: int,
+    names: tuple[str, ...],
+    expected_identity: tuple[int, int],
+    *,
+    reject_unrelated: bool,
+    label: str,
+) -> str | None:
+    """Resolve one exact active-directory tombstone or fail on competition."""
+    parent_identity = _directory_identity(parent_fd)
+    expected_plan = (expected_identity[0], expected_identity[1], stat.S_IFDIR)
+    matches: list[str] = []
+    for name in names:
+        is_active = name.startswith(PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+        is_retained = name.startswith(PENDING_CLEANUP_RETAINED_ENTRY_PREFIX)
+        if not is_active and not is_retained:
+            continue
+        prefix = (
+            PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+            if is_active
+            else PENDING_CLEANUP_RETAINED_ENTRY_PREFIX
+        )
+        encoded_plan = _pending_cleanup_internal_entry_plan(
+            name,
+            prefix,
+            parent_identity,
+        )
+        actual_identity = _named_entry_identity(parent_fd, name)
+        if encoded_plan is None:
+            raise SyncError(f"{label} has malformed private directory evidence")
+        if is_retained and (
+            encoded_plan == expected_plan or actual_identity == expected_identity
+        ):
+            raise SyncError(f"{label} has retained private directory evidence")
+        if is_active and encoded_plan == expected_plan:
+            if actual_identity != expected_identity:
+                raise SyncError(f"{label} private directory evidence changed")
+            matches.append(name)
+            continue
+        if actual_identity == expected_identity or reject_unrelated:
+            raise SyncError(f"{label} has competing private directory evidence")
+    if len(matches) > 1:
+        raise SyncError(f"{label} has ambiguous private directory evidence")
+    return matches[0] if matches else None
+
+
+def _pending_ephemeral_batch_root_binding(
+    quarantine_fd: int,
+    batch_name: str,
+    isolated_name: str,
+    expected_identity: tuple[int, int],
+) -> tuple[str, tuple[int, int]] | None:
+    names = _directory_member_names(
+        quarantine_fd,
+        maximum_entries=MAX_PENDING_CLEANUP_BATCH_SCAN,
+        overflow_message="pending cleanup quarantine root exceeds the scan limit",
+    )
+    private_name = _pending_cleanup_directory_tombstone_name(
+        quarantine_fd,
+        names,
+        expected_identity,
+        reject_unrelated=False,
+        label=f"pending ephemeral quarantine batch {batch_name}",
+    )
+    candidates: list[tuple[str, tuple[int, int]]] = []
+    for name in (batch_name, isolated_name):
+        identity = _named_entry_identity(quarantine_fd, name)
+        if identity is not None:
+            candidates.append((name, identity))
+    if len(candidates) == 2:
+        raise SyncError(
+            "pending ephemeral quarantine has canonical and isolated roots: "
+            f"{batch_name}"
+        )
+    if private_name is not None:
+        candidates.append((private_name, expected_identity))
+    if len(candidates) > 1:
+        raise SyncError(
+            "pending ephemeral quarantine batch changed before removal: "
+            f"{batch_name}: namespace is ambiguous"
+        )
+    return candidates[0] if candidates else None
+
+
+def _pending_ephemeral_leaf_binding(
+    batch_fd: int,
+    names: tuple[str, ...],
+    batch_name: str,
+    expected_identity: tuple[int, int],
+) -> tuple[str, tuple[int, int]] | None:
+    private_name = _pending_cleanup_directory_tombstone_name(
+        batch_fd,
+        names,
+        expected_identity,
+        reject_unrelated=True,
+        label=f"pending ephemeral quarantine leaf {batch_name}",
+    )
+    candidates: list[tuple[str, tuple[int, int]]] = []
+    canonical_identity = _named_entry_identity(batch_fd, "leaf")
+    if canonical_identity is not None:
+        candidates.append(("leaf", canonical_identity))
+    if private_name is not None:
+        candidates.append((private_name, expected_identity))
+    if len(candidates) > 1:
+        raise SyncError(
+            f"pending ephemeral quarantine leaf namespace is ambiguous: {batch_name}"
+        )
+    return candidates[0] if candidates else None
 
 
 def _require_pending_ephemeral_metadata_cleanup_boundary(
@@ -30321,7 +30623,10 @@ def _require_pending_ephemeral_metadata_cleanup_boundary(
         batch_name,
     )
     expected_retained_name = None if metadata_name == "metadata.json" else metadata_name
-    if "leaf" in names:
+    if any(
+        name == "leaf" or name.startswith(PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+        for name in names
+    ):
         raise SyncError(
             f"pending ephemeral scaffold leaf appeared before metadata mutation: "
             f"{batch_name}"
@@ -30912,8 +31217,18 @@ def _remove_pending_ephemeral_quarantine_batch(
     quarantine_root_identity = ticket.quarantine_root_identity
     batch_name = ticket.batch_root.name
     isolated_name = ticket.isolated_name
+    assert isolated_name is not None
     bound_batch_root = ticket.batch_root
     directory_flags = _directory_open_flags(nofollow=True)
+
+    def current_batch_root_binding() -> tuple[str, tuple[int, int]] | None:
+        return _pending_ephemeral_batch_root_binding(
+            quarantine_fd,
+            batch_name,
+            isolated_name,
+            ticket.batch_root_identity,
+        )
+
     try:
         _require_pending_cleanup_fd_access_policy(
             quarantine_fd,
@@ -30926,14 +31241,8 @@ def _remove_pending_ephemeral_quarantine_batch(
             home, quarantine_root, quarantine_fd
         ):
             raise SyncError("pending cleanup quarantine root changed")
-        canonical_identity = _named_entry_identity(quarantine_fd, batch_name)
-        isolated_identity = _named_entry_identity(quarantine_fd, isolated_name)
-        if canonical_identity is not None and isolated_identity is not None:
-            raise SyncError(
-                f"pending ephemeral quarantine has canonical and isolated roots: "
-                f"{batch_name}"
-            )
-        if canonical_identity is None and isolated_identity is None:
+        root_binding = current_batch_root_binding()
+        if root_binding is None:
             proof = _read_pending_cleanup_empty_proof(
                 home,
                 ticket,
@@ -30957,13 +31266,8 @@ def _remove_pending_ephemeral_quarantine_batch(
                 joined_allocation,
             )
             return True
-        if canonical_identity is None:
-            bound_batch_root = ticket.batch_root.with_name(isolated_name)
-            bound_name = isolated_name
-            observed_identity = isolated_identity
-        else:
-            bound_name = batch_name
-            observed_identity = canonical_identity
+        bound_name, observed_identity = root_binding
+        bound_batch_root = ticket.batch_root.with_name(bound_name)
         if observed_identity != ticket.batch_root_identity:
             raise SyncError(f"pending ephemeral quarantine batch changed: {batch_name}")
         batch_fd = os.open(bound_name, directory_flags, dir_fd=quarantine_fd)
@@ -30983,11 +31287,29 @@ def _remove_pending_ephemeral_quarantine_batch(
             batch_fd,
             batch_name,
         )
-        if ticket.version == 7 and "leaf" in names:
+        leaf_binding = (
+            None
+            if ticket.leaf_identity is None
+            else _pending_ephemeral_leaf_binding(
+                batch_fd,
+                names,
+                batch_name,
+                ticket.leaf_identity,
+            )
+        )
+        if ticket.version == 7 and any(
+            name == "leaf" or name.startswith(PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+            for name in names
+        ):
             raise SyncError(f"pending ephemeral scaffold leaf appeared: {batch_name}")
-        if "leaf" in names:
-            leaf_path = bound_batch_root / "leaf"
-            leaf_fd = os.open("leaf", directory_flags, dir_fd=batch_fd)
+        if leaf_binding is not None:
+            leaf_name, observed_leaf_identity = leaf_binding
+            if observed_leaf_identity != ticket.leaf_identity:
+                raise SyncError(
+                    f"pending ephemeral quarantine leaf changed: {batch_name}"
+                )
+            leaf_path = bound_batch_root / leaf_name
+            leaf_fd = os.open(leaf_name, directory_flags, dir_fd=batch_fd)
             if _directory_identity(
                 leaf_fd
             ) != ticket.leaf_identity or not _bound_directory_matches(
@@ -31009,12 +31331,13 @@ def _remove_pending_ephemeral_quarantine_batch(
                 batch_fd,
                 batch_name,
             )
-            leaf_stat = os.stat("leaf", dir_fd=batch_fd, follow_symlinks=False)
-            if (
-                "leaf" not in names
-                or not stat.S_ISDIR(leaf_stat.st_mode)
-                or (leaf_stat.st_dev, leaf_stat.st_ino) != ticket.leaf_identity
-            ):
+            current_leaf_binding = _pending_ephemeral_leaf_binding(
+                batch_fd,
+                names,
+                batch_name,
+                ticket.leaf_identity,
+            )
+            if current_leaf_binding != (leaf_name, ticket.leaf_identity):
                 raise SyncError(
                     f"pending ephemeral quarantine leaf changed: {batch_name}"
                 )
@@ -31029,17 +31352,8 @@ def _remove_pending_ephemeral_quarantine_batch(
                 leaf_path,
                 expected_mode=0o700,
             )
-            canonical_identity = _named_entry_identity(quarantine_fd, batch_name)
-            isolated_identity = _named_entry_identity(quarantine_fd, isolated_name)
-            expected_root_names = (
-                canonical_identity == ticket.batch_root_identity
-                and isolated_identity is None
-                if bound_name == batch_name
-                else canonical_identity is None
-                and isolated_identity == ticket.batch_root_identity
-            )
             if (
-                not expected_root_names
+                current_batch_root_binding() != (bound_name, ticket.batch_root_identity)
                 or _directory_identity(quarantine_fd) != quarantine_root_identity
                 or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
                 or _directory_identity(batch_fd) != ticket.batch_root_identity
@@ -31047,16 +31361,36 @@ def _remove_pending_ephemeral_quarantine_batch(
                 or _directory_identity(leaf_fd) != ticket.leaf_identity
                 or not _bound_directory_matches(home, leaf_path, leaf_fd)
                 or _directory_member_names(leaf_fd, maximum_entries=1) != ()
-                or _named_entry_identity(batch_fd, "leaf") != ticket.leaf_identity
+                or current_leaf_binding != (leaf_name, ticket.leaf_identity)
             ):
                 raise SyncError(
                     f"pending ephemeral quarantine leaf changed before removal: "
                     f"{batch_name}"
                 )
-            require_allocation_join()
-            os.rmdir("leaf", dir_fd=batch_fd)
+            _rmdir_bound_empty_pending_cleanup_directory(
+                home,
+                bound_batch_root,
+                batch_fd,
+                ticket.batch_root_identity,
+                leaf_name,
+                leaf_path,
+                leaf_fd,
+                ticket.leaf_identity,
+                changed_message=(
+                    "pending ephemeral quarantine leaf changed before removal: "
+                    f"{batch_name}"
+                ),
+                mutation_revalidator=require_allocation_join,
+            )
             os.fsync(batch_fd)
-            if _named_entry_identity(batch_fd, "leaf") is not None:
+            names, _retained_metadata_name = _pending_ephemeral_batch_members(
+                batch_fd,
+                batch_name,
+            )
+            if any(
+                name == "leaf" or name.startswith(PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+                for name in names
+            ):
                 raise SyncError(
                     f"pending ephemeral quarantine leaf reappeared: {batch_name}"
                 )
@@ -31064,7 +31398,10 @@ def _remove_pending_ephemeral_quarantine_batch(
             batch_fd,
             batch_name,
         )
-        if "leaf" in names:
+        if any(
+            name == "leaf" or name.startswith(PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+            for name in names
+        ):
             raise SyncError(
                 f"pending ephemeral quarantine leaf reappeared: {batch_name}"
             )
@@ -31104,20 +31441,11 @@ def _remove_pending_ephemeral_quarantine_batch(
                     "metadata.json" if name == metadata_name else name for name in names
                 )
                 retained_metadata_name = None
-            canonical_identity = _named_entry_identity(quarantine_fd, batch_name)
-            isolated_identity = _named_entry_identity(quarantine_fd, isolated_name)
-            expected_root_names = (
-                canonical_identity == ticket.batch_root_identity
-                and isolated_identity is None
-                if bound_name == batch_name
-                else canonical_identity is None
-                and isolated_identity == ticket.batch_root_identity
-            )
             current_names, current_retained_metadata = _pending_ephemeral_batch_members(
                 batch_fd, batch_name
             )
             if (
-                not expected_root_names
+                current_batch_root_binding() != (bound_name, ticket.batch_root_identity)
                 or _directory_identity(quarantine_fd) != quarantine_root_identity
                 or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
                 or _directory_identity(batch_fd) != ticket.batch_root_identity
@@ -31165,8 +31493,6 @@ def _remove_pending_ephemeral_quarantine_batch(
             bound_batch_root,
             expected_mode=0o700,
         )
-        canonical_identity = _named_entry_identity(quarantine_fd, batch_name)
-        isolated_identity = _named_entry_identity(quarantine_fd, isolated_name)
         if bound_name == batch_name:
             if (
                 _directory_identity(quarantine_fd) != quarantine_root_identity
@@ -31178,8 +31504,8 @@ def _remove_pending_ephemeral_quarantine_batch(
                 or _directory_identity(batch_fd) != ticket.batch_root_identity
                 or not _bound_directory_matches(home, bound_batch_root, batch_fd)
                 or _directory_member_names(batch_fd, maximum_entries=1) != ()
-                or canonical_identity != ticket.batch_root_identity
-                or isolated_identity is not None
+                or current_batch_root_binding()
+                != (batch_name, ticket.batch_root_identity)
             ):
                 raise SyncError(
                     f"pending ephemeral quarantine batch changed: {batch_name}"
@@ -31201,10 +31527,11 @@ def _remove_pending_ephemeral_quarantine_batch(
                 isolated_name,
             )
             os.fsync(quarantine_fd)
+            bound_name = isolated_name
             bound_batch_root = ticket.batch_root.with_name(isolated_name)
-        elif (
-            canonical_identity is not None
-            or isolated_identity != ticket.batch_root_identity
+        elif current_batch_root_binding() != (
+            bound_name,
+            ticket.batch_root_identity,
         ):
             raise SyncError(f"pending ephemeral quarantine batch changed: {batch_name}")
         if (
@@ -31233,28 +31560,46 @@ def _remove_pending_ephemeral_quarantine_batch(
             bound_batch_root,
             expected_mode=0o700,
         )
-        canonical_identity = _named_entry_identity(quarantine_fd, batch_name)
-        isolated_identity = _named_entry_identity(quarantine_fd, isolated_name)
+        batch_removal_changed_message = (
+            f"pending ephemeral quarantine batch changed before removal: {batch_name}"
+        )
+
+        def require_batch_rmdir_mutation_boundary() -> None:
+            require_allocation_join()
+            try:
+                root_binding = current_batch_root_binding()
+            except SyncError as error:
+                raise SyncError(batch_removal_changed_message) from error
+            if root_binding != (bound_name, ticket.batch_root_identity):
+                raise SyncError(batch_removal_changed_message)
+
+        try:
+            final_root_binding = current_batch_root_binding()
+        except SyncError as error:
+            raise SyncError(batch_removal_changed_message) from error
         if (
             _directory_identity(quarantine_fd) != quarantine_root_identity
             or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
-            or canonical_identity is not None
-            or isolated_identity != ticket.batch_root_identity
+            or final_root_binding != (bound_name, ticket.batch_root_identity)
             or _directory_identity(batch_fd) != ticket.batch_root_identity
             or not _bound_directory_matches(home, bound_batch_root, batch_fd)
             or _directory_member_names(batch_fd, maximum_entries=1) != ()
         ):
-            raise SyncError(
-                f"pending ephemeral quarantine batch changed before removal: "
-                f"{batch_name}"
-            )
-        require_allocation_join()
-        os.rmdir(isolated_name, dir_fd=quarantine_fd)
+            raise SyncError(batch_removal_changed_message)
+        _rmdir_bound_empty_pending_cleanup_directory(
+            home,
+            quarantine_root,
+            quarantine_fd,
+            quarantine_root_identity,
+            bound_name,
+            bound_batch_root,
+            batch_fd,
+            ticket.batch_root_identity,
+            changed_message=batch_removal_changed_message,
+            mutation_revalidator=require_batch_rmdir_mutation_boundary,
+        )
         os.fsync(quarantine_fd)
-        if (
-            _named_entry_identity(quarantine_fd, isolated_name) is not None
-            or _named_entry_identity(quarantine_fd, batch_name) is not None
-        ):
+        if current_batch_root_binding() is not None:
             raise SyncError(
                 f"pending ephemeral quarantine batch reappeared: {batch_name}"
             )
