@@ -48,7 +48,7 @@
     "quarantine_empty_batch_reclaim_tests": {
       "mode": "0644",
       "path": "tests/test_quarantine_empty_batch_reclaim.py",
-      "sha256": "559bfed7b2afc934e07768f856df337b29a5de8da51b8b794db6727ae83ea09a"
+      "sha256": "60d9c3fb7d20c5b8a7da3c40af6ba4cb57c60023715f70852ea0637e40fc3c4c"
     },
     "reconciliation_safety_tests": {
       "mode": "0644",

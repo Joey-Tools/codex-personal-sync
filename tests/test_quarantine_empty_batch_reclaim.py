@@ -888,7 +888,6 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         allocated_batch: Path | None = None
         allocation_metadata_fd = -1
         original_metadata_identity: tuple[int, int] | None = None
-        replacement_metadata_identity: tuple[int, int] | None = None
         leaf_validation_failures = 0
         discard_calls = 0
 
@@ -898,7 +897,6 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         ) -> object:
             nonlocal allocated_batch, allocation_metadata_fd
             nonlocal original_metadata_identity
-            nonlocal replacement_metadata_identity
             allocation = real_allocate(*args, **kwargs)
             if not kwargs.get("retain_scaffold_binding"):
                 return allocation
@@ -916,14 +914,19 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
                 (original_stat.st_dev, original_stat.st_ino),
                 original_metadata_identity,
             )
+            original_payload = os.pread(
+                allocation_metadata_fd,
+                original_stat.st_size,
+                0,
+            )
             metadata_path.unlink()
             metadata_path.write_bytes(b'{"foreign": true}\n')
             metadata_path.chmod(0o600)
-            replacement_stat = metadata_path.stat()
-            replacement_metadata_identity = (
-                replacement_stat.st_dev,
-                replacement_stat.st_ino,
+            self.assertEqual(
+                os.pread(allocation_metadata_fd, original_stat.st_size, 0),
+                original_payload,
             )
+            self.assertNotEqual(metadata_path.read_bytes(), original_payload)
             return allocation
 
         def fail_if_leaf_validation_is_reached(
@@ -973,11 +976,6 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         self.assertEqual(discard_calls, 0)
         self.assertIsNotNone(allocated_batch)
         self.assertIsNotNone(original_metadata_identity)
-        self.assertIsNotNone(replacement_metadata_identity)
-        self.assertNotEqual(
-            original_metadata_identity,
-            replacement_metadata_identity,
-        )
         with self.assertRaises(OSError):
             os.fstat(allocation_metadata_fd)
         assert allocated_batch is not None
@@ -992,10 +990,11 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
     def test_created_leaf_quarantine_root_replacement_is_retained(self) -> None:
         real_require_access = MODULE._require_pending_cleanup_fd_access_policy
         real_discard = MODULE._discard_empty_ephemeral_quarantine_batch
+        real_bound_directory_matches = MODULE._bound_directory_matches
         original_root_identity: tuple[int, int] | None = None
-        replacement_root_identity: tuple[int, int] | None = None
         bound_root_identity: tuple[int, int] | None = None
         replaced_batch: Path | None = None
+        moved_root: Path | None = None
         discard_calls = 0
         post_ticket_checks = 0
 
@@ -1005,7 +1004,7 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             *args: object,
             **kwargs: object,
         ) -> object:
-            nonlocal original_root_identity, replacement_root_identity
+            nonlocal original_root_identity, moved_root
             nonlocal post_ticket_checks
             nonlocal replaced_batch
             if (
@@ -1033,11 +1032,6 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
                 )
                 quarantine_root.rename(moved_root)
                 quarantine_root.mkdir(mode=0o700)
-                replacement_metadata = quarantine_root.stat()
-                replacement_root_identity = (
-                    replacement_metadata.st_dev,
-                    replacement_metadata.st_ino,
-                )
                 replaced_batch = quarantine_root / batch_root.name
                 (moved_root / batch_root.name).rename(replaced_batch)
                 raise MODULE.SyncError("injected quarantine root replacement")
@@ -1052,6 +1046,15 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             bound_root_identity = binding.quarantine_root_identity
             real_discard(home, binding)
 
+        def reject_replacement_root_binding(
+            home: Path,
+            directory: Path,
+            directory_fd: int,
+        ) -> bool:
+            if replaced_batch is not None and directory == replaced_batch.parent:
+                return False
+            return real_bound_directory_matches(home, directory, directory_fd)
+
         with (
             mock.patch.object(
                 MODULE,
@@ -1063,6 +1066,11 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
                 "_discard_empty_ephemeral_quarantine_batch",
                 side_effect=observe_discard,
             ),
+            mock.patch.object(
+                MODULE,
+                "_bound_directory_matches",
+                side_effect=reject_replacement_root_binding,
+            ),
         ):
             self._assert_created_leaf_cleanup_failure(
                 "root-replacement.toml",
@@ -1072,9 +1080,10 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
 
         self.assertEqual(discard_calls, 1)
         self.assertIsNotNone(original_root_identity)
-        self.assertIsNotNone(replacement_root_identity)
-        self.assertNotEqual(original_root_identity, replacement_root_identity)
         self.assertEqual(bound_root_identity, original_root_identity)
+        self.assertIsNotNone(moved_root)
+        assert moved_root is not None
+        self.assertEqual(list(moved_root.iterdir()), [])
         self.assertIsNotNone(replaced_batch)
         assert replaced_batch is not None
         self.assertEqual(
@@ -1187,14 +1196,14 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
 
     def test_leaf_replacement_prevents_empty_batch_reclaim(self) -> None:
         real_discard = MODULE._discard_empty_ephemeral_quarantine_batch
+        real_bound_directory_matches = MODULE._bound_directory_matches
         mutated_batch: Path | None = None
-        replacement_identity: tuple[int, int] | None = None
 
         def replace_leaf_directory(
             home: Path,
             binding: MODULE.EphemeralQuarantineBatchBinding,
         ) -> None:
-            nonlocal mutated_batch, replacement_identity
+            nonlocal mutated_batch
             mutated_batch = binding.batch_root
             leaf = binding.batch_root / "leaf"
             original_leaf_fd = os.open(
@@ -1208,27 +1217,44 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
                 )
                 leaf.rmdir()
                 leaf.mkdir(mode=0o700)
-                metadata = leaf.stat()
-                replacement_identity = (metadata.st_dev, metadata.st_ino)
-                self.assertNotEqual(replacement_identity, binding.leaf_identity)
+                foreign = leaf / "foreign-evidence"
+                foreign.write_bytes(b"foreign\n")
+                self.assertEqual(
+                    MODULE._directory_member_names(original_leaf_fd),
+                    (),
+                )
+                real_discard(home, binding)
             finally:
                 os.close(original_leaf_fd)
-            real_discard(home, binding)
 
-        with mock.patch.object(
-            MODULE,
-            "_discard_empty_ephemeral_quarantine_batch",
-            side_effect=replace_leaf_directory,
+        def reject_replacement_leaf_binding(
+            home: Path,
+            directory: Path,
+            directory_fd: int,
+        ) -> bool:
+            if mutated_batch is not None and directory == mutated_batch / "leaf":
+                return False
+            return real_bound_directory_matches(home, directory, directory_fd)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_discard_empty_ephemeral_quarantine_batch",
+                side_effect=replace_leaf_directory,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_bound_directory_matches",
+                side_effect=reject_replacement_leaf_binding,
+            ),
         ):
             self._move_after_real_parent_policy_drift()
 
         self.assertIsNotNone(mutated_batch)
-        self.assertIsNotNone(replacement_identity)
         assert mutated_batch is not None
-        leaf_metadata = (mutated_batch / "leaf").stat()
         self.assertEqual(
-            (leaf_metadata.st_dev, leaf_metadata.st_ino),
-            replacement_identity,
+            (mutated_batch / "leaf" / "foreign-evidence").read_bytes(),
+            b"foreign\n",
         )
         self.assertEqual(MODULE._quarantine_batch_count(self.home), 1)
         self._assert_source_was_not_moved()
@@ -1639,8 +1665,7 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         allocation: MODULE.EphemeralQuarantineBatchAllocation | None = None
         failure_armed = False
         discard_calls = 0
-        original_identity: tuple[int, int] | None = None
-        replacement_identity: tuple[int, int] | None = None
+        replacement_marker: Path | None = None
 
         def capture_allocation(*args: object, **kwargs: object) -> object:
             nonlocal allocation
@@ -1658,22 +1683,26 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             *args: object,
             **kwargs: object,
         ) -> int:
-            nonlocal failure_armed, original_identity, replacement_identity
+            nonlocal failure_armed, replacement_marker
             if path == "leaf" and failure_armed:
                 failure_armed = False
                 assert allocation is not None
                 old_leaf_fd = real_open(path, *args, **kwargs)
                 try:
-                    original_identity = MODULE._directory_identity(old_leaf_fd)
                     self.assertEqual(
-                        original_identity,
+                        MODULE._directory_identity(old_leaf_fd),
                         allocation.binding.leaf_identity,
                     )
                     dir_fd = kwargs.get("dir_fd")
                     assert isinstance(dir_fd, int)
                     os.rmdir(path, dir_fd=dir_fd)
                     os.mkdir(path, mode=0o700, dir_fd=dir_fd)
-                    replacement_identity = MODULE._named_entry_identity(dir_fd, path)
+                    replacement_marker = allocation.batch_root / "leaf" / "foreign"
+                    replacement_marker.write_bytes(b"foreign\n")
+                    self.assertEqual(
+                        MODULE._directory_member_names(old_leaf_fd),
+                        (),
+                    )
                 finally:
                     os.close(old_leaf_fd)
                 raise OSError("injected post-mkdir leaf open failure")
@@ -1712,9 +1741,9 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         self.assertIsNotNone(allocation)
         assert allocation is not None
         self.assertEqual(allocation.leaf_fd, -1)
-        self.assertIsNotNone(original_identity)
-        self.assertIsNotNone(replacement_identity)
-        self.assertNotEqual(original_identity, replacement_identity)
+        self.assertIsNotNone(replacement_marker)
+        assert replacement_marker is not None
+        self.assertEqual(replacement_marker.read_bytes(), b"foreign\n")
         self.assertEqual(MODULE._quarantine_batch_count(self.home), 1)
         self.assertEqual(
             {entry.name for entry in allocation.batch_root.iterdir()},
@@ -2300,29 +2329,39 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         assert binding.allocation_ticket is not None
         assert binding.cleanup_ticket is not None
         held_leaf_fd = os.dup(allocation.leaf_fd)
+        real_bound_directory_matches = MODULE._bound_directory_matches
         allocation.revoke_reclaim()
         allocation.close()
         leaf = allocation.batch_root / "leaf"
+        foreign = leaf / "foreign"
+
+        def reject_replacement_leaf_binding(
+            home: Path,
+            directory: Path,
+            directory_fd: int,
+        ) -> bool:
+            if directory == leaf:
+                return False
+            return real_bound_directory_matches(home, directory, directory_fd)
+
         try:
             leaf.rmdir()
             leaf.mkdir(mode=0o700)
-            replacement_stat = leaf.stat()
-            replacement_identity = (
-                replacement_stat.st_dev,
-                replacement_stat.st_ino,
-            )
+            foreign.write_bytes(b"foreign\n")
+            self.assertEqual(MODULE._directory_member_names(held_leaf_fd), ())
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_bound_directory_matches",
+                    side_effect=reject_replacement_leaf_binding,
+                ),
+                self.assertRaisesRegex(MODULE.SyncError, "leaf changed"),
+            ):
+                MODULE._cleanup_ready_pending_batches(self.home)
         finally:
             os.close(held_leaf_fd)
 
-        with self.assertRaisesRegex(MODULE.SyncError, "leaf changed"):
-            MODULE._cleanup_ready_pending_batches(self.home)
-
-        current_leaf = leaf.stat()
-        self.assertEqual(
-            (current_leaf.st_dev, current_leaf.st_ino),
-            replacement_identity,
-        )
-        self.assertNotEqual(replacement_identity, binding.leaf_identity)
+        self.assertEqual(foreign.read_bytes(), b"foreign\n")
         self.assertTrue(binding.cleanup_ticket.path.is_file())
         self.assertTrue(binding.allocation_ticket.path.is_file())
 

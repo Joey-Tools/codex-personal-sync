@@ -3,7 +3,7 @@ id: 20260829-rrm001
 title: Reviewer Role Regular-File Materialization
 status: active
 created: 2026-08-29
-updated: 2026-09-06
+updated: 2026-09-09
 branch: codex/daily-skill-friction-20260829-codex-personal-sync-reviewer-role-regular-install
 pr:
 supersedes: []
@@ -103,9 +103,8 @@ superseded_by:
 
 ## Next Steps
 
-- Commit the completed allocation-scaffold and private-use-retirement repairs,
-  then repeat the full-range fresh-context GPT-5.6 Sol Ultra review of the
-  resulting signed frozen head.
+- Create a signed frozen canonical head after the current portability repair,
+  then repeat the full-range fresh-context GPT-5.6 Sol Ultra review.
 - Propagate the actual squash-landed canonical commit through toolbox and the
   private overlay using the receipt-bound release chain.
 - Smoke-test the installed reviewer role without a path override on every
@@ -923,3 +922,21 @@ superseded_by:
   1,635 tests with two expected skips in 1,406.074 seconds. This changed
   source/test range still requires a new signed frozen head and fresh
   exact-head whole-range review before remote publication.
+- A current-head GitHub Codex review then identified a test portability issue:
+  several quarantine regression cases inferred replacement from a changed
+  `(st_dev, st_ino)` tuple, which is not valid on filesystems that immediately
+  reuse inode tuples. The repair keeps the original FD as evidence where
+  needed, asserts the original payload versus the replacement's foreign
+  marker, and uses narrowly scoped deterministic binding-failure injection for
+  the replacement branch. This preserves the tested properties—replacement,
+  retained foreign evidence, and fail-closed cleanup—without treating inode
+  allocation as identity proof. The already-fixed descriptor-lifetime and
+  source-lock findings were independently rechecked; the eleven-source lock
+  includes the quarantine regression module in both canonical sources and the
+  toolbox mirror.
+- The full quarantine reclaim module passed 97 tests in 203.572 seconds.
+  Ruff lint/format, Python syntax compilation, `git diff --check`, and source
+  lock refresh/check passed. Complete repository-private discovery then passed
+  1,635 tests with two expected skips in 2,185.987 seconds. This changed test
+  and lock range requires a new signed frozen head and fresh exact-head
+  whole-range review before remote publication.
