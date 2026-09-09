@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -3817,6 +3818,686 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     (evidence.stat().st_dev, evidence.stat().st_ino),
                     competing_identity,
                 )
+
+    def test_v6_ephemeral_cleanup_with_full_alias_set_evacuates_exact_canonical(
+        self,
+    ) -> None:
+        case_home = self.root / "ephemeral-v6-full-alias-set"
+        install(self.first_release, case_home, SHA_A)
+        case_target = case_home / ROLE_TARGET
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            case_home,
+            case_target,
+            require_managed_access=False,
+        )
+        ticket = MODULE._publish_pending_ephemeral_quarantine_leaf_cleanup_ticket(
+            case_home,
+            case_target,
+            expected,
+        )
+        alias_names = MODULE._pending_ephemeral_public_alias_names(
+            ticket.batch_root.name
+        )
+        protected_aliases: dict[str, tuple[tuple[int, int], bytes]] = {}
+        for index, alias_name in enumerate(alias_names):
+            alias = case_target.with_name(alias_name)
+            payload = f"foreign alias {index}\n".encode("utf-8")
+            alias.write_bytes(payload)
+            alias.chmod(0o600)
+            metadata = alias.stat()
+            protected_aliases[alias_name] = (
+                (metadata.st_dev, metadata.st_ino),
+                payload,
+            )
+
+        evidence_names = MODULE._pending_ephemeral_quarantine_evidence_names(
+            ticket.batch_root.name
+        )
+        quarantine_root = (
+            MODULE._personal_sync_root(case_home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        protected_private: dict[str, tuple[tuple[int, int], bytes]] = {}
+        for index, evidence_name in enumerate(evidence_names):
+            evidence = quarantine_root / evidence_name
+            payload = f"foreign private evidence {index}\n".encode("utf-8")
+            evidence.write_bytes(payload)
+            evidence.chmod(0o600)
+            metadata = evidence.stat()
+            protected_private[evidence_name] = (
+                (metadata.st_dev, metadata.st_ino),
+                payload,
+            )
+        real_rename = MODULE._rename_noreplace_at
+        crashed = False
+
+        def crash_after_direct_private_evacuation(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal crashed
+            real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+            if (
+                source_name == case_target.name
+                and MODULE._pending_ephemeral_quarantine_final_private_base(
+                    ticket.batch_root.name,
+                    destination_name,
+                )
+                is not None
+            ):
+                crashed = True
+                raise SystemExit("injected crash after direct private evacuation")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=crash_after_direct_private_evacuation,
+            ),
+            self.assertRaisesRegex(SystemExit, "direct private evacuation"),
+        ):
+            MODULE._cleanup_ready_pending_batches(case_home)
+
+        self.assertTrue(crashed)
+        self.assertFalse(os.path.lexists(case_target))
+        quarantine_fd = MODULE._open_directory_beneath(case_home, quarantine_root)
+        try:
+            private = MODULE._pending_ephemeral_quarantine_private_inventory(
+                quarantine_fd,
+                ticket.batch_root.name,
+            )
+        finally:
+            MODULE._close_fd_quietly(quarantine_fd)
+        exact_private = tuple(
+            item for item in private if item[1] == expected.file_identity
+        )
+        self.assertEqual(len(exact_private), 1)
+        self.assertIsNotNone(
+            MODULE._pending_ephemeral_quarantine_final_private_base(
+                ticket.batch_root.name,
+                exact_private[0][0],
+            )
+        )
+        self.assertIsNone(
+            MODULE._read_pending_cleanup_terminal_validation(
+                case_home,
+                ticket,
+                ticket.quarantine_root_identity,
+            )
+        )
+        for alias_name, (identity, payload) in protected_aliases.items():
+            alias = case_target.with_name(alias_name)
+            self.assertEqual(alias.read_bytes(), payload)
+            self.assertEqual(
+                (alias.stat().st_dev, alias.stat().st_ino),
+                identity,
+            )
+        for evidence_name, (identity, payload) in protected_private.items():
+            evidence = quarantine_root / evidence_name
+            self.assertEqual(evidence.read_bytes(), payload)
+            self.assertEqual(
+                (evidence.stat().st_dev, evidence.stat().st_ino),
+                identity,
+            )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "public alias reappeared after private isolation",
+        ):
+            MODULE._cleanup_ready_pending_batches(case_home)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertIsNotNone(
+            MODULE._read_pending_cleanup_terminal_validation(
+                case_home,
+                ticket,
+                ticket.quarantine_root_identity,
+            )
+        )
+        self.assertFalse(os.path.lexists(case_target))
+        for alias_name, (identity, payload) in protected_aliases.items():
+            alias = case_target.with_name(alias_name)
+            self.assertEqual(alias.read_bytes(), payload)
+            self.assertEqual(
+                (alias.stat().st_dev, alias.stat().st_ino),
+                identity,
+            )
+        for evidence_name, (identity, payload) in protected_private.items():
+            evidence = quarantine_root / evidence_name
+            self.assertEqual(evidence.read_bytes(), payload)
+            self.assertEqual(
+                (evidence.stat().st_dev, evidence.stat().st_ino),
+                identity,
+            )
+
+    def test_v6_ephemeral_cleanup_retries_private_evacuation_name_collisions(
+        self,
+    ) -> None:
+        case_home = self.root / "ephemeral-v6-private-name-collision"
+        install(self.first_release, case_home, SHA_A)
+        case_target = case_home / ROLE_TARGET
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            case_home,
+            case_target,
+            require_managed_access=False,
+        )
+        ticket = MODULE._publish_pending_ephemeral_quarantine_leaf_cleanup_ticket(
+            case_home,
+            case_target,
+            expected,
+        )
+        for index, alias_name in enumerate(
+            MODULE._pending_ephemeral_public_alias_names(ticket.batch_root.name)
+        ):
+            alias = case_target.with_name(alias_name)
+            alias.write_bytes(f"foreign alias {index}\n".encode("utf-8"))
+            alias.chmod(0o600)
+        quarantine_root = (
+            MODULE._personal_sync_root(case_home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        for index, evidence_name in enumerate(
+            MODULE._pending_ephemeral_quarantine_evidence_names(ticket.batch_root.name)
+        ):
+            evidence = quarantine_root / evidence_name
+            evidence.write_bytes(f"foreign evidence {index}\n".encode("utf-8"))
+            evidence.chmod(0o600)
+
+        real_rename = MODULE._rename_noreplace_at
+        collided = False
+        crashed = False
+        collision_path: Path | None = None
+
+        def collide_then_crash_after_retry(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal collided, crashed, collision_path
+            direct_private_name = (
+                source_name == case_target.name
+                and MODULE._pending_ephemeral_quarantine_final_private_base(
+                    ticket.batch_root.name,
+                    destination_name,
+                )
+                is not None
+            )
+            if direct_private_name and not collided:
+                collision_path = quarantine_root / destination_name
+                descriptor = os.open(
+                    destination_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=destination_parent_fd,
+                )
+                try:
+                    os.write(descriptor, b"racing foreign evidence\n")
+                finally:
+                    os.close(descriptor)
+                collided = True
+            real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+            if direct_private_name and collided:
+                crashed = True
+                raise SystemExit("injected crash after private retry")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=collide_then_crash_after_retry,
+            ),
+            self.assertRaisesRegex(SystemExit, "private retry"),
+        ):
+            MODULE._cleanup_ready_pending_batches(case_home)
+
+        self.assertTrue(collided)
+        self.assertTrue(crashed)
+        self.assertIsNotNone(collision_path)
+        assert collision_path is not None
+        self.assertEqual(collision_path.read_bytes(), b"racing foreign evidence\n")
+        self.assertFalse(os.path.lexists(case_target))
+        quarantine_fd = MODULE._open_directory_beneath(case_home, quarantine_root)
+        try:
+            private = MODULE._pending_ephemeral_quarantine_private_inventory(
+                quarantine_fd,
+                ticket.batch_root.name,
+            )
+        finally:
+            MODULE._close_fd_quietly(quarantine_fd)
+        self.assertEqual(
+            len([item for item in private if item[1] == expected.file_identity]),
+            1,
+        )
+
+    def test_v6_ephemeral_cleanup_does_not_receipt_private_hardlink_while_public(
+        self,
+    ) -> None:
+        case_home = self.root / "ephemeral-v6-private-hardlink-public"
+        install(self.first_release, case_home, SHA_A)
+        case_target = case_home / ROLE_TARGET
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            case_home,
+            case_target,
+            require_managed_access=False,
+        )
+        ticket = MODULE._publish_pending_ephemeral_quarantine_leaf_cleanup_ticket(
+            case_home,
+            case_target,
+            expected,
+        )
+        quarantine_root = (
+            MODULE._personal_sync_root(case_home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        private_name = MODULE._pending_ephemeral_quarantine_evidence_names(
+            ticket.batch_root.name
+        )[0]
+        os.link(case_target, quarantine_root / private_name)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_publish_pending_cleanup_terminal_validation",
+                side_effect=AssertionError("must not receipt a public payload"),
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "canonical payload changed before evacuation",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(case_home)
+
+        self.assertTrue(case_target.is_file())
+        self.assertTrue(ticket.path.is_file())
+        self.assertIsNone(
+            MODULE._read_pending_cleanup_terminal_validation(
+                case_home,
+                ticket,
+                ticket.quarantine_root_identity,
+            )
+        )
+
+    def test_v6_ephemeral_cleanup_rechecks_bound_authority_after_snapshot(
+        self,
+    ) -> None:
+        for mutation in ("ticket", "parent"):
+            with self.subTest(mutation=mutation):
+                case_home = self.root / f"ephemeral-v6-final-boundary-{mutation}"
+                install(self.first_release, case_home, SHA_A)
+                case_target = case_home / ROLE_TARGET
+                expected = MODULE._read_regular_file_snapshot_beneath(
+                    case_home,
+                    case_target,
+                    require_managed_access=False,
+                )
+                ticket = (
+                    MODULE._publish_pending_ephemeral_quarantine_leaf_cleanup_ticket(
+                        case_home,
+                        case_target,
+                        expected,
+                    )
+                )
+                real_snapshot = MODULE._regular_file_snapshot_at
+                target_snapshots = 0
+                original_parent_mode = stat.S_IMODE(case_target.parent.stat().st_mode)
+
+                def mutate_after_final_snapshot(
+                    parent_fd: int,
+                    name: str,
+                    path: Path,
+                    *,
+                    maximum_bytes: int = MODULE.MAX_ARCHIVE_MEMBER_BYTES,
+                ):
+                    nonlocal target_snapshots
+                    snapshot = real_snapshot(
+                        parent_fd,
+                        name,
+                        path,
+                        maximum_bytes=maximum_bytes,
+                    )
+                    if path != case_target:
+                        return snapshot
+                    target_snapshots += 1
+                    if target_snapshots == 2:
+                        if mutation == "ticket":
+                            ticket.path.write_bytes(b"{}\n")
+                        else:
+                            case_target.parent.chmod(original_parent_mode | 0o022)
+                    return snapshot
+
+                try:
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_regular_file_snapshot_at",
+                            side_effect=mutate_after_final_snapshot,
+                        ),
+                        mock.patch.object(MODULE, "_rename_noreplace_at") as rename,
+                        self.assertRaises(MODULE.SyncError),
+                    ):
+                        MODULE._cleanup_ready_pending_batches(case_home)
+                finally:
+                    case_target.parent.chmod(original_parent_mode)
+
+                self.assertEqual(target_snapshots, 2)
+                rename.assert_not_called()
+                self.assertTrue(case_target.is_file())
+                self.assertTrue(ticket.path.is_file())
+
+    def test_v6_ephemeral_cleanup_rejects_post_rename_destination_replacement(
+        self,
+    ) -> None:
+        case_home = self.root / "ephemeral-v6-post-rename-replacement"
+        install(self.first_release, case_home, SHA_A)
+        case_target = case_home / ROLE_TARGET
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            case_home,
+            case_target,
+            require_managed_access=False,
+        )
+        ticket = MODULE._publish_pending_ephemeral_quarantine_leaf_cleanup_ticket(
+            case_home,
+            case_target,
+            expected,
+        )
+        for index, alias_name in enumerate(
+            MODULE._pending_ephemeral_public_alias_names(ticket.batch_root.name)
+        ):
+            alias = case_target.with_name(alias_name)
+            alias.write_bytes(f"foreign alias {index}\n".encode("utf-8"))
+            alias.chmod(0o600)
+
+        real_rename = MODULE._rename_noreplace_at
+        replaced = False
+        retained: Path | None = None
+
+        def replace_destination_after_rename(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal replaced, retained
+            real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+            if (
+                source_name != case_target.name
+                or MODULE._pending_ephemeral_quarantine_final_private_base(
+                    ticket.batch_root.name,
+                    destination_name,
+                )
+                is None
+            ):
+                return
+            os.unlink(destination_name, dir_fd=destination_parent_fd)
+            descriptor = os.open(
+                destination_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=destination_parent_fd,
+            )
+            try:
+                os.write(descriptor, b"foreign post-rename replacement\n")
+            finally:
+                os.close(descriptor)
+            retained = (
+                MODULE._personal_sync_root(case_home)
+                / MODULE.QUARANTINE_RELATIVE_PATH
+                / destination_name
+            )
+            replaced = True
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=replace_destination_after_rename,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "canonical replacement was retained as isolated evidence",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(case_home)
+
+        self.assertTrue(replaced)
+        self.assertIsNotNone(retained)
+        assert retained is not None
+        self.assertEqual(retained.read_bytes(), b"foreign post-rename replacement\n")
+        self.assertFalse(os.path.lexists(case_target))
+        self.assertTrue(ticket.path.is_file())
+
+    def test_v6_ephemeral_cleanup_allows_benign_parent_child_churn(self) -> None:
+        case_home = self.root / "ephemeral-v6-benign-parent-churn"
+        install(self.first_release, case_home, SHA_A)
+        case_target = case_home / ROLE_TARGET
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            case_home,
+            case_target,
+            require_managed_access=False,
+        )
+        ticket = MODULE._publish_pending_ephemeral_quarantine_leaf_cleanup_ticket(
+            case_home,
+            case_target,
+            expected,
+        )
+        real_snapshot = MODULE._regular_file_snapshot_at
+        target_snapshots = 0
+        churned = False
+
+        def churn_after_final_snapshot(
+            parent_fd: int,
+            name: str,
+            path: Path,
+            *,
+            maximum_bytes: int = MODULE.MAX_ARCHIVE_MEMBER_BYTES,
+        ):
+            nonlocal churned, target_snapshots
+            snapshot = real_snapshot(
+                parent_fd,
+                name,
+                path,
+                maximum_bytes=maximum_bytes,
+            )
+            if path == case_target:
+                target_snapshots += 1
+                if target_snapshots == 2:
+                    sibling = case_target.with_name(".unrelated-child-churn")
+                    sibling.write_bytes(b"benign child churn\n")
+                    sibling.chmod(0o600)
+                    sibling.unlink()
+                    churned = True
+            return snapshot
+
+        with mock.patch.object(
+            MODULE,
+            "_regular_file_snapshot_at",
+            side_effect=churn_after_final_snapshot,
+        ):
+            self.assertEqual(MODULE._cleanup_ready_pending_batches(case_home), 1)
+
+        self.assertTrue(churned)
+        self.assertFalse(os.path.lexists(case_target))
+        self.assertFalse(ticket.path.exists())
+
+    def test_v6_canonical_evacuation_rejects_same_inode_metadata_changes(
+        self,
+    ) -> None:
+        for mutation in ("content", "mode", "uid", "link-count"):
+            with self.subTest(mutation=mutation):
+                case_home = self.root / f"ephemeral-v6-canonical-{mutation}"
+                install(self.first_release, case_home, SHA_A)
+                case_target = case_home / ROLE_TARGET
+                expected = MODULE._read_regular_file_snapshot_beneath(
+                    case_home,
+                    case_target,
+                    require_managed_access=False,
+                )
+                ticket = (
+                    MODULE._publish_pending_ephemeral_quarantine_leaf_cleanup_ticket(
+                        case_home,
+                        case_target,
+                        expected,
+                    )
+                )
+                original_payload = case_target.read_bytes()
+                real_snapshot = MODULE._regular_file_snapshot_at
+                mutated = False
+
+                def mutate_after_descriptor_capture(
+                    parent_fd: int,
+                    name: str,
+                    path: Path,
+                    *,
+                    maximum_bytes: int = MODULE.MAX_ARCHIVE_MEMBER_BYTES,
+                ):
+                    nonlocal mutated
+                    snapshot = real_snapshot(
+                        parent_fd,
+                        name,
+                        path,
+                        maximum_bytes=maximum_bytes,
+                    )
+                    if path != case_target or mutated:
+                        return snapshot
+                    mutated = True
+                    if mutation == "content":
+                        replacement = bytes(byte ^ 0xFF for byte in original_payload)
+                        case_target.write_bytes(replacement)
+                    elif mutation == "mode":
+                        case_target.chmod(expected.mode ^ stat.S_IXUSR)
+                    elif mutation == "link-count":
+                        os.link(case_target, case_home / "same-inode-extra-link")
+                    else:
+                        return replace(snapshot, uid=snapshot.uid + 1)
+                    return snapshot
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_regular_file_snapshot_at",
+                        side_effect=mutate_after_descriptor_capture,
+                    ),
+                    mock.patch.object(MODULE, "_rename_noreplace_at") as rename,
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "canonical payload changed before evacuation",
+                    ),
+                ):
+                    MODULE._cleanup_ready_pending_batches(case_home)
+
+                self.assertTrue(mutated)
+                rename.assert_not_called()
+                self.assertTrue(ticket.path.is_file())
+                self.assertTrue(case_target.is_file())
+                self.assertEqual(
+                    (case_target.stat().st_dev, case_target.stat().st_ino),
+                    expected.file_identity,
+                )
+
+    def test_v6_alias_evacuation_rejects_same_inode_content_change(self) -> None:
+        case_home = self.root / "ephemeral-v6-alias-content-change"
+        install(self.first_release, case_home, SHA_A)
+        case_target = case_home / ROLE_TARGET
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            case_home,
+            case_target,
+            require_managed_access=False,
+        )
+        ticket = MODULE._publish_pending_ephemeral_quarantine_leaf_cleanup_ticket(
+            case_home,
+            case_target,
+            expected,
+        )
+        alias_names = MODULE._pending_ephemeral_public_alias_names(
+            ticket.batch_root.name
+        )
+        foreign_alias = case_target.with_name(alias_names[0])
+        original_payload = b"same-uid competing alias\n"
+        changed_payload = b"same-uid changed-- alias\n"
+        self.assertEqual(len(original_payload), len(changed_payload))
+        foreign_alias.write_bytes(original_payload)
+        foreign_alias.chmod(0o600)
+        foreign_identity = (
+            foreign_alias.stat().st_dev,
+            foreign_alias.stat().st_ino,
+        )
+        real_snapshot = MODULE._regular_file_snapshot_at
+        mutated = False
+
+        def mutate_alias_after_descriptor_capture(
+            parent_fd: int,
+            name: str,
+            path: Path,
+            *,
+            maximum_bytes: int = MODULE.MAX_ARCHIVE_MEMBER_BYTES,
+        ):
+            nonlocal mutated
+            snapshot = real_snapshot(
+                parent_fd,
+                name,
+                path,
+                maximum_bytes=maximum_bytes,
+            )
+            if path == foreign_alias and not mutated:
+                mutated = True
+                foreign_alias.write_bytes(changed_payload)
+            return snapshot
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_regular_file_snapshot_at",
+                side_effect=mutate_alias_after_descriptor_capture,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "alias payload changed before evacuation",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(case_home)
+
+        self.assertTrue(mutated)
+        self.assertFalse(os.path.lexists(case_target))
+        self.assertEqual(foreign_alias.read_bytes(), changed_payload)
+        self.assertEqual(
+            (foreign_alias.stat().st_dev, foreign_alias.stat().st_ino),
+            foreign_identity,
+        )
+        exact_alias = case_target.with_name(alias_names[1])
+        self.assertEqual(
+            (exact_alias.stat().st_dev, exact_alias.stat().st_ino),
+            expected.file_identity,
+        )
+        quarantine_root = (
+            MODULE._personal_sync_root(case_home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        quarantine_fd = MODULE._open_directory_beneath(case_home, quarantine_root)
+        try:
+            self.assertEqual(
+                MODULE._pending_ephemeral_quarantine_private_inventory(
+                    quarantine_fd,
+                    ticket.batch_root.name,
+                ),
+                (),
+            )
+        finally:
+            MODULE._close_fd_quietly(quarantine_fd)
+        self.assertTrue(ticket.path.is_file())
 
     def test_v6_ephemeral_cleanup_restart_after_private_unlink_preserves_foreign_canonical(
         self,

@@ -17414,6 +17414,12 @@ def _pending_ephemeral_quarantine_evidence_names(
     return (primary,) + tuple(f"{primary}-retained-{index}" for index in range(8))
 
 
+def _pending_ephemeral_quarantine_retained_private_name(batch_name: str) -> str:
+    """Return a collision-resistant private evidence name for foreign data."""
+    primary = _pending_ephemeral_quarantine_leaf_name(batch_name)
+    return f"{primary}-retained-{os.urandom(16).hex()}"
+
+
 def _pending_ephemeral_quarantine_final_private_name(private_name: str) -> str:
     return f"{private_name}.delete-{os.urandom(16).hex()}"
 
@@ -30814,70 +30820,332 @@ def _remove_pending_ephemeral_quarantine_leaf(
                 f"payload deletion: {batch_name}"
             )
 
-    def move_canonical_to_alias(identity: tuple[int, int]) -> None:
-        destination = next(
-            (
-                name
-                for name in alias_names
-                if _named_entry_identity(public_parent_fd, name) is None
-            ),
-            None,
-        )
-        if destination is None:
-            raise SyncError(
-                f"pending ephemeral cleanup has no private public alias: {batch_name}"
-            )
-        _require_pending_cleanup_ticket_unchanged(home, ticket)
-        require_bound_parents()
-        if _named_entry_identity(public_parent_fd, target.name) != identity:
-            raise SyncError(
-                f"pending ephemeral cleanup canonical payload changed: {batch_name}"
-            )
-        _rename_noreplace_at(
-            public_parent_fd,
-            target.name,
-            public_parent_fd,
-            destination,
-        )
-        os.fsync(public_parent_fd)
-        if _named_entry_identity(public_parent_fd, destination) is None:
-            raise SyncError(
-                f"pending ephemeral cleanup canonical evacuation disappeared: "
-                f"{batch_name}"
-            )
+    def public_evacuation_snapshot(
+        name: str,
+        identity: tuple[int, int],
+        *,
+        label: str,
+        exact: bool,
+    ) -> RegularFileSnapshot:
+        """Capture complete, descriptor-bound evidence before a public rename.
 
-    def move_alias_to_private(name: str, identity: tuple[int, int]) -> None:
-        destination = next(
-            (
-                candidate
-                for candidate in evidence_names
-                if _named_entry_identity(quarantine_fd, candidate) is None
-            ),
-            None,
-        )
-        if destination is None:
-            raise SyncError(
-                f"pending ephemeral cleanup private evidence is full: {batch_name}"
+        The protected leaf properties are object identity, regular-file type,
+        content digest and size, mode/UID access policy, policy-relevant GID,
+        and exact link count. The parent property is its bound identity and
+        owner-controlled access policy; directory ctime and child-entry churn
+        are deliberately not mutation evidence.
+        """
+        path = target.with_name(name)
+        try:
+            current = _regular_file_snapshot_at(
+                public_parent_fd,
+                name,
+                path,
+                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
             )
-        _require_pending_cleanup_ticket_unchanged(home, ticket)
-        require_bound_parents()
-        if _named_entry_identity(public_parent_fd, name) != identity:
+        except (OSError, SyncError) as error:
             raise SyncError(
-                f"pending ephemeral cleanup alias payload changed: {batch_name}"
+                f"pending ephemeral cleanup {label} payload cannot be verified "
+                f"before evacuation: {batch_name}"
+            ) from error
+        if (
+            current.parent_identity != expected.parent_identity
+            or current.file_identity != identity
+            or current.uid != os.geteuid()
+            or current.mode & 0o022
+            or (
+                exact
+                and not _regular_snapshot_matches(
+                    current,
+                    expected.parent_identity,
+                    expected,
+                    expected_link_count=expected.link_count,
+                )
             )
-        _rename_noreplace_at(
-            public_parent_fd,
+        ):
+            raise SyncError(
+                f"pending ephemeral cleanup {label} payload changed before "
+                f"evacuation: {batch_name}"
+            )
+        return current
+
+    def require_public_evacuation_unchanged(
+        name: str,
+        identity: tuple[int, int],
+        captured: RegularFileSnapshot,
+        *,
+        label: str,
+        exact: bool,
+    ) -> RegularFileSnapshot:
+        current = public_evacuation_snapshot(
             name,
-            quarantine_fd,
-            destination,
+            identity,
+            label=label,
+            exact=exact,
         )
-        os.fsync(public_parent_fd)
-        os.fsync(quarantine_fd)
-        if _named_entry_identity(quarantine_fd, destination) != identity:
+        if not _regular_snapshot_matches(
+            current,
+            expected.parent_identity,
+            captured,
+            expected_link_count=captured.link_count,
+        ):
             raise SyncError(
-                "pending ephemeral cleanup alias replacement was retained as "
+                f"pending ephemeral cleanup {label} payload changed before "
+                f"evacuation: {batch_name}"
+            )
+        return current
+
+    def require_evacuation_destination(
+        destination_parent_fd: int,
+        destination_parent_identity: tuple[int, int],
+        destination: str,
+        captured: RegularFileSnapshot,
+        *,
+        label: str,
+        allow_public_alias_recovery: bool = False,
+    ) -> bool:
+        destination_path = (
+            target.with_name(destination)
+            if destination_parent_fd == public_parent_fd
+            else quarantine_root / destination
+        )
+        try:
+            moved = _regular_file_snapshot_at(
+                destination_parent_fd,
+                destination,
+                destination_path,
+                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+            )
+        except (OSError, SyncError) as error:
+            raise SyncError(
+                f"pending ephemeral cleanup {label} evacuation cannot be "
+                f"verified: {batch_name}"
+            ) from error
+        if moved.parent_identity != destination_parent_identity:
+            raise SyncError(
+                f"pending ephemeral cleanup {label} evacuation changed: {batch_name}"
+            )
+        if (
+            not _regular_snapshot_leaf_matches(moved, captured)
+            or moved.link_count != captured.link_count
+        ):
+            if allow_public_alias_recovery:
+                # The caller moved into a non-loadable public alias. Keep the
+                # replacement intact, then re-inventory it so the ordinary
+                # alias-to-private path can preserve it as private evidence.
+                # A changed destination parent is never recoverable here.
+                return False
+            raise SyncError(
+                f"pending ephemeral cleanup {label} replacement was retained as "
                 f"isolated evidence: {batch_name}"
             )
+        return True
+
+    def move_canonical_to_safe_name(
+        identity: tuple[int, int],
+        *,
+        exact: bool,
+    ) -> None:
+        for _evacuation_attempt in range(128):
+            destination_parent_fd = public_parent_fd
+            destination_parent_identity = expected.parent_identity
+            destination = next(
+                (
+                    name
+                    for name in alias_names
+                    if _named_entry_identity(public_parent_fd, name) is None
+                ),
+                None,
+            )
+            if destination is None:
+                # Every bounded non-loadable public alias may legitimately be
+                # occupied by foreign evidence. Never overwrite or delete it:
+                # move the exact ticket-bound canonical directly into a
+                # collision-resistant final-private name. That name is already
+                # recognized by v6 recovery after a crash before receipt
+                # publication.
+                destination_parent_fd = quarantine_fd
+                destination_parent_identity = ticket.quarantine_root_identity
+                destination = _pending_ephemeral_quarantine_final_private_name(
+                    evidence_names[0]
+                )
+
+            captured = public_evacuation_snapshot(
+                target.name,
+                identity,
+                label="canonical",
+                exact=exact,
+            )
+            _require_pending_cleanup_ticket_unchanged(home, ticket)
+            require_bound_parents()
+            captured = require_public_evacuation_unchanged(
+                target.name,
+                identity,
+                captured,
+                label="canonical",
+                exact=exact,
+            )
+            # Hashing the full descriptor-bound leaf can take time. Rebind
+            # both authority parents and the ticket immediately before the
+            # namespace mutation rather than relying on the pre-hash sample.
+            _require_pending_cleanup_ticket_unchanged(home, ticket)
+            require_bound_parents()
+            try:
+                _rename_noreplace_at(
+                    public_parent_fd,
+                    target.name,
+                    destination_parent_fd,
+                    destination,
+                )
+            except FileExistsError:
+                # A same-UID competitor may reserve the selected public alias
+                # or private evidence name after the last scan. Preserve that
+                # entry and choose a fresh bounded no-replace destination.
+                continue
+            except FileNotFoundError as error:
+                raise SyncError(
+                    "pending ephemeral cleanup canonical payload disappeared "
+                    f"during evacuation: {batch_name}"
+                ) from error
+
+            if destination_parent_fd != public_parent_fd:
+                # Persist the private addition before the public removal. If
+                # the second fsync reports an error, recovery can observe a
+                # durable private exact inode (and safely retain any replayed
+                # public duplicate) rather than losing both names.
+                os.fsync(quarantine_fd)
+            os.fsync(public_parent_fd)
+            require_bound_parents()
+            destination_matches = require_evacuation_destination(
+                destination_parent_fd,
+                destination_parent_identity,
+                destination,
+                captured,
+                label="canonical",
+                allow_public_alias_recovery=(destination_parent_fd == public_parent_fd),
+            )
+            if not destination_matches:
+                # The replacement is safely non-loadable at this point. The
+                # outer reconciliation loop will snapshot it afresh and move
+                # it to private quarantine without deleting any evidence.
+                return
+            return
+        raise SyncError(
+            "pending ephemeral cleanup could not allocate a safe canonical "
+            f"evacuation name: {batch_name}"
+        )
+
+    def move_alias_to_private(name: str, identity: tuple[int, int]) -> None:
+        for _evacuation_attempt in range(128):
+            destination = next(
+                (
+                    candidate
+                    for candidate in evidence_names
+                    if _named_entry_identity(quarantine_fd, candidate) is None
+                ),
+                None,
+            )
+            if destination is None:
+                destination = _pending_ephemeral_quarantine_retained_private_name(
+                    batch_name
+                )
+            captured = public_evacuation_snapshot(
+                name,
+                identity,
+                label="alias",
+                exact=False,
+            )
+            _require_pending_cleanup_ticket_unchanged(home, ticket)
+            require_bound_parents()
+            captured = require_public_evacuation_unchanged(
+                name,
+                identity,
+                captured,
+                label="alias",
+                exact=False,
+            )
+            _require_pending_cleanup_ticket_unchanged(home, ticket)
+            require_bound_parents()
+            try:
+                _rename_noreplace_at(
+                    public_parent_fd,
+                    name,
+                    quarantine_fd,
+                    destination,
+                )
+            except FileExistsError:
+                continue
+            except FileNotFoundError as error:
+                raise SyncError(
+                    "pending ephemeral cleanup alias payload disappeared during "
+                    f"evacuation: {batch_name}"
+                ) from error
+            os.fsync(quarantine_fd)
+            os.fsync(public_parent_fd)
+            require_bound_parents()
+            require_evacuation_destination(
+                quarantine_fd,
+                ticket.quarantine_root_identity,
+                destination,
+                captured,
+                label="alias",
+            )
+            return
+        raise SyncError(
+            "pending ephemeral cleanup could not allocate private evidence: "
+            f"{batch_name}"
+        )
+
+    def private_expected_snapshots(
+        private: tuple[tuple[str, tuple[int, int]], ...],
+    ) -> tuple[tuple[str, RegularFileSnapshot], ...]:
+        snapshots: list[tuple[str, RegularFileSnapshot]] = []
+        for name, identity in private:
+            if identity != expected.file_identity:
+                continue
+            try:
+                current = _regular_file_snapshot_at(
+                    quarantine_fd,
+                    name,
+                    quarantine_root / name,
+                    maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                )
+            except (OSError, SyncError) as error:
+                raise SyncError(
+                    "pending ephemeral cleanup private payload cannot be verified: "
+                    f"{batch_name}"
+                ) from error
+            if (
+                current.parent_identity != ticket.quarantine_root_identity
+                or not _regular_snapshot_leaf_matches(current, expected)
+            ):
+                raise SyncError(
+                    f"pending ephemeral cleanup private payload changed: {batch_name}"
+                )
+            snapshots.append((name, current))
+        return tuple(snapshots)
+
+    def receipt_private_snapshots(
+        private: tuple[tuple[str, tuple[int, int]], ...],
+    ) -> tuple[tuple[str, RegularFileSnapshot], ...]:
+        return tuple(
+            (name, snapshot)
+            for name, snapshot in private_expected_snapshots(private)
+            if (
+                name in evidence_names
+                or _pending_ephemeral_quarantine_final_private_base(batch_name, name)
+                is not None
+            )
+            and snapshot.link_count == expected.link_count
+        )
+
+    def no_public_exact_payload(
+        canonical_identity: tuple[int, int] | None,
+        aliases: tuple[tuple[str, tuple[int, int]], ...],
+    ) -> bool:
+        return canonical_identity != expected.file_identity and all(
+            identity != expected.file_identity for _name, identity in aliases
+        )
 
     try:
         public_parent_fd = _open_directory_beneath(home, target.parent)
@@ -30886,19 +31154,7 @@ def _remove_pending_ephemeral_quarantine_leaf(
             require_bound_parents()
             _require_pending_cleanup_ticket_unchanged(home, ticket)
             private = private_inventory()
-            exact_private = tuple(
-                item
-                for item in private
-                if item[1] == expected.file_identity
-                and (
-                    item[0] in evidence_names
-                    or _pending_ephemeral_quarantine_final_private_base(
-                        batch_name,
-                        item[0],
-                    )
-                    is not None
-                )
-            )
+            canonical_identity, aliases = public_inventory()
             phase_receipt = _read_pending_cleanup_terminal_validation(
                 home,
                 ticket,
@@ -30906,18 +31162,41 @@ def _remove_pending_ephemeral_quarantine_leaf(
             )
 
             # A crash can land after the cross-directory rename and before the
-            # receipt publication. The exact private inode itself is sufficient
-            # evidence that initial evacuation completed; publish the durable
-            # receipt before inspecting or mutating any newly public entry.
-            if phase_receipt is None and exact_private:
-                _publish_pending_cleanup_terminal_validation(
-                    home,
-                    ticket,
-                    ticket.quarantine_root_identity,
+            # receipt publication. Before acknowledging private authority,
+            # prove the complete ticket snapshot and link count from the
+            # private descriptor and prove that its inode is absent from every
+            # derived public name. Foreign public evidence may remain, but it
+            # never supplies ticket authority.
+            receipt_private = (
+                receipt_private_snapshots(private) if phase_receipt is None else ()
+            )
+            if (
+                phase_receipt is None
+                and len(receipt_private) == 1
+                and no_public_exact_payload(canonical_identity, aliases)
+            ):
+                _require_pending_cleanup_ticket_unchanged(home, ticket)
+                require_bound_parents()
+                refreshed_private = private_inventory()
+                refreshed_receipt_private = receipt_private_snapshots(refreshed_private)
+                refreshed_canonical, refreshed_aliases = public_inventory()
+                _require_pending_cleanup_ticket_unchanged(home, ticket)
+                require_bound_parents()
+                if len(refreshed_receipt_private) == 1 and no_public_exact_payload(
+                    refreshed_canonical,
+                    refreshed_aliases,
+                ):
+                    _publish_pending_cleanup_terminal_validation(
+                        home,
+                        ticket,
+                        ticket.quarantine_root_identity,
+                    )
+                    continue
+                private = refreshed_private
+                canonical_identity, aliases = (
+                    refreshed_canonical,
+                    refreshed_aliases,
                 )
-                continue
-
-            canonical_identity, aliases = public_inventory()
             if phase_receipt is not None:
                 if canonical_identity is not None:
                     raise SyncError(
@@ -31148,7 +31427,7 @@ def _remove_pending_ephemeral_quarantine_leaf(
                 # that alias reached private evidence first, the recovery
                 # would fail closed while leaving the ticket-bound canonical
                 # publication loadable.
-                move_canonical_to_alias(canonical_identity)
+                move_canonical_to_safe_name(canonical_identity, exact=True)
                 continue
             # Preserve every observed foreign alias before advancing the
             # ticket-bound inode to exact private isolation.  Selecting by
@@ -31173,7 +31452,7 @@ def _remove_pending_ephemeral_quarantine_leaf(
                 move_alias_to_private(alias_name, alias_identity)
                 continue
             if canonical_identity is not None:
-                move_canonical_to_alias(canonical_identity)
+                move_canonical_to_safe_name(canonical_identity, exact=False)
                 continue
             raise SyncError(
                 "pending ephemeral cleanup exact payload disappeared before "

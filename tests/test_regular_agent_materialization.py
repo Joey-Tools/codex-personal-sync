@@ -710,6 +710,7 @@ class PublicRegularAgentTests(unittest.TestCase):
         real_snapshot = MODULE._regular_file_snapshot_at
         real_link = os.link
         linked = False
+        failed = False
 
         def mark_linked(*args: object, **kwargs: object) -> None:
             nonlocal linked
@@ -723,7 +724,9 @@ class PublicRegularAgentTests(unittest.TestCase):
             *args: object,
             **kwargs: object,
         ) -> MODULE.RegularFileSnapshot:
-            if linked and path == target:
+            nonlocal failed
+            if linked and path == target and not failed:
+                failed = True
                 raise OSError("injected canonical snapshot failure")
             return real_snapshot(
                 directory_fd,
@@ -752,6 +755,7 @@ class PublicRegularAgentTests(unittest.TestCase):
             )
 
         self.assertFalse(os.path.lexists(target))
+        self.assertTrue(failed)
         self.assertEqual(stage.read_bytes(), b"authority")
         self.assertEqual(stage.stat().st_nlink, 1)
         internal = tuple(

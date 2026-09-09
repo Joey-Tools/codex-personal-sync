@@ -940,3 +940,47 @@ superseded_by:
   1,635 tests with two expected skips in 2,185.987 seconds. This changed test
   and lock range requires a new signed frozen head and fresh exact-head
   whole-range review before remote publication.
+- A subsequent fresh security audit identified four v6 eviction boundaries:
+  private-phase receipt authority could be inferred from an inode alone while
+  that inode remained public; fixed public and private name sets could be
+  exhausted or raced; a long descriptor-bound payload hash could outlive the
+  final ticket and parent-policy checks; and cross-directory eviction persisted
+  the public removal before the private addition. The repair keeps object
+  identity, regular-file content, mode/UID/policy-relevant GID, and link count
+  as the protected leaf properties. It reproves the ticket and both bound
+  parent policies after the final payload hash, requires one complete
+  ticket-matching private snapshot and no public exact inode before publishing
+  a phase receipt, retries no-replace collisions through recognized high-entropy
+  private names, and fsyncs the private destination before the public source.
+  Foreign entries are never overwritten; a changed post-rename destination is
+  retained as isolated evidence. Parent ctime and unrelated child-entry churn
+  remain deliberately non-authoritative.
+- New regressions cover full public and fixed-private namespace exhaustion,
+  dynamic private-name collisions, a malicious private hard link while the
+  canonical target remains public, ticket and parent-policy changes after the
+  final source snapshot, post-rename destination replacement, and benign
+  child-entry churn. The v6 focused selection passed 23 tests in 24.552
+  seconds. Ruff lint/format, Python syntax compilation, and `git diff --check`
+  passed; the source lock was refreshed for all eleven sources. An interim
+  fresh-context security audit reported no findings, but a signed frozen
+  whole-range review and complete discovery remain required before publication.
+- The first complete discovery after that repair exposed a recovery-contract
+  regression: if a final canonical-to-non-loadable-alias rename races with a
+  foreign replacement, strict destination verification stopped before the
+  existing alias-to-private quarantine pass. The replacement was safe from
+  loading but remained public evidence. Destination parent rebinding remains
+  fail closed; only a leaf mismatch in a still-bound non-loadable public alias
+  now returns control to fresh alias inventory, which snapshots and preserves
+  the foreign payload in private quarantine. Private destinations and changed
+  destination parents still fail closed as retained evidence.
+- The directly affected rollback regression passed, as did all 23 v6 cleanup
+  regressions in 61.225 seconds. Ruff lint/format, AST syntax validation,
+  `git diff --check`, and source-lock refresh/check for all eleven sources
+  passed. A new complete repository-private discovery and frozen exact-head
+  review remain required before publication.
+- The replacement complete repository-private discovery then passed 1,643
+  tests with two expected skips in 1,465.148 seconds. Project-journal
+  validation, source-lock verification, Ruff lint/format, AST syntax
+  validation, and `git diff --check` also passed on the current worktree. The
+  source range is now ready for a signed frozen head and fresh exact-head
+  whole-range review before remote publication.
