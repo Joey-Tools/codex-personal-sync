@@ -485,9 +485,13 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
                 (evidence_batch_root / "leaf").mkdir(mode=0o700)
                 return
             if mutation == "ticket":
-                ticket.path.unlink()
-                ticket.path.write_bytes(b"{}\n")
-                ticket.path.chmod(0o600)
+                original_ticket_fd = os.open(ticket.path, os.O_RDONLY)
+                try:
+                    ticket.path.unlink()
+                    ticket.path.write_bytes(b"{}\n")
+                    ticket.path.chmod(0o600)
+                finally:
+                    os.close(original_ticket_fd)
                 return
             if mutation == "batch-policy":
                 evidence_batch_root.chmod(0o755)

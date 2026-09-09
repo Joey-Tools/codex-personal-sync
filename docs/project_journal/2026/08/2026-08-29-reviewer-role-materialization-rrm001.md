@@ -1027,3 +1027,19 @@ superseded_by:
   occurred; the remaining local gates are a signed frozen head, new
   independent whole-range review, and secret admission before the PR's
   current-head GitHub checks and review can begin.
+- The current-head GitHub Codex review then identified a test-only inode reuse
+  assumption: three replacement fixtures unlinked an object and expected a
+  subsequent same-payload create to receive a different `(st_dev, st_ino)`.
+  On filesystems that immediately recycle inode tuples, that made the intended
+  identity-mismatch branch nondeterministic. The fixtures now retain a
+  descriptor for the unlinked ticket or leaf until the replacement has been
+  created and configured; production cleanup semantics are unchanged. Four
+  exact regressions, a 13-test related selection, and both affected modules
+  (197 tests in 69.314 seconds) passed, followed by source-lock refresh. A new
+  complete discovery and frozen exact-head review remain required before
+  publication.
+- The replacement complete repository-private discovery passed 1,644 tests
+  with two expected skips in 1,147.456 seconds. The next required local gates
+  are a signed frozen head, independent whole-range review, and secret
+  admission; the current GitHub review finding remains unresolved until that
+  new head is published and reviewed.

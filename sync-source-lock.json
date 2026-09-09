@@ -43,12 +43,12 @@
     "pending_staging_cleanup_tests": {
       "mode": "0644",
       "path": "tests/test_pending_staging_cleanup.py",
-      "sha256": "d239d9ea61ab4b059b05da69c7e9a76d3ae48b32da796ec8eaae017d6fca3ad9"
+      "sha256": "baad6e5d2fe3a55af373c55fa6751613caab80990d0cfea69d2db12ea8e15323"
     },
     "quarantine_empty_batch_reclaim_tests": {
       "mode": "0644",
       "path": "tests/test_quarantine_empty_batch_reclaim.py",
-      "sha256": "60d9c3fb7d20c5b8a7da3c40af6ba4cb57c60023715f70852ea0637e40fc3c4c"
+      "sha256": "d185a2a4840b42ac37f22bacdf3478017c6947eb1d41bc305a6e62ecaa1b6948"
     },
     "reconciliation_safety_tests": {
       "mode": "0644",

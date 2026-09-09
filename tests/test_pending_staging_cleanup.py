@@ -5581,9 +5581,13 @@ class PendingStagingCleanupTests(unittest.TestCase):
                         return result
                     changed = True
                     if changed_property == "identity":
-                        ticket.path.unlink()
-                        ticket.path.write_bytes(ticket_payload)
-                        ticket.path.chmod(0o600)
+                        original_ticket_fd = os.open(ticket.path, os.O_RDONLY)
+                        try:
+                            ticket.path.unlink()
+                            ticket.path.write_bytes(ticket_payload)
+                            ticket.path.chmod(0o600)
+                        finally:
+                            os.close(original_ticket_fd)
                     elif changed_property == "content":
                         changed_payload = ticket_payload.replace(
                             b'"leaf"',
@@ -5998,12 +6002,22 @@ class PendingStagingCleanupTests(unittest.TestCase):
             if display_path == leaf:
                 leaf_checks += 1
                 if leaf_checks == 2:
-                    leaf.rmdir()
-                    leaf.mkdir(mode=0o700)
-                    protected = leaf / "foreign"
-                    protected.write_bytes(b"foreign leaf\n")
-                    replacement = leaf.stat()
-                    replacement_identity = (replacement.st_dev, replacement.st_ino)
+                    original_leaf_fd = os.open(
+                        leaf,
+                        MODULE._directory_open_flags(nofollow=True),
+                    )
+                    try:
+                        leaf.rmdir()
+                        leaf.mkdir(mode=0o700)
+                        protected = leaf / "foreign"
+                        protected.write_bytes(b"foreign leaf\n")
+                        replacement = leaf.stat()
+                        replacement_identity = (
+                            replacement.st_dev,
+                            replacement.st_ino,
+                        )
+                    finally:
+                        os.close(original_leaf_fd)
             return result
 
         with (
