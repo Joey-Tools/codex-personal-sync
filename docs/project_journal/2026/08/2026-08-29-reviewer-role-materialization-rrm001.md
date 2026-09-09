@@ -1009,3 +1009,21 @@ superseded_by:
   gate is a signed frozen head followed by a new independent whole-range
   review, secret admission, and then the PR's current-head GitHub review and
   required checks; no remote publication has occurred for this repair yet.
+- The subsequent frozen whole-range review found one further before-phase
+  recovery boundary: the valid interval after the private alias is deleted but
+  before rollback recreates the canonical preimage. The snapshot helper
+  intentionally turns a missing leaf into a fail-closed `SyncError`; the
+  caller's ineffective `FileNotFoundError` handler therefore made this valid
+  crash state unrecoverable. The repair first probes the bound parent directory
+  for target absence, snapshots only an existing leaf, and still fails closed
+  for every unreadable, unsafe, or mismatched occupant. A deterministic
+  regression now crashes exactly before preimage restoration and proves the
+  following recovery restores the original object and clears the pending
+  pointer and batch. The regular-agent module passed 136 tests in 63.490
+  seconds; source-lock refresh is complete. A new full discovery and frozen
+  exact-head review are required before publication.
+- That replacement complete repository-private discovery passed 1,644 tests
+  with two expected skips in 1,123.633 seconds. No remote publication has
+  occurred; the remaining local gates are a signed frozen head, new
+  independent whole-range review, and secret admission before the PR's
+  current-head GitHub checks and review can begin.

@@ -3950,6 +3950,136 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self.assertEqual((target.stat().st_dev, target.stat().st_ino), old_identity)
         self.assertEqual(target.stat().st_nlink, 1)
 
+    def test_replace_recovery_restores_preimage_after_before_cleanup_crash(
+        self,
+    ) -> None:
+        install(self.release, self.home, SHA_A)
+        target = self.home / ROLE_TARGET
+        old_identity = (target.stat().st_dev, target.stat().st_ino)
+        next_release = self.root / "next-release"
+        write_release(next_release, role_payload='name = "updated"\n')
+        batch = self._interrupt_regular_publication_cleanup(next_release, SHA_B)
+        record = next(
+            candidate for candidate in batch.records if candidate.is_regular()
+        )
+        source = batch.batch_root / Path(*record.before_evidence.parts)
+        real_bound = MODULE._bound_directory_matches
+        real_isolate = MODULE._isolate_and_delete_pending_regular_publication_candidate
+        before_publish_started = False
+
+        def fail_after_before_publication(
+            home: Path,
+            path: Path,
+            directory_fd: int,
+        ) -> bool:
+            nonlocal before_publish_started
+            if path == source.parent and os.path.lexists(target):
+                before_publish_started = True
+                return False
+            return real_bound(home, path, directory_fd)
+
+        def fail_before_private_isolation(
+            home: Path,
+            pending_batch: MODULE.PendingLinkBatch,
+            pending_record: MODULE.PendingLinkRecord,
+            cleanup_phase: str,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            if before_publish_started and cleanup_phase == "before":
+                raise MODULE.SyncError("injected before publication cleanup crash")
+            real_isolate(
+                home,
+                pending_batch,
+                pending_record,
+                cleanup_phase,
+                *args,
+                **kwargs,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_bound_directory_matches",
+                side_effect=fail_after_before_publication,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_isolate_and_delete_pending_regular_publication_candidate",
+                side_effect=fail_before_private_isolation,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "exact cleanup could not be verified",
+            ),
+        ):
+            install(self.release, self.home, SHA_A)
+
+        journal = MODULE._read_pending_regular_publication_cleanup(
+            self.home,
+            batch,
+            record,
+            "before",
+        )
+        self.assertIsNotNone(journal)
+        assert journal is not None
+        _snapshot, active_name, phase, _expected = journal
+        self.assertEqual(phase, "before")
+        active = target.with_name(active_name)
+        self.assertEqual((active.stat().st_dev, active.stat().st_ino), old_identity)
+
+        restore_started = False
+
+        def crash_before_preimage_restoration(
+            home: Path,
+            pending_batch: MODULE.PendingLinkBatch,
+            pending_record: MODULE.PendingLinkRecord,
+            before_evidence: MODULE.SymlinkSnapshot | MODULE.RegularFileSnapshot,
+        ) -> None:
+            nonlocal restore_started
+            restore_started = True
+            self.assertFalse(os.path.lexists(target))
+            self.assertFalse(os.path.lexists(active))
+            raise MODULE.SyncError("injected crash before before-state restoration")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_restore_pending_record_before",
+                side_effect=crash_before_preimage_restoration,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "injected crash before before-state restoration",
+            ),
+        ):
+            install(self.release, self.home, SHA_A)
+
+        self.assertTrue(restore_started)
+        self.assertFalse(os.path.lexists(target))
+        self.assertFalse(os.path.lexists(active))
+        cleanup_metadata = journal[0]
+        assert cleanup_metadata.parent_identity is not None
+        anchor = MODULE._read_pending_regular_publication_private_authority(
+            self.home,
+            batch,
+            record,
+            "before",
+            journal[3],
+            journal[1],
+            cleanup_metadata.parent_identity,
+        )
+        self.assertIsNotNone(anchor)
+        self.assertTrue(MODULE._pending_link_pointer_path(self.home).is_file())
+
+        install(self.release, self.home, SHA_A)
+
+        self.assertFalse(MODULE._pending_link_pointer_path(self.home).exists())
+        self.assertFalse(batch.batch_root.exists())
+        self.assertEqual(target.read_text(encoding="utf-8"), 'name = "reviewer"\n')
+        self.assertEqual((target.stat().st_dev, target.stat().st_ino), old_identity)
+        self.assertEqual(target.stat().st_nlink, 1)
+
     def test_active_publication_foreign_replacement_is_retained(self) -> None:
         batch = self._interrupt_regular_publication_cleanup(self.release, SHA_A)
         _record, active = self._assert_active_publication_journal(batch)

@@ -20693,15 +20693,14 @@ def _recover_pending_regular_publication_cleanup(
                 and journal_phase == "before"
                 and _named_entry_identity(parent_fd, active_name) is None
             ):
-                try:
+                restored_before = None
+                if _named_entry_identity(parent_fd, target.name) is not None:
                     restored_before = _regular_file_snapshot_at(
                         parent_fd,
                         target.name,
                         target,
                         maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
                     )
-                except FileNotFoundError:
-                    restored_before = None
                 if _regular_snapshot_matches(
                     restored_before,
                     expected.parent_identity,
