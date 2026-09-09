@@ -4272,9 +4272,13 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             binding,
         )
         metadata = batch_root / "metadata.json"
-        metadata.unlink()
-        metadata.write_bytes(b'{"foreign": true}\n')
-        metadata.chmod(0o600)
+        original_metadata_fd = os.open(metadata, os.O_RDONLY)
+        try:
+            metadata.unlink()
+            metadata.write_bytes(b'{"foreign": true}\n')
+            metadata.chmod(0o600)
+        finally:
+            os.close(original_metadata_fd)
 
         with self.assertRaisesRegex(MODULE.SyncError, "changed before read"):
             MODULE._remove_cleanup_ready_batch(self.home, ticket)
@@ -4323,9 +4327,13 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
             self.home,
             binding,
         )
-        ticket.path.unlink()
-        ticket.path.write_bytes(b"{}\n")
-        ticket.path.chmod(0o600)
+        original_ticket_fd = os.open(ticket.path, os.O_RDONLY)
+        try:
+            ticket.path.unlink()
+            ticket.path.write_bytes(b"{}\n")
+            ticket.path.chmod(0o600)
+        finally:
+            os.close(original_ticket_fd)
 
         with self.assertRaisesRegex(MODULE.SyncError, "changed before read"):
             MODULE._remove_cleanup_ready_batch(self.home, ticket)

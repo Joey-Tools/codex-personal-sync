@@ -460,9 +460,13 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             ticket: MODULE.PendingBatchCleanupTicket,
         ) -> None:
             payload = self.target.read_bytes()
-            self.target.unlink()
-            self.target.write_bytes(payload)
-            self.target.chmod(0o600)
+            original_target_fd = os.open(self.target, os.O_RDONLY)
+            try:
+                self.target.unlink()
+                self.target.write_bytes(payload)
+                self.target.chmod(0o600)
+            finally:
+                os.close(original_target_fd)
             real_verify(home, ticket)
 
         with (
