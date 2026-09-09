@@ -3,7 +3,7 @@ id: 20260829-rrm001
 title: Reviewer Role Regular-File Materialization
 status: active
 created: 2026-08-29
-updated: 2026-09-02
+updated: 2026-09-09
 branch: codex/daily-skill-friction-20260829-codex-personal-sync-reviewer-role-regular-install
 pr:
 supersedes: []
@@ -88,15 +88,27 @@ superseded_by:
   of eight logical batches or standalone cursor-control actions per installer
   run; cursor residue consumes that same budget before ticket selection so a
   persistent deferred prefix cannot starve later terminal validation.
+- Version-8 allocation is a reservation fence, not authority to adopt a later
+  batch inode. A present batch therefore remains fail closed unless an exact
+  version-5/version-7 cleanup authority joins it. Private use publishes a
+  separate immutable version-1 `private-use-retirement` receipt before either
+  joined control is retired. It binds the caller-captured moved file snapshot,
+  all control-file evidence, and the complete private root/batch/leaf/metadata
+  namespace; it authorizes only retirement of v5, v8, and itself.
+- Recovery accepts only strict receipt temporary or retained forms, resumes
+  retirement in v5 → v8 → receipt order, and revalidates the entire private
+  namespace after every control-index scan. The pre-identity construction
+  window deliberately remains fail closed: without a durable object identity,
+  recovery never guesses that a later inode belongs to this operation.
 
 ## Next Steps
 
-- Complete a frozen whole-range fresh-context local review of the signed head.
-- Open and merge the canonical pull request after CI and current-head GitHub
-  Codex evidence pass.
-- Propagate the accepted canonical source through toolbox and the private
-  overlay, then smoke-test the installed reviewer role without a path override
-  on every target host.
+- Create a signed frozen canonical head after the current portability repair,
+  then repeat the full-range fresh-context GPT-5.6 Sol Ultra review.
+- Propagate the actual squash-landed canonical commit through toolbox and the
+  private overlay using the receipt-bound release chain.
+- Smoke-test the installed reviewer role without a path override on every
+  target host.
 
 ## Evidence
 
@@ -445,3 +457,589 @@ superseded_by:
   `compileall`, and `git diff --check` passed. The same affected test also
   passed under the local Xcode Python 3.9.6 interpreter; the new GitHub matrix
   lane keeps that runtime coverage durable.
+- Pending metadata version 10 now records both the prior materialization and
+  the exact removed-link key for a same-target regular-to-symlink migration.
+  Recovery derives removal authority only from a receipt-bound release tree:
+  an owner that remains in the after state uses only its after-state release,
+  while a departed owner uses only its before-state release. Versions 4 through
+  9 retain their closed legacy schemas; receiptless active-alias recovery is
+  limited to versions 6 through 9 and revalidates the complete managed parent
+  chain and exact leaf immediately before deletion.
+- The pre-PR gate on 2026-09-05 passed 1,453 tests in 973.647 seconds with
+  three expected skips. The same source passed source-lock refresh/check, Ruff
+  lint and formatting, Python 3.9 `compileall`, `actionlint`, and
+  `git diff --check`; the two macOS Python 3.9 CI-targeted pending-regular
+  compatibility tests passed locally. The new cleanup path preserves a failed
+  exclusive-file creation error where `add_note` exists and uses a chained,
+  fail-closed `SyncError` on Python 3.9 when final-name cleanup fails.
+- The first fresh frozen-range GPT-5.6 Sol Ultra review of the reconstructed
+  signed candidate found two final-boundary cleanup races: a public parent
+  access-policy check was incomplete immediately before a legacy cleanup
+  mutation, and a final public-path unlink could delete a name replacement.
+  The repair distinguishes protected leaf identity, content stability, and
+  access policy from harmless child-entry churn. It revalidates the complete
+  managed parent chain before a public-to-private rename, validates the exact
+  leaf inside a mode-`0700` private cleanup namespace, and only then deletes
+  the private alias. A replacement is first atomically removed from the
+  Codex-loadable canonical name; it is then retained as private quarantine
+  evidence whenever it cannot re-prove the authorized publication identity,
+  content, and access policy.
+- Receiptless compatibility cleanup first atomically moves the observed
+  canonical leaf to a generated non-TOML active alias. A regular leaf is then
+  moved into private quarantine for exact validation; a non-regular or
+  unreadable replacement remains fail-closed under the non-loadable retained
+  alias. New interleavings cover an already-replaced canonical leaf, a private
+  authority retained when the public target reappears, and a replacement that
+  appears while the private alias is being deleted. None of those paths unlinks
+  through the public target name.
+- The final affected six-module suite passed 848 tests with one expected skip
+  in 211.260 seconds. Final repository-private discovery passed 1,459 tests
+  with three expected skips in 939.908 seconds, and the actual local Python
+  3.9.6 regular-materialization suite passed 104/104 in 51.347 seconds. Ruff
+  `E4/E7/E9/F`, Ruff formatting, `actionlint`, `git diff --check`, and a
+  Python 3.9 compile check passed; the ten-source lock was refreshed after the
+  final source and test changes.
+- A subsequent whole-range fresh reviewer exceeded its fixed 30-minute bound
+  without a final result, so the range was not treated as clean. Its bounded
+  trace led to two independently reproduced repairs: receiptless successful
+  publication cleanup had retained an otherwise empty private quarantine batch
+  that could consume the bounded batch capacity, and durable receipt cleanup
+  lacked a canonical-name recheck immediately around private-alias deletion.
+  The new fallback-only reclamation keeps exact batch, leaf, metadata identity,
+  content, and access-policy bindings; it removes only a fully empty private
+  scaffold and leaves every unexpected child or replacement intact. Durable
+  cleanup now checks the relevant public aliases both before and after private
+  deletion, while legacy active-alias recovery keeps its valid restored
+  preimage behavior. Focused validation passed 108 regular-materialization
+  tests and 324 reconciliation-safety tests. A new final full suite and a
+  short, fresh final reviewer still remain required before PR creation.
+- A follow-up independent audit found three further recovery-boundary issues
+  before the final gate. The repair keeps the v6/v7 before-phase exception
+  narrow: an exact canonical preimage restored after the legacy private alias
+  has passed its initial absence check is not treated as a new canonical race,
+  while current durable receipt paths still recheck both canonical and active
+  names. A private alias that reappears after unlink is now re-snapshotted for
+  object identity, content, access policy, link count, and internal-name plan
+  before any attempted public restoration; a mismatch remains private retained
+  evidence. Finally, an in-process fallback batch is rebound as soon as its
+  metadata is proven; a later empty leaf-setup failure closes the captured
+  descriptor and reclaims only the exact metadata-only scaffold. An unreadable
+  or changed metadata file remains fail-closed evidence rather than being
+  guessed safe to remove. Post-repair validation passed 111 regular-
+  materialization tests in 47.618 seconds and 324 reconciliation-safety tests
+  in 84.892 seconds. The final repository-private discovery then passed 1,466
+  tests with three expected skips in 945.508 seconds. A fresh exact-head review
+  remains pending.
+- A new frozen-range fresh review found and the follow-up repair closed the
+  remaining range-introduced boundaries. Creation cleanup now evacuates a
+  newly created TOML through a non-loadable name even when the final parent
+  access-policy check fails, so it cannot remain active in a newly unsafe
+  parent. Produced publication recovery accepts a public canonical name only
+  when it is the exact receipt-bound before preimage; every create, before,
+  foreign, or post-boundary replacement remains fail-closed. Receiptless
+  cleanup now publishes a version-5 `ephemeral-quarantine` durable ticket
+  before it unlinks private payload, and its recovery consumes only an exact
+  empty scaffold through the existing ticket, tombstone, and empty-proof
+  protocol. It never treats a nonempty leaf, foreign sibling, replacement, or
+  dual batch root as deletion authority. The parser also caches and budgets
+  v10 regular-to-symlink source evidence by its release-bound identity, so
+  repeated targets cannot amplify locked recovery reads. macOS Python 3.9 CI
+  now runs the exact v10 migration and recovery paths. The integrated affected
+  suites passed 522 tests in 160.205 seconds; the Xcode Python 3.9 pair passed
+  in 2.435 seconds and its compile check passed. The final repository-private
+  discovery passed 1,480 tests with three expected skips in 955.481 seconds.
+  Ruff, formatting, `actionlint`, and `git diff --check` passed, and the
+  ten-source lock was refreshed. A new final exact-head review remains pending.
+- The preceding version-5 scaffold description was superseded during the final
+  repair by a version-6 receiptless leaf ticket. It publishes a durable ticket
+  before any public or private leaf mutation, then publishes an immutable
+  `ephemeral-private-isolated` phase receipt after the exact authority inode
+  reaches private evidence and before that inode can be unlinked. The receipt
+  binds the ticket identity and digest, payload identity, public parent, target,
+  and quarantine root. This distinguishes an initial foreign object, which must
+  be isolated from the loadable TOML path and retained with its identity, from a
+  later canonical or alias reappearance, which is outside cleanup authority and
+  is retained in place. The receipt remains durable across private unlink and
+  ticket deletion; orphan recovery removes it only after revalidating bound
+  parents and proving every ticket-derived public and private name absent.
+  Thus object identity, content stability, link count, and access policy are
+  protected without treating benign directory child-entry churn as mutation.
+  The final affected five-module regression suite passed 536 tests in 184.901
+  seconds, after the phase repair; source lock refresh succeeded for all ten
+  sources. Full discovery and fresh exact-head review remain pending.
+- A final repository-private discovery subsequently passed 1,494 tests with
+  three expected skips in 948.300 seconds. It ran under a 30-minute
+  process-group deadline with a 128 MiB retained-log ceiling; the resulting
+  35 KiB log recorded no timeout or output-budget event. The prior unbounded
+  run's four CI-private-temp errors were sandbox write denials for deliberately
+  private home-directory fixtures, not product failures; the bounded local
+  run permitted those fixtures and passed. A stale v6 evidence-layout assertion
+  in the broader legacy suite was also aligned with the direct private evidence
+  path, while the publication error now retains both the `private isolation`
+  and retained-evidence diagnostic context. Ruff `E4/E7/E9/F`, Ruff format,
+  `actionlint`, Python compilation, and `git diff --check` passed after the
+  final source-lock refresh. A fresh exact-head review remains pending.
+- A subsequent fresh frozen-range review of `c87d6c4..04044ec` found two
+  additional pre-PR issues and they were repaired before opening a PR. First,
+  modern pending-publication cleanup now advances from a public-authorized
+  journal state to private authority through an independent exclusive,
+  identity-bound anchor before private unlink. The anchor makes that lifecycle
+  monotonic across crashes: a later public canonical or active-alias
+  reappearance is retained in place, a failed private unlink remains private
+  for retry, and replaying an earlier valid v2 journal cannot recreate public
+  deletion authority. Old v1 journals that cannot prove their lifecycle remain
+  fail-closed. Second, v10 pending parsing now caches immutable release
+  receipts by owner, release SHA, directory identity, and tree digest. It
+  captures and verifies a release once, revalidates every cached release before
+  returning cleanup authority, then seals the budget; cache hits still verify
+  source and parent-chain evidence but do not repeat a full release-tree walk.
+  This removes the proven repeated-tree recovery amplification without using a
+  mutable manifest as authority. A follow-up integration review caught and
+  closed the private-unlink retry, v2 journal replay, and malformed-version
+  boundaries. Its second pass returned clean. The affected cross-module suite
+  passed 864 tests with one expected skip in 229.273 seconds; Ruff lint and
+  formatting, `actionlint`, Python compilation, `git diff --check`, and
+  source-lock regeneration passed. A new full discovery and fresh exact-head
+  review remain required before PR creation.
+- The required post-repair full repository-private discovery completed under
+  the same 30-minute process-group deadline and 128 MiB log ceiling: 1,505
+  tests passed with three expected skips in 967.447 seconds. The retained log
+  reported no deadline or output-budget event. This test result covers the
+  monotonic private-authority anchor, v2-replay rejection, malformed journal
+  versions, release-receipt cache finalization, and the revised cache-hit
+  compatibility contract. The next gate is a fresh exact-head whole-range
+  review after a signed frozen commit; no PR has been created yet.
+- A final allocation/reclaim repair introduces a durable v8 allocation fence
+  before any quarantine batch, metadata, or leaf mutation. The fence reserves
+  capacity and blocks unsafe recovery, but is never deletion authority: only a
+  separately exact v5/v7 cleanup ticket may remove a bound entity. Legacy v5
+  ticket bytes retain their historical schema without `metadata.size`; complete
+  v5 temporary tickets are promoted only through full canonical validation.
+  Classification, promotion, duplicate-canonical handling, isolation, and
+  unlink now carry exact snapshots for object identity, content stability, and
+  access policy. A malformed captured object can be retired only when that
+  same object remains bound at the destructive edge; any replacement, vanished
+  name, I/O failure, or policy uncertainty preserves durable evidence and
+  blocks further mutation.
+- Three independent fresh GPT-5.6 Sol Ultra boundary reviews drove and then
+  rechecked this repair. They covered legacy v5 compatibility, temporary-ticket
+  promotion, same-inode callback rewrites, scanner classification-to-discard
+  replacement, and duplicate-canonical revalidation. The final focused review
+  returned PASS. The post-repair cross-module suite passed 921 tests with one
+  expected skip in 229.300 seconds; complete discovery passed 1,562 tests with
+  three expected skips in 960.578 seconds under the 30-minute process-group
+  deadline and 128 MiB log ceiling. Ruff `E4/E7/E9/F`, Ruff formatting,
+  `actionlint`, Python compilation, `git diff --check`, and the refreshed
+  ten-source lock check passed. A signed frozen exact-head whole-range review
+  remains required before PR creation.
+- The ensuing frozen whole-range review identified two final lifecycle TOCTOU
+  boundaries. A legacy v2 journal is no longer overwritten in place after its
+  validation: the already-exclusive v3 private-authority anchor is the
+  monotonic authority transition, while the legacy journal keeps its exact
+  inode, content, and policy. Before private publication cleanup can unlink an
+  alias, it now moves the exact record-bound object with no-replace semantics
+  to a random private tombstone, fsyncs, and revalidates object identity,
+  content stability, access policy, link count, bound parents, journal, anchor,
+  and public authority. Recovery accepts exactly one canonical alias or one
+  valid tombstone; replacement, absence, or ambiguous tombstones remain
+  preserved fail-closed evidence.
+- A new fresh GPT-5.6 Sol Ultra review of the anchor/tombstone repair returned
+  PASS. The associated cross-module suite passed 924 tests with one expected
+  skip in 241.092 seconds. Complete discovery passed 1,565 tests with three
+  expected skips in 969.527 seconds under the same 30-minute process-group
+  deadline and 128 MiB log ceiling. The ten-source lock was refreshed before
+  that run. A new signed exact-head whole-range review remains required before
+  PR creation.
+- The PR #18 provider follow-up keeps allocation-owned root, batch, leaf, and
+  metadata descriptors live through empty-batch cleanup, so reopening names
+  cannot recreate deletion authority through inode reuse. It also makes
+  replacement and fault-injection tests portable without assuming inode
+  monotonicity, and locks `test_quarantine_empty_batch_reclaim.py` into both
+  sides of the eleven-source toolbox mirror. The focused reclaim module passed
+  51 tests; source-lock tests passed 2 tests; `refresh-lock --check` verified
+  all 11 sources. Complete discovery passed 1,567 tests with three expected
+  skips in 980.313 seconds, and the affected cross-module suite passed 926
+  tests with one expected skip in 253.504 seconds. Both runs used bounded
+  process-group deadlines and retained logs. A signed frozen exact-head
+  whole-range review remains required before the provider findings are
+  resolved.
+- A later frozen review found that cleanup-race assertions only modeled the
+  Python 3.11 `BaseException.add_note` path. The tests now separately verify
+  the Python 3.9 combined-error fallback and the CI 3.9 lane runs the complete
+  quarantine reclaim module plus the two affected pending-publication races.
+  The same review proposed automatically completing an old v1 public cleanup
+  journal after a pre-unlink crash. An independent GPT-5.6 Sol Ultra
+  adjudication rejected that proposal: a v1 journal retained through batch
+  finalization cannot distinguish the genuine crash from a later exact
+  hard-link replay from retained evidence. Public v1 candidates therefore
+  remain fail closed; only an already-bound private alias may advance through
+  the existing private-authority anchor.
+- The next frozen audit closed four final mutation-boundary findings without
+  weakening that fail-closed contract. Allocation close now detaches all four
+  owned descriptors before the first close syscall and closes the saved values
+  best-effort before rethrowing the first `BaseException`; a reused descriptor
+  can therefore never be closed by a retry or finalizer. v5/v7 canonical batch
+  isolation rechecks the bound quarantine root access policy immediately before
+  its rename. v6 private payload cleanup moves the exact object to a random
+  final-private tombstone, binds an open descriptor through the unlink, and
+  rechecks identity, content, access policy, link count, parent bindings,
+  ticket, and phase receipt. Terminal receipt deletion in both the main and
+  orphan paths now revalidates the public/private namespace and every
+  recoverable ticket representation at its mutation boundary.
+- The associated regressions cover descriptor-number reuse after a post-close
+  `BaseException`, v5/v7 mode and Darwin ACL drift, final-private replacement
+  and restart recovery, phase-receipt replacement, public replay after ticket
+  deletion, retained ticket forms, and orphan receipt deletion. Local
+  `/usr/bin/python3` 3.9.6 passed the exact CI selections (56 tests), the
+  regular-to-symlink compatibility selections (2 tests), and the complete
+  pending-staging module (81 tests). The two cleanup modules passed 133 tests
+  on the default interpreter; source-lock tests, lock regeneration/check,
+  Ruff lint/format, `actionlint`, Python compilation, and `git diff --check`
+  also passed. A newly frozen signed exact-head whole-range review and full
+  discovery remain required before pushing the repaired PR head.
+- That discovery subsequently exposed one receiptless-cleanup regression:
+  the new exact final-private tombstone changed a retained sibling from
+  `<evidence>-retained-*` to `<evidence>.delete-<token>-retained-*`, which the
+  tombstone parser mistakenly treated as unrelated child churn. It could then
+  retire the ticket and terminal receipt despite preserved residue. The shared
+  private inventory now classifies only an exact 32-character tombstone as a
+  candidate deletion object; related malformed or retained derivatives are
+  retained evidence, including when they are hard links to the expected inode.
+  This leaves unrelated quarantine-root churn unaffected while preserving the
+  exact-name authority boundary through normal cleanup, restart recovery, and
+  terminal receipt revalidation. The original sibling race, a same-inode
+  derivative, exact tombstone recovery, and the complete 133-test regular
+  materialization module passed locally. A new full discovery and frozen review
+  are required for the amended head.
+- The amended signed head passed the complete repository-private discovery:
+  1,577 tests passed with three expected skips in 975.408 seconds, under the
+  retained 30-minute process-group deadline and 128 MiB log ceiling. The
+  affected cross-module suite then passed 936 tests with one expected skip in
+  243.090 seconds. The remaining pre-push gate is one fresh isolated
+  whole-range review of this exact final head; the journal-only evidence update
+  does not require another complete discovery run.
+- A subsequent frozen review found one final-private deletion TOCTOU: the
+  regular-publication path released its leaf descriptor after the last snapshot,
+  then performed broad parent-policy checks and unlinked the tombstone by name.
+  A replacement in that interval could therefore be deleted without exact
+  authority. The repair keeps an `O_NOFOLLOW` descriptor for the exact
+  tombstone open through journal, public-name, and parent-policy revalidation,
+  then reproves descriptor identity, content, access policy, link count, name
+  binding, and parent binding immediately before unlink. Regular replacement,
+  symlink replacement, same-inode content drift, and same-inode mode drift all
+  remain as fail-closed evidence. The complete regular-materialization module
+  passed 134 tests, the eleven-source lock was refreshed and checked, and the
+  complete repository-private discovery passed 1,578 tests with two expected
+  skips in 1,072.844 seconds. Ruff lint/format, Python compilation, and
+  `git diff --check` passed. The attempted preceding CLI review was interrupted
+  by provider capacity and is not counted as a pass; a new fresh exact-head
+  whole-range review is required before remote publication.
+- The next fresh review found a separate v6 terminal-control gap: strict
+  retained-ticket parsing ignored a suffix-added tombstone derivative, so a
+  same-inode `<ticket-tombstone>.extra` could retain valid ticket bytes while
+  terminal receipt deletion and a later mutation gate treated the ticket as
+  absent. A new blocking-only classifier recognizes a valid batch's ticket and
+  ticket-temp derivatives as retained evidence but cannot recover, delete, or
+  otherwise grant authority to them; exact canonical and strict retained forms
+  keep their existing recovery paths. The regression creates a same-inode
+  suffixed tombstone after ticket deletion, proves that the terminal receipt
+  remains, then simulates its unsafe retirement and proves the independent
+  mutation gate still blocks. Adjacent terminal/orphan regressions passed, the
+  eleven-source lock was refreshed and checked, Ruff and Python compilation
+  passed, and complete repository-private discovery passed 1,579 tests with
+  two expected skips in 1,076.901 seconds. A new frozen exact-head whole-range
+  review remains required before remote publication.
+- The following fresh frozen review found two related P2 boundaries in that
+  blocking-only classifier. First, v5/v7 cleanup could delete its canonical
+  ticket and then retire the exact `.empty-proof` while a retained or
+  suffix-added ticket representation remained. The proof now revalidates the
+  representation absence on the same bound index descriptor before its
+  canonical-to-retained rename and again before its retained unlink; malformed
+  names remain blocking evidence only and never become restoration or deletion
+  authority. Second, a malformed representation could be invisible to status
+  and dry-run planning while the real mutation gate rejected it. A shared
+  unresolved-representation classifier now rejects every related noncanonical
+  form before planning, reports it as managed-state drift in ordinary status,
+  and prevents install and overlay-uninstall dry runs from claiming that it can
+  be auto-cleaned. The ready-state observer scans the entire control namespace
+  and raises the same error if residue appears after an earlier preflight scan,
+  so an ordinary ready marker cannot downgrade a late ambiguity to a
+  `would clean` plan.
+- New regressions cover v5 retained and v7 suffixed evidence after canonical
+  ticket deletion, the proof's final-unlink race, malformed direct and
+  retained forms in status/install/uninstall dry-run, and a late-residue race
+  coexisting with an ordinary ready marker. The complete discovery initially
+  exposed three test-harness compatibility errors from the new preflight and
+  callback: a cursor-FD fault injection now explicitly isolates the new gate,
+  and an existing empty-proof mock accepts and forwards the new revalidator.
+  The final focused selection passed 9 tests in 6.210 seconds. The 11-source
+  lock was refreshed and checked; Ruff lint, Python compilation, and
+  `git diff --check` passed. The final repository-private discovery passed
+  1,583 tests with two expected skips in 1,125.110 seconds. A new signed
+  frozen exact-head whole-range review remains required before remote
+  publication.
+- That review found two final repairable boundaries. Orphan empty-proof cleanup
+  now uses the same bound index descriptor to reject every recovered ticket
+  representation before proof isolation and again at each generic rename and
+  final-unlink boundary; canonical, strict retained, temp, and suffix-added
+  ticket forms therefore preserve the proof as blocking evidence rather than
+  losing the only durable empty-batch record. The v6 receiptless leaf-cleanup
+  path now owns both directory descriptors inside one `try`/`finally`, so a
+  `BaseException` while opening the quarantine root closes the already-open
+  public-parent descriptor without performing a mutation. New regressions
+  replay the exact ticket inode during the orphan proof's final unlink for both
+  canonical and retained representations, and inject a second-open
+  `SystemExit` while asserting descriptor release. The seven affected tests
+  passed in 4.325 seconds; source lock refresh/check verified 11 sources,
+  Ruff and syntax validation passed, and the repository-private complete
+  discovery passed 1,585 tests with two expected skips in 1,091.404 seconds.
+  A signed amended head and a wholly new frozen exact-head review are required
+  before remote publication.
+- The next frozen review identified three related fail-closed gaps. A v8
+  allocation fence could bind planned full metadata while a direct partial
+  write remained after a hard crash; metadata is now staged and fsynced under
+  the private index before the fence and batch enter the recoverable namespace.
+  The v8 dry-run classifier now distinguishes an exact v5/v7 joined scaffold
+  from an unowned or conflicting entity, so it cannot promise cleanup that the
+  mutating path would reject. A malformed v3 regular-publication `phase` is
+  rejected as managed-state drift before path-derived alias construction.
+- Recovery permits only an empty batch or a canonical metadata scaffold whose
+  bytes, identity, mode, ownership, and digest exactly match the v8 plan;
+  legacy partial, replacement, or extra-member states remain retained. The
+  subsequent boundary audit also found that v8-only retirement ignored sibling
+  durable cleanup controls. Its bounded, index-FD-bound scan now allows only
+  the exact current allocation at each mutation boundary and blocks same-batch
+  ticket, proof, terminal receipt, temporary, retained, metadata-stage, and
+  suffix residue. Normal v5/v7 joined cleanup still deletes its exact proof
+  before retiring its matching v8 fence; the orphan-proof regression fixture
+  explicitly holds that final retirement to model the crash window.
+- The affected reclaim, pending-staging, and regular-materialization modules
+  passed 291 tests in 129.047 seconds. The refreshed eleven-source lock check
+  passed, followed by 280 source-lock regressions in 580.265 seconds. Ruff
+  lint/format, in-memory syntax compilation, and `git diff --check` passed.
+  Complete repository-private discovery then passed 1,602 tests with two
+  expected skips in 1,092.322 seconds. A new frozen exact-head review remains
+  required before remote publication.
+- The next frozen review found three v8 control-boundary gaps: a v5→v8 crash
+  could strand a present private batch, legal v5/v7 temporary authority could
+  be blocked by the v8 classifier, and a late malformed v8 descendant could
+  escape a joined mutation boundary. The repair adds the private-use-retirement
+  receipt described above, strict temporary promotion before v8 classification,
+  and same-index-FD broad-representation checks at every joined boundary.
+  A second independent audit then found two TOCTOU details: private evidence
+  must be fully resampled after its control scan, and the joined v8 parser must
+  capture and parse on the same index FD as that scan. Both are now covered by
+  direct regressions.
+- The current affected suite passed 316 tests in 133.432 seconds. Source lock
+  was refreshed and checked for all eleven sources; its 280-test regression
+  suite passed in 568.903 seconds. Ruff lint/format, Python syntax compilation,
+  and `git diff --check` passed on the same implementation. Complete discovery
+  and a fresh frozen whole-range review remain required before remote
+  publication.
+- Complete repository-private discovery subsequently passed 1,627 tests with
+  two expected skips in 1,101.205 seconds. The journal-only evidence update
+  does not alter the reviewed production or test source range; it needs only
+  lightweight documentation and lock checks before the signed frozen commit.
+- A fresh whole-range review then found that the v5/v7 joined-allocation
+  classifier was called after either cleanup entry point had opened its index
+  directory descriptor but before that descriptor entered the existing
+  `try`/`finally`. A malformed, replaced, or mismatched v8 control could
+  therefore raise during the join and leak the descriptor. Both entry points
+  now perform the joined read inside their existing `try`/`finally`, preserving
+  the same fail-closed ordering while guaranteeing descriptor release on that
+  exception path. A direct v7/v8 metadata-size-mismatch regression exercises
+  ticket deletion and empty-proof deletion separately and verifies every
+  tracked index descriptor is closed (`EBADF`) after the expected `SyncError`.
+- The new regression passed alone, and the affected reclaim, pending-staging,
+  and regular-materialization suite passed 317 tests in 148.393 seconds. The
+  eleven-source lock was refreshed and checked; Ruff lint/format, Python
+  syntax compilation, and `git diff --check` passed. Complete
+  repository-private discovery then passed 1,628 tests with two expected
+  skips in 1,308.322 seconds. Because this repair changes the reviewed source
+  and tests, it still requires a new signed frozen head and fresh exact-head
+  whole-range review before remote publication.
+- A second fresh whole-range review found a final pathname rebinding window in
+  v5/v7 leaf and batch directory cleanup: the joined allocation scan could
+  complete after the final identity check but before direct `rmdir`, allowing a
+  competing empty replacement to be deleted. Portable Unix has no
+  inode-conditional `rmdir`, so cleanup now atomically moves only the
+  identity-encoded, exact directory entry into the existing private active
+  tombstone namespace before reopening and jointly revalidating its held FD,
+  pathname identity, emptiness, ownership, and mode. A replacement that wins
+  the race is moved to retained evidence and is never deleted.
+- Exact active directory tombstones now have v5/v7 crash recovery. Ambiguous,
+  malformed, replaced, policy-incompatible, or non-exact representations stay
+  fail closed. The implementation deliberately does not classify benign
+  metadata churn as mutation: cleanup requires an actual identity, content, or
+  access-policy mismatch before it withholds authority.
+- New regressions cover v5 and v7 competing replacement retention and exact
+  private leaf/batch tombstone recovery. The focused six-regression set passed
+  in 0.551 seconds; the affected reclaim, pending-staging, and
+  regular-materialization suite passed 321 tests in 139.904 seconds. Source
+  lock refresh/check verified all eleven sources; Ruff lint/format, Python
+  syntax compilation, and `git diff --check` passed. Complete
+  repository-private discovery subsequently passed 1,632 tests with two
+  expected skips in 1,148.870 seconds. This changed source/test range still
+  requires a new signed frozen head and a fresh exact-head whole-range review
+  before remote publication.
+- That fresh review found one remaining P1 at the private directory removal
+  boundary: parent identity alone was rechecked after the authority callback,
+  but its owner-only `0700`/ACL access policy was not. A same-identity parent
+  whose policy became writable could invalidate the private-namespace premise
+  before final pathname deletion. The shared helper now reproves the parent
+  identity, pathname binding, owner, mode, and ACL policy after the callback,
+  after private-member reopening, and immediately before the final
+  policy-before-binding deletion boundary. It keeps object identity, empty
+  contents, and access policy as the protected properties; benign ctime or
+  link-count churn remains non-authoritative.
+- Deterministic v5 leaf, v5 batch, and v7 batch regressions relax the parent
+  to `0770`, replace the private member, and prove the replacement survives
+  while cleanup/allocation authority remains retained. Ruff lint/format,
+  Python syntax compilation, `git diff --check`, and the refreshed eleven
+  source lock check passed. The affected reclaim, pending-staging, and
+  regular-materialization suite passed 323 tests in 244.553 seconds. Complete
+  repository-private discovery then passed 1,634 tests with two expected
+  skips in 1,922.213 seconds. This amended source/test range requires a new
+  signed frozen head and fresh exact-head whole-range review before remote
+  publication.
+- A subsequent fresh readonly review found a v6 failure-publication recovery
+  ordering gap. If an exact ticket-bound canonical role and a same-UID derived
+  alias existed before the first scan, retaining the alias first could make
+  private evidence nonempty and fail closed while the failed canonical role
+  remained loadable. Recovery now evacuates only the exact canonical inode
+  first, then selects foreign aliases by identity rather than alias-slot
+  order. Foreign evidence remains retained; the exact inode stays in a
+  non-loadable alias when retained evidence prevents deletion. A foreign
+  canonical plus an exact alias continues through the established
+  private-phase receipt path, preserving the existing reappearance boundary.
+- Deterministic regressions cover a competing alias in both the primary and a
+  later alias slot, asserting that the canonical path is absent, the exact
+  inode is non-loadable, and the foreign inode remains private evidence across
+  repeated recovery. The affected pending-staging, reclaim, and regular
+  materialization suite passed 324 tests in 177.769 seconds. Ruff lint/format,
+  Python syntax compilation, `git diff --check`, and refreshed eleven-source
+  lock validation passed. Complete repository-private discovery then passed
+  1,635 tests with two expected skips in 1,406.074 seconds. This changed
+  source/test range still requires a new signed frozen head and fresh
+  exact-head whole-range review before remote publication.
+- A current-head GitHub Codex review then identified a test portability issue:
+  several quarantine regression cases inferred replacement from a changed
+  `(st_dev, st_ino)` tuple, which is not valid on filesystems that immediately
+  reuse inode tuples. The repair keeps the original FD as evidence where
+  needed, asserts the original payload versus the replacement's foreign
+  marker, and uses narrowly scoped deterministic binding-failure injection for
+  the replacement branch. This preserves the tested properties—replacement,
+  retained foreign evidence, and fail-closed cleanup—without treating inode
+  allocation as identity proof. The already-fixed descriptor-lifetime and
+  source-lock findings were independently rechecked; the eleven-source lock
+  includes the quarantine regression module in both canonical sources and the
+  toolbox mirror.
+- The full quarantine reclaim module passed 97 tests in 203.572 seconds.
+  Ruff lint/format, Python syntax compilation, `git diff --check`, and source
+  lock refresh/check passed. Complete repository-private discovery then passed
+  1,635 tests with two expected skips in 2,185.987 seconds. This changed test
+  and lock range requires a new signed frozen head and fresh exact-head
+  whole-range review before remote publication.
+- A subsequent fresh security audit identified four v6 eviction boundaries:
+  private-phase receipt authority could be inferred from an inode alone while
+  that inode remained public; fixed public and private name sets could be
+  exhausted or raced; a long descriptor-bound payload hash could outlive the
+  final ticket and parent-policy checks; and cross-directory eviction persisted
+  the public removal before the private addition. The repair keeps object
+  identity, regular-file content, mode/UID/policy-relevant GID, and link count
+  as the protected leaf properties. It reproves the ticket and both bound
+  parent policies after the final payload hash, requires one complete
+  ticket-matching private snapshot and no public exact inode before publishing
+  a phase receipt, retries no-replace collisions through recognized high-entropy
+  private names, and fsyncs the private destination before the public source.
+  Foreign entries are never overwritten; a changed post-rename destination is
+  retained as isolated evidence. Parent ctime and unrelated child-entry churn
+  remain deliberately non-authoritative.
+- New regressions cover full public and fixed-private namespace exhaustion,
+  dynamic private-name collisions, a malicious private hard link while the
+  canonical target remains public, ticket and parent-policy changes after the
+  final source snapshot, post-rename destination replacement, and benign
+  child-entry churn. The v6 focused selection passed 23 tests in 24.552
+  seconds. Ruff lint/format, Python syntax compilation, and `git diff --check`
+  passed; the source lock was refreshed for all eleven sources. An interim
+  fresh-context security audit reported no findings, but a signed frozen
+  whole-range review and complete discovery remain required before publication.
+- The first complete discovery after that repair exposed a recovery-contract
+  regression: if a final canonical-to-non-loadable-alias rename races with a
+  foreign replacement, strict destination verification stopped before the
+  existing alias-to-private quarantine pass. The replacement was safe from
+  loading but remained public evidence. Destination parent rebinding remains
+  fail closed; only a leaf mismatch in a still-bound non-loadable public alias
+  now returns control to fresh alias inventory, which snapshots and preserves
+  the foreign payload in private quarantine. Private destinations and changed
+  destination parents still fail closed as retained evidence.
+- The directly affected rollback regression passed, as did all 23 v6 cleanup
+  regressions in 61.225 seconds. Ruff lint/format, AST syntax validation,
+  `git diff --check`, and source-lock refresh/check for all eleven sources
+  passed. A new complete repository-private discovery and frozen exact-head
+  review remain required before publication.
+- The replacement complete repository-private discovery then passed 1,643
+  tests with two expected skips in 1,465.148 seconds. Project-journal
+  validation, source-lock verification, Ruff lint/format, AST syntax
+  validation, and `git diff --check` also passed on the current worktree. The
+  source range is now ready for a signed frozen head and fresh exact-head
+  whole-range review before remote publication.
+- That frozen exact-head review found a before-phase recovery retry gap. After
+  durable private authority had completed its cleanup, rollback could restore
+  the exact receipt-bound regular preimage and then crash before whole-batch
+  finalization. A later recovery treated that canonical preimage as forbidden
+  public reappearance and retained the pending pointer forever. Recovery now
+  accepts only the exact restored before state: identity, payload, mode, UID,
+  policy-relevant GID/ACL, bound parent, and restored hard-link count must all
+  match both the receipt and before evidence; private aliases and the active
+  name must be absent. Every other state remains fail closed.
+- The regression deterministically exercises three recovery attempts: leave a
+  before active receipt, finish private cleanup and restore the preimage before
+  a second crash, then finalize on the third recovery. The private-authority
+  selection passed 5 tests, replace-recovery selection passed 2 tests, and the
+  repository-private regular-agent module passed 135 tests in 90.884 seconds.
+  Ruff lint/format, AST syntax validation, `git diff --check`, and refreshed
+  eleven-source lock validation passed. The review also clarified that final
+  high-entropy tombstone removal is bounded by the documented cooperative
+  same-UID threat model; a deliberately non-cooperating same-UID process that
+  observes and swaps a final private name is explicitly outside that model and
+  cannot be made inode-conditional by portable Unix `unlink` or `rmdir`.
+- Complete repository-private discovery after the before-state recovery repair
+  passed 1,643 tests with two expected skips in 1,243.166 seconds. The next
+  gate is a signed frozen head followed by a new independent whole-range
+  review, secret admission, and then the PR's current-head GitHub review and
+  required checks; no remote publication has occurred for this repair yet.
+- The subsequent frozen whole-range review found one further before-phase
+  recovery boundary: the valid interval after the private alias is deleted but
+  before rollback recreates the canonical preimage. The snapshot helper
+  intentionally turns a missing leaf into a fail-closed `SyncError`; the
+  caller's ineffective `FileNotFoundError` handler therefore made this valid
+  crash state unrecoverable. The repair first probes the bound parent directory
+  for target absence, snapshots only an existing leaf, and still fails closed
+  for every unreadable, unsafe, or mismatched occupant. A deterministic
+  regression now crashes exactly before preimage restoration and proves the
+  following recovery restores the original object and clears the pending
+  pointer and batch. The regular-agent module passed 136 tests in 63.490
+  seconds; source-lock refresh is complete. A new full discovery and frozen
+  exact-head review are required before publication.
+- That replacement complete repository-private discovery passed 1,644 tests
+  with two expected skips in 1,123.633 seconds. No remote publication has
+  occurred; the remaining local gates are a signed frozen head, new
+  independent whole-range review, and secret admission before the PR's
+  current-head GitHub checks and review can begin.
+- The current-head GitHub Codex review then identified a test-only inode reuse
+  assumption: three replacement fixtures unlinked an object and expected a
+  subsequent same-payload create to receive a different `(st_dev, st_ino)`.
+  On filesystems that immediately recycle inode tuples, that made the intended
+  identity-mismatch branch nondeterministic. The fixtures now retain a
+  descriptor for the unlinked ticket or leaf until the replacement has been
+  created and configured; production cleanup semantics are unchanged. Four
+  exact regressions, a 13-test related selection, and both affected modules
+  (197 tests in 69.314 seconds) passed, followed by source-lock refresh. A new
+  complete discovery and frozen exact-head review remain required before
+  publication.
+- The replacement complete repository-private discovery passed 1,644 tests
+  with two expected skips in 1,147.456 seconds. The next required local gates
+  are a signed frozen head, independent whole-range review, and secret
+  admission; the current GitHub review finding remains unresolved until that
+  new head is published and reviewed.

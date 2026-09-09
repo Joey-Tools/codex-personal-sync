@@ -57,6 +57,26 @@ jobs:
         run: >-
           python3 -m unittest
           tests.test_pending_agent_claim_compatibility.PendingAgentClaimCompatibilityTests.test_terminal_regular_source_validation_preflights_whole_group
+      - name: Run Python 3.9 pending cleanup failure compatibility test
+        if: matrix.python-version == '3.9'
+        run: >-
+          python3 -m unittest
+          tests.test_pending_agent_claim_compatibility.PendingAgentClaimCompatibilityTests.test_internal_file_fchmod_and_cleanup_failure_remains_fail_closed
+      - name: Run Python 3.9 quarantine cleanup compatibility tests
+        if: matrix.python-version == '3.9'
+        run: >-
+          python3 -m unittest
+          tests.test_quarantine_empty_batch_reclaim
+          tests.test_pending_staging_cleanup.PendingStagingCleanupTests.test_atomic_authority_publisher_rejects_foreign_owner_uid
+          tests.test_pending_staging_cleanup.PendingStagingCleanupTests.test_cleanup_ticket_file_exists_race_rejects_foreign_owner_uid
+          tests.test_pending_staging_cleanup.PendingStagingCleanupTests.test_v5_v7_batch_isolation_rechecks_quarantine_root_policy
+          tests.test_pending_staging_cleanup.PendingStagingCleanupTests.test_v7_batch_isolation_rechecks_quarantine_root_acl
+      - name: Run Python 3.9 regular-to-symlink migration recovery tests
+        if: matrix.python-version == '3.9'
+        run: >-
+          python3 -m unittest
+          tests.test_regular_agent_materialization.PublicRegularAgentTests.test_exact_same_target_removal_migrates_regular_agent_to_symlink
+          tests.test_regular_agent_materialization.RegularAgentPendingRecoveryTests.test_regular_to_symlink_precommit_recovery_restores_exact_regular_file
       - name: Run macOS Git locator tests
         run: >-
           python3 -m unittest discover -s tests

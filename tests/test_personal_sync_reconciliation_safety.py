@@ -1644,6 +1644,7 @@ class ReconciliationOrderingTests(unittest.TestCase):
             ):
                 MODULE._move_regular_leaf_to_unique_quarantine(
                     self.home,
+                    target.parent,
                     target_parent_fd,
                     target.name,
                     label="agent-test",
@@ -1664,6 +1665,196 @@ class ReconciliationOrderingTests(unittest.TestCase):
         )
         self.assertEqual(quarantined[0].read_bytes(), b"tampered = true\n")
 
+    def test_regular_quarantine_revalidates_parent_chain_before_rename(self) -> None:
+        target = self.home / "agents" / "reviewer.toml"
+        target.parent.mkdir()
+        target.write_bytes(b'role = "reviewer"\n')
+        target.chmod(0o600)
+        target_identity = (target.stat().st_dev, target.stat().st_ino)
+        target_parent_fd = MODULE._open_directory_beneath(self.home, target.parent)
+        real_quarantine_batch_root = MODULE._quarantine_batch_root
+
+        def make_parent_writable(*args: object, **kwargs: object):
+            result = real_quarantine_batch_root(*args, **kwargs)
+            target.parent.chmod(0o775)
+            return result
+
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_quarantine_batch_root",
+                    side_effect=make_parent_writable,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "managed regular-file parent access policy mismatch",
+                ),
+            ):
+                MODULE._move_regular_leaf_to_unique_quarantine(
+                    self.home,
+                    target.parent,
+                    target_parent_fd,
+                    target.name,
+                    label="agent-test",
+                    expected_identity=target_identity,
+                )
+        finally:
+            MODULE._close_fd_quietly(target_parent_fd)
+
+        self.assertTrue(target.is_file())
+        self.assertEqual(
+            (target.stat().st_dev, target.stat().st_ino),
+            target_identity,
+        )
+
+    def test_created_agent_parent_policy_drift_evacuates_canonical_toml(self) -> None:
+        payload = b'name = "reviewer"\n'
+        source = self._agent_source(SHA_A, payload)
+        target = self.home / "agents" / "reviewer.toml"
+        target.parent.mkdir(mode=0o755)
+        real_snapshot = MODULE._regular_file_snapshot_at
+        created_identity: tuple[int, int] | None = None
+
+        def drift_after_created_snapshot(
+            parent_fd: int,
+            name: str,
+            path: Path,
+            *,
+            maximum_bytes: int = MODULE.MAX_ARCHIVE_MEMBER_BYTES,
+        ) -> MODULE.RegularFileSnapshot:
+            nonlocal created_identity
+            snapshot = real_snapshot(
+                parent_fd,
+                name,
+                path,
+                maximum_bytes=maximum_bytes,
+            )
+            if path == target and created_identity is None:
+                created_identity = snapshot.file_identity
+                target.parent.chmod(0o775)
+            return snapshot
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_regular_file_snapshot_at",
+                side_effect=drift_after_created_snapshot,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "managed regular-file parent access policy mismatch",
+            ),
+        ):
+            MODULE._create_regular_file_beneath(self.home, source, target)
+
+        self.assertIsNotNone(created_identity)
+        self.assertFalse(os.path.lexists(target))
+        quarantined = list(
+            (self.home / "personal-sync" / "quarantine").glob("*/leaf/*")
+        )
+        self.assertEqual(len(quarantined), 1)
+        evidence = quarantined[0]
+        self.assertNotEqual(evidence.suffix, ".toml")
+        self.assertEqual(stat.S_IMODE(evidence.parent.stat().st_mode), 0o700)
+        self.assertEqual(
+            (evidence.stat().st_dev, evidence.stat().st_ino),
+            created_identity,
+        )
+        self.assertEqual(evidence.read_bytes(), payload)
+
+    def test_created_agent_canonical_reappearance_retains_private_evidence(
+        self,
+    ) -> None:
+        payload = b'name = "reviewer"\n'
+        replacement = b'name = "replacement"\n'
+        source = self._agent_source(SHA_A, payload)
+        target = self.home / "agents" / "reviewer.toml"
+        target.parent.mkdir(mode=0o755)
+        real_snapshot = MODULE._regular_file_snapshot_at
+        real_rename_noreplace = MODULE._rename_noreplace_at
+        created_identity: tuple[int, int] | None = None
+        reappeared = False
+
+        def drift_after_created_snapshot(
+            parent_fd: int,
+            name: str,
+            path: Path,
+            *,
+            maximum_bytes: int = MODULE.MAX_ARCHIVE_MEMBER_BYTES,
+        ) -> MODULE.RegularFileSnapshot:
+            nonlocal created_identity
+            snapshot = real_snapshot(
+                parent_fd,
+                name,
+                path,
+                maximum_bytes=maximum_bytes,
+            )
+            if path == target and created_identity is None:
+                created_identity = snapshot.file_identity
+                target.parent.chmod(0o775)
+            return snapshot
+
+        def reappear_after_private_move(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal reappeared
+            real_rename_noreplace(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+            if source_name.startswith(".codex-created-leaf-") and not reappeared:
+                replacement_fd = os.open(
+                    target.name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=source_parent_fd,
+                )
+                try:
+                    os.write(replacement_fd, replacement)
+                    os.fsync(replacement_fd)
+                finally:
+                    os.close(replacement_fd)
+                reappeared = True
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_regular_file_snapshot_at",
+                side_effect=drift_after_created_snapshot,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=reappear_after_private_move,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "canonical name reappeared",
+            ),
+        ):
+            MODULE._create_regular_file_beneath(self.home, source, target)
+
+        self.assertTrue(reappeared)
+        self.assertEqual(target.read_bytes(), replacement)
+        quarantined = list(
+            (self.home / "personal-sync" / "quarantine").glob("*/leaf/*")
+        )
+        self.assertEqual(len(quarantined), 1)
+        evidence = quarantined[0]
+        self.assertNotEqual(evidence.suffix, ".toml")
+        self.assertEqual(stat.S_IMODE(evidence.parent.stat().st_mode), 0o700)
+        self.assertEqual(
+            (evidence.stat().st_dev, evidence.stat().st_ino),
+            created_identity,
+        )
+        self.assertEqual(evidence.read_bytes(), payload)
+
     def test_install_release_materializes_reviewer_role_as_regular_file(self) -> None:
         source_root = self.home / "source-release"
         expected = b'name = "reviewer"\n'
@@ -1683,7 +1874,9 @@ class ReconciliationOrderingTests(unittest.TestCase):
 
         original_identity = (target.stat().st_dev, target.stat().st_ino)
         install_quietly(source_root, install_home, SHA_A)
-        self.assertEqual((target.stat().st_dev, target.stat().st_ino), original_identity)
+        self.assertEqual(
+            (target.stat().st_dev, target.stat().st_ino), original_identity
+        )
         self.assertEqual(target.read_bytes(), expected)
 
     def test_install_release_removes_managed_reviewer_regular_file(self) -> None:
@@ -1726,9 +1919,7 @@ class ReconciliationOrderingTests(unittest.TestCase):
         source = self._agent_source(SHA_A, b'name = "reviewer"\n')
         target = self.home / "agents" / "reviewer.toml"
         target.parent.mkdir()
-        legacy_target = (
-            "../personal-sync/current/personal_codex/agents/reviewer.toml"
-        )
+        legacy_target = "../personal-sync/current/personal_codex/agents/reviewer.toml"
         target.symlink_to(legacy_target)
         action = planned_reconcile_action(
             self.home,
@@ -1748,8 +1939,8 @@ class ReconciliationOrderingTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), source.read_bytes())
 
     def test_regular_file_rollback_restores_exact_preimage(self) -> None:
-        old_source = self._agent_source(SHA_A, b'old = true\n')
-        new_source = self._agent_source(SHA_B, b'new = true\n')
+        old_source = self._agent_source(SHA_A, b"old = true\n")
+        new_source = self._agent_source(SHA_B, b"new = true\n")
         target = self.home / "agents" / "reviewer.toml"
         target.parent.mkdir()
         target.write_bytes(old_source.read_bytes())
@@ -1773,13 +1964,15 @@ class ReconciliationOrderingTests(unittest.TestCase):
         MODULE._rollback_reconcile_transaction(self.home, transaction)
 
         self.assertEqual(target.read_bytes(), old_source.read_bytes())
-        self.assertEqual((target.stat().st_dev, target.stat().st_ino), original_identity)
+        self.assertEqual(
+            (target.stat().st_dev, target.stat().st_ino), original_identity
+        )
 
-    def test_regular_rollback_cleanup_retains_name_replacement_out_of_path(
+    def test_regular_rollback_cleanup_retains_final_window_replacement_in_private_quarantine(
         self,
     ) -> None:
-        old_source = self._agent_source(SHA_A, b'old = true\n')
-        new_source = self._agent_source(SHA_B, b'new = true\n')
+        old_source = self._agent_source(SHA_A, b"old = true\n")
+        new_source = self._agent_source(SHA_B, b"new = true\n")
         target = self.home / "agents" / "reviewer.toml"
         target.parent.mkdir()
         target.write_bytes(old_source.read_bytes())
@@ -1856,7 +2049,9 @@ class ReconciliationOrderingTests(unittest.TestCase):
         self.assertIsNotNone(replacement_identity)
         self.assertFalse(os.path.lexists(target))
         retained = list(
-            target.parent.glob(f"{MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX}*")
+            (self.home / "personal-sync" / "quarantine").glob(
+                ".codex-ephemeral-cleanup-*"
+            )
         )
         self.assertEqual(len(retained), 1)
         self.assertEqual(retained[0].read_bytes(), b"foreign = true\n")
@@ -1874,12 +2069,12 @@ class ReconciliationOrderingTests(unittest.TestCase):
         self.assertEqual(backup.read_bytes(), old_source.read_bytes())
 
     def test_plan_rejects_modified_or_unproven_agent_regular_file(self) -> None:
-        old_source = self._agent_source(SHA_A, b'old = true\n')
-        self._agent_source(SHA_B, b'new = true\n')
+        old_source = self._agent_source(SHA_A, b"old = true\n")
+        self._agent_source(SHA_B, b"new = true\n")
         entry = self._agent_entry()
         target = self.home / "agents" / "reviewer.toml"
         target.parent.mkdir()
-        target.write_bytes(b'modified = true\n')
+        target.write_bytes(b"modified = true\n")
         target.chmod(0o600)
         record = MODULE.ManagedLinkRecord(
             source=entry.source,
@@ -3175,8 +3370,7 @@ class AtomicMoveSafetyTests(unittest.TestCase):
                 )
                 if (
                     source_name == destination.name
-                    and destination_name
-                    == MODULE.FAILED_MOVE_ISOLATION_ENTRY_NAME
+                    and destination_name == MODULE.FAILED_MOVE_ISOLATION_ENTRY_NAME
                 ):
                     crashed = True
                     raise MODULE.SyncError("injected crash after failed-move isolation")
@@ -3414,8 +3608,7 @@ class AtomicMoveSafetyTests(unittest.TestCase):
                 nonlocal racer_identity
                 if (
                     source_name == destination.name
-                    and destination_name
-                    == MODULE.FAILED_MOVE_ISOLATION_ENTRY_NAME
+                    and destination_name == MODULE.FAILED_MOVE_ISOLATION_ENTRY_NAME
                 ):
                     os.rename(
                         source_name,
@@ -10535,6 +10728,7 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
             MODULE.PENDING_RELINQUISH_FOREIGN_ACTION,
             MODULE.PENDING_LINK_ACTIONS_BY_METADATA_VERSION[4],
         )
+
         def downgrade_to_v4(payload: dict[str, object]) -> None:
             payload["version"] = 4
             for field in ("state_before", "state_after", "commit_evidence"):
@@ -10548,6 +10742,8 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
             assert isinstance(records, list)
             for record in records:
                 assert isinstance(record, dict)
+                record.pop("before_materialization")
+                record.pop("removed_link")
                 record.pop("publication_cleanup")
                 for field in (
                     "materialization",
@@ -12985,6 +13181,8 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         payload.pop("terminal_regular_before")
         payload.pop("terminal_regular_after")
         for record in payload["records"]:
+            record.pop("before_materialization")
+            record.pop("removed_link")
             record.pop("publication_cleanup")
             for field in (
                 "materialization",

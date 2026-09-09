@@ -605,6 +605,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             expected,
             *,
             label: str,
+            mutation_revalidator=None,
         ) -> None:
             nonlocal tripped
             if not tripped and path.name.endswith(
@@ -620,7 +621,14 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
                 os.fsync(parent_fd)
                 tripped = True
                 raise MODULE.SyncError("injected empty-proof tombstone crash")
-            real_delete(home, path, parent_fd, expected, label=label)
+            real_delete(
+                home,
+                path,
+                parent_fd,
+                expected,
+                label=label,
+                mutation_revalidator=mutation_revalidator,
+            )
 
         with (
             mock.patch.object(

@@ -9,6 +9,7 @@
         "manifest_schema": "schema/sync-manifest.schema.json",
         "pending_agent_claim_compatibility_tests": "tests/test_pending_agent_claim_compatibility.py",
         "pending_staging_cleanup_tests": "tests/test_pending_staging_cleanup.py",
+        "quarantine_empty_batch_reclaim_tests": "tests/test_quarantine_empty_batch_reclaim.py",
         "reconciliation_safety_tests": "tests/test_personal_sync_reconciliation_safety.py",
         "regular_agent_materialization_tests": "tests/test_regular_agent_materialization.py",
         "regular_overlay_uninstall_status_regressions_tests": "tests/test_regular_overlay_uninstall_status_regressions.py",
@@ -22,12 +23,12 @@
     "engine": {
       "mode": "0755",
       "path": "scripts/codex_personal_sync.py",
-      "sha256": "5142ed1c39c21dd946f2a79333975500f668eedf094fe3160be416aaacb12dcb"
+      "sha256": "b3fed3dda0c10f656259da3fa3ffbf4971235affeedce270b19ae6278a2594c7"
     },
     "engine_tests": {
       "mode": "0644",
       "path": "tests/test_codex_personal_sync.py",
-      "sha256": "1c5c7d65fa9e46d518c5940f5f1e46ee6ea0fc254c1cb2714971877fd535a118"
+      "sha256": "dc4805f2cb5a30f54e2ff27b97c29f06cbe0715c16d06d2615faedf8dcaadf07"
     },
     "manifest_schema": {
       "mode": "0644",
@@ -37,27 +38,32 @@
     "pending_agent_claim_compatibility_tests": {
       "mode": "0644",
       "path": "tests/test_pending_agent_claim_compatibility.py",
-      "sha256": "68037ddf4954129db706a157ae8e7a918d1416676fd20c66145d7234427ced7c"
+      "sha256": "43008c65c647e9a0957f4870d3f2be6510d38899dfdb15561c6dd8249ad0fb67"
     },
     "pending_staging_cleanup_tests": {
       "mode": "0644",
       "path": "tests/test_pending_staging_cleanup.py",
-      "sha256": "bc0ce5859b3a70c9455ca4bb4f856ef6d30f7e7b65e9ea1cf76e204eeb9caf7a"
+      "sha256": "baad6e5d2fe3a55af373c55fa6751613caab80990d0cfea69d2db12ea8e15323"
+    },
+    "quarantine_empty_batch_reclaim_tests": {
+      "mode": "0644",
+      "path": "tests/test_quarantine_empty_batch_reclaim.py",
+      "sha256": "d185a2a4840b42ac37f22bacdf3478017c6947eb1d41bc305a6e62ecaa1b6948"
     },
     "reconciliation_safety_tests": {
       "mode": "0644",
       "path": "tests/test_personal_sync_reconciliation_safety.py",
-      "sha256": "021d7b592f07a85af86aa98721edd37b44a6573c998c5d49faa8331e166d3c25"
+      "sha256": "f562d2bdf51c17f1aee1c680ae31b5c41873f10e4cbee8519eac5392a9583176"
     },
     "regular_agent_materialization_tests": {
       "mode": "0644",
       "path": "tests/test_regular_agent_materialization.py",
-      "sha256": "bbae5f87d26dda91cc6e4c9c16399684ad4b93fa72061055da0d3211cacca4cf"
+      "sha256": "19d57d52314d7c2d1163bec42ae5cf8eeaedb1685e30f8201a76d0b836a42aef"
     },
     "regular_overlay_uninstall_status_regressions_tests": {
       "mode": "0644",
       "path": "tests/test_regular_overlay_uninstall_status_regressions.py",
-      "sha256": "a78a0c74df5c7930482f1814d6ed4becfa06b9e5b283a7270fa1acbbac17bb5e"
+      "sha256": "be91af2f7e3759c9253ebaf124291b8f0017873074101db0caca93c0003a345e"
     },
     "release_retention_tests": {
       "mode": "0644",

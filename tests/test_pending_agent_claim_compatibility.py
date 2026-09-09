@@ -80,6 +80,91 @@ def write_agent_release(
     manifest.write_text(json.dumps(manifest_payload) + "\n", encoding="utf-8")
 
 
+def write_agent_source_batch(
+    root: Path,
+    sources_by_target: dict[PurePosixPath, tuple[PurePosixPath, str]],
+) -> None:
+    links: list[dict[str, object]] = []
+    payloads_by_source: dict[PurePosixPath, str] = {}
+    for target, (source, payload) in sources_by_target.items():
+        existing_payload = payloads_by_source.setdefault(source, payload)
+        if existing_payload != payload:
+            raise AssertionError(f"conflicting fixture payload for {source}")
+        links.append(
+            {
+                "source": source.as_posix(),
+                "target": target.as_posix(),
+                "kind": "file",
+                "owner": MODULE.PUBLIC_OWNER,
+            }
+        )
+    for source, payload in payloads_by_source.items():
+        source_path = root / Path(*source.parts)
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(payload, encoding="utf-8")
+    manifest = root / MODULE.MANIFEST_RELATIVE_PATH
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "owner": MODULE.PUBLIC_OWNER,
+                "links": links,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def write_agent_to_symlink_batch(
+    root: Path,
+    prior_sources_by_target: dict[PurePosixPath, PurePosixPath],
+) -> None:
+    links: list[dict[str, object]] = []
+    removed_links: list[dict[str, object]] = []
+    for index, (target, prior_source) in enumerate(prior_sources_by_target.items()):
+        replacement_source = PurePosixPath(
+            "personal_codex",
+            "skills",
+            f"replacement-{index}",
+        )
+        skill = root / Path(*replacement_source.parts) / "SKILL.md"
+        skill.parent.mkdir(parents=True, exist_ok=True)
+        skill.write_text(f"# Replacement {index}\n", encoding="utf-8")
+        links.append(
+            {
+                "source": replacement_source.as_posix(),
+                "target": target.as_posix(),
+                "kind": "skill",
+                "owner": MODULE.PUBLIC_OWNER,
+            }
+        )
+        removed_links.append(
+            {
+                "id": f"regular-agent-to-symlink-{index}",
+                "source": prior_source.as_posix(),
+                "target": target.as_posix(),
+                "kind": "file",
+                "replacement_target": target.as_posix(),
+            }
+        )
+    manifest = root / MODULE.MANIFEST_RELATIVE_PATH
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "owner": MODULE.PUBLIC_OWNER,
+                "links": links,
+                "removed_links": removed_links,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def install(root: Path, home: Path, sha: str = SHA_A) -> None:
     with contextlib.redirect_stdout(io.StringIO()):
         MODULE.install_release_tree(root, home, sha, dry_run=False)
@@ -161,6 +246,10 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
         metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
         payload = json.loads(metadata.read_text(encoding="utf-8"))
         payload["version"] = version
+        if version < 10:
+            for raw_record in payload["records"]:
+                raw_record.pop("before_materialization", None)
+                raw_record.pop("removed_link", None)
         if version < 7:
             payload.pop("terminal_regular_before")
             payload.pop("terminal_regular_after")
@@ -173,11 +262,9 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
                 payload[field].pop("gid")
         if version == 6 and not preserve_v6_null_gid:
             for raw_record in payload["records"]:
-                if (
-                    raw_record["materialization"] == "regular"
-                    and raw_record["action"]
-                    in {"create", "replace", "quarantine-replace"}
-                ):
+                if raw_record["materialization"] == "regular" and raw_record[
+                    "action"
+                ] in {"create", "replace", "quarantine-replace"}:
                     stage = raw_record["stage"]
                     assert isinstance(stage, str)
                     stage_metadata = os.stat(batch.batch_root / stage)
@@ -284,8 +371,7 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
                 owners={MODULE.PUBLIC_OWNER: SHA_A},
                 links=links,
             ),
-            len(reviewer_payload.encode("utf-8"))
-            + len(worker_payload.encode("utf-8")),
+            len(reviewer_payload.encode("utf-8")) + len(worker_payload.encode("utf-8")),
         )
 
     def test_v4_v5_agent_symlink_claims_parse_and_recover(self) -> None:
@@ -353,11 +439,7 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
         self.assertEqual(parsed.metadata_version, 6)
         self.assertNotIn(
             ROLE_TARGET,
-            {
-                claim.target
-                for claim in parsed.claims_after
-                if claim.scope == "managed"
-            },
+            {claim.target for claim in parsed.claims_after if claim.scope == "managed"},
         )
 
         state_record = parsed.state_after_value.links[ROLE_TARGET]
@@ -376,9 +458,7 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
                 "release_sha": state_record.release_sha,
                 "parent_identity": [0, 0],
                 "link_identity": [0, 0],
-                "evidence": (
-                    f"pending/claims/after/{len(claims_after) - 1:08d}"
-                ),
+                "evidence": (f"pending/claims/after/{len(claims_after) - 1:08d}"),
             }
         )
         metadata.write_text(json.dumps(payload) + "\n", encoding="utf-8")
@@ -487,6 +567,7 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
             committed=True,
             legacy_symlink=False,
         )
+        self._downgrade_metadata(batch, 9)
         metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
         payload = json.loads(metadata.read_text(encoding="utf-8"))
 
@@ -602,9 +683,7 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
             committed=True,
         )
         assert batch.state_before_evidence is not None
-        evidence_path = batch.batch_root / Path(
-            *batch.state_before_evidence.parts
-        )
+        evidence_path = batch.batch_root / Path(*batch.state_before_evidence.parts)
         state_path = MODULE._state_path(home)
         state_path.unlink()
         real_read = MODULE._read_managed_state_file_snapshot
@@ -639,11 +718,7 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
 
     def test_state_before_restore_uses_gid_only_for_group_access(self) -> None:
         alternate_gid = next(
-            (
-                gid
-                for gid in os.getgroups()
-                if gid != os.stat(self.root).st_gid
-            ),
+            (gid for gid in os.getgroups() if gid != os.stat(self.root).st_gid),
             None,
         )
         if alternate_gid is None:
@@ -914,6 +989,284 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
                     )
                 self.assertEqual(read_source.call_count, len(expectations))
 
+    def test_v10_parser_reads_shared_immutable_source_once(self) -> None:
+        home = self.root / "home-v10-shared-source"
+        first = self.root / "release-v10-shared-source-a"
+        second = self.root / "release-v10-shared-source-b"
+        shared_source = PurePosixPath("personal_codex/agents/shared.toml")
+        shared_payload = 'name = "shared"\n'
+        sources_by_target = {
+            ROLE_TARGET: (shared_source, shared_payload),
+            UNCHANGED_ROLE_TARGET: (shared_source, shared_payload),
+        }
+        write_agent_source_batch(first, sources_by_target)
+        write_agent_to_symlink_batch(
+            second,
+            {
+                target: source
+                for target, (source, _payload) in sources_by_target.items()
+            },
+        )
+        install(first, home, SHA_A)
+        batch = self._retain_batch(
+            home,
+            second,
+            committed=True,
+            legacy_symlink=False,
+            sha=SHA_B,
+        )
+
+        with mock.patch.object(
+            MODULE,
+            "_read_pending_regular_source_payload",
+            wraps=MODULE._read_pending_regular_source_payload,
+        ) as read_source:
+            parsed = MODULE._load_pending_link_batch(home)
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.metadata_version, 10)
+        self.assertEqual(
+            sum(
+                record.before_is_regular() and not record.is_regular()
+                for record in batch.records
+            ),
+            2,
+        )
+        self.assertEqual(read_source.call_count, 1)
+
+    def test_pending_regular_source_cache_revalidates_source_receipt(self) -> None:
+        home = self.root / "home-v10-source-cache-revalidation"
+        release = self.root / "release-v10-source-cache-revalidation"
+        source = PurePosixPath("personal_codex/agents/reviewer.toml")
+        original_payload = 'name = "reviewer-a"\n'
+        replacement_payload = 'name = "reviewer-b"\n'
+        self.assertEqual(len(original_payload), len(replacement_payload))
+        write_agent_source_batch(
+            release,
+            {ROLE_TARGET: (source, original_payload)},
+        )
+        install(release, home, SHA_A)
+        state = MODULE._load_managed_state(home)
+        record = state.links[ROLE_TARGET]
+        identity, directory_identity = (
+            MODULE._installed_release_identity_and_directory_identity(
+                home,
+                MODULE.PUBLIC_OWNER,
+                SHA_A,
+            )
+        )
+        expectation = MODULE.PendingReleaseExpectation(
+            owner=MODULE.PUBLIC_OWNER,
+            sha=SHA_A,
+            directory_identity=directory_identity,
+            tree_sha256=identity[2],
+        )
+        budget = MODULE._PendingRegularSourceEvidenceBudget()
+
+        with mock.patch.object(
+            MODULE,
+            "_read_pending_regular_source_payload",
+            wraps=MODULE._read_pending_regular_source_payload,
+        ) as read_source:
+            first = budget.evidence(home, record, expectation)
+            installed_source = MODULE._record_regular_source_path(home, record)
+            replacement = installed_source.with_name("replacement.toml")
+            replacement.write_text(replacement_payload, encoding="utf-8")
+            replacement.chmod(installed_source.stat().st_mode & 0o777)
+            os.replace(replacement, installed_source)
+
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "source evidence receipt no longer matches",
+            ):
+                budget.evidence(home, record, expectation)
+
+        self.assertEqual(first.size, len(original_payload.encode("utf-8")))
+        self.assertEqual(read_source.call_count, 1)
+        self.assertEqual(budget.evidence_read_bytes, first.size)
+
+    def test_pending_regular_source_cache_defers_release_tree_revalidation_until_finalize(
+        self,
+    ) -> None:
+        home = self.root / "home-v10-release-cache-revalidation"
+        release = self.root / "release-v10-release-cache-revalidation"
+        source = PurePosixPath("personal_codex/agents/reviewer.toml")
+        payload = 'name = "reviewer"\n'
+        write_agent_source_batch(release, {ROLE_TARGET: (source, payload)})
+        install(release, home, SHA_A)
+        state = MODULE._load_managed_state(home)
+        record = state.links[ROLE_TARGET]
+        identity, directory_identity = (
+            MODULE._installed_release_identity_and_directory_identity(
+                home,
+                MODULE.PUBLIC_OWNER,
+                SHA_A,
+            )
+        )
+        expectation = MODULE.PendingReleaseExpectation(
+            owner=MODULE.PUBLIC_OWNER,
+            sha=SHA_A,
+            directory_identity=directory_identity,
+            tree_sha256=identity[2],
+        )
+        budget = MODULE._PendingRegularSourceEvidenceBudget()
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_read_pending_regular_source_payload",
+                wraps=MODULE._read_pending_regular_source_payload,
+            ) as read_source,
+            mock.patch.object(
+                MODULE,
+                "_capture_pending_regular_release_receipt",
+                wraps=MODULE._capture_pending_regular_release_receipt,
+            ) as capture_release,
+            mock.patch.object(
+                MODULE,
+                "_require_pending_regular_release_receipt",
+                wraps=MODULE._require_pending_regular_release_receipt,
+            ) as revalidate_release,
+        ):
+            first = budget.evidence(home, record, expectation)
+            self.assertEqual(capture_release.call_count, 1)
+            self.assertEqual(revalidate_release.call_count, 0)
+            release_root = MODULE._releases_root(home, MODULE.PUBLIC_OWNER) / SHA_A
+            manifest = release_root / MODULE.MANIFEST_RELATIVE_PATH
+            replacement = manifest.with_name("replacement-manifest.json")
+            replacement.write_bytes(manifest.read_bytes() + b"\n")
+            replacement.chmod(manifest.stat().st_mode & 0o777)
+            os.replace(replacement, manifest)
+
+            cached = budget.evidence(home, record, expectation)
+            self.assertIs(cached, first)
+            self.assertEqual(revalidate_release.call_count, 0)
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "release source .*pending regular-file source evidence cache "
+                "revalidation",
+            ):
+                budget.finalize(home)
+
+        self.assertEqual(read_source.call_count, 1)
+        self.assertEqual(capture_release.call_count, 1)
+        self.assertEqual(revalidate_release.call_count, 1)
+        self.assertEqual(budget.evidence_read_bytes, first.size)
+        self.assertTrue(budget.sealed)
+
+    def test_pending_regular_source_budget_read_stays_on_preflight_fd(self) -> None:
+        home = self.root / "home-v10-source-budget-binding"
+        release = self.root / "release-v10-source-budget-binding"
+        source = PurePosixPath("personal_codex/agents/reviewer.toml")
+        original_payload = 'name = "a"\n'
+        replacement_payload = 'name = "replacement-too-large"\n'
+        write_agent_source_batch(
+            release,
+            {ROLE_TARGET: (source, original_payload)},
+        )
+        install(release, home, SHA_A)
+        state = MODULE._load_managed_state(home)
+        record = state.links[ROLE_TARGET]
+        identity, directory_identity = (
+            MODULE._installed_release_identity_and_directory_identity(
+                home,
+                MODULE.PUBLIC_OWNER,
+                SHA_A,
+            )
+        )
+        expectation = MODULE.PendingReleaseExpectation(
+            owner=MODULE.PUBLIC_OWNER,
+            sha=SHA_A,
+            directory_identity=directory_identity,
+            tree_sha256=identity[2],
+        )
+        budget = MODULE._PendingRegularSourceEvidenceBudget()
+        installed_source = MODULE._record_regular_source_path(home, record)
+        real_open = MODULE._open_bounded_regular_file
+
+        def replace_after_open(*args: object, **kwargs: object):
+            opened = real_open(*args, **kwargs)
+            replacement = installed_source.with_name("replacement.toml")
+            replacement.write_text(replacement_payload, encoding="utf-8")
+            replacement.chmod(installed_source.stat().st_mode & 0o777)
+            os.replace(replacement, installed_source)
+            return opened
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MAX_PENDING_REGULAR_EVIDENCE_READ_BYTES",
+                len(original_payload.encode("utf-8")),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_open_bounded_regular_file",
+                side_effect=replace_after_open,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_read_regular_source_payload",
+                side_effect=AssertionError("source path must not be reopened"),
+            ) as reopened_source,
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "source evidence changed while reading",
+            ),
+        ):
+            budget.evidence(home, record, expectation)
+
+        reopened_source.assert_not_called()
+        self.assertEqual(budget.evidence_read_bytes, 0)
+
+    def test_v10_parser_budgets_distinct_sources_before_second_read(self) -> None:
+        home = self.root / "home-v10-distinct-source-budget"
+        first = self.root / "release-v10-distinct-source-budget-a"
+        second = self.root / "release-v10-distinct-source-budget-b"
+        reviewer_source = PurePosixPath("personal_codex/agents/reviewer.toml")
+        worker_source = PurePosixPath("personal_codex/agents/worker.toml")
+        reviewer_payload = 'name = "reviewer-budget"\n'
+        worker_payload = 'name = "worker-budget"\n'
+        sources_by_target = {
+            ROLE_TARGET: (reviewer_source, reviewer_payload),
+            UNCHANGED_ROLE_TARGET: (worker_source, worker_payload),
+        }
+        write_agent_source_batch(first, sources_by_target)
+        write_agent_to_symlink_batch(
+            second,
+            {
+                target: source
+                for target, (source, _payload) in sources_by_target.items()
+            },
+        )
+        install(first, home, SHA_A)
+        self._retain_batch(
+            home,
+            second,
+            committed=True,
+            legacy_symlink=False,
+            sha=SHA_B,
+        )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MAX_PENDING_REGULAR_EVIDENCE_READ_BYTES",
+                len(reviewer_payload.encode("utf-8")),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_read_pending_regular_source_payload",
+                wraps=MODULE._read_pending_regular_source_payload,
+            ) as read_source,
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "source evidence reads exceed the aggregate size limit",
+            ),
+        ):
+            MODULE._load_pending_link_batch(home)
+
+        self.assertEqual(read_source.call_count, 1)
+
     def test_final_regular_verification_preflights_three_pass_group(self) -> None:
         home, state, group_size = self._terminal_regular_budget_fixture("final")
         expectations = MODULE._stage_pending_terminal_regular_targets(
@@ -1124,9 +1477,7 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
         self.assertTrue(os.path.lexists(MODULE._pending_link_pointer_path(home)))
 
         backup.rename(backup.with_name(backup.name + ".missing"))
-        self.assertIsNone(
-            MODULE._pending_record_backup_snapshot(home, batch, record)
-        )
+        self.assertIsNone(MODULE._pending_record_backup_snapshot(home, batch, record))
 
     def test_private_regular_files_override_a_fully_restrictive_umask(self) -> None:
         home = self.root / "home-umask-0777"
@@ -1189,6 +1540,39 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
             MODULE._write_exclusive_internal_file(home, path, b"authority\n")
 
         self.assertFalse(os.path.lexists(path))
+
+    def test_internal_file_fchmod_and_cleanup_failure_remains_fail_closed(self) -> None:
+        home = self.root / "home-internal-fchmod-and-cleanup-failure"
+        home.mkdir()
+        path = home / "authority.json"
+        creation_error = "injected fchmod failure"
+        cleanup_error = "injected cleanup failure"
+
+        with (
+            mock.patch.object(MODULE.os, "fchmod", side_effect=OSError(creation_error)),
+            mock.patch.object(
+                MODULE,
+                "_cleanup_created_exclusive_internal_file",
+                side_effect=MODULE.SyncError(cleanup_error),
+            ),
+        ):
+            if callable(getattr(OSError(), "add_note", None)):
+                with self.assertRaisesRegex(OSError, creation_error) as raised:
+                    MODULE._write_exclusive_internal_file(home, path, b"authority\n")
+                notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+                self.assertIn("final name could not be safely cleared", notes)
+                self.assertIn(cleanup_error, notes)
+            else:
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "final name could not be safely cleared",
+                ) as raised:
+                    MODULE._write_exclusive_internal_file(home, path, b"authority\n")
+                self.assertIn(cleanup_error, str(raised.exception))
+                self.assertIn(creation_error, str(raised.exception))
+                self.assertIsInstance(raised.exception.__cause__, MODULE.SyncError)
+
+        self.assertTrue(os.path.lexists(path))
 
 
 if __name__ == "__main__":

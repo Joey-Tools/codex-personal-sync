@@ -526,10 +526,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
         before_by_path = {entry[0]: entry[1:] for entry in before}
         after_by_path = {entry[0]: entry[1:] for entry in after}
         self.assertEqual(
-            {
-                relative: after_by_path[relative]
-                for relative in before_by_path
-            },
+            {relative: after_by_path[relative] for relative in before_by_path},
             before_by_path,
         )
         added_paths = set(after_by_path).difference(before_by_path)
@@ -539,8 +536,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             self.assertFalse(added_paths)
         self.assertTrue(
             all(
-                relative == allowed_root
-                or relative.startswith(f"{allowed_root}/")
+                relative == allowed_root or relative.startswith(f"{allowed_root}/")
                 for relative in added_paths
             ),
             added_paths,
@@ -760,9 +756,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             "personal_codex/agents/z-replacement.toml"
         )
         old_target_path = MODULE.PurePosixPath("agents/a-old.toml")
-        replacement_target_path = MODULE.PurePosixPath(
-            "agents/z-replacement.toml"
-        )
+        replacement_target_path = MODULE.PurePosixPath("agents/z-replacement.toml")
         old_entry = MODULE.LinkEntry(old_source, old_target_path, "file")
         previous_replacement = MODULE.LinkEntry(
             replacement_source,
@@ -808,7 +802,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
         }
         for relative_target, target in targets.items():
             target.parent.mkdir(parents=True, exist_ok=True)
-            source = old_source if relative_target == old_target_path else replacement_source
+            source = (
+                old_source if relative_target == old_target_path else replacement_source
+            )
             target.write_bytes(old_payloads[source])
             target.chmod(0o600)
 
@@ -7520,8 +7516,7 @@ while True:
                 (
                     "type",
                     {
-                        "st_mode": stat.S_IFDIR
-                        | stat.S_IMODE(baseline.st_mode),
+                        "st_mode": stat.S_IFDIR | stat.S_IMODE(baseline.st_mode),
                     },
                 ),
             ):
@@ -8175,9 +8170,7 @@ while True:
                 before_release_namespaces = dict(
                     publication_before["release_namespaces"]
                 )
-                after_release_namespaces = dict(
-                    publication_after["release_namespaces"]
-                )
+                after_release_namespaces = dict(publication_after["release_namespaces"])
                 self.assertEqual(
                     after_release_namespaces["personal-sync/overlays"],
                     before_release_namespaces["personal-sync/overlays"],
@@ -8212,10 +8205,7 @@ while True:
                     entry[0]: entry[1:] for entry in release_namespace_after
                 }
                 self.assertEqual(
-                    {
-                        relative: after_by_path[relative]
-                        for relative in before_by_path
-                    },
+                    {relative: after_by_path[relative] for relative in before_by_path},
                     before_by_path,
                 )
                 added_paths = set(after_by_path).difference(before_by_path)
@@ -8515,15 +8505,13 @@ while True:
                 side_effect=legacy_stage_wrapper,
             ) as stage_release,
         ):
-            binding = (
-                MODULE._stage_release_tree_for_install_with_owner_access_policy(
-                    self.root / "release",
-                    self.root / "home",
-                    SHA1,
-                    mock.sentinel.manifest,
-                    None,
-                    expected_owner_uid=4321,
-                )
+            binding = MODULE._stage_release_tree_for_install_with_owner_access_policy(
+                self.root / "release",
+                self.root / "home",
+                SHA1,
+                mock.sentinel.manifest,
+                None,
+                expected_owner_uid=4321,
             )
 
         self.assertIs(binding, expected_binding)
@@ -8556,12 +8544,7 @@ while True:
             owner=MODULE.PUBLIC_OWNER,
         )
         installed_agent = (
-            home
-            / "personal-sync"
-            / "releases"
-            / SHA1
-            / "personal_codex"
-            / "AGENTS.md"
+            home / "personal-sync" / "releases" / SHA1 / "personal_codex" / "AGENTS.md"
         )
         installed_identity = (
             installed_agent.stat().st_dev,
@@ -9116,9 +9099,7 @@ while True:
         ) = self.snapshot_release_tree(release_root)
         release_fd = os.open(release_root, MODULE._source_directory_flags())
         try:
-            release_directory.chmod(
-                stat.S_IMODE(release_directory.stat().st_mode)
-            )
+            release_directory.chmod(stat.S_IMODE(release_directory.stat().st_mode))
             with (
                 mock.patch.object(MODULE.sys, "platform", "darwin"),
                 mock.patch.object(
@@ -9192,10 +9173,14 @@ while True:
             if (metadata.st_dev, metadata.st_ino) == directory_identity:
                 target_enumerations += 1
             names = real_member_names(directory_fd, **kwargs)
-            if target_enumerations == 1 and (
-                metadata.st_dev,
-                metadata.st_ino,
-            ) == directory_identity:
+            if (
+                target_enumerations == 1
+                and (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                )
+                == directory_identity
+            ):
                 before = release_directory.stat()
                 (release_directory / "unexpected.txt").write_text(
                     "unexpected\n",
@@ -9381,9 +9366,7 @@ while True:
                         mock.patch.object(
                             MODULE,
                             "_require_release_identity_fd_access_policy",
-                            side_effect=(
-                                replace_child_before_parent_postorder_scan
-                            ),
+                            side_effect=(replace_child_before_parent_postorder_scan),
                         ),
                         self.assertRaisesRegex(
                             MODULE.SyncError,
@@ -9780,12 +9763,7 @@ while True:
             owner=MODULE.PUBLIC_OWNER,
         )
         installed_agent = (
-            home
-            / "personal-sync"
-            / "releases"
-            / SHA1
-            / "personal_codex"
-            / "AGENTS.md"
+            home / "personal-sync" / "releases" / SHA1 / "personal_codex" / "AGENTS.md"
         )
         before_mode = stat.S_IMODE(installed_agent.stat().st_mode)
         real_identity = MODULE._installed_release_identity_and_directory_evidence
@@ -9867,12 +9845,7 @@ while True:
             owner=MODULE.PUBLIC_OWNER,
         )
         installed_agent = (
-            home
-            / "personal-sync"
-            / "releases"
-            / SHA1
-            / "personal_codex"
-            / "AGENTS.md"
+            home / "personal-sync" / "releases" / SHA1 / "personal_codex" / "AGENTS.md"
         )
         before_mode = stat.S_IMODE(installed_agent.stat().st_mode)
         user_name = pwd.getpwuid(os.geteuid()).pw_name
@@ -10351,12 +10324,7 @@ while True:
             os.geteuid(),
         )
         installed_agent = (
-            home
-            / "personal-sync"
-            / "releases"
-            / SHA1
-            / "personal_codex"
-            / "AGENTS.md"
+            home / "personal-sync" / "releases" / SHA1 / "personal_codex" / "AGENTS.md"
         )
         before_mode = stat.S_IMODE(installed_agent.stat().st_mode)
         authority_fd = os.open(installed_agent, os.O_RDONLY)
@@ -10996,12 +10964,7 @@ while True:
             private_sha=SHA2,
         )
         installed_agent = (
-            home
-            / "personal-sync"
-            / "releases"
-            / SHA1
-            / "personal_codex"
-            / "AGENTS.md"
+            home / "personal-sync" / "releases" / SHA1 / "personal_codex" / "AGENTS.md"
         )
         real_identity = MODULE._installed_release_identity_and_directory_evidence
         identity_calls = 0
@@ -11080,12 +11043,7 @@ while True:
             private_sha=SHA2,
         )
         installed_agent = (
-            home
-            / "personal-sync"
-            / "releases"
-            / SHA1
-            / "personal_codex"
-            / "AGENTS.md"
+            home / "personal-sync" / "releases" / SHA1 / "personal_codex" / "AGENTS.md"
         )
         real_identity = MODULE._installed_release_identity_and_directory_evidence
         identity_calls = 0
@@ -11173,12 +11131,7 @@ while True:
             dry_run=False,
         )
         installed_agent = (
-            home
-            / "personal-sync"
-            / "releases"
-            / SHA1
-            / "personal_codex"
-            / "AGENTS.md"
+            home / "personal-sync" / "releases" / SHA1 / "personal_codex" / "AGENTS.md"
         )
         installed_agent.chmod(0o666)
         stdout = io.StringIO()
@@ -14187,7 +14140,7 @@ while True:
         self.assertEqual(published.payload, b"12345")
         self.assertEqual(source.stat().st_ino, destination.stat().st_ino)
 
-    def test_regular_reconcile_publication_retains_destination_replacement(
+    def test_regular_reconcile_publication_quarantines_destination_replacement(
         self,
     ) -> None:
         home = self.root / "home" / ".codex"
@@ -14204,12 +14157,16 @@ while True:
         )
         target_plan = MODULE._capture_reconcile_target_snapshot(home, target)
         real_link = os.link
+        replacement_identity: tuple[int, int] | None = None
 
         def replace_destination_after_link(*args, **kwargs) -> None:
+            nonlocal replacement_identity
             real_link(*args, **kwargs)
             target.unlink()
             target.write_bytes(b"foreign")
             target.chmod(0o600)
+            metadata = target.stat()
+            replacement_identity = (metadata.st_dev, metadata.st_ino)
 
         with (
             mock.patch.object(
@@ -14217,10 +14174,7 @@ while True:
                 "link",
                 side_effect=replace_destination_after_link,
             ),
-            self.assertRaisesRegex(
-                MODULE.SyncError,
-                "preserved as",
-            ),
+            self.assertRaisesRegex(MODULE.SyncError, "private isolation") as raised,
         ):
             MODULE._publish_regular_reconcile_hardlink_beneath(
                 home,
@@ -14231,27 +14185,27 @@ while True:
                 {},
             )
 
+        self.assertEqual(
+            raised.exception.code,
+            MODULE.PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
+        )
         self.assertEqual(stage.read_bytes(), b"authority")
         self.assertFalse(os.path.lexists(target))
-        retained = tuple(
-            child
-            for child in target.parent.iterdir()
-            if child.name.startswith(
-                MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX
-            )
+        self.assertIsNotNone(replacement_identity)
+        quarantined = tuple(
+            (home / "personal-sync" / "quarantine").glob(".codex-ephemeral-cleanup-*")
         )
-        self.assertEqual(len(retained), 1)
-        self.assertEqual(retained[0].read_bytes(), b"foreign")
-        self.assertNotEqual(stage.stat().st_ino, retained[0].stat().st_ino)
+        self.assertEqual(len(quarantined), 1)
+        self.assertEqual(quarantined[0].read_bytes(), b"foreign")
+        self.assertEqual(
+            (quarantined[0].stat().st_dev, quarantined[0].stat().st_ino),
+            replacement_identity,
+        )
+        self.assertNotEqual(stage.stat().st_ino, quarantined[0].stat().st_ino)
 
     def test_pending_regular_aliases_reject_foreign_hardlink(self) -> None:
         home = self.root / "home" / ".codex"
-        batch_root = (
-            home
-            / "personal-sync"
-            / "quarantine"
-            / "20260901T000000Z-1-1"
-        )
+        batch_root = home / "personal-sync" / "quarantine" / "20260901T000000Z-1-1"
         stage = batch_root / "pending" / "stage" / "00000000"
         evidence = batch_root / "pending" / "evidence" / "00000000"
         target = home / "agents" / "reviewer.toml"
@@ -14266,12 +14220,8 @@ while True:
         record = mock.Mock()
         record.is_regular.return_value = True
         record.target = MODULE.PurePosixPath("agents/reviewer.toml")
-        record.stage = MODULE.PurePosixPath(
-            "pending", "stage", "00000000"
-        )
-        record.evidence = MODULE.PurePosixPath(
-            "pending", "evidence", "00000000"
-        )
+        record.stage = MODULE.PurePosixPath("pending", "stage", "00000000")
+        record.evidence = MODULE.PurePosixPath("pending", "evidence", "00000000")
         record.stage_identity = identity
         record.evidence_identity = identity
         record.before_evidence_identity = None
@@ -14387,7 +14337,9 @@ while True:
             batch_root.rename(moved_root)
             batch_root.mkdir()
             self.assertEqual(MODULE._directory_identity(batch_fd), batch_identity)
-            self.assertFalse(MODULE._bound_directory_matches(home, batch_root, batch_fd))
+            self.assertFalse(
+                MODULE._bound_directory_matches(home, batch_root, batch_fd)
+            )
             self.assertEqual(list(batch_root.iterdir()), [])
             self.assertTrue((moved_root / "metadata.json").is_file())
         finally:
