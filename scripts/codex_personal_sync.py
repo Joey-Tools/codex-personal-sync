@@ -12318,10 +12318,13 @@ def _rmdir_bound_empty_pending_cleanup_directory(
     churn can change both without replacing either protected object.  Portable
     Unix has no inode-conditional ``rmdir``, so atomically rename the current
     source to an identity-encoded, high-entropy private name first.  A source
-    replacement is moved but then retained as evidence; only the expected
-    object is reopened with ``O_NOFOLLOW`` and removed.  No external mutation
-    authority callback runs after isolation; the exact bound parent/member
-    policies and pathname binding are revalidated before removal.
+    replacement observed before the final rebind is moved but retained as
+    evidence; within the cooperative same-UID threat model, the expected object
+    is then reopened with ``O_NOFOLLOW`` and removed.  This does not cover an
+    excluded non-cooperating same-UID process actively replacing the
+    high-entropy tombstone after that rebind.  No external mutation authority
+    callback runs after isolation; the exact bound parent/member policies and
+    pathname binding are revalidated before removal.
     """
     planned = (
         expected_member_identity[0],
@@ -20638,7 +20641,7 @@ def _recover_pending_regular_publication_cleanup(
         lifecycle == "private-authority" or private_authority_anchor is not None
     )
 
-    def verify_completed_cleanup() -> None:
+    def verify_completed_cleanup(*, expected_evidence_link_count: int) -> None:
         evidence_path = (
             record.evidence if journal_phase == "produced" else record.before_evidence
         )
@@ -20653,7 +20656,7 @@ def _recover_pending_regular_publication_cleanup(
                 evidence_snapshot,
                 expected,
             )
-            or evidence_snapshot.link_count != expected.link_count - 1
+            or evidence_snapshot.link_count != expected_evidence_link_count
         ):
             raise SyncError("pending regular publication cleanup evidence changed")
 
@@ -20685,6 +20688,59 @@ def _recover_pending_regular_publication_cleanup(
                 target.parent,
                 bound_parent_fd=parent_fd,
             )
+            if (
+                private_authority
+                and journal_phase == "before"
+                and _named_entry_identity(parent_fd, active_name) is None
+            ):
+                try:
+                    restored_before = _regular_file_snapshot_at(
+                        parent_fd,
+                        target.name,
+                        target,
+                        maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                    )
+                except FileNotFoundError:
+                    restored_before = None
+                if _regular_snapshot_matches(
+                    restored_before,
+                    expected.parent_identity,
+                    expected,
+                    expected_link_count=expected.link_count,
+                ):
+                    # Private authority proves the journal's destructive phase
+                    # already completed. A later rollback step may then have
+                    # relinked the receipt-bound before preimage at its canonical
+                    # name before crashing. Accept only that exact identity,
+                    # content, access policy, parent binding, and restored
+                    # hard-link count; all other occupants remain fail-closed.
+                    verify_completed_cleanup(
+                        expected_evidence_link_count=expected.link_count,
+                    )
+                    confirmed_before = _regular_file_snapshot_at(
+                        parent_fd,
+                        target.name,
+                        target,
+                        maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                    )
+                    if (
+                        not _regular_snapshot_matches(
+                            confirmed_before,
+                            expected.parent_identity,
+                            expected,
+                            expected_link_count=expected.link_count,
+                        )
+                        or _named_entry_identity(parent_fd, active_name) is not None
+                        or not _bound_directory_matches(
+                            home,
+                            target.parent,
+                            parent_fd,
+                        )
+                    ):
+                        raise SyncError(
+                            "pending regular publication restored preimage changed"
+                        )
+                    return
             if not _pending_regular_publication_public_names_are_allowed(
                 home,
                 batch,
@@ -20703,7 +20759,9 @@ def _recover_pending_regular_publication_cleanup(
             # public candidate from evidence relinked after private deletion.
             # Only absence or the independently recorded rollback preimage is
             # therefore admissible, and neither is mutated here.
-            verify_completed_cleanup()
+            verify_completed_cleanup(
+                expected_evidence_link_count=expected.link_count - 1,
+            )
             return
         target_snapshot: RegularFileSnapshot | None
         active_snapshot: RegularFileSnapshot | None
@@ -20741,7 +20799,9 @@ def _recover_pending_regular_publication_cleanup(
                     # finalizer consumes this durable receipt. Leave the
                     # current target for the normal rollback state machine to
                     # validate; it has no authority to delete it here.
-                    verify_completed_cleanup()
+                    verify_completed_cleanup(
+                        expected_evidence_link_count=expected.link_count - 1,
+                    )
                     return
                 raise SyncError("pending regular publication target changed")
             destructive_target_snapshot = _regular_file_snapshot_at(
@@ -20810,7 +20870,9 @@ def _recover_pending_regular_publication_cleanup(
                 label="pending regular publication",
             )
         else:
-            verify_completed_cleanup()
+            verify_completed_cleanup(
+                expected_evidence_link_count=expected.link_count - 1,
+            )
     finally:
         _close_fd_quietly(parent_fd)
     # Keep this lifecycle receipt until whole-batch finalization.

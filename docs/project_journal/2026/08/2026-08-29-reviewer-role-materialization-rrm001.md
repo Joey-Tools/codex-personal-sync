@@ -984,3 +984,28 @@ superseded_by:
   validation, and `git diff --check` also passed on the current worktree. The
   source range is now ready for a signed frozen head and fresh exact-head
   whole-range review before remote publication.
+- That frozen exact-head review found a before-phase recovery retry gap. After
+  durable private authority had completed its cleanup, rollback could restore
+  the exact receipt-bound regular preimage and then crash before whole-batch
+  finalization. A later recovery treated that canonical preimage as forbidden
+  public reappearance and retained the pending pointer forever. Recovery now
+  accepts only the exact restored before state: identity, payload, mode, UID,
+  policy-relevant GID/ACL, bound parent, and restored hard-link count must all
+  match both the receipt and before evidence; private aliases and the active
+  name must be absent. Every other state remains fail closed.
+- The regression deterministically exercises three recovery attempts: leave a
+  before active receipt, finish private cleanup and restore the preimage before
+  a second crash, then finalize on the third recovery. The private-authority
+  selection passed 5 tests, replace-recovery selection passed 2 tests, and the
+  repository-private regular-agent module passed 135 tests in 90.884 seconds.
+  Ruff lint/format, AST syntax validation, `git diff --check`, and refreshed
+  eleven-source lock validation passed. The review also clarified that final
+  high-entropy tombstone removal is bounded by the documented cooperative
+  same-UID threat model; a deliberately non-cooperating same-UID process that
+  observes and swaps a final private name is explicitly outside that model and
+  cannot be made inode-conditional by portable Unix `unlink` or `rmdir`.
+- Complete repository-private discovery after the before-state recovery repair
+  passed 1,643 tests with two expected skips in 1,243.166 seconds. The next
+  gate is a signed frozen head followed by a new independent whole-range
+  review, secret admission, and then the PR's current-head GitHub review and
+  required checks; no remote publication has occurred for this repair yet.

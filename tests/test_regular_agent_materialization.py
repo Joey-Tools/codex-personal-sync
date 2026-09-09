@@ -3891,8 +3891,62 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         active = target.with_name(active_name)
         self.assertEqual((active.stat().st_dev, active.stat().st_ino), old_identity)
 
-        install(self.release, self.home, SHA_A)
+        real_restore = MODULE._restore_pending_record_before
+        restored = False
+
+        def crash_after_preimage_restoration(
+            home: Path,
+            pending_batch: MODULE.PendingLinkBatch,
+            pending_record: MODULE.PendingLinkRecord,
+            before_evidence: MODULE.SymlinkSnapshot | MODULE.RegularFileSnapshot,
+        ) -> None:
+            nonlocal restored
+            real_restore(home, pending_batch, pending_record, before_evidence)
+            restored = True
+            raise MODULE.SyncError("injected crash after before-state restoration")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_restore_pending_record_before",
+                side_effect=crash_after_preimage_restoration,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "injected crash after before-state restoration",
+            ),
+        ):
+            install(self.release, self.home, SHA_A)
+
+        self.assertTrue(restored)
         self.assertFalse(os.path.lexists(active))
+        self.assertEqual((target.stat().st_dev, target.stat().st_ino), old_identity)
+        journal = MODULE._read_pending_regular_publication_cleanup(
+            self.home,
+            batch,
+            record,
+            "before",
+        )
+        self.assertIsNotNone(journal)
+        assert journal is not None
+        self.assertEqual(target.stat().st_nlink, journal[3].link_count)
+        cleanup_metadata = journal[0]
+        assert cleanup_metadata.parent_identity is not None
+        anchor = MODULE._read_pending_regular_publication_private_authority(
+            self.home,
+            batch,
+            record,
+            "before",
+            journal[3],
+            journal[1],
+            cleanup_metadata.parent_identity,
+        )
+        self.assertIsNotNone(anchor)
+
+        install(self.release, self.home, SHA_A)
+
+        self.assertFalse(MODULE._pending_link_pointer_path(self.home).exists())
+        self.assertFalse(batch.batch_root.exists())
         self.assertEqual((target.stat().st_dev, target.stat().st_ino), old_identity)
         self.assertEqual(target.stat().st_nlink, 1)
 
