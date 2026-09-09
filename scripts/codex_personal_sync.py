@@ -31141,6 +31141,28 @@ def _remove_pending_ephemeral_quarantine_leaf(
                     _close_fd_quietly(private_fd)
                 continue
 
+            if canonical_identity == expected.file_identity:
+                # Retire the loadable canonical name before preserving a
+                # competing derived alias.  A same-UID creator can publish an
+                # alias after ticket creation but before this first scan; if
+                # that alias reached private evidence first, the recovery
+                # would fail closed while leaving the ticket-bound canonical
+                # publication loadable.
+                move_canonical_to_alias(canonical_identity)
+                continue
+            # Preserve every observed foreign alias before advancing the
+            # ticket-bound inode to exact private isolation.  Selecting by
+            # identity, rather than alias-slot order, keeps a foreign creator
+            # from remaining in the public namespace when the canonical
+            # evacuation happened to take an earlier slot.
+            foreign_alias = next(
+                (item for item in aliases if item[1] != expected.file_identity),
+                None,
+            )
+            if foreign_alias is not None:
+                alias_name, alias_identity = foreign_alias
+                move_alias_to_private(alias_name, alias_identity)
+                continue
             if len(private) > 1 or private:
                 raise SyncError(
                     "pending ephemeral cleanup retained replacement as isolated "

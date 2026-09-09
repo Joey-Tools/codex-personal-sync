@@ -903,3 +903,23 @@ superseded_by:
   skips in 1,922.213 seconds. This amended source/test range requires a new
   signed frozen head and fresh exact-head whole-range review before remote
   publication.
+- A subsequent fresh readonly review found a v6 failure-publication recovery
+  ordering gap. If an exact ticket-bound canonical role and a same-UID derived
+  alias existed before the first scan, retaining the alias first could make
+  private evidence nonempty and fail closed while the failed canonical role
+  remained loadable. Recovery now evacuates only the exact canonical inode
+  first, then selects foreign aliases by identity rather than alias-slot
+  order. Foreign evidence remains retained; the exact inode stays in a
+  non-loadable alias when retained evidence prevents deletion. A foreign
+  canonical plus an exact alias continues through the established
+  private-phase receipt path, preserving the existing reappearance boundary.
+- Deterministic regressions cover a competing alias in both the primary and a
+  later alias slot, asserting that the canonical path is absent, the exact
+  inode is non-loadable, and the foreign inode remains private evidence across
+  repeated recovery. The affected pending-staging, reclaim, and regular
+  materialization suite passed 324 tests in 177.769 seconds. Ruff lint/format,
+  Python syntax compilation, `git diff --check`, and refreshed eleven-source
+  lock validation passed. Complete repository-private discovery then passed
+  1,635 tests with two expected skips in 1,406.074 seconds. This changed
+  source/test range still requires a new signed frozen head and fresh
+  exact-head whole-range review before remote publication.

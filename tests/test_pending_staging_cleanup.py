@@ -3718,6 +3718,106 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     )
                     self.assertEqual(len(evidence), 1)
 
+    def test_v6_ephemeral_cleanup_with_competing_alias_retires_canonical_first(
+        self,
+    ) -> None:
+        for competing_index in (0, 1):
+            with self.subTest(competing_index=competing_index):
+                case_home = self.root / (
+                    f"ephemeral-v6-competing-alias-{competing_index}"
+                )
+                install(self.first_release, case_home, SHA_A)
+                case_target = case_home / ROLE_TARGET
+                expected = MODULE._read_regular_file_snapshot_beneath(
+                    case_home,
+                    case_target,
+                    require_managed_access=False,
+                )
+                ticket = (
+                    MODULE._publish_pending_ephemeral_quarantine_leaf_cleanup_ticket(
+                        case_home,
+                        case_target,
+                        expected,
+                    )
+                )
+                alias_names = MODULE._pending_ephemeral_public_alias_names(
+                    ticket.batch_root.name
+                )
+                competing_alias = case_target.with_name(alias_names[competing_index])
+                competing_alias.write_bytes(b"same-uid competing alias\n")
+                competing_alias.chmod(0o600)
+                competing_identity = (
+                    competing_alias.stat().st_dev,
+                    competing_alias.stat().st_ino,
+                )
+                self.assertEqual(competing_alias.stat().st_uid, os.geteuid())
+
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "retained replacement as isolated evidence",
+                ):
+                    MODULE._cleanup_ready_pending_batches(case_home)
+
+                self.assertTrue(ticket.path.is_file())
+                self.assertFalse(os.path.lexists(case_target))
+                exact_aliases = tuple(
+                    case_target.with_name(name)
+                    for name in alias_names
+                    if (
+                        case_target.with_name(name).exists()
+                        and (
+                            case_target.with_name(name).stat().st_dev,
+                            case_target.with_name(name).stat().st_ino,
+                        )
+                        == expected.file_identity
+                    )
+                )
+                self.assertEqual(len(exact_aliases), 1)
+                self.assertEqual(
+                    hashlib.sha256(exact_aliases[0].read_bytes()).hexdigest(),
+                    expected.sha256,
+                )
+                self.assertFalse(competing_alias.exists())
+                evidence = (
+                    MODULE._personal_sync_root(case_home)
+                    / MODULE.QUARANTINE_RELATIVE_PATH
+                    / MODULE._pending_ephemeral_quarantine_leaf_name(
+                        ticket.batch_root.name
+                    )
+                )
+                self.assertTrue(evidence.is_file())
+                self.assertEqual(
+                    (evidence.stat().st_dev, evidence.stat().st_ino),
+                    competing_identity,
+                )
+                self.assertEqual(
+                    evidence.read_bytes(),
+                    b"same-uid competing alias\n",
+                )
+
+                exact_alias_identity = (
+                    exact_aliases[0].stat().st_dev,
+                    exact_aliases[0].stat().st_ino,
+                )
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "retained replacement as isolated evidence",
+                ):
+                    MODULE._cleanup_ready_pending_batches(case_home)
+
+                self.assertFalse(os.path.lexists(case_target))
+                self.assertEqual(
+                    (
+                        exact_aliases[0].stat().st_dev,
+                        exact_aliases[0].stat().st_ino,
+                    ),
+                    exact_alias_identity,
+                )
+                self.assertEqual(
+                    (evidence.stat().st_dev, evidence.stat().st_ino),
+                    competing_identity,
+                )
+
     def test_v6_ephemeral_cleanup_restart_after_private_unlink_preserves_foreign_canonical(
         self,
     ) -> None:
