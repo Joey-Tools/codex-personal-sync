@@ -48,7 +48,7 @@
     "quarantine_empty_batch_reclaim_tests": {
       "mode": "0644",
       "path": "tests/test_quarantine_empty_batch_reclaim.py",
-      "sha256": "d185a2a4840b42ac37f22bacdf3478017c6947eb1d41bc305a6e62ecaa1b6948"
+      "sha256": "d3db56699194aa83908dae122ce97e5bf49ce4d94469acecebca1391edefde45"
     },
     "reconciliation_safety_tests": {
       "mode": "0644",
@@ -63,7 +63,7 @@
     "regular_overlay_uninstall_status_regressions_tests": {
       "mode": "0644",
       "path": "tests/test_regular_overlay_uninstall_status_regressions.py",
-      "sha256": "be91af2f7e3759c9253ebaf124291b8f0017873074101db0caca93c0003a345e"
+      "sha256": "5e9de1e1a5c6e12d735551762a57be961ec3e8e09c95adf34932830a4d447e78"
     },
     "release_retention_tests": {
       "mode": "0644",
