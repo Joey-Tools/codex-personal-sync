@@ -2803,6 +2803,194 @@ class QuarantineEmptyBatchReclaimTests(unittest.TestCase):
         self.assertTrue(cleanup.path.is_file())
         self.assertTrue(allocation_ticket.path.is_file())
 
+    def test_v5_leaf_rmdir_rechecks_parent_policy_after_mutation_revalidation(
+        self,
+    ) -> None:
+        allocation = MODULE._quarantine_batch_root(
+            self.home,
+            [],
+            retain_binding=True,
+            retain_scaffold_binding=True,
+        )
+        assert isinstance(allocation, MODULE.EphemeralQuarantineBatchAllocation)
+        allocation.create_leaf()
+        binding = allocation.binding
+        cleanup = binding.cleanup_ticket
+        allocation_ticket = binding.allocation_ticket
+        assert cleanup is not None
+        assert allocation_ticket is not None
+        assert binding.leaf_identity is not None
+        leaf = binding.batch_root / "leaf"
+        allocation.revoke_reclaim()
+        allocation.close()
+        real_revalidate = MODULE._require_joined_quarantine_allocation_unchanged
+        boundary_calls = 0
+
+        def relax_parent_after_revalidation(
+            home: Path,
+            ticket: MODULE.PendingBatchCleanupTicket,
+            expected: MODULE.PendingQuarantineAllocationTicket | None,
+        ) -> None:
+            nonlocal boundary_calls
+            real_revalidate(home, ticket, expected)
+            boundary_calls += 1
+            if boundary_calls == 2:
+                binding.batch_root.chmod(0o770)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_require_joined_quarantine_allocation_unchanged",
+                side_effect=relax_parent_after_revalidation,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "access policy mismatch",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, cleanup)
+
+        self.assertEqual(boundary_calls, 2)
+        self.assertEqual(
+            (leaf.stat().st_dev, leaf.stat().st_ino),
+            binding.leaf_identity,
+        )
+        self.assertFalse(
+            list(
+                binding.batch_root.glob(
+                    MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX + "*"
+                )
+            )
+        )
+        self.assertTrue(cleanup.path.is_file())
+        self.assertTrue(allocation_ticket.path.is_file())
+
+    def test_directory_rmdir_rechecks_parent_policy_at_final_pathname_boundary(
+        self,
+    ) -> None:
+        for scenario in ("v5-leaf", "v5-batch", "v7-batch"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as root:
+                case_home = Path(root) / "home"
+                case_home.mkdir(mode=0o700)
+                allocation = MODULE._quarantine_batch_root(
+                    case_home,
+                    [],
+                    retain_binding=True,
+                    retain_scaffold_binding=True,
+                )
+                assert isinstance(
+                    allocation,
+                    MODULE.EphemeralQuarantineBatchAllocation,
+                )
+                if scenario.startswith("v5"):
+                    allocation.create_leaf()
+                    binding = allocation.binding
+                    cleanup = binding.cleanup_ticket
+                    assert cleanup is not None
+                else:
+                    binding = allocation.binding
+                    cleanup = None
+                allocation.revoke_reclaim()
+                allocation.close()
+                if cleanup is None:
+                    cleanup = MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+                        case_home,
+                        binding,
+                    )
+                allocation_ticket = binding.allocation_ticket
+                assert allocation_ticket is not None
+
+                if scenario == "v5-leaf":
+                    target_parent = binding.batch_root
+                    expected_identity = binding.leaf_identity
+                else:
+                    target_parent = binding.batch_root.parent
+                    expected_identity = binding.batch_identity
+                assert expected_identity is not None
+                real_require_access = MODULE._require_pending_cleanup_fd_access_policy
+                replacement_identity: tuple[int, int] | None = None
+                authorized_member: Path | None = None
+                replacement_member: Path | None = None
+                private_parent_policy_checks = 0
+
+                def relax_policy_and_replace_private_member(
+                    directory_fd: int,
+                    display_path: Path,
+                    *args: object,
+                    **kwargs: object,
+                ) -> object:
+                    nonlocal replacement_identity
+                    nonlocal authorized_member, replacement_member
+                    nonlocal private_parent_policy_checks
+                    active = tuple(
+                        target_parent.glob(
+                            MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX + "*"
+                        )
+                    )
+                    if display_path == target_parent and len(active) == 1:
+                        private_parent_policy_checks += 1
+                    if (
+                        replacement_identity is None
+                        and display_path == target_parent
+                        and len(active) == 1
+                        and private_parent_policy_checks == 2
+                    ):
+                        target_parent.chmod(0o770)
+                        replacement_member = active[0]
+                        authorized_member = active[0].with_name(
+                            active[0].name + ".authorized"
+                        )
+                        active[0].rename(authorized_member)
+                        active[0].mkdir(mode=0o700)
+                        replacement = active[0].stat()
+                        replacement_identity = (
+                            replacement.st_dev,
+                            replacement.st_ino,
+                        )
+                    return real_require_access(
+                        directory_fd,
+                        display_path,
+                        *args,
+                        **kwargs,
+                    )
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_require_pending_cleanup_fd_access_policy",
+                        side_effect=relax_policy_and_replace_private_member,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "access policy mismatch",
+                    ),
+                ):
+                    MODULE._remove_cleanup_ready_batch(case_home, cleanup)
+
+                self.assertEqual(private_parent_policy_checks, 2)
+                self.assertIsNotNone(replacement_identity)
+                self.assertIsNotNone(authorized_member)
+                self.assertIsNotNone(replacement_member)
+                assert replacement_identity is not None
+                assert authorized_member is not None
+                assert replacement_member is not None
+                self.assertEqual(
+                    (
+                        authorized_member.stat().st_dev,
+                        authorized_member.stat().st_ino,
+                    ),
+                    expected_identity,
+                )
+                self.assertEqual(
+                    (
+                        replacement_member.stat().st_dev,
+                        replacement_member.stat().st_ino,
+                    ),
+                    replacement_identity,
+                )
+                self.assertTrue(cleanup.path.is_file())
+                self.assertTrue(allocation_ticket.path.is_file())
+
     def test_v5_cleanup_recovers_final_private_leaf_isolation(self) -> None:
         allocation = MODULE._quarantine_batch_root(
             self.home,

@@ -883,3 +883,23 @@ superseded_by:
   expected skips in 1,148.870 seconds. This changed source/test range still
   requires a new signed frozen head and a fresh exact-head whole-range review
   before remote publication.
+- That fresh review found one remaining P1 at the private directory removal
+  boundary: parent identity alone was rechecked after the authority callback,
+  but its owner-only `0700`/ACL access policy was not. A same-identity parent
+  whose policy became writable could invalidate the private-namespace premise
+  before final pathname deletion. The shared helper now reproves the parent
+  identity, pathname binding, owner, mode, and ACL policy after the callback,
+  after private-member reopening, and immediately before the final
+  policy-before-binding deletion boundary. It keeps object identity, empty
+  contents, and access policy as the protected properties; benign ctime or
+  link-count churn remains non-authoritative.
+- Deterministic v5 leaf, v5 batch, and v7 batch regressions relax the parent
+  to `0770`, replace the private member, and prove the replacement survives
+  while cleanup/allocation authority remains retained. Ruff lint/format,
+  Python syntax compilation, `git diff --check`, and the refreshed eleven
+  source lock check passed. The affected reclaim, pending-staging, and
+  regular-materialization suite passed 323 tests in 244.553 seconds. Complete
+  repository-private discovery then passed 1,634 tests with two expected
+  skips in 1,922.213 seconds. This amended source/test range requires a new
+  signed frozen head and fresh exact-head whole-range review before remote
+  publication.

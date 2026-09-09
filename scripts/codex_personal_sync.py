@@ -12319,16 +12319,17 @@ def _rmdir_bound_empty_pending_cleanup_directory(
     Unix has no inode-conditional ``rmdir``, so atomically rename the current
     source to an identity-encoded, high-entropy private name first.  A source
     replacement is moved but then retained as evidence; only the expected
-    object is reopened with ``O_NOFOLLOW`` and removed.  No external authority
-    probe runs after that isolation boundary.
+    object is reopened with ``O_NOFOLLOW`` and removed.  No external mutation
+    authority callback runs after isolation; the exact bound parent/member
+    policies and pathname binding are revalidated before removal.
     """
     planned = (
         expected_member_identity[0],
         expected_member_identity[1],
         stat.S_IFDIR,
     )
-    boundary_fd = -1
-    try:
+
+    def require_parent_access_boundary() -> None:
         if _directory_identity(
             parent_fd
         ) != expected_parent_identity or not _bound_directory_matches(
@@ -12340,6 +12341,10 @@ def _rmdir_bound_empty_pending_cleanup_directory(
             parent_path,
             expected_mode=0o700,
         )
+
+    boundary_fd = -1
+    try:
+        require_parent_access_boundary()
         if (
             _directory_identity(member_fd) != expected_member_identity
             or not _bound_directory_matches(home, member_path, member_fd)
@@ -12356,6 +12361,10 @@ def _rmdir_bound_empty_pending_cleanup_directory(
         isolation_error: BaseException | None = None
         for _attempt in range(128):
             mutation_revalidator()
+            # The callback may inspect mutable external authority. Reprove the
+            # exact parent's binding and owner-only access policy after it
+            # returns, before relying on this namespace for private isolation.
+            require_parent_access_boundary()
             candidate = _pending_cleanup_entry_name(
                 PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
                 expected_parent_identity,
@@ -12421,6 +12430,10 @@ def _rmdir_bound_empty_pending_cleanup_directory(
                 planned,
                 label=f"{changed_message}; private evidence changed identity",
             )
+        # Reopening the private name rebinds the pathname to the expected
+        # member descriptor, but identity alone does not preserve the parent's
+        # owner-only namespace policy.
+        require_parent_access_boundary()
         try:
             _require_pending_cleanup_fd_access_policy(
                 boundary_fd,
@@ -12449,6 +12462,25 @@ def _rmdir_bound_empty_pending_cleanup_directory(
             )
         if isolation_error is not None:
             raise isolation_error
+        # Close the final pathname boundary in policy-before-binding order:
+        # first prove that no non-owner can mutate the namespace, then rebind
+        # the private name and contents to the still-open expected directory.
+        require_parent_access_boundary()
+        if (
+            _directory_identity(boundary_fd) != expected_member_identity
+            or _directory_identity(member_fd) != expected_member_identity
+            or not _bound_directory_matches(home, private_path, boundary_fd)
+            or _directory_member_names(boundary_fd, maximum_entries=1) != ()
+            or _named_entry_identity(parent_fd, private_name)
+            != expected_member_identity
+        ):
+            _retain_pending_cleanup_entry(
+                parent_fd,
+                private_name,
+                expected_parent_identity,
+                planned,
+                label=f"{changed_message}; private evidence changed before removal",
+            )
         # The verified private name is fresh, high entropy, and exists only in
         # this mode-0700 namespace.  Keep its exact descriptor live across the
         # only pathname-based destructive syscall available on portable Unix.
