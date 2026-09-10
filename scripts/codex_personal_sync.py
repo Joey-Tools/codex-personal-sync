@@ -190,7 +190,7 @@ FAILED_MOVE_ISOLATION_DIRECTORY_NAME = "failed-move"
 FAILED_MOVE_ISOLATION_ENTRY_NAME = "entry"
 PENDING_LINK_POINTER_NAME = ".personal-sync-pending-transaction.json"
 PENDING_LINK_METADATA_NAME = "pending-transaction.json"
-PENDING_LINK_METADATA_VERSION = 10
+PENDING_LINK_METADATA_VERSION = 11
 PENDING_RELINQUISH_FOREIGN_ACTION = "relinquish-foreign"
 PENDING_LINK_V4_ACTIONS = frozenset(
     {
@@ -210,6 +210,7 @@ PENDING_LINK_ACTIONS_BY_METADATA_VERSION = {
     8: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
     9: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
     10: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
+    11: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
 }
 SUPPORTED_PENDING_LINK_METADATA_VERSIONS = frozenset(
     PENDING_LINK_ACTIONS_BY_METADATA_VERSION
@@ -230,6 +231,8 @@ PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX = ".allocation.json.tmp"
 PENDING_QUARANTINE_METADATA_STAGE_SUFFIX = ".allocation-metadata.tmp"
 PENDING_CLEANUP_EMPTY_PROOF_SUFFIX = ".empty-proof"
 PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX = ".terminal-validation"
+LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION = 4
+PENDING_TERMINAL_CLEANUP_TICKET_VERSION = 8
 PENDING_PRIVATE_USE_RETIREMENT_SUFFIX = ".private-use-retirement"
 PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX = ".publish-tmp"
 PENDING_CLEANUP_CURSOR_NAME = ".scan-cursor"
@@ -4826,6 +4829,7 @@ class PendingRegularTargetExpectation:
     size: int
     mode: int
     uid: int
+    link_count: int | None
 
 
 @dataclass(frozen=True)
@@ -16412,8 +16416,10 @@ def _pending_release_payload(
 
 def _pending_regular_target_expectation_payload(
     expectation: PendingRegularTargetExpectation,
+    *,
+    include_link_count: bool = True,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "target": expectation.target.as_posix(),
         "parent_identity": _identity_payload(expectation.parent_identity),
         "file_identity": _identity_payload(expectation.file_identity),
@@ -16422,6 +16428,9 @@ def _pending_regular_target_expectation_payload(
         "mode": expectation.mode,
         "uid": expectation.uid,
     }
+    if include_link_count:
+        payload["link_count"] = expectation.link_count
+    return payload
 
 
 def _terminal_regular_state_items(
@@ -16609,6 +16618,8 @@ def _stage_pending_terminal_regular_targets(
     records: tuple[PendingLinkRecord, ...],
     *,
     phase: str,
+    batch_root: Path | None = None,
+    produced_targets_are_published: bool = False,
 ) -> tuple[PendingRegularTargetExpectation, ...]:
     state_items = _terminal_regular_state_items(
         state,
@@ -16637,6 +16648,32 @@ def _stage_pending_terminal_regular_targets(
             size = pending_record.regular_size
             mode = pending_record.regular_mode
             uid = pending_record.regular_uid
+            if pending_record.evidence is None or batch_root is None:
+                raise SyncError(
+                    f"pending terminal regular evidence is missing: {target}"
+                )
+            snapshot = _read_regular_file_snapshot_beneath(
+                home,
+                batch_root / Path(*pending_record.evidence.parts),
+                require_managed_access=False,
+            )
+            if (
+                snapshot.file_identity != file_identity
+                or snapshot.sha256 != digest
+                or snapshot.size != size
+                or snapshot.mode != mode
+                or snapshot.uid != uid
+                or snapshot.link_count
+                != pending_record.regular_link_count
+                + (1 if produced_targets_are_published else 0)
+            ):
+                raise SyncError(f"pending terminal regular evidence changed: {target}")
+            # The live target is published from this staged inode after the
+            # durable metadata is written. Bind that one planned alias now;
+            # terminal cleanup must not infer the count after commit.
+            link_count = snapshot.link_count - (
+                1 if produced_targets_are_published else 0
+            )
         elif (
             phase == "before"
             and pending_record is not None
@@ -16654,6 +16691,7 @@ def _stage_pending_terminal_regular_targets(
             size = snapshot.size
             mode = snapshot.mode
             uid = snapshot.uid
+            link_count = snapshot.link_count
         else:
             snapshot = _read_regular_file_snapshot_beneath(
                 home,
@@ -16674,6 +16712,7 @@ def _stage_pending_terminal_regular_targets(
             size = snapshot.size
             mode = snapshot.mode
             uid = snapshot.uid
+            link_count = snapshot.link_count
         if (
             parent_identity is None
             or file_identity is None
@@ -16684,6 +16723,10 @@ def _stage_pending_terminal_regular_targets(
             or size < 0
             or mode != 0o600
             or uid != os.geteuid()
+            or not isinstance(link_count, int)
+            or isinstance(link_count, bool)
+            or link_count < 1
+            or link_count >= 2**64
         ):
             raise SyncError(f"pending terminal regular target is incomplete: {target}")
         expectations.append(
@@ -16695,6 +16738,7 @@ def _stage_pending_terminal_regular_targets(
                 size=size,
                 mode=mode,
                 uid=uid,
+                link_count=link_count,
             )
         )
     return tuple(expectations)
@@ -21700,6 +21744,7 @@ def _projected_pending_terminal_regular_payloads(
             "size": MAX_ARCHIVE_MEMBER_BYTES,
             "mode": 0o600,
             "uid": _MAX_PENDING_IDENTITY[0],
+            "link_count": _MAX_PENDING_IDENTITY[0],
         }
         for target, record in sorted(
             state.links.items(),
@@ -23066,12 +23111,14 @@ def _stage_pending_link_batch(
             canonical_state_before_value,
             record_tuple,
             phase="before",
+            batch_root=batch_root,
         )
         terminal_regular_after = _stage_pending_terminal_regular_targets(
             home,
             state_after_value,
             record_tuple,
             phase="after",
+            batch_root=batch_root,
         )
         claims_before = _stage_pending_link_claims(
             home,
@@ -24417,10 +24464,12 @@ def _parse_pending_link_batch(
         terminal_regular_before = _parse_pending_terminal_regular_targets(
             data.get("terminal_regular_before"),
             batch_name=batch_name,
+            require_link_count=version >= 11,
         )
         terminal_regular_after = _parse_pending_terminal_regular_targets(
             data.get("terminal_regular_after"),
             batch_name=batch_name,
+            require_link_count=version >= 11,
         )
         _validate_pending_terminal_regular_targets_for_state(
             home,
@@ -27081,6 +27130,7 @@ def _pending_terminal_regular_targets_from_records(
                 size=size,
                 mode=mode,
                 uid=uid,
+                link_count=None,
             )
         )
     return tuple(sorted(targets, key=lambda target: target.target.as_posix()))
@@ -27098,7 +27148,58 @@ def _pending_terminal_regular_targets(
     raise SyncError("pending terminal cleanup phase is invalid")
 
 
+def _pending_terminal_cleanup_ticket_targets(
+    home: Path,
+    batch: PendingLinkBatch,
+    *,
+    phase: str,
+) -> tuple[PendingRegularTargetExpectation, ...]:
+    targets = _pending_terminal_regular_targets(batch, phase=phase)
+    records_by_target = {
+        record.target: record for record in batch.records if record.scope == "managed"
+    }
+    ticket_targets: list[PendingRegularTargetExpectation] = []
+    for target in targets:
+        if target.link_count is None:
+            ticket_targets.append(target)
+            continue
+        link_count = target.link_count
+        record = records_by_target.get(target.target)
+        if (
+            phase == "after"
+            and record is not None
+            and record.is_regular()
+            and record.action in {"create", "replace", "quarantine-replace"}
+        ):
+            # Staging bound the stage/evidence aliases. The committed live
+            # target is the one additional alias prescribed by the record.
+            link_count += 1
+        elif (
+            phase == "before"
+            and record is not None
+            and record.before_is_regular()
+            and record.action
+            in {"replace", "quarantine-replace", "remove", "quarantine-remove"}
+            and record.backup is not None
+        ):
+            # A completed rollback may already have retired its transaction
+            # backup, while an interrupted recovery can legitimately retain it.
+            # Count only that named, inode-bound batch alias; never sample nlink
+            # after commit to infer authority.
+            backup = batch.batch_root / Path(*record.backup.parts)
+            backup_identity = _regular_alias_identity_beneath(home, backup)
+            if backup_identity == target.file_identity:
+                link_count += 1
+            elif backup_identity is not None:
+                raise SyncError(
+                    f"pending terminal regular backup changed: {target.target}"
+                )
+        ticket_targets.append(replace(target, link_count=link_count))
+    return tuple(ticket_targets)
+
+
 def _pending_terminal_cleanup_ticket_payload(
+    home: Path,
     batch: PendingLinkBatch,
     marker: ManagedStateFileSnapshot,
     *,
@@ -27116,10 +27217,42 @@ def _pending_terminal_cleanup_ticket_payload(
         if phase == "after"
         else PENDING_STATE_ROLLBACK_MARKER
     )
-    targets = _pending_terminal_regular_targets(batch, phase=phase)
+    targets = _pending_terminal_cleanup_ticket_targets(
+        home,
+        batch,
+        phase=phase,
+    )
+    # v6 action-scoped metadata can safely reconstruct the complete terminal
+    # group from its immutable batch records before publishing a ticket. Older
+    # persisted group schemas have no count field and remain explicit v4
+    # legacy authority rather than being silently upgraded.
+    ticket_version = (
+        PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        if all(target.link_count is not None for target in targets)
+        else LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+    )
+    target_payloads: list[dict[str, object]] = []
+    for target in targets:
+        payload: dict[str, object] = {
+            "target": target.target.as_posix(),
+            "parent_identity": _identity_payload(target.parent_identity),
+            "file_identity": _identity_payload(target.file_identity),
+            "sha256": target.sha256,
+            "size": target.size,
+            "mode": target.mode,
+            "uid": target.uid,
+        }
+        if ticket_version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
+            if target.link_count is None:
+                raise SyncError(
+                    "pending terminal regular target lacks exact hard-link "
+                    f"authority: {target.target}"
+                )
+            payload["link_count"] = target.link_count
+        target_payloads.append(payload)
     return _bounded_json_document(
         {
-            "version": 4,
+            "version": ticket_version,
             "batch": batch.batch_root.name,
             "batch_root_identity": _identity_payload(batch.batch_root_identity),
             "finalization_marker": {
@@ -27130,18 +27263,7 @@ def _pending_terminal_cleanup_ticket_payload(
                 "mode": marker.mode,
                 "sha256": hashlib.sha256(marker.payload).hexdigest(),
             },
-            "terminal_regular_targets": [
-                {
-                    "target": target.target.as_posix(),
-                    "parent_identity": _identity_payload(target.parent_identity),
-                    "file_identity": _identity_payload(target.file_identity),
-                    "sha256": target.sha256,
-                    "size": target.size,
-                    "mode": target.mode,
-                    "uid": target.uid,
-                }
-                for target in targets
-            ],
+            "terminal_regular_targets": target_payloads,
         },
         max_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
         overflow_error="pending terminal cleanup ticket exceeds the size limit",
@@ -27152,6 +27274,7 @@ def _parse_pending_terminal_regular_targets(
     raw_targets: object,
     *,
     batch_name: str,
+    require_link_count: bool,
 ) -> tuple[PendingRegularTargetExpectation, ...]:
     if not isinstance(raw_targets, list) or len(raw_targets) > MAX_PENDING_LINK_RECORDS:
         raise SyncError(f"pending terminal regular targets are invalid: {batch_name}")
@@ -27164,6 +27287,8 @@ def _parse_pending_terminal_regular_targets(
         "mode",
         "uid",
     }
+    if require_link_count:
+        expected_fields.add("link_count")
     targets: list[PendingRegularTargetExpectation] = []
     previous_target: PurePosixPath | None = None
     for raw_target in raw_targets:
@@ -27193,6 +27318,7 @@ def _parse_pending_terminal_regular_targets(
         size = raw_target.get("size")
         mode = raw_target.get("mode")
         uid = raw_target.get("uid")
+        link_count = raw_target.get("link_count") if require_link_count else None
         if (
             parent_identity is None
             or file_identity is None
@@ -27203,6 +27329,15 @@ def _parse_pending_terminal_regular_targets(
             or size < 0
             or mode != 0o600
             or uid != os.geteuid()
+            or (
+                require_link_count
+                and (
+                    not isinstance(link_count, int)
+                    or isinstance(link_count, bool)
+                    or link_count < 1
+                    or link_count >= 2**64
+                )
+            )
         ):
             raise SyncError(f"pending terminal regular target changed: {batch_name}")
         targets.append(
@@ -27214,6 +27349,7 @@ def _parse_pending_terminal_regular_targets(
                 size=size,
                 mode=mode,
                 uid=uid,
+                link_count=link_count,
             )
         )
     return tuple(targets)
@@ -27293,6 +27429,12 @@ def _validate_pending_terminal_regular_targets_for_state(
                 size=pending_record.regular_size,
                 mode=pending_record.regular_mode,
                 uid=pending_record.regular_uid,
+                link_count=(
+                    pending_record.regular_link_count
+                    if expectation.link_count is not None
+                    and pending_record.regular_link_count is not None
+                    else None
+                ),
             )
             if expectation != expected:
                 raise SyncError(
@@ -27319,6 +27461,9 @@ def _validate_pending_terminal_regular_targets_for_state(
                 size=planned.size,
                 mode=planned.mode,
                 uid=planned.uid,
+                link_count=(
+                    planned.link_count if expectation.link_count is not None else None
+                ),
             )
             if expectation != expected:
                 raise SyncError(
@@ -27396,7 +27541,7 @@ def _read_pending_cleanup_ticket(
             )
         data = _decode_managed_state_json(snapshot.payload, ticket_path)
         version = data.get("version")
-        if type(version) is not int or version not in {1, 2, 3, 4, 5, 6, 7}:
+        if type(version) is not int or version not in {1, 2, 3, 4, 5, 6, 7, 8}:
             raise SyncError(
                 f"pending cleanup ticket has unsupported fields: {batch_name}"
             )
@@ -27407,14 +27552,14 @@ def _read_pending_cleanup_ticket(
                 "batch_root_identity",
                 "commit_marker",
             }
-        elif version in {2, 3, 4}:
+        elif version in {2, 3, 4, 8}:
             expected_top_level_fields = {
                 "version",
                 "batch",
                 "batch_root_identity",
                 "finalization_marker",
             }
-            if version == 4:
+            if version in {4, 8}:
                 expected_top_level_fields.add("terminal_regular_targets")
         elif version in {5, 7}:
             expected_top_level_fields = {
@@ -27723,14 +27868,14 @@ def _read_pending_cleanup_ticket(
             "mode",
             "sha256",
         }
-        if version in {2, 3, 4}:
+        if version in {2, 3, 4, 8}:
             expected_marker_fields.add("phase")
         if not isinstance(marker, dict) or set(marker) != expected_marker_fields:
             raise SyncError(
                 f"pending cleanup finalization marker changed: {batch_name}"
             )
         phase = "after" if version == 1 else marker.get("phase")
-        if version == 4:
+        if version in {4, 8}:
             if phase not in {"before", "after"}:
                 raise SyncError(
                     f"pending cleanup finalization marker changed: {batch_name}"
@@ -27781,8 +27926,13 @@ def _read_pending_cleanup_ticket(
             _parse_pending_terminal_regular_targets(
                 data.get("terminal_regular_targets"),
                 batch_name=batch_name,
+                require_link_count=(version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION),
             )
-            if version == 4
+            if version
+            in {
+                LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+                PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+            }
             else ()
         )
         if version == 1:
@@ -27808,24 +27958,21 @@ def _read_pending_cleanup_ticket(
                     "sha256": marker_sha256,
                 },
             }
-            if version == 4:
+            if version in {4, 8}:
                 payload_data["terminal_regular_targets"] = [
-                    {
-                        "target": target.target.as_posix(),
-                        "parent_identity": _identity_payload(target.parent_identity),
-                        "file_identity": _identity_payload(target.file_identity),
-                        "sha256": target.sha256,
-                        "size": target.size,
-                        "mode": target.mode,
-                        "uid": target.uid,
-                    }
+                    _pending_regular_target_expectation_payload(
+                        target,
+                        include_link_count=(
+                            version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+                        ),
+                    )
                     for target in terminal_regular_targets
                 ]
             expected_payload = _bounded_json_document(
                 payload_data,
                 max_bytes=(
                     MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES
-                    if version == 4
+                    if version in {4, 8}
                     else MAX_PENDING_CLEANUP_TICKET_BYTES
                 ),
                 overflow_error="pending cleanup ticket exceeds the size limit",
@@ -29034,10 +29181,13 @@ def _mark_pending_batch_cleanup_ready(
                 batch.state_after_value,
                 batch.records,
                 phase="after",
+                batch_root=batch.batch_root,
+                produced_targets_are_published=True,
             ),
         )
     payload = (
         _pending_terminal_cleanup_ticket_payload(
+            home,
             cleanup_batch,
             marker,
             phase="after",
@@ -29071,10 +29221,12 @@ def _mark_pending_batch_rollback_cleanup_ready(
                 batch.state_before_value,
                 batch.records,
                 phase="before",
+                batch_root=batch.batch_root,
             ),
         )
     payload = (
         _pending_terminal_cleanup_ticket_payload(
+            home,
             cleanup_batch,
             marker,
             phase="before",
@@ -29982,6 +30134,7 @@ def _pending_terminal_snapshot_matches_expectation(
     expectation: PendingRegularTargetExpectation,
     *,
     expected_parent_identity: tuple[int, int],
+    expected_link_count: int | None,
 ) -> bool:
     return (
         snapshot.parent_identity == expected_parent_identity
@@ -29990,7 +30143,11 @@ def _pending_terminal_snapshot_matches_expectation(
         and snapshot.size == expectation.size
         and snapshot.mode == expectation.mode
         and snapshot.uid == expectation.uid
-        and snapshot.link_count >= 1
+        and (
+            snapshot.link_count == expected_link_count
+            if expected_link_count is not None
+            else snapshot.link_count >= 1
+        )
     )
 
 
@@ -30006,6 +30163,8 @@ def _validate_pending_terminal_target_and_alias(
     batch_root_identity: tuple[int, int],
     expectation: PendingRegularTargetExpectation,
     alias_name: str,
+    *,
+    expected_link_count: int | None,
 ) -> None:
     target = home / Path(*expectation.target.parts)
     target_snapshot = _read_regular_file_snapshot_beneath(
@@ -30017,6 +30176,7 @@ def _validate_pending_terminal_target_and_alias(
         target_snapshot,
         expectation,
         expected_parent_identity=expectation.parent_identity,
+        expected_link_count=expected_link_count,
     ):
         raise SyncError(f"final managed regular file changed: {expectation.target}")
     alias = bound_batch_root / alias_name
@@ -30029,6 +30189,7 @@ def _validate_pending_terminal_target_and_alias(
         alias_snapshot,
         expectation,
         expected_parent_identity=batch_root_identity,
+        expected_link_count=expected_link_count,
     ):
         raise SyncError(
             f"pending terminal recovery alias changed: {expectation.target}"
@@ -30042,7 +30203,7 @@ def _ensure_pending_terminal_validation_receipt(
     batch_fd: int,
     quarantine_root_identity: tuple[int, int],
 ) -> None:
-    if ticket.version != 4 or not ticket.terminal_regular_targets:
+    if ticket.version not in {4, 8} or not ticket.terminal_regular_targets:
         return
     existing_receipt = _read_pending_cleanup_terminal_validation(
         home,
@@ -30050,6 +30211,17 @@ def _ensure_pending_terminal_validation_receipt(
         quarantine_root_identity,
     )
     if existing_receipt is not None:
+        if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
+            for index, expectation in enumerate(ticket.terminal_regular_targets):
+                assert expectation.link_count is not None
+                _validate_pending_terminal_target_and_alias(
+                    home,
+                    bound_batch_root,
+                    ticket.batch_root_identity,
+                    expectation,
+                    _pending_terminal_recovery_alias_name(index),
+                    expected_link_count=expectation.link_count + 1,
+                )
         return
 
     for index, expectation in enumerate(ticket.terminal_regular_targets):
@@ -30057,6 +30229,23 @@ def _ensure_pending_terminal_validation_receipt(
         alias_identity = _named_entry_identity(batch_fd, alias_name)
         target = home / Path(*expectation.target.parts)
         if alias_identity is None:
+            if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
+                assert expectation.link_count is not None
+                target_snapshot = _read_regular_file_snapshot_beneath(
+                    home,
+                    target,
+                    require_managed_access=False,
+                )
+                if not _pending_terminal_snapshot_matches_expectation(
+                    target_snapshot,
+                    expectation,
+                    expected_parent_identity=expectation.parent_identity,
+                    expected_link_count=expectation.link_count,
+                ):
+                    raise SyncError(
+                        "final managed regular file has an unauthorized "
+                        f"hard-link alias: {expectation.target}"
+                    )
             target_parent_fd = _open_directory_beneath(home, target.parent)
             try:
                 target_state = _read_managed_state_file_snapshot(
@@ -30085,6 +30274,12 @@ def _ensure_pending_terminal_validation_receipt(
             ticket.batch_root_identity,
             expectation,
             alias_name,
+            expected_link_count=(
+                expectation.link_count + 1
+                if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+                and expectation.link_count is not None
+                else None
+            ),
         )
 
     os.fsync(batch_fd)
@@ -30110,6 +30305,12 @@ def _ensure_pending_terminal_validation_receipt(
             ticket.batch_root_identity,
             expectation,
             _pending_terminal_recovery_alias_name(index),
+            expected_link_count=(
+                expectation.link_count + 1
+                if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+                and expectation.link_count is not None
+                else None
+            ),
         )
 
 
@@ -34466,7 +34667,7 @@ def _cleanup_ready_pending_batches(
             if _remove_cleanup_ready_batch(home, ticket):
                 action_budget.mark_batch_completed(batch_name)
         except (FileNotFoundError, OSError, SyncError) as error:
-            if ticket.version == 4:
+            if ticket.version in {4, 8}:
                 raise SyncError(
                     "pending terminal regular-file validation was retained: "
                     f"{batch_name}: {error}"
@@ -34633,7 +34834,7 @@ def _require_no_pending_terminal_mutation_authority(home: Path) -> None:
                 batch_name,
                 error,
             ) from error
-        if ticket is not None and ticket.version in {3, 4, 5, 6, 7}:
+        if ticket is not None and ticket.version in {3, 4, 5, 6, 7, 8}:
             raise SyncError(
                 "pending cleanup authority must reach terminal validation before "
                 f"new mutation: {batch_name} (ticket v{ticket.version})"
@@ -35484,7 +35685,7 @@ def _verify_final_regular_targets(
     home: Path,
     ticket: PendingBatchCleanupTicket,
 ) -> None:
-    if ticket.version != 4:
+    if ticket.version not in {4, 8}:
         return
     _require_pending_terminal_regular_group_size_budget(
         tuple(expected.size for expected in ticket.terminal_regular_targets),

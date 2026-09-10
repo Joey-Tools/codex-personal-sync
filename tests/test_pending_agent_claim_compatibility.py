@@ -246,6 +246,10 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
         metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
         payload = json.loads(metadata.read_text(encoding="utf-8"))
         payload["version"] = version
+        if version < 11:
+            for field in ("terminal_regular_before", "terminal_regular_after"):
+                for raw_target in payload.get(field, []):
+                    raw_target.pop("link_count", None)
         if version < 10:
             for raw_record in payload["records"]:
                 raw_record.pop("before_materialization", None)
@@ -1015,6 +1019,7 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
             legacy_symlink=False,
             sha=SHA_B,
         )
+        self._downgrade_metadata(batch, 10)
 
         with mock.patch.object(
             MODULE,
@@ -1024,7 +1029,17 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
             parsed = MODULE._load_pending_link_batch(home)
 
         self.assertIsNotNone(parsed)
+        assert parsed is not None
         self.assertEqual(parsed.metadata_version, 10)
+        self.assertTrue(
+            all(
+                target.link_count is None
+                for target in (
+                    *parsed.terminal_regular_before,
+                    *parsed.terminal_regular_after,
+                )
+            )
+        )
         self.assertEqual(
             sum(
                 record.before_is_regular() and not record.is_regular()

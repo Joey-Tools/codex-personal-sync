@@ -155,6 +155,13 @@ def downgrade_pending_state_evidence_metadata(
     payload: dict[str, object],
     version: int,
 ) -> None:
+    if version < 11:
+        for field in ("terminal_regular_before", "terminal_regular_after"):
+            raw_targets = payload.get(field, [])
+            assert isinstance(raw_targets, list)
+            for raw_target in raw_targets:
+                assert isinstance(raw_target, dict)
+                raw_target.pop("link_count", None)
     if version >= 9:
         return
     for field in ("state_before", "state_after", "commit_evidence"):
@@ -2273,7 +2280,7 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         record = next(
             candidate for candidate in batch.records if candidate.target == ROLE_TARGET
         )
-        self.assertEqual(batch.metadata_version, 10)
+        self.assertEqual(batch.metadata_version, 11)
         self.assertTrue(record.before_is_regular())
         self.assertFalse(record.is_regular())
         self.assertEqual(record.action, "quarantine-replace")
@@ -5073,6 +5080,7 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
         payload = json.loads(metadata.read_text(encoding="utf-8"))
         payload["version"] = 9
+        downgrade_pending_state_evidence_metadata(payload, 9)
         records = payload["records"]
         assert isinstance(records, list)
         for raw_record in records:
@@ -6181,6 +6189,69 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
 
         self.assertTrue(drifted)
 
+    def test_terminal_cleanup_rejects_foreign_hardlink_before_deleting_batch(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(
+                MODULE,
+                "_try_cleanup_finalized_pending_batch",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "committed regular-file evidence cleanup was deferred",
+            ),
+        ):
+            install(self.release, self.home, SHA_A)
+
+        ticket_paths = list(
+            MODULE._pending_cleanup_index_path(self.home).glob("*.json")
+        )
+        self.assertEqual(len(ticket_paths), 1)
+        ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket_paths[0])
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertEqual(
+            ticket.version,
+            MODULE.PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        )
+        self.assertEqual(len(ticket.terminal_regular_targets), 1)
+        expectation = ticket.terminal_regular_targets[0]
+        self.assertIsNotNone(expectation.link_count)
+        target = self.home / ROLE_TARGET
+        self.assertEqual(target.stat().st_nlink, expectation.link_count)
+
+        foreign_alias = self.root / "foreign-reviewer-alias.toml"
+        os.link(target, foreign_alias)
+        recovery_alias = (
+            ticket.batch_root / MODULE._pending_terminal_recovery_alias_name(0)
+        )
+
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal regular-file validation was retained.*"
+                "unauthorized hard-link alias",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertTrue(target.is_file())
+        self.assertTrue(foreign_alias.is_file())
+        self.assertFalse(recovery_alias.exists())
+
+        foreign_alias.unlink()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+
+        self.assertFalse(ticket.path.exists())
+        self.assertFalse(ticket.batch_root.exists())
+        self.assertEqual(target.stat().st_nlink, 1)
+
 
 class PendingMetadataCompatibilityTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -6629,6 +6700,7 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
             size=10,
             mode=0o600,
             uid=os.geteuid(),
+            link_count=None,
         )
         ticket = MODULE.PendingBatchCleanupTicket(
             version=4,
@@ -7143,6 +7215,15 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
         self.assertEqual(
             [item["target"] for item in metadata["terminal_regular_after"]],
             [ROLE_TARGET.as_posix(), secondary_target.as_posix()],
+        )
+        self.assertTrue(
+            all(
+                isinstance(item["link_count"], int)
+                and not isinstance(item["link_count"], bool)
+                and item["link_count"] >= 1
+                for field in ("terminal_regular_before", "terminal_regular_after")
+                for item in metadata[field]
+            )
         )
         self.assertEqual(
             tuple(item.target for item in batch.terminal_regular_before),
