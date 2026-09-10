@@ -159,6 +159,196 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def _deferred_terminal_ticket(self) -> MODULE.PendingBatchCleanupTicket:
+        with (
+            mock.patch.object(
+                MODULE,
+                "_try_cleanup_finalized_pending_batch",
+                return_value=False,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "committed regular-file evidence cleanup was deferred",
+            ),
+        ):
+            MODULE.uninstall_overlay(self.home, "private", dry_run=False)
+        ticket_path = next(MODULE._pending_cleanup_index_path(self.home).glob("*.json"))
+        ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket_path)
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        return ticket
+
+    def _crash_after_walker_alias_unlink(
+        self,
+        ticket: MODULE.PendingBatchCleanupTicket,
+        alias_parent: Path,
+    ) -> None:
+        expected_identity = ticket.terminal_regular_targets[0].file_identity
+        alias_parent_identity = (
+            alias_parent.stat().st_dev,
+            alias_parent.stat().st_ino,
+        )
+        real_unlink = os.unlink
+        crashed = False
+
+        def crash_after_exact_alias_unlink(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            *args: object,
+            dir_fd: int | None = None,
+            **kwargs: object,
+        ) -> None:
+            nonlocal crashed
+            identity = None
+            parent_identity = None
+            if dir_fd is not None:
+                parent = os.fstat(dir_fd)
+                parent_identity = (parent.st_dev, parent.st_ino)
+                try:
+                    current = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+                except OSError:
+                    pass
+                else:
+                    identity = (current.st_dev, current.st_ino)
+            real_unlink(path, *args, dir_fd=dir_fd, **kwargs)
+            if (
+                not crashed
+                and parent_identity == alias_parent_identity
+                and identity == expected_identity
+            ):
+                crashed = True
+                raise SystemExit("injected walker alias unlink crash")
+
+        with (
+            mock.patch.object(
+                MODULE.os, "unlink", side_effect=crash_after_exact_alias_unlink
+            ),
+            self.assertRaisesRegex(SystemExit, "walker alias unlink crash"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+        self.assertTrue(crashed)
+        self.assertTrue(
+            MODULE._pending_cleanup_terminal_validation_path(
+                self.home,
+                ticket.batch_root.name,
+            ).is_file()
+        )
+
+    def _crash_after_walker_alias_parent_rmdir(
+        self,
+        ticket: MODULE.PendingBatchCleanupTicket,
+        alias_parent: Path,
+    ) -> None:
+        expected_identity = (alias_parent.stat().st_dev, alias_parent.stat().st_ino)
+        real_rmdir = os.rmdir
+        crashed = False
+
+        def crash_after_exact_alias_parent_rmdir(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            *args: object,
+            dir_fd: int | None = None,
+            **kwargs: object,
+        ) -> None:
+            nonlocal crashed
+            identity = None
+            if dir_fd is not None:
+                try:
+                    current = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+                except OSError:
+                    pass
+                else:
+                    identity = (current.st_dev, current.st_ino)
+            real_rmdir(path, *args, dir_fd=dir_fd, **kwargs)
+            if not crashed and identity == expected_identity:
+                crashed = True
+                raise SystemExit("injected walker alias parent rmdir crash")
+
+        with (
+            mock.patch.object(
+                MODULE.os,
+                "rmdir",
+                side_effect=crash_after_exact_alias_parent_rmdir,
+            ),
+            self.assertRaisesRegex(SystemExit, "alias parent rmdir crash"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+        self.assertTrue(crashed)
+        self.assertTrue(
+            MODULE._pending_cleanup_terminal_validation_path(
+                self.home,
+                ticket.batch_root.name,
+            ).is_file()
+        )
+
+    def _terminal_receipt_alias_path(
+        self,
+        ticket: MODULE.PendingBatchCleanupTicket,
+        namespace: str,
+    ) -> MODULE.PendingTerminalValidationAlias:
+        quarantine_fd = MODULE._open_directory_beneath(
+            self.home,
+            ticket.batch_root.parent,
+        )
+        try:
+            receipt = MODULE._read_pending_cleanup_terminal_validation(
+                self.home,
+                ticket,
+                MODULE._directory_identity(quarantine_fd),
+            )
+            self.assertIsNotNone(receipt)
+            assert receipt is not None
+            authority = MODULE._parse_pending_terminal_validation_authority(
+                self.home,
+                ticket,
+                MODULE._directory_identity(quarantine_fd),
+                receipt,
+            )
+        finally:
+            MODULE._close_fd_quietly(quarantine_fd)
+        self.assertIsNotNone(authority)
+        assert authority is not None
+        return next(
+            alias
+            for alias in authority.aliases
+            if alias.path.parts[:2] == ("pending", namespace)
+        )
+
+    def _directory_with_identity(
+        self,
+        root: Path,
+        identity: tuple[int, int],
+    ) -> Path:
+        for path in (root, *root.rglob("*")):
+            metadata = path.lstat()
+            if (
+                stat.S_ISDIR(metadata.st_mode)
+                and (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                )
+                == identity
+            ):
+                return path
+        self.fail(f"missing terminal receipt alias parent: {identity}")
+
+    def _active_batch_child(
+        self,
+        ticket: MODULE.PendingBatchCleanupTicket,
+        logical_name: str,
+    ) -> Path:
+        batch_identity = (
+            ticket.batch_root.stat().st_dev,
+            ticket.batch_root.stat().st_ino,
+        )
+        for child in ticket.batch_root.iterdir():
+            binding = MODULE._pending_cleanup_active_entry_binding(
+                child.name,
+                batch_identity,
+            )
+            if binding is not None and binding[1] == logical_name:
+                return child
+        self.fail(f"missing active batch child: {logical_name}")
+
     def test_precommit_rollback_uses_regular_batch_finalizer(self) -> None:
         real_finalizer = MODULE._finalize_rolled_back_pending_batch
         real_verify_releases = MODULE._verify_install_release_identities
@@ -205,9 +395,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertEqual(self.target.read_text(encoding="utf-8"), PRIVATE_PAYLOAD)
         self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o600)
         self.assertEqual(self.target.stat().st_nlink, 1)
-        self.assertFalse(
-            os.path.lexists(MODULE._pending_link_pointer_path(self.home))
-        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
         state = MODULE._load_managed_state(self.home)
         self.assertEqual(state.owners["private"], SHA_B)
         self.assertEqual(state.links[ROLE_TARGET].owner, "private")
@@ -227,9 +415,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         ):
             MODULE.uninstall_overlay(self.home, "private", dry_run=False)
 
-        self.assertFalse(
-            os.path.lexists(MODULE._pending_link_pointer_path(self.home))
-        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
         self.assertGreater(self.target.stat().st_nlink, 1)
         ticket_root = MODULE._pending_cleanup_index_path(self.home)
         self.assertTrue(any(ticket_root.glob("*.json")))
@@ -308,9 +494,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         ):
             MODULE.uninstall_overlay(self.home, "private", dry_run=False)
 
-        ticket_path = next(
-            MODULE._pending_cleanup_index_path(self.home).glob("*.json")
-        )
+        ticket_path = next(MODULE._pending_cleanup_index_path(self.home).glob("*.json"))
         ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket_path)
         self.assertIsNotNone(ticket)
         assert ticket is not None
@@ -348,6 +532,594 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertFalse(ticket.batch_root.exists())
         self.assertEqual(self.target.stat().st_nlink, 1)
 
+    def test_terminal_validation_resumes_after_stage_alias_is_consumed(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        self._crash_after_walker_alias_unlink(
+            ticket,
+            ticket.batch_root / "pending" / "stage",
+        )
+
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
+        self.assertFalse(ticket.batch_root.exists())
+        self.assertEqual(self.target.stat().st_nlink, 1)
+
+    def test_terminal_validation_resumes_after_evidence_alias_is_consumed(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        self._crash_after_walker_alias_unlink(
+            ticket,
+            ticket.batch_root / "pending" / "evidence",
+        )
+
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
+        self.assertFalse(ticket.batch_root.exists())
+        self.assertEqual(self.target.stat().st_nlink, 1)
+
+    def _assert_terminal_validation_rejects_foreign_reappearance(
+        self,
+        namespace: str,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        alias_parent = ticket.batch_root / "pending" / namespace
+        self._crash_after_walker_alias_unlink(ticket, alias_parent)
+        receipt_alias = self._terminal_receipt_alias_path(ticket, namespace)
+        alias_parent = self._directory_with_identity(
+            ticket.batch_root,
+            receipt_alias.parent_identity,
+        )
+        alias = alias_parent / receipt_alias.path.name
+        self.assertFalse(alias.exists())
+        alias.write_text("foreign replacement\n", encoding="utf-8")
+        alias.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal regular alias changed",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertTrue(alias.is_file())
+        alias.unlink()
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
+        self.assertEqual(self.target.stat().st_nlink, 1)
+
+    def test_terminal_validation_rejects_foreign_stage_alias_reappearance(
+        self,
+    ) -> None:
+        self._assert_terminal_validation_rejects_foreign_reappearance("stage")
+
+    def test_terminal_validation_rejects_foreign_evidence_alias_reappearance(
+        self,
+    ) -> None:
+        self._assert_terminal_validation_rejects_foreign_reappearance("evidence")
+
+    def _assert_terminal_validation_rejects_recreated_alias_parent(
+        self,
+        replacement: str,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        stage = ticket.batch_root / "pending" / "stage"
+        self._crash_after_walker_alias_parent_rmdir(ticket, stage)
+        pending = self._active_batch_child(ticket, "pending")
+        foreign = pending / "stage"
+        if replacement == "directory":
+            foreign.mkdir(mode=0o700)
+            foreign.chmod(0o700)
+        else:
+            foreign.symlink_to("foreign-replacement")
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal regular alias namespace changed: pending/stage",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertTrue(os.path.lexists(foreign))
+        if replacement == "directory":
+            foreign.rmdir()
+        else:
+            foreign.unlink()
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
+        self.assertEqual(self.target.stat().st_nlink, 1)
+
+    def test_terminal_validation_rejects_recreated_stage_directory_after_rmdir(
+        self,
+    ) -> None:
+        self._assert_terminal_validation_rejects_recreated_alias_parent("directory")
+
+    def test_terminal_validation_rejects_recreated_stage_symlink_after_rmdir(
+        self,
+    ) -> None:
+        self._assert_terminal_validation_rejects_recreated_alias_parent("symlink")
+
+    def test_terminal_validation_rejects_forged_v2_active_stage_after_rmdir(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        stage = ticket.batch_root / "pending" / "stage"
+        self._crash_after_walker_alias_parent_rmdir(ticket, stage)
+        pending = self._active_batch_child(ticket, "pending")
+        pending_fd = MODULE._open_directory_beneath(self.home, pending)
+        temporary_name = "stage-foreign-temporary"
+        try:
+            os.mkdir(temporary_name, 0o700, dir_fd=pending_fd)
+            temporary = os.stat(
+                temporary_name,
+                dir_fd=pending_fd,
+                follow_symlinks=False,
+            )
+            planned = MODULE._pending_cleanup_entry_plan(temporary)
+            active_name = MODULE._pending_cleanup_active_entry_name(
+                MODULE._directory_identity(pending_fd),
+                planned,
+                "stage",
+            )
+            MODULE._rename_noreplace_at(
+                pending_fd,
+                temporary_name,
+                pending_fd,
+                active_name,
+            )
+            os.fsync(pending_fd)
+        finally:
+            MODULE._close_fd_quietly(pending_fd)
+        foreign_directory = pending / active_name
+        foreign_file = foreign_directory / "99999999"
+        foreign_file.write_text("foreign replacement\n", encoding="utf-8")
+        foreign_file.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal regular alias namespace changed: pending/stage",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertTrue(foreign_file.is_file())
+        foreign_file.unlink()
+        foreign_directory.rmdir()
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
+        self.assertEqual(self.target.stat().st_nlink, 1)
+
+    def test_terminal_validation_rejects_recreated_pending_after_rmdir(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        pending = ticket.batch_root / "pending"
+        self._crash_after_walker_alias_parent_rmdir(ticket, pending)
+        self.assertFalse(pending.exists())
+
+        pending.mkdir(mode=0o700)
+        pending.chmod(0o700)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal regular alias namespace changed: pending",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertTrue(pending.is_dir())
+        pending.rmdir()
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
+        self.assertEqual(self.target.stat().st_nlink, 1)
+
+    def test_terminal_validation_resumes_after_recovery_alias_is_consumed(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        self._crash_after_walker_alias_unlink(ticket, ticket.batch_root)
+
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
+        self.assertFalse(ticket.batch_root.exists())
+        self.assertEqual(self.target.stat().st_nlink, 1)
+
+    def test_terminal_validation_resumes_legacy_active_regular_entry(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        stage = ticket.batch_root / "pending" / "stage"
+        regular = next(path for path in stage.iterdir() if path.is_file())
+        parent_fd = MODULE._open_directory_beneath(self.home, stage)
+        try:
+            parent_identity = MODULE._directory_identity(parent_fd)
+            planned = MODULE._pending_cleanup_entry_plan(
+                os.stat(regular.name, dir_fd=parent_fd, follow_symlinks=False)
+            )
+            legacy_name = MODULE._pending_cleanup_entry_name(
+                MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                parent_identity,
+                planned,
+            )
+            self.assertGreater(
+                len(os.fsencode(legacy_name)),
+                MODULE.MAX_PENDING_CLEANUP_ACTIVE_LOGICAL_NAME_BYTES,
+            )
+            MODULE._rename_noreplace_at(
+                parent_fd,
+                regular.name,
+                parent_fd,
+                legacy_name,
+            )
+            os.fsync(parent_fd)
+        finally:
+            MODULE._close_fd_quietly(parent_fd)
+
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
+        self.assertFalse(ticket.batch_root.exists())
+        self.assertEqual(self.target.stat().st_nlink, 1)
+
+    def test_odd_hex_v2_active_entry_is_not_bound(self) -> None:
+        name = (
+            f"{MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX}"
+            f"v2-1-2-3-4-{stat.S_IFREG:x}-abc-{'0' * 16}"
+        )
+        self.assertIsNone(MODULE._pending_cleanup_active_entry_binding(name, (1, 2)))
+
+    def test_active_cleanup_token_preserves_short_links_content_name(self) -> None:
+        links = self.root / "links-token"
+        links.mkdir(mode=0o700)
+        content = links / "backup.toml"
+        content.write_text("backup\n", encoding="utf-8")
+        content.chmod(0o600)
+        directory_fd = MODULE._open_directory_beneath(self.root, links)
+        try:
+            parent_identity = MODULE._directory_identity(directory_fd)
+            planned = MODULE._pending_cleanup_entry_plan(
+                os.stat(content.name, dir_fd=directory_fd, follow_symlinks=False)
+            )
+            active_name, _active = MODULE._isolate_pending_cleanup_entry(
+                directory_fd,
+                content.name,
+                parent_identity,
+                planned,
+                relative_parts=("links",),
+            )
+        finally:
+            MODULE._close_fd_quietly(directory_fd)
+
+        binding = MODULE._pending_cleanup_active_entry_binding(
+            active_name,
+            parent_identity,
+        )
+        self.assertIsNotNone(binding)
+        assert binding is not None
+        self.assertEqual(binding[0], planned)
+        self.assertEqual(binding[1], content.name)
+
+    def test_terminal_validation_partial_cleanup_still_rejects_foreign_hardlink(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        self._crash_after_walker_alias_unlink(
+            ticket,
+            ticket.batch_root / "pending" / "stage",
+        )
+        foreign = self.root / "foreign-after-receipt.toml"
+        os.link(self.target, foreign)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "unauthorized hard-link alias",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertTrue(foreign.is_file())
+        foreign.unlink()
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
+        self.assertEqual(self.target.stat().st_nlink, 1)
+
+    def test_terminal_validation_rejects_replaced_recovery_alias_after_receipt(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        quarantine_root = ticket.batch_root.parent
+        quarantine_fd = MODULE._open_directory_beneath(self.home, quarantine_root)
+        batch_fd = MODULE._open_directory_beneath(self.home, ticket.batch_root)
+        try:
+            MODULE._ensure_pending_terminal_validation_receipt(
+                self.home,
+                ticket,
+                ticket.batch_root,
+                batch_fd,
+                MODULE._directory_identity(quarantine_fd),
+            )
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+            MODULE._close_fd_quietly(quarantine_fd)
+
+        alias = ticket.batch_root / MODULE._pending_terminal_recovery_alias_name(0)
+        alias.unlink()
+        alias.write_text("foreign replacement\n", encoding="utf-8")
+        alias.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal recovery alias changed",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertTrue(alias.is_file())
+
+    def test_v8_legacy_terminal_receipt_without_alias_map_requires_recovery(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        quarantine_fd = MODULE._open_directory_beneath(
+            self.home,
+            ticket.batch_root.parent,
+        )
+        try:
+            quarantine_identity = MODULE._directory_identity(quarantine_fd)
+        finally:
+            MODULE._close_fd_quietly(quarantine_fd)
+        receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        MODULE._publish_atomic_exclusive_internal_file(
+            self.home,
+            receipt_path,
+            MODULE._pending_cleanup_terminal_validation_payload(
+                ticket,
+                quarantine_identity,
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "legacy terminal validation receipt lacks namespace authority; "
+            "manual recovery is required",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertTrue(receipt_path.is_file())
+
+    def test_v8_legacy_v2_terminal_receipt_without_namespace_map_requires_recovery(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        quarantine_fd = MODULE._open_directory_beneath(
+            self.home,
+            ticket.batch_root.parent,
+        )
+        batch_fd = MODULE._open_directory_beneath(self.home, ticket.batch_root)
+        try:
+            quarantine_identity = MODULE._directory_identity(quarantine_fd)
+            MODULE._ensure_pending_terminal_validation_receipt(
+                self.home,
+                ticket,
+                ticket.batch_root,
+                batch_fd,
+                quarantine_identity,
+            )
+            receipt = MODULE._read_pending_cleanup_terminal_validation(
+                self.home,
+                ticket,
+                quarantine_identity,
+            )
+            self.assertIsNotNone(receipt)
+            assert receipt is not None
+            authority = MODULE._parse_pending_terminal_validation_authority(
+                self.home,
+                ticket,
+                quarantine_identity,
+                receipt,
+            )
+            self.assertIsNotNone(authority)
+            assert authority is not None
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+            MODULE._close_fd_quietly(quarantine_fd)
+
+        receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        receipt_path.unlink()
+        MODULE._publish_atomic_exclusive_internal_file(
+            self.home,
+            receipt_path,
+            MODULE._pending_cleanup_terminal_validation_v2_payload(
+                ticket,
+                quarantine_identity,
+                authority.aliases,
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "legacy terminal validation receipt lacks namespace authority; "
+            "manual recovery is required",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertTrue(receipt_path.is_file())
+
+    def test_terminal_validation_rejects_replaced_recovery_alias_before_receipt(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        alias = ticket.batch_root / MODULE._pending_terminal_recovery_alias_name(0)
+        alias.write_text("foreign\n", encoding="utf-8")
+        alias.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal recovery alias changed",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertFalse(
+            MODULE._pending_cleanup_terminal_validation_path(
+                self.home,
+                ticket.batch_root.name,
+            ).exists()
+        )
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(alias.is_file())
+        alias.unlink()
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
+        self.assertEqual(self.target.stat().st_nlink, 1)
+
+    def test_terminal_validation_resumes_identity_bound_active_subtree(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        real_rename = MODULE._rename_noreplace_at
+        crashed = False
+
+        def crash_after_pending_directory_isolation(
+            source_fd: int,
+            source_name: str,
+            destination_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal crashed
+            real_rename(
+                source_fd,
+                source_name,
+                destination_fd,
+                destination_name,
+            )
+            if (
+                not crashed
+                and source_name == "pending"
+                and destination_name.startswith(
+                    MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+                )
+            ):
+                crashed = True
+                raise SystemExit("injected active subtree rename crash")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=crash_after_pending_directory_isolation,
+            ),
+            self.assertRaisesRegex(SystemExit, "active subtree rename crash"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(crashed)
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
+        self.assertFalse(ticket.batch_root.exists())
+        self.assertEqual(self.target.stat().st_nlink, 1)
+
+    def test_terminal_validation_rejects_replaced_active_subtree(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        real_rename = MODULE._rename_noreplace_at
+
+        def crash_after_pending_directory_isolation(
+            source_fd: int,
+            source_name: str,
+            destination_fd: int,
+            destination_name: str,
+        ) -> None:
+            real_rename(
+                source_fd,
+                source_name,
+                destination_fd,
+                destination_name,
+            )
+            if source_name == "pending" and destination_name.startswith(
+                MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+            ):
+                raise SystemExit("injected active subtree rename crash")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=crash_after_pending_directory_isolation,
+            ),
+            self.assertRaisesRegex(SystemExit, "active subtree rename crash"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        active = next(
+            path
+            for path in ticket.batch_root.iterdir()
+            if path.name.startswith(MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+            and path.is_dir()
+        )
+        displaced = self.root / "displaced-active-subtree"
+        active.rename(displaced)
+        active.mkdir(mode=0o700)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending cleanup active entry changed",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(active.is_dir())
+        self.assertTrue(displaced.is_dir())
+
+    def test_terminal_validation_rejects_unknown_active_subtree_entry(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        real_rename = MODULE._rename_noreplace_at
+
+        def crash_after_pending_directory_isolation(
+            source_fd: int,
+            source_name: str,
+            destination_fd: int,
+            destination_name: str,
+        ) -> None:
+            real_rename(
+                source_fd,
+                source_name,
+                destination_fd,
+                destination_name,
+            )
+            if source_name == "pending" and destination_name.startswith(
+                MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+            ):
+                raise SystemExit("injected active subtree rename crash")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=crash_after_pending_directory_isolation,
+            ),
+            self.assertRaisesRegex(SystemExit, "active subtree rename crash"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        active = next(
+            path
+            for path in ticket.batch_root.iterdir()
+            if path.name.startswith(MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+            and path.is_dir()
+        )
+        foreign = active / "unrecognized-foreign-evidence"
+        foreign.write_text("foreign\n", encoding="utf-8")
+        foreign.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "unknown entry",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(active.is_dir())
+        self.assertTrue(foreign.is_file())
+
     def test_cleanup_acl_query_failure_retains_terminal_batch(self) -> None:
         with (
             mock.patch.object(
@@ -363,9 +1135,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         ):
             MODULE.uninstall_overlay(self.home, "private", dry_run=False)
 
-        ticket_path = next(
-            MODULE._pending_cleanup_index_path(self.home).glob("*.json")
-        )
+        ticket_path = next(MODULE._pending_cleanup_index_path(self.home).glob("*.json"))
         ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket_path)
         self.assertIsNotNone(ticket)
         assert ticket is not None
@@ -698,9 +1468,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         before = pending_authority_snapshot(self.home)
         status_output = io.StringIO()
         with contextlib.redirect_stdout(status_output):
-            status_code = MODULE.main(
-                ["status", "--home", str(self.home), "--strict"]
-            )
+            status_code = MODULE.main(["status", "--home", str(self.home), "--strict"])
         dry_run_output = io.StringIO()
         with contextlib.redirect_stdout(dry_run_output):
             MODULE.uninstall_overlay(self.home, "private", dry_run=True)
@@ -739,9 +1507,7 @@ class RegularPendingAuthorityReadOnlyTests(unittest.TestCase):
         batch_root = MODULE._quarantine_batch_root(home, [])
         batch_identity = (batch_root.stat().st_dev, batch_root.stat().st_ino)
         if kind in {"v3", "retained"}:
-            marker_path = batch_root / Path(
-                *MODULE.PENDING_STATE_STAGING_MARKER.parts
-            )
+            marker_path = batch_root / Path(*MODULE.PENDING_STATE_STAGING_MARKER.parts)
             marker_path.parent.mkdir(parents=True, exist_ok=True)
             ticket = MODULE._mark_pending_batch_staging_cleanup_ready(
                 home,
@@ -750,9 +1516,7 @@ class RegularPendingAuthorityReadOnlyTests(unittest.TestCase):
             )
             authority = ticket.path
             if kind == "retained":
-                retained_name = next(
-                    MODULE._retained_pending_cleanup_names(authority)
-                )
+                retained_name = next(MODULE._retained_pending_cleanup_names(authority))
                 retained = authority.with_name(retained_name)
                 authority.rename(retained)
                 authority = retained
@@ -777,9 +1541,7 @@ class RegularPendingAuthorityReadOnlyTests(unittest.TestCase):
                 "finalization_marker": {
                     "phase": "after",
                     "path": MODULE.PENDING_STATE_COMMIT_MARKER.as_posix(),
-                    "parent_identity": MODULE._identity_payload(
-                        marker.parent_identity
-                    ),
+                    "parent_identity": MODULE._identity_payload(marker.parent_identity),
                     "file_identity": MODULE._identity_payload(marker.file_identity),
                     "mode": 0o600,
                     "sha256": hashlib.sha256(marker.payload or b"").hexdigest(),
