@@ -3,7 +3,7 @@ id: 20260829-rrm001
 title: Reviewer Role Regular-File Materialization
 status: active
 created: 2026-08-29
-updated: 2026-09-09
+updated: 2026-09-10
 branch: codex/daily-skill-friction-20260829-codex-personal-sync-reviewer-role-regular-install
 pr:
 supersedes: []
@@ -100,6 +100,12 @@ superseded_by:
   namespace after every control-index scan. The pre-identity construction
   window deliberately remains fail closed: without a durable object identity,
   recovery never guesses that a later inode belongs to this operation.
+- Version-6 receiptless cleanup classifies every private candidate by its
+  complete regular-file snapshot rather than `(st_dev, st_ino)` alone. A
+  same-identity content, access-policy, or link-count mismatch and every extra
+  private entry remain foreign evidence, prevent receipt publication and
+  unlink, and leave the cleanup ticket available for recovery after the
+  retained evidence is resolved.
 
 ## Next Steps
 
@@ -1041,3 +1047,22 @@ superseded_by:
   with three expected skips in 1,057.038 seconds. The remaining gates are an
   independent whole-range review and secret admission before the new
   current-head GitHub review and required checks.
+- A follow-up provider audit found that receiptless cleanup selected expected
+  private payloads by inode before validating their complete snapshot. The
+  repair now requires one unique exact snapshot and no additional private
+  evidence before receipt or deletion, with deterministic pre-receipt and
+  receipt-existing inode-reuse regressions. The complete pending-staging
+  cleanup module passed 102/102 in 101.210 seconds; the focused regressions,
+  Ruff, and `git diff --check` also passed.
+- The first frozen fresh-context review of that repair found that scanning every
+  foreign related private entry would turn the bounded inventory into excessive
+  full-content reads, that failed revalidation was being conflated with foreign
+  evidence, and that two fixtures assumed nonportable inode allocation. The
+  final repair prefilters on one recognized identity-matching candidate before
+  its complete snapshot, preserves unreadable or unstable snapshot failures as
+  independent fail-closed errors, and makes the inode-reuse fixtures allocator
+  independent. Four focused regressions and the pending-staging module passed
+  104 tests; source-lock refresh/check, Ruff, format, compilation, and complete
+  discovery then passed 1,648 tests with three expected skips in 1,482.585
+  seconds. The remaining local gate is a new frozen whole-range review before
+  remote publication.
