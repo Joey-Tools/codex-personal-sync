@@ -1943,7 +1943,10 @@ class PendingStagingCleanupTests(unittest.TestCase):
             install(self.next_release, self.home, SHA_B)
 
         terminal_ticket = self._only_cleanup_ticket()
-        self.assertEqual(terminal_ticket.version, 4)
+        self.assertEqual(
+            terminal_ticket.version,
+            MODULE.PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        )
         index_root = MODULE._pending_cleanup_index_path(self.home)
         deferred_tickets = {}
         for index in range(MODULE.MAX_PENDING_CLEANUP_BATCHES_PER_RUN):
@@ -2062,7 +2065,10 @@ class PendingStagingCleanupTests(unittest.TestCase):
             install(self.next_release, self.home, SHA_B)
 
         ticket = self._only_cleanup_ticket()
-        self.assertEqual(ticket.version, 4)
+        self.assertEqual(
+            ticket.version,
+            MODULE.PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        )
         retained_ticket = ticket.path.with_name(
             next(MODULE._retained_pending_cleanup_names(ticket.path))
         )
