@@ -12348,15 +12348,6 @@ def _require_pending_cleanup_control_link_count(
         )
 
 
-def _pending_cleanup_control_label_requires_single_link(label: str) -> bool:
-    return (
-        "pending cleanup" in label
-        or "pending quarantine allocation" in label
-        or "private-use retirement" in label
-        or "atomic internal authority" in label
-    )
-
-
 def _pending_cleanup_ticket_matches(
     actual: PendingBatchCleanupTicket,
     expected: PendingBatchCleanupTicket,
@@ -17255,6 +17246,7 @@ def _publish_atomic_exclusive_internal_file(
                 parent_fd,
                 staged,
                 label="atomic internal authority temp",
+                require_single_link=True,
             )
             os.fsync(parent_fd)
             return existing
@@ -26309,6 +26301,7 @@ def _delete_pending_quarantine_allocation_ticket(
             ticket.snapshot,
             label=f"pending quarantine allocation {ticket.batch_root.name}",
             mutation_revalidator=revalidate_ticket_and_boundary,
+            require_single_link=True,
         )
     finally:
         _close_fd_quietly(index_fd)
@@ -26376,6 +26369,7 @@ def _retire_pending_private_use_controls(
             label=f"private-use retirement receipt {batch_name}",
             maximum_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
             mutation_revalidator=require_final_receipt_boundary,
+            require_single_link=True,
         )
     finally:
         _close_fd_quietly(index_fd)
@@ -26807,9 +26801,6 @@ def _isolate_and_delete_pending_cleanup_file(
     mutation_revalidator: Callable[[str], None] | None = None,
     require_single_link: bool = False,
 ) -> None:
-    require_single_link = require_single_link or (
-        _pending_cleanup_control_label_requires_single_link(label)
-    )
     if (
         not _managed_state_snapshot_has_complete_file_evidence(expected)
         or expected.parent_identity != _directory_identity(parent_fd)
@@ -26843,6 +26834,15 @@ def _isolate_and_delete_pending_cleanup_file(
             )
         except OSError as error:
             raise SyncError(f"{label} changed before isolation") from error
+        if require_single_link and (
+            preflight_fd < 0
+            or preflight.st_nlink != 1
+            or named_preflight.st_nlink != 1
+        ):
+            raise SyncError(
+                f"{label} has an unauthorized hard-link alias: "
+                f"links={named_preflight.st_nlink!r}"
+            )
         if (
             not _regular_stat_matches_managed_state_file_snapshot(
                 preflight,
@@ -27645,6 +27645,7 @@ def _delete_pending_regular_staging_publication_guard(
             parent_fd,
             guard,
             label="pending regular staging publication guard",
+            require_single_link=True,
         )
         os.fsync(parent_fd)
     finally:
@@ -28661,6 +28662,7 @@ def _discard_incomplete_pending_cleanup_ticket(
                     index_fd,
                     snapshot,
                     label=label,
+                    require_single_link=True,
                 )
                 discarded += 1
                 if expected_snapshot is not None:
@@ -28731,6 +28733,7 @@ def _discard_incomplete_pending_cleanup_ticket(
                 index_fd,
                 restored,
                 label=label,
+                require_single_link=True,
             )
             discarded += 1
     finally:
@@ -28838,6 +28841,7 @@ def _publish_pending_cleanup_ticket(
                 index_fd,
                 staged,
                 label="pending cleanup ticket temp",
+                require_single_link=True,
             )
             return existing
         os.fsync(index_fd)
@@ -29087,6 +29091,7 @@ def _pending_staging_marker_snapshot(
         )
         if not marker.exists:
             return None
+        _require_pending_cleanup_control_link_count(marker, marker_path)
         expected_payload = _pending_staging_marker_payload(
             batch_root,
             batch_root_identity,
@@ -29727,6 +29732,7 @@ def _retire_pending_staging_cleanup_authority(
             parent_fd,
             marker,
             label="pending staging cleanup marker",
+            require_single_link=True,
         )
     finally:
         _close_fd_quietly(parent_fd)
@@ -33037,6 +33043,7 @@ def _delete_pending_cleanup_terminal_validation(
                 index_fd,
                 receipt,
                 label=label,
+                require_single_link=True,
             )
         else:
             _isolate_and_delete_pending_cleanup_file(
@@ -33046,6 +33053,7 @@ def _delete_pending_cleanup_terminal_validation(
                 receipt,
                 label=label,
                 mutation_revalidator=revalidate_mutation,
+                require_single_link=True,
             )
     finally:
         _close_fd_quietly(index_fd)
@@ -33712,6 +33720,7 @@ def _delete_pending_cleanup_empty_proof(
             proof,
             label=f"pending cleanup empty proof {ticket.batch_root.name}",
             mutation_revalidator=mutation_revalidator,
+            require_single_link=True,
         )
     finally:
         _close_fd_quietly(index_fd)
@@ -33751,6 +33760,7 @@ def _read_pending_ephemeral_metadata_snapshot(
         raise SyncError(
             f"pending ephemeral quarantine metadata changed: {ticket.batch_root.name}"
         )
+    _require_pending_cleanup_control_link_count(snapshot, path)
     _require_pending_cleanup_file_snapshot_access_policy(
         home,
         path,
@@ -35165,6 +35175,7 @@ def _remove_pending_ephemeral_quarantine_batch(
                 metadata,
                 label=f"pending ephemeral quarantine metadata {batch_name}",
                 mutation_revalidator=require_metadata_mutation_boundary,
+                require_single_link=True,
             )
         names, _retained_metadata_name = _pending_ephemeral_batch_members(
             batch_fd,
@@ -36355,6 +36366,7 @@ def _delete_pending_cleanup_ticket(
                 index_fd,
                 ticket.snapshot,
                 label=label,
+                require_single_link=True,
             )
         else:
             _isolate_and_delete_pending_cleanup_file(
@@ -36364,6 +36376,7 @@ def _delete_pending_cleanup_ticket(
                 ticket.snapshot,
                 label=label,
                 mutation_revalidator=mutation_revalidator,
+                require_single_link=True,
             )
         remaining = _read_managed_state_file_snapshot(
             home,
@@ -37128,6 +37141,7 @@ def _promote_pending_ephemeral_cleanup_ticket_temp(
                 staged,
                 label=f"published pending cleanup ticket temp {batch_name}",
                 mutation_revalidator=require_canonical_unchanged,
+                require_single_link=True,
             )
             return True
         current = _read_managed_state_file_snapshot(
@@ -37269,6 +37283,7 @@ def _promote_pending_quarantine_allocation_temp(
                 staged,
                 label=f"published pending quarantine allocation temp {batch_name}",
                 mutation_revalidator=require_canonical_unchanged,
+                require_single_link=True,
             )
             return True
         quarantine_fd = _open_directory_beneath(home, quarantine_root)
@@ -37716,6 +37731,40 @@ def _require_pending_cleanup_root_representations_absent(
         if is_batch_root:
             raise private_root_error(name, "encoded batch-root object is present")
 
+    # A batch root can be renamed to an otherwise unrecognised name after its
+    # ticket/proof is captured.  The name is not authority; rebind every
+    # root-level object by no-follow stat and reject any object whose exact
+    # identity and type still match the expected batch root.  Unreadable
+    # entries are also unresolved evidence and must keep the authority alive.
+    for name in names:
+        try:
+            metadata = os.stat(
+                name,
+                dir_fd=quarantine_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as error:
+            raise private_root_error(
+                name,
+                "object disappeared during root namespace revalidation",
+            ) from error
+        except OSError as error:
+            raise private_root_error(
+                name,
+                "object is unreadable during root namespace revalidation",
+            ) from error
+        if _pending_cleanup_entry_plan(metadata) == expected_plan:
+            validate_object(
+                name,
+                expected_plan,
+                is_batch_root=True,
+                is_internal_token=name.startswith(
+                    PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+                )
+                or name.startswith(PENDING_CLEANUP_ACTIVE_LINKS_ENTRY_PREFIX)
+                or name.startswith(PENDING_CLEANUP_RETAINED_ENTRY_PREFIX),
+            )
+
     for name in (batch_name, isolated_name):
         if name in names:
             validate_object(name, expected_plan, is_batch_root=True)
@@ -37954,6 +38003,7 @@ def _cleanup_orphan_pending_cleanup_empty_proofs(
                 proof,
                 label=f"orphan pending cleanup empty proof {batch_name}",
                 mutation_revalidator=revalidate_ticket_representations,
+                require_single_link=True,
             )
         finally:
             _close_fd_quietly(index_fd)
@@ -38178,6 +38228,7 @@ def _cleanup_orphan_pending_ephemeral_private_phases(
                     receipt,
                     label=f"orphan pending cleanup private phase {batch_name}",
                     mutation_revalidator=require_orphan_receipt_boundary,
+                    require_single_link=True,
                 )
             finally:
                 _close_fd_quietly(index_fd)

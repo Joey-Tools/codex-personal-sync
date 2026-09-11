@@ -1651,6 +1651,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             *,
             label: str,
             mutation_revalidator=None,
+            **kwargs: object,
         ) -> None:
             nonlocal tripped
             proof_root = MODULE._pending_cleanup_index_path(home)
@@ -1677,6 +1678,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
                 expected,
                 label=label,
                 mutation_revalidator=mutation_revalidator,
+                **kwargs,
             )
 
         with (
@@ -1839,6 +1841,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             label: str,
             maximum_bytes: int = MODULE.MAX_MANAGED_STATE_BYTES,
             mutation_revalidator=None,
+            **kwargs: object,
         ) -> None:
             nonlocal injected
             if (
@@ -1856,6 +1859,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
                 label=label,
                 maximum_bytes=maximum_bytes,
                 mutation_revalidator=mutation_revalidator,
+                **kwargs,
             )
 
         with (
@@ -2338,6 +2342,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             *,
             label: str,
             mutation_revalidator=None,
+            **kwargs: object,
         ) -> None:
             nonlocal tripped
             if not tripped and path.name.endswith(
@@ -2360,6 +2365,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
                 expected,
                 label=label,
                 mutation_revalidator=mutation_revalidator,
+                **kwargs,
             )
 
         with (

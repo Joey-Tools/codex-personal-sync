@@ -859,7 +859,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
             self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
 
-        self.assertIn("missing without an exact empty proof", stdout.getvalue())
+        self.assertIn("still has a batch root", stdout.getvalue())
         self.assertTrue(ticket.path.is_file())
         self.assertTrue(moved_batch.is_dir())
         self.assertEqual(self.target.stat().st_nlink, 2)
@@ -903,6 +903,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
             expected,
             *,
             label: str,
+            **kwargs: object,
         ) -> None:
             if label == "pending staging cleanup marker":
                 raise MODULE.SyncError("injected staging marker retention")
@@ -912,6 +913,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 parent_fd,
                 expected,
                 label=label,
+                **kwargs,
             )
 
         with (
@@ -958,6 +960,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
             expected,
             *,
             label: str,
+            **kwargs: object,
         ) -> None:
             if path == ticket.path:
                 retained = next(MODULE._retained_pending_cleanup_names(path))
@@ -975,6 +978,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 parent_fd,
                 expected,
                 label=label,
+                **kwargs,
             )
 
         with (
@@ -1026,6 +1030,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
             expected,
             *,
             label: str,
+            **kwargs: object,
         ) -> None:
             if path == temp_path:
                 retained = next(MODULE._retained_pending_cleanup_names(path))
@@ -1037,7 +1042,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 )
                 os.fsync(parent_fd)
                 raise SystemExit("injected temp tombstone crash")
-            real_delete(home, path, parent_fd, expected, label=label)
+            real_delete(home, path, parent_fd, expected, label=label, **kwargs)
 
         with (
             mock.patch.object(
@@ -2371,6 +2376,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
             *,
             label: str,
             mutation_revalidator=None,
+            **kwargs: object,
         ) -> None:
             self.assertEqual(path, orphan_path)
             self.assertIn(orphan_batch, label)
@@ -3411,6 +3417,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     label: str,
                     maximum_bytes: int = MODULE.MAX_MANAGED_STATE_BYTES,
                     mutation_revalidator=None,
+                    **kwargs: object,
                 ) -> None:
                     nonlocal mutated_identity, mutated_payload
                     if path == temp_path and mutated_identity is None:
@@ -3447,6 +3454,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
                         label=label,
                         maximum_bytes=maximum_bytes,
                         mutation_revalidator=mutation_revalidator,
+                        **kwargs,
                     )
 
                 with (
@@ -3520,6 +3528,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
             label: str,
             maximum_bytes: int = MODULE.MAX_MANAGED_STATE_BYTES,
             mutation_revalidator=None,
+            **kwargs: object,
         ) -> None:
             nonlocal disappeared
             if path == temp_path and not disappeared:
@@ -3533,6 +3542,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 label=label,
                 maximum_bytes=maximum_bytes,
                 mutation_revalidator=mutation_revalidator,
+                **kwargs,
             )
 
         with (
@@ -5764,6 +5774,121 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     (recreated_root / "foreign").read_bytes(),
                     b"foreign batch evidence\n",
                 )
+
+    def test_orphan_v3_proof_rejects_nonempty_root_renamed_to_unknown_name(
+        self,
+    ) -> None:
+        case_home = self.root / "ephemeral-v5-proof-renamed-root"
+        install(self.first_release, case_home, SHA_A)
+        ticket = self._make_v5_empty_ticket(
+            case_home,
+            case_home / ROLE_TARGET,
+        )
+        quarantine_root = ticket.batch_root.parent
+        quarantine_root_identity = (
+            quarantine_root.stat().st_dev,
+            quarantine_root.stat().st_ino,
+        )
+        authority = MODULE._pending_cleanup_empty_proof_authority_from_ticket(
+            ticket,
+            quarantine_root_identity,
+        )
+        renamed_root = quarantine_root / "renamed-root-with-live-content"
+        ticket.batch_root.rename(renamed_root)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "empty proof still has a batch root",
+        ):
+            MODULE._require_pending_cleanup_proof_batch_roots_absent(
+                case_home,
+                authority,
+            )
+
+        self.assertTrue((renamed_root / "metadata.json").is_file())
+        self.assertEqual(
+            (renamed_root.stat().st_dev, renamed_root.stat().st_ino),
+            ticket.batch_root_identity,
+        )
+
+    def test_pending_staging_marker_reader_rejects_external_hardlink(self) -> None:
+        case_home = self.root / "staging-marker-hardlink"
+        case_home.mkdir()
+        quarantine_root = (
+            MODULE._personal_sync_root(case_home)
+            / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        state_root = quarantine_root / "20260911T000000Z-1-9" / "pending" / "state"
+        state_root.mkdir(parents=True, mode=0o700)
+        for path in (quarantine_root, state_root.parent, state_root):
+            path.chmod(0o700)
+        batch_root = state_root.parent.parent
+        batch_identity = (batch_root.stat().st_dev, batch_root.stat().st_ino)
+        marker_path = state_root / MODULE.PENDING_STATE_STAGING_MARKER.name
+        MODULE._publish_atomic_exclusive_internal_file(
+            case_home,
+            marker_path,
+            MODULE._pending_staging_marker_payload(batch_root, batch_identity),
+        )
+        alias = state_root / "marker-alias"
+        os.link(marker_path, alias)
+
+        with self.assertRaisesRegex(MODULE.SyncError, "unauthorized hard-link alias"):
+            MODULE._pending_staging_marker_snapshot(
+                case_home,
+                batch_root,
+                batch_identity,
+            )
+
+    def test_pending_ephemeral_metadata_reader_rejects_external_hardlink(self) -> None:
+        case_home = self.root / "ephemeral-metadata-hardlink"
+        install(self.first_release, case_home, SHA_A)
+        ticket = self._make_v5_empty_ticket(
+            case_home,
+            case_home / ROLE_TARGET,
+        )
+        metadata_path = ticket.batch_root / "metadata.json"
+        alias = ticket.batch_root / "metadata-alias"
+        os.link(metadata_path, alias)
+        batch_fd = MODULE._open_directory_beneath(case_home, ticket.batch_root)
+        try:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "unauthorized hard-link alias",
+            ):
+                MODULE._read_pending_ephemeral_metadata_snapshot(
+                    case_home,
+                    ticket,
+                    ticket.batch_root,
+                    batch_fd,
+                    "metadata.json",
+                )
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+
+    def test_pending_regular_staging_guard_delete_rejects_external_hardlink(
+        self,
+    ) -> None:
+        case_home = self.root / "regular-staging-guard-hardlink"
+        case_home.mkdir()
+        guard_path = case_home / "staging-publication.guard"
+        guard = MODULE._write_exclusive_internal_file(
+            case_home,
+            guard_path,
+            b"staging publication guard\n",
+        )
+        alias = case_home / "staging-publication.guard.alias"
+        os.link(guard_path, alias)
+
+        with self.assertRaisesRegex(MODULE.SyncError, "unauthorized hard-link alias"):
+            MODULE._delete_pending_regular_staging_publication_guard(
+                case_home,
+                guard_path,
+                guard,
+            )
+
+        self.assertTrue(guard_path.is_file())
+        self.assertTrue(alias.is_file())
 
     def test_orphan_v3_proof_final_unlink_rechecks_batch_root_absence(self) -> None:
         case_home = self.root / "ephemeral-v5-orphan-proof-batch-replay"
