@@ -2323,6 +2323,66 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
         return ticket
 
+    def _prepare_pointerless_generic_v2_ticket(
+        self,
+        release_name: str,
+    ) -> MODULE.PendingBatchCleanupTicket:
+        symlink_release = self.root / release_name
+        write_release(symlink_release)
+        with (
+            mock.patch.object(
+                MODULE,
+                "_publish_pending_commit_marker",
+                side_effect=MODULE.SyncError("injected precommit crash"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_rollback_reconcile_transaction",
+                side_effect=MODULE.SyncError("injected hard rollback crash"),
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "rollback was incomplete"),
+        ):
+            install(symlink_release, self.home, SHA_A)
+        batch = MODULE._load_pending_link_batch(self.home)
+        self.assertIsNotNone(batch)
+        assert batch is not None
+        write_legacy_generic_terminal_ticket(self.home, batch, phase="before")
+        os.unlink(MODULE._pending_link_pointer_path(self.home))
+        ticket_path = MODULE._pending_cleanup_ticket_path(
+            self.home,
+            batch.batch_root.name,
+        )
+        ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket_path)
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertEqual(ticket.version, 2)
+        return ticket
+
+    def _isolate_pending_root_as_cleanup_walker(
+        self,
+        ticket: MODULE.PendingBatchCleanupTicket,
+    ) -> Path:
+        batch_fd = MODULE._open_directory_beneath(self.home, ticket.batch_root)
+        try:
+            batch_identity = MODULE._directory_identity(batch_fd)
+            pending = os.stat("pending", dir_fd=batch_fd, follow_symlinks=False)
+            planned = MODULE._pending_cleanup_entry_plan(pending)
+            active_name, active = MODULE._isolate_pending_cleanup_entry(
+                batch_fd,
+                "pending",
+                batch_identity,
+                planned,
+                relative_parts=(),
+            )
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+        self.assertEqual(MODULE._pending_cleanup_entry_plan(active), planned)
+        self.assertEqual(
+            MODULE._pending_cleanup_active_entry_binding(active_name, batch_identity),
+            (planned, "pending"),
+        )
+        return ticket.batch_root / active_name
+
     def _prepare_pointerless_legacy_generic_regular_ticket(
         self,
         *,
@@ -2754,6 +2814,192 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
             list(MODULE._pending_cleanup_index_path(self.home).glob("*.json")),
             [],
         )
+
+    def test_legacy_generic_retry_restores_active_pending_root(self) -> None:
+        for version in (1, 2):
+            with self.subTest(version=version):
+                self.home = self.root / f"home-active-pending-v{version}"
+                ticket = (
+                    self._prepare_pointerless_generic_v1_ticket(
+                        f"active-pending-v{version}-release"
+                    )
+                    if version == 1
+                    else self._prepare_pointerless_generic_v2_ticket(
+                        f"active-pending-v{version}-release"
+                    )
+                )
+                metadata_path = (
+                    ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+                )
+                active_pending = self._isolate_pending_root_as_cleanup_walker(ticket)
+
+                self.assertTrue(metadata_path.is_file())
+                self.assertFalse((ticket.batch_root / "pending").exists())
+                self.assertTrue(active_pending.is_dir())
+
+                self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+                MODULE._require_no_pending_terminal_mutation_authority(self.home)
+
+                self.assertFalse(ticket.path.exists())
+                self.assertFalse(ticket.batch_root.exists())
+                followup_release = self.root / f"active-pending-v{version}-followup"
+                write_release(followup_release)
+                install(followup_release, self.home, SHA_B)
+
+    def test_legacy_generic_mutation_gate_restores_active_pending_root(self) -> None:
+        for version in (1, 2):
+            with self.subTest(version=version):
+                self.home = self.root / f"home-active-gate-v{version}"
+                ticket = (
+                    self._prepare_pointerless_generic_v1_ticket(
+                        f"active-gate-v{version}-release"
+                    )
+                    if version == 1
+                    else self._prepare_pointerless_generic_v2_ticket(
+                        f"active-gate-v{version}-release"
+                    )
+                )
+                active_pending = self._isolate_pending_root_as_cleanup_walker(ticket)
+                metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+                metadata_before = metadata_path.read_bytes()
+                metadata_identity = (
+                    metadata_path.stat().st_dev,
+                    metadata_path.stat().st_ino,
+                )
+                pending_tree_before = {
+                    path.relative_to(active_pending): (
+                        os.lstat(path).st_dev,
+                        os.lstat(path).st_ino,
+                        stat.S_IFMT(os.lstat(path).st_mode),
+                        os.lstat(path).st_size,
+                    )
+                    for path in active_pending.rglob("*")
+                }
+
+                MODULE._require_no_pending_terminal_mutation_authority(self.home)
+
+                self.assertFalse(active_pending.exists())
+                restored_pending = ticket.batch_root / "pending"
+                self.assertTrue(restored_pending.is_dir())
+                self.assertTrue(ticket.path.is_file())
+                self.assertEqual(metadata_path.read_bytes(), metadata_before)
+                self.assertEqual(
+                    (metadata_path.stat().st_dev, metadata_path.stat().st_ino),
+                    metadata_identity,
+                )
+                self.assertEqual(
+                    {
+                        path.relative_to(restored_pending): (
+                            os.lstat(path).st_dev,
+                            os.lstat(path).st_ino,
+                            stat.S_IFMT(os.lstat(path).st_mode),
+                            os.lstat(path).st_size,
+                        )
+                        for path in restored_pending.rglob("*")
+                    },
+                    pending_tree_before,
+                )
+                self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+
+    def test_active_pending_restore_preserves_legacy_terminal_fence(self) -> None:
+        for phase in ("after", "before"):
+            with self.subTest(phase=phase):
+                self.home = self.root / f"home-active-terminal-{phase}"
+                ticket = self._prepare_pointerless_legacy_generic_regular_ticket(
+                    phase=phase
+                )
+                active_pending = self._isolate_pending_root_as_cleanup_walker(ticket)
+
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "complete terminal regular hard-link group",
+                ):
+                    MODULE._cleanup_ready_pending_batches(self.home)
+
+                self.assertFalse(active_pending.exists())
+                self.assertTrue((ticket.batch_root / "pending").is_dir())
+                self.assertTrue(ticket.path.is_file())
+
+    def test_missing_pending_without_v2_token_remains_blocking(self) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "missing-pending-without-token-release"
+        )
+        pending_root = ticket.batch_root / "pending"
+        unbound_root = ticket.batch_root / "unbound-pending"
+        os.rename(pending_root, unbound_root)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal regular-file validation was retained",
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertFalse(pending_root.exists())
+        self.assertTrue(unbound_root.is_dir())
+        self.assertTrue(ticket.path.is_file())
+
+    def test_multiple_active_pending_tokens_remain_blocking(self) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "multiple-active-pending-release"
+        )
+        first_active = self._isolate_pending_root_as_cleanup_walker(ticket)
+        batch_fd = MODULE._open_directory_beneath(self.home, ticket.batch_root)
+        try:
+            batch_identity = MODULE._directory_identity(batch_fd)
+            os.mkdir("second-pending", mode=0o700, dir_fd=batch_fd)
+            second = os.stat(
+                "second-pending",
+                dir_fd=batch_fd,
+                follow_symlinks=False,
+            )
+            second_plan = MODULE._pending_cleanup_entry_plan(second)
+            second_name = MODULE._pending_cleanup_active_entry_name(
+                batch_fd,
+                batch_identity,
+                second_plan,
+                "pending",
+            )
+            MODULE._rename_noreplace_at(
+                batch_fd,
+                "second-pending",
+                batch_fd,
+                second_name,
+            )
+            os.fsync(batch_fd)
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+        second_active = ticket.batch_root / second_name
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal regular-file validation was retained",
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertFalse((ticket.batch_root / "pending").exists())
+        self.assertTrue(first_active.is_dir())
+        self.assertTrue(second_active.is_dir())
+        self.assertTrue(ticket.path.is_file())
+
+    def test_replaced_active_pending_token_remains_blocking(self) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "replaced-active-pending-release"
+        )
+        active_pending = self._isolate_pending_root_as_cleanup_walker(ticket)
+        displaced_pending = ticket.batch_root / "displaced-pending"
+        os.rename(active_pending, displaced_pending)
+        active_pending.mkdir(mode=0o700)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal regular-file validation was retained",
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertFalse((ticket.batch_root / "pending").exists())
+        self.assertTrue(active_pending.is_dir())
+        self.assertTrue(displaced_pending.is_dir())
+        self.assertTrue(ticket.path.is_file())
 
     def test_pointerless_generic_ticket_with_missing_marker_is_retained(
         self,

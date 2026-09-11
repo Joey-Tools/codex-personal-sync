@@ -33591,6 +33591,182 @@ def _remove_pending_ephemeral_quarantine_batch(
     return True
 
 
+def _restore_legacy_generic_cleanup_active_pending_root(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    bound_batch_root: Path,
+    batch_fd: int,
+    metadata: ManagedStateFileSnapshot,
+) -> None:
+    """Restore one ticket-bound v2 ``pending`` token for legacy parsing.
+
+    The cleanup walker durably renames a child before deleting its subtree.  A
+    crash at that boundary can therefore leave the legacy metadata in place
+    while its canonical ``pending`` directory has the self-described v2 active
+    name.  Recover only an unambiguous token whose parent and object identity,
+    directory type, mount, and access policy still match.  The full metadata,
+    marker, and terminal-authority parser runs after this admission and remains
+    responsible for authorizing any deletion.
+    """
+    if ticket.version not in {1, 2} or bound_batch_root != ticket.batch_root:
+        return
+
+    def require_batch_boundary() -> None:
+        if (
+            _directory_identity(batch_fd) != ticket.batch_root_identity
+            or not _bound_directory_matches(home, bound_batch_root, batch_fd)
+        ):
+            raise SyncError("legacy generic pending cleanup batch changed")
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd,
+            bound_batch_root,
+            expected_mode=0o700,
+        )
+
+    def require_metadata_boundary() -> None:
+        current_metadata = _read_managed_state_file_snapshot(
+            home,
+            bound_batch_root / PENDING_LINK_METADATA_NAME,
+            batch_fd,
+            expected_identity=metadata.file_identity,
+        )
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            current_metadata,
+            metadata,
+        ):
+            raise SyncError("legacy generic pending cleanup metadata changed")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            bound_batch_root / PENDING_LINK_METADATA_NAME,
+            batch_fd,
+            current_metadata,
+        )
+
+    def require_ticket_boundary() -> None:
+        current_ticket = _read_pending_cleanup_ticket(
+            home,
+            ticket.path,
+            expected_ticket_identity=ticket.snapshot.file_identity,
+        )
+        if current_ticket is None or not _pending_cleanup_ticket_matches(
+            current_ticket,
+            ticket,
+        ):
+            raise SyncError("legacy generic pending cleanup ticket changed")
+
+    require_batch_boundary()
+    batch_identity = ticket.batch_root_identity
+    names = _directory_member_names(
+        batch_fd,
+        maximum_entries=MAX_PENDING_CLEANUP_ENTRIES,
+        overflow_message="legacy generic pending cleanup batch exceeds the size limit",
+    )
+    active_candidates: list[tuple[str, tuple[int, int, int]]] = []
+    for name in names:
+        active_binding = _pending_cleanup_active_entry_binding(name, batch_identity)
+        if active_binding is None or active_binding[1] != "pending":
+            continue
+        active_candidates.append((name, active_binding[0]))
+    canonical_identity = _named_entry_identity(batch_fd, "pending")
+    if canonical_identity is not None:
+        if active_candidates:
+            raise SyncError(
+                "legacy generic pending cleanup has ambiguous pending roots"
+            )
+        return
+    if not active_candidates:
+        return
+    if len(active_candidates) != 1:
+        raise SyncError("legacy generic pending cleanup has ambiguous pending roots")
+    active_name, planned = active_candidates[0]
+    if planned[2] != stat.S_IFDIR:
+        raise SyncError("legacy generic pending cleanup active root is not a directory")
+    active_fd = -1
+    restored_fd = -1
+    try:
+        active_fd = os.open(
+            active_name,
+            _directory_open_flags(nofollow=True),
+            dir_fd=batch_fd,
+        )
+        active_snapshot = _require_pending_cleanup_fd_access_policy(
+            active_fd,
+            bound_batch_root / active_name,
+            expected_mode=0o700,
+        )
+        if _pending_cleanup_entry_plan(active_snapshot) != planned:
+            raise SyncError("legacy generic pending cleanup active root changed")
+        if _directory_mount_identity(active_fd) != _directory_mount_identity(batch_fd):
+            raise SyncError(
+                "legacy generic pending cleanup active root crosses a mount boundary"
+            )
+        require_batch_boundary()
+        named_active = os.stat(
+            active_name,
+            dir_fd=batch_fd,
+            follow_symlinks=False,
+        )
+        if (
+            _pending_cleanup_entry_plan(named_active) != planned
+            or (named_active.st_dev, named_active.st_ino)
+            != _directory_identity(active_fd)
+            or stat.S_IMODE(named_active.st_mode)
+            != stat.S_IMODE(active_snapshot.st_mode)
+            or named_active.st_uid != active_snapshot.st_uid
+            or named_active.st_gid != active_snapshot.st_gid
+        ):
+            raise SyncError("legacy generic pending cleanup active root changed")
+        if _named_entry_identity(batch_fd, "pending") is not None:
+            raise SyncError(
+                "legacy generic pending cleanup has ambiguous pending roots"
+            )
+        require_metadata_boundary()
+        require_ticket_boundary()
+        require_batch_boundary()
+        _rename_noreplace_at(
+            batch_fd,
+            active_name,
+            batch_fd,
+            "pending",
+        )
+        os.fsync(batch_fd)
+        restored_fd = os.open(
+            "pending",
+            _directory_open_flags(nofollow=True),
+            dir_fd=batch_fd,
+        )
+        restored_snapshot = _require_pending_cleanup_fd_access_policy(
+            restored_fd,
+            bound_batch_root / "pending",
+            expected_mode=0o700,
+        )
+        named_restored = os.stat(
+            "pending",
+            dir_fd=batch_fd,
+            follow_symlinks=False,
+        )
+        if (
+            _pending_cleanup_entry_plan(restored_snapshot) != planned
+            or _pending_cleanup_entry_plan(named_restored) != planned
+            or (named_restored.st_dev, named_restored.st_ino)
+            != _directory_identity(restored_fd)
+            or _directory_identity(active_fd) != planned[:2]
+            or not _bound_directory_matches(
+                home,
+                bound_batch_root / "pending",
+                restored_fd,
+            )
+            or _named_entry_identity(batch_fd, active_name) is not None
+        ):
+            raise SyncError("legacy generic pending cleanup restored root changed")
+        require_batch_boundary()
+        require_metadata_boundary()
+        require_ticket_boundary()
+    finally:
+        _close_fd_quietly(restored_fd)
+        _close_fd_quietly(active_fd)
+
+
 def _require_legacy_generic_cleanup_ticket_is_nonterminal(
     home: Path,
     ticket: PendingBatchCleanupTicket,
@@ -33662,13 +33838,25 @@ def _require_legacy_generic_cleanup_ticket_is_nonterminal(
     except (OSError, SyncError) as error:
         raise manual_recovery_error(str(error)) from error
     try:
-        data, _metadata_version, _batch_name = (
+        data, _metadata_version, metadata_batch_name = (
             _parse_pending_link_batch_schema_envelope(home, metadata.payload)
         )
     except SyncError:
         # Captured bytes rejected without any mutable filesystem observation.
         # This is the sole compatible generic-cleanup case.
         return
+    if metadata_batch_name != ticket.batch_root.name:
+        raise manual_recovery_error("metadata batch binding changed")
+    try:
+        _restore_legacy_generic_cleanup_active_pending_root(
+            home,
+            ticket,
+            bound_batch_root,
+            batch_fd,
+            metadata,
+        )
+    except (OSError, SyncError) as error:
+        raise manual_recovery_error(str(error)) from error
     declared_paths: list[object] = [PENDING_STATE_COMMIT_MARKER.as_posix()]
     for state_key in ("state_before", "state_after", "commit_evidence"):
         raw_state = data.get(state_key)
