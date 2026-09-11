@@ -490,6 +490,52 @@ class PendingStagingCleanupTests(unittest.TestCase):
         self.assertEqual(ticket.version, version)
         return ticket
 
+    def test_terminal_empty_proof_capacity_is_preflighted_before_cleanup_mutation(
+        self,
+    ) -> None:
+        ticket = self._publish_legacy_cleanup_ticket(version=4)
+        original_batch_identity = (
+            ticket.batch_root.stat().st_dev,
+            ticket.batch_root.stat().st_ino,
+        )
+        original_members = tuple(sorted(path.name for path in ticket.batch_root.iterdir()))
+        isolated_root = ticket.batch_root.with_name(
+            MODULE._pending_cleanup_isolated_batch_name(ticket.batch_root.name)
+        )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_pending_cleanup_empty_proof_payload",
+                side_effect=MODULE.SyncError(
+                    "pending cleanup empty proof exceeds the size limit"
+                ),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                wraps=MODULE._remove_pending_batch_directory_contents,
+            ) as remove_contents,
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup empty proof exceeds the size limit",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertEqual(
+            (ticket.batch_root.stat().st_dev, ticket.batch_root.stat().st_ino),
+            original_batch_identity,
+        )
+        self.assertEqual(
+            tuple(sorted(path.name for path in ticket.batch_root.iterdir())),
+            original_members,
+        )
+        self.assertFalse(os.path.lexists(isolated_root))
+        remove_contents.assert_not_called()
+
     def _stage_legacy_symlink_pointer(self, metadata_version: int):
         legacy_home = self.root / f"legacy-home-v{metadata_version}"
         first_release = self.root / f"legacy-first-v{metadata_version}"
@@ -5522,6 +5568,167 @@ class PendingStagingCleanupTests(unittest.TestCase):
             1,
         )
         self.assertFalse(proof_path.exists())
+
+    def test_orphan_empty_proof_blocks_mutation_after_cleanup_budget_exhaustion(
+        self,
+    ) -> None:
+        case_home = self.root / "ephemeral-v5-orphan-proof-mutation-fence"
+        install(self.first_release, case_home, SHA_A)
+        ticket = self._make_v5_empty_ticket(case_home, case_home / ROLE_TARGET)
+        proof_path = MODULE._pending_cleanup_empty_proof_path(
+            case_home,
+            ticket.batch_root.name,
+        )
+        with mock.patch.object(
+            MODULE,
+            "_delete_pending_cleanup_empty_proof",
+            return_value=None,
+        ):
+            self.assertTrue(MODULE._remove_cleanup_ready_batch(case_home, ticket))
+
+        exhausted_budget = MODULE.PendingCleanupActionBudget(0)
+        self.assertEqual(
+            MODULE._cleanup_ready_pending_batches(
+                case_home,
+                budget=exhausted_budget,
+            ),
+            0,
+        )
+        self.assertTrue(proof_path.is_file())
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "empty-proof authority must be reconciled",
+        ):
+            MODULE._require_no_pending_terminal_mutation_authority(case_home)
+
+        retained_path = proof_path.with_name(
+            next(MODULE._retained_pending_cleanup_names(proof_path))
+        )
+        proof_path.rename(retained_path)
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "retained pending cleanup authority must be reconciled",
+        ):
+            MODULE._require_no_pending_terminal_mutation_authority(case_home)
+
+        self.assertFalse(proof_path.exists())
+        self.assertTrue(retained_path.is_file())
+
+    def test_empty_proof_publish_temps_do_not_block_mutation(self) -> None:
+        case_home = self.root / "empty-proof-publish-temp-mutation-fence"
+        install(self.first_release, case_home, SHA_A)
+        index_root = MODULE._pending_cleanup_index_path(case_home)
+        index_fd = MODULE._open_or_create_directory_beneath(
+            case_home,
+            index_root,
+            mode=0o700,
+        )
+        MODULE._close_fd_quietly(index_fd)
+        temp_path = index_root / (
+            "20260911T000000Z-1-0"
+            + MODULE.PENDING_CLEANUP_EMPTY_PROOF_SUFFIX
+            + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+        )
+        temp_path.write_bytes(b"unpublished empty-proof staging bytes\n")
+        temp_path.chmod(0o600)
+
+        MODULE._require_no_pending_terminal_mutation_authority(case_home)
+
+        retained_temp = temp_path.with_name(
+            next(MODULE._retained_pending_cleanup_names(temp_path))
+        )
+        temp_path.rename(retained_temp)
+        MODULE._require_no_pending_terminal_mutation_authority(case_home)
+
+        self.assertFalse(temp_path.exists())
+        self.assertTrue(retained_temp.is_file())
+
+    def test_orphan_v3_proof_final_root_snapshot_rejects_recreated_roots(
+        self,
+    ) -> None:
+        for representation in ("canonical", "isolated"):
+            with self.subTest(representation=representation):
+                case_home = self.root / f"ephemeral-v5-proof-root-{representation}"
+                install(self.first_release, case_home, SHA_A)
+                ticket = self._make_v5_empty_ticket(
+                    case_home,
+                    case_home / ROLE_TARGET,
+                )
+                proof_path = MODULE._pending_cleanup_empty_proof_path(
+                    case_home,
+                    ticket.batch_root.name,
+                )
+                with mock.patch.object(
+                    MODULE,
+                    "_delete_pending_cleanup_empty_proof",
+                    return_value=None,
+                ):
+                    self.assertTrue(
+                        MODULE._remove_cleanup_ready_batch(case_home, ticket)
+                    )
+
+                authority = MODULE._parse_pending_cleanup_empty_proof_authority(
+                    proof_path,
+                    proof_path.read_bytes(),
+                )
+                quarantine_root = (
+                    MODULE._personal_sync_root(case_home)
+                    / MODULE.QUARANTINE_RELATIVE_PATH
+                )
+                recreated_root = (
+                    ticket.batch_root
+                    if representation == "canonical"
+                    else ticket.batch_root.with_name(authority.isolated_name)
+                )
+                real_policy = MODULE._require_pending_cleanup_fd_access_policy
+                policy_calls = 0
+                injected = False
+
+                def recreate_root_after_final_policy(
+                    file_descriptor: int,
+                    display_path: Path,
+                    *,
+                    expected_mode: int,
+                ):
+                    nonlocal policy_calls, injected
+                    result = real_policy(
+                        file_descriptor,
+                        display_path,
+                        expected_mode=expected_mode,
+                    )
+                    self.assertEqual(display_path, quarantine_root)
+                    policy_calls += 1
+                    if policy_calls == 2:
+                        recreated_root.mkdir(mode=0o700)
+                        protected = recreated_root / "foreign"
+                        protected.write_bytes(b"foreign batch evidence\n")
+                        protected.chmod(0o600)
+                        injected = True
+                    return result
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_require_pending_cleanup_fd_access_policy",
+                        side_effect=recreate_root_after_final_policy,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "empty proof still has a batch root",
+                    ),
+                ):
+                    MODULE._require_pending_cleanup_proof_batch_roots_absent(
+                        case_home,
+                        authority,
+                    )
+
+                self.assertTrue(injected)
+                self.assertEqual(policy_calls, 2)
+                self.assertTrue(recreated_root.is_dir())
+                self.assertEqual(
+                    (recreated_root / "foreign").read_bytes(),
+                    b"foreign batch evidence\n",
+                )
 
     def test_orphan_v3_proof_final_unlink_rechecks_batch_root_absence(self) -> None:
         case_home = self.root / "ephemeral-v5-orphan-proof-batch-replay"

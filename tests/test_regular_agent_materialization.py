@@ -8006,6 +8006,102 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
             [ROLE_TARGET.as_posix()],
         )
 
+    def test_v3_empty_proof_uses_terminal_capacity_for_full_target_groups(
+        self,
+    ) -> None:
+        batch_name = "20260911T000000Z-1-01"
+        authority = MODULE.PendingCleanupEmptyProofAuthority(
+            version=3,
+            batch_name=batch_name,
+            batch_root_identity=(1, 2),
+            quarantine_root_identity=(3, 4),
+            isolated_name=MODULE._pending_cleanup_isolated_batch_name(batch_name),
+            ticket_identity=(5, 6),
+            ticket_sha256="a" * 64,
+            terminal_regular_targets=tuple(
+                MODULE.PendingRegularTargetExpectation(
+                    target=PurePosixPath("skills", f"x{index:04d}"),
+                    parent_identity=(7, index + 1),
+                    file_identity=(8, index + 1),
+                    sha256="b" * 64,
+                    size=1,
+                    mode=0o600,
+                    uid=os.geteuid(),
+                    link_count=None,
+                )
+                for index in range(13)
+            ),
+            source_ticket_version=MODULE.PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        )
+
+        payload = MODULE._pending_cleanup_empty_proof_payload_from_authority(
+            authority
+        )
+
+        self.assertGreater(len(payload), MODULE.MAX_PENDING_CLEANUP_TICKET_BYTES)
+        self.assertLessEqual(
+            len(payload),
+            MODULE.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+        )
+        self.assertEqual(
+            MODULE._parse_pending_cleanup_empty_proof_authority(
+                Path(batch_name + MODULE.PENDING_CLEANUP_EMPTY_PROOF_SUFFIX),
+                payload,
+            ),
+            authority,
+        )
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending cleanup empty proof exceeds the size limit",
+        ):
+            MODULE._pending_cleanup_empty_proof_payload_from_authority(
+                replace(authority, version=2, source_ticket_version=None)
+            )
+
+    def test_metadata_capacity_preflights_projected_empty_proof(self) -> None:
+        state = MODULE.ManagedState(
+            owners={MODULE.PUBLIC_OWNER: SHA_A},
+            links={
+                ROLE_TARGET: MODULE.ManagedLinkRecord(
+                    source=PurePosixPath("personal_codex/agents/reviewer.toml"),
+                    target=ROLE_TARGET,
+                    kind="file",
+                    owner=MODULE.PUBLIC_OWNER,
+                    link_target="releases/" + SHA_A,
+                    release_sha=SHA_A,
+                )
+            },
+        )
+        capacity = MODULE.PendingLinkCapacityPlan(
+            ordered_groups=(),
+            flattened_actions=(),
+            retired_absence_specs=(),
+        )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_validate_pending_terminal_validation_receipt_capacity",
+            ),
+            mock.patch.object(
+                MODULE,
+                "MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES",
+                1,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup empty proof exceeds the size limit",
+            ),
+        ):
+            MODULE._validate_pending_link_metadata_capacity(
+                self.home,
+                capacity,
+                MODULE.ManagedStateFileSnapshot(exists=True),
+                state,
+                state,
+                state,
+            )
+
     def test_rollback_terminal_receipt_directory_capacity_boundary(self) -> None:
         # With the shortest distinct depth-64 paths in this fixture, 1,263 is
         # the last complete v3 receipt below 16 MiB; the next target crosses

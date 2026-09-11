@@ -21912,6 +21912,46 @@ def _projected_pending_terminal_regular_payloads(
     ]
 
 
+def _projected_pending_cleanup_empty_proof_authority(
+    state: ManagedState,
+) -> PendingCleanupEmptyProofAuthority:
+    """Build the conservative v3 proof envelope for one terminal state."""
+    return PendingCleanupEmptyProofAuthority(
+        version=3,
+        batch_name=_MAX_PENDING_BATCH_NAME,
+        batch_root_identity=_MAX_PENDING_IDENTITY,
+        quarantine_root_identity=_MAX_PENDING_IDENTITY,
+        isolated_name=_pending_cleanup_isolated_batch_name(_MAX_PENDING_BATCH_NAME),
+        ticket_identity=_MAX_PENDING_IDENTITY,
+        ticket_sha256=_MAX_PENDING_DIGEST,
+        terminal_regular_targets=tuple(
+            PendingRegularTargetExpectation(
+                target=target,
+                parent_identity=_MAX_PENDING_IDENTITY,
+                file_identity=_MAX_PENDING_IDENTITY,
+                sha256=_MAX_PENDING_DIGEST,
+                size=MAX_ARCHIVE_MEMBER_BYTES,
+                mode=0o600,
+                uid=_MAX_PENDING_IDENTITY[0],
+                link_count=None,
+            )
+            for target, record in sorted(
+                state.links.items(),
+                key=lambda item: item[0].as_posix(),
+            )
+            if _record_materializes_regular_file(record)
+        ),
+        source_ticket_version=PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+    )
+
+
+def _validate_pending_cleanup_empty_proof_capacity(state: ManagedState) -> None:
+    """Reject a transaction before it can need an unpublishable v3 proof."""
+    _pending_cleanup_empty_proof_payload_from_authority(
+        _projected_pending_cleanup_empty_proof_authority(state)
+    )
+
+
 def _projected_pending_terminal_validation_alias_paths(
     home: Path,
     capacity: PendingLinkCapacityPlan,
@@ -22682,6 +22722,8 @@ def _validate_pending_link_metadata_capacity(
         state_after_value,
         phase="after",
     )
+    _validate_pending_cleanup_empty_proof_capacity(state_before_value)
+    _validate_pending_cleanup_empty_proof_capacity(state_after_value)
     records: list[dict[str, Any]] = []
     record_actions: dict[tuple[str, PurePosixPath], str] = {}
     for scope, actions in capacity.ordered_groups:
@@ -33078,9 +33120,9 @@ def _pending_cleanup_empty_proof_payload_from_authority(
         payload["source_ticket_version"] = authority.source_ticket_version
         payload["terminal_regular_targets"] = [
             _pending_regular_target_expectation_payload(
-            expectation,
-            include_link_count=False,
-        )
+                expectation,
+                include_link_count=False,
+            )
             for expectation in authority.terminal_regular_targets
         ]
         if (
@@ -33138,9 +33180,16 @@ def _pending_cleanup_empty_proof_payload_from_authority(
                 allocation_control
             )
             payload["allocation_join_metadata"] = join_payload
+    # v3 carries the complete terminal regular-file group, just like v4/v8
+    # terminal tickets. Historic v1/v2 proofs remain small control records.
+    maximum_bytes = (
+        MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES
+        if authority.version == 3
+        else MAX_PENDING_CLEANUP_TICKET_BYTES
+    )
     return _bounded_json_document(
         payload,
-        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        max_bytes=maximum_bytes,
         overflow_error="pending cleanup empty proof exceeds the size limit",
     )
 
@@ -35597,6 +35646,14 @@ def _remove_cleanup_ready_batch(
             expected_mode=0o700,
         )
         quarantine_root_identity = _directory_identity(quarantine_fd)
+        if ticket.version in {4, 8}:
+            # New transactions are admitted through the conservative planner,
+            # but a resumed historic ticket may predate that check. Serialize
+            # its exact v3 proof before touching its batch namespace.
+            _pending_cleanup_empty_proof_payload(
+                ticket,
+                quarantine_root_identity,
+            )
         batch_name = ticket.batch_root.name
         isolated_name = _pending_cleanup_isolated_batch_name(batch_name)
         bound_batch_root = ticket.batch_root
@@ -37486,7 +37543,7 @@ def _require_pending_cleanup_proof_batch_roots_absent(
             expected_mode=0o700,
         )
 
-        def require_no_private_batch_root_residue() -> None:
+        def require_no_batch_root_representations() -> None:
             expected_plan = (
                 authority.batch_root_identity[0],
                 authority.batch_root_identity[1],
@@ -37497,6 +37554,14 @@ def _require_pending_cleanup_proof_batch_roots_absent(
                 maximum_entries=MAX_PENDING_CLEANUP_ENTRIES,
                 overflow_message="pending cleanup quarantine root exceeds the size limit",
             )
+            if (
+                authority.batch_name in names
+                or authority.isolated_name in names
+            ):
+                raise SyncError(
+                    "pending cleanup empty proof still has a batch root: "
+                    f"{authority.batch_name}"
+                )
             for name in names:
                 for prefix in (
                     PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
@@ -37515,16 +37580,7 @@ def _require_pending_cleanup_proof_batch_roots_absent(
                             f"batch-root evidence: {authority.batch_name}"
                         )
 
-        require_no_private_batch_root_residue()
-        if (
-            _named_entry_identity(quarantine_fd, authority.batch_name) is not None
-            or _named_entry_identity(quarantine_fd, authority.isolated_name)
-            is not None
-        ):
-            raise SyncError(
-                "pending cleanup empty proof still has a batch root: "
-                f"{authority.batch_name}"
-            )
+        require_no_batch_root_representations()
         if _directory_identity(
             quarantine_fd
         ) != authority.quarantine_root_identity or not _bound_directory_matches(
@@ -37536,7 +37592,9 @@ def _require_pending_cleanup_proof_batch_roots_absent(
             quarantine_root,
             expected_mode=0o700,
         )
-        require_no_private_batch_root_residue()
+        # This final, bound directory snapshot simultaneously rejects every
+        # representation of the proof's batch root before proof retirement.
+        require_no_batch_root_representations()
     finally:
         _close_fd_quietly(quarantine_fd)
 
@@ -38770,6 +38828,7 @@ def _require_no_pending_terminal_mutation_authority(home: Path) -> None:
         if retained is not None and retained[0].endswith(
             (
                 PENDING_CLEANUP_TICKET_SUFFIX,
+                PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
                 PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
             )
         ):
@@ -38788,6 +38847,16 @@ def _require_no_pending_terminal_mutation_authority(home: Path) -> None:
                 "pending cleanup ticket representation must be reconciled before "
                 f"new mutation: {related_ticket_batch_name}"
             )
+        if name.endswith(PENDING_CLEANUP_EMPTY_PROOF_SUFFIX):
+            batch_name = name[: -len(PENDING_CLEANUP_EMPTY_PROOF_SUFFIX)]
+            if (
+                len(batch_name) <= MAX_PENDING_LINK_BATCH_NAME_BYTES
+                and PENDING_LINK_BATCH_RE.fullmatch(batch_name) is not None
+            ):
+                raise SyncError(
+                    "pending cleanup empty-proof authority must be reconciled "
+                    f"before new mutation: {batch_name}"
+                )
         if name.endswith(PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX):
             batch_name = name[: -len(PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX)]
             if (
