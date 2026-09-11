@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
@@ -1168,6 +1169,47 @@ class PendingStagingCleanupTests(unittest.TestCase):
                         self.assertTrue(ticket.path.is_file())
                 finally:
                     self.home = original_home
+
+    def test_legacy_empty_proof_retirement_rechecks_recreated_batch_root(self) -> None:
+        ticket = self._publish_legacy_cleanup_ticket(version=1)
+        quarantine_root = (
+            MODULE._personal_sync_root(self.home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        quarantine_root_identity = (
+            quarantine_root.stat().st_dev,
+            quarantine_root.stat().st_ino,
+        )
+        MODULE._publish_pending_cleanup_empty_proof(
+            self.home,
+            ticket,
+            quarantine_root_identity,
+        )
+        shutil.rmtree(ticket.batch_root)
+        proof_path = MODULE._pending_cleanup_empty_proof_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        real_delete_proof = MODULE._delete_pending_cleanup_empty_proof
+
+        def recreate_batch_root_then_delete(*args: object, **kwargs: object) -> None:
+            ticket.batch_root.mkdir()
+            real_delete_proof(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_delete_pending_cleanup_empty_proof",
+                side_effect=recreate_batch_root_then_delete,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup empty proof still has a batch root",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertTrue(proof_path.is_file())
 
     def test_partial_canonical_cleanup_authority_is_never_overwritten(self) -> None:
         for version, label in ((2, "rollback"), (3, "staging")):

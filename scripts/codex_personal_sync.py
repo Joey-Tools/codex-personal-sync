@@ -35744,10 +35744,18 @@ def _remove_cleanup_ready_batch(
                         quarantine_root_identity,
                     )
                     _delete_pending_cleanup_ticket(home, ticket)
+                    proof_authority = _parse_pending_cleanup_empty_proof_authority(
+                        _pending_cleanup_empty_proof_path(home, batch_name),
+                        proof.payload,
+                    )
                     _delete_pending_cleanup_empty_proof(
                         home,
                         ticket,
                         quarantine_root_identity,
+                        boundary_revalidator=lambda: _require_pending_cleanup_proof_batch_roots_absent(
+                            home,
+                            proof_authority,
+                        ),
                     )
                 return True
         legacy_generic_validation: LegacyGenericCleanupValidation | None = None
