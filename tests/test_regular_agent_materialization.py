@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import replace
+import errno
 import importlib.util
 import io
 import json
@@ -2299,6 +2300,29 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self.assertEqual(parsed.metadata_version, version)
         return parsed
 
+    def _prepare_pointerless_generic_v1_ticket(
+        self,
+        release_name: str,
+    ) -> MODULE.PendingBatchCleanupTicket:
+        symlink_release = self.root / release_name
+        write_release(symlink_release)
+        with (
+            mock.patch.object(
+                MODULE,
+                "_try_cleanup_finalized_pending_batch",
+                side_effect=MODULE.SyncError("injected pointerless cleanup crash"),
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "pointerless cleanup crash"),
+        ):
+            install(symlink_release, self.home, SHA_A)
+        ticket_path = next(MODULE._pending_cleanup_index_path(self.home).glob("*.json"))
+        ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket_path)
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertEqual(ticket.version, 1)
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
+        return ticket
+
     def _downgrade_durable_pending_regular_metadata(
         self,
         batch: MODULE.PendingLinkBatch,
@@ -2739,6 +2763,236 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
             MODULE._cleanup_ready_pending_batches(self.home)
 
         self.assertTrue(ticket_path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_pointerless_generic_metadata_read_failure_is_retained(self) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "pointerless-generic-metadata-read-release"
+        )
+        real_read = MODULE._read_managed_state_file_snapshot
+        metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+
+        def fail_metadata_read(
+            home: Path,
+            path: Path,
+            parent_fd: int,
+            **kwargs: object,
+        ) -> MODULE.ManagedStateFileSnapshot:
+            if path == metadata_path:
+                raise OSError("injected metadata read failure")
+            return real_read(home, path, parent_fd, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_read_managed_state_file_snapshot",
+                side_effect=fail_metadata_read,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal regular-file validation was retained",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_pointerless_generic_metadata_access_failure_is_retained(self) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "pointerless-generic-metadata-access-release"
+        )
+        real_require = MODULE._require_pending_cleanup_file_snapshot_access_policy
+        metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+
+        def fail_metadata_access(
+            home: Path,
+            path: Path,
+            parent_fd: int,
+            snapshot: MODULE.ManagedStateFileSnapshot,
+        ) -> None:
+            if path == metadata_path:
+                raise MODULE.SyncError("injected metadata ACL revalidation failure")
+            real_require(home, path, parent_fd, snapshot)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_require_pending_cleanup_file_snapshot_access_policy",
+                side_effect=fail_metadata_access,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal regular-file validation was retained",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_pointerless_generic_batch_revalidation_failures_are_retained(
+        self,
+    ) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "pointerless-generic-batch-revalidation-release"
+        )
+        real_bound = MODULE._bound_directory_matches
+
+        def fail_batch_binding(home: Path, path: Path, directory_fd: int) -> bool:
+            if path == ticket.batch_root:
+                return False
+            return real_bound(home, path, directory_fd)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_bound_directory_matches",
+                side_effect=fail_batch_binding,
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
+
+        self.assertIn("batch root changed: binding mismatch", stdout.getvalue())
+
+        real_access = MODULE._require_pending_cleanup_fd_access_policy
+
+        def fail_batch_access(
+            file_descriptor: int,
+            display_path: Path,
+            *,
+            expected_mode: int,
+        ) -> os.stat_result:
+            if display_path == ticket.batch_root:
+                raise OSError("injected batch access-policy revalidation failure")
+            return real_access(
+                file_descriptor,
+                display_path,
+                expected_mode=expected_mode,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_require_pending_cleanup_fd_access_policy",
+                side_effect=fail_batch_access,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal regular-file validation was retained",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_pointerless_v2_marker_revalidation_failure_blocks_install(self) -> None:
+        install(self.release, self.home, SHA_A)
+        next_release = self.root / "pointerless-v2-marker-failure-release"
+        write_release(next_release, role_payload='name = "updated"\n')
+        batch = self._interrupt_uncommitted_regular_publication(next_release, SHA_B)
+        parsed = self._downgrade_pending_regular_metadata(batch, 6)
+        write_legacy_generic_terminal_ticket(self.home, parsed, phase="before")
+        os.unlink(MODULE._pending_link_pointer_path(self.home))
+        ticket_path = MODULE._pending_cleanup_ticket_path(
+            self.home,
+            parsed.batch_root.name,
+        )
+        state_path = MODULE._state_path(self.home)
+        state_before = state_path.read_bytes()
+
+        for error in (
+            OSError("injected marker metadata read failure"),
+            MODULE.SyncError("injected marker identity revalidation failure"),
+        ):
+            with (
+                self.subTest(error=type(error).__name__),
+                mock.patch.object(
+                    MODULE,
+                    "_pending_rollback_marker_snapshot",
+                    side_effect=error,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "pending terminal regular-file validation was retained",
+                ),
+            ):
+                MODULE._cleanup_ready_pending_batches(self.home)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_pending_rollback_marker_snapshot",
+                side_effect=MODULE.SyncError(
+                    "injected marker access-policy revalidation failure"
+                ),
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal regular-file validation was retained",
+            ),
+        ):
+            install(self.release, self.home, SHA_A)
+
+        self.assertEqual(state_path.read_bytes(), state_before)
+        self.assertTrue(ticket_path.is_file())
+        self.assertTrue(parsed.batch_root.is_dir())
+
+    def test_pointerless_generic_schema_rejection_keeps_compatible_cleanup(
+        self,
+    ) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "pointerless-generic-schema-rejection-release"
+        )
+        metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        payload["version"] = 3
+        metadata_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        metadata_path.chmod(0o600)
+
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+
+        self.assertFalse(ticket.path.exists())
+        self.assertFalse(ticket.batch_root.exists())
+
+    def test_pointerless_generic_missing_metadata_keeps_compatible_cleanup(
+        self,
+    ) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "pointerless-generic-missing-metadata-release"
+        )
+        metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        metadata_path.unlink()
+
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+
+        self.assertFalse(ticket.path.exists())
+        self.assertFalse(ticket.batch_root.exists())
+
+    def test_pointerless_generic_external_parser_enotdir_is_blocking(self) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "pointerless-generic-external-enotdir-release"
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_parse_pending_link_batch",
+                side_effect=NotADirectoryError(
+                    errno.ENOTDIR,
+                    "injected external release path failure",
+                    "external-release",
+                ),
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal regular-file validation was retained",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertTrue(ticket.path.is_file())
         self.assertTrue(ticket.batch_root.is_dir())
 
     def test_v6_terminal_ticket_creates_a_missing_cleanup_index(self) -> None:
@@ -6829,6 +7083,60 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def _deep_regular_rollback_capacity(
+        self,
+        count: int,
+    ) -> tuple[MODULE.PendingLinkCapacityPlan, MODULE.ManagedState]:
+        links: dict[PurePosixPath, MODULE.ManagedLinkRecord] = {}
+        actions: list[MODULE.ReconcileAction] = []
+        for index in range(count):
+            target = PurePosixPath(
+                f"target-{index:04d}",
+                *("d" for _unused in range(62)),
+                "agent.toml",
+            )
+            self.assertEqual(len(target.parts), MODULE.MAX_MANIFEST_TARGET_PATH_DEPTH)
+            links[target] = MODULE.ManagedLinkRecord(
+                source=PurePosixPath("personal_codex/agents/reviewer.toml"),
+                target=target,
+                kind="file",
+                owner=MODULE.PUBLIC_OWNER,
+                link_target="releases/" + SHA_A,
+                release_sha=SHA_A,
+            )
+            actions.append(
+                MODULE.ReconcileAction(
+                    action="remove",
+                    target=self.home / Path(*target.parts),
+                    link_target="",
+                    kind="file",
+                    planned_snapshot=MODULE.ReconcileTargetSnapshot(
+                        parent_identity=(1, index + 1),
+                        link_identity=(2, index + 1),
+                        ancestor_identity=(1, index + 1),
+                        regular_sha256="a" * 64,
+                        regular_size=1,
+                        regular_mode=0o600,
+                        regular_uid=os.geteuid(),
+                        regular_gid=os.getegid(),
+                        regular_link_count=1,
+                    ),
+                    materialization="regular",
+                )
+            )
+        action_tuple = tuple(actions)
+        return (
+            MODULE.PendingLinkCapacityPlan(
+                ordered_groups=(("managed", action_tuple),),
+                flattened_actions=action_tuple,
+                retired_absence_specs=(),
+            ),
+            MODULE.ManagedState(
+                owners={MODULE.PUBLIC_OWNER: SHA_A},
+                links=links,
+            ),
+        )
+
     def test_projected_planned_snapshot_covers_every_v6_field(self) -> None:
         target = self.home / ROLE_TARGET
         absent = MODULE.ReconcileTargetSnapshot(
@@ -6933,6 +7241,57 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
             [item["target"] for item in projected["terminal_regular_after"]],
             [ROLE_TARGET.as_posix()],
         )
+
+    def test_rollback_terminal_receipt_directory_capacity_boundary(self) -> None:
+        # With the shortest distinct depth-64 paths in this fixture, 1,263 is
+        # the last complete v3 receipt below 16 MiB; the next target crosses
+        # the byte boundary before the directory-count boundary.
+        accepted_count = 1_263
+        accepted_capacity, accepted_state = self._deep_regular_rollback_capacity(
+            accepted_count
+        )
+
+        MODULE._validate_pending_terminal_validation_receipt_capacity(
+            self.home,
+            accepted_capacity,
+            accepted_state,
+            phase="before",
+        )
+
+        oversized_capacity, oversized_state = self._deep_regular_rollback_capacity(
+            accepted_count + 1
+        )
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal validation receipt exceeds the size limit",
+        ):
+            MODULE._validate_pending_terminal_validation_receipt_capacity(
+                self.home,
+                oversized_capacity,
+                oversized_state,
+                phase="before",
+            )
+
+        per_target_directories = MODULE.MAX_MANIFEST_TARGET_PATH_DEPTH - 1
+        fixed_directories = 3
+        directory_overflow_count = (
+            MODULE.MAX_PENDING_TERMINAL_VALIDATION_DIRECTORIES - fixed_directories
+        ) // per_target_directories + 1
+        rejected_capacity, rejected_state = self._deep_regular_rollback_capacity(
+            directory_overflow_count
+        )
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal validation directories exceed the limit",
+        ):
+            MODULE._validate_pending_link_metadata_capacity(
+                self.home,
+                rejected_capacity,
+                MODULE.ManagedStateFileSnapshot(exists=True),
+                rejected_state,
+                rejected_state,
+                MODULE.ManagedState(owners={}, links={}),
+            )
 
     def test_manifest_transition_capacity_counts_terminal_regular_arrays(self) -> None:
         profile = MODULE._manifest_transition_capacity_profile(

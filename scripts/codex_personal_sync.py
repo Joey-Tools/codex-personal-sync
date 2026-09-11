@@ -234,6 +234,9 @@ PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX = ".terminal-validation"
 PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION = 3
 LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION = 4
 PENDING_TERMINAL_CLEANUP_TICKET_VERSION = 8
+LEGACY_GENERIC_CLEANUP_MANUAL_RECOVERY_CODE = (
+    "legacy-generic-cleanup-manual-recovery"
+)
 PENDING_PRIVATE_USE_RETIREMENT_SUFFIX = ".private-use-retirement"
 PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX = ".publish-tmp"
 PENDING_CLEANUP_CURSOR_NAME = ".scan-cursor"
@@ -582,6 +585,10 @@ class SyncError(RuntimeError):
 
 
 class _PendingCleanupAccessPolicyError(SyncError):
+    pass
+
+
+class _LegacyGenericCleanupForeignBatch(SyncError):
     pass
 
 
@@ -21796,6 +21803,156 @@ def _projected_pending_terminal_regular_payloads(
     ]
 
 
+def _projected_pending_terminal_validation_alias_paths(
+    home: Path,
+    capacity: PendingLinkCapacityPlan,
+    state: ManagedState,
+    *,
+    phase: str,
+) -> tuple[PurePosixPath, ...]:
+    if phase not in {"before", "after"}:
+        raise SyncError("projected pending terminal validation phase is invalid")
+    terminal_target_set = {
+        target
+        for target, record in state.links.items()
+        if _record_materializes_regular_file(record)
+    }
+    indexed_actions: list[tuple[int, str, ReconcileAction, PurePosixPath]] = []
+    record_index = 0
+    for scope, actions in capacity.ordered_groups:
+        for action in actions:
+            try:
+                target = PurePosixPath(*action.target.relative_to(home).parts)
+            except ValueError as error:
+                raise SyncError(
+                    f"pending target is outside home: {action.target}"
+                ) from error
+            indexed_actions.append((record_index, scope, action, target))
+            if scope == "managed" and target in state.links:
+                if (
+                    phase == "before"
+                    and action.action
+                    in {
+                        "replace",
+                        "quarantine-replace",
+                        "remove",
+                        "quarantine-remove",
+                    }
+                    and _regular_snapshot_from_reconcile(action.planned_snapshot)
+                    is not None
+                ) or (
+                    phase == "after"
+                    and action.action
+                    in {"create", "replace", "quarantine-replace"}
+                    and action.materialization == "regular"
+                ):
+                    terminal_target_set.add(target)
+            record_index += 1
+    terminal_targets = sorted(terminal_target_set, key=PurePosixPath.as_posix)
+    aliases = [
+        PurePosixPath(_pending_terminal_recovery_alias_name(index))
+        for index, _target in enumerate(terminal_targets)
+    ]
+    for record_index, scope, action, target in indexed_actions:
+        if scope == "managed" and target in terminal_target_set:
+            if (
+                phase == "before"
+                and action.action
+                in {
+                    "replace",
+                    "quarantine-replace",
+                    "remove",
+                    "quarantine-remove",
+                }
+                and _regular_snapshot_from_reconcile(action.planned_snapshot)
+                is not None
+            ):
+                aliases.extend(
+                    (
+                        PurePosixPath(
+                            "pending", "before", f"{record_index:08d}"
+                        ),
+                        PurePosixPath("links") / target,
+                    )
+                )
+            elif (
+                phase == "after"
+                and action.action
+                in {"create", "replace", "quarantine-replace"}
+                and action.materialization == "regular"
+            ):
+                aliases.extend(
+                    (
+                        PurePosixPath(
+                            "pending", "stage", f"{record_index:08d}"
+                        ),
+                        PurePosixPath(
+                            "pending", "evidence", f"{record_index:08d}"
+                        ),
+                    )
+                )
+    aliases.sort(key=PurePosixPath.as_posix)
+    if len(aliases) > MAX_PENDING_TERMINAL_VALIDATION_ALIASES:
+        raise SyncError("pending terminal validation aliases exceed the limit")
+    if any(left == right for left, right in zip(aliases, aliases[1:])):
+        raise SyncError("projected pending terminal validation aliases are duplicated")
+    return tuple(aliases)
+
+
+def _validate_pending_terminal_validation_receipt_capacity(
+    home: Path,
+    capacity: PendingLinkCapacityPlan,
+    state: ManagedState,
+    *,
+    phase: str,
+) -> None:
+    alias_paths = _projected_pending_terminal_validation_alias_paths(
+        home,
+        capacity,
+        state,
+        phase=phase,
+    )
+    directory_paths: set[PurePosixPath] = set()
+    for alias_path in alias_paths:
+        ancestor = alias_path.parent
+        while ancestor.parts:
+            directory_paths.add(ancestor)
+            ancestor = ancestor.parent
+    if len(directory_paths) > MAX_PENDING_TERMINAL_VALIDATION_DIRECTORIES:
+        raise SyncError("pending terminal validation directories exceed the limit")
+    maximum_identity = _identity_payload(_MAX_PENDING_IDENTITY)
+    _bounded_json_document(
+        {
+            "version": PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION,
+            "phase": "terminal-validation",
+            "batch": _MAX_PENDING_BATCH_NAME,
+            "batch_root_identity": maximum_identity,
+            "quarantine_root_identity": maximum_identity,
+            "ticket_identity": maximum_identity,
+            "ticket_sha256": _MAX_PENDING_DIGEST,
+            "terminal_regular_aliases": [
+                {
+                    "path": path.as_posix(),
+                    "parent_identity": maximum_identity,
+                    "file_identity": maximum_identity,
+                }
+                for path in alias_paths
+            ],
+            "terminal_regular_alias_directories": [
+                {
+                    "path": path.as_posix(),
+                    "identity": maximum_identity,
+                }
+                for path in sorted(directory_paths, key=PurePosixPath.as_posix)
+            ],
+        },
+        max_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+        overflow_error=(
+            "pending terminal validation receipt exceeds the size limit"
+        ),
+    )
+
+
 def _projected_pending_metadata_payload(
     *,
     state_before_exists: bool,
@@ -22404,6 +22561,18 @@ def _validate_pending_link_metadata_capacity(
     planning_state_before: ManagedState,
     state_after_value: ManagedState,
 ) -> None:
+    _validate_pending_terminal_validation_receipt_capacity(
+        home,
+        capacity,
+        state_before_value,
+        phase="before",
+    )
+    _validate_pending_terminal_validation_receipt_capacity(
+        home,
+        capacity,
+        state_after_value,
+        phase="after",
+    )
     records: list[dict[str, Any]] = []
     record_actions: dict[tuple[str, PurePosixPath], str] = {}
     for scope, actions in capacity.ordered_groups:
@@ -23791,11 +23960,11 @@ def _read_pending_commit_evidence(
     return snapshot, evidence
 
 
-def _parse_pending_link_batch(
+def _parse_pending_link_batch_schema_envelope(
     home: Path,
     payload: bytes,
-    pointer_snapshot: ManagedStateFileSnapshot,
-) -> PendingLinkBatch:
+) -> tuple[dict[str, Any], int, str]:
+    """Parse the metadata fields that require no filesystem observations."""
     data = _decode_managed_state_json(payload, _pending_link_pointer_path(home))
     version = data.get("version")
     if (
@@ -23830,6 +23999,18 @@ def _parse_pending_link_batch(
         or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
     ):
         raise SyncError("pending transaction has an invalid batch name")
+    return data, version, batch_name
+
+
+def _parse_pending_link_batch(
+    home: Path,
+    payload: bytes,
+    pointer_snapshot: ManagedStateFileSnapshot,
+) -> PendingLinkBatch:
+    data, version, batch_name = _parse_pending_link_batch_schema_envelope(
+        home,
+        payload,
+    )
     batch_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH / batch_name
     metadata_path = batch_root / PENDING_LINK_METADATA_NAME
     metadata_parent_fd = _open_directory_beneath(home, batch_root)
@@ -29511,26 +29692,60 @@ def _pending_cleanup_entry_name(
     )
 
 
+def _pending_cleanup_active_logical_name_is_valid(
+    logical_name: str,
+    encoded_name: bytes,
+) -> bool:
+    return (
+        bool(logical_name)
+        and logical_name not in {".", ".."}
+        and len(encoded_name) <= MAX_PENDING_CLEANUP_ACTIVE_LOGICAL_NAME_BYTES
+        and b"/" not in encoded_name
+        and b"\0" not in encoded_name
+        and os.fsencode(logical_name) == encoded_name
+    )
+
+
 def _pending_cleanup_active_entry_name(
+    directory_fd: int,
     parent_identity: tuple[int, int],
     planned: tuple[int, int, int],
     logical_name: str,
 ) -> str:
     """Encode the canonical cleanup name into a resumable active-entry token."""
     encoded_name = os.fsencode(logical_name)
-    if (
-        not encoded_name
-        or len(encoded_name) > MAX_PENDING_CLEANUP_ACTIVE_LOGICAL_NAME_BYTES
-        or b"/" in encoded_name
-        or b"\0" in encoded_name
+    if not _pending_cleanup_active_logical_name_is_valid(
+        logical_name,
+        encoded_name,
     ):
         raise SyncError("pending cleanup active entry name is not safely encodable")
-    return (
+    active_name = (
         f"{PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX}v2-"
         f"{parent_identity[0]:x}-{parent_identity[1]:x}-"
         f"{planned[0]:x}-{planned[1]:x}-{planned[2]:x}-"
         f"{encoded_name.hex()}-{os.urandom(8).hex()}"
     )
+    _require_pending_cleanup_entry_name_fits(directory_fd, active_name)
+    return active_name
+
+
+def _require_pending_cleanup_entry_name_fits(
+    directory_fd: int,
+    name: str,
+) -> None:
+    try:
+        name_max = os.fpathconf(directory_fd, "PC_NAME_MAX")
+    except (OSError, ValueError) as error:
+        raise SyncError(
+            "pending cleanup cannot determine the target directory name limit"
+        ) from error
+    if not isinstance(name_max, int) or name_max <= 0:
+        raise SyncError("pending cleanup target directory name limit is invalid")
+    if len(os.fsencode(name)) > name_max:
+        raise SyncError(
+            "pending cleanup active entry token exceeds the target directory "
+            "name limit"
+        )
 
 
 def _pending_cleanup_active_entry_binding(
@@ -29555,10 +29770,9 @@ def _pending_cleanup_active_entry_binding(
         logical_name = os.fsdecode(encoded_name)
     except UnicodeError:
         return None
-    if (
-        not logical_name
-        or logical_name in {".", ".."}
-        or os.fsencode(logical_name) != encoded_name
+    if not _pending_cleanup_active_logical_name_is_valid(
+        logical_name,
+        encoded_name,
     ):
         return None
     return (
@@ -29665,6 +29879,7 @@ def _isolate_pending_cleanup_entry(
         else:
             try:
                 active_name = _pending_cleanup_active_entry_name(
+                    directory_fd,
                     parent_identity,
                     planned,
                     logical_name if logical_name is not None else name,
@@ -29680,6 +29895,7 @@ def _isolate_pending_cleanup_entry(
                     parent_identity,
                     planned,
                 )
+        _require_pending_cleanup_entry_name_fits(directory_fd, active_name)
         if active_name == name:
             continue
         try:
@@ -33327,22 +33543,46 @@ def _require_legacy_generic_cleanup_ticket_is_nonterminal(
     still has parseable metadata must still match the ticket's finalization
     marker, then can reveal that it would delete a terminal regular link
     without durable count authority. Retain either unsafe case for guided
-    recovery. Missing, isolated, or no-longer-parseable historic batches
-    remain on the pre-existing cleanup path: they carry no comparable
-    terminal authority and must not prevent a safely bound cleanup retry from
-    completing merely because a later binary cannot reconstruct their state.
+    recovery. Missing, isolated, or schema-incompatible historic batches
+    remain on the pre-existing cleanup path: they carry no comparable terminal
+    authority and must not prevent a safely bound cleanup retry from completing
+    merely because a later binary cannot reconstruct their state. Once
+    canonical metadata bytes have a supported schema envelope, every
+    filesystem, access-policy, identity, and marker revalidation failure is
+    retained for manual recovery rather than downgraded to schema
+    incompatibility.
     """
     if ticket.version not in {1, 2}:
         return
     if bound_batch_root != ticket.batch_root:
         return
+
+    def manual_recovery_error(
+        detail: str,
+    ) -> SyncError:
+        return SyncError(
+            "legacy generic pending cleanup authority revalidation failed; "
+            "manual recovery is required: "
+            f"{ticket.batch_root.name}: {detail}",
+            code=LEGACY_GENERIC_CLEANUP_MANUAL_RECOVERY_CODE,
+        )
+
+    def foreign_batch_error(detail: str) -> SyncError:
+        return _LegacyGenericCleanupForeignBatch(
+            "legacy generic pending cleanup batch structure changed and was "
+            f"retained: {ticket.batch_root.name}: {detail}"
+        )
+
     try:
-        if _directory_identity(
-            batch_fd
-        ) != ticket.batch_root_identity or not _bound_directory_matches(
-            home, bound_batch_root, batch_fd
-        ):
-            return
+        if _directory_identity(batch_fd) != ticket.batch_root_identity:
+            raise foreign_batch_error("batch root changed: identity mismatch")
+        if not _bound_directory_matches(home, bound_batch_root, batch_fd):
+            raise foreign_batch_error("batch root changed: binding mismatch")
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd,
+            bound_batch_root,
+            expected_mode=0o700,
+        )
         metadata_path = bound_batch_root / PENDING_LINK_METADATA_NAME
         metadata = _read_managed_state_file_snapshot(
             home,
@@ -33357,22 +33597,101 @@ def _require_legacy_generic_cleanup_ticket_is_nonterminal(
             batch_fd,
             metadata,
         )
-        batch = _parse_pending_link_batch(home, metadata.payload, metadata)
-    except (OSError, SyncError):
+    except _LegacyGenericCleanupForeignBatch:
+        raise
+    except (OSError, SyncError) as error:
+        raise manual_recovery_error(str(error)) from error
+    try:
+        data, _metadata_version, _batch_name = (
+            _parse_pending_link_batch_schema_envelope(home, metadata.payload)
+        )
+    except SyncError:
+        # Captured bytes rejected without any mutable filesystem observation.
+        # This is the sole compatible generic-cleanup case.
         return
+    declared_paths: list[object] = [PENDING_STATE_COMMIT_MARKER.as_posix()]
+    for state_key in ("state_before", "state_after", "commit_evidence"):
+        raw_state = data.get(state_key)
+        if isinstance(raw_state, dict):
+            declared_paths.append(raw_state.get("evidence"))
+    for claims_key in ("claims_before", "claims_after"):
+        raw_claims = data.get(claims_key)
+        if isinstance(raw_claims, list):
+            declared_paths.extend(
+                raw_claim.get("evidence")
+                for raw_claim in raw_claims
+                if isinstance(raw_claim, dict)
+            )
+    raw_records = data.get("records")
+    if isinstance(raw_records, list):
+        for raw_record in raw_records:
+            if not isinstance(raw_record, dict):
+                continue
+            declared_paths.extend(
+                raw_record.get(field)
+                for field in (
+                    "before_evidence",
+                    "backup",
+                    "stage",
+                    "evidence",
+                    "publication_cleanup",
+                )
+            )
+    declared_parent_paths = {PurePosixPath("pending")}
+    for raw_path in declared_paths:
+        if not isinstance(raw_path, str):
+            continue
+        try:
+            relative_path = _validate_relative_path(
+                raw_path,
+                "legacy pending batch-local evidence path",
+            )
+        except SyncError:
+            continue
+        if relative_path.parts[0] not in {"pending", "links"}:
+            continue
+        if relative_path.parent.parts:
+            declared_parent_paths.add(relative_path.parent)
+    for relative_parent in sorted(
+        declared_parent_paths,
+        key=PurePosixPath.as_posix,
+    ):
+        try:
+            parent_fd = _open_directory_beneath(
+                home,
+                bound_batch_root / Path(*relative_parent.parts),
+            )
+            _close_fd_quietly(parent_fd)
+        except FileNotFoundError:
+            # Missing evidence is an authority failure for the full parser. It
+            # does not prove that an unrelated object replaced the batch.
+            continue
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise foreign_batch_error(str(error)) from error
+            raise manual_recovery_error(str(error)) from error
+        except SyncError as error:
+            raise manual_recovery_error(str(error)) from error
+    try:
+        batch = _parse_pending_link_batch(home, metadata.payload, metadata)
+    except (OSError, SyncError) as error:
+        raise manual_recovery_error(str(error)) from error
     if (
         batch.batch_root != ticket.batch_root
         or batch.batch_root_identity != ticket.batch_root_identity
     ):
-        return
+        raise manual_recovery_error("parsed batch binding changed")
     expected_phase = "after" if ticket.version == 1 else "before"
     if ticket.phase != expected_phase:
-        return
-    marker = (
-        _pending_commit_marker_snapshot(home, batch)
-        if expected_phase == "after"
-        else _pending_rollback_marker_snapshot(home, batch)
-    )
+        raise manual_recovery_error("ticket finalization phase changed")
+    try:
+        marker = (
+            _pending_commit_marker_snapshot(home, batch)
+            if expected_phase == "after"
+            else _pending_rollback_marker_snapshot(home, batch)
+        )
+    except (OSError, SyncError) as error:
+        raise manual_recovery_error(str(error)) from error
     expected_marker_path = (
         PENDING_STATE_COMMIT_MARKER
         if expected_phase == "after"
@@ -33389,7 +33708,8 @@ def _require_legacy_generic_cleanup_ticket_is_nonterminal(
     ):
         raise SyncError(
             "legacy generic pending cleanup finalization marker changed; manual "
-            f"recovery is required: {ticket.batch_root.name}"
+            f"recovery is required: {ticket.batch_root.name}",
+            code=LEGACY_GENERIC_CLEANUP_MANUAL_RECOVERY_CODE,
         )
     state = (
         batch.state_after_value
@@ -33404,7 +33724,8 @@ def _require_legacy_generic_cleanup_ticket_is_nonterminal(
         raise SyncError(
             "legacy generic pending cleanup ticket cannot prove the complete "
             "terminal regular hard-link group; manual recovery is required: "
-            f"{ticket.batch_root.name}"
+            f"{ticket.batch_root.name}",
+            code=LEGACY_GENERIC_CLEANUP_MANUAL_RECOVERY_CODE,
         )
 
 
@@ -33505,6 +33826,12 @@ def _remove_cleanup_ready_batch(
                     quarantine_root_identity,
                 )
                 return True
+        _require_legacy_generic_cleanup_ticket_is_nonterminal(
+            home,
+            ticket,
+            bound_batch_root,
+            batch_fd,
+        )
         if _directory_identity(
             batch_fd
         ) != ticket.batch_root_identity or not _bound_directory_matches(
@@ -33515,12 +33842,6 @@ def _remove_cleanup_ready_batch(
             batch_fd,
             bound_batch_root,
             expected_mode=0o700,
-        )
-        _require_legacy_generic_cleanup_ticket_is_nonterminal(
-            home,
-            ticket,
-            bound_batch_root,
-            batch_fd,
         )
         if ticket.version == 3:
             _require_no_pending_staging_manual_retention(
@@ -35931,23 +36252,23 @@ def _cleanup_ready_pending_batches(
             if _remove_cleanup_ready_batch(home, ticket):
                 action_budget.mark_batch_completed(batch_name)
         except (FileNotFoundError, OSError, SyncError) as error:
-            legacy_terminal_group_is_unprovable = ticket.version in {1, 2} and str(
-                error
-            ).startswith(
-                "legacy generic pending cleanup ticket cannot prove the "
-                "complete terminal regular hard-link group"
+            legacy_manual_recovery_is_required = (
+                ticket.version in {1, 2}
+                and isinstance(error, SyncError)
+                and error.code == LEGACY_GENERIC_CLEANUP_MANUAL_RECOVERY_CODE
             )
-            legacy_finalization_marker_is_untrusted = ticket.version in {1, 2} and str(
-                error
-            ).startswith("legacy generic pending cleanup finalization marker changed")
             if (
                 ticket.version in {4, 8}
-                or legacy_terminal_group_is_unprovable
-                or legacy_finalization_marker_is_untrusted
+                or legacy_manual_recovery_is_required
             ):
                 raise SyncError(
                     "pending terminal regular-file validation was retained: "
-                    f"{batch_name}: {error}"
+                    f"{batch_name}: {error}",
+                    code=(
+                        LEGACY_GENERIC_CLEANUP_MANUAL_RECOVERY_CODE
+                        if legacy_manual_recovery_is_required
+                        else None
+                    ),
                 ) from error
             if ticket.version in {5, 6, 7}:
                 raise SyncError(

@@ -655,6 +655,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             )
             planned = MODULE._pending_cleanup_entry_plan(temporary)
             active_name = MODULE._pending_cleanup_active_entry_name(
+                pending_fd,
                 MODULE._directory_identity(pending_fd),
                 planned,
                 "stage",
@@ -760,6 +761,59 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             f"v2-1-2-3-4-{stat.S_IFREG:x}-abc-{'0' * 16}"
         )
         self.assertIsNone(MODULE._pending_cleanup_active_entry_binding(name, (1, 2)))
+
+    def test_v2_active_entry_rejects_non_component_logical_name(self) -> None:
+        for encoded_name in (b"foo/bar", b"foo\0bar"):
+            with self.subTest(encoded_name=encoded_name):
+                name = (
+                    f"{MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX}"
+                    f"v2-1-2-3-4-{stat.S_IFREG:x}-"
+                    f"{encoded_name.hex()}-{'0' * 16}"
+                )
+                self.assertIsNone(
+                    MODULE._pending_cleanup_active_entry_binding(name, (1, 2))
+                )
+
+    def test_v2_active_entry_falls_back_when_target_name_max_is_143(self) -> None:
+        directory = self.root / "active-token-name-max"
+        directory.mkdir(mode=0o700)
+        logical_name = "x" * MODULE.MAX_PENDING_CLEANUP_ACTIVE_LOGICAL_NAME_BYTES
+        content = directory / logical_name
+        content.write_text("backup\n", encoding="utf-8")
+        content.chmod(0o600)
+        directory_fd = MODULE._open_directory_beneath(self.root, directory)
+        try:
+            parent_identity = MODULE._directory_identity(directory_fd)
+            planned = MODULE._pending_cleanup_entry_plan(
+                os.stat(content.name, dir_fd=directory_fd, follow_symlinks=False)
+            )
+            with mock.patch.object(MODULE.os, "fpathconf", return_value=143):
+                active_name, _active = MODULE._isolate_pending_cleanup_entry(
+                    directory_fd,
+                    content.name,
+                    parent_identity,
+                    planned,
+                    relative_parts=("links",),
+                )
+        finally:
+            MODULE._close_fd_quietly(directory_fd)
+
+        self.assertTrue(
+            active_name.startswith(MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+        )
+        self.assertFalse(
+            active_name.startswith(f"{MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX}v2-")
+        )
+        self.assertLessEqual(len(os.fsencode(active_name)), 143)
+        self.assertEqual(
+            MODULE._pending_cleanup_internal_entry_plan(
+                active_name,
+                MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                parent_identity,
+            ),
+            planned,
+        )
+        (directory / active_name).unlink()
 
     def test_active_cleanup_token_preserves_short_links_content_name(self) -> None:
         links = self.root / "links-token"

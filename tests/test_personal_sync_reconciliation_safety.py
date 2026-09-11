@@ -11870,8 +11870,9 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
         install_quietly(self.release_b, self.home, SHA_B)
 
-        self.assertFalse(os.path.lexists(batch_root))
-        self.assertFalse(os.path.lexists(ticket_path))
+        self.assertTrue(batch_root.is_dir())
+        self.assertTrue(ticket_path.is_file())
+        self.assertTrue(pending.is_symlink())
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
         self.assertTrue(unrelated_batch.is_dir())
 
