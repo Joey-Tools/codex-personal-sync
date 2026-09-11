@@ -3058,6 +3058,220 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                 ):
                     MODULE._require_no_pending_terminal_mutation_authority(self.home)
 
+    def test_legacy_generic_marker_replacement_before_receipt_is_retained(
+        self,
+    ) -> None:
+        """The parser-to-ledger handoff must not publish replacement authority."""
+        for version in (1, 2):
+            with self.subTest(version=version):
+                self.home = self.root / f"home-marker-handoff-v{version}"
+                ticket = (
+                    self._prepare_pointerless_generic_v1_ticket(
+                        f"marker-handoff-v{version}-release"
+                    )
+                    if version == 1
+                    else self._prepare_pointerless_generic_v2_ticket(
+                        f"marker-handoff-v{version}-release"
+                    )
+                )
+                marker_relative = (
+                    MODULE.PENDING_STATE_COMMIT_MARKER
+                    if version == 1
+                    else MODULE.PENDING_STATE_ROLLBACK_MARKER
+                )
+                marker_path = ticket.batch_root / Path(*marker_relative.parts)
+                original_entries = (
+                    MODULE._legacy_generic_cleanup_entries_from_identity_ledger
+                )
+
+                def replace_marker_after_capture(
+                    *args: object,
+                    **kwargs: object,
+                ) -> tuple[MODULE.LegacyGenericCleanupEntryAuthority, ...]:
+                    entries = original_entries(*args, **kwargs)
+                    marker_path.unlink()
+                    marker_path.write_bytes(b"foreign-marker-after-ledger")
+                    marker_path.chmod(0o600)
+                    return entries
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_legacy_generic_cleanup_entries_from_identity_ledger",
+                        side_effect=replace_marker_after_capture,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "manual recovery is required",
+                    ),
+                ):
+                    MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+                receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+                    self.home,
+                    ticket.batch_root.name,
+                )
+                self.assertFalse(receipt_path.exists())
+                self.assertTrue(ticket.path.is_file())
+                self.assertTrue(ticket.batch_root.is_dir())
+                self.assertEqual(marker_path.read_bytes(), b"foreign-marker-after-ledger")
+
+    def test_legacy_generic_metadata_rewrite_after_receipt_is_not_deleted(
+        self,
+    ) -> None:
+        """A receipt does not authorize a same-inode metadata rewrite."""
+        for version in (1, 2):
+            with self.subTest(version=version):
+                self.home = self.root / f"home-metadata-rewrite-v{version}"
+                ticket = (
+                    self._prepare_pointerless_generic_v1_ticket(
+                        f"metadata-rewrite-v{version}-release"
+                    )
+                    if version == 1
+                    else self._prepare_pointerless_generic_v2_ticket(
+                        f"metadata-rewrite-v{version}-release"
+                    )
+                )
+                metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+                metadata_identity = (
+                    metadata_path.stat().st_dev,
+                    metadata_path.stat().st_ino,
+                )
+                original_payload = metadata_path.read_bytes()
+                original_publish = MODULE._publish_pending_cleanup_terminal_validation
+
+                def rewrite_metadata_after_receipt(
+                    *args: object,
+                    **kwargs: object,
+                ) -> MODULE.ManagedStateFileSnapshot:
+                    receipt = original_publish(*args, **kwargs)
+                    replacement = bytes(
+                        [original_payload[0] ^ 1]
+                    ) + original_payload[1:]
+                    with metadata_path.open("r+b") as stream:
+                        stream.write(replacement)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    return receipt
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_publish_pending_cleanup_terminal_validation",
+                        side_effect=rewrite_metadata_after_receipt,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "validation metadata changed",
+                    ),
+                ):
+                    MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+                self.assertTrue(metadata_path.is_file())
+                self.assertEqual(
+                    (metadata_path.stat().st_dev, metadata_path.stat().st_ino),
+                    metadata_identity,
+                )
+                self.assertNotEqual(metadata_path.read_bytes(), original_payload)
+                self.assertTrue(ticket.path.is_file())
+                self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_legacy_generic_metadata_rewrite_blocks_noncontrol_mutation(
+        self,
+    ) -> None:
+        """Semantic control drift blocks every subsequent walker action."""
+        for version in (1, 2):
+            with self.subTest(version=version):
+                self.home = self.root / f"home-metadata-global-fence-v{version}"
+                ticket = (
+                    self._prepare_pointerless_generic_v1_ticket(
+                        f"metadata-global-fence-v{version}-release"
+                    )
+                    if version == 1
+                    else self._prepare_pointerless_generic_v2_ticket(
+                        f"metadata-global-fence-v{version}-release"
+                    )
+                )
+                metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+                metadata_identity = (
+                    metadata_path.stat().st_dev,
+                    metadata_path.stat().st_ino,
+                )
+                original_payload = metadata_path.read_bytes()
+
+                def rewrite_before_noncontrol_mutation(
+                    *_args: object,
+                    **kwargs: object,
+                ) -> None:
+                    mutation_revalidator = kwargs.get("mutation_revalidator")
+                    self.assertIsNotNone(mutation_revalidator)
+                    replacement = bytes(
+                        [original_payload[0] ^ 1]
+                    ) + original_payload[1:]
+                    with metadata_path.open("r+b") as stream:
+                        stream.write(replacement)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    assert mutation_revalidator is not None
+                    mutation_revalidator(
+                        PurePosixPath("pending") / "first-noncontrol-entry",
+                        "before_isolate",
+                    )
+                    raise AssertionError("legacy mutation fence did not fail closed")
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_remove_pending_batch_directory_contents",
+                        side_effect=rewrite_before_noncontrol_mutation,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "validation metadata changed",
+                    ),
+                ):
+                    MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+                self.assertTrue(metadata_path.is_file())
+                self.assertEqual(
+                    (metadata_path.stat().st_dev, metadata_path.stat().st_ino),
+                    metadata_identity,
+                )
+                self.assertNotEqual(metadata_path.read_bytes(), original_payload)
+                self.assertTrue(ticket.path.is_file())
+                self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_legacy_generic_owner_only_metadata_gid_churn_is_accepted(
+        self,
+    ) -> None:
+        """A 0600 regular file does not gain access through its GID."""
+        alternate_gids = [gid for gid in os.getgroups() if gid != os.getegid()]
+        if not alternate_gids:
+            self.skipTest("the current user has no alternate supplementary GID")
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "generic-owner-only-gid-churn-release"
+        )
+
+        def crash_after_validation(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("injected cleanup crash after validation")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=crash_after_validation,
+            ),
+            self.assertRaisesRegex(RuntimeError, "cleanup crash"),
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        os.chown(metadata_path, -1, alternate_gids[0])
+        self.assertEqual(stat.S_IMODE(metadata_path.stat().st_mode), 0o600)
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+        self.assertFalse(ticket.path.exists())
+        self.assertFalse(ticket.batch_root.exists())
+
     def test_legacy_generic_receipt_mutation_gate_keeps_active_mismatch_read_only(
         self,
     ) -> None:

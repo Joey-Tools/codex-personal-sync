@@ -4918,6 +4918,38 @@ class PendingBatchCleanupTicket:
 
 
 @dataclass(frozen=True)
+class PendingCleanupEmptyProofAuthority:
+    """Durable authority carried by one terminal empty-batch proof.
+
+    Version 1 predates terminal regular-file groups. Version 2 persists the
+    group without transient batch-alias link counts. Version 3 additionally
+    records the source ticket shape, so ticket-missing recovery can distinguish
+    a terminal target group from an allocation-backed ephemeral scaffold.
+    """
+
+    version: int
+    batch_name: str
+    batch_root_identity: tuple[int, int]
+    quarantine_root_identity: tuple[int, int]
+    isolated_name: str
+    ticket_identity: tuple[int, int]
+    ticket_sha256: str
+    terminal_regular_targets: tuple[PendingRegularTargetExpectation, ...]
+    source_ticket_version: int | None = None
+    allocation_control: PendingPrivateUseControlEvidence | None = None
+    allocation_join_metadata: PendingCleanupEmptyProofAllocationJoin | None = None
+
+
+@dataclass(frozen=True)
+class PendingCleanupEmptyProofAllocationJoin:
+    """The v5/v7 fields needed to reprove its v8 allocation join."""
+
+    metadata_sha256: str
+    metadata_size: int | None
+    metadata_mode: int
+
+
+@dataclass(frozen=True)
 class PendingQuarantineAllocationTicket:
     """Durable reservation/fence; never deletion authority for a batch."""
 
@@ -12391,6 +12423,7 @@ def _rmdir_bound_empty_pending_cleanup_directory(
     *,
     changed_message: str,
     mutation_revalidator: Callable[[], None],
+    restore_member_name_after_rmdir_failure: bool = False,
 ) -> None:
     """Privately isolate and remove only the bound empty directory.
 
@@ -12569,7 +12602,54 @@ def _rmdir_bound_empty_pending_cleanup_directory(
         # The verified private name is fresh, high entropy, and exists only in
         # this mode-0700 namespace.  Keep its exact descriptor live across the
         # only pathname-based destructive syscall available on portable Unix.
-        os.rmdir(private_name, dir_fd=parent_fd)
+        try:
+            os.rmdir(private_name, dir_fd=parent_fd)
+        except OSError as error:
+            if not restore_member_name_after_rmdir_failure:
+                raise
+            # This caller needs a durable, enumerable recovery name. Restore
+            # only the exact, still-empty private object after reproving both
+            # pathname bindings and owner-only policy; otherwise leave the
+            # private evidence in place and fail closed.
+            require_parent_access_boundary()
+            if (
+                _directory_identity(boundary_fd) != expected_member_identity
+                or _directory_identity(member_fd) != expected_member_identity
+                or not _bound_directory_matches(home, private_path, boundary_fd)
+                or _directory_member_names(boundary_fd, maximum_entries=1) != ()
+                or _named_entry_identity(parent_fd, private_name)
+                != expected_member_identity
+                or _named_entry_identity(parent_fd, member_name) is not None
+            ):
+                raise SyncError(
+                    f"{changed_message}; private root could not be safely restored"
+                ) from error
+            try:
+                _rename_noreplace_at(
+                    parent_fd,
+                    private_name,
+                    parent_fd,
+                    member_name,
+                )
+                os.fsync(parent_fd)
+            except OSError as restore_error:
+                raise SyncError(
+                    f"{changed_message}; private root restoration failed: "
+                    f"{restore_error}"
+                ) from error
+            restored_path = parent_path / member_name
+            if (
+                _directory_identity(boundary_fd) != expected_member_identity
+                or _directory_identity(member_fd) != expected_member_identity
+                or not _bound_directory_matches(home, restored_path, boundary_fd)
+                or _directory_member_names(boundary_fd, maximum_entries=1) != ()
+                or _named_entry_identity(parent_fd, member_name)
+                != expected_member_identity
+            ):
+                raise SyncError(
+                    f"{changed_message}; restored root changed after rmdir failure"
+                ) from error
+            raise SyncError(f"{changed_message}; {error}") from error
         os.fsync(parent_fd)
         if _named_entry_identity(parent_fd, private_name) is not None:
             raise SyncError(f"{changed_message}; private name reappeared")
@@ -25942,6 +26022,154 @@ def _require_joined_quarantine_allocation_unchanged(
         )
 
 
+def _require_orphan_v3_empty_proof_allocation_join(
+    home: Path,
+    authority: PendingCleanupEmptyProofAuthority,
+    index_root: Path,
+    index_fd: int,
+) -> None:
+    """Reprove the source-shape authority before orphan-proof deletion.
+
+    A v3 proof is durable authority after its cleanup ticket is gone. For
+    v5/v7 it must therefore rebind the exact v8 allocation control and every
+    field the original cleanup-to-allocation join compared. v4/v8 instead
+    reject any same-batch allocation residue; an unlabelled v1/v2 proof never
+    reaches this function.
+    """
+    if authority.version != 3 or authority.source_ticket_version not in {
+        4,
+        5,
+        7,
+        8,
+    }:
+        raise SyncError(
+            "pending cleanup empty proof lacks v3 source authority: "
+            f"{authority.batch_name}"
+        )
+    _require_pending_cleanup_fd_access_policy(
+        index_fd,
+        index_root,
+        expected_mode=0o700,
+    )
+    if not _bound_directory_matches(home, index_root, index_fd):
+        raise SyncError("pending cleanup empty proof index changed")
+
+    def allocation_control_names() -> tuple[str, ...]:
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending cleanup control scan exceeds the size limit",
+        )
+        related: list[str] = []
+        for name in names:
+            unresolved = _pending_quarantine_unresolved_allocation_representation(
+                name
+            )
+            if unresolved is not None and unresolved[0] == authority.batch_name:
+                raise _pending_quarantine_unresolved_allocation_representation_error(
+                    unresolved
+                )
+            if (
+                _pending_quarantine_allocation_control_batch_name(name)
+                == authority.batch_name
+            ):
+                related.append(name)
+        return tuple(sorted(related))
+
+    before_names = allocation_control_names()
+    has_no_allocation_shape = authority.source_ticket_version in {4, 8} or (
+        authority.source_ticket_version == 5
+        and authority.allocation_control is None
+        and authority.allocation_join_metadata is None
+    )
+    if has_no_allocation_shape:
+        if (
+            authority.allocation_control is not None
+            or authority.allocation_join_metadata is not None
+            or before_names
+        ):
+            raise SyncError(
+                "pending cleanup empty proof allocation authority changed: "
+                f"{authority.batch_name}"
+            )
+    else:
+        allocation_control = authority.allocation_control
+        join_metadata = authority.allocation_join_metadata
+        expected_name = authority.batch_name + PENDING_QUARANTINE_ALLOCATION_SUFFIX
+        if (
+            authority.terminal_regular_targets
+            or allocation_control is None
+            or join_metadata is None
+            or allocation_control.name != expected_name
+            or before_names != (expected_name,)
+        ):
+            raise SyncError(
+                "pending cleanup empty proof allocation authority changed: "
+                f"{authority.batch_name}"
+            )
+        allocation_path = index_root / expected_name
+        snapshot = _read_managed_state_file_snapshot(
+            home,
+            allocation_path,
+            index_fd,
+            expected_identity=allocation_control.file_identity,
+            maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        )
+        if not _pending_private_use_control_matches(snapshot, allocation_control):
+            raise SyncError(
+                "pending cleanup empty proof allocation control changed: "
+                f"{authority.batch_name}"
+            )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            allocation_path,
+            index_fd,
+            snapshot,
+        )
+        allocation = _read_pending_quarantine_allocation_ticket(
+            home,
+            allocation_path,
+            expected_identity=allocation_control.file_identity,
+        )
+        if (
+            allocation is None
+            or not _pending_private_use_control_matches(
+                allocation.snapshot,
+                allocation_control,
+            )
+            or allocation.batch_root.name != authority.batch_name
+            or allocation.quarantine_root_identity
+            != authority.quarantine_root_identity
+            or allocation.isolated_name != authority.isolated_name
+            or allocation.metadata_sha256 != join_metadata.metadata_sha256
+            or allocation.metadata_mode != join_metadata.metadata_mode
+            or (
+                authority.source_ticket_version == 7
+                and allocation.metadata_size != join_metadata.metadata_size
+            )
+            or (
+                authority.source_ticket_version == 5
+                and join_metadata.metadata_size is not None
+            )
+        ):
+            raise SyncError(
+                "pending cleanup empty proof allocation join changed: "
+                f"{authority.batch_name}"
+            )
+    after_names = allocation_control_names()
+    _require_pending_cleanup_fd_access_policy(
+        index_fd,
+        index_root,
+        expected_mode=0o700,
+    )
+    if after_names != before_names or not _bound_directory_matches(
+        home,
+        index_root,
+        index_fd,
+    ):
+        raise SyncError("pending cleanup empty proof allocation index changed")
+
+
 def _delete_pending_quarantine_allocation_ticket(
     home: Path,
     ticket: PendingQuarantineAllocationTicket,
@@ -30427,6 +30655,7 @@ def _remove_pending_batch_directory_contents(
     ) = None,
     directory_expected_mode: int | None = 0o700,
     regular_file_expected_mode: int | None = 0o600,
+    mutation_revalidator: Callable[[PurePosixPath, str], None] | None = None,
 ) -> None:
     if depth > MAX_PENDING_CLEANUP_DEPTH:
         raise SyncError("pending cleanup directory depth exceeds the limit")
@@ -30551,6 +30780,11 @@ def _remove_pending_batch_directory_contents(
         _uid,
         _gid,
     ) in entries:
+        logical_entry_path = (
+            PurePosixPath("links")
+            if links_content_root
+            else PurePosixPath(*relative_parts)
+        ) / logical_name
         if planned[2] not in {
             stat.S_IFDIR,
             stat.S_IFREG,
@@ -30595,6 +30829,13 @@ def _remove_pending_batch_directory_contents(
             )
             is not None
         )
+        if mutation_revalidator is not None:
+            # The caller may hold authority outside this directory's local
+            # identity ledger (for example a terminal alias receipt).  Check
+            # it immediately before the canonical-to-active rename, then
+            # once more below after that rename has made the entry's logical
+            # name recoverable only through the active-token binding.
+            mutation_revalidator(logical_entry_path, "before_isolate")
         active_name, current = _isolate_pending_cleanup_entry(
             directory_fd,
             name,
@@ -30611,6 +30852,8 @@ def _remove_pending_batch_directory_contents(
             ),
         )
         mutated = True
+        if mutation_revalidator is not None:
+            mutation_revalidator(logical_entry_path, "before_delete")
         if stat.S_ISDIR(current.st_mode):
             try:
                 child_fd = os.open(
@@ -30661,6 +30904,7 @@ def _remove_pending_batch_directory_contents(
                     name_validator=name_validator,
                     directory_expected_mode=directory_expected_mode,
                     regular_file_expected_mode=regular_file_expected_mode,
+                    mutation_revalidator=mutation_revalidator,
                 )
                 try:
                     current = os.stat(
@@ -31773,18 +32017,32 @@ def _require_legacy_generic_cleanup_validation_current_state(
             _pending_cleanup_entry_plan(metadata) != entry.plan
             or stat.S_IMODE(metadata.st_mode) != entry.mode
             or metadata.st_uid != entry.uid
-            or metadata.st_gid != entry.gid
+            or (
+                metadata.st_gid != entry.gid
+                and (
+                    entry.plan[2] != stat.S_IFREG
+                    or not _gid_matches_regular_file_access_policy(
+                        metadata.st_gid,
+                        entry.gid,
+                        entry.mode,
+                    )
+                )
+            )
         ):
             raise SyncError(
                 "legacy generic cleanup receipt-bound entry changed: "
                 f"{entry.path.as_posix()}"
             )
 
-    def require_metadata_snapshot(name: str) -> None:
+    def require_metadata_snapshot(
+        name: str,
+        directory_fd: int,
+        physical_path: Path,
+    ) -> None:
         snapshot = _read_managed_state_file_snapshot(
             home,
-            bound_batch_root / name,
-            batch_fd,
+            physical_path / name,
+            directory_fd,
             expected_identity=validation.metadata_identity,
         )
         if (
@@ -31808,8 +32066,48 @@ def _require_legacy_generic_cleanup_validation_current_state(
             raise SyncError("legacy generic cleanup validation metadata changed")
         _require_pending_cleanup_file_snapshot_access_policy(
             home,
-            bound_batch_root / name,
-            batch_fd,
+            physical_path / name,
+            directory_fd,
+            snapshot,
+        )
+
+    def require_finalization_marker_snapshot(
+        name: str,
+        directory_fd: int,
+        physical_path: Path,
+    ) -> None:
+        if (
+            ticket.marker_path is None
+            or ticket.marker_parent_identity is None
+            or ticket.marker_file_identity is None
+            or ticket.marker_mode is None
+            or ticket.marker_sha256 is None
+        ):
+            raise SyncError("legacy generic cleanup validation marker authority changed")
+        snapshot = _read_managed_state_file_snapshot(
+            home,
+            physical_path / name,
+            directory_fd,
+            expected_identity=ticket.marker_file_identity,
+        )
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+            or snapshot.parent_identity != ticket.marker_parent_identity
+            or snapshot.file_identity != ticket.marker_file_identity
+            or snapshot.file_type != stat.S_IFREG
+            or snapshot.mode != ticket.marker_mode
+            or snapshot.uid != os.geteuid()
+            or snapshot.payload is None
+            or hashlib.sha256(snapshot.payload).hexdigest()
+            != ticket.marker_sha256
+        ):
+            raise SyncError(
+                "legacy generic cleanup validation finalization marker changed"
+            )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            physical_path / name,
+            directory_fd,
             snapshot,
         )
 
@@ -31997,7 +32295,13 @@ def _require_legacy_generic_cleanup_validation_current_state(
             observed_paths.add(candidate_path)
             require_entry(authority, metadata)
             if candidate_path == PurePosixPath(PENDING_LINK_METADATA_NAME):
-                require_metadata_snapshot(name)
+                require_metadata_snapshot(name, directory_fd, physical_path)
+            elif candidate_path == ticket.marker_path:
+                require_finalization_marker_snapshot(
+                    name,
+                    directory_fd,
+                    physical_path,
+                )
             elif authority.plan[2] == stat.S_IFREG:
                 require_regular_file_access_policy(
                     directory_fd,
@@ -32615,33 +32919,404 @@ def _delete_pending_cleanup_terminal_validation(
         _close_fd_quietly(index_fd)
 
 
-def _pending_cleanup_empty_proof_payload(
+def _pending_cleanup_empty_proof_authority_from_ticket(
     ticket: PendingBatchCleanupTicket,
     quarantine_root_identity: tuple[int, int],
-) -> bytes:
+    *,
+    joined_allocation: PendingQuarantineAllocationTicket | None = None,
+) -> PendingCleanupEmptyProofAuthority:
     if ticket.snapshot.file_identity is None or ticket.snapshot.payload is None:
         raise SyncError("pending cleanup ticket has no empty-proof identity")
+    terminal_regular_targets = (
+        tuple(
+            replace(expectation, link_count=None)
+            for expectation in ticket.terminal_regular_targets
+        )
+        if ticket.version in {4, 8}
+        else ()
+    )
+    source_ticket_version: int | None = None
+    allocation_control: PendingPrivateUseControlEvidence | None = None
+    allocation_join_metadata: PendingCleanupEmptyProofAllocationJoin | None = None
+    if ticket.version in {4, 8}:
+        # v3 carries the exact target group and its source shape.  The latter
+        # lets an orphan scanner reject historic v1/v2 bytes that cannot state
+        # whether they came from an allocation-backed ephemeral cleanup.
+        proof_version = 3
+        source_ticket_version = ticket.version
+    elif ticket.version == 5:
+        if ticket.terminal_regular_targets:
+            raise SyncError("ephemeral cleanup ticket has terminal regular targets")
+        # A normal v5 private move has already retired its allocation fence
+        # through the private-use receipt before empty-batch cleanup begins.
+        # If an exact v8 join survives a crash, carry it; otherwise v3 records
+        # the explicit no-allocation source shape.
+        proof_version = 3
+        source_ticket_version = ticket.version
+        if joined_allocation is None:
+            pass
+        else:
+            if (
+                not _cleanup_ticket_matches_quarantine_allocation(
+                    ticket,
+                    joined_allocation,
+                )
+                or joined_allocation.snapshot.payload is None
+            ):
+                raise SyncError(
+                    "pending quarantine allocation does not join cleanup authority: "
+                    f"{ticket.batch_root.name}"
+                )
+            if (
+                ticket.metadata_sha256 is None
+                or ticket.metadata_mode is None
+            ):
+                raise SyncError("pending ephemeral cleanup authority is incomplete")
+            allocation_control = _pending_private_use_control_evidence(
+                joined_allocation.path.name,
+                joined_allocation.snapshot,
+            )
+            allocation_join_metadata = PendingCleanupEmptyProofAllocationJoin(
+                metadata_sha256=ticket.metadata_sha256,
+                metadata_size=ticket.metadata_size,
+                metadata_mode=ticket.metadata_mode,
+            )
+    elif ticket.version == 7:
+        if ticket.terminal_regular_targets:
+            raise SyncError("ephemeral cleanup ticket has terminal regular targets")
+        if joined_allocation is None:
+            # Retained-reader compatibility for a historic v1/v2 proof. A
+            # current v7 publisher rejects this state before writing a proof.
+            proof_version = 1
+        else:
+            if (
+                not _cleanup_ticket_matches_quarantine_allocation(
+                    ticket,
+                    joined_allocation,
+                )
+                or joined_allocation.snapshot.payload is None
+            ):
+                raise SyncError(
+                    "pending quarantine allocation does not join cleanup authority: "
+                    f"{ticket.batch_root.name}"
+                )
+            if (
+                ticket.metadata_sha256 is None
+                or ticket.metadata_mode is None
+                or ticket.metadata_size is None
+            ):
+                raise SyncError("pending ephemeral cleanup authority is incomplete")
+            proof_version = 3
+            source_ticket_version = ticket.version
+            allocation_control = _pending_private_use_control_evidence(
+                joined_allocation.path.name,
+                joined_allocation.snapshot,
+            )
+            allocation_join_metadata = PendingCleanupEmptyProofAllocationJoin(
+                metadata_sha256=ticket.metadata_sha256,
+                metadata_size=ticket.metadata_size,
+                metadata_mode=ticket.metadata_mode,
+            )
+    else:
+        proof_version = 1
+    return PendingCleanupEmptyProofAuthority(
+        version=proof_version,
+        batch_name=ticket.batch_root.name,
+        batch_root_identity=ticket.batch_root_identity,
+        quarantine_root_identity=quarantine_root_identity,
+        isolated_name=_pending_cleanup_isolated_batch_name(ticket.batch_root.name),
+        ticket_identity=ticket.snapshot.file_identity,
+        ticket_sha256=hashlib.sha256(ticket.snapshot.payload).hexdigest(),
+        terminal_regular_targets=terminal_regular_targets,
+        source_ticket_version=source_ticket_version,
+        allocation_control=allocation_control,
+        allocation_join_metadata=allocation_join_metadata,
+    )
+
+
+def _pending_cleanup_empty_proof_payload_from_authority(
+    authority: PendingCleanupEmptyProofAuthority,
+) -> bytes:
+    if authority.version not in {1, 2, 3}:
+        raise SyncError("pending cleanup empty proof has an unsupported version")
+    payload: dict[str, object] = {
+        "version": authority.version,
+        "batch": authority.batch_name,
+        "batch_root_identity": _identity_payload(authority.batch_root_identity),
+        "quarantine_root_identity": _identity_payload(
+            authority.quarantine_root_identity
+        ),
+        "isolated_name": authority.isolated_name,
+        "ticket_identity": _identity_payload(authority.ticket_identity),
+        "ticket_sha256": authority.ticket_sha256,
+    }
+    if authority.version == 1:
+        if (
+            authority.terminal_regular_targets
+            or authority.source_ticket_version is not None
+            or authority.allocation_control is not None
+            or authority.allocation_join_metadata is not None
+        ):
+            raise SyncError("pending cleanup empty proof v1 has unsupported authority")
+    elif authority.version == 2:
+        if (
+            authority.source_ticket_version is not None
+            or authority.allocation_control is not None
+            or authority.allocation_join_metadata is not None
+        ):
+            raise SyncError("pending cleanup empty proof v2 has unsupported authority")
+        payload["terminal_regular_targets"] = [
+            _pending_regular_target_expectation_payload(
+                expectation,
+                include_link_count=False,
+            )
+            for expectation in authority.terminal_regular_targets
+        ]
+    else:
+        if authority.source_ticket_version not in {4, 5, 7, 8}:
+            raise SyncError("pending cleanup empty proof v3 has invalid source ticket")
+        payload["source_ticket_version"] = authority.source_ticket_version
+        payload["terminal_regular_targets"] = [
+            _pending_regular_target_expectation_payload(
+            expectation,
+            include_link_count=False,
+        )
+            for expectation in authority.terminal_regular_targets
+        ]
+        if (
+            authority.source_ticket_version in {5, 7}
+            and authority.terminal_regular_targets
+        ):
+            raise SyncError(
+                "pending cleanup empty proof v3 has unexpected ephemeral targets"
+            )
+        if authority.source_ticket_version in {4, 8} or (
+            authority.source_ticket_version == 5
+            and authority.allocation_control is None
+            and authority.allocation_join_metadata is None
+        ):
+            if (
+                authority.allocation_control is not None
+                or authority.allocation_join_metadata is not None
+            ):
+                raise SyncError(
+                    "pending cleanup empty proof v3 has unexpected allocation authority"
+                )
+            payload["allocation_control"] = None
+            payload["allocation_join_metadata"] = None
+        else:
+            allocation_control = authority.allocation_control
+            join_metadata = authority.allocation_join_metadata
+            if (
+                authority.terminal_regular_targets
+                or allocation_control is None
+                or join_metadata is None
+            ):
+                raise SyncError(
+                    "pending cleanup empty proof v3 lacks ephemeral allocation authority"
+                )
+            if (
+                allocation_control.name
+                != authority.batch_name + PENDING_QUARANTINE_ALLOCATION_SUFFIX
+            ):
+                raise SyncError("pending cleanup empty proof v3 allocation changed")
+            join_payload: dict[str, object] = {
+                "sha256": join_metadata.metadata_sha256,
+                "mode": join_metadata.metadata_mode,
+            }
+            if authority.source_ticket_version == 7:
+                if join_metadata.metadata_size is None:
+                    raise SyncError(
+                        "pending cleanup empty proof v3 lacks v7 metadata size"
+                    )
+                join_payload["size"] = join_metadata.metadata_size
+            elif join_metadata.metadata_size is not None:
+                raise SyncError(
+                    "pending cleanup empty proof v3 has unexpected v5 metadata size"
+                )
+            payload["allocation_control"] = _pending_private_use_control_payload(
+                allocation_control
+            )
+            payload["allocation_join_metadata"] = join_payload
     return _bounded_json_document(
-        {
-            "version": 1,
-            "batch": ticket.batch_root.name,
-            "batch_root_identity": _identity_payload(ticket.batch_root_identity),
-            "quarantine_root_identity": _identity_payload(quarantine_root_identity),
-            "isolated_name": _pending_cleanup_isolated_batch_name(
-                ticket.batch_root.name
-            ),
-            "ticket_identity": _identity_payload(ticket.snapshot.file_identity),
-            "ticket_sha256": hashlib.sha256(ticket.snapshot.payload).hexdigest(),
-        },
+        payload,
         max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
         overflow_error="pending cleanup empty proof exceeds the size limit",
     )
+
+
+def _pending_cleanup_empty_proof_payload(
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+    *,
+    joined_allocation: PendingQuarantineAllocationTicket | None = None,
+) -> bytes:
+    return _pending_cleanup_empty_proof_payload_from_authority(
+        _pending_cleanup_empty_proof_authority_from_ticket(
+            ticket,
+            quarantine_root_identity,
+            joined_allocation=joined_allocation,
+        )
+    )
+
+
+def _parse_pending_cleanup_empty_proof_authority(
+    proof_path: Path,
+    payload: bytes | None,
+) -> PendingCleanupEmptyProofAuthority:
+    suffix = PENDING_CLEANUP_EMPTY_PROOF_SUFFIX
+    if payload is None or not proof_path.name.endswith(suffix):
+        raise SyncError("pending cleanup empty proof changed")
+    batch_name = proof_path.name[: -len(suffix)]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        raise SyncError("pending cleanup empty proof changed")
+    try:
+        data = _decode_managed_state_json(payload, proof_path)
+    except SyncError as error:
+        raise SyncError(f"pending cleanup empty proof changed: {batch_name}") from error
+    version = data.get("version")
+    expected_fields = {
+        "version",
+        "batch",
+        "batch_root_identity",
+        "quarantine_root_identity",
+        "isolated_name",
+        "ticket_identity",
+        "ticket_sha256",
+    }
+    if version == 2:
+        expected_fields.add("terminal_regular_targets")
+    elif version == 3:
+        expected_fields.update(
+            {
+                "source_ticket_version",
+                "terminal_regular_targets",
+                "allocation_control",
+                "allocation_join_metadata",
+            }
+        )
+    if version not in {1, 2, 3} or set(data) != expected_fields:
+        raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
+    batch_identity = _parse_pending_identity(
+        data.get("batch_root_identity"),
+        "pending cleanup empty-proof batch identity",
+    )
+    quarantine_identity = _parse_pending_identity(
+        data.get("quarantine_root_identity"),
+        "pending cleanup empty-proof quarantine identity",
+    )
+    ticket_identity = _parse_pending_identity(
+        data.get("ticket_identity"),
+        "pending cleanup empty-proof ticket identity",
+    )
+    ticket_sha256 = data.get("ticket_sha256")
+    isolated_name = _pending_cleanup_isolated_batch_name(batch_name)
+    if (
+        data.get("batch") != batch_name
+        or batch_identity is None
+        or quarantine_identity is None
+        or ticket_identity is None
+        or data.get("isolated_name") != isolated_name
+        or not isinstance(ticket_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", ticket_sha256) is None
+    ):
+        raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
+    targets = (
+        _parse_pending_terminal_regular_targets(
+            data.get("terminal_regular_targets"),
+            batch_name=batch_name,
+            require_link_count=False,
+        )
+        if version in {2, 3}
+        else ()
+    )
+    source_ticket_version: int | None = None
+    allocation_control: PendingPrivateUseControlEvidence | None = None
+    allocation_join_metadata: PendingCleanupEmptyProofAllocationJoin | None = None
+    if version == 3:
+        source_ticket_version = data.get("source_ticket_version")
+        if source_ticket_version not in {4, 5, 7, 8}:
+            raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
+        if source_ticket_version in {5, 7} and targets:
+            raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
+        allocation_payload = data.get("allocation_control")
+        join_payload = data.get("allocation_join_metadata")
+        if source_ticket_version in {4, 8}:
+            if allocation_payload is not None or join_payload is not None:
+                raise SyncError(
+                    f"pending cleanup empty proof changed: {batch_name}"
+                )
+        elif source_ticket_version == 5 and (
+            allocation_payload is None or join_payload is None
+        ):
+            if allocation_payload is not None or join_payload is not None:
+                raise SyncError(
+                    f"pending cleanup empty proof changed: {batch_name}"
+                )
+        else:
+            if targets:
+                raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
+            allocation_control = _pending_private_use_control_from_payload(
+                allocation_payload,
+                expected_name=batch_name + PENDING_QUARANTINE_ALLOCATION_SUFFIX,
+                label="pending cleanup empty-proof allocation control",
+            )
+            expected_join_fields = {"sha256", "mode"}
+            if source_ticket_version == 7:
+                expected_join_fields.add("size")
+            if not isinstance(join_payload, dict) or set(join_payload) != expected_join_fields:
+                raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
+            metadata_sha256 = join_payload.get("sha256")
+            metadata_mode = join_payload.get("mode")
+            metadata_size = join_payload.get("size")
+            if (
+                not isinstance(metadata_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", metadata_sha256) is None
+                or metadata_mode != 0o600
+                or (
+                    source_ticket_version == 7
+                    and (
+                        type(metadata_size) is not int
+                        or not 0 <= metadata_size <= MAX_MANAGED_STATE_BYTES
+                    )
+                )
+                or (source_ticket_version == 5 and metadata_size is not None)
+            ):
+                raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
+            allocation_join_metadata = PendingCleanupEmptyProofAllocationJoin(
+                metadata_sha256=metadata_sha256,
+                metadata_size=(
+                    metadata_size if source_ticket_version == 7 else None
+                ),
+                metadata_mode=metadata_mode,
+            )
+    authority = PendingCleanupEmptyProofAuthority(
+        version=version,
+        batch_name=batch_name,
+        batch_root_identity=batch_identity,
+        quarantine_root_identity=quarantine_identity,
+        isolated_name=isolated_name,
+        ticket_identity=ticket_identity,
+        ticket_sha256=ticket_sha256,
+        terminal_regular_targets=targets,
+        source_ticket_version=source_ticket_version,
+        allocation_control=allocation_control,
+        allocation_join_metadata=allocation_join_metadata,
+    )
+    if payload != _pending_cleanup_empty_proof_payload_from_authority(authority):
+        raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
+    return authority
 
 
 def _read_pending_cleanup_empty_proof(
     home: Path,
     ticket: PendingBatchCleanupTicket,
     quarantine_root_identity: tuple[int, int],
+    *,
+    joined_allocation: PendingQuarantineAllocationTicket | None = None,
 ) -> ManagedStateFileSnapshot | None:
     proof_path = _pending_cleanup_empty_proof_path(
         home,
@@ -32656,15 +33331,61 @@ def _read_pending_cleanup_empty_proof(
         )
         if not proof.exists:
             return None
-        expected_payload = _pending_cleanup_empty_proof_payload(
+        authority = _parse_pending_cleanup_empty_proof_authority(
+            proof_path,
+            proof.payload,
+        )
+        current_allocation: PendingQuarantineAllocationTicket | None = None
+        if ticket.version in {5, 7}:
+            current_allocation = _read_joined_quarantine_allocation_for_cleanup(
+                home,
+                ticket,
+            )
+            if (
+                joined_allocation is not None
+                and (
+                    current_allocation is None
+                    or not _pending_quarantine_allocation_ticket_matches(
+                        current_allocation,
+                        joined_allocation,
+                    )
+                )
+            ):
+                raise SyncError(
+                    "pending quarantine allocation changed while reading empty proof: "
+                    f"{ticket.batch_root.name}"
+                )
+        elif joined_allocation is not None:
+            raise ValueError("non-ephemeral empty proof received an allocation join")
+        expected_authority = _pending_cleanup_empty_proof_authority_from_ticket(
             ticket,
             quarantine_root_identity,
+            joined_allocation=current_allocation,
         )
+        compatible_v1_authority = replace(
+            expected_authority,
+            version=1,
+            terminal_regular_targets=(),
+            source_ticket_version=None,
+            allocation_control=None,
+            allocation_join_metadata=None,
+        )
+        compatible_authorities = [expected_authority, compatible_v1_authority]
+        if ticket.version in {4, 5, 7, 8}:
+            compatible_authorities.append(
+                replace(
+                    expected_authority,
+                    version=2,
+                    source_ticket_version=None,
+                    allocation_control=None,
+                    allocation_join_metadata=None,
+                )
+            )
         if (
             proof.file_type != stat.S_IFREG
             or proof.mode != 0o600
             or proof.uid != os.geteuid()
-            or proof.payload != expected_payload
+            or authority not in compatible_authorities
             or proof.parent_identity != _directory_identity(index_fd)
         ):
             raise SyncError(
@@ -32685,11 +33406,34 @@ def _publish_pending_cleanup_empty_proof(
     home: Path,
     ticket: PendingBatchCleanupTicket,
     quarantine_root_identity: tuple[int, int],
+    *,
+    joined_allocation: PendingQuarantineAllocationTicket | None = None,
 ) -> ManagedStateFileSnapshot:
+    ticket_version = getattr(ticket, "version", None)
+    if ticket_version == 7:
+        if joined_allocation is None:
+            raise SyncError(
+                "pending ephemeral cleanup needs an exact allocation join before "
+                f"empty-proof publication: {ticket.batch_root.name}"
+            )
+        _require_joined_quarantine_allocation_unchanged(
+            home,
+            ticket,
+            joined_allocation,
+        )
+    elif ticket_version == 5 and joined_allocation is not None:
+        _require_joined_quarantine_allocation_unchanged(
+            home,
+            ticket,
+            joined_allocation,
+        )
+    elif joined_allocation is not None:
+        raise ValueError("non-ephemeral empty proof received an allocation join")
     existing = _read_pending_cleanup_empty_proof(
         home,
         ticket,
         quarantine_root_identity,
+        joined_allocation=joined_allocation,
     )
     if existing is not None:
         return existing
@@ -32703,12 +33447,14 @@ def _publish_pending_cleanup_empty_proof(
         _pending_cleanup_empty_proof_payload(
             ticket,
             quarantine_root_identity,
+            joined_allocation=joined_allocation,
         ),
     )
     verified = _read_pending_cleanup_empty_proof(
         home,
         ticket,
         quarantine_root_identity,
+        joined_allocation=joined_allocation,
     )
     if verified is None or not _managed_state_snapshot_matches_bound_file_evidence(
         verified,
@@ -32718,6 +33464,12 @@ def _publish_pending_cleanup_empty_proof(
             f"pending cleanup empty proof changed after publication: "
             f"{ticket.batch_root.name}"
         )
+    if ticket_version in {5, 7} and joined_allocation is not None:
+        _require_joined_quarantine_allocation_unchanged(
+            home,
+            ticket,
+            joined_allocation,
+        )
     return verified
 
 
@@ -32725,6 +33477,8 @@ def _delete_pending_cleanup_empty_proof(
     home: Path,
     ticket: PendingBatchCleanupTicket,
     quarantine_root_identity: tuple[int, int],
+    *,
+    boundary_revalidator: Callable[[], None] | None = None,
 ) -> None:
     proof_path = _pending_cleanup_empty_proof_path(
         home,
@@ -32737,16 +33491,60 @@ def _delete_pending_cleanup_empty_proof(
             if ticket.version in {5, 7}
             else None
         )
-        # v5/v7 retire an allocation after the proof is gone.  A canonical
+        # v5/v7 retire an allocation after the proof is gone. A canonical
         # ticket may have just been deleted while a retained or suffix-added
         # representation of its exact bytes remains.  Such a representation is
         # blocking evidence only: it must never gain recovery or deletion
         # authority, but the proof must survive so canonical recovery does not
         # lose its exact empty-batch evidence.
+        proof = _read_pending_cleanup_empty_proof(
+            home,
+            ticket,
+            quarantine_root_identity,
+        )
+        if proof is None:
+            return
+        proof_authority = _parse_pending_cleanup_empty_proof_authority(
+            proof_path,
+            proof.payload,
+        )
+
+        def revalidate_proof_boundary(
+            _proof_member: str,
+            *,
+            require_ticket_representations: bool = True,
+        ) -> None:
+            # A v2/v3 proof is the only persistent final-target authority after
+            # ticket retirement. Recheck it at both irreversible proof-file
+            # boundaries; retained ticket representations also keep the proof
+            # as evidence instead of allowing it to be discarded. This is the
+            # final point-in-time pre-unlink group check: the generic helper's
+            # unlink is the retirement linearization point, so a same-UID
+            # namespace change after this callback is post-commit behavior
+            # rather than an atomic cross-object guarantee.
+            if proof_authority.version in {2, 3}:
+                if require_ticket_representations:
+                    _require_pending_ephemeral_ticket_representations_absent(
+                        home,
+                        proof_path.parent,
+                        index_fd,
+                        ticket.batch_root.name,
+                    )
+                _verify_final_regular_target_group(
+                    home,
+                    proof_authority.terminal_regular_targets,
+                )
+            if boundary_revalidator is not None:
+                boundary_revalidator()
+
         mutation_revalidator: Callable[[str], None] | None = None
         if ticket.version in {5, 7}:
 
             def revalidate_ticket_representations(_proof_member: str) -> None:
+                revalidate_proof_boundary(
+                    _proof_member,
+                    require_ticket_representations=False,
+                )
                 _require_pending_ephemeral_ticket_representations_absent(
                     home,
                     proof_path.parent,
@@ -32760,15 +33558,10 @@ def _delete_pending_cleanup_empty_proof(
                 )
 
             mutation_revalidator = revalidate_ticket_representations
+        elif proof_authority.version in {2, 3} or boundary_revalidator is not None:
+            mutation_revalidator = revalidate_proof_boundary
+        if mutation_revalidator is not None:
             mutation_revalidator(proof_path.name)
-
-        proof = _read_pending_cleanup_empty_proof(
-            home,
-            ticket,
-            quarantine_root_identity,
-        )
-        if proof is None:
-            return
         _isolate_and_delete_pending_cleanup_file(
             home,
             proof_path,
@@ -33969,6 +34762,22 @@ def _remove_pending_ephemeral_quarantine_batch(
             ticket.batch_root_identity,
         )
 
+    def current_empty_proof_authority() -> PendingCleanupEmptyProofAuthority:
+        proof = _read_pending_cleanup_empty_proof(
+            home,
+            ticket,
+            quarantine_root_identity,
+        )
+        if proof is None:
+            raise SyncError(
+                "pending cleanup batch root is missing without an exact "
+                f"empty proof: {batch_name}"
+            )
+        return _parse_pending_cleanup_empty_proof_authority(
+            _pending_cleanup_empty_proof_path(home, batch_name),
+            proof.payload,
+        )
+
     try:
         _require_pending_cleanup_fd_access_policy(
             quarantine_fd,
@@ -33983,21 +34792,16 @@ def _remove_pending_ephemeral_quarantine_batch(
             raise SyncError("pending cleanup quarantine root changed")
         root_binding = current_batch_root_binding()
         if root_binding is None:
-            proof = _read_pending_cleanup_empty_proof(
-                home,
-                ticket,
-                quarantine_root_identity,
-            )
-            if proof is None:
-                raise SyncError(
-                    "pending cleanup batch root is missing without an exact "
-                    f"empty proof: {batch_name}"
-                )
+            proof_authority = current_empty_proof_authority()
             _delete_pending_cleanup_ticket(home, ticket)
             _delete_pending_cleanup_empty_proof(
                 home,
                 ticket,
                 quarantine_root_identity,
+                boundary_revalidator=lambda: _require_pending_cleanup_proof_batch_roots_absent(
+                    home,
+                    proof_authority,
+                ),
             )
             require_allocation_join()
             _retire_joined_quarantine_allocation(
@@ -34288,6 +35092,7 @@ def _remove_pending_ephemeral_quarantine_batch(
             home,
             ticket,
             quarantine_root_identity,
+            joined_allocation=joined_allocation,
         )
         _require_pending_cleanup_ticket_unchanged(home, ticket)
         _require_pending_cleanup_fd_access_policy(
@@ -34347,11 +35152,16 @@ def _remove_pending_ephemeral_quarantine_batch(
         _close_fd_quietly(leaf_fd)
         _close_fd_quietly(batch_fd)
         _close_fd_quietly(quarantine_fd)
+    proof_authority = current_empty_proof_authority()
     _delete_pending_cleanup_ticket(home, ticket)
     _delete_pending_cleanup_empty_proof(
         home,
         ticket,
         quarantine_root_identity,
+        boundary_revalidator=lambda: _require_pending_cleanup_proof_batch_roots_absent(
+            home,
+            proof_authority,
+        ),
     )
     require_allocation_join()
     _retire_joined_quarantine_allocation(
@@ -34790,6 +35600,35 @@ def _remove_cleanup_ready_batch(
         batch_name = ticket.batch_root.name
         isolated_name = _pending_cleanup_isolated_batch_name(batch_name)
         bound_batch_root = ticket.batch_root
+
+        def require_no_private_batch_root_residue() -> None:
+            expected_plan = (
+                ticket.batch_root_identity[0],
+                ticket.batch_root_identity[1],
+                stat.S_IFDIR,
+            )
+            names = _directory_member_names(
+                quarantine_fd,
+                maximum_entries=MAX_PENDING_CLEANUP_ENTRIES,
+                overflow_message="pending cleanup quarantine root exceeds the size limit",
+            )
+            for name in names:
+                for prefix in (
+                    PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                    PENDING_CLEANUP_RETAINED_ENTRY_PREFIX,
+                ):
+                    if (
+                        _pending_cleanup_internal_entry_plan(
+                            name,
+                            prefix,
+                            quarantine_root_identity,
+                        )
+                        == expected_plan
+                    ):
+                        raise SyncError(
+                            "pending cleanup batch has unresolved private root "
+                            f"evidence: {batch_name}"
+                        )
         try:
             batch_fd = os.open(
                 batch_name,
@@ -34805,6 +35644,7 @@ def _remove_cleanup_ready_batch(
                     dir_fd=quarantine_fd,
                 )
             except FileNotFoundError:
+                require_no_private_batch_root_residue()
                 proof = _read_pending_cleanup_empty_proof(
                     home,
                     ticket,
@@ -34833,18 +35673,25 @@ def _remove_cleanup_ready_batch(
                         "pending cleanup batch root is missing without an exact "
                         f"empty proof: {batch_name}"
                     )
-                _verify_final_regular_targets(home, ticket)
-                _delete_pending_cleanup_terminal_validation(
-                    home,
-                    ticket,
-                    quarantine_root_identity,
-                )
-                _delete_pending_cleanup_ticket(home, ticket)
-                _delete_pending_cleanup_empty_proof(
-                    home,
-                    ticket,
-                    quarantine_root_identity,
-                )
+                if ticket.version in {4, 8}:
+                    _retire_terminal_regular_cleanup_controls(
+                        home,
+                        ticket,
+                        quarantine_root_identity,
+                    )
+                else:
+                    _verify_final_regular_targets(home, ticket)
+                    _delete_pending_cleanup_terminal_validation(
+                        home,
+                        ticket,
+                        quarantine_root_identity,
+                    )
+                    _delete_pending_cleanup_ticket(home, ticket)
+                    _delete_pending_cleanup_empty_proof(
+                        home,
+                        ticket,
+                        quarantine_root_identity,
+                    )
                 return True
         legacy_generic_validation: LegacyGenericCleanupValidation | None = None
         existing_legacy_receipt = (
@@ -34926,14 +35773,65 @@ def _remove_cleanup_ready_batch(
                 name_validator=_pending_batch_cleanup_name_is_authorized,
                 directory_expected_mode=0o700,
             )
-        if legacy_generic_validation is not None:
+        if legacy_generic_validation is not None and existing_legacy_receipt is None:
+            revalidated_legacy_metadata = (
+                _require_legacy_generic_cleanup_ticket_is_nonterminal(
+                    home,
+                    ticket,
+                    bound_batch_root,
+                    batch_fd,
+                )
+            )
+            if revalidated_legacy_metadata is None:
+                raise SyncError(
+                    "legacy generic cleanup metadata or finalization marker "
+                    "changed before receipt publication"
+                )
+            revalidated_legacy_validation = (
+                _legacy_generic_cleanup_validation_from_current_state(
+                    home,
+                    ticket,
+                    bound_batch_root,
+                    batch_fd,
+                    revalidated_legacy_metadata,
+                )
+            )
+            if revalidated_legacy_validation is None:
+                raise SyncError(
+                    "legacy generic cleanup namespace changed before receipt "
+                    "publication"
+                )
             legacy_generic_validation = replace(
-                legacy_generic_validation,
+                revalidated_legacy_validation,
                 entries=_legacy_generic_cleanup_entries_from_identity_ledger(
                     ticket,
                     identity_ledger,
                 ),
             )
+            # The ledger-to-receipt conversion itself can take time and reads
+            # mutable directory entries.  Re-run the parser-bound proof after
+            # it has finished so neither a replacement finalization marker nor
+            # a same-inode metadata rewrite becomes newly published receipt
+            # authority.
+            final_legacy_metadata = (
+                _require_legacy_generic_cleanup_ticket_is_nonterminal(
+                    home,
+                    ticket,
+                    bound_batch_root,
+                    batch_fd,
+                )
+            )
+            if (
+                final_legacy_metadata is None
+                or not _managed_state_snapshot_matches_bound_file_evidence(
+                    final_legacy_metadata,
+                    revalidated_legacy_metadata,
+                )
+            ):
+                raise SyncError(
+                    "legacy generic cleanup metadata or finalization marker "
+                    "changed during receipt preparation"
+                )
         _ensure_pending_terminal_validation_receipt(
             home,
             ticket,
@@ -34942,6 +35840,19 @@ def _remove_cleanup_ready_batch(
             quarantine_root_identity,
             legacy_generic_validation=legacy_generic_validation,
         )
+        if legacy_generic_validation is not None:
+            # Receipt publication itself is a mutable control-file operation.
+            # Re-read the complete receipt-bound namespace before admitting
+            # even the first walker mutation, so a metadata or marker rewrite
+            # cannot become authority merely because an unrelated entry happens
+            # to be enumerated first.
+            _require_legacy_generic_cleanup_validation_current_state(
+                home,
+                ticket,
+                bound_batch_root,
+                batch_fd,
+                legacy_generic_validation,
+            )
         if ticket.version not in {1, 2}:
             # v4/v8 receipt setup may add a terminal recovery hard link.  The
             # deletion ledger must be captured after that controlled mutation,
@@ -34962,6 +35873,7 @@ def _remove_cleanup_ready_batch(
                 name_validator=_pending_batch_cleanup_name_is_authorized,
                 directory_expected_mode=0o700,
             )
+        terminal_alias_paths: frozenset[PurePosixPath] = frozenset()
         if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
             receipt = _read_pending_cleanup_terminal_validation(
                 home,
@@ -35023,6 +35935,99 @@ def _remove_cleanup_ready_batch(
                 terminal_authority.directories,
                 require_complete_aliases=False,
             )
+            terminal_alias_paths = frozenset(
+                alias.path for alias in terminal_authority.aliases
+            )
+        legacy_mutation_revalidator: (
+            Callable[[PurePosixPath, str], None] | None
+        ) = None
+        if legacy_generic_validation is not None:
+
+            def revalidate_legacy_control_file(
+                logical_path: PurePosixPath,
+                _stage: str,
+            ) -> None:
+                # Metadata and the finalization marker carry semantic cleanup
+                # authority for the entire batch.  A rewrite after receipt
+                # publication must therefore block *any* later destructive
+                # mutation, not only deletion of those two files. The receipt
+                # validator accepts already-consumed slots, follows v2 active
+                # tokens, and deliberately ignores unrelated directory churn.
+                _require_legacy_generic_cleanup_validation_current_state(
+                    home,
+                    ticket,
+                    bound_batch_root,
+                    batch_fd,
+                    legacy_generic_validation,
+                )
+
+            legacy_mutation_revalidator = revalidate_legacy_control_file
+        mutation_revalidator = legacy_mutation_revalidator
+        if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
+
+            def revalidate_terminal_alias_boundary(
+                logical_path: PurePosixPath,
+                _stage: str,
+            ) -> None:
+                # Rebuild the current receipt-bound alias ledger immediately
+                # before each terminal regular alias is renamed or unlinked.
+                # This closes the gap between the pre-walker ledger check and
+                # the destructive boundary without treating unrelated
+                # directory entry churn as a target mutation.
+                if logical_path not in terminal_alias_paths:
+                    return
+                current_receipt = _read_pending_cleanup_terminal_validation(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                )
+                if current_receipt is None:
+                    raise SyncError(
+                        "pending terminal validation receipt disappeared before "
+                        f"cleanup: {ticket.batch_root.name}"
+                    )
+                current_authority = _parse_pending_terminal_validation_authority(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                    current_receipt,
+                )
+                if current_authority is None:
+                    raise SyncError(
+                        "pending terminal validation receipt lacks namespace "
+                        f"authority: {ticket.batch_root.name}"
+                    )
+                if frozenset(
+                    alias.path for alias in current_authority.aliases
+                ) != terminal_alias_paths:
+                    raise SyncError(
+                        "pending terminal validation namespace authority changed "
+                        f"before cleanup: {ticket.batch_root.name}"
+                    )
+                current_budget = [MAX_PENDING_CLEANUP_ENTRIES]
+                current_ledger: PendingCleanupIdentityLedger = {}
+                _capture_pending_cleanup_identity_ledger(
+                    batch_fd,
+                    ticket.batch_root_identity,
+                    batch_mount_identity,
+                    current_budget,
+                    current_ledger,
+                    depth=0,
+                    relative_parts=(),
+                    skipped_names=frozenset(),
+                    name_validator=_pending_batch_cleanup_name_is_authorized,
+                    directory_expected_mode=0o700,
+                )
+                _validate_pending_terminal_alias_ledger(
+                    home,
+                    ticket,
+                    current_ledger,
+                    current_authority.aliases,
+                    current_authority.directories,
+                    require_complete_aliases=False,
+                )
+
+            mutation_revalidator = revalidate_terminal_alias_boundary
         _remove_pending_batch_directory_contents(
             batch_fd,
             ticket.batch_root_identity,
@@ -35031,6 +36036,7 @@ def _remove_cleanup_ready_batch(
             depth=0,
             identity_ledger=identity_ledger,
             name_validator=_pending_batch_cleanup_name_is_authorized,
+            mutation_revalidator=mutation_revalidator,
         )
         with os.scandir(batch_fd) as iterator:
             if next(iterator, None) is not None:
@@ -35061,31 +36067,92 @@ def _remove_cleanup_ready_batch(
             bound_batch_root,
             expected_mode=0o700,
         )
+        expected_proof_authority = _pending_cleanup_empty_proof_authority_from_ticket(
+            ticket,
+            quarantine_root_identity,
+        )
         _publish_pending_cleanup_empty_proof(
             home,
             ticket,
             quarantine_root_identity,
         )
-        os.rmdir(isolated_name, dir_fd=quarantine_fd)
-        os.fsync(quarantine_fd)
+
+        def require_terminal_batch_rmdir_boundary() -> None:
+            _require_pending_cleanup_ticket_unchanged(home, ticket)
+            _require_pending_cleanup_fd_access_policy(
+                quarantine_fd,
+                quarantine_root,
+                expected_mode=0o700,
+            )
+            _require_pending_cleanup_fd_access_policy(
+                batch_fd,
+                bound_batch_root,
+                expected_mode=0o700,
+            )
+            if (
+                _directory_identity(quarantine_fd) != quarantine_root_identity
+                or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+                or _named_entry_identity(quarantine_fd, isolated_name)
+                != ticket.batch_root_identity
+                or _directory_identity(batch_fd) != ticket.batch_root_identity
+                or not _bound_directory_matches(home, bound_batch_root, batch_fd)
+                or _directory_member_names(batch_fd, maximum_entries=1) != ()
+            ):
+                raise SyncError(f"pending cleanup batch root changed: {batch_name}")
+            proof = _read_pending_cleanup_empty_proof(
+                home,
+                ticket,
+                quarantine_root_identity,
+            )
+            if proof is None:
+                raise SyncError(
+                    "pending cleanup batch root is missing without an exact "
+                    f"empty proof: {batch_name}"
+                )
+            _verify_final_regular_targets(home, ticket)
+
+        _rmdir_bound_empty_pending_cleanup_directory(
+            home,
+            quarantine_root,
+            quarantine_fd,
+            quarantine_root_identity,
+            isolated_name,
+            bound_batch_root,
+            batch_fd,
+            ticket.batch_root_identity,
+            changed_message=f"pending cleanup batch root changed: {batch_name}",
+            mutation_revalidator=require_terminal_batch_rmdir_boundary,
+            restore_member_name_after_rmdir_failure=True,
+        )
         if _named_entry_identity(quarantine_fd, isolated_name) is not None:
             raise SyncError(f"pending cleanup batch root reappeared: {batch_name}")
     finally:
         if batch_fd >= 0:
             _close_fd_quietly(batch_fd)
         _close_fd_quietly(quarantine_fd)
-    _verify_final_regular_targets(home, ticket)
-    _delete_pending_cleanup_terminal_validation(
-        home,
-        ticket,
-        quarantine_root_identity,
-    )
-    _delete_pending_cleanup_ticket(home, ticket)
-    _delete_pending_cleanup_empty_proof(
-        home,
-        ticket,
-        quarantine_root_identity,
-    )
+    if ticket.version in {4, 8}:
+        _retire_terminal_regular_cleanup_controls(
+            home,
+            ticket,
+            quarantine_root_identity,
+        )
+    else:
+        _verify_final_regular_targets(home, ticket)
+        _delete_pending_cleanup_terminal_validation(
+            home,
+            ticket,
+            quarantine_root_identity,
+        )
+        _delete_pending_cleanup_ticket(home, ticket)
+        _delete_pending_cleanup_empty_proof(
+            home,
+            ticket,
+            quarantine_root_identity,
+            boundary_revalidator=lambda: _require_pending_cleanup_proof_batch_roots_absent(
+                home,
+                expected_proof_authority,
+            ),
+        )
     return True
 
 
@@ -35163,6 +36230,104 @@ def _delete_pending_cleanup_ticket(
             )
     finally:
         _close_fd_quietly(index_fd)
+
+
+def _retire_terminal_regular_cleanup_controls(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+) -> None:
+    """Retire v4/v8 controls while retaining final-target authority.
+
+    A normal ticket proves the target group until its own deletion. Afterwards
+    a v3 empty proof carries the same group, so every receipt, ticket, and
+    proof mutation boundary remains fail-closed across a crash/retry split.
+    """
+    if ticket.version not in {4, 8}:
+        raise ValueError("terminal regular control retirement requires v4 or v8")
+    expected_proof_authority = _pending_cleanup_empty_proof_authority_from_ticket(
+        ticket,
+        quarantine_root_identity,
+    )
+    compatible_v2_authority = replace(
+        expected_proof_authority,
+        version=2,
+        source_ticket_version=None,
+        allocation_control=None,
+        allocation_join_metadata=None,
+    )
+
+    def require_current_v3_proof_and_final_group() -> None:
+        proof = _read_pending_cleanup_empty_proof(
+            home,
+            ticket,
+            quarantine_root_identity,
+        )
+        if proof is None:
+            raise SyncError(
+                "pending cleanup batch root is missing without an exact empty "
+                f"proof: {ticket.batch_root.name}"
+            )
+        proof_authority = _parse_pending_cleanup_empty_proof_authority(
+            _pending_cleanup_empty_proof_path(home, ticket.batch_root.name),
+            proof.payload,
+        )
+        if (
+            proof_authority != expected_proof_authority
+            and proof_authority != compatible_v2_authority
+        ):
+            # Old v1 proofs remain parseable so callers can report or inspect
+            # historic state, but they lack the final target group needed once
+            # the canonical ticket moves to a tombstone. Historic v2 can only
+            # complete while this exact v4/v8 ticket remains live; an orphan
+            # scanner never accepts it because it lacks source-shape authority.
+            raise SyncError(
+                "pending cleanup empty proof lacks v3 final target authority: "
+                f"{ticket.batch_root.name}"
+            )
+        _require_pending_cleanup_proof_batch_roots_absent(
+            home,
+            proof_authority,
+        )
+        _verify_final_regular_target_group(
+            home,
+            proof_authority.terminal_regular_targets,
+        )
+
+    def require_ticket_proof_and_final_group() -> None:
+        _verify_final_regular_targets(home, ticket)
+        require_current_v3_proof_and_final_group()
+
+    def require_terminal_validation_boundary(
+        _receipt_member: str,
+        _index_fd: int,
+    ) -> None:
+        require_ticket_proof_and_final_group()
+
+    _delete_pending_cleanup_terminal_validation(
+        home,
+        ticket,
+        quarantine_root_identity,
+        mutation_revalidator=require_terminal_validation_boundary,
+    )
+    _delete_pending_cleanup_ticket(
+        home,
+        ticket,
+        # The generic ticket deleter holds and revalidates the ticket's exact
+        # descriptor after it has renamed the canonical pathname. The v2 proof
+        # is re-read at both mutation boundaries because it becomes the only
+        # durable target-group authority when that canonical name disappears.
+        boundary_revalidator=require_current_v3_proof_and_final_group,
+    )
+    _delete_pending_cleanup_empty_proof(
+        home,
+        ticket,
+        quarantine_root_identity,
+        boundary_revalidator=lambda: _require_pending_cleanup_proof_batch_roots_absent(
+            home,
+            expected_proof_authority,
+        ),
+    )
 
 
 def _try_cleanup_finalized_pending_batch(
@@ -36301,6 +37466,81 @@ def _cleanup_pending_cleanup_ticket_temps(
     return discarded
 
 
+def _require_pending_cleanup_proof_batch_roots_absent(
+    home: Path,
+    authority: PendingCleanupEmptyProofAuthority,
+) -> None:
+    """Reprove the missing batch namespace before a proof is retired."""
+    quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
+    quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    try:
+        if _directory_identity(
+            quarantine_fd
+        ) != authority.quarantine_root_identity or not _bound_directory_matches(
+            home, quarantine_root, quarantine_fd
+        ):
+            raise SyncError("pending cleanup quarantine root changed")
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd,
+            quarantine_root,
+            expected_mode=0o700,
+        )
+
+        def require_no_private_batch_root_residue() -> None:
+            expected_plan = (
+                authority.batch_root_identity[0],
+                authority.batch_root_identity[1],
+                stat.S_IFDIR,
+            )
+            names = _directory_member_names(
+                quarantine_fd,
+                maximum_entries=MAX_PENDING_CLEANUP_ENTRIES,
+                overflow_message="pending cleanup quarantine root exceeds the size limit",
+            )
+            for name in names:
+                for prefix in (
+                    PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                    PENDING_CLEANUP_RETAINED_ENTRY_PREFIX,
+                ):
+                    if (
+                        _pending_cleanup_internal_entry_plan(
+                            name,
+                            prefix,
+                            authority.quarantine_root_identity,
+                        )
+                        == expected_plan
+                    ):
+                        raise SyncError(
+                            "pending cleanup empty proof has unresolved private "
+                            f"batch-root evidence: {authority.batch_name}"
+                        )
+
+        require_no_private_batch_root_residue()
+        if (
+            _named_entry_identity(quarantine_fd, authority.batch_name) is not None
+            or _named_entry_identity(quarantine_fd, authority.isolated_name)
+            is not None
+        ):
+            raise SyncError(
+                "pending cleanup empty proof still has a batch root: "
+                f"{authority.batch_name}"
+            )
+        if _directory_identity(
+            quarantine_fd
+        ) != authority.quarantine_root_identity or not _bound_directory_matches(
+            home, quarantine_root, quarantine_fd
+        ):
+            raise SyncError("pending cleanup quarantine root changed")
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd,
+            quarantine_root,
+            expected_mode=0o700,
+        )
+        require_no_private_batch_root_residue()
+    finally:
+        _close_fd_quietly(quarantine_fd)
+
+
 def _read_orphan_pending_cleanup_empty_proof(
     home: Path,
     proof_path: Path,
@@ -36336,78 +37576,11 @@ def _read_orphan_pending_cleanup_empty_proof(
         )
     finally:
         _close_fd_quietly(index_fd)
-    data = _decode_managed_state_json(proof.payload, proof_path)
-    if (
-        set(data)
-        != {
-            "version",
-            "batch",
-            "batch_root_identity",
-            "quarantine_root_identity",
-            "isolated_name",
-            "ticket_identity",
-            "ticket_sha256",
-        }
-        or data.get("version") != 1
-    ):
-        raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
-    batch_identity = _parse_pending_identity(
-        data.get("batch_root_identity"),
-        "pending cleanup empty-proof batch identity",
+    authority = _parse_pending_cleanup_empty_proof_authority(
+        proof_path,
+        proof.payload,
     )
-    quarantine_identity = _parse_pending_identity(
-        data.get("quarantine_root_identity"),
-        "pending cleanup empty-proof quarantine identity",
-    )
-    ticket_identity = _parse_pending_identity(
-        data.get("ticket_identity"),
-        "pending cleanup empty-proof ticket identity",
-    )
-    ticket_sha256 = data.get("ticket_sha256")
-    isolated_name = _pending_cleanup_isolated_batch_name(batch_name)
-    if (
-        data.get("batch") != batch_name
-        or batch_identity is None
-        or quarantine_identity is None
-        or ticket_identity is None
-        or data.get("isolated_name") != isolated_name
-        or not isinstance(ticket_sha256, str)
-        or re.fullmatch(r"[0-9a-f]{64}", ticket_sha256) is None
-    ):
-        raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
-    expected_payload = _bounded_json_document(
-        {
-            "version": 1,
-            "batch": batch_name,
-            "batch_root_identity": _identity_payload(batch_identity),
-            "quarantine_root_identity": _identity_payload(quarantine_identity),
-            "isolated_name": isolated_name,
-            "ticket_identity": _identity_payload(ticket_identity),
-            "ticket_sha256": ticket_sha256,
-        },
-        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
-        overflow_error="pending cleanup empty proof exceeds the size limit",
-    )
-    if proof.payload != expected_payload:
-        raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
-    quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
-    quarantine_fd = _open_directory_beneath(home, quarantine_root)
-    try:
-        if _directory_identity(
-            quarantine_fd
-        ) != quarantine_identity or not _bound_directory_matches(
-            home, quarantine_root, quarantine_fd
-        ):
-            raise SyncError("pending cleanup quarantine root changed")
-        if (
-            _named_entry_identity(quarantine_fd, batch_name) is not None
-            or _named_entry_identity(quarantine_fd, isolated_name) is not None
-        ):
-            raise SyncError(
-                f"pending cleanup empty proof still has a batch root: {batch_name}"
-            )
-    finally:
-        _close_fd_quietly(quarantine_fd)
+    _require_pending_cleanup_proof_batch_roots_absent(home, authority)
     return proof
 
 
@@ -36466,6 +37639,22 @@ def _cleanup_orphan_pending_cleanup_empty_proofs(
             continue
         proof_path = index_root / proof_name
         proof = _read_orphan_pending_cleanup_empty_proof(home, proof_path)
+        proof_authority = _parse_pending_cleanup_empty_proof_authority(
+            proof_path,
+            proof.payload,
+        )
+        if proof_authority.version != 3:
+            # Historic v1/v2 proofs omit the source ticket shape. A missing
+            # canonical ticket therefore leaves an ambiguity between a regular
+            # target group and an allocation-backed ephemeral cleanup. Retain
+            # the control for exact-ticket restoration or manual recovery
+            # instead of promoting legacy bytes into terminal authority.
+            raise SyncError(
+                "historic pending cleanup empty proof lacks v3 source "
+                "authority; manual recovery is required: "
+                f"{batch_name}. Restore the exact canonical ticket and retry "
+                "the installer; do not delete pending cleanup evidence manually."
+            )
         index_fd = _open_directory_beneath(home, index_root)
         try:
 
@@ -36479,6 +37668,25 @@ def _cleanup_orphan_pending_cleanup_empty_proofs(
                     index_root,
                     index_fd,
                     batch_name,
+                )
+                _require_orphan_v3_empty_proof_allocation_join(
+                    home,
+                    proof_authority,
+                    index_root,
+                    index_fd,
+                )
+                _require_pending_cleanup_proof_batch_roots_absent(
+                    home,
+                    proof_authority,
+                )
+                # The canonical ticket may already have been retired. The v3
+                # proof is therefore the sole authority for this terminal
+                # deletion; its source shape also proves whether a v8
+                # allocation must remain live. A foreign hard link keeps the
+                # proof for retry instead of silently discarding it.
+                _verify_final_regular_target_group(
+                    home,
+                    proof_authority.terminal_regular_targets,
                 )
 
             revalidate_ticket_representations(proof_path.name)
@@ -38476,28 +39684,29 @@ def _batch_has_regular_records(batch: PendingLinkBatch) -> bool:
     return any(record.has_regular_authority() for record in batch.records)
 
 
-def _verify_final_regular_targets(
+def _verify_final_regular_target_group(
     home: Path,
-    ticket: PendingBatchCleanupTicket,
+    expectations: tuple[PendingRegularTargetExpectation, ...],
+    *,
+    passes: int = 3,
+    preflight: bool = True,
 ) -> None:
-    if ticket.version not in {4, 8}:
-        return
-    _require_pending_terminal_regular_group_size_budget(
-        tuple(expected.size for expected in ticket.terminal_regular_targets),
-        phase=ticket.phase,
-    )
-    for _pass in range(3):
-        current_ticket = _read_pending_cleanup_ticket(
-            home,
-            ticket.path,
-            expected_ticket_identity=ticket.snapshot.file_identity,
+    """Verify final targets without reading a cleanup ticket.
+
+    The protected property is the final target group: each path must still
+    bind the exact parent and regular-file object, byte content, and managed
+    access policy, with no surviving hard-link alias. Directory ctime or
+    unrelated child churn is intentionally not compared.
+    """
+    if passes < 1:
+        raise ValueError("final regular target verification pass count is invalid")
+    if preflight:
+        _require_pending_terminal_regular_group_size_budget(
+            tuple(expected.size for expected in expectations),
+            phase="final",
         )
-        if current_ticket is None or not _pending_cleanup_ticket_matches(
-            current_ticket,
-            ticket,
-        ):
-            raise SyncError(f"pending cleanup ticket changed: {ticket.batch_root.name}")
-        for expected in ticket.terminal_regular_targets:
+    for _pass in range(passes):
+        for expected in expectations:
             target = home / Path(*expected.target.parts)
             snapshot = _read_regular_file_snapshot_beneath(
                 home,
@@ -38516,6 +39725,37 @@ def _verify_final_regular_targets(
                 raise SyncError(
                     f"final managed regular file changed: {expected.target}"
                 )
+
+
+def _verify_final_regular_targets(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+) -> None:
+    if ticket.version not in {4, 8}:
+        return
+    # Reject an over-budget authority before reading its mutable ticket.  The
+    # same target group is then reread at each ticket boundary below.
+    _require_pending_terminal_regular_group_size_budget(
+        tuple(expected.size for expected in ticket.terminal_regular_targets),
+        phase="final",
+    )
+    for _pass in range(3):
+        current_ticket = _read_pending_cleanup_ticket(
+            home,
+            ticket.path,
+            expected_ticket_identity=ticket.snapshot.file_identity,
+        )
+        if current_ticket is None or not _pending_cleanup_ticket_matches(
+            current_ticket,
+            ticket,
+        ):
+            raise SyncError(f"pending cleanup ticket changed: {ticket.batch_root.name}")
+        _verify_final_regular_target_group(
+            home,
+            ticket.terminal_regular_targets,
+            passes=1,
+            preflight=False,
+        )
     current_ticket = _read_pending_cleanup_ticket(
         home,
         ticket.path,
