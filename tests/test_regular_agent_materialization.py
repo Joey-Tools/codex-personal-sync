@@ -2323,6 +2323,30 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
         return ticket
 
+    def _prepare_pointerless_legacy_generic_regular_ticket(
+        self,
+        *,
+        phase: str,
+    ) -> MODULE.PendingBatchCleanupTicket:
+        install(self.release, self.home, SHA_A)
+        next_release = self.root / f"pointerless-generic-{phase}-release"
+        write_release(next_release, role_payload='name = "updated"\n')
+        batch = self._interrupt_uncommitted_regular_publication(next_release, SHA_B)
+        parsed = self._downgrade_pending_regular_metadata(batch, 6)
+        if phase == "after":
+            MODULE._publish_pending_commit_marker(self.home, parsed)
+        write_legacy_generic_terminal_ticket(self.home, parsed, phase=phase)
+        os.unlink(MODULE._pending_link_pointer_path(self.home))
+        ticket_path = MODULE._pending_cleanup_ticket_path(
+            self.home,
+            parsed.batch_root.name,
+        )
+        ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket_path)
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertEqual(ticket.version, 1 if phase == "after" else 2)
+        return ticket
+
     def _downgrade_durable_pending_regular_metadata(
         self,
         batch: MODULE.PendingLinkBatch,
@@ -2939,6 +2963,72 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self.assertEqual(state_path.read_bytes(), state_before)
         self.assertTrue(ticket_path.is_file())
         self.assertTrue(parsed.batch_root.is_dir())
+
+    def test_zero_cleanup_budget_reclassifies_canonical_legacy_authority(
+        self,
+    ) -> None:
+        for phase, invalidate_marker, expected_error in (
+            ("after", False, "complete terminal regular hard-link group"),
+            ("before", True, "manual recovery is required"),
+        ):
+            with self.subTest(phase=phase):
+                self.home = self.root / f"home-zero-budget-{phase}"
+                ticket = self._prepare_pointerless_legacy_generic_regular_ticket(
+                    phase=phase
+                )
+                if invalidate_marker:
+                    assert ticket.marker_path is not None
+                    os.unlink(ticket.batch_root / Path(*ticket.marker_path.parts))
+                stage = mock.Mock(
+                    side_effect=AssertionError("mutation staging must not start")
+                )
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_stage_release_tree_for_install",
+                        stage,
+                    ),
+                    self.assertRaisesRegex(MODULE.SyncError, expected_error),
+                ):
+                    MODULE.install_release_tree(
+                        self.release,
+                        self.home,
+                        SHA_A,
+                        dry_run=False,
+                        cleanup_budget=MODULE.PendingCleanupActionBudget(0),
+                    )
+
+                stage.assert_not_called()
+                self.assertTrue(ticket.path.is_file())
+                self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_mutation_gate_preserves_legacy_foreign_batch_exemption(
+        self,
+    ) -> None:
+        ticket = self._prepare_pointerless_legacy_generic_regular_ticket(
+            phase="before"
+        )
+        real_bound = MODULE._bound_directory_matches
+
+        def classify_ticket_batch_as_foreign(
+            home: Path,
+            path: Path,
+            directory_fd: int,
+        ) -> bool:
+            if path == ticket.batch_root:
+                return False
+            return real_bound(home, path, directory_fd)
+
+        with mock.patch.object(
+            MODULE,
+            "_bound_directory_matches",
+            side_effect=classify_ticket_batch_as_foreign,
+        ):
+            MODULE._require_no_pending_terminal_mutation_authority(self.home)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
 
     def test_pointerless_generic_schema_rejection_keeps_compatible_cleanup(
         self,

@@ -31243,6 +31243,79 @@ def _pending_terminal_validation_alias_changed_error(path: PurePosixPath) -> Syn
     return SyncError(f"pending terminal regular alias changed: {path.as_posix()}")
 
 
+def _pending_terminal_validation_current_by_path(
+    identity_ledger: PendingCleanupIdentityLedger,
+    terminal_aliases: tuple[PendingTerminalValidationAlias, ...],
+) -> dict[PurePosixPath, tuple[tuple[int, int], tuple[int, int, int]]]:
+    """Resolve uniquely bound legacy active files back to receipt slots.
+
+    A v1 active token carries the parent and object identities but not its
+    pre-rename logical name. The immutable receipt can restore that name only
+    when exactly one still-unoccupied slot has the same binding. A terminal
+    object that cannot be bound uniquely is rejected here so its synthetic
+    ledger path cannot collide with a real receipt slot. Non-terminal objects
+    retain that synthetic path for compatibility with legacy cleanup ledgers.
+    """
+    current_by_path: dict[
+        PurePosixPath,
+        tuple[tuple[int, int], tuple[int, int, int]],
+    ] = {}
+    legacy_active_files: list[
+        tuple[tuple[int, int], tuple[int, int, int], PurePosixPath]
+    ] = []
+    for parent_identity, entries in identity_ledger.items():
+        for (
+            _name,
+            planned,
+            already_active,
+            links_content_root,
+            logical_name,
+            _active_matches,
+            ledger_path,
+        ) in entries:
+            legacy_ledger_name = _pending_cleanup_legacy_active_ledger_name(
+                parent_identity,
+                planned,
+            )
+            is_legacy_active_file = (
+                planned[2] == stat.S_IFREG
+                and already_active
+                and not links_content_root
+                and ledger_path.name == legacy_ledger_name
+                and logical_name != legacy_ledger_name
+            )
+            if is_legacy_active_file:
+                legacy_active_files.append(
+                    (parent_identity, planned, ledger_path)
+                )
+                continue
+            if ledger_path in current_by_path:
+                raise SyncError("pending cleanup terminal alias path is duplicated")
+            current_by_path[ledger_path] = (parent_identity, planned)
+
+    terminal_file_identities = {alias.file_identity for alias in terminal_aliases}
+    for parent_identity, planned, legacy_path in legacy_active_files:
+        candidates = [
+            alias.path
+            for alias in terminal_aliases
+            if alias.parent_identity == parent_identity
+            and alias.file_identity == planned[:2]
+            and alias.path not in current_by_path
+        ]
+        if len(candidates) == 1:
+            resolved_path = candidates[0]
+        elif planned[:2] in terminal_file_identities:
+            raise SyncError(
+                "pending terminal legacy active alias cannot be uniquely resolved"
+            )
+        else:
+            resolved_path = legacy_path
+        if resolved_path in current_by_path:
+            raise SyncError("pending cleanup terminal alias path is duplicated")
+        current_by_path[resolved_path] = (parent_identity, planned)
+    return current_by_path
+
+
 def _ensure_pending_terminal_validation_receipt(
     home: Path,
     ticket: PendingBatchCleanupTicket,
@@ -31435,24 +31508,11 @@ def _validate_pending_terminal_alias_ledger(
     expected_identities = {
         expectation.file_identity for expectation in ticket.terminal_regular_targets
     }
-    current_by_path: dict[
-        PurePosixPath,
-        tuple[tuple[int, int], tuple[int, int, int]],
-    ] = {}
     alias_counts: dict[tuple[int, int], int] = {}
-    for parent_identity, entries in identity_ledger.items():
-        for (
-            _name,
-            planned,
-            _active,
-            _links_root,
-            _logical_name,
-            _active_matches,
-            ledger_path,
-        ) in entries:
-            if ledger_path in current_by_path:
-                raise SyncError("pending cleanup terminal alias path is duplicated")
-            current_by_path[ledger_path] = (parent_identity, planned)
+    current_by_path = _pending_terminal_validation_current_by_path(
+        identity_ledger,
+        terminal_aliases,
+    )
     for path, expected_identity in expected_directories.items():
         current = current_by_path.get(path)
         if current is None:
@@ -36299,6 +36359,63 @@ def _try_cleanup_ready_pending_batches(home: Path) -> int:
         return 0
 
 
+def _require_legacy_generic_cleanup_ticket_allows_mutation(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+) -> None:
+    """Reclassify a budget-deferred canonical v1/v2 ticket before mutation."""
+    if ticket.version not in {1, 2}:
+        return
+    quarantine_root = ticket.batch_root.parent
+    try:
+        quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    except FileNotFoundError:
+        return
+    batch_fd = -1
+    try:
+        if not _bound_directory_matches(home, quarantine_root, quarantine_fd):
+            raise SyncError("pending cleanup quarantine root changed before mutation")
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd,
+            quarantine_root,
+            expected_mode=0o700,
+        )
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            batch_fd = os.open(
+                ticket.batch_root.name,
+                directory_flags,
+                dir_fd=quarantine_fd,
+            )
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                # A non-directory canonical slot cannot be the ticket-bound
+                # batch. Keep the historic foreign-batch exemption.
+                return
+            raise _pending_cleanup_authority_classification_error(
+                ticket.batch_root.name,
+                error,
+            ) from error
+        try:
+            _require_legacy_generic_cleanup_ticket_is_nonterminal(
+                home,
+                ticket,
+                ticket.batch_root,
+                batch_fd,
+            )
+        except _LegacyGenericCleanupForeignBatch:
+            # An identity or binding mismatch proves only a foreign canonical
+            # occupant. Preserve the existing cleanup deferral exemption.
+            return
+    finally:
+        _close_fd_quietly(batch_fd)
+        _close_fd_quietly(quarantine_fd)
+
+
 def _require_no_pending_terminal_mutation_authority(home: Path) -> None:
     if not _pending_link_pointer_is_absent(home):
         raise SyncError(
@@ -36432,7 +36549,12 @@ def _require_no_pending_terminal_mutation_authority(home: Path) -> None:
                 batch_name,
                 error,
             ) from error
-        if ticket is not None and ticket.version in {3, 4, 5, 6, 7, 8}:
+        if ticket is None:
+            continue
+        if ticket.version in {1, 2}:
+            _require_legacy_generic_cleanup_ticket_allows_mutation(home, ticket)
+            continue
+        if ticket.version in {3, 4, 5, 6, 7, 8}:
             raise SyncError(
                 "pending cleanup authority must reach terminal validation before "
                 f"new mutation: {batch_name} (ticket v{ticket.version})"

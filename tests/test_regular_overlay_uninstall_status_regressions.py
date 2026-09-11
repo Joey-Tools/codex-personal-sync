@@ -755,6 +755,226 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertFalse(ticket.batch_root.exists())
         self.assertEqual(self.target.stat().st_nlink, 1)
 
+    def test_terminal_validation_resumes_name_max_fallback_after_rename(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        expected_identities = {
+            expectation.file_identity
+            for expectation in ticket.terminal_regular_targets
+        }
+        stage = ticket.batch_root / "pending" / "stage"
+        stage_alias = next(
+            path
+            for path in stage.iterdir()
+            if (path.stat().st_dev, path.stat().st_ino) in expected_identities
+        )
+        links = ticket.batch_root / "links"
+        logical_name = "x" * MODULE.MAX_PENDING_CLEANUP_ACTIVE_LOGICAL_NAME_BYTES
+        stage_fd = MODULE._open_directory_beneath(self.home, stage)
+        links_fd = MODULE._open_directory_beneath(self.home, links)
+        try:
+            MODULE._rename_noreplace_at(
+                stage_fd,
+                stage_alias.name,
+                links_fd,
+                logical_name,
+            )
+            os.fsync(stage_fd)
+            os.fsync(links_fd)
+        finally:
+            MODULE._close_fd_quietly(links_fd)
+            MODULE._close_fd_quietly(stage_fd)
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=SystemExit("injected crash after receipt"),
+            ),
+            self.assertRaisesRegex(SystemExit, "after receipt"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        quarantine_fd = MODULE._open_directory_beneath(
+            self.home,
+            ticket.batch_root.parent,
+        )
+        try:
+            receipt = MODULE._read_pending_cleanup_terminal_validation(
+                self.home,
+                ticket,
+                MODULE._directory_identity(quarantine_fd),
+            )
+            self.assertIsNotNone(receipt)
+            assert receipt is not None
+            authority = MODULE._parse_pending_terminal_validation_authority(
+                self.home,
+                ticket,
+                MODULE._directory_identity(quarantine_fd),
+                receipt,
+            )
+        finally:
+            MODULE._close_fd_quietly(quarantine_fd)
+        self.assertIsNotNone(authority)
+        assert authority is not None
+        links_alias = next(
+            alias
+            for alias in authority.aliases
+            if alias.path == PurePosixPath("links", logical_name)
+        )
+
+        real_unlink = os.unlink
+        crashed = False
+        fallback_name: str | None = None
+
+        def crash_before_fallback_unlink(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            *args: object,
+            dir_fd: int | None = None,
+            **kwargs: object,
+        ) -> None:
+            nonlocal crashed, fallback_name
+            current_identity = None
+            parent_identity = None
+            if dir_fd is not None:
+                parent = os.fstat(dir_fd)
+                parent_identity = (parent.st_dev, parent.st_ino)
+                try:
+                    current = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+                except OSError:
+                    pass
+                else:
+                    current_identity = (current.st_dev, current.st_ino)
+            name = os.fsdecode(path)
+            if (
+                not crashed
+                and parent_identity == links_alias.parent_identity
+                and current_identity == links_alias.file_identity
+                and name.startswith(MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+                and MODULE._pending_cleanup_active_entry_binding(
+                    name,
+                    links_alias.parent_identity,
+                )
+                is None
+            ):
+                crashed = True
+                fallback_name = name
+                raise SystemExit("injected crash after fallback rename")
+            real_unlink(path, *args, dir_fd=dir_fd, **kwargs)
+
+        with (
+            mock.patch.object(MODULE.os, "fpathconf", return_value=143),
+            mock.patch.object(
+                MODULE.os,
+                "unlink",
+                side_effect=crash_before_fallback_unlink,
+            ),
+            self.assertRaisesRegex(SystemExit, "after fallback rename"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(crashed)
+        self.assertIsNotNone(fallback_name)
+        assert fallback_name is not None
+        alias_parent = self._directory_with_identity(
+            ticket.batch_root,
+            links_alias.parent_identity,
+        )
+        self.assertTrue((alias_parent / fallback_name).is_file())
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
+        self.assertFalse(ticket.batch_root.exists())
+        self.assertEqual(self.target.stat().st_nlink, 1)
+
+    def test_terminal_validation_does_not_guess_ambiguous_v1_active_slot(
+        self,
+    ) -> None:
+        parent_identity = (1, 2)
+        planned = (3, 4, stat.S_IFREG)
+        physical_name = (
+            f"{MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX}"
+            f"1-2-3-4-{stat.S_IFREG:x}-{'0' * 16}"
+        )
+        legacy_name = MODULE._pending_cleanup_legacy_active_ledger_name(
+            parent_identity,
+            planned,
+        )
+        legacy_path = PurePosixPath("links", legacy_name)
+        identity_ledger = {
+            parent_identity: (
+                (
+                    physical_name,
+                    planned,
+                    True,
+                    False,
+                    physical_name,
+                    True,
+                    legacy_path,
+                ),
+            ),
+        }
+        aliases = tuple(
+            MODULE.PendingTerminalValidationAlias(
+                path=PurePosixPath("links", name),
+                parent_identity=parent_identity,
+                file_identity=planned[:2],
+            )
+            for name in ("first.toml", "second.toml")
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "legacy active alias cannot be uniquely resolved",
+        ):
+            MODULE._pending_terminal_validation_current_by_path(
+                identity_ledger,
+                aliases,
+            )
+
+    def test_terminal_validation_rejects_legacy_synthetic_name_collision(
+        self,
+    ) -> None:
+        parent_identity = (1, 2)
+        planned = (3, 4, stat.S_IFREG)
+        physical_name = (
+            f"{MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX}"
+            f"1-2-3-4-{stat.S_IFREG:x}-{'0' * 16}"
+        )
+        legacy_name = MODULE._pending_cleanup_legacy_active_ledger_name(
+            parent_identity,
+            planned,
+        )
+        legacy_path = PurePosixPath("links", legacy_name)
+        identity_ledger = {
+            parent_identity: (
+                (
+                    physical_name,
+                    planned,
+                    True,
+                    False,
+                    physical_name,
+                    True,
+                    legacy_path,
+                ),
+            ),
+        }
+        aliases = tuple(
+            MODULE.PendingTerminalValidationAlias(
+                path=path,
+                parent_identity=parent_identity,
+                file_identity=planned[:2],
+            )
+            for path in (legacy_path, PurePosixPath("links", "second.toml"))
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "legacy active alias cannot be uniquely resolved",
+        ):
+            MODULE._pending_terminal_validation_current_by_path(
+                identity_ledger,
+                aliases,
+            )
+
     def test_odd_hex_v2_active_entry_is_not_bound(self) -> None:
         name = (
             f"{MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX}"
