@@ -4875,6 +4875,9 @@ PendingCleanupIdentityLedgerEntry = tuple[
     str,
     bool,
     PurePosixPath,
+    int,
+    int,
+    int,
 ]
 PendingCleanupIdentityLedger = dict[
     tuple[int, int], tuple[PendingCleanupIdentityLedgerEntry, ...]
@@ -5337,6 +5340,32 @@ class ManagedStateFileSnapshot:
     size: int | None = None
     uid: int | None = None
     gid: int | None = None
+
+
+@dataclass(frozen=True)
+class LegacyGenericCleanupEntryAuthority:
+    """One immutable pre-walker namespace slot for legacy generic cleanup."""
+
+    path: PurePosixPath
+    parent_identity: tuple[int, int]
+    plan: tuple[int, int, int]
+    mode: int
+    uid: int
+    gid: int
+
+
+@dataclass(frozen=True)
+class LegacyGenericCleanupValidation:
+    """The durable pre-walker authority for a fully parsed v1/v2 ticket."""
+
+    metadata_identity: tuple[int, int]
+    metadata_sha256: str
+    metadata_size: int
+    metadata_mode: int
+    metadata_uid: int
+    metadata_gid: int
+    pending_identity: tuple[int, int]
+    entries: tuple[LegacyGenericCleanupEntryAuthority, ...]
 
 
 @dataclass
@@ -30323,6 +30352,9 @@ def _capture_pending_cleanup_identity_ledger(
                     logical_name,
                     active_plan_matches_entry,
                     PurePosixPath(*relative_parts, ledger_name),
+                    stat.S_IMODE(metadata.st_mode),
+                    metadata.st_uid,
+                    metadata.st_gid,
                 )
             )
     ledger[directory_identity] = tuple(entries)
@@ -30347,6 +30379,9 @@ def _capture_pending_cleanup_identity_ledger(
         logical_name,
         active_plan_matches_entry,
         _ledger_path,
+        _mode,
+        _uid,
+        _gid,
     ) in entries:
         if planned[2] != stat.S_IFDIR or not active_plan_matches_entry:
             continue
@@ -30478,6 +30513,9 @@ def _remove_pending_batch_directory_contents(
             _logical_name,
             _active_matches,
             _ledger_path,
+            _mode,
+            _uid,
+            _gid,
         ) in entries
     }
     if current_entries != expected_entries:
@@ -30509,6 +30547,9 @@ def _remove_pending_batch_directory_contents(
         logical_name,
         _active_plan_matches_entry,
         _ledger_path,
+        _mode,
+        _uid,
+        _gid,
     ) in entries:
         if planned[2] not in {
             stat.S_IFDIR,
@@ -30857,6 +30898,9 @@ def _pending_terminal_validation_aliases_from_identity_ledger(
             _logical_name,
             _active_matches,
             ledger_path,
+            _mode,
+            _uid,
+            _gid,
         ) in entries:
             if planned[2] != stat.S_IFREG or planned[:2] not in expected_identities:
                 continue
@@ -30891,6 +30935,9 @@ def _pending_terminal_validation_directories_from_identity_ledger(
             _logical_name,
             _active_matches,
             ledger_path,
+            _mode,
+            _uid,
+            _gid,
         ) in entries:
             if planned[2] != stat.S_IFDIR:
                 continue
@@ -30928,6 +30975,156 @@ def _pending_terminal_validation_directories_from_identity_ledger(
             directories.items(), key=lambda item: item[0].as_posix()
         )
     )
+
+
+def _legacy_generic_cleanup_entries_from_identity_ledger(
+    ticket: PendingBatchCleanupTicket,
+    identity_ledger: PendingCleanupIdentityLedger,
+) -> tuple[LegacyGenericCleanupEntryAuthority, ...]:
+    """Freeze every deletable legacy slot before the generic walker mutates it."""
+    entries: list[LegacyGenericCleanupEntryAuthority] = []
+    for parent_identity, ledger_entries in identity_ledger.items():
+        for (
+            _name,
+            planned,
+            _already_active,
+            _links_root,
+            _logical_name,
+            _active_matches,
+            ledger_path,
+            mode,
+            uid,
+            gid,
+        ) in ledger_entries:
+            entries.append(
+                LegacyGenericCleanupEntryAuthority(
+                    path=ledger_path,
+                    parent_identity=parent_identity,
+                    plan=planned,
+                    mode=mode,
+                    uid=uid,
+                    gid=gid,
+                )
+            )
+    entries.sort(key=lambda entry: entry.path.as_posix())
+    if len(entries) > MAX_PENDING_CLEANUP_ENTRIES:
+        raise SyncError("legacy generic cleanup authority exceeds the entry limit")
+    if any(left.path == right.path for left, right in zip(entries, entries[1:])):
+        raise SyncError("legacy generic cleanup authority has duplicate paths")
+    by_path = {entry.path: entry for entry in entries}
+    for entry in entries:
+        parent_path = entry.path.parent
+        expected_parent_identity = ticket.batch_root_identity
+        if parent_path.parts:
+            parent = by_path.get(parent_path)
+            if parent is None or parent.plan[2] != stat.S_IFDIR:
+                raise SyncError(
+                    "legacy generic cleanup authority has an unbound parent: "
+                    f"{entry.path.as_posix()}"
+                )
+            expected_parent_identity = parent.plan[:2]
+        if entry.parent_identity != expected_parent_identity:
+            raise SyncError(
+                "legacy generic cleanup authority parent changed: "
+                f"{entry.path.as_posix()}"
+            )
+    return tuple(entries)
+
+
+def _legacy_generic_cleanup_entry_payload(
+    entry: LegacyGenericCleanupEntryAuthority,
+) -> list[object]:
+    return [
+        entry.path.as_posix(),
+        _identity_payload(entry.parent_identity),
+        [entry.plan[0], entry.plan[1], entry.plan[2]],
+        entry.mode,
+        entry.uid,
+        entry.gid,
+    ]
+
+
+def _parse_legacy_generic_cleanup_entries_payload(
+    ticket: PendingBatchCleanupTicket,
+    raw_entries: object,
+) -> tuple[LegacyGenericCleanupEntryAuthority, ...]:
+    if (
+        not isinstance(raw_entries, list)
+        or len(raw_entries) > MAX_PENDING_CLEANUP_ENTRIES
+    ):
+        raise SyncError(
+            f"legacy generic cleanup authority changed: {ticket.batch_root.name}"
+        )
+    entries: list[LegacyGenericCleanupEntryAuthority] = []
+    previous_path: str | None = None
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, list) or len(raw_entry) != 6:
+            raise SyncError(
+                f"legacy generic cleanup authority changed: {ticket.batch_root.name}"
+            )
+        path = _validate_relative_path(raw_entry[0], "legacy generic cleanup path")
+        path_text = path.as_posix()
+        if previous_path is not None and path_text <= previous_path:
+            raise SyncError(
+                f"legacy generic cleanup authority order changed: {ticket.batch_root.name}"
+            )
+        previous_path = path_text
+        parent_identity = _parse_pending_identity(
+            raw_entry[1], "legacy generic cleanup parent identity"
+        )
+        raw_plan = raw_entry[2]
+        if (
+            parent_identity is None
+            or not isinstance(raw_plan, list)
+            or len(raw_plan) != 3
+            or type(raw_plan[0]) is not int
+            or type(raw_plan[1]) is not int
+            or type(raw_plan[2]) is not int
+            or raw_plan[0] < 0
+            or raw_plan[1] < 0
+            or raw_plan[2] not in {stat.S_IFDIR, stat.S_IFREG, stat.S_IFLNK}
+            or type(raw_entry[3]) is not int
+            or not 0 <= raw_entry[3] <= 0o7777
+            or type(raw_entry[4]) is not int
+            or raw_entry[4] < 0
+            or type(raw_entry[5]) is not int
+            or raw_entry[5] < 0
+        ):
+            raise SyncError(
+                f"legacy generic cleanup authority changed: {ticket.batch_root.name}"
+            )
+        entries.append(
+            LegacyGenericCleanupEntryAuthority(
+                path=path,
+                parent_identity=parent_identity,
+                plan=(raw_plan[0], raw_plan[1], raw_plan[2]),
+                mode=raw_entry[3],
+                uid=raw_entry[4],
+                gid=raw_entry[5],
+            )
+        )
+    parsed = tuple(entries)
+    by_path = {entry.path: entry for entry in parsed}
+    if len(by_path) != len(parsed):
+        raise SyncError(
+            f"legacy generic cleanup authority has duplicate paths: {ticket.batch_root.name}"
+        )
+    for entry in parsed:
+        parent_path = entry.path.parent
+        expected_parent_identity = ticket.batch_root_identity
+        if parent_path.parts:
+            parent = by_path.get(parent_path)
+            if parent is None or parent.plan[2] != stat.S_IFDIR:
+                raise SyncError(
+                    "legacy generic cleanup authority has an unbound parent: "
+                    f"{ticket.batch_root.name}"
+                )
+            expected_parent_identity = parent.plan[:2]
+        if entry.parent_identity != expected_parent_identity:
+            raise SyncError(
+                f"legacy generic cleanup authority parent changed: {ticket.batch_root.name}"
+            )
+    return parsed
 
 
 def _pending_terminal_validation_alias_payload(
@@ -31109,6 +31306,154 @@ def _pending_cleanup_terminal_validation_v2_payload(
     )
 
 
+def _legacy_generic_cleanup_validation_payload(
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+    validation: LegacyGenericCleanupValidation,
+) -> bytes:
+    if ticket.snapshot.file_identity is None or ticket.snapshot.payload is None:
+        raise SyncError("pending cleanup ticket has no validation identity")
+    return _bounded_json_document(
+        {
+            "version": 2,
+            "phase": "legacy-generic-validation",
+            "batch": ticket.batch_root.name,
+            "batch_root_identity": _identity_payload(ticket.batch_root_identity),
+            "quarantine_root_identity": _identity_payload(quarantine_root_identity),
+            "ticket_identity": _identity_payload(ticket.snapshot.file_identity),
+            "ticket_sha256": hashlib.sha256(ticket.snapshot.payload).hexdigest(),
+            "metadata": {
+                "file_identity": _identity_payload(validation.metadata_identity),
+                "sha256": validation.metadata_sha256,
+                "size": validation.metadata_size,
+                "mode": validation.metadata_mode,
+                "uid": validation.metadata_uid,
+                "gid": validation.metadata_gid,
+            },
+            "pending_identity": _identity_payload(validation.pending_identity),
+            "entries": [
+                _legacy_generic_cleanup_entry_payload(entry)
+                for entry in validation.entries
+            ],
+        },
+        max_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+        overflow_error="legacy generic cleanup validation exceeds the size limit",
+    )
+
+
+def _parse_legacy_generic_cleanup_validation(
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+    data: dict[str, Any],
+) -> LegacyGenericCleanupValidation:
+    if ticket.snapshot.file_identity is None or ticket.snapshot.payload is None:
+        raise SyncError("pending cleanup ticket has no validation identity")
+    expected_fields = {
+        "version",
+        "phase",
+        "batch",
+        "batch_root_identity",
+        "quarantine_root_identity",
+        "ticket_identity",
+        "ticket_sha256",
+        "metadata",
+        "pending_identity",
+        "entries",
+    }
+    if (
+        set(data) != expected_fields
+        or data.get("version") != 2
+        or data.get("phase") != "legacy-generic-validation"
+        or data.get("batch") != ticket.batch_root.name
+        or data.get("batch_root_identity")
+        != _identity_payload(ticket.batch_root_identity)
+        or data.get("quarantine_root_identity")
+        != _identity_payload(quarantine_root_identity)
+        or data.get("ticket_identity")
+        != _identity_payload(ticket.snapshot.file_identity)
+        or data.get("ticket_sha256")
+        != hashlib.sha256(ticket.snapshot.payload).hexdigest()
+    ):
+        raise SyncError(
+            f"legacy generic cleanup validation changed: {ticket.batch_root.name}"
+        )
+    metadata = data.get("metadata")
+    metadata_fields = {"file_identity", "sha256", "size", "mode", "uid", "gid"}
+    if not isinstance(metadata, dict) or set(metadata) != metadata_fields:
+        raise SyncError(
+            f"legacy generic cleanup validation changed: {ticket.batch_root.name}"
+        )
+    metadata_identity = _parse_pending_identity(
+        metadata.get("file_identity"),
+        "legacy generic cleanup metadata identity",
+    )
+    pending_identity = _parse_pending_identity(
+        data.get("pending_identity"),
+        "legacy generic cleanup pending identity",
+    )
+    entries = _parse_legacy_generic_cleanup_entries_payload(
+        ticket,
+        data.get("entries"),
+    )
+    metadata_sha256 = metadata.get("sha256")
+    metadata_size = metadata.get("size")
+    metadata_uid = metadata.get("uid")
+    metadata_gid = metadata.get("gid")
+    if (
+        metadata_identity is None
+        or pending_identity is None
+        or not isinstance(metadata_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", metadata_sha256) is None
+        or type(metadata_size) is not int
+        or not 0 <= metadata_size <= MAX_MANAGED_STATE_BYTES
+        or metadata.get("mode") != 0o600
+        or metadata_uid != os.geteuid()
+        or type(metadata_gid) is not int
+        or metadata_gid < 0
+    ):
+        raise SyncError(
+            f"legacy generic cleanup validation changed: {ticket.batch_root.name}"
+        )
+    validation = LegacyGenericCleanupValidation(
+        metadata_identity=metadata_identity,
+        metadata_sha256=metadata_sha256,
+        metadata_size=metadata_size,
+        metadata_mode=0o600,
+        metadata_uid=metadata_uid,
+        metadata_gid=metadata_gid,
+        pending_identity=pending_identity,
+        entries=entries,
+    )
+    by_path = {entry.path: entry for entry in entries}
+    metadata_entry = by_path.get(PurePosixPath(PENDING_LINK_METADATA_NAME))
+    pending_entry = by_path.get(PurePosixPath("pending"))
+    if (
+        metadata_entry is None
+        or metadata_entry.plan
+        != (*validation.metadata_identity, stat.S_IFREG)
+        or metadata_entry.mode != validation.metadata_mode
+        or metadata_entry.uid != validation.metadata_uid
+        or metadata_entry.gid != validation.metadata_gid
+        or pending_entry is None
+        or pending_entry.plan != (*validation.pending_identity, stat.S_IFDIR)
+    ):
+        raise SyncError(
+            f"legacy generic cleanup validation authority changed: {ticket.batch_root.name}"
+        )
+    if data != _decode_managed_state_json(
+        _legacy_generic_cleanup_validation_payload(
+            ticket,
+            quarantine_root_identity,
+            validation,
+        ),
+        Path("<legacy-generic-cleanup-validation>"),
+    ):
+        raise SyncError(
+            f"legacy generic cleanup validation changed: {ticket.batch_root.name}"
+        )
+    return validation
+
+
 def _parse_pending_terminal_validation_authority(
     home: Path,
     ticket: PendingBatchCleanupTicket,
@@ -31125,6 +31470,13 @@ def _parse_pending_terminal_validation_authority(
         ticket.batch_root.name,
     )
     data = _decode_managed_state_json(receipt.payload, receipt_path)
+    if ticket.version in {1, 2}:
+        _parse_legacy_generic_cleanup_validation(
+            ticket,
+            quarantine_root_identity,
+            data,
+        )
+        return PendingTerminalValidationAuthority((), ())
     if ticket.version != PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
         if receipt.payload != _pending_cleanup_terminal_validation_payload(
             ticket,
@@ -31272,6 +31624,9 @@ def _pending_terminal_validation_current_by_path(
             logical_name,
             _active_matches,
             ledger_path,
+            _mode,
+            _uid,
+            _gid,
         ) in entries:
             legacy_ledger_name = _pending_cleanup_legacy_active_ledger_name(
                 parent_identity,
@@ -31316,13 +31671,403 @@ def _pending_terminal_validation_current_by_path(
     return current_by_path
 
 
+def _legacy_generic_cleanup_validation_from_current_state(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    bound_batch_root: Path,
+    batch_fd: int,
+    metadata: ManagedStateFileSnapshot,
+) -> LegacyGenericCleanupValidation | None:
+    if not _managed_state_snapshot_has_complete_file_evidence(metadata):
+        raise SyncError("legacy generic cleanup metadata has incomplete evidence")
+    if (
+        metadata.parent_identity != ticket.batch_root_identity
+        or metadata.file_identity is None
+        or metadata.payload is None
+        or metadata.mode != 0o600
+        or metadata.file_type != stat.S_IFREG
+        or metadata.uid != os.geteuid()
+        or metadata.gid is None
+        or metadata.size is None
+    ):
+        raise SyncError("legacy generic cleanup metadata changed")
+    pending_fd = -1
+    try:
+        pending_fd = os.open(
+            "pending",
+            _directory_open_flags(nofollow=True),
+            dir_fd=batch_fd,
+        )
+        pending_snapshot = _require_pending_cleanup_fd_access_policy(
+            pending_fd,
+            bound_batch_root / "pending",
+            expected_mode=0o700,
+        )
+        if (
+            not stat.S_ISDIR(pending_snapshot.st_mode)
+            or not _bound_directory_matches(
+                home,
+                bound_batch_root / "pending",
+                pending_fd,
+            )
+            or _directory_mount_identity(pending_fd)
+            != _directory_mount_identity(batch_fd)
+        ):
+            raise SyncError("legacy generic cleanup pending root changed")
+        return LegacyGenericCleanupValidation(
+            metadata_identity=metadata.file_identity,
+            metadata_sha256=hashlib.sha256(metadata.payload).hexdigest(),
+            metadata_size=metadata.size,
+            metadata_mode=metadata.mode,
+            metadata_uid=metadata.uid,
+            metadata_gid=metadata.gid,
+            pending_identity=_directory_identity(pending_fd),
+            entries=(),
+        )
+    except FileNotFoundError:
+        # The historic compatibility path can complete without a canonical
+        # pending root, but it has not established the new receipt boundary.
+        return None
+    finally:
+        _close_fd_quietly(pending_fd)
+
+
+def _require_legacy_generic_cleanup_validation_current_state(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    bound_batch_root: Path,
+    batch_fd: int,
+    validation: LegacyGenericCleanupValidation,
+    *,
+    defer_retainable_active_mismatch_to_walker: bool = False,
+) -> None:
+    """Accept only exact receipt-bound survivors after an interrupted walker.
+
+    Absence is an expected one-way progress state.  Presence is not: every
+    remaining object must occupy an originally authorized logical slot and
+    preserve its identity, type, and access policy.  Directory ctime and link
+    count are intentionally not compared because child deletion changes them.
+    """
+    if not validation.entries:
+        raise SyncError("legacy generic cleanup receipt lacks namespace authority")
+    if (
+        _directory_identity(batch_fd) != ticket.batch_root_identity
+        or not _bound_directory_matches(home, bound_batch_root, batch_fd)
+    ):
+        raise SyncError("legacy generic cleanup validation batch changed")
+    _require_pending_cleanup_fd_access_policy(
+        batch_fd,
+        bound_batch_root,
+        expected_mode=0o700,
+    )
+    root_mount_identity = _directory_mount_identity(batch_fd)
+    authority_by_path = {entry.path: entry for entry in validation.entries}
+    if len(authority_by_path) != len(validation.entries):
+        raise SyncError("legacy generic cleanup receipt has duplicate authority")
+
+    def require_entry(
+        entry: LegacyGenericCleanupEntryAuthority,
+        metadata: os.stat_result,
+    ) -> None:
+        if (
+            _pending_cleanup_entry_plan(metadata) != entry.plan
+            or stat.S_IMODE(metadata.st_mode) != entry.mode
+            or metadata.st_uid != entry.uid
+            or metadata.st_gid != entry.gid
+        ):
+            raise SyncError(
+                "legacy generic cleanup receipt-bound entry changed: "
+                f"{entry.path.as_posix()}"
+            )
+
+    def require_metadata_snapshot(name: str) -> None:
+        snapshot = _read_managed_state_file_snapshot(
+            home,
+            bound_batch_root / name,
+            batch_fd,
+            expected_identity=validation.metadata_identity,
+        )
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+            or snapshot.parent_identity != ticket.batch_root_identity
+            or snapshot.file_identity != validation.metadata_identity
+            or snapshot.file_type != stat.S_IFREG
+            or snapshot.mode != validation.metadata_mode
+            or snapshot.uid != validation.metadata_uid
+            or snapshot.size != validation.metadata_size
+            or snapshot.payload is None
+            or hashlib.sha256(snapshot.payload).hexdigest()
+            != validation.metadata_sha256
+            or snapshot.gid is None
+            or not _gid_matches_regular_file_access_policy(
+                snapshot.gid,
+                validation.metadata_gid,
+                validation.metadata_mode,
+            )
+        ):
+            raise SyncError("legacy generic cleanup validation metadata changed")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            bound_batch_root / name,
+            batch_fd,
+            snapshot,
+        )
+
+    def require_directory_access_policy(
+        directory_fd: int,
+        physical_path: Path,
+        logical_path: PurePosixPath,
+    ) -> None:
+        expected_mode = _cleanup_directory_expected_mode(
+            0o700,
+            tuple(logical_path.parts),
+        )
+        if expected_mode is None:
+            _require_current_user_cleanup_fd_access_policy(
+                directory_fd,
+                physical_path,
+            )
+        else:
+            _require_pending_cleanup_fd_access_policy(
+                directory_fd,
+                physical_path,
+                expected_mode=expected_mode,
+            )
+
+    def require_regular_file_access_policy(
+        directory_fd: int,
+        name: str,
+        physical_path: Path,
+        logical_path: PurePosixPath,
+        expected_plan: tuple[int, int, int],
+    ) -> None:
+        file_fd = -1
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            flags |= getattr(os, "O_NONBLOCK", 0)
+            file_fd = os.open(name, flags, dir_fd=directory_fd)
+            expected_mode = _cleanup_regular_file_expected_mode(
+                0o600,
+                tuple(logical_path.parent.parts),
+                links_content_root=bool(
+                    logical_path.parts and logical_path.parts[0] == "links"
+                ),
+            )
+            if expected_mode is None:
+                opened = _require_current_user_cleanup_fd_access_policy(
+                    file_fd,
+                    physical_path,
+                )
+            else:
+                opened = _require_pending_cleanup_fd_access_policy(
+                    file_fd,
+                    physical_path,
+                    expected_mode=expected_mode,
+                )
+            if _pending_cleanup_entry_plan(opened) != expected_plan:
+                raise SyncError(
+                    "legacy generic cleanup receipt-bound regular file changed: "
+                    f"{logical_path.as_posix()}"
+                )
+        finally:
+            _close_fd_quietly(file_fd)
+
+    def validate_directory(
+        directory_fd: int,
+        directory_identity: tuple[int, int],
+        physical_path: Path,
+        logical_path: PurePosixPath,
+    ) -> bool:
+        if (
+            _directory_identity(directory_fd) != directory_identity
+            or _directory_mount_identity(directory_fd) != root_mount_identity
+            or not _bound_directory_matches(home, physical_path, directory_fd)
+        ):
+            raise SyncError("legacy generic cleanup receipt-bound directory changed")
+        require_directory_access_policy(directory_fd, physical_path, logical_path)
+        observed_paths: set[PurePosixPath] = set()
+        current_entries: list[tuple[str, os.stat_result]] = []
+        with os.scandir(directory_fd) as iterator:
+            for item in iterator:
+                try:
+                    current_entries.append((item.name, item.stat(follow_symlinks=False)))
+                except OSError as error:
+                    raise SyncError(
+                        "legacy generic cleanup receipt-bound entry changed: "
+                        f"{item.name}"
+                    ) from error
+        if len(current_entries) > MAX_PENDING_CLEANUP_ENTRIES:
+            raise SyncError("legacy generic cleanup batch exceeds the size limit")
+        for name, metadata in current_entries:
+            retained_plan = _pending_cleanup_internal_entry_plan(
+                name,
+                PENDING_CLEANUP_RETAINED_ENTRY_PREFIX,
+                directory_identity,
+            )
+            if retained_plan is not None:
+                # A cleanup walker may have atomically isolated a replacement
+                # after this receipt was written. The retained token is not
+                # deletion authority: preserve the historic manual-cleanup
+                # outcome without attempting a second rename or unlink.
+                raise SyncError(
+                    "pending cleanup retained entry requires manual cleanup: "
+                    f"{name}"
+                )
+            if _pending_cleanup_retained_canonical_name(name) is not None:
+                raise SyncError(
+                    "pending cleanup retained file requires manual cleanup: "
+                    f"{name}"
+                )
+            physical_name = (
+                _pending_regular_publication_private_deletion_alias_base(name)
+                or name
+            )
+            active_links_plan = _pending_cleanup_internal_entry_plan(
+                name,
+                PENDING_CLEANUP_ACTIVE_LINKS_ENTRY_PREFIX,
+                directory_identity,
+            )
+            active_binding = _pending_cleanup_active_entry_binding(
+                physical_name,
+                directory_identity,
+            )
+            legacy_active_plan = (
+                None
+                if active_binding is not None or active_links_plan is not None
+                else _pending_cleanup_internal_entry_plan(
+                    physical_name,
+                    PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                    directory_identity,
+                )
+            )
+            declared_plan = (
+                active_links_plan
+                or (active_binding[0] if active_binding is not None else None)
+                or legacy_active_plan
+            )
+            if declared_plan is not None and _pending_cleanup_entry_plan(metadata) != declared_plan:
+                if (
+                    defer_retainable_active_mismatch_to_walker
+                    and declared_plan[2] != stat.S_IFDIR
+                    and _pending_cleanup_entry_plan(metadata)[2] != stat.S_IFDIR
+                ):
+                    # The cleanup walker owns this narrow repair path. It
+                    # re-captures the full ledger and moves the mismatched
+                    # regular/symlink object to a retained token before any
+                    # deletion. Mutation admission never enables this
+                    # deferral and therefore remains read-only.
+                    return True
+                raise SyncError(
+                    "legacy generic cleanup active entry changed: "
+                    f"{name}"
+                )
+            if active_links_plan is not None:
+                candidate_path = logical_path / "links"
+            elif active_binding is not None:
+                candidate_path = logical_path / active_binding[1]
+            elif legacy_active_plan is not None:
+                candidates = [
+                    entry.path
+                    for entry in validation.entries
+                    if entry.path.parent == logical_path
+                    and entry.parent_identity == directory_identity
+                    and entry.plan == legacy_active_plan
+                    and entry.path not in observed_paths
+                ]
+                if len(candidates) != 1:
+                    raise SyncError(
+                        "legacy generic cleanup active entry is ambiguous: "
+                        f"{name}"
+                    )
+                candidate_path = candidates[0]
+            else:
+                candidate_path = logical_path / physical_name
+            authority = authority_by_path.get(candidate_path)
+            if authority is None or authority.parent_identity != directory_identity:
+                raise SyncError(
+                    "legacy generic cleanup receipt found an unknown entry: "
+                    f"{candidate_path.as_posix()}"
+                )
+            if candidate_path in observed_paths:
+                raise SyncError(
+                    "legacy generic cleanup receipt has duplicate current entries: "
+                    f"{candidate_path.as_posix()}"
+                )
+            observed_paths.add(candidate_path)
+            require_entry(authority, metadata)
+            if candidate_path == PurePosixPath(PENDING_LINK_METADATA_NAME):
+                require_metadata_snapshot(name)
+            elif authority.plan[2] == stat.S_IFREG:
+                require_regular_file_access_policy(
+                    directory_fd,
+                    name,
+                    physical_path / name,
+                    candidate_path,
+                    authority.plan,
+                )
+            if authority.plan[2] != stat.S_IFDIR:
+                continue
+            child_fd = -1
+            try:
+                child_fd = os.open(
+                    name,
+                    _directory_open_flags(nofollow=True),
+                    dir_fd=directory_fd,
+                )
+                if validate_directory(
+                    child_fd,
+                    authority.plan[:2],
+                    physical_path / name,
+                    candidate_path,
+                ):
+                    return True
+            finally:
+                _close_fd_quietly(child_fd)
+        return False
+
+    validate_directory(
+        batch_fd,
+        ticket.batch_root_identity,
+        bound_batch_root,
+        PurePosixPath(),
+    )
+
+
 def _ensure_pending_terminal_validation_receipt(
     home: Path,
     ticket: PendingBatchCleanupTicket,
     bound_batch_root: Path,
     batch_fd: int,
     quarantine_root_identity: tuple[int, int],
+    *,
+    legacy_generic_validation: LegacyGenericCleanupValidation | None = None,
 ) -> None:
+    if ticket.version in {1, 2}:
+        existing_receipt = _read_pending_cleanup_terminal_validation(
+            home,
+            ticket,
+            quarantine_root_identity,
+        )
+        if existing_receipt is None:
+            if legacy_generic_validation is None:
+                # Compatibility cleanup that never reached a complete legacy
+                # parse retains its old behavior. It receives no new durable
+                # authority, so a later missing evidence object cannot become
+                # a receipt-backed deletion boundary.
+                return
+            # A fully parsed legacy generic ticket has no complete terminal
+            # target group, but it does have a bounded pre-walker authority.
+            # Bind the exact metadata snapshot and pending-root identity before
+            # the first deletion so retry can distinguish expected consumption
+            # from an unproven replacement.
+            _publish_pending_cleanup_terminal_validation(
+                home,
+                ticket,
+                quarantine_root_identity,
+                legacy_generic_validation=legacy_generic_validation,
+            )
+        return
     if ticket.version not in {4, 8} or not ticket.terminal_regular_targets:
         return
     existing_receipt = _read_pending_cleanup_terminal_validation(
@@ -31589,9 +32334,24 @@ def _pending_cleanup_terminal_validation_payload(
     *,
     terminal_aliases: tuple[PendingTerminalValidationAlias, ...] | None = None,
     terminal_directories: tuple[PendingTerminalValidationDirectory, ...] | None = None,
+    legacy_generic_validation: LegacyGenericCleanupValidation | None = None,
 ) -> bytes:
     if ticket.snapshot.file_identity is None or ticket.snapshot.payload is None:
         raise SyncError("pending cleanup ticket has no validation identity")
+    if ticket.version in {1, 2}:
+        if (
+            terminal_aliases is not None
+            or terminal_directories is not None
+            or legacy_generic_validation is None
+        ):
+            raise SyncError("legacy generic cleanup validation lacks authority")
+        return _legacy_generic_cleanup_validation_payload(
+            ticket,
+            quarantine_root_identity,
+            legacy_generic_validation,
+        )
+    if legacy_generic_validation is not None:
+        raise SyncError("pending cleanup validation has unsupported legacy authority")
     if terminal_aliases is not None or terminal_directories is not None:
         if ticket.version != PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
             raise SyncError(
@@ -31714,7 +32474,17 @@ def _publish_pending_cleanup_terminal_validation(
     *,
     terminal_aliases: tuple[PendingTerminalValidationAlias, ...] | None = None,
     terminal_directories: tuple[PendingTerminalValidationDirectory, ...] | None = None,
+    legacy_generic_validation: LegacyGenericCleanupValidation | None = None,
 ) -> ManagedStateFileSnapshot:
+    if ticket.version in {1, 2}:
+        if (
+            legacy_generic_validation is None
+            or terminal_aliases is not None
+            or terminal_directories is not None
+        ):
+            raise SyncError("legacy generic cleanup validation lacks authority")
+    elif legacy_generic_validation is not None:
+        raise SyncError("pending cleanup validation has unsupported legacy authority")
     if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION and (
         terminal_aliases is None or terminal_directories is None
     ):
@@ -31760,6 +32530,7 @@ def _publish_pending_cleanup_terminal_validation(
             quarantine_root_identity,
             terminal_aliases=terminal_aliases,
             terminal_directories=terminal_directories,
+            legacy_generic_validation=legacy_generic_validation,
         ),
     )
     verified = _read_pending_cleanup_terminal_validation(
@@ -33772,7 +34543,7 @@ def _require_legacy_generic_cleanup_ticket_is_nonterminal(
     ticket: PendingBatchCleanupTicket,
     bound_batch_root: Path,
     batch_fd: int,
-) -> None:
+) -> ManagedStateFileSnapshot | None:
     """Stop readable legacy metadata with untrusted finalization or terminal group.
 
     v1/v2 tickets predate a complete target group.  A canonical batch that
@@ -33789,9 +34560,9 @@ def _require_legacy_generic_cleanup_ticket_is_nonterminal(
     incompatibility.
     """
     if ticket.version not in {1, 2}:
-        return
+        return None
     if bound_batch_root != ticket.batch_root:
-        return
+        return None
 
     def manual_recovery_error(
         detail: str,
@@ -33826,7 +34597,7 @@ def _require_legacy_generic_cleanup_ticket_is_nonterminal(
             batch_fd,
         )
         if not metadata.exists or metadata.payload is None:
-            return
+            return None
         _require_pending_cleanup_file_snapshot_access_policy(
             home,
             metadata_path,
@@ -33844,7 +34615,7 @@ def _require_legacy_generic_cleanup_ticket_is_nonterminal(
     except SyncError:
         # Captured bytes rejected without any mutable filesystem observation.
         # This is the sole compatible generic-cleanup case.
-        return
+        return None
     if metadata_batch_name != ticket.batch_root.name:
         raise manual_recovery_error("metadata batch binding changed")
     try:
@@ -33975,6 +34746,7 @@ def _require_legacy_generic_cleanup_ticket_is_nonterminal(
             f"{ticket.batch_root.name}",
             code=LEGACY_GENERIC_CLEANUP_MANUAL_RECOVERY_CODE,
         )
+    return metadata
 
 
 def _remove_cleanup_ready_batch(
@@ -34074,12 +34846,54 @@ def _remove_cleanup_ready_batch(
                     quarantine_root_identity,
                 )
                 return True
-        _require_legacy_generic_cleanup_ticket_is_nonterminal(
-            home,
-            ticket,
-            bound_batch_root,
-            batch_fd,
+        legacy_generic_validation: LegacyGenericCleanupValidation | None = None
+        existing_legacy_receipt = (
+            _read_pending_cleanup_terminal_validation(
+                home,
+                ticket,
+                quarantine_root_identity,
+            )
+            if ticket.version in {1, 2}
+            else None
         )
+        if existing_legacy_receipt is not None:
+            assert existing_legacy_receipt.payload is not None
+            legacy_generic_validation = _parse_legacy_generic_cleanup_validation(
+                ticket,
+                quarantine_root_identity,
+                _decode_managed_state_json(
+                    existing_legacy_receipt.payload,
+                    _pending_cleanup_terminal_validation_path(
+                        home,
+                        ticket.batch_root.name,
+                    ),
+                ),
+            )
+            _require_legacy_generic_cleanup_validation_current_state(
+                home,
+                ticket,
+                bound_batch_root,
+                batch_fd,
+                legacy_generic_validation,
+                defer_retainable_active_mismatch_to_walker=True,
+            )
+        else:
+            legacy_metadata = _require_legacy_generic_cleanup_ticket_is_nonterminal(
+                home,
+                ticket,
+                bound_batch_root,
+                batch_fd,
+            )
+            if legacy_metadata is not None:
+                legacy_generic_validation = (
+                    _legacy_generic_cleanup_validation_from_current_state(
+                        home,
+                        ticket,
+                        bound_batch_root,
+                        batch_fd,
+                        legacy_metadata,
+                    )
+                )
         if _directory_identity(
             batch_fd
         ) != ticket.batch_root_identity or not _bound_directory_matches(
@@ -34096,28 +34910,58 @@ def _remove_cleanup_ready_batch(
                 home,
                 bound_batch_root,
             )
+        cleanup_budget = [MAX_PENDING_CLEANUP_ENTRIES]
+        identity_ledger: PendingCleanupIdentityLedger = {}
+        batch_mount_identity = _directory_mount_identity(batch_fd)
+        if ticket.version in {1, 2}:
+            _capture_pending_cleanup_identity_ledger(
+                batch_fd,
+                ticket.batch_root_identity,
+                batch_mount_identity,
+                cleanup_budget,
+                identity_ledger,
+                depth=0,
+                relative_parts=(),
+                skipped_names=frozenset(),
+                name_validator=_pending_batch_cleanup_name_is_authorized,
+                directory_expected_mode=0o700,
+            )
+        if legacy_generic_validation is not None:
+            legacy_generic_validation = replace(
+                legacy_generic_validation,
+                entries=_legacy_generic_cleanup_entries_from_identity_ledger(
+                    ticket,
+                    identity_ledger,
+                ),
+            )
         _ensure_pending_terminal_validation_receipt(
             home,
             ticket,
             bound_batch_root,
             batch_fd,
             quarantine_root_identity,
+            legacy_generic_validation=legacy_generic_validation,
         )
-        cleanup_budget = [MAX_PENDING_CLEANUP_ENTRIES]
-        identity_ledger: PendingCleanupIdentityLedger = {}
-        batch_mount_identity = _directory_mount_identity(batch_fd)
-        _capture_pending_cleanup_identity_ledger(
-            batch_fd,
-            ticket.batch_root_identity,
-            batch_mount_identity,
-            cleanup_budget,
-            identity_ledger,
-            depth=0,
-            relative_parts=(),
-            skipped_names=frozenset(),
-            name_validator=_pending_batch_cleanup_name_is_authorized,
-            directory_expected_mode=0o700,
-        )
+        if ticket.version not in {1, 2}:
+            # v4/v8 receipt setup may add a terminal recovery hard link.  The
+            # deletion ledger must be captured after that controlled mutation,
+            # otherwise current-head validation sees an alias absent from its
+            # own pre-receipt snapshot and misclassifies the public nlink.
+            cleanup_budget = [MAX_PENDING_CLEANUP_ENTRIES]
+            identity_ledger = {}
+            batch_mount_identity = _directory_mount_identity(batch_fd)
+            _capture_pending_cleanup_identity_ledger(
+                batch_fd,
+                ticket.batch_root_identity,
+                batch_mount_identity,
+                cleanup_budget,
+                identity_ledger,
+                depth=0,
+                relative_parts=(),
+                skipped_names=frozenset(),
+                name_validator=_pending_batch_cleanup_name_is_authorized,
+                directory_expected_mode=0o700,
+            )
         if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
             receipt = _read_pending_cleanup_terminal_validation(
                 home,
@@ -36589,12 +37433,39 @@ def _require_legacy_generic_cleanup_ticket_allows_mutation(
                 error,
             ) from error
         try:
-            _require_legacy_generic_cleanup_ticket_is_nonterminal(
+            quarantine_root_identity = _directory_identity(quarantine_fd)
+            receipt = _read_pending_cleanup_terminal_validation(
                 home,
                 ticket,
-                ticket.batch_root,
-                batch_fd,
+                quarantine_root_identity,
             )
+            if receipt is None:
+                _require_legacy_generic_cleanup_ticket_is_nonterminal(
+                    home,
+                    ticket,
+                    ticket.batch_root,
+                    batch_fd,
+                )
+            else:
+                assert receipt.payload is not None
+                validation = _parse_legacy_generic_cleanup_validation(
+                    ticket,
+                    quarantine_root_identity,
+                    _decode_managed_state_json(
+                        receipt.payload,
+                        _pending_cleanup_terminal_validation_path(
+                            home,
+                            ticket.batch_root.name,
+                        ),
+                    ),
+                )
+                _require_legacy_generic_cleanup_validation_current_state(
+                    home,
+                    ticket,
+                    ticket.batch_root,
+                    batch_fd,
+                    validation,
+                )
         except _LegacyGenericCleanupForeignBatch:
             # An identity or binding mismatch proves only a foreign canonical
             # occupant. Preserve the existing cleanup deferral exemption.
@@ -36715,6 +37586,22 @@ def _require_no_pending_terminal_mutation_authority(home: Path) -> None:
                 len(batch_name) <= MAX_PENDING_LINK_BATCH_NAME_BYTES
                 and PENDING_LINK_BATCH_RE.fullmatch(batch_name) is not None
             ):
+                try:
+                    receipt_ticket = _read_pending_cleanup_ticket(
+                        home,
+                        index_root / (batch_name + PENDING_CLEANUP_TICKET_SUFFIX),
+                    )
+                except (FileNotFoundError, OSError, SyncError) as error:
+                    raise _pending_cleanup_authority_classification_error(
+                        batch_name,
+                        error,
+                    ) from error
+                if receipt_ticket is not None and receipt_ticket.version in {1, 2}:
+                    # A v1/v2 receipt is only its durable parser-to-walker
+                    # boundary. Reclassify the paired ticket below instead of
+                    # treating this immutable control file as independent
+                    # terminal deletion authority.
+                    continue
                 raise SyncError(
                     "pending cleanup private or terminal authority must be "
                     f"reconciled before new mutation: {batch_name}"

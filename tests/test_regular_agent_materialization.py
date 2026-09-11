@@ -2901,6 +2901,220 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                 )
                 self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
 
+    def test_legacy_generic_retry_after_partial_cleanup_uses_validation_receipt(
+        self,
+    ) -> None:
+        for version in (1, 2):
+            with self.subTest(version=version):
+                self.home = self.root / f"home-partial-generic-v{version}"
+                ticket = (
+                    self._prepare_pointerless_generic_v1_ticket(
+                        f"partial-generic-v{version}-release"
+                    )
+                    if version == 1
+                    else self._prepare_pointerless_generic_v2_ticket(
+                        f"partial-generic-v{version}-release"
+                    )
+                )
+                marker_relative = (
+                    MODULE.PENDING_STATE_COMMIT_MARKER
+                    if version == 1
+                    else MODULE.PENDING_STATE_ROLLBACK_MARKER
+                )
+                marker_path = ticket.batch_root / Path(*marker_relative.parts)
+
+                def consume_marker_then_crash(*args: object, **kwargs: object) -> None:
+                    marker_path.unlink()
+                    raise RuntimeError("injected cleanup crash after evidence deletion")
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_remove_pending_batch_directory_contents",
+                        side_effect=consume_marker_then_crash,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "cleanup crash"),
+                ):
+                    MODULE._cleanup_ready_pending_batches(self.home)
+
+                quarantine_fd = MODULE._open_directory_beneath(
+                    self.home,
+                    ticket.batch_root.parent,
+                )
+                try:
+                    quarantine_identity = MODULE._directory_identity(quarantine_fd)
+                finally:
+                    MODULE._close_fd_quietly(quarantine_fd)
+                self.assertFalse(marker_path.exists())
+                self.assertIsNotNone(
+                    MODULE._read_pending_cleanup_terminal_validation(
+                        self.home,
+                        ticket,
+                        quarantine_identity,
+                    )
+                )
+                self.assertTrue(ticket.path.is_file())
+
+                # The mutation gate follows the same durable receipt path;
+                # it must not rerun the legacy parser after the marker has
+                # been consumed by the interrupted cleanup walker.
+                MODULE._require_no_pending_terminal_mutation_authority(self.home)
+
+                self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+                self.assertFalse(ticket.path.exists())
+                self.assertFalse(ticket.batch_root.exists())
+
+    def test_legacy_generic_validation_receipt_retains_unknown_post_crash_entry(
+        self,
+    ) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "generic-receipt-unknown-entry-release"
+        )
+
+        def crash_after_validation(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("injected cleanup crash after validation")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=crash_after_validation,
+            ),
+            self.assertRaisesRegex(RuntimeError, "cleanup crash"),
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        unknown = ticket.batch_root / "pending" / "foreign-after-validation"
+        unknown.write_bytes(b"foreign")
+        unknown.chmod(0o600)
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
+
+        self.assertIn("unknown entry", stdout.getvalue())
+        self.assertTrue(unknown.is_file())
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_legacy_generic_validation_receipt_retains_rebuilt_known_marker(
+        self,
+    ) -> None:
+        """A consumed authorized name cannot authorize a later replacement."""
+        for version in (1, 2):
+            with self.subTest(version=version):
+                self.home = self.root / f"home-rebuilt-generic-marker-v{version}"
+                ticket = (
+                    self._prepare_pointerless_generic_v1_ticket(
+                        f"rebuilt-generic-marker-v{version}-release"
+                    )
+                    if version == 1
+                    else self._prepare_pointerless_generic_v2_ticket(
+                        f"rebuilt-generic-marker-v{version}-release"
+                    )
+                )
+                marker_relative = (
+                    MODULE.PENDING_STATE_COMMIT_MARKER
+                    if version == 1
+                    else MODULE.PENDING_STATE_ROLLBACK_MARKER
+                )
+                marker_path = ticket.batch_root / Path(*marker_relative.parts)
+
+                def consume_marker_then_crash(*args: object, **kwargs: object) -> None:
+                    marker_path.unlink()
+                    raise RuntimeError("injected cleanup crash after evidence deletion")
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_remove_pending_batch_directory_contents",
+                        side_effect=consume_marker_then_crash,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "cleanup crash"),
+                ):
+                    MODULE._cleanup_ready_pending_batches(self.home)
+
+                marker_path.write_bytes(b"foreign-rebuilt-marker")
+                marker_path.chmod(0o600)
+                marker_identity = (
+                    os.lstat(marker_path).st_dev,
+                    os.lstat(marker_path).st_ino,
+                )
+
+                with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                    self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
+
+                self.assertIn("receipt-bound entry changed", stdout.getvalue())
+                self.assertTrue(marker_path.is_file())
+                self.assertEqual(
+                    (os.lstat(marker_path).st_dev, os.lstat(marker_path).st_ino),
+                    marker_identity,
+                )
+                self.assertEqual(marker_path.read_bytes(), b"foreign-rebuilt-marker")
+                self.assertTrue(ticket.path.is_file())
+                self.assertTrue(ticket.batch_root.is_dir())
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "receipt-bound entry changed",
+                ):
+                    MODULE._require_no_pending_terminal_mutation_authority(self.home)
+
+    def test_legacy_generic_receipt_mutation_gate_keeps_active_mismatch_read_only(
+        self,
+    ) -> None:
+        """Only the cleanup walker may retain a mismatched active regular file."""
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "generic-receipt-read-only-active-mismatch-release"
+        )
+
+        def crash_after_validation(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("injected cleanup crash after validation")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=crash_after_validation,
+            ),
+            self.assertRaisesRegex(RuntimeError, "cleanup crash"),
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        metadata = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        original_metadata = metadata.read_bytes()
+        batch_fd = MODULE._open_directory_beneath(self.home, ticket.batch_root)
+        try:
+            batch_identity = MODULE._directory_identity(batch_fd)
+            planned = MODULE._pending_cleanup_entry_plan(
+                os.stat(metadata.name, dir_fd=batch_fd, follow_symlinks=False)
+            )
+            active_name, _active = MODULE._isolate_pending_cleanup_entry(
+                batch_fd,
+                metadata.name,
+                batch_identity,
+                planned,
+                relative_parts=(),
+            )
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+        active = ticket.batch_root / active_name
+        expected = self.root / "generic-receipt-original-metadata"
+        active.rename(expected)
+        active.write_bytes(b"foreign")
+        active.chmod(0o600)
+        foreign_identity = (active.stat().st_dev, active.stat().st_ino)
+
+        with self.assertRaisesRegex(MODULE.SyncError, "active entry changed"):
+            MODULE._require_no_pending_terminal_mutation_authority(self.home)
+
+        self.assertEqual(active.read_bytes(), b"foreign")
+        self.assertEqual((active.stat().st_dev, active.stat().st_ino), foreign_identity)
+        self.assertEqual(expected.read_bytes(), original_metadata)
+        self.assertEqual(
+            list(ticket.batch_root.glob(f"{MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX}*")),
+            [],
+        )
+        self.assertTrue(ticket.path.is_file())
+
     def test_active_pending_restore_preserves_legacy_terminal_fence(self) -> None:
         for phase in ("after", "before"):
             with self.subTest(phase=phase):

@@ -909,6 +909,9 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
                     physical_name,
                     True,
                     legacy_path,
+                    0o600,
+                    os.geteuid(),
+                    os.getegid(),
                 ),
             ),
         }
@@ -954,6 +957,9 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
                     physical_name,
                     True,
                     legacy_path,
+                    0o600,
+                    os.geteuid(),
+                    os.getegid(),
                 ),
             ),
         }
