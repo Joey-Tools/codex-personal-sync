@@ -4974,6 +4974,7 @@ class PendingPrivateUseControlEvidence:
     mode: int
     uid: int
     gid: int
+    link_count: int
 
 
 @dataclass(frozen=True)
@@ -5372,6 +5373,7 @@ class ManagedStateFileSnapshot:
     size: int | None = None
     uid: int | None = None
     gid: int | None = None
+    link_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -12334,6 +12336,27 @@ def _managed_state_snapshot_matches_bound_file_evidence(
     )
 
 
+def _require_pending_cleanup_control_link_count(
+    snapshot: ManagedStateFileSnapshot,
+    display_path: Path,
+) -> None:
+    """Reject external aliases for a durable pending-cleanup control file."""
+    if snapshot.link_count != 1:
+        raise SyncError(
+            "pending cleanup control has an unauthorized hard-link alias: "
+            f"{display_path} (links={snapshot.link_count!r})"
+        )
+
+
+def _pending_cleanup_control_label_requires_single_link(label: str) -> bool:
+    return (
+        "pending cleanup" in label
+        or "pending quarantine allocation" in label
+        or "private-use retirement" in label
+        or "atomic internal authority" in label
+    )
+
+
 def _pending_cleanup_ticket_matches(
     actual: PendingBatchCleanupTicket,
     expected: PendingBatchCleanupTicket,
@@ -12913,6 +12936,7 @@ def _read_managed_state_file_snapshot(
         size=opened_metadata.st_size,
         uid=opened_metadata.st_uid,
         gid=opened_metadata.st_gid,
+        link_count=opened_metadata.st_nlink,
     )
 
 
@@ -18019,6 +18043,7 @@ def _pending_private_use_control_evidence(
         or snapshot.uid != os.geteuid()
         or snapshot.gid is None
         or snapshot.size is None
+        or snapshot.link_count != 1
     ):
         raise SyncError(f"private-use retirement control is incomplete: {name}")
     return PendingPrivateUseControlEvidence(
@@ -18029,6 +18054,7 @@ def _pending_private_use_control_evidence(
         mode=snapshot.mode,
         uid=snapshot.uid,
         gid=snapshot.gid,
+        link_count=snapshot.link_count,
     )
 
 
@@ -18063,6 +18089,7 @@ def _pending_private_use_control_matches(
         and _gid_matches_regular_file_access_policy(
             snapshot.gid, expected.gid, expected.mode
         )
+        and snapshot.link_count == expected.link_count == 1
     )
 
 
@@ -25727,6 +25754,7 @@ def _read_pending_quarantine_allocation_ticket(
             )
             if not snapshot.exists:
                 return None
+            _require_pending_cleanup_control_link_count(snapshot, path)
             if (
                 not _managed_state_snapshot_has_complete_file_evidence(snapshot)
                 or snapshot.file_type != stat.S_IFREG
@@ -25752,6 +25780,7 @@ def _read_pending_quarantine_allocation_ticket(
             raise SyncError(f"pending quarantine allocation changed: {batch_name}")
         if not snapshot.exists:
             return None
+        _require_pending_cleanup_control_link_count(snapshot, path)
         if (
             not _managed_state_snapshot_has_complete_file_evidence(snapshot)
             or snapshot.file_type != stat.S_IFREG
@@ -26776,13 +26805,22 @@ def _isolate_and_delete_pending_cleanup_file(
     label: str,
     maximum_bytes: int = MAX_MANAGED_STATE_BYTES,
     mutation_revalidator: Callable[[str], None] | None = None,
+    require_single_link: bool = False,
 ) -> None:
+    require_single_link = require_single_link or (
+        _pending_cleanup_control_label_requires_single_link(label)
+    )
     if (
         not _managed_state_snapshot_has_complete_file_evidence(expected)
         or expected.parent_identity != _directory_identity(parent_fd)
         or expected.file_type != stat.S_IFREG
     ):
         raise SyncError(f"{label} has no deletion identity")
+    if require_single_link and expected.link_count != 1:
+        raise SyncError(
+            f"{label} has an unauthorized hard-link alias: "
+            f"links={expected.link_count!r}"
+        )
     if not _bound_directory_matches(home, path.parent, parent_fd):
         raise SyncError(f"{label} parent changed before isolation")
 
@@ -26879,10 +26917,19 @@ def _isolate_and_delete_pending_cleanup_file(
                 raise SyncError(
                     f"{label} changed {stage}; preserved as {retained_name}"
                 ) from error
+            if require_single_link and (
+                before.st_nlink != 1 or named.st_nlink != 1
+            ):
+                raise SyncError(
+                    f"{label} has an unauthorized hard-link alias; "
+                    f"preserved as {retained_name}"
+                )
             if (
                 not stat.S_ISREG(before.st_mode)
+                or (require_single_link and before.st_nlink != 1)
                 or not _regular_stat_metadata_matches(after, before)
                 or not _regular_stat_metadata_matches(named, before)
+                or (require_single_link and named.st_nlink != 1)
                 or not _regular_stat_matches_managed_state_file_snapshot(
                     after,
                     expected,
@@ -26906,15 +26953,12 @@ def _isolate_and_delete_pending_cleanup_file(
             # The canonical-to-tombstone rename may have committed before an
             # injected exception or concurrent namespace change.  Reprove the
             # broader authority with the retained name immediately before the
-            # irreversible unlink.
+            # irreversible unlink.  The callback is repeated after the
+            # descriptor/content/ACL/stat/parent checks below so it remains the
+            # final observable filesystem operation before unlink.
             mutation_revalidator(retained_name)
-            # The broader callback may itself run arbitrary filesystem probes.
-            # Re-read through the descriptor it could not replace, then bind
-            # the retained name back to that exact identity before unlinking.
-            # Same-inode content changes and access-policy changes therefore
-            # fail closed, while unrelated child-entry timestamp churn remains
-            # outside the protected property set.
             require_open_file_unchanged("after mutation revalidation")
+            mutation_revalidator(retained_name)
         os.unlink(retained_name, dir_fd=parent_fd)
         os.fsync(parent_fd)
         if _named_entry_identity(
@@ -27075,8 +27119,20 @@ def _pending_private_use_control_from_payload(
     expected_name: str,
     label: str,
 ) -> PendingPrivateUseControlEvidence:
-    fields = {"name", "file_identity", "sha256", "size", "mode", "uid", "gid"}
-    if not isinstance(value, dict) or set(value) != fields:
+    legacy_fields = {
+        "name",
+        "file_identity",
+        "sha256",
+        "size",
+        "mode",
+        "uid",
+        "gid",
+    }
+    current_fields = legacy_fields | {"link_count"}
+    if not isinstance(value, dict) or set(value) not in (
+        legacy_fields,
+        current_fields,
+    ):
         raise SyncError(f"private-use retirement {label} changed")
     identity = _parse_pending_identity(
         value.get("file_identity"),
@@ -27087,6 +27143,11 @@ def _pending_private_use_control_from_payload(
     mode = value.get("mode")
     uid = value.get("uid")
     gid = value.get("gid")
+    # Older version-1 private-use receipts did not persist a control-file link
+    # count.  Treat their authority as requiring the current object to have
+    # exactly one name; the live snapshot check above supplies that signal
+    # without invalidating otherwise recoverable historical receipts.
+    link_count = value.get("link_count", 1)
     if (
         value.get("name") != expected_name
         or identity is None
@@ -27098,6 +27159,8 @@ def _pending_private_use_control_from_payload(
         or uid != os.geteuid()
         or type(gid) is not int
         or gid < 0
+        or type(link_count) is not int
+        or link_count != 1
     ):
         raise SyncError(f"private-use retirement {label} changed")
     return PendingPrivateUseControlEvidence(
@@ -27108,6 +27171,7 @@ def _pending_private_use_control_from_payload(
         mode=mode,
         uid=uid,
         gid=gid,
+        link_count=link_count,
     )
 
 
@@ -27174,6 +27238,7 @@ def _read_pending_private_use_retirement_receipt(
                 raise SyncError(f"private-use retirement receipt changed: {batch_name}")
         if not snapshot.exists:
             return None
+        _require_pending_cleanup_control_link_count(snapshot, path)
         if (
             not _managed_state_snapshot_has_complete_file_evidence(snapshot)
             or snapshot.file_type != stat.S_IFREG
@@ -28058,6 +28123,7 @@ def _read_pending_cleanup_ticket(
                 )
         if not snapshot.exists:
             return None
+        _require_pending_cleanup_control_link_count(snapshot, ticket_path)
         if snapshot.payload is None or (
             len(snapshot.payload) > MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES
         ):
@@ -30974,6 +31040,11 @@ def _remove_pending_batch_directory_contents(
                         planned,
                         label=f"pending cleanup child directory changed: {name}",
                     )
+                if mutation_revalidator is not None:
+                    # Keep the authority callback immediately before the
+                    # irreversible directory removal.  No filesystem probe
+                    # runs between this callback and rmdir.
+                    mutation_revalidator(logical_entry_path, "before_rmdir")
                 try:
                     os.rmdir(active_name, dir_fd=directory_fd)
                 except OSError:
@@ -31032,6 +31103,11 @@ def _remove_pending_batch_directory_contents(
                 finally:
                     if file_fd >= 0:
                         _close_fd_quietly(file_fd)
+            if mutation_revalidator is not None:
+                # All descriptor, content, ACL, stat, and parent checks are
+                # complete.  This callback is the final observable filesystem
+                # operation before unlink.
+                mutation_revalidator(logical_entry_path, "before_unlink")
             try:
                 os.unlink(active_name, dir_fd=directory_fd)
             except OSError:
@@ -32422,6 +32498,16 @@ def _ensure_pending_terminal_validation_receipt(
         quarantine_root_identity,
     )
     if existing_receipt is not None:
+        if ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
+            # v4 receipts predate the durable recovery-alias namespace map. A
+            # generic receipt cannot prove which aliases belong to this batch,
+            # so never resume destructive cleanup from it without a manual
+            # recovery decision.
+            raise SyncError(
+                "legacy terminal validation receipt lacks namespace authority; "
+                "manual recovery is required: "
+                f"{ticket.batch_root.name}"
+            )
         # The receipt is the durable boundary after which the cleanup walker
         # may already have consumed any subset of the batch aliases. Validate
         # the remaining complete namespace through one identity ledger in the
@@ -32787,6 +32873,10 @@ def _read_pending_cleanup_terminal_validation(
         )
         if not receipt.exists:
             return None
+        _require_pending_cleanup_control_link_count(
+            receipt,
+            receipt_path,
+        )
         if (
             receipt.file_type != stat.S_IFREG
             or receipt.mode != 0o600
@@ -33380,6 +33470,10 @@ def _read_pending_cleanup_empty_proof(
         )
         if not proof.exists:
             return None
+        _require_pending_cleanup_control_link_count(
+            proof,
+            proof_path,
+        )
         authority = _parse_pending_cleanup_empty_proof_authority(
             proof_path,
             proof.payload,
@@ -35664,28 +35758,15 @@ def _remove_cleanup_ready_batch(
                 ticket.batch_root_identity[1],
                 stat.S_IFDIR,
             )
-            names = _directory_member_names(
+            _require_pending_cleanup_root_representations_absent(
+                home,
+                quarantine_root,
                 quarantine_fd,
-                maximum_entries=MAX_PENDING_CLEANUP_ENTRIES,
-                overflow_message="pending cleanup quarantine root exceeds the size limit",
+                quarantine_root_identity,
+                expected_plan,
+                batch_name,
+                isolated_name,
             )
-            for name in names:
-                for prefix in (
-                    PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
-                    PENDING_CLEANUP_RETAINED_ENTRY_PREFIX,
-                ):
-                    if (
-                        _pending_cleanup_internal_entry_plan(
-                            name,
-                            prefix,
-                            quarantine_root_identity,
-                        )
-                        == expected_plan
-                    ):
-                        raise SyncError(
-                            "pending cleanup batch has unresolved private root "
-                            f"evidence: {batch_name}"
-                        )
         try:
             batch_fd = os.open(
                 batch_name,
@@ -37531,6 +37612,137 @@ def _cleanup_pending_cleanup_ticket_temps(
     return discarded
 
 
+def _require_pending_cleanup_root_representations_absent(
+    home: Path,
+    quarantine_root: Path,
+    quarantine_fd: int,
+    quarantine_root_identity: tuple[int, int],
+    expected_plan: tuple[int, int, int],
+    batch_name: str,
+    isolated_name: str,
+) -> None:
+    """Validate and reject every root-level token for one batch root.
+
+    Token names are only declarations.  The object named by each declaration
+    is lstat'ed and rebound through a no-follow descriptor before its parent
+    binding and owner-only policy are trusted.  A malformed, replaced, or
+    unreadable token blocks proof retirement even when its encoded identity does
+    not match this proof's batch root.
+    """
+    names = _directory_member_names(
+        quarantine_fd,
+        maximum_entries=MAX_PENDING_CLEANUP_ENTRIES,
+        overflow_message="pending cleanup quarantine root exceeds the size limit",
+    )
+
+    def private_root_error(name: str, detail: str) -> SyncError:
+        return SyncError(
+            "pending cleanup empty proof has unresolved private batch-root "
+            f"evidence: {batch_name}: {name} ({detail})"
+        )
+
+    def validate_object(
+        name: str,
+        declared_plan: tuple[int, int, int],
+        *,
+        is_batch_root: bool,
+        is_internal_token: bool = False,
+    ) -> None:
+        candidate_path = quarantine_root / name
+        try:
+            metadata = os.stat(
+                name,
+                dir_fd=quarantine_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as error:
+            raise private_root_error(name, "object disappeared during revalidation") from error
+        except OSError as error:
+            raise private_root_error(name, "object is unreadable") from error
+        if _pending_cleanup_entry_plan(metadata) != declared_plan:
+            if is_batch_root and not is_internal_token:
+                raise SyncError(
+                    "pending cleanup empty proof still has a batch root: "
+                    f"{batch_name}"
+                )
+            raise private_root_error(name, "encoded identity/type does not match object")
+        if not _bound_directory_matches(home, quarantine_root, quarantine_fd):
+            raise SyncError("pending cleanup quarantine root changed")
+
+        object_fd = -1
+        try:
+            if declared_plan[2] == stat.S_IFDIR:
+                object_fd = os.open(
+                    name,
+                    _directory_open_flags(nofollow=True),
+                    dir_fd=quarantine_fd,
+                )
+                _require_pending_cleanup_fd_access_policy(
+                    object_fd,
+                    candidate_path,
+                    expected_mode=0o700,
+                )
+                if _directory_identity(object_fd) != declared_plan[:2]:
+                    raise private_root_error(name, "directory identity changed")
+                if not _bound_directory_matches(home, candidate_path, object_fd):
+                    raise private_root_error(name, "directory parent binding changed")
+            elif declared_plan[2] == stat.S_IFREG:
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                flags |= getattr(os, "O_NONBLOCK", 0)
+                object_fd = os.open(name, flags, dir_fd=quarantine_fd)
+                opened = _require_pending_cleanup_fd_access_policy(
+                    object_fd,
+                    candidate_path,
+                    expected_mode=0o600,
+                )
+                if _pending_cleanup_entry_plan(opened) != declared_plan:
+                    raise private_root_error(name, "file identity changed")
+            else:
+                raise private_root_error(name, "unsupported root-token object type")
+        except FileNotFoundError as error:
+            raise private_root_error(name, "object disappeared during revalidation") from error
+        except OSError as error:
+            raise private_root_error(name, "object is unreadable") from error
+        finally:
+            if object_fd >= 0:
+                _close_fd_quietly(object_fd)
+
+        if is_batch_root and not is_internal_token:
+            raise SyncError(
+                "pending cleanup empty proof still has a batch root: "
+                f"{batch_name}"
+            )
+        if is_batch_root:
+            raise private_root_error(name, "encoded batch-root object is present")
+
+    for name in (batch_name, isolated_name):
+        if name in names:
+            validate_object(name, expected_plan, is_batch_root=True)
+
+    for prefix in (
+        PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+        PENDING_CLEANUP_ACTIVE_LINKS_ENTRY_PREFIX,
+        PENDING_CLEANUP_RETAINED_ENTRY_PREFIX,
+    ):
+        for name in names:
+            if not name.startswith(prefix):
+                continue
+            declared_plan = _pending_cleanup_internal_entry_plan(
+                name,
+                prefix,
+                quarantine_root_identity,
+            )
+            if declared_plan is None:
+                raise private_root_error(name, "malformed root-token name")
+            validate_object(
+                name,
+                declared_plan,
+                is_batch_root=declared_plan == expected_plan,
+                is_internal_token=True,
+            )
+
+
 def _require_pending_cleanup_proof_batch_roots_absent(
     home: Path,
     authority: PendingCleanupEmptyProofAuthority,
@@ -37557,36 +37769,15 @@ def _require_pending_cleanup_proof_batch_roots_absent(
                 authority.batch_root_identity[1],
                 stat.S_IFDIR,
             )
-            names = _directory_member_names(
+            _require_pending_cleanup_root_representations_absent(
+                home,
+                quarantine_root,
                 quarantine_fd,
-                maximum_entries=MAX_PENDING_CLEANUP_ENTRIES,
-                overflow_message="pending cleanup quarantine root exceeds the size limit",
+                authority.quarantine_root_identity,
+                expected_plan,
+                authority.batch_name,
+                authority.isolated_name,
             )
-            if (
-                authority.batch_name in names
-                or authority.isolated_name in names
-            ):
-                raise SyncError(
-                    "pending cleanup empty proof still has a batch root: "
-                    f"{authority.batch_name}"
-                )
-            for name in names:
-                for prefix in (
-                    PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
-                    PENDING_CLEANUP_RETAINED_ENTRY_PREFIX,
-                ):
-                    if (
-                        _pending_cleanup_internal_entry_plan(
-                            name,
-                            prefix,
-                            authority.quarantine_root_identity,
-                        )
-                        == expected_plan
-                    ):
-                        raise SyncError(
-                            "pending cleanup empty proof has unresolved private "
-                            f"batch-root evidence: {authority.batch_name}"
-                        )
 
         require_no_batch_root_representations()
         if _directory_identity(

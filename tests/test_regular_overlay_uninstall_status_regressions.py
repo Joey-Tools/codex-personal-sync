@@ -1166,6 +1166,50 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertTrue(ticket.batch_root.is_dir())
         self.assertTrue(receipt_path.is_file())
 
+    def test_v4_terminal_receipt_without_alias_map_fails_closed_before_resume(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        legacy_ticket = MODULE.replace(
+            ticket,
+            version=MODULE.LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        )
+        quarantine_fd = MODULE._open_directory_beneath(
+            self.home,
+            ticket.batch_root.parent,
+        )
+        batch_fd = MODULE._open_directory_beneath(self.home, ticket.batch_root)
+        try:
+            quarantine_identity = MODULE._directory_identity(quarantine_fd)
+            receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+                self.home,
+                ticket.batch_root.name,
+            )
+            MODULE._publish_atomic_exclusive_internal_file(
+                self.home,
+                receipt_path,
+                MODULE._pending_cleanup_terminal_validation_payload(
+                    legacy_ticket,
+                    quarantine_identity,
+                ),
+            )
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "legacy terminal validation receipt lacks namespace authority; "
+                "manual recovery is required",
+            ):
+                MODULE._ensure_pending_terminal_validation_receipt(
+                    self.home,
+                    legacy_ticket,
+                    ticket.batch_root,
+                    batch_fd,
+                    quarantine_identity,
+                )
+            self.assertTrue(receipt_path.is_file())
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+            MODULE._close_fd_quietly(quarantine_fd)
+
     def test_v8_legacy_v2_terminal_receipt_without_namespace_map_requires_recovery(
         self,
     ) -> None:
@@ -1713,6 +1757,65 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertFalse(proof_path.exists())
         self.assertEqual(self.target.stat().st_nlink, 1)
 
+    def test_pending_cleanup_ticket_rejects_external_hardlink(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        foreign = self.root / "foreign-pending-cleanup-ticket.json"
+        os.link(ticket.path, foreign)
+        try:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup control has an unauthorized hard-link alias",
+            ):
+                MODULE._remove_cleanup_ready_batch(self.home, ticket)
+            self.assertTrue(ticket.path.is_file())
+            self.assertTrue(ticket.batch_root.is_dir())
+            self.assertTrue(foreign.is_file())
+        finally:
+            foreign.unlink()
+
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
+
+    def test_pending_cleanup_unlink_has_no_filesystem_probe_after_callback(self) -> None:
+        self._deferred_terminal_ticket()
+        probe = MODULE._pending_cleanup_index_path(self.home) / "callback-order.json"
+        probe.write_bytes(b"callback ordering\n")
+        probe.chmod(0o600)
+        parent_fd = MODULE._open_directory_beneath(self.home, probe.parent)
+        events: list[str] = []
+
+        def callback(_name: str) -> None:
+            events.append("callback")
+
+        real_unlink = MODULE.os.unlink
+
+        def record_unlink(*args: object, **kwargs: object) -> None:
+            events.append("unlink")
+            real_unlink(*args, **kwargs)
+
+        try:
+            expected = MODULE._read_managed_state_file_snapshot(
+                self.home,
+                probe,
+                parent_fd,
+            )
+            with mock.patch.object(
+                MODULE.os,
+                "unlink",
+                side_effect=record_unlink,
+            ):
+                MODULE._isolate_and_delete_pending_cleanup_file(
+                    self.home,
+                    probe,
+                    parent_fd,
+                    expected,
+                    label="pending cleanup callback ordering",
+                    mutation_revalidator=callback,
+                )
+        finally:
+            MODULE._close_fd_quietly(parent_fd)
+        self.assertEqual(events[-2:], ["callback", "unlink"])
+        self.assertFalse(probe.exists())
+
     def test_v8_orphan_proof_revalidates_group_after_ticket_retirement(self) -> None:
         ticket = self._deferred_terminal_ticket()
         self.assertEqual(
@@ -1955,6 +2058,45 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertTrue(proof_path.is_file())
         self.assertTrue(private_root.is_dir())
         self.assertEqual(protected.read_bytes(), b"foreign private batch evidence\n")
+
+    def test_v8_orphan_proof_rejects_active_links_root_identity_mismatch(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        proof_path = MODULE._pending_cleanup_empty_proof_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        with mock.patch.object(
+            MODULE,
+            "_delete_pending_cleanup_empty_proof",
+            return_value=None,
+        ):
+            self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
+
+        quarantine_root = ticket.batch_root.parent
+        quarantine_fd = MODULE._open_directory_beneath(self.home, quarantine_root)
+        try:
+            quarantine_identity = MODULE._directory_identity(quarantine_fd)
+            private_name = MODULE._pending_cleanup_entry_name(
+                MODULE.PENDING_CLEANUP_ACTIVE_LINKS_ENTRY_PREFIX,
+                quarantine_identity,
+                (
+                    ticket.batch_root_identity[0],
+                    ticket.batch_root_identity[1],
+                    stat.S_IFDIR,
+                ),
+            )
+            os.mkdir(private_name, 0o700, dir_fd=quarantine_fd)
+        finally:
+            MODULE._close_fd_quietly(quarantine_fd)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "empty proof has unresolved private batch-root evidence",
+        ):
+            MODULE._cleanup_orphan_pending_cleanup_empty_proofs(self.home)
+
+        self.assertTrue(proof_path.is_file())
+        self.assertTrue((quarantine_root / private_name).is_dir())
 
     def test_v8_historic_v1_proof_is_parseable_but_cannot_retire_ticket(self) -> None:
         ticket = self._deferred_terminal_ticket()
