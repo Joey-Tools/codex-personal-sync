@@ -650,6 +650,46 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             "forged namespace object\n",
         )
 
+    def test_v8_terminal_validation_allows_owner_only_gid_drift(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        real_capture = MODULE._capture_pending_cleanup_identity_ledger
+        drifted_parents: set[tuple[int, int]] = set()
+
+        def capture_with_benign_gid_drift(*args: object, **kwargs: object) -> None:
+            real_capture(*args, **kwargs)
+            ledger = args[4]
+            assert isinstance(ledger, dict)
+            for parent_identity, entries in tuple(ledger.items()):
+                if parent_identity in drifted_parents:
+                    continue
+                for index, entry in enumerate(entries):
+                    planned = entry[1]
+                    mode = entry[7]
+                    if (
+                        planned[2] == stat.S_IFREG
+                        and not bool(
+                            mode & MODULE._REGULAR_FILE_GID_SENSITIVE_MODE_MASK
+                        )
+                    ):
+                        updated = list(entry)
+                        updated[9] += 1
+                        replacement_entries = list(entries)
+                        replacement_entries[index] = tuple(updated)
+                        ledger[parent_identity] = tuple(replacement_entries)
+                        drifted_parents.add(parent_identity)
+                        return
+
+        with mock.patch.object(
+            MODULE,
+            "_capture_pending_cleanup_identity_ledger",
+            side_effect=capture_with_benign_gid_drift,
+        ):
+            self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
+
+        self.assertTrue(drifted_parents)
+        self.assertFalse(ticket.batch_root.exists())
+        self.assertEqual(self.target.stat().st_nlink, 1)
+
     def test_v8_terminal_validation_capacity_is_preflighted_before_alias_creation(
         self,
     ) -> None:

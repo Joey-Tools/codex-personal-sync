@@ -31402,7 +31402,7 @@ def _pending_terminal_validation_namespace_anchor_digest(
             is not None
         )
     payload = [
-        _pending_terminal_validation_namespace_entry_payload(entry)
+        _pending_terminal_validation_namespace_anchor_entry_payload(entry)
         for entry in namespace_entries
         if not is_excluded(entry.path)
     ]
@@ -31717,6 +31717,23 @@ def _pending_terminal_validation_namespace_entry_payload(
         entry.uid,
         entry.gid,
     ]
+
+
+def _pending_terminal_validation_namespace_anchor_entry_payload(
+    entry: PendingTerminalValidationNamespaceEntry,
+) -> list[object]:
+    """Canonicalize only metadata that the live access policy allows to drift."""
+    payload = _pending_terminal_validation_namespace_entry_payload(entry)
+    if (
+        entry.plan[2] == stat.S_IFREG
+        and not bool(entry.mode & _REGULAR_FILE_GID_SENSITIVE_MODE_MASK)
+    ):
+        # For an owner-only regular file, GID cannot change access behavior;
+        # the live namespace validator therefore permits it to drift. Keep the
+        # namespace anchor consistent with that policy without weakening the
+        # durable receipt's diagnostic metadata.
+        payload[-1] = 0
+    return payload
 
 
 def _parse_pending_terminal_validation_namespace_entries_payload(
