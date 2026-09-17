@@ -231,7 +231,8 @@ PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX = ".allocation.json.tmp"
 PENDING_QUARANTINE_METADATA_STAGE_SUFFIX = ".allocation-metadata.tmp"
 PENDING_CLEANUP_EMPTY_PROOF_SUFFIX = ".empty-proof"
 PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX = ".terminal-validation"
-PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION = 3
+PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION = 4
+LEGACY_PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION = 3
 LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION = 4
 PENDING_TERMINAL_CLEANUP_TICKET_VERSION = 8
 LEGACY_GENERIC_CLEANUP_MANUAL_RECOVERY_CODE = (
@@ -278,6 +279,7 @@ MAX_PENDING_CLEANUP_ENTRIES = (
     + MAX_PENDING_LINK_CLAIMS * 2
     + 128
 )
+MAX_PENDING_TERMINAL_VALIDATION_ENTRIES = MAX_PENDING_CLEANUP_ENTRIES
 _MAX_PENDING_IDENTITY = (2**64 - 1, 2**64 - 1)
 _MAX_PENDING_DIGEST = "f" * 64
 _MAX_PENDING_LINK_TARGET = "\udcff" * MAX_RECONCILE_LINK_TARGET_BYTES
@@ -4862,9 +4864,20 @@ class PendingTerminalValidationDirectory:
 
 
 @dataclass(frozen=True)
+class PendingTerminalValidationNamespaceEntry:
+    path: PurePosixPath
+    parent_identity: tuple[int, int]
+    plan: tuple[int, int, int]
+    mode: int
+    uid: int
+    gid: int
+
+
+@dataclass(frozen=True)
 class PendingTerminalValidationAuthority:
     aliases: tuple[PendingTerminalValidationAlias, ...]
     directories: tuple[PendingTerminalValidationDirectory, ...]
+    namespace_entries: tuple[PendingTerminalValidationNamespaceEntry, ...] | None = None
 
 
 PendingCleanupIdentityLedgerEntry = tuple[
@@ -22113,6 +22126,7 @@ def _validate_pending_terminal_validation_receipt_capacity(
                 }
                 for path in sorted(directory_paths, key=PurePosixPath.as_posix)
             ],
+            "namespace_entries": [],
         },
         max_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
         overflow_error=(
@@ -31514,6 +31528,112 @@ def _pending_terminal_validation_directory_payload(
     }
 
 
+def _pending_terminal_validation_namespace_entry_payload(
+    entry: PendingTerminalValidationNamespaceEntry,
+) -> list[object]:
+    return [
+        entry.path.as_posix(),
+        _identity_payload(entry.parent_identity),
+        [entry.plan[0], entry.plan[1], entry.plan[2]],
+        entry.mode,
+        entry.uid,
+        entry.gid,
+    ]
+
+
+def _parse_pending_terminal_validation_namespace_entries_payload(
+    ticket: PendingBatchCleanupTicket,
+    raw_entries: object,
+) -> tuple[PendingTerminalValidationNamespaceEntry, ...]:
+    if (
+        not isinstance(raw_entries, list)
+        or len(raw_entries) > MAX_PENDING_TERMINAL_VALIDATION_ENTRIES
+    ):
+        raise SyncError(
+            "pending terminal validation namespace authority changed: "
+            f"{ticket.batch_root.name}"
+        )
+    entries: list[PendingTerminalValidationNamespaceEntry] = []
+    previous_path: str | None = None
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, list) or len(raw_entry) != 6:
+            raise SyncError(
+                "pending terminal validation namespace authority changed: "
+                f"{ticket.batch_root.name}"
+            )
+        path = _validate_relative_path(
+            raw_entry[0],
+            "pending terminal validation namespace path",
+        )
+        path_text = path.as_posix()
+        if previous_path is not None and path_text <= previous_path:
+            raise SyncError(
+                "pending terminal validation namespace authority order changed: "
+                f"{ticket.batch_root.name}"
+            )
+        previous_path = path_text
+        parent_identity = _parse_pending_identity(
+            raw_entry[1],
+            "pending terminal validation namespace parent identity",
+        )
+        raw_plan = raw_entry[2]
+        if (
+            parent_identity is None
+            or not isinstance(raw_plan, list)
+            or len(raw_plan) != 3
+            or type(raw_plan[0]) is not int
+            or type(raw_plan[1]) is not int
+            or type(raw_plan[2]) is not int
+            or raw_plan[0] < 0
+            or raw_plan[1] < 0
+            or raw_plan[2] not in {stat.S_IFDIR, stat.S_IFREG, stat.S_IFLNK}
+            or type(raw_entry[3]) is not int
+            or not 0 <= raw_entry[3] <= 0o7777
+            or type(raw_entry[4]) is not int
+            or raw_entry[4] < 0
+            or type(raw_entry[5]) is not int
+            or raw_entry[5] < 0
+        ):
+            raise SyncError(
+                "pending terminal validation namespace authority changed: "
+                f"{ticket.batch_root.name}"
+            )
+        entries.append(
+            PendingTerminalValidationNamespaceEntry(
+                path=path,
+                parent_identity=parent_identity,
+                plan=(raw_plan[0], raw_plan[1], raw_plan[2]),
+                mode=raw_entry[3],
+                uid=raw_entry[4],
+                gid=raw_entry[5],
+            )
+        )
+    parsed = tuple(entries)
+    by_path = {entry.path: entry for entry in parsed}
+    if len(by_path) != len(parsed):
+        raise SyncError(
+            "pending terminal validation namespace authority has duplicate paths: "
+            f"{ticket.batch_root.name}"
+        )
+    for entry in parsed:
+        parent_path = entry.path.parent
+        expected_parent_identity = ticket.batch_root_identity
+        if parent_path.parts:
+            parent = by_path.get(parent_path)
+            if parent is None or parent.plan[2] != stat.S_IFDIR:
+                raise SyncError(
+                    "pending terminal validation namespace authority has an "
+                    f"unbound parent: {ticket.batch_root.name}"
+                )
+            expected_parent_identity = parent.plan[:2]
+        if entry.parent_identity != expected_parent_identity:
+            raise SyncError(
+                "pending terminal validation namespace parent changed: "
+                f"{ticket.batch_root.name}"
+            )
+    return parsed
+
+
 def _parse_pending_terminal_validation_aliases_payload(
     ticket: PendingBatchCleanupTicket,
     raw_aliases: object,
@@ -31828,7 +31948,7 @@ def _parse_pending_terminal_validation_authority(
     quarantine_root_identity: tuple[int, int],
     receipt: ManagedStateFileSnapshot,
 ) -> PendingTerminalValidationAuthority | None:
-    """Parse v3 authority; ``None`` denotes a receipt without namespace proof."""
+    """Parse terminal authority; ``None`` denotes a receipt without namespace proof."""
     if receipt.payload is None:
         raise SyncError(
             f"pending cleanup terminal validation changed: {ticket.batch_root.name}"
@@ -31878,10 +31998,15 @@ def _parse_pending_terminal_validation_authority(
         "ticket_sha256",
         "terminal_regular_aliases",
     }
-    current_v3_fields = legacy_v2_fields | {
+    legacy_v3_fields = legacy_v2_fields | {
         "terminal_regular_alias_directories",
     }
-    if version not in {2, PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION}:
+    current_v4_fields = legacy_v3_fields | {"namespace_entries"}
+    if version not in {
+        2,
+        LEGACY_PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION,
+        PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION,
+    }:
         raise SyncError(
             f"pending cleanup terminal validation changed: {ticket.batch_root.name}"
         )
@@ -31890,8 +32015,11 @@ def _parse_pending_terminal_validation_authority(
             f"pending cleanup terminal validation changed: {ticket.batch_root.name}"
         )
     if (
+        version == LEGACY_PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION
+        and set(data) != legacy_v3_fields
+    ) or (
         version == PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION
-        and set(data) != current_v3_fields
+        and set(data) != current_v4_fields
     ):
         raise SyncError(
             f"pending cleanup terminal validation changed: {ticket.batch_root.name}"
@@ -31930,15 +32058,25 @@ def _parse_pending_terminal_validation_authority(
                 "pending terminal validation alias parent authority changed: "
                 f"{ticket.batch_root.name}"
             )
+    namespace_entries = (
+        _parse_pending_terminal_validation_namespace_entries_payload(
+            ticket,
+            data.get("namespace_entries"),
+        )
+        if version == PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION
+        else None
+    )
     authority = PendingTerminalValidationAuthority(
         aliases=parsed_aliases,
         directories=parsed_directories,
+        namespace_entries=namespace_entries,
     )
     if receipt.payload != _pending_cleanup_terminal_validation_payload(
         ticket,
         quarantine_root_identity,
         terminal_aliases=authority.aliases,
         terminal_directories=authority.directories,
+        namespace_entries=authority.namespace_entries,
     ):
         raise SyncError(
             f"pending cleanup terminal validation changed: {ticket.batch_root.name}"
@@ -31963,10 +32101,14 @@ def _pending_terminal_validation_alias_changed_error(path: PurePosixPath) -> Syn
     return SyncError(f"pending terminal regular alias changed: {path.as_posix()}")
 
 
-def _pending_terminal_validation_current_by_path(
+def _pending_terminal_validation_namespace_entries_by_path(
     identity_ledger: PendingCleanupIdentityLedger,
     terminal_aliases: tuple[PendingTerminalValidationAlias, ...],
-) -> dict[PurePosixPath, tuple[tuple[int, int], tuple[int, int, int]]]:
+    *,
+    namespace_entries: (
+        tuple[PendingTerminalValidationNamespaceEntry, ...] | None
+    ) = None,
+) -> dict[PurePosixPath, PendingTerminalValidationNamespaceEntry]:
     """Resolve uniquely bound legacy active files back to receipt slots.
 
     A v1 active token carries the parent and object identities but not its
@@ -31978,10 +32120,17 @@ def _pending_terminal_validation_current_by_path(
     """
     current_by_path: dict[
         PurePosixPath,
-        tuple[tuple[int, int], tuple[int, int, int]],
+        PendingTerminalValidationNamespaceEntry,
     ] = {}
     legacy_active_files: list[
-        tuple[tuple[int, int], tuple[int, int, int], PurePosixPath]
+        tuple[
+            tuple[int, int],
+            tuple[int, int, int],
+            PurePosixPath,
+            int,
+            int,
+            int,
+        ]
     ] = []
     for parent_identity, entries in identity_ledger.items():
         for (
@@ -31992,9 +32141,9 @@ def _pending_terminal_validation_current_by_path(
             logical_name,
             _active_matches,
             ledger_path,
-            _mode,
-            _uid,
-            _gid,
+            mode,
+            uid,
+            gid,
         ) in entries:
             legacy_ledger_name = _pending_cleanup_legacy_active_ledger_name(
                 parent_identity,
@@ -32009,25 +32158,45 @@ def _pending_terminal_validation_current_by_path(
             )
             if is_legacy_active_file:
                 legacy_active_files.append(
-                    (parent_identity, planned, ledger_path)
+                    (parent_identity, planned, ledger_path, mode, uid, gid)
                 )
                 continue
             if ledger_path in current_by_path:
                 raise SyncError("pending cleanup terminal alias path is duplicated")
-            current_by_path[ledger_path] = (parent_identity, planned)
+            current_by_path[ledger_path] = PendingTerminalValidationNamespaceEntry(
+                path=ledger_path,
+                parent_identity=parent_identity,
+                plan=planned,
+                mode=mode,
+                uid=uid,
+                gid=gid,
+            )
 
     terminal_file_identities = {alias.file_identity for alias in terminal_aliases}
-    for parent_identity, planned, legacy_path in legacy_active_files:
+    namespace_candidates = (
+        tuple(namespace_entries) if namespace_entries is not None else ()
+    )
+    for parent_identity, planned, legacy_path, mode, uid, gid in legacy_active_files:
         candidates = [
-            alias.path
-            for alias in terminal_aliases
-            if alias.parent_identity == parent_identity
-            and alias.file_identity == planned[:2]
-            and alias.path not in current_by_path
+            entry.path
+            for entry in namespace_candidates
+            if entry.parent_identity == parent_identity
+            and entry.plan[:2] == planned[:2]
+            and entry.path not in current_by_path
         ]
+        if not candidates:
+            candidates = [
+                alias.path
+                for alias in terminal_aliases
+                if alias.parent_identity == parent_identity
+                and alias.file_identity == planned[:2]
+                and alias.path not in current_by_path
+            ]
         if len(candidates) == 1:
             resolved_path = candidates[0]
-        elif planned[:2] in terminal_file_identities:
+        elif planned[:2] in terminal_file_identities or (
+            namespace_entries is not None and candidates
+        ):
             raise SyncError(
                 "pending terminal legacy active alias cannot be uniquely resolved"
             )
@@ -32035,8 +32204,40 @@ def _pending_terminal_validation_current_by_path(
             resolved_path = legacy_path
         if resolved_path in current_by_path:
             raise SyncError("pending cleanup terminal alias path is duplicated")
-        current_by_path[resolved_path] = (parent_identity, planned)
+        current_by_path[resolved_path] = PendingTerminalValidationNamespaceEntry(
+            path=resolved_path,
+            parent_identity=parent_identity,
+            plan=planned,
+            mode=mode,
+            uid=uid,
+            gid=gid,
+        )
     return current_by_path
+
+
+def _pending_terminal_validation_current_by_path(
+    identity_ledger: PendingCleanupIdentityLedger,
+    terminal_aliases: tuple[PendingTerminalValidationAlias, ...],
+) -> dict[PurePosixPath, tuple[tuple[int, int], tuple[int, int, int]]]:
+    """Return the compatibility projection of the complete namespace map."""
+    return {
+        path: (entry.parent_identity, entry.plan)
+        for path, entry in _pending_terminal_validation_namespace_entries_by_path(
+            identity_ledger,
+            terminal_aliases,
+        ).items()
+    }
+
+
+def _pending_terminal_validation_namespace_entries_from_identity_ledger(
+    identity_ledger: PendingCleanupIdentityLedger,
+    terminal_aliases: tuple[PendingTerminalValidationAlias, ...],
+) -> tuple[PendingTerminalValidationNamespaceEntry, ...]:
+    entries = _pending_terminal_validation_namespace_entries_by_path(
+        identity_ledger,
+        terminal_aliases,
+    )
+    return tuple(entries[path] for path in sorted(entries, key=PurePosixPath.as_posix))
 
 
 def _legacy_generic_cleanup_validation_from_current_state(
@@ -32616,6 +32817,12 @@ def _ensure_pending_terminal_validation_receipt(
                 terminal_aliases,
             )
         )
+        namespace_entries = (
+            _pending_terminal_validation_namespace_entries_from_identity_ledger(
+                identity_ledger,
+                terminal_aliases,
+            )
+        )
         _validate_pending_terminal_alias_ledger(
             home,
             ticket,
@@ -32623,6 +32830,7 @@ def _ensure_pending_terminal_validation_receipt(
             terminal_aliases,
             terminal_directories,
             require_complete_aliases=True,
+            namespace_entries=namespace_entries,
         )
         _publish_pending_cleanup_terminal_validation(
             home,
@@ -32630,6 +32838,7 @@ def _ensure_pending_terminal_validation_receipt(
             quarantine_root_identity,
             terminal_aliases=terminal_aliases,
             terminal_directories=terminal_directories,
+            namespace_entries=namespace_entries,
         )
         return
     _publish_pending_cleanup_terminal_validation(
@@ -32661,6 +32870,9 @@ def _validate_pending_terminal_alias_ledger(
     terminal_directories: tuple[PendingTerminalValidationDirectory, ...],
     *,
     require_complete_aliases: bool,
+    namespace_entries: (
+        tuple[PendingTerminalValidationNamespaceEntry, ...] | None
+    ) = None,
 ) -> None:
     """Bind remaining v8 aliases and their namespace to the receipt authority."""
     if ticket.version != PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
@@ -32692,10 +32904,58 @@ def _validate_pending_terminal_alias_ledger(
         expectation.file_identity for expectation in ticket.terminal_regular_targets
     }
     alias_counts: dict[tuple[int, int], int] = {}
-    current_by_path = _pending_terminal_validation_current_by_path(
+    current_namespace_by_path = _pending_terminal_validation_namespace_entries_by_path(
         identity_ledger,
         terminal_aliases,
+        namespace_entries=namespace_entries,
     )
+    current_by_path = {
+        path: (entry.parent_identity, entry.plan)
+        for path, entry in current_namespace_by_path.items()
+    }
+    if namespace_entries is not None:
+        expected_namespace_by_path = {
+            entry.path: entry for entry in namespace_entries
+        }
+        if len(expected_namespace_by_path) != len(namespace_entries):
+            raise SyncError(
+                "pending terminal validation namespace authority has duplicate paths"
+            )
+        for path, current in current_namespace_by_path.items():
+            expected = expected_namespace_by_path.get(path)
+            if expected is None:
+                raise SyncError(
+                    "pending terminal validation namespace changed: "
+                    f"{path.as_posix()}"
+                )
+            if (
+                current.parent_identity != expected.parent_identity
+                or current.plan != expected.plan
+                or current.mode != expected.mode
+                or current.uid != expected.uid
+                or (
+                    current.gid != expected.gid
+                    and (
+                        current.plan[2] != stat.S_IFREG
+                        or not _gid_matches_regular_file_access_policy(
+                            current.gid,
+                            expected.gid,
+                            expected.mode,
+                        )
+                    )
+                )
+            ):
+                if path in expected_by_path:
+                    raise _pending_terminal_validation_alias_changed_error(path)
+                if path in expected_directories:
+                    raise SyncError(
+                        "pending terminal regular alias namespace changed: "
+                        f"{path.as_posix()}"
+                    )
+                raise SyncError(
+                    "pending terminal validation namespace changed: "
+                    f"{path.as_posix()}"
+                )
     for path, expected_identity in expected_directories.items():
         current = current_by_path.get(path)
         if current is None:
@@ -32772,6 +33032,9 @@ def _pending_cleanup_terminal_validation_payload(
     *,
     terminal_aliases: tuple[PendingTerminalValidationAlias, ...] | None = None,
     terminal_directories: tuple[PendingTerminalValidationDirectory, ...] | None = None,
+    namespace_entries: (
+        tuple[PendingTerminalValidationNamespaceEntry, ...] | None
+    ) = None,
     legacy_generic_validation: LegacyGenericCleanupValidation | None = None,
 ) -> bytes:
     if ticket.snapshot.file_identity is None or ticket.snapshot.payload is None:
@@ -32780,6 +33043,7 @@ def _pending_cleanup_terminal_validation_payload(
         if (
             terminal_aliases is not None
             or terminal_directories is not None
+            or namespace_entries is not None
             or legacy_generic_validation is None
         ):
             raise SyncError("legacy generic cleanup validation lacks authority")
@@ -32797,24 +33061,34 @@ def _pending_cleanup_terminal_validation_payload(
             )
         if terminal_aliases is None or terminal_directories is None:
             raise SyncError("pending terminal alias receipt lacks namespace authority")
+        payload: dict[str, object] = {
+            "version": (
+                PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION
+                if namespace_entries is not None
+                else LEGACY_PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION
+            ),
+            "phase": "terminal-validation",
+            "batch": ticket.batch_root.name,
+            "batch_root_identity": _identity_payload(ticket.batch_root_identity),
+            "quarantine_root_identity": _identity_payload(quarantine_root_identity),
+            "ticket_identity": _identity_payload(ticket.snapshot.file_identity),
+            "ticket_sha256": hashlib.sha256(ticket.snapshot.payload).hexdigest(),
+            "terminal_regular_aliases": [
+                _pending_terminal_validation_alias_payload(alias)
+                for alias in terminal_aliases
+            ],
+            "terminal_regular_alias_directories": [
+                _pending_terminal_validation_directory_payload(directory)
+                for directory in terminal_directories
+            ],
+        }
+        if namespace_entries is not None:
+            payload["namespace_entries"] = [
+                _pending_terminal_validation_namespace_entry_payload(entry)
+                for entry in namespace_entries
+            ]
         return _bounded_json_document(
-            {
-                "version": PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION,
-                "phase": "terminal-validation",
-                "batch": ticket.batch_root.name,
-                "batch_root_identity": _identity_payload(ticket.batch_root_identity),
-                "quarantine_root_identity": _identity_payload(quarantine_root_identity),
-                "ticket_identity": _identity_payload(ticket.snapshot.file_identity),
-                "ticket_sha256": hashlib.sha256(ticket.snapshot.payload).hexdigest(),
-                "terminal_regular_aliases": [
-                    _pending_terminal_validation_alias_payload(alias)
-                    for alias in terminal_aliases
-                ],
-                "terminal_regular_alias_directories": [
-                    _pending_terminal_validation_directory_payload(directory)
-                    for directory in terminal_directories
-                ],
-            },
+            payload,
             max_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
             overflow_error="pending cleanup validation receipt exceeds the size limit",
         )
@@ -32916,6 +33190,9 @@ def _publish_pending_cleanup_terminal_validation(
     *,
     terminal_aliases: tuple[PendingTerminalValidationAlias, ...] | None = None,
     terminal_directories: tuple[PendingTerminalValidationDirectory, ...] | None = None,
+    namespace_entries: (
+        tuple[PendingTerminalValidationNamespaceEntry, ...] | None
+    ) = None,
     legacy_generic_validation: LegacyGenericCleanupValidation | None = None,
 ) -> ManagedStateFileSnapshot:
     if ticket.version in {1, 2}:
@@ -32923,16 +33200,23 @@ def _publish_pending_cleanup_terminal_validation(
             legacy_generic_validation is None
             or terminal_aliases is not None
             or terminal_directories is not None
+            or namespace_entries is not None
         ):
             raise SyncError("legacy generic cleanup validation lacks authority")
     elif legacy_generic_validation is not None:
         raise SyncError("pending cleanup validation has unsupported legacy authority")
     if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION and (
-        terminal_aliases is None or terminal_directories is None
+        terminal_aliases is None
+        or terminal_directories is None
+        or namespace_entries is None
     ):
-        raise SyncError("pending terminal alias receipt lacks namespace authority")
+        raise SyncError(
+            "pending terminal alias receipt lacks complete namespace authority"
+        )
     if ticket.version != PENDING_TERMINAL_CLEANUP_TICKET_VERSION and (
-        terminal_aliases is not None or terminal_directories is not None
+        terminal_aliases is not None
+        or terminal_directories is not None
+        or namespace_entries is not None
     ):
         raise SyncError(
             "pending terminal alias receipt has unsupported ticket authority"
@@ -32953,6 +33237,7 @@ def _publish_pending_cleanup_terminal_validation(
             expected_authority = PendingTerminalValidationAuthority(
                 aliases=terminal_aliases,
                 directories=terminal_directories,
+                namespace_entries=namespace_entries,
             )
             if existing_authority != expected_authority:
                 raise SyncError(
@@ -32972,6 +33257,7 @@ def _publish_pending_cleanup_terminal_validation(
             quarantine_root_identity,
             terminal_aliases=terminal_aliases,
             terminal_directories=terminal_directories,
+            namespace_entries=namespace_entries,
             legacy_generic_validation=legacy_generic_validation,
         ),
     )
@@ -32998,6 +33284,7 @@ def _publish_pending_cleanup_terminal_validation(
         != PendingTerminalValidationAuthority(
             aliases=terminal_aliases,
             directories=terminal_directories,
+            namespace_entries=namespace_entries,
         )
     ):
         raise SyncError(
@@ -35806,12 +36093,23 @@ def _remove_cleanup_ready_batch(
                         # Once both bound roots are gone, completing their
                         # control-file cleanup preserves the compatible
                         # recovery behavior without deleting batch contents.
+                        def revalidate_no_batch_root_residue(
+                            _receipt_member: str,
+                            _index_fd: int,
+                        ) -> None:
+                            require_no_private_batch_root_residue()
+
                         _delete_pending_cleanup_terminal_validation(
                             home,
                             ticket,
                             quarantine_root_identity,
+                            mutation_revalidator=revalidate_no_batch_root_residue,
                         )
-                        _delete_pending_cleanup_ticket(home, ticket)
+                        _delete_pending_cleanup_ticket(
+                            home,
+                            ticket,
+                            boundary_revalidator=require_no_private_batch_root_residue,
+                        )
                         _delete_pending_cleanup_empty_proof(
                             home,
                             ticket,
@@ -36051,6 +36349,12 @@ def _remove_cleanup_ready_batch(
                         terminal_aliases,
                     )
                 )
+                namespace_entries = (
+                    _pending_terminal_validation_namespace_entries_from_identity_ledger(
+                        identity_ledger,
+                        terminal_aliases,
+                    )
+                )
                 _validate_pending_terminal_alias_ledger(
                     home,
                     ticket,
@@ -36058,6 +36362,7 @@ def _remove_cleanup_ready_batch(
                     terminal_aliases,
                     terminal_directories,
                     require_complete_aliases=True,
+                    namespace_entries=namespace_entries,
                 )
                 _publish_pending_cleanup_terminal_validation(
                     home,
@@ -36065,6 +36370,7 @@ def _remove_cleanup_ready_batch(
                     quarantine_root_identity,
                     terminal_aliases=terminal_aliases,
                     terminal_directories=terminal_directories,
+                    namespace_entries=namespace_entries,
                 )
                 receipt = _read_pending_cleanup_terminal_validation(
                     home,
@@ -36084,6 +36390,12 @@ def _remove_cleanup_ready_batch(
                     "manual recovery is required: "
                     f"{ticket.batch_root.name}"
                 )
+            if terminal_authority.namespace_entries is None:
+                raise SyncError(
+                    "legacy terminal validation receipt lacks complete namespace "
+                    "authority; manual recovery is required: "
+                    f"{ticket.batch_root.name}"
+                )
             _validate_pending_terminal_alias_ledger(
                 home,
                 ticket,
@@ -36091,6 +36403,7 @@ def _remove_cleanup_ready_batch(
                 terminal_authority.aliases,
                 terminal_authority.directories,
                 require_complete_aliases=False,
+                namespace_entries=terminal_authority.namespace_entries,
             )
             terminal_alias_paths = frozenset(
                 alias.path for alias in terminal_authority.aliases
@@ -36123,16 +36436,13 @@ def _remove_cleanup_ready_batch(
         if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
 
             def revalidate_terminal_alias_boundary(
-                logical_path: PurePosixPath,
+                _logical_path: PurePosixPath,
                 _stage: str,
             ) -> None:
-                # Rebuild the current receipt-bound alias ledger immediately
-                # before each terminal regular alias is renamed or unlinked.
-                # This closes the gap between the pre-walker ledger check and
-                # the destructive boundary without treating unrelated
-                # directory entry churn as a target mutation.
-                if logical_path not in terminal_alias_paths:
-                    return
+                # Rebuild the complete receipt-bound namespace immediately
+                # before every rename, rmdir, or unlink. This permits already
+                # consumed entries to disappear, but rejects any new or
+                # replaced non-terminal entry before the walker can delete it.
                 current_receipt = _read_pending_cleanup_terminal_validation(
                     home,
                     ticket,
@@ -36153,6 +36463,11 @@ def _remove_cleanup_ready_batch(
                     raise SyncError(
                         "pending terminal validation receipt lacks namespace "
                         f"authority: {ticket.batch_root.name}"
+                    )
+                if current_authority.namespace_entries is None:
+                    raise SyncError(
+                        "pending terminal validation receipt lacks complete "
+                        f"namespace authority: {ticket.batch_root.name}"
                     )
                 if frozenset(
                     alias.path for alias in current_authority.aliases
@@ -36182,6 +36497,7 @@ def _remove_cleanup_ready_batch(
                     current_authority.aliases,
                     current_authority.directories,
                     require_complete_aliases=False,
+                    namespace_entries=current_authority.namespace_entries,
                 )
 
             mutation_revalidator = revalidate_terminal_alias_boundary

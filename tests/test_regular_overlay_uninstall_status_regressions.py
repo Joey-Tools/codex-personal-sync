@@ -532,6 +532,34 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertFalse(ticket.batch_root.exists())
         self.assertEqual(self.target.stat().st_nlink, 1)
 
+    def test_v8_terminal_validation_rejects_recreated_nonterminal_entry(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=SystemExit("injected crash after receipt"),
+            ),
+            self.assertRaisesRegex(SystemExit, "after receipt"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        nonterminal = ticket.batch_root / Path(*MODULE.PENDING_STATE_COMMIT_MARKER.parts)
+        self.assertTrue(nonterminal.is_file())
+        nonterminal.unlink()
+        nonterminal.write_text("foreign replacement\n", encoding="utf-8")
+        nonterminal.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal validation namespace changed",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertEqual(nonterminal.read_text(encoding="utf-8"), "foreign replacement\n")
+
     def test_terminal_validation_resumes_after_stage_alias_is_consumed(self) -> None:
         ticket = self._deferred_terminal_ticket()
         self._crash_after_walker_alias_unlink(

@@ -1216,6 +1216,39 @@ class PendingStagingCleanupTests(unittest.TestCase):
         self.assertTrue(ticket.batch_root.is_dir())
         self.assertTrue(proof_path.is_file())
 
+    def test_legacy_no_proof_retirement_rechecks_recreated_batch_root(self) -> None:
+        ticket = self._publish_legacy_cleanup_ticket(version=1)
+        shutil.rmtree(ticket.batch_root)
+        real_delete_ticket = MODULE._delete_pending_cleanup_ticket
+        recreated = False
+
+        def recreate_batch_root_then_delete(
+            home: Path,
+            current_ticket: MODULE.PendingBatchCleanupTicket,
+            **kwargs: object,
+        ) -> None:
+            nonlocal recreated
+            ticket.batch_root.mkdir()
+            recreated = True
+            real_delete_ticket(home, current_ticket, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_delete_pending_cleanup_ticket",
+                side_effect=recreate_batch_root_then_delete,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup empty proof still has a batch root",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(recreated)
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertTrue(ticket.path.is_file())
+
     def test_partial_canonical_cleanup_authority_is_never_overwritten(self) -> None:
         for version, label in ((2, "rollback"), (3, "staging")):
             with self.subTest(label=label):
