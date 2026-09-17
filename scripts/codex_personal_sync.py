@@ -32999,6 +32999,18 @@ def _ensure_pending_terminal_validation_receipt(
         return
     if ticket.version not in {4, 8} or not ticket.terminal_regular_targets:
         return
+    if (
+        ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        and namespace_anchor_sha256 is None
+    ):
+        # Older v8 tickets may still be parsed so their exact bytes and batch
+        # can be retained, but a receipt must never be synthesized from a
+        # later namespace snapshot that was not ticket-authorized.
+        raise SyncError(
+            "pending terminal validation ticket lacks namespace authority "
+            "anchor; manual recovery is required: "
+            f"{ticket.batch_root.name}"
+        )
     existing_receipt = _read_pending_cleanup_terminal_validation(
         home,
         ticket,

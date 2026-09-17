@@ -690,6 +690,43 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertFalse(ticket.batch_root.exists())
         self.assertEqual(self.target.stat().st_nlink, 1)
 
+    def test_v8_ticket_without_namespace_anchor_requires_manual_recovery(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        ticket_payload = json.loads(ticket.path.read_text(encoding="utf-8"))
+        self.assertIsInstance(ticket_payload, dict)
+        assert isinstance(ticket_payload, dict)
+        ticket_payload.pop("terminal_namespace_sha256")
+        ticket.path.write_bytes(
+            MODULE._bounded_json_document(
+                ticket_payload,
+                max_bytes=MODULE.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+                overflow_error="pending cleanup ticket exceeds the size limit",
+            )
+        )
+        legacy_ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket.path)
+        self.assertIsNotNone(legacy_ticket)
+        assert legacy_ticket is not None
+        foreign = ticket.batch_root / "links" / "foreign-entry"
+        foreign.parent.mkdir(mode=0o700, exist_ok=True)
+        foreign.write_bytes(b"foreign link content\n")
+        foreign.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "namespace authority anchor.*manual recovery",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, legacy_ticket)
+
+        self.assertTrue(legacy_ticket.path.is_file())
+        self.assertTrue(legacy_ticket.batch_root.is_dir())
+        self.assertFalse(
+            (
+                legacy_ticket.batch_root
+                / MODULE._pending_terminal_recovery_alias_name(0)
+            ).exists()
+        )
+        self.assertEqual(foreign.read_bytes(), b"foreign link content\n")
+
     def test_v8_terminal_validation_capacity_is_preflighted_before_alias_creation(
         self,
     ) -> None:
@@ -1298,6 +1335,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
                 ticket.batch_root,
                 batch_fd,
                 MODULE._directory_identity(quarantine_fd),
+                namespace_anchor_sha256=ticket.terminal_namespace_sha256,
             )
         finally:
             MODULE._close_fd_quietly(batch_fd)
@@ -1415,6 +1453,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
                 ticket.batch_root,
                 batch_fd,
                 quarantine_identity,
+                namespace_anchor_sha256=ticket.terminal_namespace_sha256,
             )
             receipt = MODULE._read_pending_cleanup_terminal_validation(
                 self.home,
