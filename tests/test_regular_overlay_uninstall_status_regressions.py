@@ -757,6 +757,160 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             ).exists()
         )
 
+    def test_v8_terminal_validation_rechecks_ticket_before_hardlink(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        alias = ticket.batch_root / MODULE._pending_terminal_recovery_alias_name(0)
+        real_publish = MODULE._publish_regular_hardlink_beneath
+        rewritten = False
+
+        def rewrite_ticket_before_publication(*args: object, **kwargs: object):
+            nonlocal rewritten
+            if not rewritten:
+                payload = json.loads(ticket.path.read_text(encoding="utf-8"))
+                self.assertIsInstance(payload, dict)
+                assert isinstance(payload, dict)
+                payload["terminal_namespace_sha256"] = "0" * 64
+                ticket.path.write_bytes(
+                    MODULE._bounded_json_document(
+                        payload,
+                        max_bytes=MODULE.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+                        overflow_error="pending cleanup ticket exceeds the size limit",
+                    )
+                )
+                rewritten = True
+            return real_publish(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_publish_regular_hardlink_beneath",
+                side_effect=rewrite_ticket_before_publication,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup ticket changed",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(rewritten)
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertFalse(alias.exists())
+
+    def test_v8_terminal_validation_rechecks_ticket_before_walker_mutation(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        real_remove = MODULE._remove_pending_batch_directory_contents
+        rewritten = False
+
+        def rewrite_ticket_before_walker(*args: object, **kwargs: object):
+            nonlocal rewritten
+            if not rewritten:
+                payload = json.loads(ticket.path.read_text(encoding="utf-8"))
+                self.assertIsInstance(payload, dict)
+                assert isinstance(payload, dict)
+                payload["terminal_namespace_sha256"] = "0" * 64
+                ticket.path.write_bytes(
+                    MODULE._bounded_json_document(
+                        payload,
+                        max_bytes=MODULE.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+                        overflow_error="pending cleanup ticket exceeds the size limit",
+                    )
+                )
+                rewritten = True
+            return real_remove(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=rewrite_ticket_before_walker,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup ticket changed",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(rewritten)
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_terminal_receipt_capacity_projects_deep_backup_namespace(self) -> None:
+        terminal_target = PurePosixPath("agents", "reviewer.toml")
+        terminal_record = MODULE.ManagedLinkRecord(
+            source=PurePosixPath("personal_codex", "agents", "reviewer.toml"),
+            target=terminal_target,
+            kind="file",
+            owner=MODULE.PUBLIC_OWNER,
+            link_target="release",
+            release_sha=SHA_A,
+        )
+        terminal_snapshot = MODULE.ReconcileTargetSnapshot(
+            parent_identity=(1, 2),
+            link_identity=(3, 4),
+            regular_sha256="a" * 64,
+            regular_size=1,
+            regular_mode=0o600,
+            regular_uid=0,
+            regular_gid=0,
+            regular_link_count=1,
+        )
+        actions = [
+            MODULE.ReconcileAction(
+                "remove",
+                self.home / Path(*terminal_target.parts),
+                "release",
+                "file",
+                planned_snapshot=terminal_snapshot,
+            )
+        ]
+        for index in range(1200):
+            target = PurePosixPath(
+                "deep",
+                f"{index:04d}",
+                *("segment",) * 62,
+            )
+            actions.append(
+                MODULE.ReconcileAction(
+                    "remove",
+                    self.home / Path(*target.parts),
+                    "release",
+                    "skill",
+                    planned_snapshot=MODULE.ReconcileTargetSnapshot(
+                        parent_identity=(5, 6),
+                        link_identity=(7, 8),
+                        link_target="release",
+                    ),
+                )
+            )
+        capacity = MODULE.PendingLinkCapacityPlan(
+            ordered_groups=(("managed", tuple(actions)),),
+            flattened_actions=tuple(actions),
+            retired_absence_specs=(),
+        )
+        before_state = MODULE.ManagedState(
+            owners={MODULE.PUBLIC_OWNER: SHA_A},
+            links={terminal_target: terminal_record},
+        )
+        after_state = MODULE.ManagedState(owners={}, links={})
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal validation receipt exceeds the size limit",
+        ):
+            MODULE._validate_pending_link_metadata_capacity(
+                self.home,
+                capacity,
+                MODULE.ManagedStateFileSnapshot(exists=False),
+                before_state,
+                before_state,
+                after_state,
+            )
+
     def test_terminal_validation_resumes_after_stage_alias_is_consumed(self) -> None:
         ticket = self._deferred_terminal_ticket()
         self._crash_after_walker_alias_unlink(

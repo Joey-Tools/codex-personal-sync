@@ -17292,6 +17292,7 @@ def _publish_regular_hardlink_beneath(
     expected_source: ManagedStateFileSnapshot,
     *,
     maximum_bytes: int | None = None,
+    mutation_revalidator: Callable[[], None] | None = None,
 ) -> ManagedStateFileSnapshot:
     if maximum_bytes is None:
         pending_parent = destination.parent
@@ -17328,6 +17329,8 @@ def _publish_regular_hardlink_beneath(
                 f"regular-file evidence source changed: {source}",
                 code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
             )
+        if mutation_revalidator is not None:
+            mutation_revalidator()
         try:
             os.link(
                 source.name,
@@ -17343,6 +17346,8 @@ def _publish_regular_hardlink_beneath(
                 code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
             ) from error
         published = True
+        if mutation_revalidator is not None:
+            mutation_revalidator()
         rebound_source = _read_managed_state_file_snapshot(
             home,
             source,
@@ -22082,12 +22087,148 @@ def _projected_pending_terminal_validation_alias_paths(
     return tuple(aliases)
 
 
+def _projected_pending_terminal_validation_namespace_paths(
+    home: Path,
+    capacity: PendingLinkCapacityPlan,
+    state_before_value: ManagedState,
+    planning_state_before: ManagedState,
+    state_after_value: ManagedState,
+    record_actions: dict[tuple[str, PurePosixPath], str],
+) -> frozenset[PurePosixPath]:
+    """Project every batch namespace path before staging publishes it.
+
+    The terminal receipt records the complete batch namespace, not only its
+    recovery aliases.  Build a conservative path projection from the pending
+    records and fixed control layout so receipt capacity is checked before the
+    transaction can commit.  Entry metadata uses the maximum scalar sizes in
+    the serializer; actual identities and modes can only be shorter.
+    """
+    paths: set[PurePosixPath] = set()
+
+    def add_path(path: PurePosixPath) -> None:
+        paths.add(path)
+        ancestor = path.parent
+        while ancestor.parts:
+            paths.add(ancestor)
+            ancestor = ancestor.parent
+
+    fixed_directories = (
+        PurePosixPath("pending"),
+        PurePosixPath("pending", "before"),
+        PurePosixPath("pending", "stage"),
+        PurePosixPath("pending", "evidence"),
+        PurePosixPath("pending", "cleanup"),
+        PurePosixPath("pending", "state"),
+        PurePosixPath("pending", "claims"),
+        PurePosixPath("pending", "claims", "before"),
+        PurePosixPath("pending", "claims", "after"),
+    )
+    for path in fixed_directories:
+        add_path(path)
+    add_path(PurePosixPath(PENDING_LINK_METADATA_NAME))
+    # Keep the compatibility name in the projection as well; it is accepted
+    # by the cleanup parser and costs only a bounded control entry.
+    add_path(PurePosixPath("metadata.json"))
+
+    state_paths = (
+        PENDING_STATE_AFTER_EVIDENCE,
+        PENDING_STATE_COMMIT_EVIDENCE,
+        PENDING_STATE_COMMIT_MARKER,
+        PENDING_STATE_ROLLBACK_MARKER,
+        PENDING_STATE_STAGING_MARKER,
+    )
+    if state_before_value is not None:
+        state_paths = (*state_paths, PENDING_STATE_BEFORE_EVIDENCE)
+    for path in state_paths:
+        add_path(path)
+
+    # Managed-state quarantine and pointer-retirement entries are outside the
+    # namespace anchor digest, but they remain part of the durable receipt.
+    dynamic_state_suffix = "9" * 19 + "-99"
+    for name in (
+        "managed-links.json",
+        f"original-{dynamic_state_suffix}",
+        f"publish-error-{dynamic_state_suffix}",
+        f"pending-complete-{dynamic_state_suffix}",
+        f"pending-publish-error-{dynamic_state_suffix}",
+    ):
+        add_path(PurePosixPath("state", name))
+
+    record_index = 0
+    for _scope, actions in capacity.ordered_groups:
+        for action in actions:
+            target = PurePosixPath(*action.target.relative_to(home).parts)
+            producing = action.action in {
+                "create",
+                "replace",
+                "quarantine-replace",
+            }
+            destructive = action.action in {
+                "replace",
+                "quarantine-replace",
+                "remove",
+                "quarantine-remove",
+            }
+            if destructive:
+                add_path(
+                    PurePosixPath("pending", "before", f"{record_index:08d}")
+                )
+                add_path(PurePosixPath("links", *target.parts))
+            if producing:
+                add_path(
+                    PurePosixPath("pending", "stage", f"{record_index:08d}")
+                )
+                add_path(
+                    PurePosixPath("pending", "evidence", f"{record_index:08d}")
+                )
+            planned_regular = (
+                _regular_snapshot_from_reconcile(action.planned_snapshot)
+                if action.planned_snapshot is not None
+                else None
+            )
+            if (producing and action.materialization == "regular") or (
+                destructive and planned_regular is not None
+            ):
+                cleanup_name = f"{record_index:08d}.json"
+                add_path(PurePosixPath("pending", "cleanup", cleanup_name))
+                add_path(
+                    PurePosixPath(
+                        "pending", "cleanup", f"{record_index:08d}.before.json"
+                    )
+                )
+                add_path(
+                    PurePosixPath(
+                        "pending",
+                        "cleanup",
+                        f"{record_index:08d}.private-authority.json",
+                    )
+                )
+            record_index += 1
+
+    for state, phase in (
+        (state_before_value, "before"),
+        (state_after_value, "after"),
+    ):
+        for claim in _projected_pending_claim_payloads(
+            home,
+            phase,
+            state,
+            record_actions,
+        ):
+            evidence = claim.get("evidence")
+            if isinstance(evidence, str):
+                add_path(PurePosixPath(evidence))
+
+    return frozenset(paths)
+
+
 def _validate_pending_terminal_validation_receipt_capacity(
     home: Path,
     capacity: PendingLinkCapacityPlan,
     state: ManagedState,
     *,
     phase: str,
+    namespace_paths: frozenset[PurePosixPath] | None = None,
 ) -> None:
     alias_paths = _projected_pending_terminal_validation_alias_paths(
         home,
@@ -22095,6 +22236,10 @@ def _validate_pending_terminal_validation_receipt_capacity(
         state,
         phase=phase,
     )
+    if not alias_paths:
+        return
+    if namespace_paths is None:
+        namespace_paths = frozenset()
     directory_paths: set[PurePosixPath] = set()
     for alias_path in alias_paths:
         ancestor = alias_path.parent
@@ -22103,7 +22248,24 @@ def _validate_pending_terminal_validation_receipt_capacity(
             ancestor = ancestor.parent
     if len(directory_paths) > MAX_PENDING_TERMINAL_VALIDATION_DIRECTORIES:
         raise SyncError("pending terminal validation directories exceed the limit")
+    if len(namespace_paths) > MAX_PENDING_TERMINAL_VALIDATION_ENTRIES:
+        raise SyncError("pending terminal validation namespace entries exceed the limit")
     maximum_identity = _identity_payload(_MAX_PENDING_IDENTITY)
+    projected_namespace_entries = [
+        [
+            path.as_posix(),
+            maximum_identity,
+            [
+                _MAX_PENDING_IDENTITY[0],
+                _MAX_PENDING_IDENTITY[1],
+                stat.S_IFREG,
+            ],
+            0o7777,
+            _MAX_PENDING_IDENTITY[0],
+            _MAX_PENDING_IDENTITY[1],
+        ]
+        for path in sorted(namespace_paths, key=PurePosixPath.as_posix)
+    ]
     _bounded_json_document(
         {
             "version": PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION,
@@ -22128,7 +22290,7 @@ def _validate_pending_terminal_validation_receipt_capacity(
                 }
                 for path in sorted(directory_paths, key=PurePosixPath.as_posix)
             ],
-            "namespace_entries": [],
+            "namespace_entries": projected_namespace_entries,
         },
         max_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
         overflow_error=(
@@ -22745,18 +22907,6 @@ def _validate_pending_link_metadata_capacity(
     planning_state_before: ManagedState,
     state_after_value: ManagedState,
 ) -> None:
-    _validate_pending_terminal_validation_receipt_capacity(
-        home,
-        capacity,
-        state_before_value,
-        phase="before",
-    )
-    _validate_pending_terminal_validation_receipt_capacity(
-        home,
-        capacity,
-        state_after_value,
-        phase="after",
-    )
     _validate_pending_cleanup_empty_proof_capacity(state_before_value)
     _validate_pending_cleanup_empty_proof_capacity(state_after_value)
     records: list[dict[str, Any]] = []
@@ -22796,6 +22946,28 @@ def _validate_pending_link_metadata_capacity(
                 len(records),
             )
         )
+    namespace_paths = _projected_pending_terminal_validation_namespace_paths(
+        home,
+        capacity,
+        state_before_value,
+        planning_state_before,
+        state_after_value,
+        record_actions,
+    )
+    _validate_pending_terminal_validation_receipt_capacity(
+        home,
+        capacity,
+        state_before_value,
+        phase="before",
+        namespace_paths=namespace_paths,
+    )
+    _validate_pending_terminal_validation_receipt_capacity(
+        home,
+        capacity,
+        state_after_value,
+        phase="after",
+        namespace_paths=namespace_paths,
+    )
     payload = _projected_pending_metadata_payload(
         state_before_exists=state_before.exists,
         records=records,
@@ -33094,6 +33266,10 @@ def _ensure_pending_terminal_validation_receipt(
                 bound_batch_root / alias_name,
                 target_state,
                 maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                mutation_revalidator=lambda: _require_pending_cleanup_ticket_unchanged(
+                    home,
+                    ticket,
+                ),
             )
         elif alias_identity != expectation.file_identity:
             raise SyncError(
@@ -36812,6 +36988,9 @@ def _remove_cleanup_ready_batch(
                 # before every rename, rmdir, or unlink. This permits already
                 # consumed entries to disappear, but rejects any new or
                 # replaced non-terminal entry before the walker can delete it.
+                # The ticket itself is the outer authority for the receipt;
+                # revalidate it before reading any other mutable cleanup state.
+                _require_pending_cleanup_ticket_unchanged(home, ticket)
                 current_receipt = _read_pending_cleanup_terminal_validation(
                     home,
                     ticket,
