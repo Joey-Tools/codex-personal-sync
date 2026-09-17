@@ -4911,6 +4911,7 @@ class PendingBatchCleanupTicket:
     marker_mode: int | None
     marker_sha256: str | None
     terminal_regular_targets: tuple[PendingRegularTargetExpectation, ...] = ()
+    terminal_namespace_sha256: str | None = None
     kind: str | None = None
     quarantine_root_identity: tuple[int, int] | None = None
     isolated_name: str | None = None
@@ -12381,6 +12382,7 @@ def _pending_cleanup_ticket_matches(
         and actual.marker_mode == expected.marker_mode
         and actual.marker_sha256 == expected.marker_sha256
         and actual.terminal_regular_targets == expected.terminal_regular_targets
+        and actual.terminal_namespace_sha256 == expected.terminal_namespace_sha256
         and actual.kind == expected.kind
         and actual.quarantine_root_identity == expected.quarantine_root_identity
         and actual.isolated_name == expected.isolated_name
@@ -27806,6 +27808,7 @@ def _pending_terminal_cleanup_ticket_payload(
     marker: ManagedStateFileSnapshot,
     *,
     phase: str,
+    terminal_namespace_sha256: str | None = None,
 ) -> bytes:
     if (
         marker.parent_identity is None
@@ -27835,6 +27838,11 @@ def _pending_terminal_cleanup_ticket_payload(
         and all(target.link_count is not None for target in targets)
         else LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
     )
+    if terminal_namespace_sha256 is not None and (
+        ticket_version != PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        or re.fullmatch(r"[0-9a-f]{64}", terminal_namespace_sha256) is None
+    ):
+        raise SyncError("pending terminal namespace digest is invalid")
     target_payloads: list[dict[str, object]] = []
     for target in targets:
         payload: dict[str, object] = {
@@ -27854,21 +27862,24 @@ def _pending_terminal_cleanup_ticket_payload(
                 )
             payload["link_count"] = target.link_count
         target_payloads.append(payload)
-    return _bounded_json_document(
-        {
-            "version": ticket_version,
-            "batch": batch.batch_root.name,
-            "batch_root_identity": _identity_payload(batch.batch_root_identity),
-            "finalization_marker": {
-                "phase": phase,
-                "path": marker_path.as_posix(),
-                "parent_identity": _identity_payload(marker.parent_identity),
-                "file_identity": _identity_payload(marker.file_identity),
-                "mode": marker.mode,
-                "sha256": hashlib.sha256(marker.payload).hexdigest(),
-            },
-            "terminal_regular_targets": target_payloads,
+    payload: dict[str, object] = {
+        "version": ticket_version,
+        "batch": batch.batch_root.name,
+        "batch_root_identity": _identity_payload(batch.batch_root_identity),
+        "finalization_marker": {
+            "phase": phase,
+            "path": marker_path.as_posix(),
+            "parent_identity": _identity_payload(marker.parent_identity),
+            "file_identity": _identity_payload(marker.file_identity),
+            "mode": marker.mode,
+            "sha256": hashlib.sha256(marker.payload).hexdigest(),
         },
+        "terminal_regular_targets": target_payloads,
+    }
+    if terminal_namespace_sha256 is not None:
+        payload["terminal_namespace_sha256"] = terminal_namespace_sha256
+    return _bounded_json_document(
+        payload,
         max_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
         overflow_error="pending terminal cleanup ticket exceeds the size limit",
     )
@@ -28197,7 +28208,16 @@ def _read_pending_cleanup_ticket(
                 "public_parent_identity",
                 "payload",
             }
-        if set(data) != expected_top_level_fields:
+        if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
+            allowed_top_level_fields = {
+                frozenset(expected_top_level_fields),
+                frozenset((*expected_top_level_fields, "terminal_namespace_sha256")),
+            }
+            if frozenset(data) not in allowed_top_level_fields:
+                raise SyncError(
+                    f"pending cleanup ticket has unsupported fields: {batch_name}"
+                )
+        elif set(data) != expected_top_level_fields:
             raise SyncError(
                 f"pending cleanup ticket has unsupported fields: {batch_name}"
             )
@@ -28330,6 +28350,17 @@ def _read_pending_cleanup_ticket(
         )
         if batch_identity is None:
             raise SyncError(f"pending cleanup batch identity is missing: {batch_name}")
+        terminal_namespace_sha256 = data.get("terminal_namespace_sha256")
+        if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION and (
+            terminal_namespace_sha256 is not None
+            and (
+                not isinstance(terminal_namespace_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", terminal_namespace_sha256) is None
+            )
+        ):
+            raise SyncError(
+                f"pending terminal namespace digest changed: {batch_name}"
+            )
         batch_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH / batch_name
         if version in {5, 7}:
             if len(snapshot.payload) > MAX_PENDING_CLEANUP_TICKET_BYTES:
@@ -28583,6 +28614,10 @@ def _read_pending_cleanup_ticket(
                     )
                     for target in terminal_regular_targets
                 ]
+            if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION and (
+                terminal_namespace_sha256 is not None
+            ):
+                payload_data["terminal_namespace_sha256"] = terminal_namespace_sha256
             expected_payload = _bounded_json_document(
                 payload_data,
                 max_bytes=(
@@ -28614,6 +28649,11 @@ def _read_pending_cleanup_ticket(
             marker_mode=marker_mode,
             marker_sha256=marker_sha256,
             terminal_regular_targets=terminal_regular_targets,
+            terminal_namespace_sha256=(
+                terminal_namespace_sha256
+                if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+                else None
+            ),
         )
     finally:
         _close_fd_quietly(index_fd)
@@ -29941,12 +29981,22 @@ def _mark_pending_batch_cleanup_ready(
         )
     ):
         return
+    terminal_namespace_sha256 = (
+        _pending_terminal_namespace_anchor_from_batch(
+            home,
+            cleanup_batch,
+            phase="after",
+        )
+        if cleanup_batch.terminal_regular_after
+        else None
+    )
     payload = (
         _pending_terminal_cleanup_ticket_payload(
             home,
             cleanup_batch,
             marker,
             phase="after",
+            terminal_namespace_sha256=terminal_namespace_sha256,
         )
         if cleanup_batch.terminal_regular_after
         else _pending_cleanup_ticket_payload(
@@ -29981,12 +30031,22 @@ def _mark_pending_batch_rollback_cleanup_ready(
         )
     ):
         return
+    terminal_namespace_sha256 = (
+        _pending_terminal_namespace_anchor_from_batch(
+            home,
+            cleanup_batch,
+            phase="before",
+        )
+        if cleanup_batch.terminal_regular_before
+        else None
+    )
     payload = (
         _pending_terminal_cleanup_ticket_payload(
             home,
             cleanup_batch,
             marker,
             phase="before",
+            terminal_namespace_sha256=terminal_namespace_sha256,
         )
         if cleanup_batch.terminal_regular_before
         else _pending_rollback_cleanup_ticket_payload(
@@ -31263,13 +31323,10 @@ def _validate_pending_terminal_target_and_alias(
         )
 
 
-def _pending_terminal_validation_aliases_from_identity_ledger(
-    ticket: PendingBatchCleanupTicket,
+def _pending_terminal_validation_aliases_for_identities(
     identity_ledger: PendingCleanupIdentityLedger,
+    expected_identities: set[tuple[int, int]],
 ) -> tuple[PendingTerminalValidationAlias, ...]:
-    expected_identities = {
-        expectation.file_identity for expectation in ticket.terminal_regular_targets
-    }
     aliases: list[PendingTerminalValidationAlias] = []
     for parent_identity, entries in identity_ledger.items():
         for (
@@ -31299,6 +31356,127 @@ def _pending_terminal_validation_aliases_from_identity_ledger(
     if any(left.path == right.path for left, right in zip(aliases, aliases[1:])):
         raise SyncError("pending terminal validation aliases are duplicated")
     return tuple(aliases)
+
+
+def _pending_terminal_validation_aliases_from_identity_ledger(
+    ticket: PendingBatchCleanupTicket,
+    identity_ledger: PendingCleanupIdentityLedger,
+) -> tuple[PendingTerminalValidationAlias, ...]:
+    return _pending_terminal_validation_aliases_for_identities(
+        identity_ledger,
+        {
+            expectation.file_identity
+            for expectation in ticket.terminal_regular_targets
+        },
+    )
+
+
+def _pending_terminal_validation_namespace_anchor_digest(
+    namespace_entries: tuple[PendingTerminalValidationNamespaceEntry, ...],
+    terminal_aliases: tuple[PendingTerminalValidationAlias, ...],
+) -> str:
+    """Hash the non-terminal namespace that v8 receipt authority must preserve.
+
+    Recovery aliases are intentionally excluded because they are created after
+    the cleanup ticket is anchored.  The batch metadata file is already bound
+    separately through the pending transaction pointer and ticket parser.
+    """
+    alias_paths = {alias.path for alias in terminal_aliases}
+    # Clearing the active pointer after ticket publication creates one
+    # implementation-owned state directory and a generated pointer-retirement
+    # entry. Those objects are bound by the pointer/transaction protocol and
+    # are intentionally outside this ticket-time namespace snapshot.
+    excluded_paths = alias_paths | {
+        PurePosixPath(PENDING_LINK_METADATA_NAME),
+        PurePosixPath("state"),
+    }
+
+    def is_excluded(path: PurePosixPath) -> bool:
+        return path in excluded_paths or (
+            len(path.parts) == 2
+            and path.parts[0] == "state"
+            and re.fullmatch(
+                r"pending-(?:complete|publish-error)-[0-9]+-[0-9]+",
+                path.parts[1],
+            )
+            is not None
+        )
+    payload = [
+        _pending_terminal_validation_namespace_entry_payload(entry)
+        for entry in namespace_entries
+        if not is_excluded(entry.path)
+    ]
+    return hashlib.sha256(
+        _bounded_json_document(
+            payload,
+            max_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+            overflow_error="pending terminal validation namespace exceeds the size limit",
+        )
+    ).hexdigest()
+
+
+def _pending_terminal_validation_namespace_entries_for_anchor(
+    identity_ledger: PendingCleanupIdentityLedger,
+    terminal_aliases: tuple[PendingTerminalValidationAlias, ...],
+) -> tuple[PendingTerminalValidationNamespaceEntry, ...]:
+    entries = _pending_terminal_validation_namespace_entries_by_path(
+        identity_ledger,
+        terminal_aliases,
+    )
+    return tuple(entries[path] for path in sorted(entries, key=PurePosixPath.as_posix))
+
+
+def _pending_terminal_namespace_anchor_from_batch(
+    home: Path,
+    batch: PendingLinkBatch,
+    *,
+    phase: str,
+) -> str | None:
+    """Bind the v8 non-terminal namespace after commit/rollback is complete."""
+    targets = _pending_terminal_cleanup_ticket_targets(home, batch, phase=phase)
+    if (
+        batch.metadata_version < 11
+        or not targets
+        or any(target.link_count is None for target in targets)
+    ):
+        return None
+    batch_fd = _open_directory_beneath(home, batch.batch_root)
+    try:
+        if (
+            _directory_identity(batch_fd) != batch.batch_root_identity
+            or not _bound_directory_matches(home, batch.batch_root, batch_fd)
+        ):
+            raise SyncError("pending terminal cleanup batch root changed")
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd,
+            batch.batch_root,
+            expected_mode=0o700,
+        )
+        budget = [MAX_PENDING_CLEANUP_ENTRIES]
+        identity_ledger: PendingCleanupIdentityLedger = {}
+        _capture_pending_cleanup_identity_ledger(
+            batch_fd,
+            batch.batch_root_identity,
+            _directory_mount_identity(batch_fd),
+            budget,
+            identity_ledger,
+            depth=0,
+            relative_parts=(),
+            skipped_names=frozenset(),
+            name_validator=_pending_batch_cleanup_name_is_authorized,
+            directory_expected_mode=0o700,
+        )
+    finally:
+        _close_fd_quietly(batch_fd)
+    aliases = _pending_terminal_validation_aliases_for_identities(
+        identity_ledger,
+        {target.file_identity for target in targets},
+    )
+    entries = _pending_terminal_validation_namespace_entries_for_anchor(
+        identity_ledger,
+        aliases,
+    )
+    return _pending_terminal_validation_namespace_anchor_digest(entries, aliases)
 
 
 def _pending_terminal_validation_directories_from_identity_ledger(
@@ -32663,6 +32841,110 @@ def _require_legacy_generic_cleanup_validation_current_state(
     )
 
 
+def _validate_pending_terminal_validation_receipt_namespace_capacity(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    bound_batch_root: Path,
+    batch_fd: int,
+    batch_mount_identity: tuple[int, int | None],
+    quarantine_root_identity: tuple[int, int],
+) -> None:
+    """Preflight the complete v8 receipt before creating recovery aliases."""
+    budget = [MAX_PENDING_CLEANUP_ENTRIES]
+    identity_ledger: PendingCleanupIdentityLedger = {}
+    _capture_pending_cleanup_identity_ledger(
+        batch_fd,
+        ticket.batch_root_identity,
+        batch_mount_identity,
+        budget,
+        identity_ledger,
+        depth=0,
+        relative_parts=(),
+        skipped_names=frozenset(),
+        name_validator=_pending_batch_cleanup_name_is_authorized,
+        directory_expected_mode=0o700,
+    )
+    expected_identities = {
+        expectation.file_identity
+        for expectation in ticket.terminal_regular_targets
+    }
+    aliases = list(
+        _pending_terminal_validation_aliases_for_identities(
+            identity_ledger,
+            expected_identities,
+        )
+    )
+    namespace_by_path = _pending_terminal_validation_namespace_entries_by_path(
+        identity_ledger,
+        tuple(aliases),
+    )
+    for index, expectation in enumerate(ticket.terminal_regular_targets):
+        alias_path = PurePosixPath(_pending_terminal_recovery_alias_name(index))
+        if alias_path in namespace_by_path:
+            continue
+        target_snapshot = _read_regular_file_snapshot_beneath(
+            home,
+            home / Path(*expectation.target.parts),
+            require_managed_access=False,
+        )
+        if not _pending_terminal_snapshot_matches_expectation(
+            target_snapshot,
+            expectation,
+            expected_parent_identity=expectation.parent_identity,
+            expected_link_count=expectation.link_count,
+        ):
+            if (
+                expectation.link_count is not None
+                and target_snapshot.parent_identity == expectation.parent_identity
+                and target_snapshot.file_identity == expectation.file_identity
+                and target_snapshot.sha256 == expectation.sha256
+                and target_snapshot.size == expectation.size
+                and target_snapshot.mode == expectation.mode
+                and target_snapshot.uid == expectation.uid
+                and target_snapshot.link_count > expectation.link_count
+            ):
+                raise SyncError(
+                    "final managed regular file has an unauthorized hard-link "
+                    f"alias: {expectation.target}"
+                )
+            raise SyncError(
+                "final managed regular file changed before terminal receipt "
+                f"capacity validation: {expectation.target}"
+            )
+        aliases.append(
+            PendingTerminalValidationAlias(
+                path=alias_path,
+                parent_identity=ticket.batch_root_identity,
+                file_identity=expectation.file_identity,
+            )
+        )
+        namespace_by_path[alias_path] = PendingTerminalValidationNamespaceEntry(
+            path=alias_path,
+            parent_identity=ticket.batch_root_identity,
+            plan=(*expectation.file_identity, stat.S_IFREG),
+            mode=expectation.mode,
+            uid=expectation.uid,
+            gid=target_snapshot.gid,
+        )
+    aliases_tuple = tuple(sorted(aliases, key=lambda alias: alias.path.as_posix()))
+    directories = _pending_terminal_validation_directories_from_identity_ledger(
+        ticket,
+        identity_ledger,
+        aliases_tuple,
+    )
+    namespace_entries = tuple(
+        namespace_by_path[path]
+        for path in sorted(namespace_by_path, key=PurePosixPath.as_posix)
+    )
+    _pending_cleanup_terminal_validation_payload(
+        ticket,
+        quarantine_root_identity,
+        terminal_aliases=aliases_tuple,
+        terminal_directories=directories,
+        namespace_entries=namespace_entries,
+    )
+
+
 def _ensure_pending_terminal_validation_receipt(
     home: Path,
     ticket: PendingBatchCleanupTicket,
@@ -32671,6 +32953,7 @@ def _ensure_pending_terminal_validation_receipt(
     quarantine_root_identity: tuple[int, int],
     *,
     legacy_generic_validation: LegacyGenericCleanupValidation | None = None,
+    namespace_anchor_sha256: str | None = None,
 ) -> None:
     if ticket.version in {1, 2}:
         existing_receipt = _read_pending_cleanup_terminal_validation(
@@ -32719,6 +33002,28 @@ def _ensure_pending_terminal_validation_receipt(
         # may already have consumed any subset of the batch aliases. Validate
         # the remaining complete namespace through one identity ledger in the
         # caller instead of requiring every recovery alias to survive.
+        if namespace_anchor_sha256 is not None:
+            existing_authority = _parse_pending_terminal_validation_authority(
+                home,
+                ticket,
+                quarantine_root_identity,
+                existing_receipt,
+            )
+            if existing_authority is None:
+                raise SyncError(
+                    "legacy terminal validation receipt lacks namespace authority; "
+                    "manual recovery is required: "
+                    f"{ticket.batch_root.name}"
+                )
+            existing_digest = _pending_terminal_validation_namespace_anchor_digest(
+                existing_authority.namespace_entries or (),
+                existing_authority.aliases,
+            )
+            if existing_digest != namespace_anchor_sha256:
+                raise SyncError(
+                    "pending terminal validation namespace authority changed: "
+                    f"{ticket.batch_root.name}"
+                )
         return
 
     for index, expectation in enumerate(ticket.terminal_regular_targets):
@@ -32832,6 +33137,18 @@ def _ensure_pending_terminal_validation_receipt(
             require_complete_aliases=True,
             namespace_entries=namespace_entries,
         )
+        if namespace_anchor_sha256 is not None:
+            if (
+                _pending_terminal_validation_namespace_anchor_digest(
+                    namespace_entries,
+                    terminal_aliases,
+                )
+                != namespace_anchor_sha256
+            ):
+                raise SyncError(
+                    "pending terminal validation namespace authority changed: "
+                    f"{ticket.batch_root.name}"
+                )
         _publish_pending_cleanup_terminal_validation(
             home,
             ticket,
@@ -36207,6 +36524,11 @@ def _remove_cleanup_ready_batch(
             bound_batch_root,
             expected_mode=0o700,
         )
+        terminal_namespace_anchor_sha256 = (
+            ticket.terminal_namespace_sha256
+            if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+            else None
+        )
         if ticket.version == 3:
             _require_no_pending_staging_manual_retention(
                 home,
@@ -36287,6 +36609,23 @@ def _remove_cleanup_ready_batch(
                     "legacy generic cleanup metadata or finalization marker "
                     "changed during receipt preparation"
                 )
+        if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
+            if (
+                _read_pending_cleanup_terminal_validation(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                )
+                is None
+            ):
+                _validate_pending_terminal_validation_receipt_namespace_capacity(
+                    home,
+                    ticket,
+                    bound_batch_root,
+                    batch_fd,
+                    batch_mount_identity,
+                    quarantine_root_identity,
+                )
         _ensure_pending_terminal_validation_receipt(
             home,
             ticket,
@@ -36294,6 +36633,7 @@ def _remove_cleanup_ready_batch(
             batch_fd,
             quarantine_root_identity,
             legacy_generic_validation=legacy_generic_validation,
+            namespace_anchor_sha256=terminal_namespace_anchor_sha256,
         )
         if legacy_generic_validation is not None:
             # Receipt publication itself is a mutable control-file operation.
@@ -36469,6 +36809,31 @@ def _remove_cleanup_ready_batch(
                         "pending terminal validation receipt lacks complete "
                         f"namespace authority: {ticket.batch_root.name}"
                     )
+                if terminal_namespace_anchor_sha256 is not None and (
+                    _pending_terminal_validation_namespace_anchor_digest(
+                        current_authority.namespace_entries,
+                        current_authority.aliases,
+                    )
+                    != terminal_namespace_anchor_sha256
+                ):
+                    raise SyncError(
+                        "pending terminal validation namespace authority changed "
+                        f"before cleanup: {ticket.batch_root.name}"
+                    )
+                if (
+                    _directory_identity(batch_fd) != ticket.batch_root_identity
+                    or _directory_mount_identity(batch_fd) != batch_mount_identity
+                    or not _bound_directory_matches(home, bound_batch_root, batch_fd)
+                ):
+                    raise SyncError(
+                        "pending terminal validation batch root binding changed "
+                        f"before cleanup: {ticket.batch_root.name}"
+                    )
+                _require_pending_cleanup_fd_access_policy(
+                    batch_fd,
+                    bound_batch_root,
+                    expected_mode=0o700,
+                )
                 if frozenset(
                     alias.path for alias in current_authority.aliases
                 ) != terminal_alias_paths:
@@ -37960,6 +38325,16 @@ def _require_pending_cleanup_root_representations_absent(
     unreadable token blocks proof retirement even when its encoded identity does
     not match this proof's batch root.
     """
+    _require_pending_cleanup_fd_access_policy(
+        quarantine_fd,
+        quarantine_root,
+        expected_mode=0o700,
+    )
+    if (
+        _directory_identity(quarantine_fd) != quarantine_root_identity
+        or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+    ):
+        raise SyncError("pending cleanup quarantine root changed")
     names = _directory_member_names(
         quarantine_fd,
         maximum_entries=MAX_PENDING_CLEANUP_ENTRIES,

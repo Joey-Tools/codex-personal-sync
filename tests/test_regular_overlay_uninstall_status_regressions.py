@@ -560,6 +560,126 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertTrue(ticket.batch_root.is_dir())
         self.assertEqual(nonterminal.read_text(encoding="utf-8"), "foreign replacement\n")
 
+    def test_v8_terminal_validation_rejects_self_consistent_forged_namespace(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=SystemExit("injected crash after receipt"),
+            ),
+            self.assertRaisesRegex(SystemExit, "after receipt"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        quarantine_root = ticket.batch_root.parent
+        quarantine_identity = (
+            quarantine_root.stat().st_dev,
+            quarantine_root.stat().st_ino,
+        )
+        receipt = MODULE._read_pending_cleanup_terminal_validation(
+            self.home,
+            ticket,
+            quarantine_identity,
+        )
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        authority = MODULE._parse_pending_terminal_validation_authority(
+            self.home,
+            ticket,
+            quarantine_identity,
+            receipt,
+        )
+        self.assertIsNotNone(authority)
+        assert authority is not None
+        alias_paths = {alias.path for alias in authority.aliases}
+        candidate = next(
+            entry
+            for entry in authority.namespace_entries or ()
+            if entry.plan[2] == stat.S_IFREG
+            and entry.path not in alias_paths
+            and entry.path != PurePosixPath(MODULE.PENDING_LINK_METADATA_NAME)
+            and entry.path.parts[:2] != ("pending", "state")
+            and (not entry.path.parts or entry.path.parts[0] != "state")
+        )
+        candidate_path = ticket.batch_root / Path(*candidate.path.parts)
+        candidate_path.unlink()
+        candidate_path.write_text("forged namespace object\n", encoding="utf-8")
+        candidate_path.chmod(0o600)
+        replacement = candidate_path.stat()
+        forged_entries = tuple(
+            MODULE.replace(
+                entry,
+                plan=(replacement.st_dev, replacement.st_ino, stat.S_IFREG),
+                mode=stat.S_IMODE(replacement.st_mode),
+                uid=replacement.st_uid,
+                gid=replacement.st_gid,
+            )
+            if entry.path == candidate.path
+            else entry
+            for entry in authority.namespace_entries or ()
+        )
+        receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        receipt_path.unlink()
+        MODULE._publish_atomic_exclusive_internal_file(
+            self.home,
+            receipt_path,
+            MODULE._pending_cleanup_terminal_validation_payload(
+                ticket,
+                quarantine_identity,
+                terminal_aliases=authority.aliases,
+                terminal_directories=authority.directories,
+                namespace_entries=forged_entries,
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal validation namespace authority changed",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertEqual(
+            candidate_path.read_text(encoding="utf-8"),
+            "forged namespace object\n",
+        )
+
+    def test_v8_terminal_validation_capacity_is_preflighted_before_alias_creation(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        alias = ticket.batch_root / MODULE._pending_terminal_recovery_alias_name(0)
+        with (
+            mock.patch.object(
+                MODULE,
+                "_pending_cleanup_terminal_validation_payload",
+                side_effect=MODULE.SyncError(
+                    "pending cleanup validation receipt exceeds the size limit"
+                ),
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup validation receipt exceeds the size limit",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertFalse(alias.exists())
+        self.assertFalse(
+            MODULE._pending_cleanup_terminal_validation_path(
+                self.home,
+                ticket.batch_root.name,
+            ).exists()
+        )
+
     def test_terminal_validation_resumes_after_stage_alias_is_consumed(self) -> None:
         ticket = self._deferred_terminal_ticket()
         self._crash_after_walker_alias_unlink(
@@ -1985,6 +2105,61 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             (isolated / "foreign").read_bytes(),
             b"foreign batch evidence\n",
         )
+
+    def test_v8_terminal_validation_rechecks_batch_root_before_walker_mutation(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        real_remove = MODULE._remove_pending_batch_directory_contents
+        replacement = ticket.batch_root.with_name(
+            f"{ticket.batch_root.name}-renamed-for-test"
+        )
+        injected = False
+
+        def replace_root_before_walker_mutation(
+            directory_fd: int,
+            directory_identity: tuple[int, int],
+            root_mount_identity: tuple[int, int | None],
+            budget: list[int],
+            **kwargs: object,
+        ) -> None:
+            nonlocal injected
+            if not injected and directory_identity == ticket.batch_root_identity:
+                ticket.batch_root.rename(replacement)
+                ticket.batch_root.mkdir(mode=0o700)
+                foreign = ticket.batch_root / "foreign"
+                foreign.write_text("foreign batch root\n", encoding="utf-8")
+                foreign.chmod(0o600)
+                injected = True
+            real_remove(
+                directory_fd,
+                directory_identity,
+                root_mount_identity,
+                budget,
+                **kwargs,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=replace_root_before_walker_mutation,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal validation batch root binding changed",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(injected)
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertEqual(
+            (ticket.batch_root / "foreign").read_text(encoding="utf-8"),
+            "foreign batch root\n",
+        )
+        self.assertTrue(replacement.is_dir())
 
     def test_v8_proof_retirement_rechecks_batch_root_absence(self) -> None:
         ticket = self._deferred_terminal_ticket()
