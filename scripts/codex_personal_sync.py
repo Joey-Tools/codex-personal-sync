@@ -31024,11 +31024,26 @@ def _pending_cleanup_identity_ledgers_match(
     right: PendingCleanupIdentityLedger,
 ) -> bool:
     """Compare cleanup ledgers without depending on scandir enumeration order."""
+
+    def normalized_entries(
+        entries: tuple[PendingCleanupIdentityLedgerEntry, ...],
+    ) -> tuple[PendingCleanupIdentityLedgerEntry, ...]:
+        normalized: list[PendingCleanupIdentityLedgerEntry] = []
+        for entry in entries:
+            if (
+                entry[1][2] == stat.S_IFREG
+                and not bool(entry[7] & _REGULAR_FILE_GID_SENSITIVE_MODE_MASK)
+            ):
+                # Match the live access-policy contract: GID is not an
+                # authority signal for an owner-only regular file.
+                entry = (*entry[:9], 0)
+            normalized.append(entry)
+        return tuple(sorted(normalized, key=lambda entry: entry[0]))
+
     if set(left) != set(right):
         return False
     return all(
-        tuple(sorted(left[identity], key=lambda entry: entry[0]))
-        == tuple(sorted(right[identity], key=lambda entry: entry[0]))
+        normalized_entries(left[identity]) == normalized_entries(right[identity])
         for identity in left
     )
 

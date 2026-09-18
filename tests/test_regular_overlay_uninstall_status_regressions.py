@@ -967,6 +967,23 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertTrue(legacy_ticket.batch_root.is_dir())
         self.assertEqual(foreign.read_bytes(), b"foreign link content\n")
 
+    def test_v4_identity_ledger_match_allows_owner_only_gid_drift(self) -> None:
+        common = (
+            "entry",
+            (11, 22, stat.S_IFREG),
+            False,
+            False,
+            "entry",
+            True,
+            PurePosixPath("entry"),
+            0o600,
+            os.geteuid(),
+        )
+        left = {(1, 2): (common + (100,),)}
+        right = {(1, 2): (common + (200,),)}
+
+        self.assertTrue(MODULE._pending_cleanup_identity_ledgers_match(left, right))
+
     def test_terminal_receipt_capacity_projects_deep_backup_namespace(self) -> None:
         terminal_target = PurePosixPath("agents", "reviewer.toml")
         terminal_record = MODULE.ManagedLinkRecord(
