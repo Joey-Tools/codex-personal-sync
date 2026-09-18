@@ -834,6 +834,57 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             b"foreign transaction metadata\n",
         )
 
+    def test_v8_terminal_validation_rejects_one_sided_pointer_authority_before_receipt(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        metadata = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        metadata.unlink()
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pointer retirement authority is incomplete; manual recovery is required",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertFalse(
+            MODULE._pending_cleanup_terminal_validation_path(
+                self.home,
+                ticket.batch_root.name,
+            ).exists()
+        )
+
+    def test_v8_terminal_validation_rejects_pointer_retirement_hardlink_alias(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        self.assertIsNotNone(ticket.pointer_retirement_path)
+        assert ticket.pointer_retirement_path is not None
+        retirement = ticket.batch_root / Path(*ticket.pointer_retirement_path.parts)
+        foreign = self.root / "foreign-pointer-retirement.toml"
+        os.link(retirement, foreign)
+
+        try:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pointer retirement object changed; manual recovery is required",
+            ):
+                MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+            self.assertTrue(ticket.path.is_file())
+            self.assertTrue(ticket.batch_root.is_dir())
+            self.assertTrue(foreign.is_file())
+            self.assertFalse(
+                MODULE._pending_cleanup_terminal_validation_path(
+                    self.home,
+                    ticket.batch_root.name,
+                ).exists()
+            )
+        finally:
+            foreign.unlink()
+
     def test_v8_terminal_validation_capacity_is_preflighted_before_alias_creation(
         self,
     ) -> None:

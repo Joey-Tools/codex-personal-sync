@@ -13413,6 +13413,7 @@ def _move_managed_state_entry_to_quarantine(
     destination_name: str | None = None,
     expected_identity: tuple[int, int] | None = None,
     expected_snapshot: ManagedStateFileSnapshot | None = None,
+    expected_link_count: int | None = None,
 ) -> tuple[Path, bool]:
     source_metadata = os.stat(
         source_name,
@@ -13422,6 +13423,13 @@ def _move_managed_state_entry_to_quarantine(
     source_identity = (source_metadata.st_dev, source_metadata.st_ino)
     if expected_identity is not None and source_identity != expected_identity:
         raise SyncError(f"managed state entry changed before quarantine: {source_name}")
+    if (
+        expected_link_count is not None
+        and source_metadata.st_nlink != expected_link_count
+    ):
+        raise SyncError(
+            f"managed state entry hard-link count changed before quarantine: {source_name}"
+        )
 
     with _managed_state_quarantine_directory_fd(home, transaction) as quarantine_fd:
         selected_name = destination_name
@@ -13458,6 +13466,8 @@ def _move_managed_state_entry_to_quarantine(
         matches = moved_identity == source_identity
         if expected_identity is not None:
             matches = matches and moved_identity == expected_identity
+        if expected_link_count is not None:
+            matches = matches and moved_metadata.st_nlink == expected_link_count
         if expected_snapshot is not None:
             assert transaction.batch_root is not None
             matches = matches and _managed_state_file_matches(
@@ -25437,6 +25447,7 @@ def _quarantine_pending_link_pointer(
         destination_name=destination_name,
         expected_identity=expected.file_identity,
         expected_snapshot=expected,
+        expected_link_count=expected.link_count,
     )
     if not matches:
         raise SyncError(
@@ -33754,6 +33765,9 @@ def _validate_pending_terminal_validation_receipt_namespace_capacity(
 def _pending_terminal_file_matches_expectation(
     snapshot: ManagedStateFileSnapshot,
     expectation: PendingTerminalFileExpectation,
+    *,
+    expected_link_count: int | None = None,
+    allowed_link_counts: frozenset[int] | None = None,
 ) -> bool:
     return (
         _managed_state_snapshot_has_complete_file_evidence(snapshot)
@@ -33766,6 +33780,16 @@ def _pending_terminal_file_matches_expectation(
         and snapshot.uid == expectation.uid
         and snapshot.gid is not None
         and _gid_matches_regular_file_access_policy(snapshot.gid, expectation.gid, expectation.mode)
+        and (
+            (
+                expected_link_count is None
+                or snapshot.link_count == expected_link_count
+            )
+            and (
+                allowed_link_counts is None
+                or snapshot.link_count in allowed_link_counts
+            )
+        )
     )
 
 
@@ -33877,6 +33901,11 @@ def _require_pending_terminal_pointer_retirement_authority(
         _close_fd_quietly(state_fd)
     retirement_exists = retirement_snapshot.exists
     metadata_exists = metadata_snapshot.exists
+    if not allow_consumed and retirement_exists != metadata_exists:
+        raise SyncError(
+            "pending pointer retirement authority is incomplete; manual recovery "
+            f"is required: {ticket.batch_root.name}"
+        )
     if not retirement_exists and not metadata_exists:
         if allow_consumed:
             return
@@ -33885,21 +33914,61 @@ def _require_pending_terminal_pointer_retirement_authority(
             "manual recovery is required: "
             f"{ticket.batch_root.name}"
         )
-    if retirement_exists and not _pending_terminal_file_matches_expectation(
+    metadata_matches = metadata_exists and _pending_terminal_file_matches_expectation(
+        metadata_snapshot,
+        authority.metadata,
+    )
+    retirement_matches = retirement_exists and _pending_terminal_file_matches_expectation(
         retirement_snapshot,
         authority.pointer,
+    )
+    expected_live_link_count = int(metadata_matches) + int(retirement_matches)
+    if expected_live_link_count < 1:
+        if metadata_exists:
+            raise SyncError(
+                "pending transaction metadata changed; manual recovery is required: "
+                f"{ticket.batch_root.name}"
+            )
+        raise SyncError(
+            "pending pointer retirement object changed; manual recovery is "
+            f"required: {ticket.batch_root.name}"
+        )
+    allowed_live_link_counts = frozenset({expected_live_link_count})
+    if allow_consumed and expected_live_link_count == 1:
+        # During receipt-backed cleanup the walker may have isolated the
+        # consumed control name into an active hard-link token while the
+        # canonical survivor is still present.  That token is protocol-owned;
+        # accept the original two-name count, but reject any additional alias.
+        allowed_live_link_counts = frozenset(
+            {expected_live_link_count, authority.pointer.link_count}
+        )
+    if retirement_matches and not _pending_terminal_file_matches_expectation(
+        retirement_snapshot,
+        authority.pointer,
+        allowed_link_counts=allowed_live_link_counts,
     ):
         raise SyncError(
             "pending pointer retirement object changed; manual recovery is "
             f"required: {ticket.batch_root.name}"
         )
-    if metadata_exists and not _pending_terminal_file_matches_expectation(
+    if metadata_matches and not _pending_terminal_file_matches_expectation(
         metadata_snapshot,
         authority.metadata,
+        allowed_link_counts=allowed_live_link_counts,
     ):
         raise SyncError(
             "pending transaction metadata changed; manual recovery is required: "
             f"{ticket.batch_root.name}"
+        )
+    if metadata_exists and not metadata_matches:
+        raise SyncError(
+            "pending transaction metadata changed; manual recovery is required: "
+            f"{ticket.batch_root.name}"
+        )
+    if retirement_exists and not retirement_matches:
+        raise SyncError(
+            "pending pointer retirement object changed; manual recovery is "
+            f"required: {ticket.batch_root.name}"
         )
     if retirement_exists and metadata_exists and (
         retirement_snapshot.file_identity != metadata_snapshot.file_identity
@@ -40912,6 +40981,8 @@ def _clear_pending_link_pointer(
         expected = batch.pointer_snapshot
         if expected is None or not _managed_state_snapshot_exact(current, expected):
             raise SyncError("pending link pointer changed and was left in place")
+        if expected.link_count is None or current.link_count != expected.link_count:
+            raise SyncError("pending link pointer hard-link count changed and was left in place")
         committed = _pending_commit_decision(home, batch)
         if phase == "before" and committed:
             raise SyncError(
