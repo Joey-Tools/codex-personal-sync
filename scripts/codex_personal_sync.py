@@ -27287,6 +27287,15 @@ def _isolate_and_delete_pending_cleanup_file(
             mutation_revalidator(retained_name)
             require_open_file_unchanged("after mutation revalidation")
             mutation_revalidator(retained_name)
+            # The second callback is the caller's final external-authority
+            # boundary.  Re-check the protected object identity after it: a
+            # cooperative callback may deliberately replace the retained name
+            # while preserving the parent policy.  Portable Unix has no
+            # inode-conditional unlink, so the final identity check closes
+            # the callback-induced substitution window; a non-cooperating
+            # same-UID replacement after this check remains outside the
+            # installer threat model.
+            require_open_file_unchanged("after final mutation revalidation")
         require_parent_access_policy("before deletion")
         os.unlink(retained_name, dir_fd=parent_fd)
         os.fsync(parent_fd)
@@ -31667,6 +31676,74 @@ def _remove_pending_batch_directory_contents(
                 expected_mode=effective_expected_mode,
             )
 
+    def require_current_entry_identity_after_callback(
+        active_name: str,
+        planned: tuple[int, int, int],
+        *,
+        label: str,
+    ) -> None:
+        """Rebind the entry object after the caller's final callback.
+
+        The walker protects the entry object identity and its access policy,
+        not incidental directory metadata such as ctime.  A callback can
+        intentionally replace the active name, so compare the no-follow
+        object plan again and, for regular files, admit the reopened object's
+        access policy before unlink/rmdir is attempted.
+        """
+        file_fd = -1
+        try:
+            current = os.stat(
+                active_name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if _pending_cleanup_entry_plan(current) != planned:
+                raise SyncError(f"{label} object identity changed")
+            if stat.S_ISREG(current.st_mode):
+                file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                file_flags |= getattr(os, "O_NOFOLLOW", 0)
+                file_flags |= getattr(os, "O_NONBLOCK", 0)
+                file_fd = os.open(
+                    active_name,
+                    file_flags,
+                    dir_fd=directory_fd,
+                )
+                effective_regular_file_expected_mode = (
+                    _cleanup_regular_file_expected_mode(
+                        regular_file_expected_mode,
+                        relative_parts,
+                        links_content_root=links_content_root,
+                    )
+                )
+                if effective_regular_file_expected_mode is None:
+                    opened = _require_current_user_cleanup_fd_access_policy(
+                        file_fd,
+                        Path("<pending-cleanup-file>")
+                        / Path(*relative_parts)
+                        / active_name,
+                    )
+                else:
+                    opened = _require_pending_cleanup_fd_access_policy(
+                        file_fd,
+                        Path("<pending-cleanup-file>")
+                        / Path(*relative_parts)
+                        / active_name,
+                        expected_mode=effective_regular_file_expected_mode,
+                    )
+                if _pending_cleanup_entry_plan(opened) != planned:
+                    raise SyncError(f"{label} object identity changed")
+        except (OSError, SyncError) as error:
+            _retain_pending_cleanup_entry(
+                directory_fd,
+                active_name,
+                directory_identity,
+                planned,
+                label=f"{label}: {error}",
+            )
+        finally:
+            if file_fd >= 0:
+                _close_fd_quietly(file_fd)
+
     if _directory_identity(directory_fd) != directory_identity:
         raise SyncError("pending cleanup directory identity changed")
     if _directory_mount_identity(directory_fd) != root_mount_identity:
@@ -31924,9 +32001,37 @@ def _remove_pending_batch_directory_contents(
                     )
                 if mutation_revalidator is not None:
                     # Keep the authority callback immediately before the
-                    # irreversible directory removal.  No filesystem probe
-                    # runs between this callback and rmdir.
+                    # irreversible directory removal, then rebind the
+                    # no-follow entry identity before rmdir.
                     mutation_revalidator(logical_entry_path, "before_rmdir")
+                require_current_entry_identity_after_callback(
+                    active_name,
+                    planned,
+                    label=f"pending cleanup child directory changed: {name}",
+                )
+                child_relative_parts = (
+                    ("links",)
+                    if links_content_root
+                    else (*relative_parts, logical_name)
+                )
+                child_display_path = Path("<pending-cleanup-dir>") / Path(
+                    *child_relative_parts
+                )
+                child_expected_mode = _cleanup_directory_expected_mode(
+                    directory_expected_mode,
+                    child_relative_parts,
+                )
+                if child_expected_mode is None:
+                    _require_current_user_cleanup_fd_access_policy(
+                        child_fd,
+                        child_display_path,
+                    )
+                else:
+                    _require_pending_cleanup_fd_access_policy(
+                        child_fd,
+                        child_display_path,
+                        expected_mode=child_expected_mode,
+                    )
                 require_current_directory_access_policy()
                 try:
                     os.rmdir(active_name, dir_fd=directory_fd)
@@ -31987,10 +32092,14 @@ def _remove_pending_batch_directory_contents(
                     if file_fd >= 0:
                         _close_fd_quietly(file_fd)
             if mutation_revalidator is not None:
-                # All descriptor, content, ACL, stat, and parent checks are
-                # complete.  This callback is the final observable filesystem
-                # operation before unlink.
+                # Rebind the no-follow entry identity after the caller's
+                # final authority callback and before unlink.
                 mutation_revalidator(logical_entry_path, "before_unlink")
+            require_current_entry_identity_after_callback(
+                active_name,
+                planned,
+                label=f"pending cleanup entry changed: {name}",
+            )
             require_current_directory_access_policy()
             try:
                 os.unlink(active_name, dir_fd=directory_fd)

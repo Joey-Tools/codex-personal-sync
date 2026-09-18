@@ -2486,7 +2486,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
 
         self.assertTrue(MODULE._remove_cleanup_ready_batch(self.home, ticket))
 
-    def test_pending_cleanup_unlink_has_no_filesystem_probe_after_callback(self) -> None:
+    def test_pending_cleanup_unlink_keeps_final_unlink_after_callback(self) -> None:
         self._deferred_terminal_ticket()
         probe = MODULE._pending_cleanup_index_path(self.home) / "callback-order.json"
         probe.write_bytes(b"callback ordering\n")
@@ -2527,6 +2527,55 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertEqual(events[-2:], ["callback", "unlink"])
         self.assertFalse(probe.exists())
 
+    def test_pending_cleanup_unlink_rechecks_identity_after_final_callback(
+        self,
+    ) -> None:
+        self._deferred_terminal_ticket()
+        probe = MODULE._pending_cleanup_index_path(self.home) / "callback-rebind.json"
+        probe.write_bytes(b"callback rebind\n")
+        probe.chmod(0o600)
+        parent_path = probe.parent
+        parent_fd = MODULE._open_directory_beneath(self.home, parent_path)
+        backup_path = parent_path / "callback-rebind-original"
+        retained_path: Path | None = None
+        calls = 0
+
+        def replace_after_final_callback(name: str) -> None:
+            nonlocal calls, retained_path
+            calls += 1
+            if calls == 3:
+                retained_path = parent_path / name
+                retained_path.rename(backup_path)
+                retained_path.write_bytes(b"callback replacement\n")
+                retained_path.chmod(0o600)
+
+        try:
+            expected = MODULE._read_managed_state_file_snapshot(
+                self.home,
+                probe,
+                parent_fd,
+            )
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "changed after final mutation revalidation",
+            ):
+                MODULE._isolate_and_delete_pending_cleanup_file(
+                    self.home,
+                    probe,
+                    parent_fd,
+                    expected,
+                    label="pending cleanup callback rebind",
+                    mutation_revalidator=replace_after_final_callback,
+                )
+        finally:
+            MODULE._close_fd_quietly(parent_fd)
+
+        self.assertEqual(calls, 3)
+        self.assertIsNotNone(retained_path)
+        assert retained_path is not None
+        self.assertTrue(backup_path.is_file())
+        self.assertEqual(retained_path.read_bytes(), b"callback replacement\n")
+
     def test_pending_cleanup_unlink_rechecks_parent_access_policy(self) -> None:
         self._deferred_terminal_ticket()
         probe = MODULE._pending_cleanup_index_path(self.home) / "parent-policy.json"
@@ -2551,7 +2600,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 MODULE.SyncError,
-                "parent access policy changed before deletion",
+                r"(?:parent access policy changed before deletion|changed after final mutation revalidation)",
             ):
                 MODULE._isolate_and_delete_pending_cleanup_file(
                     self.home,
@@ -2613,6 +2662,56 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         )
         self.assertEqual(len(retained), 1)
 
+    def test_pending_cleanup_walker_rechecks_identity_after_unlink_callback(
+        self,
+    ) -> None:
+        walker_root = self.home / "walker-rebind"
+        walker_root.mkdir(mode=0o700)
+        victim = walker_root / "victim.txt"
+        victim.write_bytes(b"walker original\n")
+        victim.chmod(0o600)
+        directory_fd = MODULE._open_directory_beneath(self.home, walker_root)
+        backup_path = walker_root / "walker-original"
+
+        def replace_after_unlink_callback(
+            _logical_path: PurePosixPath,
+            stage: str,
+        ) -> None:
+            if stage == "before_unlink":
+                active = next(
+                    child
+                    for child in walker_root.iterdir()
+                    if child.name.startswith(MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+                )
+                active.rename(backup_path)
+                active.write_bytes(b"walker replacement\n")
+                active.chmod(0o600)
+
+        try:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "object identity changed",
+            ):
+                MODULE._remove_pending_batch_directory_contents(
+                    directory_fd,
+                    MODULE._directory_identity(directory_fd),
+                    MODULE._directory_mount_identity(directory_fd),
+                    [MODULE.MAX_PENDING_CLEANUP_ENTRIES],
+                    depth=0,
+                    mutation_revalidator=replace_after_unlink_callback,
+                )
+        finally:
+            MODULE._close_fd_quietly(directory_fd)
+
+        self.assertTrue(backup_path.is_file())
+        self.assertTrue(
+            any(
+                child.is_file()
+                and child.read_bytes() == b"walker replacement\n"
+                for child in walker_root.iterdir()
+            )
+        )
+
     def test_pending_cleanup_walker_rechecks_parent_access_policy_before_rmdir(
         self,
     ) -> None:
@@ -2654,6 +2753,56 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             if child.name.startswith(MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
         )
         self.assertEqual(len(retained), 1)
+
+    def test_pending_cleanup_walker_rechecks_identity_after_rmdir_callback(
+        self,
+    ) -> None:
+        walker_root = self.home / "walker-rebind-rmdir"
+        walker_root.mkdir(mode=0o700)
+        victim = walker_root / "victim-directory"
+        victim.mkdir(mode=0o700)
+        directory_fd = MODULE._open_directory_beneath(self.home, walker_root)
+        backup_path = walker_root / "walker-directory-original"
+
+        def replace_after_rmdir_callback(
+            _logical_path: PurePosixPath,
+            stage: str,
+        ) -> None:
+            if stage == "before_rmdir":
+                active = next(
+                    child
+                    for child in walker_root.iterdir()
+                    if child.name.startswith(MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+                )
+                active.rename(backup_path)
+                active.mkdir(mode=0o700)
+
+        try:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "object identity changed",
+            ):
+                MODULE._remove_pending_batch_directory_contents(
+                    directory_fd,
+                    MODULE._directory_identity(directory_fd),
+                    MODULE._directory_mount_identity(directory_fd),
+                    [MODULE.MAX_PENDING_CLEANUP_ENTRIES],
+                    depth=0,
+                    mutation_revalidator=replace_after_rmdir_callback,
+                )
+        finally:
+            MODULE._close_fd_quietly(directory_fd)
+
+        self.assertTrue(backup_path.is_dir())
+        self.assertTrue(
+            any(
+                child.is_dir()
+                and child.name.startswith(
+                    MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX
+                )
+                for child in walker_root.iterdir()
+            )
+        )
 
     def test_v8_orphan_proof_revalidates_group_after_ticket_retirement(self) -> None:
         ticket = self._deferred_terminal_ticket()
