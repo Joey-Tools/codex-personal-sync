@@ -1197,7 +1197,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
         real_delete_proof = MODULE._delete_pending_cleanup_empty_proof
 
         def recreate_batch_root_then_delete(*args: object, **kwargs: object) -> None:
-            ticket.batch_root.mkdir()
+            ticket.batch_root.mkdir(mode=0o700)
             real_delete_proof(*args, **kwargs)
 
         with (
@@ -1228,7 +1228,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
             **kwargs: object,
         ) -> None:
             nonlocal recreated
-            ticket.batch_root.mkdir()
+            ticket.batch_root.mkdir(mode=0o700)
             recreated = True
             real_delete_ticket(home, current_ticket, **kwargs)
 

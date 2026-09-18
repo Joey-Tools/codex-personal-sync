@@ -885,6 +885,47 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         finally:
             foreign.unlink()
 
+    def test_v8_terminal_validation_rejects_foreign_alias_after_metadata_consumption(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        self.assertIsNotNone(ticket.pointer_retirement_path)
+        assert ticket.pointer_retirement_path is not None
+        retirement = ticket.batch_root / Path(*ticket.pointer_retirement_path.parts)
+        metadata = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        foreign = self.root / "foreign-pointer-after-metadata-consumption.toml"
+
+        def consume_metadata_then_crash(*args: object, **kwargs: object) -> None:
+            metadata.unlink()
+            os.link(retirement, foreign)
+            raise SystemExit("injected post-metadata-consumption crash")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=consume_metadata_then_crash,
+            ),
+            self.assertRaisesRegex(SystemExit, "post-metadata-consumption crash"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(
+            MODULE._pending_cleanup_terminal_validation_path(
+                self.home,
+                ticket.batch_root.name,
+            ).is_file()
+        )
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pointer retirement object changed; manual recovery is required",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertTrue(foreign.is_file())
+
     def test_v8_terminal_validation_capacity_is_preflighted_before_alias_creation(
         self,
     ) -> None:

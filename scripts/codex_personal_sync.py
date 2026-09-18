@@ -33952,7 +33952,6 @@ def _pending_terminal_file_matches_expectation(
     expectation: PendingTerminalFileExpectation,
     *,
     expected_link_count: int | None = None,
-    allowed_link_counts: frozenset[int] | None = None,
 ) -> bool:
     return (
         _managed_state_snapshot_has_complete_file_evidence(snapshot)
@@ -33966,14 +33965,8 @@ def _pending_terminal_file_matches_expectation(
         and snapshot.gid is not None
         and _gid_matches_regular_file_access_policy(snapshot.gid, expectation.gid, expectation.mode)
         and (
-            (
-                expected_link_count is None
-                or snapshot.link_count == expected_link_count
-            )
-            and (
-                allowed_link_counts is None
-                or snapshot.link_count in allowed_link_counts
-            )
+            expected_link_count is None
+            or snapshot.link_count == expected_link_count
         )
     )
 
@@ -34060,10 +34053,23 @@ def _require_pending_terminal_pointer_retirement_authority(
                             entry.name,
                             _directory_identity(state_fd),
                         )
+                        legacy_plan = _pending_cleanup_internal_entry_plan(
+                            entry.name,
+                            PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                            _directory_identity(state_fd),
+                        )
                         if (
-                            binding is not None
-                            and binding[1] == retirement_name
-                            and binding[0][2] == stat.S_IFREG
+                            (
+                                binding is not None
+                                and binding[1] == retirement_name
+                                and binding[0][2] == stat.S_IFREG
+                            )
+                            or (
+                                binding is None
+                                and authority.pointer.file_identity is not None
+                                and legacy_plan
+                                == (*authority.pointer.file_identity, stat.S_IFREG)
+                            )
                         ):
                             retirement_snapshot = _read_managed_state_file_snapshot(
                                 home,
@@ -34073,15 +34079,52 @@ def _require_pending_terminal_pointer_retirement_authority(
                             )
                             break
         metadata_path = bound_batch_root / PENDING_LINK_METADATA_NAME
-        try:
-            metadata_snapshot = _read_managed_state_file_snapshot(
-                home,
-                metadata_path,
-                batch_fd,
-                maximum_bytes=MAX_MANAGED_STATE_BYTES,
-            )
-        except FileNotFoundError:
-            metadata_snapshot = ManagedStateFileSnapshot(exists=False)
+        metadata_snapshot = _read_managed_state_file_snapshot(
+            home,
+            metadata_path,
+            batch_fd,
+            maximum_bytes=MAX_MANAGED_STATE_BYTES,
+        )
+        metadata_candidates: list[str] = []
+        if not metadata_snapshot.exists:
+            with os.scandir(batch_fd) as iterator:
+                for entry in iterator:
+                    binding = _pending_cleanup_active_entry_binding(
+                        entry.name,
+                        ticket.batch_root_identity,
+                    )
+                    legacy_plan = _pending_cleanup_internal_entry_plan(
+                        entry.name,
+                        PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                        ticket.batch_root_identity,
+                    )
+                    if (
+                        (
+                            binding is not None
+                            and binding[1] == PENDING_LINK_METADATA_NAME
+                            and binding[0][2] == stat.S_IFREG
+                        )
+                        or (
+                            binding is None
+                            and authority.metadata.file_identity is not None
+                            and legacy_plan
+                            == (*authority.metadata.file_identity, stat.S_IFREG)
+                        )
+                    ):
+                        metadata_candidates.append(entry.name)
+            if len(metadata_candidates) > 1:
+                raise SyncError(
+                    "pending transaction metadata has ambiguous active tokens; "
+                    "manual recovery is required: "
+                    f"{ticket.batch_root.name}"
+                )
+            if metadata_candidates:
+                metadata_snapshot = _read_managed_state_file_snapshot(
+                    home,
+                    bound_batch_root / metadata_candidates[0],
+                    batch_fd,
+                    maximum_bytes=MAX_MANAGED_STATE_BYTES,
+                )
     finally:
         _close_fd_quietly(state_fd)
     retirement_exists = retirement_snapshot.exists
@@ -34118,19 +34161,10 @@ def _require_pending_terminal_pointer_retirement_authority(
             "pending pointer retirement object changed; manual recovery is "
             f"required: {ticket.batch_root.name}"
         )
-    allowed_live_link_counts = frozenset({expected_live_link_count})
-    if allow_consumed and expected_live_link_count == 1:
-        # During receipt-backed cleanup the walker may have isolated the
-        # consumed control name into an active hard-link token while the
-        # canonical survivor is still present.  That token is protocol-owned;
-        # accept the original two-name count, but reject any additional alias.
-        allowed_live_link_counts = frozenset(
-            {expected_live_link_count, authority.pointer.link_count}
-        )
     if retirement_matches and not _pending_terminal_file_matches_expectation(
         retirement_snapshot,
         authority.pointer,
-        allowed_link_counts=allowed_live_link_counts,
+        expected_link_count=expected_live_link_count,
     ):
         raise SyncError(
             "pending pointer retirement object changed; manual recovery is "
@@ -34139,7 +34173,7 @@ def _require_pending_terminal_pointer_retirement_authority(
     if metadata_matches and not _pending_terminal_file_matches_expectation(
         metadata_snapshot,
         authority.metadata,
-        allowed_link_counts=allowed_live_link_counts,
+        expected_link_count=expected_live_link_count,
     ):
         raise SyncError(
             "pending transaction metadata changed; manual recovery is required: "
