@@ -28197,24 +28197,75 @@ def _pending_terminal_cleanup_ticket_payload(
         batch,
         phase=phase,
     )
-    # Only metadata v11 durably records the exact pre-commit link counts for
-    # the complete terminal group. Older metadata can reconstruct target
-    # content and identity, but must keep emitting the compatible v4 ticket:
-    # upgrading a resumed v6 batch would conflict with an already durable v4
-    # ticket published by an older binary.
+    ticket_batch = batch
+    if targets and any(target.link_count is None for target in targets):
+        staged_targets = _stage_pending_terminal_regular_targets(
+            home,
+            batch.state_after_value if phase == "after" else batch.state_before_value,
+            batch.records,
+            phase=phase,
+            batch_root=batch.batch_root,
+            produced_targets_are_published=(phase == "after"),
+        )
+        staged_by_target = {target.target: target for target in staged_targets}
+        if any(target.target not in staged_by_target for target in targets):
+            raise SyncError(
+                "pending terminal regular target group changed while deriving "
+                "hard-link authority"
+            )
+        selected_targets = tuple(staged_by_target[target.target] for target in targets)
+        staged_batch = replace(
+            batch,
+            terminal_regular_after=(
+                selected_targets if phase == "after" else batch.terminal_regular_after
+            ),
+            terminal_regular_before=(
+                selected_targets if phase == "before" else batch.terminal_regular_before
+            ),
+        )
+        ticket_batch = staged_batch
+        targets = _pending_terminal_cleanup_ticket_targets(
+            home,
+            staged_batch,
+            phase=phase,
+        )
+    # Metadata v11 persists exact pre-commit link counts. Older metadata can
+    # derive the same action-scoped counts while publishing a new ticket, but
+    # resumed historic tickets keep their original v4/v8 bytes.
     ticket_version = (
         PENDING_TERMINAL_CLEANUP_TICKET_VERSION
         if batch.metadata_version >= 11
         and all(target.link_count is not None for target in targets)
         else LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
     )
+    if (
+        ticket_version
+        in {
+            LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+            PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        }
+        and terminal_namespace_sha256 is None
+    ):
+        terminal_namespace_sha256 = _pending_terminal_namespace_anchor_from_batch(
+            home,
+            ticket_batch,
+            phase=phase,
+        )
     pointer_retirement_authority = (
         _pending_terminal_pointer_retirement_authority(home, batch)
-        if ticket_version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        if ticket_version
+        in {
+            LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+            PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        }
         else None
     )
     if terminal_namespace_sha256 is not None and (
-        ticket_version != PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        ticket_version
+        not in {
+            LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+            PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        }
         or re.fullmatch(r"[0-9a-f]{64}", terminal_namespace_sha256) is None
     ):
         raise SyncError("pending terminal namespace digest is invalid")
@@ -28229,13 +28280,14 @@ def _pending_terminal_cleanup_ticket_payload(
             "mode": target.mode,
             "uid": target.uid,
         }
+        if target.link_count is not None:
+            payload["link_count"] = target.link_count
         if ticket_version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
             if target.link_count is None:
                 raise SyncError(
                     "pending terminal regular target lacks exact hard-link "
                     f"authority: {target.target}"
                 )
-            payload["link_count"] = target.link_count
         target_payloads.append(payload)
     payload: dict[str, object] = {
         "version": ticket_version,
@@ -28253,7 +28305,10 @@ def _pending_terminal_cleanup_ticket_payload(
     }
     if terminal_namespace_sha256 is not None:
         payload["terminal_namespace_sha256"] = terminal_namespace_sha256
-    if ticket_version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
+    if ticket_version in {
+        LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+    }:
         payload["pointer_retirement_path"] = _pending_pointer_retirement_path(
             batch.batch_root.name,
         ).as_posix()
@@ -28275,10 +28330,11 @@ def _parse_pending_terminal_regular_targets(
     *,
     batch_name: str,
     require_link_count: bool,
+    allow_link_count: bool = False,
 ) -> tuple[PendingRegularTargetExpectation, ...]:
     if not isinstance(raw_targets, list) or len(raw_targets) > MAX_PENDING_LINK_RECORDS:
         raise SyncError(f"pending terminal regular targets are invalid: {batch_name}")
-    expected_fields = {
+    base_fields = {
         "target",
         "parent_identity",
         "file_identity",
@@ -28287,12 +28343,18 @@ def _parse_pending_terminal_regular_targets(
         "mode",
         "uid",
     }
+    allowed_fields = {frozenset(base_fields)}
     if require_link_count:
-        expected_fields.add("link_count")
+        allowed_fields = {frozenset((*base_fields, "link_count"))}
+    elif allow_link_count:
+        allowed_fields.add(frozenset((*base_fields, "link_count")))
     targets: list[PendingRegularTargetExpectation] = []
     previous_target: PurePosixPath | None = None
     for raw_target in raw_targets:
-        if not isinstance(raw_target, dict) or set(raw_target) != expected_fields:
+        if (
+            not isinstance(raw_target, dict)
+            or frozenset(raw_target) not in allowed_fields
+        ):
             raise SyncError(f"pending terminal regular target changed: {batch_name}")
         target = _validate_relative_path(
             raw_target.get("target"),
@@ -28318,7 +28380,8 @@ def _parse_pending_terminal_regular_targets(
         size = raw_target.get("size")
         mode = raw_target.get("mode")
         uid = raw_target.get("uid")
-        link_count = raw_target.get("link_count") if require_link_count else None
+        has_link_count = "link_count" in raw_target
+        link_count = raw_target.get("link_count") if has_link_count else None
         if (
             parent_identity is None
             or file_identity is None
@@ -28330,7 +28393,7 @@ def _parse_pending_terminal_regular_targets(
             or mode != 0o600
             or uid != os.geteuid()
             or (
-                require_link_count
+                has_link_count
                 and (
                     not isinstance(link_count, int)
                     or isinstance(link_count, bool)
@@ -28685,7 +28748,10 @@ def _read_pending_cleanup_ticket(
                 "public_parent_identity",
                 "payload",
             }
-        if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
+        if version in {
+            LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+            PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        }:
             allowed_top_level_fields = {
                 frozenset(expected_top_level_fields),
                 frozenset((*expected_top_level_fields, "terminal_namespace_sha256")),
@@ -28859,7 +28925,10 @@ def _read_pending_cleanup_ticket(
         if batch_identity is None:
             raise SyncError(f"pending cleanup batch identity is missing: {batch_name}")
         terminal_namespace_sha256 = data.get("terminal_namespace_sha256")
-        if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION and (
+        if version in {
+            LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+            PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        } and (
             terminal_namespace_sha256 is not None
             and (
                 not isinstance(terminal_namespace_sha256, str)
@@ -28871,7 +28940,10 @@ def _read_pending_cleanup_ticket(
             )
         batch_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH / batch_name
         pointer_retirement_path = None
-        if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION and (
+        if version in {
+            LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+            PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        } and (
             "pointer_retirement_path" in data
         ):
             pointer_retirement_path = _validate_relative_path(
@@ -28883,7 +28955,10 @@ def _read_pending_cleanup_ticket(
                     f"pending pointer retirement path changed: {batch_name}"
                 )
         pointer_retirement_authority = None
-        if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION and (
+        if version in {
+            LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+            PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        } and (
             "pointer_retirement" in data
         ):
             if pointer_retirement_path is None:
@@ -29107,6 +29182,9 @@ def _read_pending_cleanup_ticket(
                 data.get("terminal_regular_targets"),
                 batch_name=batch_name,
                 require_link_count=(version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION),
+                allow_link_count=(
+                    version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+                ),
             )
             if version
             in {
@@ -29115,6 +29193,14 @@ def _read_pending_cleanup_ticket(
             }
             else ()
         )
+        if version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
+            has_link_counts = {
+                target.link_count is not None for target in terminal_regular_targets
+            }
+            if len(has_link_counts) > 1:
+                raise SyncError(
+                    f"pending terminal regular target link-count authority changed: {batch_name}"
+                )
         if version == 1:
             expected_payload = _pending_cleanup_ticket_payload(
                 batch_root,
@@ -29142,23 +29228,30 @@ def _read_pending_cleanup_ticket(
                 payload_data["terminal_regular_targets"] = [
                     _pending_regular_target_expectation_payload(
                         target,
-                        include_link_count=(
-                            version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
-                        ),
+                        include_link_count=target.link_count is not None,
                     )
                     for target in terminal_regular_targets
                 ]
-            if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION and (
+            if version in {
+                LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+                PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+            } and (
                 terminal_namespace_sha256 is not None
             ):
                 payload_data["terminal_namespace_sha256"] = terminal_namespace_sha256
-            if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION and (
+            if version in {
+                LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+                PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+            } and (
                 pointer_retirement_path is not None
             ):
                 payload_data["pointer_retirement_path"] = (
                     pointer_retirement_path.as_posix()
                 )
-            if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION and (
+            if version in {
+                LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+                PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+            } and (
                 pointer_retirement_authority is not None
             ):
                 payload_data["pointer_retirement"] = (
@@ -29199,17 +29292,29 @@ def _read_pending_cleanup_ticket(
             terminal_regular_targets=terminal_regular_targets,
             terminal_namespace_sha256=(
                 terminal_namespace_sha256
-                if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+                if version
+                in {
+                    LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+                    PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+                }
                 else None
             ),
             pointer_retirement_path=(
                 pointer_retirement_path
-                if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+                if version
+                in {
+                    LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+                    PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+                }
                 else None
             ),
             pointer_retirement_authority=(
                 pointer_retirement_authority
-                if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+                if version
+                in {
+                    LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+                    PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+                }
                 else None
             ),
         )
@@ -30493,7 +30598,16 @@ def _reuse_existing_legacy_terminal_cleanup_ticket(
             )
     else:
         expected_ticket_targets = (
-            tuple(replace(target, link_count=None) for target in expected_targets)
+            (
+                expected_targets
+                if all(
+                    target.link_count is not None
+                    for target in existing.terminal_regular_targets
+                )
+                else tuple(
+                    replace(target, link_count=None) for target in expected_targets
+                )
+            )
             if existing.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
             else expected_targets
         )
@@ -32096,13 +32210,9 @@ def _pending_terminal_namespace_anchor_from_batch(
     *,
     phase: str,
 ) -> str | None:
-    """Bind the v8 non-terminal namespace after commit/rollback is complete."""
+    """Bind the terminal ticket's non-terminal namespace after finalization."""
     targets = _pending_terminal_cleanup_ticket_targets(home, batch, phase=phase)
-    if (
-        batch.metadata_version < 11
-        or not targets
-        or any(target.link_count is None for target in targets)
-    ):
+    if not targets:
         return None
     batch_fd = _open_directory_beneath(home, batch.batch_root)
     try:
@@ -32836,7 +32946,10 @@ def _parse_pending_terminal_validation_authority(
             data,
         )
         return PendingTerminalValidationAuthority((), ())
-    if ticket.version != PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
+    if ticket.version not in {
+        LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+    }:
         if receipt.payload != _pending_cleanup_terminal_validation_payload(
             ticket,
             quarantine_root_identity,
@@ -33841,22 +33954,13 @@ def _ensure_pending_terminal_validation_receipt(
         ticket,
         quarantine_root_identity,
     )
-    if ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
-        if existing_receipt is not None:
+    if namespace_anchor_sha256 is None:
+        if ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
             raise SyncError(
-                "legacy terminal validation receipt lacks namespace authority; "
+                "legacy terminal validation ticket lacks namespace authority; "
                 "manual recovery is required: "
                 f"{ticket.batch_root.name}"
             )
-        raise SyncError(
-            "legacy terminal validation ticket lacks namespace authority; manual "
-            "recovery is required: "
-            f"{ticket.batch_root.name}"
-        )
-    if (
-        ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
-        and namespace_anchor_sha256 is None
-    ):
         # Older v8 tickets may still be parsed so their exact bytes and batch
         # can be retained, but a receipt must never be synthesized from a
         # later namespace snapshot that was not ticket-authorized.
@@ -33866,15 +33970,21 @@ def _ensure_pending_terminal_validation_receipt(
             f"{ticket.batch_root.name}"
         )
     if (
-        ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
-        and (
-            ticket.pointer_retirement_path is None
-            or ticket.pointer_retirement_authority is None
-        )
+        ticket.pointer_retirement_path is None
+        or ticket.pointer_retirement_authority is None
     ):
         raise SyncError(
             "pending terminal validation ticket lacks exact pointer retirement "
             "authority; manual recovery is required: "
+            f"{ticket.batch_root.name}"
+        )
+    if any(
+        expectation.link_count is None
+        for expectation in ticket.terminal_regular_targets
+    ):
+        raise SyncError(
+            "pending terminal ticket lacks exact hard-link authority; manual "
+            "recovery is required: "
             f"{ticket.batch_root.name}"
         )
     _require_pending_terminal_pointer_retirement_authority(
@@ -33884,36 +33994,39 @@ def _ensure_pending_terminal_validation_receipt(
         batch_fd,
         allow_consumed=existing_receipt is not None,
     )
+
     if existing_receipt is not None:
         # The receipt is the durable boundary after which the cleanup walker
         # may already have consumed any subset of the batch aliases. Validate
         # the remaining complete namespace through one identity ledger in the
         # caller instead of requiring every recovery alias to survive.
-        if namespace_anchor_sha256 is not None:
-            existing_authority = _parse_pending_terminal_validation_authority(
-                home,
+        existing_authority = _parse_pending_terminal_validation_authority(
+            home,
+            ticket,
+            quarantine_root_identity,
+            existing_receipt,
+        )
+        if (
+            existing_authority is None
+            or existing_authority.namespace_entries is None
+        ):
+            raise SyncError(
+                "legacy terminal validation receipt lacks namespace authority; "
+                "manual recovery is required: "
+                f"{ticket.batch_root.name}"
+            )
+        existing_digest = (
+            _pending_terminal_validation_namespace_anchor_digest_for_ticket(
                 ticket,
-                quarantine_root_identity,
-                existing_receipt,
+                existing_authority.namespace_entries,
+                existing_authority.aliases,
             )
-            if existing_authority is None:
-                raise SyncError(
-                    "legacy terminal validation receipt lacks namespace authority; "
-                    "manual recovery is required: "
-                    f"{ticket.batch_root.name}"
-                )
-            existing_digest = (
-                _pending_terminal_validation_namespace_anchor_digest_for_ticket(
-                    ticket,
-                    existing_authority.namespace_entries or (),
-                    existing_authority.aliases,
-                )
+        )
+        if existing_digest != namespace_anchor_sha256:
+            raise SyncError(
+                "pending terminal validation namespace authority changed: "
+                f"{ticket.batch_root.name}"
             )
-            if existing_digest != namespace_anchor_sha256:
-                raise SyncError(
-                    "pending terminal validation namespace authority changed: "
-                    f"{ticket.batch_root.name}"
-                )
         return
 
     for index, expectation in enumerate(ticket.terminal_regular_targets):
@@ -33921,8 +34034,7 @@ def _ensure_pending_terminal_validation_receipt(
         alias_identity = _named_entry_identity(batch_fd, alias_name)
         target = home / Path(*expectation.target.parts)
         if alias_identity is None:
-            if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
-                assert expectation.link_count is not None
+            if expectation.link_count is not None:
                 target_snapshot = _read_regular_file_snapshot_beneath(
                     home,
                     target,
@@ -33972,8 +34084,7 @@ def _ensure_pending_terminal_validation_receipt(
             alias_name,
             expected_link_count=(
                 expectation.link_count + 1
-                if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
-                and expectation.link_count is not None
+                if expectation.link_count is not None
                 else None
             ),
         )
@@ -33988,8 +34099,11 @@ def _ensure_pending_terminal_validation_receipt(
         ticket,
     ):
         raise SyncError(f"pending cleanup ticket changed: {ticket.batch_root.name}")
-    if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
-        # The v8 receipt binds the complete surviving alias namespace after
+    if ticket.version in {
+        LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+    }:
+        # The terminal receipt binds the complete surviving alias namespace after
         # recovery aliases exist and before the first destructive walker step.
         cleanup_budget = [MAX_PENDING_CLEANUP_ENTRIES]
         identity_ledger: PendingCleanupIdentityLedger = {}
@@ -34068,8 +34182,11 @@ def _validate_pending_terminal_alias_ledger(
         tuple[PendingTerminalValidationNamespaceEntry, ...] | None
     ) = None,
 ) -> None:
-    """Bind remaining v8 aliases and their namespace to the receipt authority."""
-    if ticket.version != PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
+    """Bind remaining terminal aliases and their namespace to receipt authority."""
+    if ticket.version not in {
+        LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+    }:
         return
     expected_by_path = {alias.path: alias for alias in terminal_aliases}
     if len(expected_by_path) != len(terminal_aliases):
@@ -34193,7 +34310,11 @@ def _validate_pending_terminal_alias_ledger(
         elif _pending_terminal_validation_alias_slot(path):
             raise _pending_terminal_validation_alias_changed_error(path)
     for expectation in ticket.terminal_regular_targets:
-        assert expectation.link_count is not None
+        if expectation.link_count is None:
+            raise SyncError(
+                "pending terminal regular target lacks exact hard-link authority: "
+                f"{expectation.target}"
+            )
         batch_alias_count = alias_counts.get(expectation.file_identity, 0)
         if batch_alias_count > expectation.link_count or (
             require_complete_aliases and batch_alias_count != expectation.link_count
@@ -34249,7 +34370,10 @@ def _pending_cleanup_terminal_validation_payload(
     if legacy_generic_validation is not None:
         raise SyncError("pending cleanup validation has unsupported legacy authority")
     if terminal_aliases is not None or terminal_directories is not None:
-        if ticket.version != PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
+        if ticket.version not in {
+            LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+            PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        }:
             raise SyncError(
                 "pending terminal alias receipt has unsupported ticket authority"
             )
@@ -34399,7 +34523,10 @@ def _publish_pending_cleanup_terminal_validation(
             raise SyncError("legacy generic cleanup validation lacks authority")
     elif legacy_generic_validation is not None:
         raise SyncError("pending cleanup validation has unsupported legacy authority")
-    if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION and (
+    if ticket.version in {
+        LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+    } and (
         terminal_aliases is None
         or terminal_directories is None
         or namespace_entries is None
@@ -34407,7 +34534,10 @@ def _publish_pending_cleanup_terminal_validation(
         raise SyncError(
             "pending terminal alias receipt lacks complete namespace authority"
         )
-    if ticket.version != PENDING_TERMINAL_CLEANUP_TICKET_VERSION and (
+    if ticket.version not in {
+        LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+    } and (
         terminal_aliases is not None
         or terminal_directories is not None
         or namespace_entries is not None
@@ -34421,7 +34551,10 @@ def _publish_pending_cleanup_terminal_validation(
         quarantine_root_identity,
     )
     if existing is not None:
-        if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
+        if ticket.version in {
+            LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+            PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        }:
             existing_authority = _parse_pending_terminal_validation_authority(
                 home,
                 ticket,
@@ -34468,7 +34601,10 @@ def _publish_pending_cleanup_terminal_validation(
             "pending cleanup terminal validation changed after publication: "
             f"{ticket.batch_root.name}"
         )
-    if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION and (
+    if ticket.version in {
+        LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+    } and (
         _parse_pending_terminal_validation_authority(
             home,
             ticket,
@@ -37403,7 +37539,11 @@ def _remove_cleanup_ready_batch(
         )
         terminal_namespace_anchor_sha256 = (
             ticket.terminal_namespace_sha256
-            if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+            if ticket.version
+            in {
+                LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+                PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+            }
             else None
         )
         if ticket.version == 3:
@@ -37486,7 +37626,10 @@ def _remove_cleanup_ready_batch(
                     "legacy generic cleanup metadata or finalization marker "
                     "changed during receipt preparation"
                 )
-        if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
+        if ticket.version in {
+            LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+            PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        }:
             if (
                 _read_pending_cleanup_terminal_validation(
                     home,
@@ -37546,7 +37689,10 @@ def _remove_cleanup_ready_batch(
                 directory_expected_mode=0o700,
             )
         terminal_alias_paths: frozenset[PurePosixPath] = frozenset()
-        if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
+        if ticket.version in {
+            LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+            PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        }:
             receipt = _read_pending_cleanup_terminal_validation(
                 home,
                 ticket,
@@ -37650,7 +37796,16 @@ def _remove_cleanup_ready_batch(
 
             legacy_mutation_revalidator = revalidate_legacy_control_file
         mutation_revalidator = legacy_mutation_revalidator
-        if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
+        if ticket.version in {
+            LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+            PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        } and ticket.terminal_regular_targets:
+            # A historic v4 marker-only ticket has no terminal regular target
+            # group.  It is not admitted as a regular-file cleanup authority;
+            # keep its old marker cleanup path usable so a crash between batch
+            # removal and ticket deletion can still be classified on retry.
+            # Any v4/v8 ticket with a target group remains fenced by the full
+            # pointer/metadata and namespace receipt contract above.
 
             def revalidate_terminal_alias_boundary(
                 _logical_path: PurePosixPath,
@@ -37754,80 +37909,6 @@ def _remove_cleanup_ready_batch(
                 )
 
             mutation_revalidator = revalidate_terminal_alias_boundary
-        elif (
-            ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
-            and ticket.terminal_regular_targets
-        ):
-
-            def revalidate_legacy_terminal_boundary(
-                _logical_path: PurePosixPath,
-                _stage: str,
-            ) -> None:
-                # v4 receipts predate the complete namespace map, but the
-                # ticket and its terminal target group remain the only durable
-                # authority for this compatibility cleanup. Revalidate them
-                # before every walker mutation so a same-inode ticket rewrite
-                # cannot authorize deletion of any later entry.
-                _require_pending_cleanup_ticket_unchanged(home, ticket)
-                current_receipt = _read_pending_cleanup_terminal_validation(
-                    home,
-                    ticket,
-                    quarantine_root_identity,
-                )
-                if current_receipt is None:
-                    raise SyncError(
-                        "pending terminal validation receipt disappeared before "
-                        f"cleanup: {ticket.batch_root.name}"
-                    )
-                _parse_pending_terminal_validation_authority(
-                    home,
-                    ticket,
-                    quarantine_root_identity,
-                    current_receipt,
-                )
-                if (
-                    _directory_identity(batch_fd) != ticket.batch_root_identity
-                    or _directory_mount_identity(batch_fd) != batch_mount_identity
-                    or not _bound_directory_matches(home, bound_batch_root, batch_fd)
-                ):
-                    raise SyncError(
-                        "pending terminal validation batch root binding changed "
-                        f"before cleanup: {ticket.batch_root.name}"
-                    )
-                _require_pending_cleanup_fd_access_policy(
-                    batch_fd,
-                    bound_batch_root,
-                    expected_mode=0o700,
-                )
-                for index, expectation in enumerate(ticket.terminal_regular_targets):
-                    alias_name = _pending_terminal_recovery_alias_name(index)
-                    if _named_entry_identity(batch_fd, alias_name) is not None:
-                        _validate_pending_terminal_target_and_alias(
-                            home,
-                            bound_batch_root,
-                            ticket.batch_root_identity,
-                            expectation,
-                            alias_name,
-                            expected_link_count=None,
-                        )
-                        continue
-                    target_snapshot = _read_regular_file_snapshot_beneath(
-                        home,
-                        home / Path(*expectation.target.parts),
-                        require_managed_access=False,
-                    )
-                    if not _pending_terminal_snapshot_matches_expectation(
-                        target_snapshot,
-                        expectation,
-                        expected_parent_identity=expectation.parent_identity,
-                        expected_link_count=None,
-                    ):
-                        raise SyncError(
-                            "final managed regular file changed: "
-                            f"{expectation.target}"
-                        )
-
-            mutation_revalidator = revalidate_legacy_terminal_boundary
         _remove_pending_batch_directory_contents(
             batch_fd,
             ticket.batch_root_identity,

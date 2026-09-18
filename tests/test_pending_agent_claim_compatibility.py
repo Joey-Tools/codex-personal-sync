@@ -511,17 +511,37 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
                 parsed = MODULE._load_pending_link_batch(home)
                 self.assertIsNotNone(parsed)
                 state, snapshot = MODULE._load_managed_state_with_snapshot(home)
-                with contextlib.redirect_stdout(io.StringIO()):
-                    _state, _snapshot, recovered = (
+                if committed:
+                    # The current writer may have already published a v8
+                    # terminal ticket before this historical metadata rewrite.
+                    # Its pointer/metadata authority must not be silently
+                    # rebound to the rewritten bytes; retain the ticket for
+                    # guided manual recovery instead of accepting mutated
+                    # cleanup authority.
+                    with (
+                        contextlib.redirect_stdout(io.StringIO()),
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            "committed pending regular-file evidence cleanup was deferred",
+                        ),
+                    ):
                         MODULE._recover_pending_link_transaction(
                             home,
                             state,
                             snapshot,
                             dry_run=False,
                         )
-                    )
-
-                self.assertTrue(recovered)
+                else:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        _state, _snapshot, recovered = (
+                            MODULE._recover_pending_link_transaction(
+                                home,
+                                state,
+                                snapshot,
+                                dry_run=False,
+                            )
+                        )
+                    self.assertTrue(recovered)
                 self.assertFalse(
                     os.path.lexists(MODULE._pending_link_pointer_path(home))
                 )

@@ -1852,7 +1852,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 MODULE.SyncError,
-                "legacy terminal validation receipt lacks namespace authority; "
+                "legacy terminal validation ticket lacks namespace authority; "
                 "manual recovery is required",
             ):
                 MODULE._ensure_pending_terminal_validation_receipt(
