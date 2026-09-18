@@ -735,6 +735,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertIsInstance(ticket_payload, dict)
         assert isinstance(ticket_payload, dict)
         ticket_payload.pop("pointer_retirement_path")
+        ticket_payload.pop("pointer_retirement")
         ticket.path.write_bytes(
             MODULE._bounded_json_document(
                 ticket_payload,
@@ -776,6 +777,62 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             ).exists()
         )
         self.assertEqual(lookalike.read_bytes(), b"foreign state lookalike\n")
+
+    def test_v8_terminal_validation_rejects_replaced_pointer_retirement_before_receipt(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        self.assertIsNotNone(ticket.pointer_retirement_path)
+        assert ticket.pointer_retirement_path is not None
+        retirement = ticket.batch_root / Path(*ticket.pointer_retirement_path.parts)
+        self.assertTrue(retirement.is_file())
+        retirement.unlink()
+        retirement.write_bytes(b"foreign pointer retirement\n")
+        retirement.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pointer retirement object changed; manual recovery is required",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertFalse(
+            MODULE._pending_cleanup_terminal_validation_path(
+                self.home,
+                ticket.batch_root.name,
+            ).exists()
+        )
+        self.assertEqual(retirement.read_bytes(), b"foreign pointer retirement\n")
+
+    def test_v8_terminal_validation_rejects_replaced_transaction_metadata_before_receipt(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        metadata = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        metadata.unlink()
+        metadata.write_bytes(b"foreign transaction metadata\n")
+        metadata.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending transaction metadata changed; manual recovery is required",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertFalse(
+            MODULE._pending_cleanup_terminal_validation_path(
+                self.home,
+                ticket.batch_root.name,
+            ).exists()
+        )
+        self.assertEqual(
+            metadata.read_bytes(),
+            b"foreign transaction metadata\n",
+        )
 
     def test_v8_terminal_validation_capacity_is_preflighted_before_alias_creation(
         self,
@@ -906,6 +963,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             target.pop("link_count", None)
         payload.pop("terminal_namespace_sha256", None)
         payload.pop("pointer_retirement_path", None)
+        payload.pop("pointer_retirement", None)
         ticket.path.write_bytes(
             MODULE._bounded_json_document(
                 payload,
@@ -921,45 +979,16 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             MODULE.LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
         )
         alias = ticket.batch_root / MODULE._pending_terminal_recovery_alias_name(0)
-        real_remove = MODULE._remove_pending_batch_directory_contents
-        rewritten = False
-
-        def rewrite_ticket_before_walker(*args: object, **kwargs: object):
-            nonlocal rewritten
-            if not rewritten:
-                rewritten_payload = json.loads(
-                    ticket.path.read_text(encoding="utf-8")
-                )
-                self.assertIsInstance(rewritten_payload, dict)
-                assert isinstance(rewritten_payload, dict)
-                rewritten_payload["terminal_regular_targets"][0]["sha256"] = "0" * 64
-                ticket.path.write_bytes(
-                    MODULE._bounded_json_document(
-                        rewritten_payload,
-                        max_bytes=MODULE.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
-                        overflow_error="pending cleanup ticket exceeds the size limit",
-                    )
-                )
-                rewritten = True
-            return real_remove(*args, **kwargs)
-
-        with (
-            mock.patch.object(
-                MODULE,
-                "_remove_pending_batch_directory_contents",
-                side_effect=rewrite_ticket_before_walker,
-            ),
-            self.assertRaisesRegex(
-                MODULE.SyncError,
-                "pending cleanup ticket changed",
-            ),
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "legacy terminal validation ticket lacks namespace authority; "
+            "manual recovery is required",
         ):
             MODULE._remove_cleanup_ready_batch(self.home, legacy_ticket)
 
-        self.assertTrue(rewritten)
         self.assertTrue(legacy_ticket.path.is_file())
         self.assertTrue(legacy_ticket.batch_root.is_dir())
-        self.assertTrue(alias.exists())
+        self.assertFalse(alias.exists())
 
     def test_v4_terminal_validation_rejects_namespace_added_during_receipt_publish(
         self,
@@ -978,6 +1007,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             target.pop("link_count", None)
         payload.pop("terminal_namespace_sha256", None)
         payload.pop("pointer_retirement_path", None)
+        payload.pop("pointer_retirement", None)
         ticket.path.write_bytes(
             MODULE._bounded_json_document(
                 payload,
@@ -989,35 +1019,16 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertIsNotNone(legacy_ticket)
         assert legacy_ticket is not None
         foreign = ticket.batch_root / "links" / "foreign-entry"
-        real_publish = MODULE._publish_pending_cleanup_terminal_validation
-        injected = False
-
-        def publish_then_inject(*args: object, **kwargs: object):
-            nonlocal injected
-            result = real_publish(*args, **kwargs)
-            foreign.parent.mkdir(mode=0o700, exist_ok=True)
-            foreign.write_bytes(b"foreign link content\n")
-            foreign.chmod(0o600)
-            injected = True
-            return result
-
-        with (
-            mock.patch.object(
-                MODULE,
-                "_publish_pending_cleanup_terminal_validation",
-                side_effect=publish_then_inject,
-            ),
-            self.assertRaisesRegex(
-                MODULE.SyncError,
-                "namespace changed while publishing the validation receipt",
-            ),
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "legacy terminal validation ticket lacks namespace authority; "
+            "manual recovery is required",
         ):
             MODULE._remove_cleanup_ready_batch(self.home, legacy_ticket)
 
-        self.assertTrue(injected)
         self.assertTrue(legacy_ticket.path.is_file())
         self.assertTrue(legacy_ticket.batch_root.is_dir())
-        self.assertEqual(foreign.read_bytes(), b"foreign link content\n")
+        self.assertFalse(foreign.exists())
 
     def test_v4_identity_ledger_match_allows_owner_only_gid_drift(self) -> None:
         common = (

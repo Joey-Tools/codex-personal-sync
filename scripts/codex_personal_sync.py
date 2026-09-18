@@ -4880,6 +4880,28 @@ class PendingTerminalValidationAuthority:
     namespace_entries: tuple[PendingTerminalValidationNamespaceEntry, ...] | None = None
 
 
+@dataclass(frozen=True)
+class PendingTerminalFileExpectation:
+    """Immutable content/identity evidence for one terminal control file."""
+
+    file_identity: tuple[int, int]
+    sha256: str
+    size: int
+    mode: int
+    uid: int
+    gid: int
+    link_count: int
+
+
+@dataclass(frozen=True)
+class PendingTerminalPointerRetirementAuthority:
+    """Bind the retired pointer to its transaction metadata before it moves."""
+
+    parent_identity: tuple[int, int] | None
+    pointer: PendingTerminalFileExpectation
+    metadata: PendingTerminalFileExpectation
+
+
 PendingCleanupIdentityLedgerEntry = tuple[
     str,
     tuple[int, int, int],
@@ -4913,6 +4935,7 @@ class PendingBatchCleanupTicket:
     terminal_regular_targets: tuple[PendingRegularTargetExpectation, ...] = ()
     terminal_namespace_sha256: str | None = None
     pointer_retirement_path: PurePosixPath | None = None
+    pointer_retirement_authority: PendingTerminalPointerRetirementAuthority | None = None
     kind: str | None = None
     quarantine_root_identity: tuple[int, int] | None = None
     isolated_name: str | None = None
@@ -12384,6 +12407,9 @@ def _pending_cleanup_ticket_matches(
         and actual.marker_sha256 == expected.marker_sha256
         and actual.terminal_regular_targets == expected.terminal_regular_targets
         and actual.terminal_namespace_sha256 == expected.terminal_namespace_sha256
+        and actual.pointer_retirement_path == expected.pointer_retirement_path
+        and actual.pointer_retirement_authority
+        == expected.pointer_retirement_authority
         and actual.kind == expected.kind
         and actual.quarantine_root_identity == expected.quarantine_root_identity
         and actual.isolated_name == expected.isolated_name
@@ -28021,6 +28047,131 @@ def _pending_terminal_cleanup_ticket_targets(
     return tuple(ticket_targets)
 
 
+def _pending_terminal_file_expectation_from_snapshot(
+    snapshot: ManagedStateFileSnapshot,
+    label: str,
+) -> PendingTerminalFileExpectation:
+    if (
+        not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+        or snapshot.file_type != stat.S_IFREG
+        or snapshot.file_identity is None
+        or snapshot.size is None
+        or snapshot.mode is None
+        or snapshot.uid is None
+        or snapshot.gid is None
+        or snapshot.link_count is None
+        or snapshot.link_count < 1
+    ):
+        raise SyncError(f"pending terminal {label} evidence is incomplete")
+    return PendingTerminalFileExpectation(
+        file_identity=snapshot.file_identity,
+        sha256=hashlib.sha256(snapshot.payload or b"").hexdigest(),
+        size=snapshot.size,
+        mode=snapshot.mode,
+        uid=snapshot.uid,
+        gid=snapshot.gid,
+        link_count=snapshot.link_count,
+    )
+
+
+def _pending_terminal_file_expectation_payload(
+    expectation: PendingTerminalFileExpectation,
+) -> dict[str, object]:
+    return {
+        "file_identity": _identity_payload(expectation.file_identity),
+        "sha256": expectation.sha256,
+        "size": expectation.size,
+        "mode": expectation.mode,
+        "uid": expectation.uid,
+        "gid": expectation.gid,
+        "link_count": expectation.link_count,
+    }
+
+
+def _pending_terminal_pointer_retirement_authority(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> PendingTerminalPointerRetirementAuthority:
+    pointer_snapshot = batch.pointer_snapshot
+    if pointer_snapshot is None:
+        pointer_parent_fd = _open_directory_beneath(home, home)
+        try:
+            pointer_snapshot = _read_managed_state_file_snapshot(
+                home,
+                _pending_link_pointer_path(home),
+                pointer_parent_fd,
+            )
+        finally:
+            _close_fd_quietly(pointer_parent_fd)
+    pointer = _pending_terminal_file_expectation_from_snapshot(
+        pointer_snapshot,
+        "pointer-retirement",
+    )
+    metadata_path = batch.batch_root / PENDING_LINK_METADATA_NAME
+    metadata_parent_fd = _open_directory_beneath(home, metadata_path.parent)
+    try:
+        metadata_snapshot = _read_managed_state_file_snapshot(
+            home,
+            metadata_path,
+            metadata_parent_fd,
+            expected_identity=pointer.file_identity,
+            maximum_bytes=MAX_MANAGED_STATE_BYTES,
+        )
+    finally:
+        _close_fd_quietly(metadata_parent_fd)
+    metadata = _pending_terminal_file_expectation_from_snapshot(
+        metadata_snapshot,
+        "transaction metadata",
+    )
+    if metadata != pointer:
+        raise SyncError(
+            "pending pointer and transaction metadata evidence do not match"
+        )
+    pointer_retirement_path = _pending_pointer_retirement_path(
+        batch.batch_root.name,
+    )
+    state_path = batch.batch_root / Path(*pointer_retirement_path.parent.parts)
+    state_identity: tuple[int, int] | None = None
+    try:
+        state_fd = _open_directory_beneath(home, state_path)
+    except FileNotFoundError:
+        # The pointer quarantine helper creates the implementation-owned state
+        # directory during pointer retirement, after this ticket is published.
+        # The durable ticket still binds the pointer and metadata inodes and
+        # contents; the state-directory identity is bound when it exists.
+        pass
+    else:
+        try:
+            _require_pending_cleanup_fd_access_policy(
+                state_fd,
+                state_path,
+                expected_mode=0o700,
+            )
+            state_identity = _directory_identity(state_fd)
+            if _named_entry_identity(state_fd, pointer_retirement_path.name) is not None:
+                raise SyncError(
+                    "pending pointer retirement destination is already occupied: "
+                    f"{batch.batch_root.name}"
+                )
+        finally:
+            _close_fd_quietly(state_fd)
+    return PendingTerminalPointerRetirementAuthority(
+        parent_identity=state_identity,
+        pointer=pointer,
+        metadata=metadata,
+    )
+
+
+def _pending_terminal_pointer_retirement_authority_payload(
+    authority: PendingTerminalPointerRetirementAuthority,
+) -> dict[str, object]:
+    return {
+        "parent_identity": _identity_payload(authority.parent_identity),
+        "pointer": _pending_terminal_file_expectation_payload(authority.pointer),
+        "metadata": _pending_terminal_file_expectation_payload(authority.metadata),
+    }
+
+
 def _pending_terminal_cleanup_ticket_payload(
     home: Path,
     batch: PendingLinkBatch,
@@ -28056,6 +28207,11 @@ def _pending_terminal_cleanup_ticket_payload(
         if batch.metadata_version >= 11
         and all(target.link_count is not None for target in targets)
         else LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+    )
+    pointer_retirement_authority = (
+        _pending_terminal_pointer_retirement_authority(home, batch)
+        if ticket_version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        else None
     )
     if terminal_namespace_sha256 is not None and (
         ticket_version != PENDING_TERMINAL_CLEANUP_TICKET_VERSION
@@ -28101,6 +28257,12 @@ def _pending_terminal_cleanup_ticket_payload(
         payload["pointer_retirement_path"] = _pending_pointer_retirement_path(
             batch.batch_root.name,
         ).as_posix()
+        assert pointer_retirement_authority is not None
+        payload["pointer_retirement"] = (
+            _pending_terminal_pointer_retirement_authority_payload(
+                pointer_retirement_authority
+            )
+        )
     return _bounded_json_document(
         payload,
         max_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
@@ -28191,6 +28353,98 @@ def _parse_pending_terminal_regular_targets(
             )
         )
     return tuple(targets)
+
+
+def _parse_pending_terminal_file_expectation(
+    raw: object,
+    *,
+    batch_name: str,
+    label: str,
+) -> PendingTerminalFileExpectation:
+    fields = {
+        "file_identity",
+        "sha256",
+        "size",
+        "mode",
+        "uid",
+        "gid",
+        "link_count",
+    }
+    if not isinstance(raw, dict) or set(raw) != fields:
+        raise SyncError(f"pending terminal {label} authority changed: {batch_name}")
+    file_identity = _parse_pending_identity(
+        raw.get("file_identity"),
+        f"pending terminal {label} identity",
+    )
+    sha256 = raw.get("sha256")
+    size = raw.get("size")
+    mode = raw.get("mode")
+    uid = raw.get("uid")
+    gid = raw.get("gid")
+    link_count = raw.get("link_count")
+    if (
+        file_identity is None
+        or not isinstance(sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+        or type(size) is not int
+        or size < 0
+        or size > MAX_MANAGED_STATE_BYTES
+        or mode != 0o600
+        or type(uid) is not int
+        or uid < 0
+        or type(gid) is not int
+        or gid < 0
+        or type(link_count) is not int
+        or link_count < 1
+        or link_count >= 2**64
+    ):
+        raise SyncError(f"pending terminal {label} authority changed: {batch_name}")
+    return PendingTerminalFileExpectation(
+        file_identity=file_identity,
+        sha256=sha256,
+        size=size,
+        mode=mode,
+        uid=uid,
+        gid=gid,
+        link_count=link_count,
+    )
+
+
+def _parse_pending_terminal_pointer_retirement_authority(
+    raw: object,
+    *,
+    batch_name: str,
+) -> PendingTerminalPointerRetirementAuthority:
+    fields = {"parent_identity", "pointer", "metadata"}
+    if not isinstance(raw, dict) or set(raw) != fields:
+        raise SyncError(
+            "pending terminal pointer retirement authority changed: "
+            f"{batch_name}"
+        )
+    parent_identity = _parse_pending_identity(
+        raw.get("parent_identity"),
+        "pending terminal pointer retirement parent identity",
+    )
+    pointer = _parse_pending_terminal_file_expectation(
+        raw.get("pointer"),
+        batch_name=batch_name,
+        label="pointer retirement",
+    )
+    metadata = _parse_pending_terminal_file_expectation(
+        raw.get("metadata"),
+        batch_name=batch_name,
+        label="transaction metadata",
+    )
+    if metadata != pointer:
+        raise SyncError(
+            "pending terminal pointer retirement authority changed: "
+            f"{batch_name}"
+        )
+    return PendingTerminalPointerRetirementAuthority(
+        parent_identity=parent_identity,
+        pointer=pointer,
+        metadata=metadata,
+    )
 
 
 def _validate_pending_terminal_regular_targets_for_state(
@@ -28436,11 +28690,34 @@ def _read_pending_cleanup_ticket(
                 frozenset(expected_top_level_fields),
                 frozenset((*expected_top_level_fields, "terminal_namespace_sha256")),
                 frozenset((*expected_top_level_fields, "pointer_retirement_path")),
+                frozenset((*expected_top_level_fields, "pointer_retirement")),
                 frozenset(
                     (
                         *expected_top_level_fields,
                         "terminal_namespace_sha256",
                         "pointer_retirement_path",
+                    )
+                ),
+                frozenset(
+                    (
+                        *expected_top_level_fields,
+                        "terminal_namespace_sha256",
+                        "pointer_retirement",
+                    )
+                ),
+                frozenset(
+                    (
+                        *expected_top_level_fields,
+                        "pointer_retirement_path",
+                        "pointer_retirement",
+                    )
+                ),
+                frozenset(
+                    (
+                        *expected_top_level_fields,
+                        "terminal_namespace_sha256",
+                        "pointer_retirement_path",
+                        "pointer_retirement",
                     )
                 ),
             }
@@ -28605,6 +28882,20 @@ def _read_pending_cleanup_ticket(
                 raise SyncError(
                     f"pending pointer retirement path changed: {batch_name}"
                 )
+        pointer_retirement_authority = None
+        if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION and (
+            "pointer_retirement" in data
+        ):
+            if pointer_retirement_path is None:
+                raise SyncError(
+                    f"pending pointer retirement path is missing: {batch_name}"
+                )
+            pointer_retirement_authority = (
+                _parse_pending_terminal_pointer_retirement_authority(
+                    data.get("pointer_retirement"),
+                    batch_name=batch_name,
+                )
+            )
         if version in {5, 7}:
             if len(snapshot.payload) > MAX_PENDING_CLEANUP_TICKET_BYTES:
                 raise SyncError(
@@ -28867,6 +29158,14 @@ def _read_pending_cleanup_ticket(
                 payload_data["pointer_retirement_path"] = (
                     pointer_retirement_path.as_posix()
                 )
+            if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION and (
+                pointer_retirement_authority is not None
+            ):
+                payload_data["pointer_retirement"] = (
+                    _pending_terminal_pointer_retirement_authority_payload(
+                        pointer_retirement_authority
+                    )
+                )
             expected_payload = _bounded_json_document(
                 payload_data,
                 max_bytes=(
@@ -28905,6 +29204,11 @@ def _read_pending_cleanup_ticket(
             ),
             pointer_retirement_path=(
                 pointer_retirement_path
+                if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+                else None
+            ),
+            pointer_retirement_authority=(
+                pointer_retirement_authority
                 if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
                 else None
             ),
@@ -33334,6 +33638,167 @@ def _validate_pending_terminal_validation_receipt_namespace_capacity(
     )
 
 
+def _pending_terminal_file_matches_expectation(
+    snapshot: ManagedStateFileSnapshot,
+    expectation: PendingTerminalFileExpectation,
+) -> bool:
+    return (
+        _managed_state_snapshot_has_complete_file_evidence(snapshot)
+        and snapshot.file_type == stat.S_IFREG
+        and snapshot.file_identity == expectation.file_identity
+        and hashlib.sha256(snapshot.payload or b"").hexdigest()
+        == expectation.sha256
+        and snapshot.size == expectation.size
+        and snapshot.mode == expectation.mode
+        and snapshot.uid == expectation.uid
+        and snapshot.gid is not None
+        and _gid_matches_regular_file_access_policy(snapshot.gid, expectation.gid, expectation.mode)
+    )
+
+
+def _require_pending_terminal_pointer_retirement_authority(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    bound_batch_root: Path,
+    batch_fd: int,
+    *,
+    allow_consumed: bool,
+) -> None:
+    """Revalidate the retired pointer and transaction metadata as one inode."""
+    if ticket.pointer_retirement_path is None or (
+        ticket.pointer_retirement_authority is None
+    ):
+        raise SyncError(
+            "pending terminal ticket lacks pointer-retirement authority; "
+            "manual recovery is required: "
+            f"{ticket.batch_root.name}"
+        )
+    authority = ticket.pointer_retirement_authority
+    state_path = bound_batch_root / Path(*ticket.pointer_retirement_path.parent.parts)
+    retirement_name = ticket.pointer_retirement_path.name
+    state_fd = -1
+    state_physical_path = state_path
+    retirement_snapshot = ManagedStateFileSnapshot(exists=False)
+    try:
+        try:
+            state_fd = os.open(
+                state_path.name,
+                _directory_open_flags(nofollow=True),
+                dir_fd=batch_fd,
+            )
+        except FileNotFoundError:
+            # A walker may have isolated the logical state directory under an
+            # active-entry token between its two mutation callbacks. Resolve
+            # that token by its durable logical-name binding.
+            with os.scandir(batch_fd) as iterator:
+                for entry in iterator:
+                    binding = _pending_cleanup_active_entry_binding(
+                        entry.name,
+                        ticket.batch_root_identity,
+                    )
+                    if (
+                        binding is not None
+                        and binding[1] == state_path.name
+                        and binding[0][2] == stat.S_IFDIR
+                    ):
+                        state_physical_path = bound_batch_root / entry.name
+                        state_fd = os.open(
+                            entry.name,
+                            _directory_open_flags(nofollow=True),
+                            dir_fd=batch_fd,
+                        )
+                        break
+        if state_fd >= 0:
+            _require_pending_cleanup_fd_access_policy(
+                state_fd,
+                state_physical_path,
+                expected_mode=0o700,
+            )
+            if (
+                (
+                    authority.parent_identity is not None
+                    and _directory_identity(state_fd) != authority.parent_identity
+                )
+                or not _bound_directory_matches(home, state_physical_path, state_fd)
+            ):
+                raise SyncError(
+                    "pending pointer retirement parent changed; manual recovery is "
+                    f"required: {ticket.batch_root.name}"
+                )
+            retirement_snapshot = _read_managed_state_file_snapshot(
+                home,
+                state_physical_path / retirement_name,
+                state_fd,
+                maximum_bytes=MAX_MANAGED_STATE_BYTES,
+            )
+            if not retirement_snapshot.exists:
+                with os.scandir(state_fd) as iterator:
+                    for entry in iterator:
+                        binding = _pending_cleanup_active_entry_binding(
+                            entry.name,
+                            _directory_identity(state_fd),
+                        )
+                        if (
+                            binding is not None
+                            and binding[1] == retirement_name
+                            and binding[0][2] == stat.S_IFREG
+                        ):
+                            retirement_snapshot = _read_managed_state_file_snapshot(
+                                home,
+                                state_physical_path / entry.name,
+                                state_fd,
+                                maximum_bytes=MAX_MANAGED_STATE_BYTES,
+                            )
+                            break
+        metadata_path = bound_batch_root / PENDING_LINK_METADATA_NAME
+        try:
+            metadata_snapshot = _read_managed_state_file_snapshot(
+                home,
+                metadata_path,
+                batch_fd,
+                maximum_bytes=MAX_MANAGED_STATE_BYTES,
+            )
+        except FileNotFoundError:
+            metadata_snapshot = ManagedStateFileSnapshot(exists=False)
+    finally:
+        _close_fd_quietly(state_fd)
+    retirement_exists = retirement_snapshot.exists
+    metadata_exists = metadata_snapshot.exists
+    if not retirement_exists and not metadata_exists:
+        if allow_consumed:
+            return
+        raise SyncError(
+            "pending pointer retirement and transaction metadata are both missing; "
+            "manual recovery is required: "
+            f"{ticket.batch_root.name}"
+        )
+    if retirement_exists and not _pending_terminal_file_matches_expectation(
+        retirement_snapshot,
+        authority.pointer,
+    ):
+        raise SyncError(
+            "pending pointer retirement object changed; manual recovery is "
+            f"required: {ticket.batch_root.name}"
+        )
+    if metadata_exists and not _pending_terminal_file_matches_expectation(
+        metadata_snapshot,
+        authority.metadata,
+    ):
+        raise SyncError(
+            "pending transaction metadata changed; manual recovery is required: "
+            f"{ticket.batch_root.name}"
+        )
+    if retirement_exists and metadata_exists and (
+        retirement_snapshot.file_identity != metadata_snapshot.file_identity
+        or retirement_snapshot.payload != metadata_snapshot.payload
+    ):
+        raise SyncError(
+            "pending pointer retirement is not bound to transaction metadata; "
+            "manual recovery is required: "
+            f"{ticket.batch_root.name}"
+        )
+
+
 def _ensure_pending_terminal_validation_receipt(
     home: Path,
     ticket: PendingBatchCleanupTicket,
@@ -33343,7 +33808,6 @@ def _ensure_pending_terminal_validation_receipt(
     *,
     legacy_generic_validation: LegacyGenericCleanupValidation | None = None,
     namespace_anchor_sha256: str | None = None,
-    publish_legacy_terminal_receipt: bool = True,
 ) -> None:
     if ticket.version in {1, 2}:
         existing_receipt = _read_pending_cleanup_terminal_validation(
@@ -33372,6 +33836,23 @@ def _ensure_pending_terminal_validation_receipt(
         return
     if ticket.version not in {4, 8} or not ticket.terminal_regular_targets:
         return
+    existing_receipt = _read_pending_cleanup_terminal_validation(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
+    if ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
+        if existing_receipt is not None:
+            raise SyncError(
+                "legacy terminal validation receipt lacks namespace authority; "
+                "manual recovery is required: "
+                f"{ticket.batch_root.name}"
+            )
+        raise SyncError(
+            "legacy terminal validation ticket lacks namespace authority; manual "
+            "recovery is required: "
+            f"{ticket.batch_root.name}"
+        )
     if (
         ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
         and namespace_anchor_sha256 is None
@@ -33384,37 +33865,26 @@ def _ensure_pending_terminal_validation_receipt(
             "anchor; manual recovery is required: "
             f"{ticket.batch_root.name}"
         )
-    existing_receipt = _read_pending_cleanup_terminal_validation(
-        home,
-        ticket,
-        quarantine_root_identity,
-    )
     if (
-        existing_receipt is None
-        and ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
-        and ticket.pointer_retirement_path is None
+        ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        and (
+            ticket.pointer_retirement_path is None
+            or ticket.pointer_retirement_authority is None
+        )
     ):
-        # A pre-path v8 ticket can be retained for compatibility, but its
-        # historical name-only anchor cannot authorize a new receipt.  A
-        # lookalike state entry may have appeared after that anchor was
-        # captured, so synthesizing a receipt from the current namespace would
-        # turn an unbound inode into deletion authority.
         raise SyncError(
             "pending terminal validation ticket lacks exact pointer retirement "
             "authority; manual recovery is required: "
             f"{ticket.batch_root.name}"
         )
+    _require_pending_terminal_pointer_retirement_authority(
+        home,
+        ticket,
+        bound_batch_root,
+        batch_fd,
+        allow_consumed=existing_receipt is not None,
+    )
     if existing_receipt is not None:
-        if ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
-            # v4 receipts predate the durable recovery-alias namespace map. A
-            # generic receipt cannot prove which aliases belong to this batch,
-            # so never resume destructive cleanup from it without a manual
-            # recovery decision.
-            raise SyncError(
-                "legacy terminal validation receipt lacks namespace authority; "
-                "manual recovery is required: "
-                f"{ticket.batch_root.name}"
-            )
         # The receipt is the durable boundary after which the cleanup walker
         # may already have consumed any subset of the batch aliases. Validate
         # the remaining complete namespace through one identity ledger in the
@@ -33583,26 +34053,7 @@ def _ensure_pending_terminal_validation_receipt(
             namespace_entries=namespace_entries,
         )
         return
-    if publish_legacy_terminal_receipt:
-        _publish_pending_cleanup_terminal_validation(
-            home,
-            ticket,
-            quarantine_root_identity,
-        )
-    for index, expectation in enumerate(ticket.terminal_regular_targets):
-        _validate_pending_terminal_target_and_alias(
-            home,
-            bound_batch_root,
-            ticket.batch_root_identity,
-            expectation,
-            _pending_terminal_recovery_alias_name(index),
-            expected_link_count=(
-                expectation.link_count + 1
-                if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
-                and expectation.link_count is not None
-                else None
-            ),
-        )
+    raise AssertionError("unreachable pending terminal ticket version")
 
 
 def _validate_pending_terminal_alias_ledger(
@@ -37052,10 +37503,6 @@ def _remove_cleanup_ready_batch(
                     batch_mount_identity,
                     quarantine_root_identity,
                 )
-        legacy_v4_terminal_receipt_pending = (
-            ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
-            and bool(ticket.terminal_regular_targets)
-        )
         _ensure_pending_terminal_validation_receipt(
             home,
             ticket,
@@ -37064,7 +37511,6 @@ def _remove_cleanup_ready_batch(
             quarantine_root_identity,
             legacy_generic_validation=legacy_generic_validation,
             namespace_anchor_sha256=terminal_namespace_anchor_sha256,
-            publish_legacy_terminal_receipt=not legacy_v4_terminal_receipt_pending,
         )
         if legacy_generic_validation is not None:
             # Receipt publication itself is a mutable control-file operation.
@@ -37078,35 +37524,6 @@ def _remove_cleanup_ready_batch(
                 bound_batch_root,
                 batch_fd,
                 legacy_generic_validation,
-            )
-        legacy_v4_pre_receipt_identity_ledger: (
-            PendingCleanupIdentityLedger | None
-        ) = None
-        if legacy_v4_terminal_receipt_pending:
-            # v4 receipts predate a durable namespace map.  Capture the exact
-            # post-alias namespace before publishing the generic receipt, then
-            # require the namespace to be unchanged after publication.  This
-            # closes the interval in which a foreign batch entry could be
-            # added and accidentally become walker deletion authority.
-            cleanup_budget = [MAX_PENDING_CLEANUP_ENTRIES]
-            legacy_v4_pre_receipt_identity_ledger = {}
-            batch_mount_identity = _directory_mount_identity(batch_fd)
-            _capture_pending_cleanup_identity_ledger(
-                batch_fd,
-                ticket.batch_root_identity,
-                batch_mount_identity,
-                cleanup_budget,
-                legacy_v4_pre_receipt_identity_ledger,
-                depth=0,
-                relative_parts=(),
-                skipped_names=frozenset(),
-                name_validator=_pending_batch_cleanup_name_is_authorized,
-                directory_expected_mode=0o700,
-            )
-            _publish_pending_cleanup_terminal_validation(
-                home,
-                ticket,
-                quarantine_root_identity,
             )
         if ticket.version not in {1, 2}:
             # v4/v8 receipt setup may add a terminal recovery hard link.  The
@@ -37128,17 +37545,6 @@ def _remove_cleanup_ready_batch(
                 name_validator=_pending_batch_cleanup_name_is_authorized,
                 directory_expected_mode=0o700,
             )
-            if (
-                legacy_v4_pre_receipt_identity_ledger is not None
-                and not _pending_cleanup_identity_ledgers_match(
-                    legacy_v4_pre_receipt_identity_ledger,
-                    identity_ledger,
-                )
-            ):
-                raise SyncError(
-                    "legacy terminal cleanup namespace changed while publishing "
-                    f"the validation receipt: {batch_name}"
-                )
         terminal_alias_paths: frozenset[PurePosixPath] = frozenset()
         if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
             receipt = _read_pending_cleanup_terminal_validation(
@@ -37308,6 +37714,13 @@ def _remove_cleanup_ready_batch(
                     batch_fd,
                     bound_batch_root,
                     expected_mode=0o700,
+                )
+                _require_pending_terminal_pointer_retirement_authority(
+                    home,
+                    ticket,
+                    bound_batch_root,
+                    batch_fd,
+                    allow_consumed=True,
                 )
                 if frozenset(
                     alias.path for alias in current_authority.aliases

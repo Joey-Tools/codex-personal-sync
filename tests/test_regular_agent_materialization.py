@@ -8823,11 +8823,20 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
                     phase="after",
                 )
 
-                install(release, self.home, sha)
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "committed pending regular-file evidence cleanup was deferred",
+                ):
+                    install(release, self.home, sha)
 
                 self.assertEqual(target.read_text(encoding="utf-8"), expected_payload)
                 self.assertEqual(target.stat().st_gid, alternate_gid)
-                self.assertEqual(target.stat().st_nlink, 1)
+                self.assertGreaterEqual(target.stat().st_nlink, 1)
+                self.assertTrue(
+                    any(
+                        MODULE._pending_cleanup_index_path(self.home).glob("*.json")
+                    )
+                )
                 self.assertFalse(
                     os.path.lexists(MODULE._pending_link_pointer_path(self.home))
                 )
