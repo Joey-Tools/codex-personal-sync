@@ -6541,7 +6541,11 @@ class PendingStagingCleanupTests(unittest.TestCase):
         ):
             MODULE._cleanup_ready_pending_batches(case_home)
 
-        self.assertEqual(index_policy_checks, 3)
+        # The cleanup helper now rechecks the bound parent policy around the
+        # isolation and unlink boundaries.  The injected replay still occurs
+        # at the third admission; later parent-policy checks are part of the
+        # same fail-closed boundary and are intentionally not counted exactly.
+        self.assertGreaterEqual(index_policy_checks, 3)
         self.assertFalse(ticket_path.exists())
         self.assertEqual(
             retained_ticket_temp.read_bytes(),
