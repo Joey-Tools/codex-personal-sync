@@ -22167,8 +22167,14 @@ def _projected_pending_terminal_validation_namespace_paths(
         "managed-links.json",
         f"original-{dynamic_state_suffix}",
         f"publish-error-{dynamic_state_suffix}",
-        f"pending-complete-{dynamic_state_suffix}",
-        f"pending-publish-error-{dynamic_state_suffix}",
+        _pending_pointer_retirement_path(
+            _MAX_PENDING_BATCH_NAME,
+            label="complete",
+        ).name,
+        _pending_pointer_retirement_path(
+            _MAX_PENDING_BATCH_NAME,
+            label="publish-error",
+        ).name,
     ):
         add_path(PurePosixPath("state", name))
 
@@ -25375,12 +25381,21 @@ def _quarantine_pending_link_pointer(
         batch_root=batch.batch_root,
         state_parent_identity=_directory_identity(parent_fd),
     )
+    destination_name = (
+        _pending_pointer_retirement_path(
+            batch.batch_root.name,
+            label=label,
+        ).name
+        if batch.metadata_version >= 11
+        else None
+    )
     moved, matches = _move_managed_state_entry_to_quarantine(
         home,
         transaction,
         parent_fd,
         pointer_path.name,
         f"pending-{label}",
+        destination_name=destination_name,
         expected_identity=expected.file_identity,
         expected_snapshot=expected,
     )
@@ -30704,6 +30719,22 @@ def _pending_batch_cleanup_name_is_authorized(
     return False
 
 
+def _pending_pointer_retirement_path(
+    batch_name: str,
+    *,
+    label: str = "complete",
+) -> PurePosixPath:
+    """Return the one protocol-bound state path used to retire a pointer."""
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        raise SyncError("pending pointer retirement batch name is invalid")
+    if label not in {"complete", "publish-error"}:
+        raise SyncError("pending pointer retirement label is invalid")
+    return PurePosixPath("state", f"pending-{label}-{batch_name}")
+
+
 def _require_no_pending_staging_manual_retention(
     home: Path,
     bound_batch_root: Path,
@@ -31594,6 +31625,8 @@ def _pending_terminal_validation_aliases_from_identity_ledger(
 def _pending_terminal_validation_namespace_anchor_digest(
     namespace_entries: tuple[PendingTerminalValidationNamespaceEntry, ...],
     terminal_aliases: tuple[PendingTerminalValidationAlias, ...],
+    *,
+    pointer_retirement_path: PurePosixPath | None = None,
 ) -> str:
     """Hash the non-terminal namespace that v8 receipt authority must preserve.
 
@@ -31603,24 +31636,24 @@ def _pending_terminal_validation_namespace_anchor_digest(
     """
     alias_paths = {alias.path for alias in terminal_aliases}
     # Clearing the active pointer after ticket publication creates one
-    # implementation-owned state directory and a generated pointer-retirement
-    # entry. Those objects are bound by the pointer/transaction protocol and
-    # are intentionally outside this ticket-time namespace snapshot.
+    # implementation-owned state directory and one exact, batch-bound
+    # pointer-retirement entry. The directory itself, the metadata object, and
+    # that exact future entry are bound separately by the pointer/transaction
+    # protocol and are intentionally outside this ticket-time namespace
+    # snapshot. Keep every other child entry in the state directory in the
+    # anchor: a name that merely looks like a pointer-retirement artifact is
+    # not proof that its inode was created or bound by that protocol.
     excluded_paths = alias_paths | {
         PurePosixPath(PENDING_LINK_METADATA_NAME),
         PurePosixPath("state"),
     }
+    if pointer_retirement_path is not None:
+        if pointer_retirement_path.parent != PurePosixPath("state"):
+            raise SyncError("pending pointer retirement path is not under state")
+        excluded_paths.add(pointer_retirement_path)
 
     def is_excluded(path: PurePosixPath) -> bool:
-        return path in excluded_paths or (
-            len(path.parts) == 2
-            and path.parts[0] == "state"
-            and re.fullmatch(
-                r"pending-(?:complete|publish-error)-[0-9]+-[0-9]+",
-                path.parts[1],
-            )
-            is not None
-        )
+        return path in excluded_paths
     payload = [
         _pending_terminal_validation_namespace_anchor_entry_payload(entry)
         for entry in namespace_entries
@@ -31696,7 +31729,19 @@ def _pending_terminal_namespace_anchor_from_batch(
         identity_ledger,
         aliases,
     )
-    return _pending_terminal_validation_namespace_anchor_digest(entries, aliases)
+    pointer_retirement_path = _pending_pointer_retirement_path(
+        batch.batch_root.name,
+    )
+    if any(entry.path == pointer_retirement_path for entry in entries):
+        raise SyncError(
+            "pending pointer retirement destination is already occupied: "
+            f"{batch.batch_root.name}"
+        )
+    return _pending_terminal_validation_namespace_anchor_digest(
+        entries,
+        aliases,
+        pointer_retirement_path=pointer_retirement_path,
+    )
 
 
 def _pending_terminal_validation_directories_from_identity_ledger(
@@ -33268,6 +33313,9 @@ def _ensure_pending_terminal_validation_receipt(
             existing_digest = _pending_terminal_validation_namespace_anchor_digest(
                 existing_authority.namespace_entries or (),
                 existing_authority.aliases,
+                pointer_retirement_path=_pending_pointer_retirement_path(
+                    ticket.batch_root.name,
+                ),
             )
             if existing_digest != namespace_anchor_sha256:
                 raise SyncError(
@@ -33396,6 +33444,9 @@ def _ensure_pending_terminal_validation_receipt(
                 _pending_terminal_validation_namespace_anchor_digest(
                     namespace_entries,
                     terminal_aliases,
+                    pointer_retirement_path=_pending_pointer_retirement_path(
+                        ticket.batch_root.name,
+                    ),
                 )
                 != namespace_anchor_sha256
             ):
@@ -37116,6 +37167,9 @@ def _remove_cleanup_ready_batch(
                     _pending_terminal_validation_namespace_anchor_digest(
                         current_authority.namespace_entries,
                         current_authority.aliases,
+                        pointer_retirement_path=_pending_pointer_retirement_path(
+                            ticket.batch_root.name,
+                        ),
                     )
                     != terminal_namespace_anchor_sha256
                 ):

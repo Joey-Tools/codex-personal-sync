@@ -984,6 +984,51 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
 
         self.assertTrue(MODULE._pending_cleanup_identity_ledgers_match(left, right))
 
+    def test_v8_namespace_anchor_binds_state_retirement_lookalike(self) -> None:
+        entry = MODULE.PendingTerminalValidationNamespaceEntry(
+            path=PurePosixPath("state", "pending-complete-1-1"),
+            parent_identity=(11, 22),
+            plan=(33, 44, stat.S_IFREG),
+            mode=0o600,
+            uid=os.geteuid(),
+            gid=os.getegid(),
+        )
+        pointer_retirement = MODULE.replace(
+            entry,
+            path=PurePosixPath(
+                "state",
+                "pending-complete-20260910T000000Z-1-2",
+            ),
+        )
+
+        original = MODULE._pending_terminal_validation_namespace_anchor_digest(
+            (entry, pointer_retirement),
+            (),
+            pointer_retirement_path=pointer_retirement.path,
+        )
+        retired_replacement = MODULE.replace(
+            pointer_retirement,
+            plan=(55, 66, stat.S_IFREG),
+        )
+        self.assertEqual(
+            original,
+            MODULE._pending_terminal_validation_namespace_anchor_digest(
+                (entry, retired_replacement),
+                (),
+                pointer_retirement_path=pointer_retirement.path,
+            ),
+        )
+        replacement = MODULE.replace(entry, plan=(55, 66, stat.S_IFREG))
+
+        self.assertNotEqual(
+            original,
+            MODULE._pending_terminal_validation_namespace_anchor_digest(
+                (replacement, pointer_retirement),
+                (),
+                pointer_retirement_path=pointer_retirement.path,
+            ),
+        )
+
     def test_terminal_receipt_capacity_projects_deep_backup_namespace(self) -> None:
         terminal_target = PurePosixPath("agents", "reviewer.toml")
         terminal_record = MODULE.ManagedLinkRecord(
