@@ -839,6 +839,77 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertTrue(ticket.path.is_file())
         self.assertTrue(ticket.batch_root.is_dir())
 
+    def test_v4_terminal_validation_rechecks_ticket_before_walker_mutation(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        payload = json.loads(ticket.path.read_text(encoding="utf-8"))
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        payload["version"] = MODULE.LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        targets = payload.get("terminal_regular_targets")
+        self.assertIsInstance(targets, list)
+        assert isinstance(targets, list)
+        for target in targets:
+            self.assertIsInstance(target, dict)
+            assert isinstance(target, dict)
+            target.pop("link_count", None)
+        payload.pop("terminal_namespace_sha256", None)
+        ticket.path.write_bytes(
+            MODULE._bounded_json_document(
+                payload,
+                max_bytes=MODULE.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+                overflow_error="pending cleanup ticket exceeds the size limit",
+            )
+        )
+        legacy_ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket.path)
+        self.assertIsNotNone(legacy_ticket)
+        assert legacy_ticket is not None
+        self.assertEqual(
+            legacy_ticket.version,
+            MODULE.LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        )
+        alias = ticket.batch_root / MODULE._pending_terminal_recovery_alias_name(0)
+        real_remove = MODULE._remove_pending_batch_directory_contents
+        rewritten = False
+
+        def rewrite_ticket_before_walker(*args: object, **kwargs: object):
+            nonlocal rewritten
+            if not rewritten:
+                rewritten_payload = json.loads(
+                    ticket.path.read_text(encoding="utf-8")
+                )
+                self.assertIsInstance(rewritten_payload, dict)
+                assert isinstance(rewritten_payload, dict)
+                rewritten_payload["terminal_regular_targets"][0]["sha256"] = "0" * 64
+                ticket.path.write_bytes(
+                    MODULE._bounded_json_document(
+                        rewritten_payload,
+                        max_bytes=MODULE.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+                        overflow_error="pending cleanup ticket exceeds the size limit",
+                    )
+                )
+                rewritten = True
+            return real_remove(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=rewrite_ticket_before_walker,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup ticket changed",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, legacy_ticket)
+
+        self.assertTrue(rewritten)
+        self.assertTrue(legacy_ticket.path.is_file())
+        self.assertTrue(legacy_ticket.batch_root.is_dir())
+        self.assertTrue(alias.exists())
+
     def test_terminal_receipt_capacity_projects_deep_backup_namespace(self) -> None:
         terminal_target = PurePosixPath("agents", "reviewer.toml")
         terminal_record = MODULE.ManagedLinkRecord(
@@ -897,6 +968,28 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             links={terminal_target: terminal_record},
         )
         after_state = MODULE.ManagedState(owners={}, links={})
+        record_actions = {
+            (
+                "managed",
+                PurePosixPath(*action.target.relative_to(self.home).parts),
+            ): action.action
+            for action in capacity.flattened_actions
+        }
+        namespace_paths = MODULE._projected_pending_terminal_validation_namespace_paths(
+            self.home,
+            capacity,
+            before_state,
+            before_state,
+            after_state,
+            record_actions,
+        )
+        projected_aliases = MODULE._projected_pending_terminal_validation_alias_paths(
+            self.home,
+            capacity,
+            before_state,
+            phase="before",
+        )
+        self.assertTrue(set(projected_aliases).issubset(namespace_paths))
 
         with self.assertRaisesRegex(
             MODULE.SyncError,

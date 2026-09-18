@@ -22142,6 +22142,22 @@ def _projected_pending_terminal_validation_namespace_paths(
     for path in state_paths:
         add_path(path)
 
+    # Recovery aliases are created at the batch root after the transaction
+    # metadata is published, but the terminal receipt records them in its
+    # complete namespace map. Include both phase projections so capacity is
+    # rejected before a commit can publish an over-limit receipt.
+    for state, phase in (
+        (state_before_value, "before"),
+        (state_after_value, "after"),
+    ):
+        for alias_path in _projected_pending_terminal_validation_alias_paths(
+            home,
+            capacity,
+            state,
+            phase=phase,
+        ):
+            add_path(alias_path)
+
     # Managed-state quarantine and pointer-retirement entries are outside the
     # namespace anchor digest, but they remain part of the durable receipt.
     dynamic_state_suffix = "9" * 19 + "-99"
@@ -37074,6 +37090,80 @@ def _remove_cleanup_ready_batch(
                 )
 
             mutation_revalidator = revalidate_terminal_alias_boundary
+        elif (
+            ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+            and ticket.terminal_regular_targets
+        ):
+
+            def revalidate_legacy_terminal_boundary(
+                _logical_path: PurePosixPath,
+                _stage: str,
+            ) -> None:
+                # v4 receipts predate the complete namespace map, but the
+                # ticket and its terminal target group remain the only durable
+                # authority for this compatibility cleanup. Revalidate them
+                # before every walker mutation so a same-inode ticket rewrite
+                # cannot authorize deletion of any later entry.
+                _require_pending_cleanup_ticket_unchanged(home, ticket)
+                current_receipt = _read_pending_cleanup_terminal_validation(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                )
+                if current_receipt is None:
+                    raise SyncError(
+                        "pending terminal validation receipt disappeared before "
+                        f"cleanup: {ticket.batch_root.name}"
+                    )
+                _parse_pending_terminal_validation_authority(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                    current_receipt,
+                )
+                if (
+                    _directory_identity(batch_fd) != ticket.batch_root_identity
+                    or _directory_mount_identity(batch_fd) != batch_mount_identity
+                    or not _bound_directory_matches(home, bound_batch_root, batch_fd)
+                ):
+                    raise SyncError(
+                        "pending terminal validation batch root binding changed "
+                        f"before cleanup: {ticket.batch_root.name}"
+                    )
+                _require_pending_cleanup_fd_access_policy(
+                    batch_fd,
+                    bound_batch_root,
+                    expected_mode=0o700,
+                )
+                for index, expectation in enumerate(ticket.terminal_regular_targets):
+                    alias_name = _pending_terminal_recovery_alias_name(index)
+                    if _named_entry_identity(batch_fd, alias_name) is not None:
+                        _validate_pending_terminal_target_and_alias(
+                            home,
+                            bound_batch_root,
+                            ticket.batch_root_identity,
+                            expectation,
+                            alias_name,
+                            expected_link_count=None,
+                        )
+                        continue
+                    target_snapshot = _read_regular_file_snapshot_beneath(
+                        home,
+                        home / Path(*expectation.target.parts),
+                        require_managed_access=False,
+                    )
+                    if not _pending_terminal_snapshot_matches_expectation(
+                        target_snapshot,
+                        expectation,
+                        expected_parent_identity=expectation.parent_identity,
+                        expected_link_count=None,
+                    ):
+                        raise SyncError(
+                            "final managed regular file changed: "
+                            f"{expectation.target}"
+                        )
+
+            mutation_revalidator = revalidate_legacy_terminal_boundary
         _remove_pending_batch_directory_contents(
             batch_fd,
             ticket.batch_root_identity,
