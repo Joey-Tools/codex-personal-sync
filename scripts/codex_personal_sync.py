@@ -33389,6 +33389,21 @@ def _ensure_pending_terminal_validation_receipt(
         ticket,
         quarantine_root_identity,
     )
+    if (
+        existing_receipt is None
+        and ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        and ticket.pointer_retirement_path is None
+    ):
+        # A pre-path v8 ticket can be retained for compatibility, but its
+        # historical name-only anchor cannot authorize a new receipt.  A
+        # lookalike state entry may have appeared after that anchor was
+        # captured, so synthesizing a receipt from the current namespace would
+        # turn an unbound inode into deletion authority.
+        raise SyncError(
+            "pending terminal validation ticket lacks exact pointer retirement "
+            "authority; manual recovery is required: "
+            f"{ticket.batch_root.name}"
+        )
     if existing_receipt is not None:
         if ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
             # v4 receipts predate the durable recovery-alias namespace map. A
