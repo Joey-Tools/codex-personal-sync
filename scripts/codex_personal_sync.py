@@ -4912,6 +4912,7 @@ class PendingBatchCleanupTicket:
     marker_sha256: str | None
     terminal_regular_targets: tuple[PendingRegularTargetExpectation, ...] = ()
     terminal_namespace_sha256: str | None = None
+    pointer_retirement_path: PurePosixPath | None = None
     kind: str | None = None
     quarantine_root_identity: tuple[int, int] | None = None
     isolated_name: str | None = None
@@ -25381,14 +25382,26 @@ def _quarantine_pending_link_pointer(
         batch_root=batch.batch_root,
         state_parent_identity=_directory_identity(parent_fd),
     )
-    destination_name = (
-        _pending_pointer_retirement_path(
+    destination_name: str | None = None
+    if batch.metadata_version >= 11:
+        destination_name = _pending_pointer_retirement_path(
             batch.batch_root.name,
             label=label,
         ).name
-        if batch.metadata_version >= 11
-        else None
-    )
+    elif label == "complete":
+        # A current v8 ticket can outlive a deliberately downgraded legacy
+        # metadata fixture (and a crash can leave the pointer for recovery).
+        # Reuse its explicit retirement path when available; historic tickets
+        # without that field retain the dynamic compatibility name.
+        try:
+            existing_ticket = _read_pending_cleanup_ticket(
+                home,
+                _pending_cleanup_ticket_path(home, batch.batch_root.name),
+            )
+        except (OSError, SyncError):
+            existing_ticket = None
+        if existing_ticket is not None and existing_ticket.pointer_retirement_path:
+            destination_name = existing_ticket.pointer_retirement_path.name
     moved, matches = _move_managed_state_entry_to_quarantine(
         home,
         transaction,
@@ -28084,6 +28097,10 @@ def _pending_terminal_cleanup_ticket_payload(
     }
     if terminal_namespace_sha256 is not None:
         payload["terminal_namespace_sha256"] = terminal_namespace_sha256
+    if ticket_version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
+        payload["pointer_retirement_path"] = _pending_pointer_retirement_path(
+            batch.batch_root.name,
+        ).as_posix()
     return _bounded_json_document(
         payload,
         max_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
@@ -28418,6 +28435,14 @@ def _read_pending_cleanup_ticket(
             allowed_top_level_fields = {
                 frozenset(expected_top_level_fields),
                 frozenset((*expected_top_level_fields, "terminal_namespace_sha256")),
+                frozenset((*expected_top_level_fields, "pointer_retirement_path")),
+                frozenset(
+                    (
+                        *expected_top_level_fields,
+                        "terminal_namespace_sha256",
+                        "pointer_retirement_path",
+                    )
+                ),
             }
             if frozenset(data) not in allowed_top_level_fields:
                 raise SyncError(
@@ -28568,6 +28593,18 @@ def _read_pending_cleanup_ticket(
                 f"pending terminal namespace digest changed: {batch_name}"
             )
         batch_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH / batch_name
+        pointer_retirement_path = None
+        if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION and (
+            "pointer_retirement_path" in data
+        ):
+            pointer_retirement_path = _validate_relative_path(
+                data.get("pointer_retirement_path"),
+                "pending pointer retirement path",
+            )
+            if pointer_retirement_path != _pending_pointer_retirement_path(batch_name):
+                raise SyncError(
+                    f"pending pointer retirement path changed: {batch_name}"
+                )
         if version in {5, 7}:
             if len(snapshot.payload) > MAX_PENDING_CLEANUP_TICKET_BYTES:
                 raise SyncError(
@@ -28824,6 +28861,12 @@ def _read_pending_cleanup_ticket(
                 terminal_namespace_sha256 is not None
             ):
                 payload_data["terminal_namespace_sha256"] = terminal_namespace_sha256
+            if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION and (
+                pointer_retirement_path is not None
+            ):
+                payload_data["pointer_retirement_path"] = (
+                    pointer_retirement_path.as_posix()
+                )
             expected_payload = _bounded_json_document(
                 payload_data,
                 max_bytes=(
@@ -28857,6 +28900,11 @@ def _read_pending_cleanup_ticket(
             terminal_regular_targets=terminal_regular_targets,
             terminal_namespace_sha256=(
                 terminal_namespace_sha256
+                if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+                else None
+            ),
+            pointer_retirement_path=(
+                pointer_retirement_path
                 if version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
                 else None
             ),
@@ -31668,6 +31716,65 @@ def _pending_terminal_validation_namespace_anchor_digest(
     ).hexdigest()
 
 
+def _pending_terminal_validation_namespace_anchor_digest_legacy(
+    namespace_entries: tuple[PendingTerminalValidationNamespaceEntry, ...],
+    terminal_aliases: tuple[PendingTerminalValidationAlias, ...],
+) -> str:
+    """Reproduce the pre-v1.0 v8 anchor for tickets without path authority."""
+    alias_paths = {alias.path for alias in terminal_aliases}
+    excluded_paths = alias_paths | {
+        PurePosixPath(PENDING_LINK_METADATA_NAME),
+        PurePosixPath("state"),
+    }
+
+    def is_excluded(path: PurePosixPath) -> bool:
+        return path in excluded_paths or (
+            len(path.parts) == 2
+            and path.parts[0] == "state"
+            and re.fullmatch(
+                r"pending-(?:complete|publish-error)-[0-9]+-[0-9]+",
+                path.parts[1],
+            )
+            is not None
+        )
+
+    payload = [
+        _pending_terminal_validation_namespace_anchor_entry_payload(entry)
+        for entry in namespace_entries
+        if not is_excluded(entry.path)
+    ]
+    return hashlib.sha256(
+        _bounded_json_document(
+            payload,
+            max_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+            overflow_error="pending terminal validation namespace exceeds the size limit",
+        )
+    ).hexdigest()
+
+
+def _pending_terminal_validation_namespace_anchor_digest_for_ticket(
+    ticket: PendingBatchCleanupTicket,
+    namespace_entries: tuple[PendingTerminalValidationNamespaceEntry, ...],
+    terminal_aliases: tuple[PendingTerminalValidationAlias, ...],
+) -> str:
+    if (
+        ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        and ticket.pointer_retirement_path is None
+    ):
+        # The old v8 ticket schema did not persist the exact retirement path.
+        # Keep its historical anchor only for bounded compatibility; all new
+        # tickets carry explicit path authority and use the strict digest.
+        return _pending_terminal_validation_namespace_anchor_digest_legacy(
+            namespace_entries,
+            terminal_aliases,
+        )
+    return _pending_terminal_validation_namespace_anchor_digest(
+        namespace_entries,
+        terminal_aliases,
+        pointer_retirement_path=ticket.pointer_retirement_path,
+    )
+
+
 def _pending_terminal_validation_namespace_entries_for_anchor(
     identity_ledger: PendingCleanupIdentityLedger,
     terminal_aliases: tuple[PendingTerminalValidationAlias, ...],
@@ -33310,12 +33417,12 @@ def _ensure_pending_terminal_validation_receipt(
                     "manual recovery is required: "
                     f"{ticket.batch_root.name}"
                 )
-            existing_digest = _pending_terminal_validation_namespace_anchor_digest(
-                existing_authority.namespace_entries or (),
-                existing_authority.aliases,
-                pointer_retirement_path=_pending_pointer_retirement_path(
-                    ticket.batch_root.name,
-                ),
+            existing_digest = (
+                _pending_terminal_validation_namespace_anchor_digest_for_ticket(
+                    ticket,
+                    existing_authority.namespace_entries or (),
+                    existing_authority.aliases,
+                )
             )
             if existing_digest != namespace_anchor_sha256:
                 raise SyncError(
@@ -33441,12 +33548,10 @@ def _ensure_pending_terminal_validation_receipt(
         )
         if namespace_anchor_sha256 is not None:
             if (
-                _pending_terminal_validation_namespace_anchor_digest(
+                _pending_terminal_validation_namespace_anchor_digest_for_ticket(
+                    ticket,
                     namespace_entries,
                     terminal_aliases,
-                    pointer_retirement_path=_pending_pointer_retirement_path(
-                        ticket.batch_root.name,
-                    ),
                 )
                 != namespace_anchor_sha256
             ):
@@ -37164,12 +37269,10 @@ def _remove_cleanup_ready_batch(
                         f"namespace authority: {ticket.batch_root.name}"
                     )
                 if terminal_namespace_anchor_sha256 is not None and (
-                    _pending_terminal_validation_namespace_anchor_digest(
+                    _pending_terminal_validation_namespace_anchor_digest_for_ticket(
+                        ticket,
                         current_authority.namespace_entries,
                         current_authority.aliases,
-                        pointer_retirement_path=_pending_pointer_retirement_path(
-                            ticket.batch_root.name,
-                        ),
                     )
                     != terminal_namespace_anchor_sha256
                 ):

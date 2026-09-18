@@ -23,7 +23,7 @@
     "engine": {
       "mode": "0755",
       "path": "scripts/codex_personal_sync.py",
-      "sha256": "dd52fb8642f8b2589f69f0de1cf2e3fc21ccce12577085a6d60f47118141f8c1"
+      "sha256": "60a1f550f933b92b7b1895ef3ec847c82fc8b9d9e15e5f6bfe2b491643129a69"
     },
     "engine_tests": {
       "mode": "0644",
