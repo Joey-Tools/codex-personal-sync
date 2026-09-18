@@ -910,6 +910,63 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertTrue(legacy_ticket.batch_root.is_dir())
         self.assertTrue(alias.exists())
 
+    def test_v4_terminal_validation_rejects_namespace_added_during_receipt_publish(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        payload = json.loads(ticket.path.read_text(encoding="utf-8"))
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        payload["version"] = MODULE.LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        targets = payload.get("terminal_regular_targets")
+        self.assertIsInstance(targets, list)
+        assert isinstance(targets, list)
+        for target in targets:
+            self.assertIsInstance(target, dict)
+            assert isinstance(target, dict)
+            target.pop("link_count", None)
+        payload.pop("terminal_namespace_sha256", None)
+        ticket.path.write_bytes(
+            MODULE._bounded_json_document(
+                payload,
+                max_bytes=MODULE.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+                overflow_error="pending cleanup ticket exceeds the size limit",
+            )
+        )
+        legacy_ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket.path)
+        self.assertIsNotNone(legacy_ticket)
+        assert legacy_ticket is not None
+        foreign = ticket.batch_root / "links" / "foreign-entry"
+        real_publish = MODULE._publish_pending_cleanup_terminal_validation
+        injected = False
+
+        def publish_then_inject(*args: object, **kwargs: object):
+            nonlocal injected
+            result = real_publish(*args, **kwargs)
+            foreign.parent.mkdir(mode=0o700, exist_ok=True)
+            foreign.write_bytes(b"foreign link content\n")
+            foreign.chmod(0o600)
+            injected = True
+            return result
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_publish_pending_cleanup_terminal_validation",
+                side_effect=publish_then_inject,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "namespace changed while publishing the validation receipt",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, legacy_ticket)
+
+        self.assertTrue(injected)
+        self.assertTrue(legacy_ticket.path.is_file())
+        self.assertTrue(legacy_ticket.batch_root.is_dir())
+        self.assertEqual(foreign.read_bytes(), b"foreign link content\n")
+
     def test_terminal_receipt_capacity_projects_deep_backup_namespace(self) -> None:
         terminal_target = PurePosixPath("agents", "reviewer.toml")
         terminal_record = MODULE.ManagedLinkRecord(
@@ -982,6 +1039,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             before_state,
             after_state,
             record_actions,
+            state_before_exists=False,
         )
         projected_aliases = MODULE._projected_pending_terminal_validation_alias_paths(
             self.home,
@@ -990,6 +1048,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             phase="before",
         )
         self.assertTrue(set(projected_aliases).issubset(namespace_paths))
+        self.assertNotIn(MODULE.PENDING_STATE_BEFORE_EVIDENCE, namespace_paths)
 
         with self.assertRaisesRegex(
             MODULE.SyncError,

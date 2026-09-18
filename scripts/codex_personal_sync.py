@@ -22094,6 +22094,8 @@ def _projected_pending_terminal_validation_namespace_paths(
     planning_state_before: ManagedState,
     state_after_value: ManagedState,
     record_actions: dict[tuple[str, PurePosixPath], str],
+    *,
+    state_before_exists: bool,
 ) -> frozenset[PurePosixPath]:
     """Project every batch namespace path before staging publishes it.
 
@@ -22137,7 +22139,7 @@ def _projected_pending_terminal_validation_namespace_paths(
         PENDING_STATE_ROLLBACK_MARKER,
         PENDING_STATE_STAGING_MARKER,
     )
-    if state_before_value is not None:
+    if state_before_exists:
         state_paths = (*state_paths, PENDING_STATE_BEFORE_EVIDENCE)
     for path in state_paths:
         add_path(path)
@@ -22969,6 +22971,7 @@ def _validate_pending_link_metadata_capacity(
         planning_state_before,
         state_after_value,
         record_actions,
+        state_before_exists=state_before.exists,
     )
     _validate_pending_terminal_validation_receipt_capacity(
         home,
@@ -31016,6 +31019,20 @@ def _capture_pending_cleanup_identity_ledger(
                 _close_fd_quietly(child_fd)
 
 
+def _pending_cleanup_identity_ledgers_match(
+    left: PendingCleanupIdentityLedger,
+    right: PendingCleanupIdentityLedger,
+) -> bool:
+    """Compare cleanup ledgers without depending on scandir enumeration order."""
+    if set(left) != set(right):
+        return False
+    return all(
+        tuple(sorted(left[identity], key=lambda entry: entry[0]))
+        == tuple(sorted(right[identity], key=lambda entry: entry[0]))
+        for identity in left
+    )
+
+
 def _remove_pending_batch_directory_contents(
     directory_fd: int,
     directory_identity: tuple[int, int],
@@ -33159,6 +33176,7 @@ def _ensure_pending_terminal_validation_receipt(
     *,
     legacy_generic_validation: LegacyGenericCleanupValidation | None = None,
     namespace_anchor_sha256: str | None = None,
+    publish_legacy_terminal_receipt: bool = True,
 ) -> None:
     if ticket.version in {1, 2}:
         existing_receipt = _read_pending_cleanup_terminal_validation(
@@ -33379,11 +33397,12 @@ def _ensure_pending_terminal_validation_receipt(
             namespace_entries=namespace_entries,
         )
         return
-    _publish_pending_cleanup_terminal_validation(
-        home,
-        ticket,
-        quarantine_root_identity,
-    )
+    if publish_legacy_terminal_receipt:
+        _publish_pending_cleanup_terminal_validation(
+            home,
+            ticket,
+            quarantine_root_identity,
+        )
     for index, expectation in enumerate(ticket.terminal_regular_targets):
         _validate_pending_terminal_target_and_alias(
             home,
@@ -36847,6 +36866,10 @@ def _remove_cleanup_ready_batch(
                     batch_mount_identity,
                     quarantine_root_identity,
                 )
+        legacy_v4_terminal_receipt_pending = (
+            ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+            and bool(ticket.terminal_regular_targets)
+        )
         _ensure_pending_terminal_validation_receipt(
             home,
             ticket,
@@ -36855,6 +36878,7 @@ def _remove_cleanup_ready_batch(
             quarantine_root_identity,
             legacy_generic_validation=legacy_generic_validation,
             namespace_anchor_sha256=terminal_namespace_anchor_sha256,
+            publish_legacy_terminal_receipt=not legacy_v4_terminal_receipt_pending,
         )
         if legacy_generic_validation is not None:
             # Receipt publication itself is a mutable control-file operation.
@@ -36868,6 +36892,35 @@ def _remove_cleanup_ready_batch(
                 bound_batch_root,
                 batch_fd,
                 legacy_generic_validation,
+            )
+        legacy_v4_pre_receipt_identity_ledger: (
+            PendingCleanupIdentityLedger | None
+        ) = None
+        if legacy_v4_terminal_receipt_pending:
+            # v4 receipts predate a durable namespace map.  Capture the exact
+            # post-alias namespace before publishing the generic receipt, then
+            # require the namespace to be unchanged after publication.  This
+            # closes the interval in which a foreign batch entry could be
+            # added and accidentally become walker deletion authority.
+            cleanup_budget = [MAX_PENDING_CLEANUP_ENTRIES]
+            legacy_v4_pre_receipt_identity_ledger = {}
+            batch_mount_identity = _directory_mount_identity(batch_fd)
+            _capture_pending_cleanup_identity_ledger(
+                batch_fd,
+                ticket.batch_root_identity,
+                batch_mount_identity,
+                cleanup_budget,
+                legacy_v4_pre_receipt_identity_ledger,
+                depth=0,
+                relative_parts=(),
+                skipped_names=frozenset(),
+                name_validator=_pending_batch_cleanup_name_is_authorized,
+                directory_expected_mode=0o700,
+            )
+            _publish_pending_cleanup_terminal_validation(
+                home,
+                ticket,
+                quarantine_root_identity,
             )
         if ticket.version not in {1, 2}:
             # v4/v8 receipt setup may add a terminal recovery hard link.  The
@@ -36889,6 +36942,17 @@ def _remove_cleanup_ready_batch(
                 name_validator=_pending_batch_cleanup_name_is_authorized,
                 directory_expected_mode=0o700,
             )
+            if (
+                legacy_v4_pre_receipt_identity_ledger is not None
+                and not _pending_cleanup_identity_ledgers_match(
+                    legacy_v4_pre_receipt_identity_ledger,
+                    identity_ledger,
+                )
+            ):
+                raise SyncError(
+                    "legacy terminal cleanup namespace changed while publishing "
+                    f"the validation receipt: {batch_name}"
+                )
         terminal_alias_paths: frozenset[PurePosixPath] = frozenset()
         if ticket.version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
             receipt = _read_pending_cleanup_terminal_validation(
