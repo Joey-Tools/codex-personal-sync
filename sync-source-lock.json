@@ -23,7 +23,7 @@
     "engine": {
       "mode": "0755",
       "path": "scripts/codex_personal_sync.py",
-      "sha256": "70fd66ff3b631730e67ab1de8fedc189641778e230b48fd8222debd3f11596ac"
+      "sha256": "3fbb60f1e10fd23d1ecc643a3377986a75ba8bcd60a600b2833a78f576d7cd0e"
     },
     "engine_tests": {
       "mode": "0644",
@@ -38,12 +38,12 @@
     "pending_agent_claim_compatibility_tests": {
       "mode": "0644",
       "path": "tests/test_pending_agent_claim_compatibility.py",
-      "sha256": "43008c65c647e9a0957f4870d3f2be6510d38899dfdb15561c6dd8249ad0fb67"
+      "sha256": "4faadb2b1d3fc80eb46284d000d52f405388ce7d5af478a7c4b44a2f8f93222a"
     },
     "pending_staging_cleanup_tests": {
       "mode": "0644",
       "path": "tests/test_pending_staging_cleanup.py",
-      "sha256": "0a2a70b4f54301695087c0a616ee10765ffbea7c0898badab451127939c466ee"
+      "sha256": "7f959cefb3da4b9c4b474db12bb7aa708e4a51c08413dd0a54ecf95e2827cd7d"
     },
     "quarantine_empty_batch_reclaim_tests": {
       "mode": "0644",
@@ -53,17 +53,17 @@
     "reconciliation_safety_tests": {
       "mode": "0644",
       "path": "tests/test_personal_sync_reconciliation_safety.py",
-      "sha256": "f562d2bdf51c17f1aee1c680ae31b5c41873f10e4cbee8519eac5392a9583176"
+      "sha256": "52ec827d2061eb827fb5ad8211a26c59716847321973d8e36f4da30bfd46caef"
     },
     "regular_agent_materialization_tests": {
       "mode": "0644",
       "path": "tests/test_regular_agent_materialization.py",
-      "sha256": "19d57d52314d7c2d1163bec42ae5cf8eeaedb1685e30f8201a76d0b836a42aef"
+      "sha256": "49c7f8b802db4b851b9ab2a52e4e5513becb1a4059cac02e5de0bba5a726ed0c"
     },
     "regular_overlay_uninstall_status_regressions_tests": {
       "mode": "0644",
       "path": "tests/test_regular_overlay_uninstall_status_regressions.py",
-      "sha256": "5e9de1e1a5c6e12d735551762a57be961ec3e8e09c95adf34932830a4d447e78"
+      "sha256": "da01fff08f3b5e14f02aee0c374cbfc7b03c4013bb0d04b6718e6d8cdd0908ad"
     },
     "release_retention_tests": {
       "mode": "0644",
