@@ -12748,6 +12748,34 @@ def _require_current_user_cleanup_fd_access_policy(
     return metadata
 
 
+def _require_pending_cleanup_parent_access_policy(
+    home: Path,
+    parent_path: Path,
+    parent_fd: int,
+) -> os.stat_result:
+    """Prove the namespace containing a cleanup file is still private.
+
+    Internal personal-sync directories are created with exact owner-only
+    ``0700`` policy, including Darwin ACL admission.  Cleanup files outside
+    that tree (for example scheduler configuration paths) retain the broader
+    current-user policy, which rejects non-owner write authority without
+    imposing an unrelated exact mode on the caller's external directory.
+    """
+    personal_root = _personal_sync_root(home)
+    try:
+        parent_path.relative_to(personal_root)
+    except ValueError:
+        return _require_current_user_cleanup_fd_access_policy(
+            parent_fd,
+            parent_path,
+        )
+    return _require_pending_cleanup_fd_access_policy(
+        parent_fd,
+        parent_path,
+        expected_mode=0o700,
+    )
+
+
 def _require_pending_cleanup_file_snapshot_access_policy(
     home: Path,
     path: Path,
@@ -25434,7 +25462,11 @@ def _quarantine_pending_link_pointer(
                 home,
                 _pending_cleanup_ticket_path(home, batch.batch_root.name),
             )
-        except (OSError, SyncError):
+        except FileNotFoundError:
+            # A genuinely missing legacy ticket has no retirement authority;
+            # retain the historic dynamic compatibility name.  Any other
+            # unreadable, malformed, or policy-invalid ticket must remain a
+            # hard failure so the pointer cannot move to an unbound path.
             existing_ticket = None
         if existing_ticket is not None and existing_ticket.pointer_retirement_path:
             destination_name = existing_ticket.pointer_retirement_path.name
@@ -27084,6 +27116,20 @@ def _isolate_and_delete_pending_cleanup_file(
             f"{label} has an unauthorized hard-link alias: "
             f"links={expected.link_count!r}"
         )
+
+    def require_parent_access_policy(stage: str) -> None:
+        try:
+            _require_pending_cleanup_parent_access_policy(
+                home,
+                path.parent,
+                parent_fd,
+            )
+        except (OSError, SyncError) as error:
+            raise SyncError(
+                f"{label} parent access policy changed {stage}: {error}"
+            ) from error
+
+    require_parent_access_policy("before isolation")
     if not _bound_directory_matches(home, path.parent, parent_fd):
         raise SyncError(f"{label} parent changed before isolation")
 
@@ -27124,6 +27170,7 @@ def _isolate_and_delete_pending_cleanup_file(
             or not _bound_directory_matches(home, path.parent, parent_fd)
         ):
             raise SyncError(f"{label} changed before isolation")
+        require_parent_access_policy("before isolation")
     finally:
         if preflight_fd >= 0:
             _close_fd_quietly(preflight_fd)
@@ -27136,6 +27183,7 @@ def _isolate_and_delete_pending_cleanup_file(
             # infer.  Revalidate it inside the syscall loop so failed
             # no-replace candidates do not create an unchecked retry window.
             mutation_revalidator(path.name)
+        require_parent_access_policy("during isolation")
         try:
             _rename_noreplace_at(
                 parent_fd,
@@ -27151,6 +27199,7 @@ def _isolate_and_delete_pending_cleanup_file(
         break
     assert retained_name is not None
     os.fsync(parent_fd)
+    require_parent_access_policy("after isolation")
 
     retained_path = path.with_name(retained_name)
     file_fd = -1
@@ -27158,6 +27207,7 @@ def _isolate_and_delete_pending_cleanup_file(
 
         def require_open_file_unchanged(stage: str) -> None:
             try:
+                require_parent_access_policy(stage)
                 before = _require_release_identity_fd_access_policy(
                     file_fd,
                     retained_path,
@@ -27185,6 +27235,7 @@ def _isolate_and_delete_pending_cleanup_file(
                     dir_fd=parent_fd,
                     follow_symlinks=False,
                 )
+                require_parent_access_policy(stage)
             except (OSError, SyncError) as error:
                 raise SyncError(
                     f"{label} changed {stage}; preserved as {retained_name}"
@@ -27226,13 +27277,15 @@ def _isolate_and_delete_pending_cleanup_file(
             # injected exception or concurrent namespace change.  Reprove the
             # broader authority with the retained name immediately before the
             # irreversible unlink.  The callback is repeated after the
-            # descriptor/content/ACL/stat/parent checks below so it remains the
-            # final observable filesystem operation before unlink.
+            # descriptor/content/ACL/stat/parent checks below, followed by one
+            # final parent-policy admission immediately before unlink.
             mutation_revalidator(retained_name)
             require_open_file_unchanged("after mutation revalidation")
             mutation_revalidator(retained_name)
+        require_parent_access_policy("before deletion")
         os.unlink(retained_name, dir_fd=parent_fd)
         os.fsync(parent_fd)
+        require_parent_access_policy("after deletion")
         if _named_entry_identity(
             parent_fd, retained_name
         ) is not None or not _bound_directory_matches(home, path.parent, parent_fd):

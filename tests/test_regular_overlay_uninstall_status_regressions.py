@@ -2527,6 +2527,49 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertEqual(events[-2:], ["callback", "unlink"])
         self.assertFalse(probe.exists())
 
+    def test_pending_cleanup_unlink_rechecks_parent_access_policy(self) -> None:
+        self._deferred_terminal_ticket()
+        probe = MODULE._pending_cleanup_index_path(self.home) / "parent-policy.json"
+        probe.write_bytes(b"parent policy ordering\n")
+        probe.chmod(0o600)
+        parent_path = probe.parent
+        original_mode = stat.S_IMODE(parent_path.stat().st_mode)
+        parent_fd = MODULE._open_directory_beneath(self.home, parent_path)
+        calls = 0
+
+        def weaken_parent_on_final_callback(_name: str) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                parent_path.chmod(0o755)
+
+        try:
+            expected = MODULE._read_managed_state_file_snapshot(
+                self.home,
+                probe,
+                parent_fd,
+            )
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "parent access policy changed before deletion",
+            ):
+                MODULE._isolate_and_delete_pending_cleanup_file(
+                    self.home,
+                    probe,
+                    parent_fd,
+                    expected,
+                    label="pending cleanup parent policy ordering",
+                    mutation_revalidator=weaken_parent_on_final_callback,
+                )
+        finally:
+            parent_path.chmod(original_mode)
+            MODULE._close_fd_quietly(parent_fd)
+
+        self.assertFalse(probe.exists())
+        self.assertEqual(calls, 3)
+        retained = tuple(parent_path.glob(".retained-cleanup-parent-policy.json-*"))
+        self.assertEqual(len(retained), 1)
+
     def test_v8_orphan_proof_revalidates_group_after_ticket_retirement(self) -> None:
         ticket = self._deferred_terminal_ticket()
         self.assertEqual(
