@@ -5174,6 +5174,75 @@ class PendingStagingCleanupTests(unittest.TestCase):
             )
         )
 
+    def test_v6_final_private_unlink_rechecks_quarantine_parent_policy(
+        self,
+    ) -> None:
+        case_home = self.root / "ephemeral-v6-final-private-parent-policy"
+        install(self.first_release, case_home, SHA_A)
+        case_target = case_home / ROLE_TARGET
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            case_home,
+            case_target,
+            require_managed_access=False,
+        )
+        with (
+            self._receiptless_cleanup_crash_patch("alias-private"),
+            self.assertRaisesRegex(SystemExit, "after private isolation"),
+        ):
+            MODULE._delete_exact_regular_publication_without_pending_receipt(
+                case_home,
+                case_target,
+                expected,
+            )
+
+        ticket = self._only_cleanup_ticket_for_home(case_home)
+        quarantine_root = (
+            MODULE._personal_sync_root(case_home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        original_mode = stat.S_IMODE(quarantine_root.stat().st_mode)
+        checks = 0
+        drifted = False
+        real_require = MODULE._require_release_identity_fd_access_policy
+
+        def weaken_quarantine_parent_after_private_revalidation(
+            file_descriptor: int,
+            display_path: Path,
+            expected_owner_uid: int,
+        ):
+            nonlocal checks, drifted
+            result = real_require(
+                file_descriptor,
+                display_path,
+                expected_owner_uid,
+            )
+            if ".delete-" in display_path.name:
+                checks += 1
+                if checks >= 3 and not drifted:
+                    quarantine_root.chmod(0o755)
+                    drifted = True
+            return result
+
+        try:
+            with mock.patch.object(
+                MODULE,
+                "_require_release_identity_fd_access_policy",
+                side_effect=weaken_quarantine_parent_after_private_revalidation,
+            ), self.assertRaisesRegex(MODULE.SyncError, "mode 0755 != 0700"):
+                MODULE._cleanup_ready_pending_batches(case_home)
+        finally:
+            quarantine_root.chmod(original_mode)
+
+        self.assertTrue(drifted)
+        self.assertGreaterEqual(checks, 3)
+        self.assertTrue(ticket.path.is_file())
+        self.assertIsNotNone(
+            MODULE._read_pending_cleanup_terminal_validation(
+                case_home,
+                ticket,
+                ticket.quarantine_root_identity,
+            )
+        )
+
     def test_v6_ephemeral_cleanup_recovers_final_private_tombstone(self) -> None:
         case_home = self.root / "ephemeral-v6-final-private-crash"
         install(self.first_release, case_home, SHA_A)

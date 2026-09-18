@@ -2570,6 +2570,91 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         retained = tuple(parent_path.glob(".retained-cleanup-parent-policy.json-*"))
         self.assertEqual(len(retained), 1)
 
+    def test_pending_cleanup_walker_rechecks_parent_access_policy_before_unlink(
+        self,
+    ) -> None:
+        walker_root = self.home / "walker-parent-policy"
+        walker_root.mkdir(mode=0o700)
+        victim = walker_root / "victim.txt"
+        victim.write_bytes(b"walker parent policy\n")
+        victim.chmod(0o600)
+        original_mode = stat.S_IMODE(walker_root.stat().st_mode)
+        directory_fd = MODULE._open_directory_beneath(self.home, walker_root)
+
+        def weaken_parent_before_unlink(
+            _logical_path: PurePosixPath,
+            stage: str,
+        ) -> None:
+            if stage == "before_unlink":
+                walker_root.chmod(0o755)
+
+        try:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "mode 0755 != 0700",
+            ):
+                MODULE._remove_pending_batch_directory_contents(
+                    directory_fd,
+                    MODULE._directory_identity(directory_fd),
+                    MODULE._directory_mount_identity(directory_fd),
+                    [MODULE.MAX_PENDING_CLEANUP_ENTRIES],
+                    depth=0,
+                    mutation_revalidator=weaken_parent_before_unlink,
+                )
+        finally:
+            walker_root.chmod(original_mode)
+            MODULE._close_fd_quietly(directory_fd)
+
+        self.assertFalse(victim.exists())
+        retained = tuple(
+            child
+            for child in walker_root.iterdir()
+            if child.name.startswith(MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+        )
+        self.assertEqual(len(retained), 1)
+
+    def test_pending_cleanup_walker_rechecks_parent_access_policy_before_rmdir(
+        self,
+    ) -> None:
+        walker_root = self.home / "walker-parent-policy-rmdir"
+        walker_root.mkdir(mode=0o700)
+        victim = walker_root / "victim-directory"
+        victim.mkdir(mode=0o700)
+        original_mode = stat.S_IMODE(walker_root.stat().st_mode)
+        directory_fd = MODULE._open_directory_beneath(self.home, walker_root)
+
+        def weaken_parent_before_rmdir(
+            _logical_path: PurePosixPath,
+            stage: str,
+        ) -> None:
+            if stage == "before_rmdir":
+                walker_root.chmod(0o755)
+
+        try:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "mode 0755 != 0700",
+            ):
+                MODULE._remove_pending_batch_directory_contents(
+                    directory_fd,
+                    MODULE._directory_identity(directory_fd),
+                    MODULE._directory_mount_identity(directory_fd),
+                    [MODULE.MAX_PENDING_CLEANUP_ENTRIES],
+                    depth=0,
+                    mutation_revalidator=weaken_parent_before_rmdir,
+                )
+        finally:
+            walker_root.chmod(original_mode)
+            MODULE._close_fd_quietly(directory_fd)
+
+        self.assertFalse(victim.exists())
+        retained = tuple(
+            child
+            for child in walker_root.iterdir()
+            if child.name.startswith(MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+        )
+        self.assertEqual(len(retained), 1)
+
     def test_v8_orphan_proof_revalidates_group_after_ticket_retirement(self) -> None:
         ticket = self._deferred_terminal_ticket()
         self.assertEqual(

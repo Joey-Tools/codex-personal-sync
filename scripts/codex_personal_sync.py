@@ -19788,6 +19788,11 @@ def _delete_pending_regular_publication_private_alias(
         # content, access-policy, and link-count validation immediately before
         # the irreversible unlink.
         require_open_private_unchanged("after boundary revalidation")
+        _require_pending_cleanup_fd_access_policy(
+            cleanup_parent_fd,
+            cleanup_parent,
+            expected_mode=0o700,
+        )
         os.unlink(deletion_name, dir_fd=cleanup_parent_fd)
         os.fsync(cleanup_parent_fd)
         if _named_entry_identity(cleanup_parent_fd, deletion_name) is not None:
@@ -31349,6 +31354,7 @@ def _capture_pending_cleanup_identity_ledger(
             display_path,
             expected_mode=effective_expected_mode,
         )
+
     if _directory_identity(directory_fd) != directory_identity:
         raise SyncError("pending cleanup directory identity changed")
     if _directory_mount_identity(directory_fd) != root_mount_identity:
@@ -31646,6 +31652,21 @@ def _remove_pending_batch_directory_contents(
             display_path,
             expected_mode=effective_expected_mode,
         )
+
+    def require_current_directory_access_policy() -> None:
+        """Re-admit the bound directory immediately before each deletion."""
+        if effective_expected_mode is None:
+            _require_current_user_cleanup_fd_access_policy(
+                directory_fd,
+                display_path,
+            )
+        else:
+            _require_pending_cleanup_fd_access_policy(
+                directory_fd,
+                display_path,
+                expected_mode=effective_expected_mode,
+            )
+
     if _directory_identity(directory_fd) != directory_identity:
         raise SyncError("pending cleanup directory identity changed")
     if _directory_mount_identity(directory_fd) != root_mount_identity:
@@ -31906,6 +31927,7 @@ def _remove_pending_batch_directory_contents(
                     # irreversible directory removal.  No filesystem probe
                     # runs between this callback and rmdir.
                     mutation_revalidator(logical_entry_path, "before_rmdir")
+                require_current_directory_access_policy()
                 try:
                     os.rmdir(active_name, dir_fd=directory_fd)
                 except OSError:
@@ -31969,6 +31991,7 @@ def _remove_pending_batch_directory_contents(
                 # complete.  This callback is the final observable filesystem
                 # operation before unlink.
                 mutation_revalidator(logical_entry_path, "before_unlink")
+            require_current_directory_access_policy()
             try:
                 os.unlink(active_name, dir_fd=directory_fd)
             except OSError:
@@ -36498,6 +36521,11 @@ def _remove_pending_ephemeral_quarantine_leaf(
                     # and repeat content/access/link-count validation, before
                     # issuing the irreversible unlink.
                     require_open_private_unchanged("after boundary revalidation")
+                    _require_pending_cleanup_fd_access_policy(
+                        quarantine_fd,
+                        quarantine_root,
+                        expected_mode=0o700,
+                    )
                     os.unlink(quarantine_name, dir_fd=quarantine_fd)
                     os.fsync(quarantine_fd)
                     if (

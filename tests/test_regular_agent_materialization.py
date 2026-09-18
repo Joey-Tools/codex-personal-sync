@@ -4600,6 +4600,75 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                     )
                     self.assertEqual(stat.S_IMODE(drifted_path.stat().st_mode), 0o640)
 
+    def test_final_private_deletion_rechecks_parent_policy_immediately_before_unlink(
+        self,
+    ) -> None:
+        self.home = self.root / "home-final-delete-parent-policy"
+        batch = self._interrupt_regular_publication_cleanup(self.release, SHA_A)
+        record, _active = self._assert_active_publication_journal(batch)
+        journal = MODULE._read_pending_regular_publication_cleanup(
+            self.home,
+            batch,
+            record,
+            "produced",
+        )
+        assert journal is not None
+        cleanup = batch.batch_root / "pending" / "cleanup"
+        original_mode = stat.S_IMODE(cleanup.stat().st_mode)
+        reads = 0
+        drifted = False
+        real_read = MODULE._read_managed_state_bytes
+
+        def drift_after_final_content_revalidation(
+            file_descriptor: int,
+            path: Path,
+            maximum_bytes: int = MODULE.MAX_MANAGED_STATE_BYTES,
+        ) -> bytes:
+            nonlocal reads, drifted
+            payload = real_read(file_descriptor, path, maximum_bytes)
+            if (
+                path.parent == cleanup
+                and MODULE._pending_regular_publication_private_deletion_alias_base(
+                    path.name
+                )
+                is not None
+            ):
+                reads += 1
+                if reads >= 4 and not drifted:
+                    cleanup.chmod(0o755)
+                    drifted = True
+            return payload
+
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_read_managed_state_bytes",
+                    side_effect=drift_after_final_content_revalidation,
+                ),
+                self.assertRaisesRegex(MODULE.SyncError, "mode 0755 != 0700"),
+            ):
+                MODULE._recover_pending_regular_publication_cleanup(
+                    self.home,
+                    batch,
+                    record,
+                    "produced",
+                )
+        finally:
+            cleanup.chmod(original_mode)
+
+        self.assertTrue(drifted)
+        self.assertGreaterEqual(reads, 4)
+        self.assertTrue(
+            any(
+                MODULE._pending_regular_publication_private_deletion_alias_base(
+                    child.name
+                )
+                is not None
+                for child in cleanup.iterdir()
+            )
+        )
+
     def test_private_authority_anchor_rejects_v2_journal_replay(self) -> None:
         for public_name in ("canonical", "active"):
             with self.subTest(public_name=public_name):
