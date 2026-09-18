@@ -855,6 +855,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             assert isinstance(target, dict)
             target.pop("link_count", None)
         payload.pop("terminal_namespace_sha256", None)
+        payload.pop("pointer_retirement_path", None)
         ticket.path.write_bytes(
             MODULE._bounded_json_document(
                 payload,
@@ -926,6 +927,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             assert isinstance(target, dict)
             target.pop("link_count", None)
         payload.pop("terminal_namespace_sha256", None)
+        payload.pop("pointer_retirement_path", None)
         ticket.path.write_bytes(
             MODULE._bounded_json_document(
                 payload,

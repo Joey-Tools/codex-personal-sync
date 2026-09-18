@@ -63,7 +63,7 @@
     "regular_overlay_uninstall_status_regressions_tests": {
       "mode": "0644",
       "path": "tests/test_regular_overlay_uninstall_status_regressions.py",
-      "sha256": "e141326856ba8d3794672af0078e85c443d29708253993fafc8c95bd88f7c3ce"
+      "sha256": "13af41ce6adfd91d559b0cd89a3ac97c84d1007a1615c142aa25c67312a97430"
     },
     "release_retention_tests": {
       "mode": "0644",
