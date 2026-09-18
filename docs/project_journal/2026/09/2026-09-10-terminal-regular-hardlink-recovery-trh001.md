@@ -3,7 +3,7 @@ id: 20260910-trh001
 title: Preserve Terminal Regular Hardlink Authority
 status: active
 created: 2026-09-10
-updated: 2026-09-17
+updated: 2026-09-18
 branch: codex/terminal-regular-hardlink-recovery-20260910
 pr: https://github.com/Joey-Tools/codex-personal-sync/pull/21
 supersedes: []
@@ -53,3 +53,4 @@ superseded_by:
 - 紧接着的 Luna `max` whole-range review 发现另一个 P2：为兼容旧格式而仍可解析、但缺少 `terminal_namespace_sha256` 的 v8 ticket，会在首次恢复时用较晚的 namespace 快照补发 receipt，进而可能扩大 cleanup 删除授权。解析兼容性保留以便保存原始 ticket/batch，但 `_ensure_pending_terminal_validation_receipt` 现在在无 anchor 时直接进入明确的 manual-recovery 路径，禁止创建 receipt、recovery alias 或删除任何新增条目；新增旧 v8 无 anchor 且注入 `links/*` 的回归。regular overlay 模块 `67` tests、py_compile、Ruff 与 diff check 通过；该修复提交后仍需执行完整 suite 与新的 frozen Luna `max` review。
 - source lock 已针对该修复刷新并签名提交；CI 同款 private-temp runner 的第二次完整 suite 通过 `1746` tests、`3` expected skips（`1602.570s`）。第一次全量仅因 lock 尚未刷新而报告 canonical hash mismatch，刷新后 `refresh-lock --check` 与第二次全量均通过。
 - 提交后的 frozen Luna `max` review 又发现两项 P2 并已修复：terminal recovery hardlink 创建及 walker 每个 mutation boundary 现在在最后可观察点前后重验 ticket 的 inode、内容、单链接和访问策略；容量规划不再把 `namespace_entries` 当作空集合，而是从完整 pending record、深层 `links/**` backup、claims、publication journals 与 state-retirement entries 投影 namespace，并用最大字段序列化预检，避免合法深层 symlink backup 在 commit 后才因 16 MiB receipt 上限进入 manual recovery。新增同 inode ticket rewrite（hardlink/walker）和深层 namespace capacity regressions；regular overlay `70` tests、pending staging cleanup 与 regular agent materialization 合计 `294` tests、py_compile、Ruff、diff check 通过。该修复需再次刷新 source lock、跑完整 suite 并执行新的 frozen Luna `max` review。
+- 修复后的 CI 同款 private-temp runner 完整 suite 通过 `1749` tests、`3` expected skips（`1617.700s`）；source lock refresh/`--check`、project journal validation、py_compile、Ruff 与 diff check 也通过。当前提交 `0df3336` 仍需在精确 frozen range 上执行新的 GPT-5.6 Luna `max` whole-range review，之后才进入 GitHub current-head lane、merge、release、安装与热加载 smoke-test。
