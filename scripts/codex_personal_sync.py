@@ -231,6 +231,9 @@ PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX = ".allocation.json.tmp"
 PENDING_QUARANTINE_METADATA_STAGE_SUFFIX = ".allocation-metadata.tmp"
 PENDING_CLEANUP_EMPTY_PROOF_SUFFIX = ".empty-proof"
 PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX = ".terminal-validation"
+PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX = (
+    ".terminal-validation-retired"
+)
 PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION = 4
 LEGACY_PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION = 3
 LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION = 4
@@ -25840,6 +25843,23 @@ def _pending_cleanup_terminal_validation_path(
     )
 
 
+def _pending_cleanup_terminal_validation_retirement_path(
+    home: Path,
+    batch_name: str,
+) -> Path:
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        raise SyncError(
+            "pending cleanup terminal validation retirement has an invalid "
+            "batch name"
+        )
+    return _pending_cleanup_index_path(home) / (
+        batch_name + PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX
+    )
+
+
 def _pending_private_use_retirement_path(home: Path, batch_name: str) -> Path:
     if (
         len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
@@ -35548,11 +35568,15 @@ def _read_pending_cleanup_terminal_validation(
     home: Path,
     ticket: PendingBatchCleanupTicket,
     quarantine_root_identity: tuple[int, int],
+    *,
+    receipt_path: Path | None = None,
+    expected_link_count: int | None = 1,
 ) -> ManagedStateFileSnapshot | None:
-    receipt_path = _pending_cleanup_terminal_validation_path(
-        home,
-        ticket.batch_root.name,
-    )
+    if receipt_path is None:
+        receipt_path = _pending_cleanup_terminal_validation_path(
+            home,
+            ticket.batch_root.name,
+        )
     index_fd = _open_directory_beneath(home, receipt_path.parent)
     try:
         receipt = _read_managed_state_file_snapshot(
@@ -35562,10 +35586,11 @@ def _read_pending_cleanup_terminal_validation(
         )
         if not receipt.exists:
             return None
-        _require_pending_cleanup_control_link_count(
-            receipt,
-            receipt_path,
-        )
+        if expected_link_count is not None and receipt.link_count != expected_link_count:
+            raise SyncError(
+                "pending cleanup terminal validation has an unauthorized "
+                f"hard-link alias: {receipt_path} (links={receipt.link_count!r})"
+            )
         if (
             receipt.file_type != stat.S_IFREG
             or receipt.mode != 0o600
@@ -35729,18 +35754,23 @@ def _delete_pending_cleanup_terminal_validation(
     quarantine_root_identity: tuple[int, int],
     *,
     mutation_revalidator: Callable[[str, int], None] | None = None,
+    receipt_path: Path | None = None,
+    expected_link_count: int = 1,
 ) -> None:
     receipt = _read_pending_cleanup_terminal_validation(
         home,
         ticket,
         quarantine_root_identity,
+        receipt_path=receipt_path,
+        expected_link_count=expected_link_count,
     )
     if receipt is None:
         return
-    receipt_path = _pending_cleanup_terminal_validation_path(
-        home,
-        ticket.batch_root.name,
-    )
+    if receipt_path is None:
+        receipt_path = _pending_cleanup_terminal_validation_path(
+            home,
+            ticket.batch_root.name,
+        )
     index_fd = _open_directory_beneath(home, receipt_path.parent)
     try:
 
@@ -35758,7 +35788,7 @@ def _delete_pending_cleanup_terminal_validation(
                 index_fd,
                 receipt,
                 label=label,
-                require_single_link=True,
+                require_single_link=expected_link_count == 1,
             )
         else:
             _isolate_and_delete_pending_cleanup_file(
@@ -35768,7 +35798,7 @@ def _delete_pending_cleanup_terminal_validation(
                 receipt,
                 label=label,
                 mutation_revalidator=revalidate_mutation,
-                require_single_link=True,
+                require_single_link=expected_link_count == 1,
             )
     finally:
         _close_fd_quietly(index_fd)
@@ -38554,7 +38584,7 @@ def _remove_cleanup_ready_batch(
                         "pending cleanup batch root is missing without an exact "
                         f"empty proof: {batch_name}"
                     )
-                if ticket.version in {4, 8}:
+                if ticket.version in {4, 8} and ticket.terminal_regular_targets:
                     _retire_terminal_regular_cleanup_controls(
                         home,
                         ticket,
@@ -39139,7 +39169,7 @@ def _remove_cleanup_ready_batch(
         if batch_fd >= 0:
             _close_fd_quietly(batch_fd)
         _close_fd_quietly(quarantine_fd)
-    if ticket.version in {4, 8}:
+    if ticket.version in {4, 8} and ticket.terminal_regular_targets:
         _retire_terminal_regular_cleanup_controls(
             home,
             ticket,
@@ -39256,6 +39286,7 @@ def _retire_terminal_regular_cleanup_controls(
     """
     if ticket.version not in {4, 8}:
         raise ValueError("terminal regular control retirement requires v4 or v8")
+
     expected_proof_authority = _pending_cleanup_empty_proof_authority_from_ticket(
         ticket,
         quarantine_root_identity,
@@ -39305,6 +39336,164 @@ def _retire_terminal_regular_cleanup_controls(
             proof_authority.terminal_regular_targets,
         )
 
+    # Validate the proof before receipt retirement so a historic v1/v2 proof
+    # reports its precise missing authority even when the batch root is gone.
+    require_current_v3_proof_and_final_group()
+
+    receipt_path = _pending_cleanup_terminal_validation_path(
+        home,
+        ticket.batch_root.name,
+    )
+    retirement_path = _pending_cleanup_terminal_validation_retirement_path(
+        home,
+        ticket.batch_root.name,
+    )
+
+    def require_terminal_receipt_retirement_authority(
+        path: Path,
+        *,
+        expected_link_count: int,
+    ) -> PendingTerminalValidationAuthority:
+        """Require complete receipt authority before retiring rootless controls.
+
+        The retirement path is a hard link to the validated receipt.  It is an
+        explicit, inode-bound phase marker for the crash window after the
+        canonical receipt name is removed and before the ticket/proof retire.
+        A missing marker or incomplete receipt remains manual recovery; it is
+        never treated as implicit authorization.
+        """
+        receipt = _read_pending_cleanup_terminal_validation(
+            home,
+            ticket,
+            quarantine_root_identity,
+            receipt_path=path,
+            expected_link_count=expected_link_count,
+        )
+        if receipt is None:
+            raise SyncError(
+                "pending terminal validation receipt is missing before control "
+                "retirement; manual recovery is required: "
+                f"{ticket.batch_root.name}"
+            )
+        authority = _parse_pending_terminal_validation_authority(
+            home,
+            ticket,
+            quarantine_root_identity,
+            receipt,
+        )
+        if (
+            authority is None
+            or authority.namespace_entries is None
+            or not authority.control_files
+            or ticket.terminal_namespace_sha256 is None
+            or ticket.pointer_retirement_authority is None
+            or ticket.pointer_retirement_path is None
+        ):
+            raise SyncError(
+                "pending terminal validation receipt lacks complete retirement "
+                "authority; manual recovery is required: "
+                f"{ticket.batch_root.name}"
+            )
+        if (
+            _pending_terminal_validation_namespace_anchor_digest_for_ticket(
+                ticket,
+                authority.namespace_entries,
+                authority.aliases,
+            )
+            != ticket.terminal_namespace_sha256
+        ):
+            raise SyncError(
+                "pending terminal validation namespace authority changed before "
+                "control retirement; manual recovery is required: "
+                f"{ticket.batch_root.name}"
+            )
+        return authority
+
+    canonical_receipt = _read_pending_cleanup_terminal_validation(
+        home,
+        ticket,
+        quarantine_root_identity,
+        receipt_path=receipt_path,
+        expected_link_count=None,
+    )
+    retired_receipt = _read_pending_cleanup_terminal_validation(
+        home,
+        ticket,
+        quarantine_root_identity,
+        receipt_path=retirement_path,
+        expected_link_count=None,
+    )
+    if canonical_receipt is None and retired_receipt is None:
+        raise SyncError(
+            "pending terminal validation receipt is missing before control "
+            "retirement; manual recovery is required: "
+            f"{ticket.batch_root.name}"
+        )
+    if canonical_receipt is not None and retired_receipt is None:
+        require_terminal_receipt_retirement_authority(
+            receipt_path,
+            expected_link_count=1,
+        )
+        index_fd = _open_directory_beneath(home, receipt_path.parent)
+        try:
+            try:
+                os.link(
+                    receipt_path.name,
+                    retirement_path.name,
+                    src_dir_fd=index_fd,
+                    dst_dir_fd=index_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                pass
+            os.fsync(index_fd)
+        finally:
+            _close_fd_quietly(index_fd)
+        canonical_receipt = _read_pending_cleanup_terminal_validation(
+            home,
+            ticket,
+            quarantine_root_identity,
+            receipt_path=receipt_path,
+            expected_link_count=2,
+        )
+        retired_receipt = _read_pending_cleanup_terminal_validation(
+            home,
+            ticket,
+            quarantine_root_identity,
+            receipt_path=retirement_path,
+            expected_link_count=2,
+        )
+    elif canonical_receipt is None:
+        require_terminal_receipt_retirement_authority(
+            retirement_path,
+            expected_link_count=1,
+        )
+    else:
+        if canonical_receipt.link_count != 2 or retired_receipt.link_count != 2:
+            raise SyncError(
+                "pending terminal validation retirement hard-link authority "
+                "changed; manual recovery is required: "
+                f"{ticket.batch_root.name}"
+            )
+        require_terminal_receipt_retirement_authority(
+            receipt_path,
+            expected_link_count=2,
+        )
+        require_terminal_receipt_retirement_authority(
+            retirement_path,
+            expected_link_count=2,
+        )
+    if canonical_receipt is not None and retired_receipt is not None:
+        if not _managed_state_snapshot_matches_file_evidence(
+            canonical_receipt,
+            retired_receipt,
+        ):
+            raise SyncError(
+                "pending terminal validation retirement receipt changed; manual "
+                "recovery is required: "
+                f"{ticket.batch_root.name}"
+            )
+
     def require_ticket_proof_and_final_group() -> None:
         _verify_final_regular_targets(home, ticket)
         require_current_v3_proof_and_final_group()
@@ -39314,13 +39503,26 @@ def _retire_terminal_regular_cleanup_controls(
         _index_fd: int,
     ) -> None:
         require_ticket_proof_and_final_group()
+        # The generic isolation helper invokes this callback before the
+        # canonical-to-tombstone rename and again while the retained tombstone
+        # is still open.  In both phases the tombstone and retirement marker
+        # intentionally share one inode; the marker drops to one link only
+        # after the helper unlinks that tombstone.
+        expected_retirement_link_count = 2
+        require_terminal_receipt_retirement_authority(
+            retirement_path,
+            expected_link_count=expected_retirement_link_count,
+        )
 
-    _delete_pending_cleanup_terminal_validation(
-        home,
-        ticket,
-        quarantine_root_identity,
-        mutation_revalidator=require_terminal_validation_boundary,
-    )
+    if canonical_receipt is not None:
+        _delete_pending_cleanup_terminal_validation(
+            home,
+            ticket,
+            quarantine_root_identity,
+            mutation_revalidator=require_terminal_validation_boundary,
+            receipt_path=receipt_path,
+            expected_link_count=2,
+        )
     _delete_pending_cleanup_ticket(
         home,
         ticket,
@@ -39328,7 +39530,20 @@ def _retire_terminal_regular_cleanup_controls(
         # descriptor after it has renamed the canonical pathname. The v2 proof
         # is re-read at both mutation boundaries because it becomes the only
         # durable target-group authority when that canonical name disappears.
-        boundary_revalidator=require_current_v3_proof_and_final_group,
+        boundary_revalidator=lambda: (
+            require_current_v3_proof_and_final_group(),
+            require_terminal_receipt_retirement_authority(
+                retirement_path,
+                expected_link_count=1,
+            ),
+        ),
+    )
+    _delete_pending_cleanup_terminal_validation(
+        home,
+        ticket,
+        quarantine_root_identity,
+        receipt_path=retirement_path,
+        expected_link_count=1,
     )
     _delete_pending_cleanup_empty_proof(
         home,
@@ -39507,6 +39722,20 @@ def _pending_cleanup_ticket_representation_batch_name(name: str) -> str | None:
     if marker_index <= 0:
         return None
     batch_name = candidate[:marker_index]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        return None
+    return batch_name
+
+
+def _pending_cleanup_terminal_validation_retirement_batch_name(
+    name: str,
+) -> str | None:
+    if not name.endswith(PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX):
+        return None
+    batch_name = name[: -len(PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX)]
     if (
         len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
         or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
@@ -39728,6 +39957,30 @@ def _require_no_pending_unresolved_ticket_representations(home: Path) -> None:
             overflow_message="private-use retirement scan exceeds the size limit",
         )
         for name in names:
+            retirement_batch_name = (
+                _pending_cleanup_terminal_validation_retirement_batch_name(name)
+            )
+            if retirement_batch_name is not None:
+                canonical_ticket = (
+                    retirement_batch_name + PENDING_CLEANUP_TICKET_SUFFIX
+                )
+                has_ticket = canonical_ticket in names or any(
+                    (
+                        retained := _pending_cleanup_retained_control_name(
+                            candidate
+                        )
+                    )
+                    is not None
+                    and retained[0] == canonical_ticket
+                    for candidate in names
+                )
+                if not has_ticket:
+                    raise SyncError(
+                        "pending terminal validation retirement phase must be "
+                        "reconciled before new mutation: "
+                        f"{retirement_batch_name}"
+                    )
+                continue
             unresolved_receipt = (
                 _pending_private_use_retirement_unresolved_representation(name)
             )

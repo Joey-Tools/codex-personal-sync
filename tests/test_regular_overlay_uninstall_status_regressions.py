@@ -532,6 +532,87 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertFalse(ticket.batch_root.exists())
         self.assertEqual(self.target.stat().st_nlink, 1)
 
+    def test_rootless_retirement_rejects_incomplete_terminal_receipt(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        with (
+            mock.patch.object(
+                MODULE,
+                "_retire_terminal_regular_cleanup_controls",
+                side_effect=SystemExit("injected before terminal retirement"),
+            ),
+            self.assertRaisesRegex(SystemExit, "before terminal retirement"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertFalse(ticket.batch_root.exists())
+        receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        proof_path = MODULE._pending_cleanup_empty_proof_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        quarantine_fd = MODULE._open_directory_beneath(
+            self.home,
+            ticket.batch_root.parent,
+        )
+        try:
+            quarantine_identity = MODULE._directory_identity(quarantine_fd)
+        finally:
+            MODULE._close_fd_quietly(quarantine_fd)
+        receipt_path.unlink()
+        MODULE._publish_atomic_exclusive_internal_file(
+            self.home,
+            receipt_path,
+            MODULE._pending_cleanup_terminal_validation_payload(
+                ticket,
+                quarantine_identity,
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "receipt lacks complete retirement authority; manual recovery is required",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(receipt_path.is_file())
+        self.assertTrue(proof_path.is_file())
+
+    def test_rootless_retirement_rejects_missing_terminal_receipt(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        with (
+            mock.patch.object(
+                MODULE,
+                "_retire_terminal_regular_cleanup_controls",
+                side_effect=SystemExit("injected before terminal retirement"),
+            ),
+            self.assertRaisesRegex(SystemExit, "before terminal retirement"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        proof_path = MODULE._pending_cleanup_empty_proof_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        receipt_path.unlink()
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "receipt is missing before control retirement; manual recovery is required",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertFalse(receipt_path.exists())
+        self.assertTrue(proof_path.is_file())
+
     def test_v8_terminal_validation_rejects_recreated_nonterminal_entry(self) -> None:
         ticket = self._deferred_terminal_ticket()
         with (
