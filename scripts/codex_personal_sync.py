@@ -4878,10 +4878,33 @@ class PendingTerminalValidationNamespaceEntry:
 
 
 @dataclass(frozen=True)
+class PendingTerminalValidationControlPath:
+    """One logical name in a receipt-bound control-file hard-link set."""
+
+    path: PurePosixPath
+    parent_identity: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class PendingTerminalValidationControlFile:
+    """Content, policy, and exact surviving names for one control inode."""
+
+    paths: tuple[PendingTerminalValidationControlPath, ...]
+    file_identity: tuple[int, int]
+    sha256: str
+    size: int
+    mode: int
+    uid: int
+    gid: int
+    link_count: int
+
+
+@dataclass(frozen=True)
 class PendingTerminalValidationAuthority:
     aliases: tuple[PendingTerminalValidationAlias, ...]
     directories: tuple[PendingTerminalValidationDirectory, ...]
     namespace_entries: tuple[PendingTerminalValidationNamespaceEntry, ...] | None = None
+    control_files: tuple[PendingTerminalValidationControlFile, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -5442,6 +5465,7 @@ class LegacyGenericCleanupValidation:
     metadata_gid: int
     pending_identity: tuple[int, int]
     entries: tuple[LegacyGenericCleanupEntryAuthority, ...]
+    control_files: tuple[PendingTerminalValidationControlFile, ...] = ()
 
 
 @dataclass
@@ -22364,6 +22388,15 @@ def _validate_pending_terminal_validation_receipt_capacity(
         ]
         for path in sorted(namespace_paths, key=PurePosixPath.as_posix)
     ]
+    projected_control = {
+        "file_identity": maximum_identity,
+        "sha256": _MAX_PENDING_DIGEST,
+        "size": MAX_MANAGED_STATE_BYTES,
+        "mode": 0o600,
+        "uid": _MAX_PENDING_IDENTITY[0],
+        "gid": _MAX_PENDING_IDENTITY[1],
+        "link_count": 2,
+    }
     _bounded_json_document(
         {
             "version": PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION,
@@ -22389,6 +22422,31 @@ def _validate_pending_terminal_validation_receipt_capacity(
                 for path in sorted(directory_paths, key=PurePosixPath.as_posix)
             ],
             "namespace_entries": projected_namespace_entries,
+            "control_files": [
+                {
+                    **projected_control,
+                    "paths": [
+                        {
+                            "path": PENDING_STATE_COMMIT_EVIDENCE.as_posix(),
+                            "parent_identity": maximum_identity,
+                        },
+                        {
+                            "path": PENDING_STATE_COMMIT_MARKER.as_posix(),
+                            "parent_identity": maximum_identity,
+                        },
+                    ],
+                },
+                {
+                    **projected_control,
+                    "link_count": 1,
+                    "paths": [
+                        {
+                            "path": PENDING_STATE_ROLLBACK_MARKER.as_posix(),
+                            "parent_identity": maximum_identity,
+                        },
+                    ],
+                },
+            ],
         },
         max_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
         overflow_error=(
@@ -24427,9 +24485,17 @@ def _parse_pending_link_batch_schema_envelope(
     if type(version) is not int:
         raise SyncError("pending transaction has unsupported fields or version")
     if version not in SUPPORTED_PENDING_LINK_METADATA_VERSIONS:
-        raise _PendingLinkMetadataSchemaIncompatible(
-            "pending transaction has unsupported fields or version"
-        )
+        batch_name = data.get("batch")
+        if (
+            version > 0
+            and isinstance(batch_name, str)
+            and len(batch_name) <= MAX_PENDING_LINK_BATCH_NAME_BYTES
+            and PENDING_LINK_BATCH_RE.fullmatch(batch_name) is not None
+        ):
+            raise _PendingLinkMetadataSchemaIncompatible(
+                "pending transaction has unsupported fields or version"
+            )
+        raise SyncError("pending transaction has unsupported fields or version")
     expected_top_level_fields = {
         "version",
         "batch",
@@ -32723,6 +32789,168 @@ def _pending_terminal_validation_namespace_anchor_entry_payload(
     return payload
 
 
+def _pending_terminal_validation_control_file_payload(
+    control: PendingTerminalValidationControlFile,
+) -> dict[str, object]:
+    return {
+        "paths": [
+            {
+                "path": path.path.as_posix(),
+                "parent_identity": _identity_payload(path.parent_identity),
+            }
+            for path in control.paths
+        ],
+        "file_identity": _identity_payload(control.file_identity),
+        "sha256": control.sha256,
+        "size": control.size,
+        "mode": control.mode,
+        "uid": control.uid,
+        "gid": control.gid,
+        "link_count": control.link_count,
+    }
+
+
+def _pending_terminal_validation_control_files_payload(
+    controls: tuple[PendingTerminalValidationControlFile, ...],
+) -> list[dict[str, object]]:
+    return [
+        _pending_terminal_validation_control_file_payload(control)
+        for control in controls
+    ]
+
+
+def _parse_pending_terminal_validation_control_files_payload(
+    ticket: PendingBatchCleanupTicket,
+    raw_controls: object,
+) -> tuple[PendingTerminalValidationControlFile, ...]:
+    if (
+        not isinstance(raw_controls, list)
+        or len(raw_controls) > MAX_PENDING_CLEANUP_ENTRIES
+    ):
+        raise SyncError(
+            "pending terminal validation control authority changed: "
+            f"{ticket.batch_root.name}"
+        )
+    controls: list[PendingTerminalValidationControlFile] = []
+    seen_paths: set[PurePosixPath] = set()
+    seen_identities: set[tuple[int, int]] = set()
+    for raw_control in raw_controls:
+        if not isinstance(raw_control, dict) or set(raw_control) != {
+            "paths",
+            "file_identity",
+            "sha256",
+            "size",
+            "mode",
+            "uid",
+            "gid",
+            "link_count",
+        }:
+            raise SyncError(
+                "pending terminal validation control authority changed: "
+                f"{ticket.batch_root.name}"
+            )
+        raw_paths = raw_control.get("paths")
+        if (
+            not isinstance(raw_paths, list)
+            or not raw_paths
+            or len(raw_paths) > MAX_PENDING_CLEANUP_ENTRIES
+        ):
+            raise SyncError(
+                "pending terminal validation control paths changed: "
+                f"{ticket.batch_root.name}"
+            )
+        paths: list[PendingTerminalValidationControlPath] = []
+        previous_path: str | None = None
+        for raw_path in raw_paths:
+            if not isinstance(raw_path, dict) or set(raw_path) != {
+                "path",
+                "parent_identity",
+            }:
+                raise SyncError(
+                    "pending terminal validation control path changed: "
+                    f"{ticket.batch_root.name}"
+                )
+            path = _validate_relative_path(
+                raw_path.get("path"),
+                "pending terminal validation control path",
+            )
+            path_text = path.as_posix()
+            if previous_path is not None and path_text <= previous_path:
+                raise SyncError(
+                    "pending terminal validation control path order changed: "
+                    f"{ticket.batch_root.name}"
+                )
+            previous_path = path_text
+            parent_identity = _parse_pending_identity(
+                raw_path.get("parent_identity"),
+                "pending terminal validation control parent identity",
+            )
+            if parent_identity is None:
+                raise SyncError(
+                    "pending terminal validation control parent changed: "
+                    f"{ticket.batch_root.name}"
+                )
+            if path in seen_paths:
+                raise SyncError(
+                    "pending terminal validation control path is duplicated: "
+                    f"{ticket.batch_root.name}"
+                )
+            seen_paths.add(path)
+            paths.append(
+                PendingTerminalValidationControlPath(
+                    path=path,
+                    parent_identity=parent_identity,
+                )
+            )
+        file_identity = _parse_pending_identity(
+            raw_control.get("file_identity"),
+            "pending terminal validation control identity",
+        )
+        sha256 = raw_control.get("sha256")
+        size = raw_control.get("size")
+        mode = raw_control.get("mode")
+        uid = raw_control.get("uid")
+        gid = raw_control.get("gid")
+        link_count = raw_control.get("link_count")
+        if (
+            file_identity is None
+            or file_identity in seen_identities
+            or not isinstance(sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+            or type(size) is not int
+            or size < 0
+            or size > MAX_MANAGED_STATE_BYTES
+            or mode != 0o600
+            or type(uid) is not int
+            or uid < 0
+            or type(gid) is not int
+            or gid < 0
+            or type(link_count) is not int
+            or link_count < 1
+            or link_count >= 2**64
+            or link_count != len(paths)
+        ):
+            raise SyncError(
+                "pending terminal validation control authority changed: "
+                f"{ticket.batch_root.name}"
+            )
+        seen_identities.add(file_identity)
+        controls.append(
+            PendingTerminalValidationControlFile(
+                paths=tuple(paths),
+                file_identity=file_identity,
+                sha256=sha256,
+                size=size,
+                mode=mode,
+                uid=uid,
+                gid=gid,
+                link_count=link_count,
+            )
+        )
+    controls.sort(key=lambda control: control.paths[0].path.as_posix())
+    return tuple(controls)
+
+
 def _parse_pending_terminal_validation_namespace_entries_payload(
     ticket: PendingBatchCleanupTicket,
     raw_entries: object,
@@ -33005,6 +33233,9 @@ def _legacy_generic_cleanup_validation_payload(
                 _legacy_generic_cleanup_entry_payload(entry)
                 for entry in validation.entries
             ],
+            "control_files": _pending_terminal_validation_control_files_payload(
+                validation.control_files
+            ),
         },
         max_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
         overflow_error="legacy generic cleanup validation exceeds the size limit",
@@ -33029,6 +33260,7 @@ def _parse_legacy_generic_cleanup_validation(
         "metadata",
         "pending_identity",
         "entries",
+        "control_files",
     }
     if (
         set(data) != expected_fields
@@ -33065,6 +33297,10 @@ def _parse_legacy_generic_cleanup_validation(
         ticket,
         data.get("entries"),
     )
+    control_files = _parse_pending_terminal_validation_control_files_payload(
+        ticket,
+        data.get("control_files"),
+    )
     metadata_sha256 = metadata.get("sha256")
     metadata_size = metadata.get("size")
     metadata_uid = metadata.get("uid")
@@ -33093,6 +33329,7 @@ def _parse_legacy_generic_cleanup_validation(
         metadata_gid=metadata_gid,
         pending_identity=pending_identity,
         entries=entries,
+        control_files=control_files,
     )
     by_path = {entry.path: entry for entry in entries}
     metadata_entry = by_path.get(PurePosixPath(PENDING_LINK_METADATA_NAME))
@@ -33185,8 +33422,11 @@ def _parse_pending_terminal_validation_authority(
     }
     legacy_v3_fields = legacy_v2_fields | {
         "terminal_regular_alias_directories",
+        "control_files",
     }
     current_v4_fields = legacy_v3_fields | {"namespace_entries"}
+    legacy_v3_fields_without_controls = legacy_v3_fields - {"control_files"}
+    current_v4_fields_without_controls = current_v4_fields - {"control_files"}
     if version not in {
         2,
         LEGACY_PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION,
@@ -33201,10 +33441,12 @@ def _parse_pending_terminal_validation_authority(
         )
     if (
         version == LEGACY_PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION
-        and set(data) != legacy_v3_fields
+        and set(data)
+        not in (legacy_v3_fields, legacy_v3_fields_without_controls)
     ) or (
         version == PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION
-        and set(data) != current_v4_fields
+        and set(data)
+        not in (current_v4_fields, current_v4_fields_without_controls)
     ):
         raise SyncError(
             f"pending cleanup terminal validation changed: {ticket.batch_root.name}"
@@ -33251,10 +33493,19 @@ def _parse_pending_terminal_validation_authority(
         if version == PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION
         else None
     )
+    control_files = (
+        _parse_pending_terminal_validation_control_files_payload(
+            ticket,
+            data.get("control_files"),
+        )
+        if "control_files" in data
+        else ()
+    )
     authority = PendingTerminalValidationAuthority(
         aliases=parsed_aliases,
         directories=parsed_directories,
         namespace_entries=namespace_entries,
+        control_files=control_files,
     )
     if receipt.payload != _pending_cleanup_terminal_validation_payload(
         ticket,
@@ -33262,6 +33513,7 @@ def _parse_pending_terminal_validation_authority(
         terminal_aliases=authority.aliases,
         terminal_directories=authority.directories,
         namespace_entries=authority.namespace_entries,
+        control_files=authority.control_files,
     ):
         raise SyncError(
             f"pending cleanup terminal validation changed: {ticket.batch_root.name}"
@@ -33468,6 +33720,15 @@ def _legacy_generic_cleanup_validation_from_current_state(
             != _directory_mount_identity(batch_fd)
         ):
             raise SyncError("legacy generic cleanup pending root changed")
+        control_files = _pending_terminal_validation_control_files_from_paths(
+            home,
+            bound_batch_root,
+            batch_fd,
+            _pending_terminal_validation_control_paths_for_ticket(
+                ticket,
+                include_metadata=False,
+            ),
+        )
         return LegacyGenericCleanupValidation(
             metadata_identity=metadata.file_identity,
             metadata_sha256=hashlib.sha256(metadata.payload).hexdigest(),
@@ -33477,6 +33738,7 @@ def _legacy_generic_cleanup_validation_from_current_state(
             metadata_gid=metadata.gid,
             pending_identity=_directory_identity(pending_fd),
             entries=(),
+            control_files=control_files,
         )
     except FileNotFoundError:
         # The historic compatibility path can complete without a canonical
@@ -33504,6 +33766,11 @@ def _require_legacy_generic_cleanup_validation_current_state(
     """
     if not validation.entries:
         raise SyncError("legacy generic cleanup receipt lacks namespace authority")
+    if not validation.control_files:
+        raise SyncError(
+            "legacy generic cleanup receipt lacks control authority; manual "
+            "recovery is required"
+        )
     if (
         _directory_identity(batch_fd) != ticket.batch_root_identity
         or not _bound_directory_matches(home, bound_batch_root, batch_fd)
@@ -33513,6 +33780,12 @@ def _require_legacy_generic_cleanup_validation_current_state(
         batch_fd,
         bound_batch_root,
         expected_mode=0o700,
+    )
+    _require_pending_terminal_validation_control_files(
+        home,
+        bound_batch_root,
+        batch_fd,
+        validation.control_files,
     )
     root_mount_identity = _directory_mount_identity(batch_fd)
     authority_by_path = {entry.path: entry for entry in validation.entries}
@@ -34299,10 +34572,7 @@ def _ensure_pending_terminal_validation_receipt(
             quarantine_root_identity,
             existing_receipt,
         )
-        if (
-            existing_authority is None
-            or existing_authority.namespace_entries is None
-        ):
+        if existing_authority is None or existing_authority.namespace_entries is None:
             raise SyncError(
                 "legacy terminal validation receipt lacks namespace authority; "
                 "manual recovery is required: "
@@ -34318,6 +34588,12 @@ def _ensure_pending_terminal_validation_receipt(
         if existing_digest != namespace_anchor_sha256:
             raise SyncError(
                 "pending terminal validation namespace authority changed: "
+                f"{ticket.batch_root.name}"
+            )
+        if not existing_authority.control_files:
+            raise SyncError(
+                "legacy terminal validation receipt lacks control authority; "
+                "manual recovery is required: "
                 f"{ticket.batch_root.name}"
             )
         return
@@ -34456,9 +34732,15 @@ def _ensure_pending_terminal_validation_receipt(
             ticket,
             quarantine_root_identity,
             terminal_aliases=terminal_aliases,
-            terminal_directories=terminal_directories,
-            namespace_entries=namespace_entries,
-        )
+                terminal_directories=terminal_directories,
+                namespace_entries=namespace_entries,
+                control_files=_pending_terminal_validation_control_files_from_paths(
+                    home,
+                    bound_batch_root,
+                    batch_fd,
+                    _pending_terminal_validation_control_paths_for_ticket(ticket),
+                ),
+            )
         return
     raise AssertionError("unreachable pending terminal ticket version")
 
@@ -34634,6 +34916,249 @@ def _validate_pending_terminal_alias_ledger(
             )
 
 
+def _pending_cleanup_logical_child_name(
+    directory_fd: int,
+    logical_name: str,
+    directory_identity: tuple[int, int],
+) -> str | None:
+    """Resolve a canonical or active-token child for one logical name."""
+    try:
+        os.stat(logical_name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise SyncError(
+            f"pending cleanup control parent is unreadable: {logical_name}"
+        ) from error
+    else:
+        return logical_name
+    candidates: list[str] = []
+    with os.scandir(directory_fd) as iterator:
+        for entry in iterator:
+            binding = _pending_cleanup_active_entry_binding(
+                entry.name,
+                directory_identity,
+            )
+            if binding is not None and binding[1] == logical_name:
+                candidates.append(entry.name)
+    if len(candidates) > 1:
+        raise SyncError(
+            "pending cleanup control has ambiguous active-token bindings: "
+            f"{logical_name}"
+        )
+    return candidates[0] if candidates else None
+
+
+def _read_pending_cleanup_logical_control_snapshot(
+    home: Path,
+    bound_batch_root: Path,
+    batch_fd: int,
+    logical_path: PurePosixPath,
+) -> ManagedStateFileSnapshot | None:
+    """Read a control file through canonical names or walker active tokens."""
+    parent_fd = os.dup(batch_fd)
+    physical_parent = bound_batch_root
+    try:
+        for component in logical_path.parent.parts:
+            directory_identity = _directory_identity(parent_fd)
+            physical_name = _pending_cleanup_logical_child_name(
+                parent_fd,
+                component,
+                directory_identity,
+            )
+            if physical_name is None:
+                return None
+            next_fd = os.open(
+                physical_name,
+                _directory_open_flags(nofollow=True),
+                dir_fd=parent_fd,
+            )
+            _close_fd_quietly(parent_fd)
+            parent_fd = next_fd
+            physical_parent = physical_parent / physical_name
+        directory_identity = _directory_identity(parent_fd)
+        physical_name = _pending_cleanup_logical_child_name(
+            parent_fd,
+            logical_path.name,
+            directory_identity,
+        )
+        if physical_name is None:
+            return None
+        physical_path = physical_parent / physical_name
+        snapshot = _read_managed_state_file_snapshot(
+            home,
+            physical_path,
+            parent_fd,
+            maximum_bytes=MAX_MANAGED_STATE_BYTES,
+        )
+        if snapshot.exists:
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                physical_path,
+                parent_fd,
+                snapshot,
+            )
+        return snapshot
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _pending_terminal_validation_control_files_from_paths(
+    home: Path,
+    bound_batch_root: Path,
+    batch_fd: int,
+    logical_paths: tuple[PurePosixPath, ...],
+) -> tuple[PendingTerminalValidationControlFile, ...]:
+    snapshots: list[tuple[PurePosixPath, ManagedStateFileSnapshot]] = []
+    for logical_path in sorted(set(logical_paths), key=PurePosixPath.as_posix):
+        snapshot = _read_pending_cleanup_logical_control_snapshot(
+            home,
+            bound_batch_root,
+            batch_fd,
+            logical_path,
+        )
+        if (
+            snapshot is None
+            or not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+            or snapshot.file_type != stat.S_IFREG
+            or snapshot.payload is None
+            or snapshot.file_identity is None
+            or snapshot.parent_identity is None
+            or snapshot.size is None
+            or snapshot.mode != 0o600
+            or snapshot.uid != os.geteuid()
+            or snapshot.gid is None
+            or snapshot.link_count is None
+            or snapshot.link_count < 1
+        ):
+            raise SyncError(
+                "pending terminal validation control is incomplete: "
+                f"{logical_path.as_posix()}"
+            )
+        snapshots.append((logical_path, snapshot))
+    grouped: dict[tuple[int, int], list[tuple[PurePosixPath, ManagedStateFileSnapshot]]] = {}
+    for logical_path, snapshot in snapshots:
+        assert snapshot.file_identity is not None
+        grouped.setdefault(snapshot.file_identity, []).append((logical_path, snapshot))
+    controls: list[PendingTerminalValidationControlFile] = []
+    for entries in grouped.values():
+        first = entries[0][1]
+        assert first.file_identity is not None
+        assert first.payload is not None
+        assert first.size is not None
+        assert first.mode is not None
+        assert first.uid is not None
+        assert first.gid is not None
+        assert first.link_count is not None
+        for _path, snapshot in entries[1:]:
+            if (
+                snapshot.payload != first.payload
+                or snapshot.size != first.size
+                or snapshot.mode != first.mode
+                or snapshot.uid != first.uid
+                or not _gid_matches_regular_file_access_policy(
+                    snapshot.gid,
+                    first.gid,
+                    first.mode,
+                )
+            ):
+                raise SyncError(
+                    "pending terminal validation namespace authority changed: "
+                    "control hard-link set changed"
+                )
+        if first.link_count != len(entries):
+            raise SyncError(
+                "pending terminal validation namespace authority changed: "
+                "control has an unauthorized hard-link alias: "
+                f"{entries[0][0].as_posix()} "
+                f"links={first.link_count!r}"
+            )
+        controls.append(
+            PendingTerminalValidationControlFile(
+                paths=tuple(
+                    PendingTerminalValidationControlPath(
+                        path=logical_path,
+                        parent_identity=snapshot.parent_identity,
+                    )
+                    for logical_path, snapshot in entries
+                ),
+                file_identity=first.file_identity,
+                sha256=hashlib.sha256(first.payload).hexdigest(),
+                size=first.size,
+                mode=first.mode,
+                uid=first.uid,
+                gid=first.gid,
+                link_count=first.link_count,
+            )
+        )
+    controls.sort(key=lambda control: control.paths[0].path.as_posix())
+    return tuple(controls)
+
+
+def _pending_terminal_validation_control_paths_for_ticket(
+    ticket: PendingBatchCleanupTicket,
+    *,
+    include_metadata: bool = False,
+) -> tuple[PurePosixPath, ...]:
+    paths: set[PurePosixPath] = {PENDING_STATE_COMMIT_EVIDENCE}
+    if ticket.marker_path is not None:
+        paths.add(ticket.marker_path)
+    if include_metadata:
+        paths.add(PurePosixPath(PENDING_LINK_METADATA_NAME))
+    return tuple(sorted(paths, key=PurePosixPath.as_posix))
+
+
+def _require_pending_terminal_validation_control_files(
+    home: Path,
+    bound_batch_root: Path,
+    batch_fd: int,
+    controls: tuple[PendingTerminalValidationControlFile, ...],
+) -> None:
+    """Revalidate control content and the exact remaining hard-link set."""
+    if not _bound_directory_matches(home, bound_batch_root, batch_fd):
+        raise SyncError("pending terminal validation batch root binding changed")
+    for control in controls:
+        present: list[ManagedStateFileSnapshot] = []
+        for path_authority in control.paths:
+            snapshot = _read_pending_cleanup_logical_control_snapshot(
+                home,
+                bound_batch_root,
+                batch_fd,
+                path_authority.path,
+            )
+            if snapshot is None:
+                continue
+            if (
+                snapshot.parent_identity != path_authority.parent_identity
+                or not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+                or snapshot.file_type != stat.S_IFREG
+                or snapshot.file_identity != control.file_identity
+                or snapshot.payload is None
+                or hashlib.sha256(snapshot.payload).hexdigest() != control.sha256
+                or snapshot.size != control.size
+                or snapshot.mode != control.mode
+                or snapshot.uid != control.uid
+                or snapshot.gid is None
+                or not _gid_matches_regular_file_access_policy(
+                    snapshot.gid,
+                    control.gid,
+                    control.mode,
+                )
+            ):
+                raise SyncError(
+                    "pending terminal validation namespace authority changed: "
+                    "receipt-bound entry changed: "
+                    f"{path_authority.path.as_posix()}"
+                )
+            present.append(snapshot)
+        if present and any(snapshot.link_count != len(present) for snapshot in present):
+            raise SyncError(
+                "pending terminal validation namespace authority changed: "
+                "control has an unauthorized hard-link alias: "
+                f"{control.paths[0].path.as_posix()}"
+            )
+
+
 def _pending_cleanup_terminal_validation_payload(
     ticket: PendingBatchCleanupTicket,
     quarantine_root_identity: tuple[int, int],
@@ -34643,6 +35168,7 @@ def _pending_cleanup_terminal_validation_payload(
     namespace_entries: (
         tuple[PendingTerminalValidationNamespaceEntry, ...] | None
     ) = None,
+    control_files: tuple[PendingTerminalValidationControlFile, ...] = (),
     legacy_generic_validation: LegacyGenericCleanupValidation | None = None,
 ) -> bytes:
     if ticket.snapshot.file_identity is None or ticket.snapshot.payload is None:
@@ -34652,6 +35178,7 @@ def _pending_cleanup_terminal_validation_payload(
             terminal_aliases is not None
             or terminal_directories is not None
             or namespace_entries is not None
+            or control_files
             or legacy_generic_validation is None
         ):
             raise SyncError("legacy generic cleanup validation lacks authority")
@@ -34698,6 +35225,10 @@ def _pending_cleanup_terminal_validation_payload(
                 _pending_terminal_validation_namespace_entry_payload(entry)
                 for entry in namespace_entries
             ]
+        if control_files:
+            payload["control_files"] = _pending_terminal_validation_control_files_payload(
+                control_files
+            )
         return _bounded_json_document(
             payload,
             max_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
@@ -34804,6 +35335,7 @@ def _publish_pending_cleanup_terminal_validation(
     namespace_entries: (
         tuple[PendingTerminalValidationNamespaceEntry, ...] | None
     ) = None,
+    control_files: tuple[PendingTerminalValidationControlFile, ...] = (),
     legacy_generic_validation: LegacyGenericCleanupValidation | None = None,
 ) -> ManagedStateFileSnapshot:
     if ticket.version in {1, 2}:
@@ -34812,6 +35344,7 @@ def _publish_pending_cleanup_terminal_validation(
             or terminal_aliases is not None
             or terminal_directories is not None
             or namespace_entries is not None
+            or control_files
         ):
             raise SyncError("legacy generic cleanup validation lacks authority")
     elif legacy_generic_validation is not None:
@@ -34834,6 +35367,7 @@ def _publish_pending_cleanup_terminal_validation(
         terminal_aliases is not None
         or terminal_directories is not None
         or namespace_entries is not None
+        or control_files
     ):
         raise SyncError(
             "pending terminal alias receipt has unsupported ticket authority"
@@ -34847,7 +35381,7 @@ def _publish_pending_cleanup_terminal_validation(
         if ticket.version in {
             LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
             PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
-        }:
+        } and ticket.terminal_regular_targets:
             existing_authority = _parse_pending_terminal_validation_authority(
                 home,
                 ticket,
@@ -34858,6 +35392,7 @@ def _publish_pending_cleanup_terminal_validation(
                 aliases=terminal_aliases,
                 directories=terminal_directories,
                 namespace_entries=namespace_entries,
+                control_files=control_files,
             )
             if existing_authority != expected_authority:
                 raise SyncError(
@@ -34878,6 +35413,7 @@ def _publish_pending_cleanup_terminal_validation(
             terminal_aliases=terminal_aliases,
             terminal_directories=terminal_directories,
             namespace_entries=namespace_entries,
+            control_files=control_files,
             legacy_generic_validation=legacy_generic_validation,
         ),
     )
@@ -34908,6 +35444,7 @@ def _publish_pending_cleanup_terminal_validation(
             aliases=terminal_aliases,
             directories=terminal_directories,
             namespace_entries=namespace_entries,
+            control_files=control_files,
         )
     ):
         raise SyncError(
@@ -37928,7 +38465,7 @@ def _remove_cleanup_ready_batch(
         if ticket.version in {
             LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
             PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
-        }:
+        } and ticket.terminal_regular_targets:
             if (
                 _read_pending_cleanup_terminal_validation(
                     home,
@@ -37991,7 +38528,7 @@ def _remove_cleanup_ready_batch(
         if ticket.version in {
             LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
             PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
-        }:
+        } and ticket.terminal_regular_targets:
             receipt = _read_pending_cleanup_terminal_validation(
                 home,
                 ticket,
@@ -38058,6 +38595,12 @@ def _remove_cleanup_ready_batch(
                     "authority; manual recovery is required: "
                     f"{ticket.batch_root.name}"
                 )
+            if not terminal_authority.control_files:
+                raise SyncError(
+                    "legacy terminal validation receipt lacks control authority; "
+                    "manual recovery is required: "
+                    f"{ticket.batch_root.name}"
+                )
             _validate_pending_terminal_alias_ledger(
                 home,
                 ticket,
@@ -38117,6 +38660,12 @@ def _remove_cleanup_ready_batch(
                 # The ticket itself is the outer authority for the receipt;
                 # revalidate it before reading any other mutable cleanup state.
                 _require_pending_cleanup_ticket_unchanged(home, ticket)
+                _require_pending_terminal_validation_control_files(
+                    home,
+                    bound_batch_root,
+                    batch_fd,
+                    terminal_authority.control_files,
+                )
                 current_receipt = _read_pending_cleanup_terminal_validation(
                     home,
                     ticket,
@@ -38205,6 +38754,12 @@ def _remove_cleanup_ready_batch(
                     current_authority.directories,
                     require_complete_aliases=False,
                     namespace_entries=current_authority.namespace_entries,
+                )
+                _require_pending_terminal_validation_control_files(
+                    home,
+                    bound_batch_root,
+                    batch_fd,
+                    current_authority.control_files,
                 )
 
             mutation_revalidator = revalidate_terminal_alias_boundary

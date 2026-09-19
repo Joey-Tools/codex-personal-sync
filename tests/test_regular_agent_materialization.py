@@ -3058,6 +3058,49 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                 ):
                     MODULE._require_no_pending_terminal_mutation_authority(self.home)
 
+    def test_legacy_generic_receipt_rejects_commit_evidence_external_hardlink(
+        self,
+    ) -> None:
+        for phase in ("after", "before"):
+            with self.subTest(phase=phase):
+                self.home = self.root / f"home-generic-evidence-hardlink-{phase}"
+                ticket = (
+                    self._prepare_pointerless_generic_v1_ticket(
+                        f"generic-evidence-hardlink-{phase}-release"
+                    )
+                    if phase == "after"
+                    else self._prepare_pointerless_generic_v2_ticket(
+                        f"generic-evidence-hardlink-{phase}-release"
+                    )
+                )
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_remove_pending_batch_directory_contents",
+                        side_effect=SystemExit("injected crash after receipt"),
+                    ),
+                    self.assertRaisesRegex(SystemExit, "after receipt"),
+                ):
+                    MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+                evidence = ticket.batch_root / Path(
+                    *MODULE.PENDING_STATE_COMMIT_EVIDENCE.parts
+                )
+                foreign = self.root / f"foreign-commit-evidence-{phase}"
+                os.link(evidence, foreign)
+                with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                    self.assertEqual(
+                        MODULE._cleanup_ready_pending_batches(self.home),
+                        0,
+                    )
+                self.assertIn(
+                    "pending terminal validation namespace authority changed",
+                    stdout.getvalue(),
+                )
+                self.assertTrue(ticket.path.is_file())
+                self.assertTrue(ticket.batch_root.is_dir())
+                self.assertTrue(foreign.is_file())
+
     def test_legacy_generic_marker_replacement_before_receipt_is_retained(
         self,
     ) -> None:
@@ -3732,6 +3775,12 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
             ("string-version", b'{"version":"11"}'),
             ("float-version", b'{"version":11.0}'),
             ("supported-missing-fields", b'{"version":11}'),
+            ("unsupported-missing-batch", b'{"version":12}'),
+            ("unsupported-null-batch", b'{"version":12,"batch":null}'),
+            (
+                "nonpositive-version",
+                b'{"version":0,"batch":"20260919T000000Z-1-1"}',
+            ),
         )
         for ticket_version in (1, 2):
             for payload_name, malformed_payload in malformed_payloads:

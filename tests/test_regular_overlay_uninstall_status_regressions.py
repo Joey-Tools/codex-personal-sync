@@ -560,6 +560,60 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertTrue(ticket.batch_root.is_dir())
         self.assertEqual(nonterminal.read_text(encoding="utf-8"), "foreign replacement\n")
 
+    def test_v8_terminal_validation_rejects_same_inode_marker_rewrite(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=SystemExit("injected crash after receipt"),
+            ),
+            self.assertRaisesRegex(SystemExit, "after receipt"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        marker = ticket.batch_root / Path(*MODULE.PENDING_STATE_COMMIT_MARKER.parts)
+        original = marker.read_bytes()
+        with marker.open("r+b") as stream:
+            stream.seek(0)
+            stream.write(bytes([original[0] ^ 1]) + original[1:])
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal validation namespace authority changed",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_v8_terminal_validation_rejects_external_marker_hardlink(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=SystemExit("injected crash after receipt"),
+            ),
+            self.assertRaisesRegex(SystemExit, "after receipt"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        marker = ticket.batch_root / Path(*MODULE.PENDING_STATE_COMMIT_MARKER.parts)
+        foreign = self.root / "foreign-finalization-marker"
+        os.link(marker, foreign)
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal validation namespace authority changed",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertTrue(foreign.is_file())
+
     def test_v8_terminal_validation_rejects_self_consistent_forged_namespace(
         self,
     ) -> None:
