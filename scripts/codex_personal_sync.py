@@ -4921,6 +4921,15 @@ class PendingTerminalFileExpectation:
 
 
 @dataclass(frozen=True)
+class PendingTerminalCommitEvidenceAuthority:
+    """Ticket-bound authority for the transaction commit-evidence inode."""
+
+    path: PurePosixPath
+    parent_identity: tuple[int, int]
+    file: PendingTerminalFileExpectation
+
+
+@dataclass(frozen=True)
 class PendingTerminalPointerRetirementAuthority:
     """Bind the retired pointer to its transaction metadata before it moves."""
 
@@ -4961,6 +4970,7 @@ class PendingBatchCleanupTicket:
     marker_sha256: str | None
     terminal_regular_targets: tuple[PendingRegularTargetExpectation, ...] = ()
     terminal_namespace_sha256: str | None = None
+    commit_evidence: PendingTerminalCommitEvidenceAuthority | None = None
     pointer_retirement_path: PurePosixPath | None = None
     pointer_retirement_authority: PendingTerminalPointerRetirementAuthority | None = None
     kind: str | None = None
@@ -12435,6 +12445,7 @@ def _pending_cleanup_ticket_matches(
         and actual.marker_sha256 == expected.marker_sha256
         and actual.terminal_regular_targets == expected.terminal_regular_targets
         and actual.terminal_namespace_sha256 == expected.terminal_namespace_sha256
+        and actual.commit_evidence == expected.commit_evidence
         and actual.pointer_retirement_path == expected.pointer_retirement_path
         and actual.pointer_retirement_authority
         == expected.pointer_retirement_authority
@@ -16733,6 +16744,13 @@ def _terminal_regular_state_items(
         if not _record_materializes_regular_file(state_record):
             continue
         pending_record = records_by_target.get(target)
+        if phase == "after" and pending_record is not None and not pending_record.is_regular():
+            # The state schema retains the manifest kind independently from
+            # the transaction's chosen materialization.  A historic writer
+            # may deliberately publish a symlink for a regular-agent target;
+            # that transaction must not be retroactively classified as a
+            # regular terminal group merely because its state kind is file.
+            continue
         if phase == "before" and pending_record is not None:
             if (
                 pending_record.action
@@ -21257,7 +21275,19 @@ def _pending_state_claim_semantics(
     state: ManagedState,
     *,
     metadata_version: int,
+    pending_records: tuple[PendingLinkRecord, ...] | None = None,
+    phase: str | None = None,
 ) -> list[tuple[str, PurePosixPath, str, PurePosixPath | None, str, str, str]]:
+    if pending_records is not None and phase not in {"before", "after"}:
+        raise SyncError("pending claim materialization phase is invalid")
+    records_by_target = (
+        {
+            (record.scope, record.target): record
+            for record in pending_records
+        }
+        if pending_records is not None
+        else {}
+    )
     claims: list[
         tuple[str, PurePosixPath, str, PurePosixPath | None, str, str, str]
     ] = []
@@ -21275,7 +21305,19 @@ def _pending_state_claim_semantics(
             )
         )
     for record in state.links.values():
-        if metadata_version >= 6 and _record_materializes_regular_file(record):
+        pending_record = records_by_target.get(("managed", record.target))
+        regular_materialization = (
+            pending_record.before_is_regular()
+            if phase == "before" and pending_record is not None
+            else pending_record.is_regular()
+            if phase == "after" and pending_record is not None
+            else True
+        )
+        if (
+            metadata_version >= 6
+            and _record_materializes_regular_file(record)
+            and regular_materialization
+        ):
             # Regular-file preimages are carried by the action record's exact
             # before evidence. Since pending metadata v6, they intentionally do
             # not masquerade as symlink claims. Legacy v4/v5 metadata still
@@ -21454,6 +21496,8 @@ def _stage_pending_link_claims(
         home,
         state,
         metadata_version=PENDING_LINK_METADATA_VERSION,
+        pending_records=records,
+        phase=phase,
     ):
         (
             scope,
@@ -24099,6 +24143,7 @@ def _parse_pending_link_claims(
     state: ManagedState,
     *,
     metadata_version: int,
+    pending_records: tuple[PendingLinkRecord, ...] | None = None,
     omitted_keys: set[tuple[str, PurePosixPath]] | None = None,
 ) -> tuple[PendingLinkClaim, ...]:
     if phase not in {"before", "after"}:
@@ -24110,6 +24155,8 @@ def _parse_pending_link_claims(
         home,
         state,
         metadata_version=metadata_version,
+        pending_records=pending_records,
+        phase=phase,
     )
     semantic_keys = {(semantic[0], semantic[1]) for semantic in all_semantics}
     if not omitted_keys.issubset(semantic_keys):
@@ -25286,6 +25333,8 @@ def _parse_pending_link_batch(
             home,
             state_before_value,
             metadata_version=version,
+            pending_records=tuple(records),
+            phase="before",
         )
     }
     state_claimed_absences = {
@@ -25306,6 +25355,7 @@ def _parse_pending_link_batch(
         data.get("claims_before"),
         state_before_value,
         metadata_version=version,
+        pending_records=tuple(records),
         omitted_keys=state_claimed_absences,
     )
     claims_after = _parse_pending_link_claims(
@@ -25315,6 +25365,7 @@ def _parse_pending_link_batch(
         data.get("claims_after"),
         state_after_value,
         metadata_version=version,
+        pending_records=tuple(records),
     )
     before_claims_by_target = {
         (claim.scope, claim.target): claim for claim in claims_before
@@ -25608,6 +25659,27 @@ def _pending_commit_marker_snapshot(
                 "pending transaction commit marker is not the exact evidence inode"
             )
         return marker
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _pending_commit_evidence_snapshot(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> ManagedStateFileSnapshot:
+    """Read live commit evidence while retaining the staged immutable binding."""
+    evidence_path = batch.batch_root / Path(*batch.commit_evidence_path.parts)
+    parent_fd = _open_directory_beneath(home, evidence_path.parent)
+    try:
+        evidence = _read_managed_state_file_snapshot(
+            home,
+            evidence_path,
+            parent_fd,
+            expected_identity=batch.commit_evidence.file_identity,
+        )
+        if not _pending_commit_snapshot_matches(evidence, batch.commit_evidence):
+            raise SyncError("pending transaction commit evidence changed")
+        return evidence
     finally:
         _close_fd_quietly(parent_fd)
 
@@ -28237,6 +28309,16 @@ def _pending_terminal_file_expectation_payload(
     }
 
 
+def _pending_terminal_commit_evidence_authority_payload(
+    authority: PendingTerminalCommitEvidenceAuthority,
+) -> dict[str, object]:
+    return {
+        "path": authority.path.as_posix(),
+        "parent_identity": _identity_payload(authority.parent_identity),
+        "file": _pending_terminal_file_expectation_payload(authority.file),
+    }
+
+
 def _pending_terminal_pointer_retirement_authority(
     home: Path,
     batch: PendingLinkBatch,
@@ -28409,6 +28491,22 @@ def _pending_terminal_cleanup_ticket_payload(
         }
         else None
     )
+    commit_evidence_authority = None
+    if ticket_version in {
+        LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+    }:
+        commit_evidence_snapshot = _pending_commit_evidence_snapshot(home, batch)
+        if commit_evidence_snapshot.parent_identity is None:
+            raise SyncError("pending terminal commit evidence parent is missing")
+        commit_evidence_authority = PendingTerminalCommitEvidenceAuthority(
+            path=PENDING_STATE_COMMIT_EVIDENCE,
+            parent_identity=commit_evidence_snapshot.parent_identity,
+            file=_pending_terminal_file_expectation_from_snapshot(
+                commit_evidence_snapshot,
+                "commit-evidence",
+            ),
+        )
     if terminal_namespace_sha256 is not None and (
         ticket_version
         not in {
@@ -28452,6 +28550,12 @@ def _pending_terminal_cleanup_ticket_payload(
         },
         "terminal_regular_targets": target_payloads,
     }
+    if commit_evidence_authority is not None:
+        payload["commit_evidence"] = (
+            _pending_terminal_commit_evidence_authority_payload(
+                commit_evidence_authority
+            )
+        )
     if terminal_namespace_sha256 is not None:
         payload["terminal_namespace_sha256"] = terminal_namespace_sha256
     if ticket_version in {
@@ -28901,41 +29005,24 @@ def _read_pending_cleanup_ticket(
             LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
             PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
         }:
-            allowed_top_level_fields = {
-                frozenset(expected_top_level_fields),
-                frozenset((*expected_top_level_fields, "terminal_namespace_sha256")),
-                frozenset((*expected_top_level_fields, "pointer_retirement_path")),
-                frozenset((*expected_top_level_fields, "pointer_retirement")),
-                frozenset(
-                    (
-                        *expected_top_level_fields,
-                        "terminal_namespace_sha256",
-                        "pointer_retirement_path",
-                    )
-                ),
-                frozenset(
-                    (
-                        *expected_top_level_fields,
-                        "terminal_namespace_sha256",
-                        "pointer_retirement",
-                    )
-                ),
-                frozenset(
-                    (
-                        *expected_top_level_fields,
-                        "pointer_retirement_path",
-                        "pointer_retirement",
-                    )
-                ),
-                frozenset(
-                    (
-                        *expected_top_level_fields,
-                        "terminal_namespace_sha256",
-                        "pointer_retirement_path",
-                        "pointer_retirement",
-                    )
-                ),
-            }
+            optional_terminal_fields = (
+                "terminal_namespace_sha256",
+                "pointer_retirement_path",
+                "pointer_retirement",
+            )
+            allowed_top_level_fields = set()
+            for mask in range(1 << len(optional_terminal_fields)):
+                fields = frozenset(
+                    field
+                    for index, field in enumerate(optional_terminal_fields)
+                    if mask & (1 << index)
+                )
+                allowed_top_level_fields.add(
+                    frozenset(expected_top_level_fields) | fields
+                )
+                allowed_top_level_fields.add(
+                    frozenset(expected_top_level_fields) | fields | {"commit_evidence"}
+                )
             if frozenset(data) not in allowed_top_level_fields:
                 raise SyncError(
                     f"pending cleanup ticket has unsupported fields: {batch_name}"
@@ -29326,6 +29413,42 @@ def _read_pending_cleanup_ticket(
             raise SyncError(
                 f"pending cleanup finalization marker digest changed: {batch_name}"
             )
+        commit_evidence_authority = None
+        if version in {
+            LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+            PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        } and "commit_evidence" in data:
+            raw_commit_evidence = data.get("commit_evidence")
+            if (
+                not isinstance(raw_commit_evidence, dict)
+                or set(raw_commit_evidence) != {"path", "parent_identity", "file"}
+                or raw_commit_evidence.get("path")
+                != PENDING_STATE_COMMIT_EVIDENCE.as_posix()
+            ):
+                raise SyncError(
+                    f"pending terminal commit evidence authority changed: {batch_name}"
+                )
+            commit_evidence_parent_identity = _parse_pending_identity(
+                raw_commit_evidence.get("parent_identity"),
+                "pending terminal commit evidence parent identity",
+            )
+            commit_evidence_file = _parse_pending_terminal_file_expectation(
+                raw_commit_evidence.get("file"),
+                batch_name=batch_name,
+                label="commit evidence",
+            )
+            if (
+                commit_evidence_parent_identity is None
+                or commit_evidence_parent_identity != marker_parent_identity
+            ):
+                raise SyncError(
+                    f"pending terminal commit evidence parent changed: {batch_name}"
+                )
+            commit_evidence_authority = PendingTerminalCommitEvidenceAuthority(
+                path=PENDING_STATE_COMMIT_EVIDENCE,
+                parent_identity=commit_evidence_parent_identity,
+                file=commit_evidence_file,
+            )
         terminal_regular_targets = (
             _parse_pending_terminal_regular_targets(
                 data.get("terminal_regular_targets"),
@@ -29381,6 +29504,12 @@ def _read_pending_cleanup_ticket(
                     )
                     for target in terminal_regular_targets
                 ]
+                if commit_evidence_authority is not None:
+                    payload_data["commit_evidence"] = (
+                        _pending_terminal_commit_evidence_authority_payload(
+                            commit_evidence_authority
+                        )
+                    )
             if version in {
                 LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
                 PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
@@ -29448,6 +29577,7 @@ def _read_pending_cleanup_ticket(
                 }
                 else None
             ),
+            commit_evidence=commit_evidence_authority,
             pointer_retirement_path=(
                 pointer_retirement_path
                 if version
@@ -32955,7 +33085,14 @@ def _require_pending_terminal_validation_control_set(
     ticket: PendingBatchCleanupTicket,
     controls: tuple[PendingTerminalValidationControlFile, ...],
 ) -> None:
-    """Require receipt controls to close over the ticket's evidence and marker."""
+    """Require receipt controls to close over ticket-bound evidence and marker.
+
+    The commit marker is a hard link to ``commit-evidence``. Keep those two
+    logical names in the same receipt control set and require the marker's
+    ticket-bound identity/content to cover both names. Otherwise a replaced
+    evidence name could be sampled as fresh authority immediately before the
+    first receipt is published while the original marker remains unchanged.
+    """
     if not controls:
         return
     expected_paths = set(_pending_terminal_validation_control_paths_for_ticket(ticket))
@@ -32999,6 +33136,75 @@ def _require_pending_terminal_validation_control_set(
             "pending terminal validation marker authority changed: "
             f"{ticket.batch_root.name}"
         )
+    evidence_path = PurePosixPath(PENDING_STATE_COMMIT_EVIDENCE)
+    evidence_controls = [
+        control
+        for control in controls
+        if any(path.path == evidence_path for path in control.paths)
+    ]
+    if ticket.commit_evidence is None:
+        # v1/v2 generic receipts and historic v4/v8 tickets predate the
+        # ticket-bound evidence field.  Preserve their established receipt
+        # protocol; for an old commit-phase ticket the existing hard-link
+        # control relation still closes the evidence/marker names.  New
+        # tickets always carry the field and take the strict path below.
+        if (
+            ticket.version in {
+                LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+                PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+            }
+            and ticket.marker_path == PENDING_STATE_COMMIT_MARKER
+            and (len(evidence_controls) != 1 or evidence_controls[0] != marker_control)
+        ):
+            raise SyncError(
+                "pending terminal validation commit evidence and marker authority "
+                "are split: "
+                f"{ticket.batch_root.name}"
+            )
+        return
+    if len(evidence_controls) != 1:
+        raise SyncError(
+            "pending terminal validation commit evidence authority is incomplete: "
+            f"{ticket.batch_root.name}"
+        )
+    evidence_control = evidence_controls[0]
+    evidence_path_authority = next(
+        path for path in evidence_control.paths if path.path == evidence_path
+    )
+    if (
+        ticket.marker_path == PENDING_STATE_COMMIT_MARKER
+        and evidence_control != marker_control
+    ):
+        raise SyncError(
+            "pending terminal validation commit evidence and marker authority "
+            "are split: "
+            f"{ticket.batch_root.name}"
+        )
+    expected_evidence = ticket.commit_evidence
+    if (
+        evidence_path_authority.parent_identity != expected_evidence.parent_identity
+        or evidence_control.file_identity != expected_evidence.file.file_identity
+        or evidence_control.sha256 != expected_evidence.file.sha256
+        or evidence_control.size != expected_evidence.file.size
+        or evidence_control.mode != expected_evidence.file.mode
+        or evidence_control.uid != expected_evidence.file.uid
+        or not _gid_matches_regular_file_access_policy(
+            evidence_control.gid,
+            expected_evidence.file.gid,
+            expected_evidence.file.mode,
+        )
+        or evidence_control.link_count != expected_evidence.file.link_count
+    ):
+        raise SyncError(
+            "pending terminal validation commit evidence authority changed: "
+            f"{ticket.batch_root.name}"
+        )
+    if ticket.marker_path == PENDING_STATE_COMMIT_MARKER:
+        if evidence_path_authority.parent_identity != ticket.marker_parent_identity:
+            raise SyncError(
+                "pending terminal validation commit evidence parent authority "
+                f"changed: {ticket.batch_root.name}"
+            )
 
 
 def _parse_pending_terminal_validation_namespace_entries_payload(
@@ -38632,6 +38838,12 @@ def _remove_cleanup_ready_batch(
                     terminal_aliases=terminal_aliases,
                     terminal_directories=terminal_directories,
                     namespace_entries=namespace_entries,
+                    control_files=_pending_terminal_validation_control_files_from_paths(
+                        home,
+                        bound_batch_root,
+                        batch_fd,
+                        _pending_terminal_validation_control_paths_for_ticket(ticket),
+                    ),
                 )
                 receipt = _read_pending_cleanup_terminal_validation(
                     home,

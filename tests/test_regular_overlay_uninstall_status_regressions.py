@@ -614,6 +614,25 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertTrue(ticket.batch_root.is_dir())
         self.assertTrue(foreign.is_file())
 
+    def test_v8_terminal_validation_rejects_replaced_commit_evidence_before_receipt(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        evidence = ticket.batch_root / Path(*MODULE.PENDING_STATE_COMMIT_EVIDENCE.parts)
+        evidence.unlink()
+        evidence.write_bytes(b"foreign commit evidence\n")
+        evidence.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "commit evidence and marker authority are split",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertEqual(evidence.read_bytes(), b"foreign commit evidence\n")
+
     def test_v8_terminal_validation_rejects_self_consistent_forged_namespace(
         self,
     ) -> None:
