@@ -594,6 +594,10 @@ class _LegacyGenericCleanupForeignBatch(SyncError):
     pass
 
 
+class _PendingLinkMetadataSchemaIncompatible(SyncError):
+    """A valid metadata object uses a schema this binary cannot parse."""
+
+
 class _PrivateControlRecoveryInitialAbsence(SyncError):
     pass
 
@@ -24424,7 +24428,9 @@ def _parse_pending_link_batch_schema_envelope(
         type(version) is not int
         or version not in SUPPORTED_PENDING_LINK_METADATA_VERSIONS
     ):
-        raise SyncError("pending transaction has unsupported fields or version")
+        raise _PendingLinkMetadataSchemaIncompatible(
+            "pending transaction has unsupported fields or version"
+        )
     expected_top_level_fields = {
         "version",
         "batch",
@@ -24444,7 +24450,9 @@ def _parse_pending_link_batch_schema_envelope(
             {"terminal_regular_before", "terminal_regular_after"}
         )
     if set(data) != expected_top_level_fields:
-        raise SyncError("pending transaction has unsupported fields or version")
+        raise _PendingLinkMetadataSchemaIncompatible(
+            "pending transaction has unsupported fields or version"
+        )
     batch_name = data.get("batch")
     if (
         not isinstance(batch_name, str)
@@ -37486,9 +37494,10 @@ def _require_legacy_generic_cleanup_ticket_is_nonterminal(
         data, _metadata_version, metadata_batch_name = (
             _parse_pending_link_batch_schema_envelope(home, metadata.payload)
         )
-    except SyncError:
-        # Captured bytes rejected without any mutable filesystem observation.
-        # This is the sole compatible generic-cleanup case.
+    except _PendingLinkMetadataSchemaIncompatible:
+        # A valid object with an explicitly unsupported envelope is the sole
+        # compatible generic-cleanup case. Decode failures, non-object JSON,
+        # invalid bindings, and other malformed bytes require recovery.
         return None
     if metadata_batch_name != ticket.batch_root.name:
         raise manual_recovery_error("metadata batch binding changed")

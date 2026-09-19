@@ -23,7 +23,7 @@
     "engine": {
       "mode": "0755",
       "path": "scripts/codex_personal_sync.py",
-      "sha256": "600ff408a80f0fac525c7e186807d2467437d98d476774d45137e5e59751a343"
+      "sha256": "14d3fcc36ec8e893cd3ec193649d9e0045a745d9d144ef92fda7a5e2ced5dcb7"
     },
     "engine_tests": {
       "mode": "0644",
@@ -58,7 +58,7 @@
     "regular_agent_materialization_tests": {
       "mode": "0644",
       "path": "tests/test_regular_agent_materialization.py",
-      "sha256": "49c7f8b802db4b851b9ab2a52e4e5513becb1a4059cac02e5de0bba5a726ed0c"
+      "sha256": "98470d5d26d29dc88f3f9db6ecc7f28a8d682141b6121ee405c5dadbcde4d2a0"
     },
     "regular_overlay_uninstall_status_regressions_tests": {
       "mode": "0644",

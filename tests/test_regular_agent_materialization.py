@@ -3721,6 +3721,30 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self.assertFalse(ticket.path.exists())
         self.assertFalse(ticket.batch_root.exists())
 
+    def test_pointerless_generic_malformed_metadata_requires_manual_recovery(
+        self,
+    ) -> None:
+        for ticket_version, release_name in (
+            (1, "pointerless-generic-malformed-v1-release"),
+            (2, "pointerless-generic-malformed-v2-release"),
+        ):
+            with self.subTest(ticket_version=ticket_version):
+                self.home = self.root / f"home-pointerless-generic-malformed-v{ticket_version}"
+                ticket = (
+                    self._prepare_pointerless_generic_v1_ticket(release_name)
+                    if ticket_version == 1
+                    else self._prepare_pointerless_generic_v2_ticket(release_name)
+                )
+                metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+                metadata_path.write_bytes(b'{"version":')
+                metadata_path.chmod(0o600)
+
+                self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
+
+                self.assertTrue(ticket.path.is_file())
+                self.assertTrue(ticket.batch_root.is_dir())
+                self.assertEqual(metadata_path.read_bytes(), b'{"version":')
+
     def test_pointerless_generic_missing_metadata_keeps_compatible_cleanup(
         self,
     ) -> None:
