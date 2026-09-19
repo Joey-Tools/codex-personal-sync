@@ -704,6 +704,181 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             "forged namespace object\n",
         )
 
+    def test_v8_terminal_validation_rejects_incomplete_forged_control_set(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=SystemExit("injected crash after receipt"),
+            ),
+            self.assertRaisesRegex(SystemExit, "after receipt"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        quarantine_root = ticket.batch_root.parent
+        quarantine_identity = (
+            quarantine_root.stat().st_dev,
+            quarantine_root.stat().st_ino,
+        )
+        receipt = MODULE._read_pending_cleanup_terminal_validation(
+            self.home,
+            ticket,
+            quarantine_identity,
+        )
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        authority = MODULE._parse_pending_terminal_validation_authority(
+            self.home,
+            ticket,
+            quarantine_identity,
+            receipt,
+        )
+        self.assertIsNotNone(authority)
+        assert authority is not None
+        forged_controls = tuple(
+            MODULE.replace(
+                control,
+                paths=tuple(
+                    path for path in control.paths if path.path != ticket.marker_path
+                ),
+                link_count=sum(
+                    path.path != ticket.marker_path for path in control.paths
+                ),
+            )
+            for control in authority.control_files
+            if any(path.path != ticket.marker_path for path in control.paths)
+        )
+        self.assertTrue(forged_controls)
+        receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        receipt_path.unlink()
+        MODULE._publish_atomic_exclusive_internal_file(
+            self.home,
+            receipt_path,
+            MODULE._pending_cleanup_terminal_validation_payload(
+                ticket,
+                quarantine_identity,
+                terminal_aliases=authority.aliases,
+                terminal_directories=authority.directories,
+                namespace_entries=authority.namespace_entries,
+                control_files=forged_controls,
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "control authority is incomplete",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_v8_terminal_validation_rejects_forged_marker_digest(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=SystemExit("injected crash after receipt"),
+            ),
+            self.assertRaisesRegex(SystemExit, "after receipt"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        quarantine_root = ticket.batch_root.parent
+        quarantine_identity = (
+            quarantine_root.stat().st_dev,
+            quarantine_root.stat().st_ino,
+        )
+        receipt = MODULE._read_pending_cleanup_terminal_validation(
+            self.home,
+            ticket,
+            quarantine_identity,
+        )
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        authority = MODULE._parse_pending_terminal_validation_authority(
+            self.home,
+            ticket,
+            quarantine_identity,
+            receipt,
+        )
+        self.assertIsNotNone(authority)
+        assert authority is not None
+        marker = ticket.batch_root / Path(*ticket.marker_path.parts)
+        original = marker.read_bytes()
+        replacement = bytes([original[0] ^ 1]) + original[1:]
+        marker.write_bytes(replacement)
+        marker.chmod(0o600)
+        marker_controls = tuple(
+            MODULE.replace(
+                control,
+                sha256=hashlib.sha256(replacement).hexdigest(),
+            )
+            if any(path.path == ticket.marker_path for path in control.paths)
+            else control
+            for control in authority.control_files
+        )
+        receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        receipt_path.unlink()
+        MODULE._publish_atomic_exclusive_internal_file(
+            self.home,
+            receipt_path,
+            MODULE._pending_cleanup_terminal_validation_payload(
+                ticket,
+                quarantine_identity,
+                terminal_aliases=authority.aliases,
+                terminal_directories=authority.directories,
+                namespace_entries=authority.namespace_entries,
+                control_files=marker_controls,
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "marker authority changed",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertEqual(marker.read_bytes(), replacement)
+
+    def test_terminal_receipt_capacity_preflight_includes_control_files(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        quarantine_root = ticket.batch_root.parent
+        quarantine_identity = (
+            quarantine_root.stat().st_dev,
+            quarantine_root.stat().st_ino,
+        )
+        batch_fd = MODULE._open_directory_beneath(self.home, ticket.batch_root)
+        try:
+            with mock.patch.object(
+                MODULE,
+                "_pending_cleanup_terminal_validation_payload",
+                wraps=MODULE._pending_cleanup_terminal_validation_payload,
+            ) as payload:
+                MODULE._validate_pending_terminal_validation_receipt_namespace_capacity(
+                    self.home,
+                    ticket,
+                    ticket.batch_root,
+                    batch_fd,
+                    MODULE._directory_mount_identity(batch_fd),
+                    quarantine_identity,
+                )
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+        self.assertTrue(payload.call_args.kwargs["control_files"])
+
     def test_v8_terminal_validation_allows_owner_only_gid_drift(self) -> None:
         ticket = self._deferred_terminal_ticket()
         real_capture = MODULE._capture_pending_cleanup_identity_ledger

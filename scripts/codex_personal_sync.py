@@ -32951,6 +32951,56 @@ def _parse_pending_terminal_validation_control_files_payload(
     return tuple(controls)
 
 
+def _require_pending_terminal_validation_control_set(
+    ticket: PendingBatchCleanupTicket,
+    controls: tuple[PendingTerminalValidationControlFile, ...],
+) -> None:
+    """Require receipt controls to close over the ticket's evidence and marker."""
+    if not controls:
+        return
+    expected_paths = set(_pending_terminal_validation_control_paths_for_ticket(ticket))
+    actual_paths = {
+        path.path
+        for control in controls
+        for path in control.paths
+    }
+    if actual_paths != expected_paths:
+        raise SyncError(
+            "pending terminal validation control authority is incomplete: "
+            f"{ticket.batch_root.name}"
+        )
+    if ticket.marker_path is None or ticket.marker_file_identity is None:
+        raise SyncError(
+            "pending terminal validation marker authority is incomplete: "
+            f"{ticket.batch_root.name}"
+        )
+    marker_controls = [
+        control
+        for control in controls
+        if any(path.path == ticket.marker_path for path in control.paths)
+    ]
+    if len(marker_controls) != 1:
+        raise SyncError(
+            "pending terminal validation marker control authority is ambiguous: "
+            f"{ticket.batch_root.name}"
+        )
+    marker_control = marker_controls[0]
+    marker_path = next(
+        path for path in marker_control.paths if path.path == ticket.marker_path
+    )
+    if (
+        marker_path.parent_identity != ticket.marker_parent_identity
+        or marker_control.file_identity != ticket.marker_file_identity
+        or marker_control.sha256 != ticket.marker_sha256
+        or marker_control.mode != ticket.marker_mode
+        or marker_control.uid != os.geteuid()
+    ):
+        raise SyncError(
+            "pending terminal validation marker authority changed: "
+            f"{ticket.batch_root.name}"
+        )
+
+
 def _parse_pending_terminal_validation_namespace_entries_payload(
     ticket: PendingBatchCleanupTicket,
     raw_entries: object,
@@ -33301,6 +33351,7 @@ def _parse_legacy_generic_cleanup_validation(
         ticket,
         data.get("control_files"),
     )
+    _require_pending_terminal_validation_control_set(ticket, control_files)
     metadata_sha256 = metadata.get("sha256")
     metadata_size = metadata.get("size")
     metadata_uid = metadata.get("uid")
@@ -33501,6 +33552,7 @@ def _parse_pending_terminal_validation_authority(
         if "control_files" in data
         else ()
     )
+    _require_pending_terminal_validation_control_set(ticket, control_files)
     authority = PendingTerminalValidationAuthority(
         aliases=parsed_aliases,
         directories=parsed_directories,
@@ -33729,6 +33781,7 @@ def _legacy_generic_cleanup_validation_from_current_state(
                 include_metadata=False,
             ),
         )
+        _require_pending_terminal_validation_control_set(ticket, control_files)
         return LegacyGenericCleanupValidation(
             metadata_identity=metadata.file_identity,
             metadata_sha256=hashlib.sha256(metadata.payload).hexdigest(),
@@ -34216,12 +34269,20 @@ def _validate_pending_terminal_validation_receipt_namespace_capacity(
         namespace_by_path[path]
         for path in sorted(namespace_by_path, key=PurePosixPath.as_posix)
     )
+    control_files = _pending_terminal_validation_control_files_from_paths(
+        home,
+        bound_batch_root,
+        batch_fd,
+        _pending_terminal_validation_control_paths_for_ticket(ticket),
+    )
+    _require_pending_terminal_validation_control_set(ticket, control_files)
     _pending_cleanup_terminal_validation_payload(
         ticket,
         quarantine_root_identity,
         terminal_aliases=aliases_tuple,
         terminal_directories=directories,
         namespace_entries=namespace_entries,
+        control_files=control_files,
     )
 
 
@@ -35338,6 +35399,7 @@ def _publish_pending_cleanup_terminal_validation(
     control_files: tuple[PendingTerminalValidationControlFile, ...] = (),
     legacy_generic_validation: LegacyGenericCleanupValidation | None = None,
 ) -> ManagedStateFileSnapshot:
+    _require_pending_terminal_validation_control_set(ticket, control_files)
     if ticket.version in {1, 2}:
         if (
             legacy_generic_validation is None
