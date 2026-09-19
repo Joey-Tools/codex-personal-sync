@@ -24424,10 +24424,9 @@ def _parse_pending_link_batch_schema_envelope(
     """Parse the metadata fields that require no filesystem observations."""
     data = _decode_managed_state_json(payload, _pending_link_pointer_path(home))
     version = data.get("version")
-    if (
-        type(version) is not int
-        or version not in SUPPORTED_PENDING_LINK_METADATA_VERSIONS
-    ):
+    if type(version) is not int:
+        raise SyncError("pending transaction has unsupported fields or version")
+    if version not in SUPPORTED_PENDING_LINK_METADATA_VERSIONS:
         raise _PendingLinkMetadataSchemaIncompatible(
             "pending transaction has unsupported fields or version"
         )
@@ -24450,9 +24449,7 @@ def _parse_pending_link_batch_schema_envelope(
             {"terminal_regular_before", "terminal_regular_after"}
         )
     if set(data) != expected_top_level_fields:
-        raise _PendingLinkMetadataSchemaIncompatible(
-            "pending transaction has unsupported fields or version"
-        )
+        raise SyncError("pending transaction has unsupported fields or version")
     batch_name = data.get("batch")
     if (
         not isinstance(batch_name, str)

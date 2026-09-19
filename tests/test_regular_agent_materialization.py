@@ -3724,26 +3724,46 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
     def test_pointerless_generic_malformed_metadata_requires_manual_recovery(
         self,
     ) -> None:
-        for ticket_version, release_name in (
-            (1, "pointerless-generic-malformed-v1-release"),
-            (2, "pointerless-generic-malformed-v2-release"),
-        ):
-            with self.subTest(ticket_version=ticket_version):
-                self.home = self.root / f"home-pointerless-generic-malformed-v{ticket_version}"
-                ticket = (
-                    self._prepare_pointerless_generic_v1_ticket(release_name)
-                    if ticket_version == 1
-                    else self._prepare_pointerless_generic_v2_ticket(release_name)
-                )
-                metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
-                metadata_path.write_bytes(b'{"version":')
-                metadata_path.chmod(0o600)
+        malformed_payloads = (
+            ("truncated", b'{"version":'),
+            ("missing-version", b"{}"),
+            ("null-version", b'{"version":null}'),
+            ("boolean-version", b'{"version":true}'),
+            ("string-version", b'{"version":"11"}'),
+            ("float-version", b'{"version":11.0}'),
+            ("supported-missing-fields", b'{"version":11}'),
+        )
+        for ticket_version in (1, 2):
+            for payload_name, malformed_payload in malformed_payloads:
+                with self.subTest(
+                    ticket_version=ticket_version,
+                    payload_name=payload_name,
+                ):
+                    self.home = self.root / (
+                        "home-pointerless-generic-malformed-"
+                        f"v{ticket_version}-{payload_name}"
+                    )
+                    release_name = (
+                        "pointerless-generic-malformed-"
+                        f"v{ticket_version}-{payload_name}-release"
+                    )
+                    ticket = (
+                        self._prepare_pointerless_generic_v1_ticket(release_name)
+                        if ticket_version == 1
+                        else self._prepare_pointerless_generic_v2_ticket(release_name)
+                    )
+                    metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+                    metadata_path.write_bytes(malformed_payload)
+                    metadata_path.chmod(0o600)
 
-                self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
+                    self.assertEqual(
+                        MODULE._cleanup_ready_pending_batches(self.home),
+                        0,
+                    )
 
-                self.assertTrue(ticket.path.is_file())
-                self.assertTrue(ticket.batch_root.is_dir())
-                self.assertEqual(metadata_path.read_bytes(), b'{"version":')
+                    self.assertTrue(ticket.path.is_file())
+                    self.assertTrue(ticket.batch_root.is_dir())
+                    self.assertEqual(metadata_path.read_bytes(), malformed_payload)
 
     def test_pointerless_generic_missing_metadata_keeps_compatible_cleanup(
         self,
