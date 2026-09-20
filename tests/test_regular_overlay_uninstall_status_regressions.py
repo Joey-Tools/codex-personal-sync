@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import stat
 import sys
 import tempfile
@@ -2859,6 +2860,139 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             self.assertTrue(foreign.is_file())
         finally:
             foreign.unlink()
+
+    def test_marker_only_v4_recovers_after_metadata_isolation_crash(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        payload = json.loads(ticket.path.read_text(encoding="utf-8"))
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        payload["version"] = MODULE.LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        payload["terminal_regular_targets"] = []
+        for field in (
+            "commit_evidence",
+            "terminal_namespace_sha256",
+            "pointer_retirement_path",
+            "pointer_retirement",
+        ):
+            payload.pop(field, None)
+        self._rewrite_ticket_same_inode(ticket, payload)
+        (ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME).write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "created_at": "2026-09-20T00:00:00Z",
+                    "actions": [],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        shutil.rmtree(ticket.batch_root / "links")
+        shutil.rmtree(ticket.batch_root / "state", ignore_errors=True)
+        pending_root = ticket.batch_root / "pending"
+        for child in pending_root.iterdir():
+            if child.name != "state":
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+        state_root = pending_root / "state"
+        for child in state_root.iterdir():
+            if child.name not in {"committed", "commit-evidence"}:
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+        legacy_ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket.path)
+        self.assertIsNotNone(legacy_ticket)
+        assert legacy_ticket is not None
+        batch_fd = MODULE._open_directory_beneath(self.home, legacy_ticket.batch_root)
+        try:
+            metadata_snapshot = MODULE._read_managed_state_file_snapshot(
+                self.home,
+                legacy_ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME,
+                batch_fd,
+            )
+            self.assertTrue(
+                MODULE._legacy_marker_only_v4_empty_metadata_is_admitted(
+                    self.home,
+                    legacy_ticket,
+                    batch_fd,
+                    metadata_snapshot,
+                )
+            )
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+
+        real_isolate = MODULE._isolate_pending_cleanup_entry
+        crashed = False
+
+        def isolate_then_crash(*args: object, **kwargs: object):
+            nonlocal crashed
+            result = real_isolate(*args, **kwargs)
+            name = args[1] if len(args) > 1 else None
+            if not crashed and name in {
+                MODULE.PENDING_LINK_METADATA_NAME,
+                "metadata.json",
+            }:
+                crashed = True
+                raise SystemExit("injected marker-only isolation crash")
+            return result
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_isolate_pending_cleanup_entry",
+                side_effect=isolate_then_crash,
+            ),
+            self.assertRaisesRegex(
+                SystemExit,
+                "injected marker-only isolation crash",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, legacy_ticket)
+
+        self.assertTrue(crashed)
+        batch_metadata = legacy_ticket.batch_root.stat()
+        batch_identity = (batch_metadata.st_dev, batch_metadata.st_ino)
+        self.assertTrue(
+            any(
+                MODULE._pending_cleanup_active_entry_binding(
+                    child.name,
+                    batch_identity,
+                )
+                for child in legacy_ticket.batch_root.iterdir()
+                if child.name.startswith(MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+            )
+        )
+        self.assertTrue(MODULE._cleanup_ready_pending_batches(self.home))
+        self.assertFalse(legacy_ticket.batch_root.exists())
+
+    def test_marker_only_control_scan_has_global_entry_budget(self) -> None:
+        scan_root = self.root / "bounded-control-scan"
+        scan_root.mkdir(mode=0o700)
+        current = scan_root
+        for index in range(6):
+            current = current / f"branch-{index}"
+            current.mkdir(mode=0o700)
+        scan_fd = os.open(scan_root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with (
+                mock.patch.object(MODULE, "MAX_PENDING_CLEANUP_ENTRIES", 4),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "pending cleanup control scan exceeds the entry budget",
+                ),
+            ):
+                MODULE._find_pending_cleanup_control_snapshot(
+                    self.home,
+                    scan_root,
+                    scan_fd,
+                    PurePosixPath("target"),
+                    expected_identity=None,
+                )
+        finally:
+            MODULE._close_fd_quietly(scan_fd)
 
     def test_ticket_tombstone_is_restored_and_cleanup_retries(self) -> None:
         real_delete = MODULE._isolate_and_delete_pending_cleanup_file
