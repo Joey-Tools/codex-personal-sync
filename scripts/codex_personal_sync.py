@@ -35518,6 +35518,10 @@ def _ensure_pending_terminal_validation_receipt(
                     (),
                 )
             )
+        _require_pending_marker_only_namespace_bounds(
+            ticket,
+            marker_only_namespace_entries,
+        )
         metadata_path = PurePosixPath(PENDING_LINK_METADATA_NAME)
         if (
             _read_pending_cleanup_logical_control_snapshot(
@@ -36215,6 +36219,53 @@ def _pending_marker_only_control_paths(
     return (ticket.marker_path,)
 
 
+def _require_pending_marker_only_namespace_bounds(
+    ticket: PendingBatchCleanupTicket,
+    namespace_entries: tuple[PendingTerminalValidationNamespaceEntry, ...],
+) -> None:
+    """Keep historic marker-only receipts inside their fixed control namespace.
+
+    Marker-only v4 tickets have no ticket-bound terminal namespace digest.  The
+    compatibility protocol therefore admits only the small metadata/marker
+    state namespace that the old writer could have produced.  In particular,
+    receipt and proof bytes cannot jointly introduce a later ``links/**`` or
+    other content entry and make it look like original cleanup authority.
+    """
+    if (
+        ticket.version != LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        or ticket.terminal_regular_targets
+    ):
+        return
+    paths = {entry.path for entry in namespace_entries}
+    marker_path = ticket.marker_path
+    metadata_paths = {
+        PurePosixPath(PENDING_LINK_METADATA_NAME),
+        PurePosixPath("metadata.json"),
+    }
+    allowed_paths = {
+        PurePosixPath("pending"),
+        PurePosixPath("pending", "state"),
+        PENDING_STATE_COMMIT_EVIDENCE,
+        *(metadata_paths),
+    }
+    if marker_path is not None:
+        allowed_paths.add(marker_path)
+    if (
+        marker_path is None
+        or marker_path not in paths
+        or not paths & metadata_paths
+        or not paths <= allowed_paths
+    ):
+        raise SyncError(
+            "pending cleanup empty proof changed; pending terminal validation "
+            "namespace changed: legacy marker-only v4 namespace authority is "
+            f"outside the bounded control set: {ticket.batch_root.name}: "
+            f"paths={sorted(path.as_posix() for path in paths)}, "
+            f"unknown={sorted(path.as_posix() for path in paths - allowed_paths)}, "
+            f"metadata={sorted(path.as_posix() for path in paths & metadata_paths)}"
+        )
+
+
 def _pending_marker_only_control_set_is_present(
     home: Path,
     bound_batch_root: Path,
@@ -36264,6 +36315,49 @@ def _pending_marker_only_control_set_is_present(
         ):
             return True
     return False
+
+
+def _pending_marker_only_live_control_paths(
+    home: Path,
+    bound_batch_root: Path,
+    batch_fd: int,
+    ticket: PendingBatchCleanupTicket,
+    *,
+    entry_budget: list[int] | None = None,
+) -> tuple[PurePosixPath, ...]:
+    """Resolve the exact legacy marker-only control names before mutation."""
+    paths = list(_pending_marker_only_control_paths(ticket))
+    metadata_path: PurePosixPath | None = None
+    for candidate in (
+        PurePosixPath(PENDING_LINK_METADATA_NAME),
+        PurePosixPath("metadata.json"),
+    ):
+        if (
+            _read_pending_cleanup_logical_control_snapshot(
+                home,
+                bound_batch_root,
+                batch_fd,
+                candidate,
+                entry_budget=entry_budget,
+            )
+            is not None
+        ):
+            metadata_path = candidate
+            break
+    if metadata_path is not None:
+        paths.append(metadata_path)
+    if (
+        _read_pending_cleanup_logical_control_snapshot(
+            home,
+            bound_batch_root,
+            batch_fd,
+            PENDING_STATE_COMMIT_EVIDENCE,
+            entry_budget=entry_budget,
+        )
+        is not None
+    ):
+        paths.append(PENDING_STATE_COMMIT_EVIDENCE)
+    return tuple(sorted(set(paths), key=PurePosixPath.as_posix))
 
 
 def _require_pending_terminal_validation_control_files(
@@ -37217,7 +37311,12 @@ def _read_pending_cleanup_empty_proof(
     quarantine_root_identity: tuple[int, int],
     *,
     joined_allocation: PendingQuarantineAllocationTicket | None = None,
+    allow_consumed_marker_only_receipt: bool = False,
 ) -> ManagedStateFileSnapshot | None:
+    marker_only_ticket = (
+        ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        and not ticket.terminal_regular_targets
+    )
     proof_path = _pending_cleanup_empty_proof_path(
         home,
         ticket.batch_root.name,
@@ -37269,7 +37368,7 @@ def _read_pending_cleanup_empty_proof(
                 home,
                 ticket,
                 quarantine_root_identity,
-                expected_link_count=None,
+                expected_link_count=1 if marker_only_ticket else None,
             )
             if current_receipt is not None and _pending_terminal_validation_receipt_has_complete_authority(
                 home,
@@ -37283,6 +37382,27 @@ def _read_pending_cleanup_empty_proof(
                         "validation receipt",
                     )
                 )
+                if marker_only_ticket:
+                    current_receipt_authority_data = (
+                        _parse_pending_terminal_validation_authority(
+                            home,
+                            ticket,
+                            quarantine_root_identity,
+                            current_receipt,
+                        )
+                    )
+                    if (
+                        current_receipt_authority_data is None
+                        or current_receipt_authority_data.namespace_entries is None
+                    ):
+                        raise SyncError(
+                            "legacy marker-only v4 validation receipt lacks "
+                            f"namespace authority: {ticket.batch_root.name}"
+                        )
+                    _require_pending_marker_only_namespace_bounds(
+                        ticket,
+                        current_receipt_authority_data.namespace_entries,
+                    )
         expected_authority = _pending_cleanup_empty_proof_authority_from_ticket(
             ticket,
             quarantine_root_identity,
@@ -37330,24 +37450,34 @@ def _read_pending_cleanup_empty_proof(
                 current_receipt_authority,
             )
         )
-        marker_only_ticket = (
-            ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
-            and not ticket.terminal_regular_targets
-        )
         if marker_only_ticket:
             # A marker-only receipt is itself mutable cleanup authority.  Once
             # the receipt exists, the empty proof must carry its complete
             # inode/content/policy anchor; a self-consistent replacement
             # receipt may not expand the deletion namespace.
-            authority_match = (
-                authority.version == 3
-                and authority.source_ticket_version == ticket.version
-                and authority.terminal_validation_receipt is not None
-                and (
-                    receipt_authority_match
-                    or current_receipt_authority is None
+            if current_receipt_authority is None:
+                # Historical marker-only empty proofs predate the receipt
+                # protocol.  Keep their exact v1/v2/v3 bytes readable until
+                # the old bounded cleanup path retires them.
+                authority_match = (
+                    (
+                        authority in compatible_authorities
+                        and authority.terminal_validation_receipt is None
+                    )
+                    or (
+                        allow_consumed_marker_only_receipt
+                        and authority.version == 3
+                        and authority.source_ticket_version == ticket.version
+                        and authority.terminal_validation_receipt is not None
+                    )
                 )
-            )
+            else:
+                authority_match = (
+                    authority.version == 3
+                    and authority.source_ticket_version == ticket.version
+                    and authority.terminal_validation_receipt is not None
+                    and receipt_authority_match
+                )
         else:
             authority_match = (
                 authority in compatible_authorities
@@ -37481,6 +37611,7 @@ def _delete_pending_cleanup_empty_proof(
     quarantine_root_identity: tuple[int, int],
     *,
     boundary_revalidator: Callable[[], None] | None = None,
+    allow_consumed_marker_only_receipt: bool = False,
 ) -> None:
     proof_path = _pending_cleanup_empty_proof_path(
         home,
@@ -37503,6 +37634,7 @@ def _delete_pending_cleanup_empty_proof(
             home,
             ticket,
             quarantine_root_identity,
+            allow_consumed_marker_only_receipt=allow_consumed_marker_only_receipt,
         )
         if proof is None:
             return
@@ -40094,6 +40226,7 @@ def _remove_cleanup_ready_batch(
                     home,
                     ticket,
                     quarantine_root_identity,
+                    allow_consumed_marker_only_receipt=True,
                 )
                 if proof is None:
                     if ticket.version in {1, 2}:
@@ -40177,6 +40310,7 @@ def _remove_cleanup_ready_batch(
             else None
         )
         marker_only_receipt_required = existing_marker_only_receipt is not None
+        marker_only_legacy_proof_compat = False
         if marker_only_ticket and existing_marker_only_receipt is not None:
             # A marker-only receipt is only admissible when the durable empty
             # proof already anchors its exact inode/content/policy evidence.
@@ -40211,6 +40345,7 @@ def _remove_cleanup_ready_batch(
                         "legacy marker-only v4 validation receipt is missing: "
                         f"{ticket.batch_root.name}"
                     )
+                marker_only_legacy_proof_compat = True
         if existing_legacy_receipt is not None:
             assert existing_legacy_receipt.payload is not None
             legacy_generic_validation = _parse_legacy_generic_cleanup_validation(
@@ -40243,7 +40378,8 @@ def _remove_cleanup_ready_batch(
             )
             if marker_only_ticket:
                 marker_only_receipt_required = (
-                    legacy_metadata is not None
+                    not marker_only_legacy_proof_compat
+                    and legacy_metadata is not None
                     and _pending_marker_only_control_set_is_present(
                         home,
                         bound_batch_root,
@@ -40508,12 +40644,84 @@ def _remove_cleanup_ready_batch(
                     "authority; manual recovery is required: "
                     f"{ticket.batch_root.name}"
                 )
+            _require_pending_marker_only_namespace_bounds(
+                ticket,
+                marker_only_validation_authority.namespace_entries,
+            )
+            marker_only_expected_control_paths = frozenset(
+                _pending_marker_only_live_control_paths(
+                    home,
+                    bound_batch_root,
+                    batch_fd,
+                    ticket,
+                    entry_budget=cleanup_budget,
+                )
+            )
+            marker_only_receipt_control_paths = frozenset(
+                path.path
+                for control in marker_only_validation_authority.control_files
+                for path in control.paths
+            )
+            if marker_only_receipt_control_paths != marker_only_expected_control_paths:
+                raise SyncError(
+                    "legacy marker-only v4 validation control namespace changed: "
+                    f"{ticket.batch_root.name}"
+                )
+            marker_only_receipt_authority = (
+                _pending_terminal_validation_receipt_authority_from_snapshot(
+                    marker_only_receipt,
+                    "validation receipt",
+                )
+            )
 
             def revalidate_marker_only_controls(
                 _logical_path: PurePosixPath,
                 _stage: str,
             ) -> None:
                 _require_pending_cleanup_ticket_unchanged(home, ticket)
+                current_receipt = _read_pending_cleanup_terminal_validation(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                    expected_link_count=1,
+                )
+                if current_receipt is None or not _pending_terminal_validation_receipt_matches_authority(
+                    current_receipt,
+                    marker_only_receipt_authority,
+                    expected_link_count=1,
+                ):
+                    raise SyncError(
+                        "legacy marker-only v4 validation receipt authority changed "
+                        f"before cleanup: {ticket.batch_root.name}"
+                    )
+                current_authority = _parse_pending_terminal_validation_authority(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                    current_receipt,
+                )
+                if (
+                    current_authority is None
+                    or current_authority.namespace_entries is None
+                ):
+                    raise SyncError(
+                        "legacy marker-only v4 validation receipt lacks namespace "
+                        f"authority: {ticket.batch_root.name}"
+                    )
+                _require_pending_marker_only_namespace_bounds(
+                    ticket,
+                    current_authority.namespace_entries,
+                )
+                current_control_paths = frozenset(
+                    path.path
+                    for control in current_authority.control_files
+                    for path in control.paths
+                )
+                if not current_control_paths <= marker_only_expected_control_paths:
+                    raise SyncError(
+                        "legacy marker-only v4 validation control namespace "
+                        f"expanded before cleanup: {ticket.batch_root.name}"
+                    )
                 _require_pending_terminal_validation_control_files(
                     home,
                     bound_batch_root,
@@ -41054,6 +41262,7 @@ def _remove_cleanup_ready_batch(
             home,
             ticket,
             quarantine_root_identity,
+            allow_consumed_marker_only_receipt=True,
             boundary_revalidator=lambda: _require_pending_cleanup_proof_batch_roots_absent(
                 home,
                 expected_proof_authority,

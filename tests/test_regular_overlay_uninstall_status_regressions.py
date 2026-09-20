@@ -3111,6 +3111,168 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertTrue(ticket.path.is_file())
         self.assertTrue(foreign.is_file())
 
+    def test_marker_only_v4_receipt_and_proof_cannot_expand_namespace_together(
+        self,
+    ) -> None:
+        ticket = self._marker_only_v4_ticket()
+        receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        proof_path = MODULE._pending_cleanup_empty_proof_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=SystemExit("injected after marker-only receipt"),
+            ),
+            self.assertRaisesRegex(
+                SystemExit,
+                "injected after marker-only receipt",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        links_root = ticket.batch_root / "links"
+        links_root.mkdir(mode=0o700)
+        foreign = links_root / "foreign"
+        foreign.write_bytes(b"foreign\n")
+        foreign.chmod(0o600)
+        links_metadata = links_root.stat()
+        foreign_metadata = foreign.stat()
+
+        receipt_payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertIsInstance(receipt_payload, dict)
+        assert isinstance(receipt_payload, dict)
+        namespace_entries = receipt_payload.get("namespace_entries")
+        self.assertIsInstance(namespace_entries, list)
+        assert isinstance(namespace_entries, list)
+        namespace_entries.extend(
+            [
+                [
+                    "links",
+                    MODULE._identity_payload(
+                        (ticket.batch_root.stat().st_dev, ticket.batch_root.stat().st_ino)
+                    ),
+                    [links_metadata.st_dev, links_metadata.st_ino, stat.S_IFDIR],
+                    stat.S_IMODE(links_metadata.st_mode),
+                    links_metadata.st_uid,
+                    links_metadata.st_gid,
+                ],
+                [
+                    "links/foreign",
+                    MODULE._identity_payload(
+                        (links_metadata.st_dev, links_metadata.st_ino)
+                    ),
+                    [foreign_metadata.st_dev, foreign_metadata.st_ino, stat.S_IFREG],
+                    stat.S_IMODE(foreign_metadata.st_mode),
+                    foreign_metadata.st_uid,
+                    foreign_metadata.st_gid,
+                ],
+            ]
+        )
+        namespace_entries.sort(key=lambda entry: entry[0])
+        rewritten_receipt = MODULE._bounded_json_document(
+            receipt_payload,
+            max_bytes=MODULE.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+            overflow_error="pending cleanup validation receipt exceeds the size limit",
+        )
+        with receipt_path.open("wb") as stream:
+            stream.write(rewritten_receipt)
+            stream.flush()
+            os.fsync(stream.fileno())
+        receipt_path.chmod(0o600)
+
+        proof_payload = json.loads(proof_path.read_text(encoding="utf-8"))
+        self.assertIsInstance(proof_payload, dict)
+        assert isinstance(proof_payload, dict)
+        receipt_authority = proof_payload.get("terminal_validation_receipt")
+        self.assertIsInstance(receipt_authority, dict)
+        assert isinstance(receipt_authority, dict)
+        receipt_file = receipt_authority.get("file")
+        self.assertIsInstance(receipt_file, dict)
+        assert isinstance(receipt_file, dict)
+        receipt_file["sha256"] = hashlib.sha256(rewritten_receipt).hexdigest()
+        receipt_file["size"] = len(rewritten_receipt)
+        rewritten_proof = MODULE._bounded_json_document(
+            proof_payload,
+            max_bytes=MODULE.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+            overflow_error="pending cleanup empty proof exceeds the size limit",
+        )
+        with proof_path.open("wb") as stream:
+            stream.write(rewritten_proof)
+            stream.flush()
+            os.fsync(stream.fileno())
+        proof_path.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "bounded control set|empty proof changed|namespace authority",
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(foreign.is_file())
+
+    def test_marker_only_v4_receipt_rejects_external_hardlink_at_retry(self) -> None:
+        ticket = self._marker_only_v4_ticket()
+        receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=SystemExit("injected after marker-only receipt"),
+            ),
+            self.assertRaisesRegex(
+                SystemExit,
+                "injected after marker-only receipt",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+        foreign = self.root / "foreign-marker-only-receipt"
+        os.link(receipt_path, foreign)
+        try:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "unauthorized hard-link alias",
+            ):
+                MODULE._cleanup_ready_pending_batches(self.home)
+        finally:
+            foreign.unlink()
+
+    def test_marker_only_v4_historic_empty_proof_retries_without_receipt(self) -> None:
+        ticket = self._marker_only_v4_ticket()
+        quarantine_root = ticket.batch_root.parent
+        quarantine_identity = (
+            quarantine_root.stat().st_dev,
+            quarantine_root.stat().st_ino,
+        )
+        proof_path = MODULE._pending_cleanup_empty_proof_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        MODULE._publish_pending_cleanup_empty_proof(
+            self.home,
+            ticket,
+            quarantine_identity,
+        )
+        self.assertFalse(
+            MODULE._pending_cleanup_terminal_validation_path(
+                self.home,
+                ticket.batch_root.name,
+            ).exists()
+        )
+        self.assertTrue(proof_path.is_file())
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+        self.assertFalse(ticket.path.exists())
+        self.assertFalse(ticket.batch_root.exists())
+        self.assertFalse(proof_path.exists())
+
     def test_marker_only_v4_requires_ticket_before_first_walker_mutation(self) -> None:
         ticket = self._marker_only_v4_ticket()
         real_remove = MODULE._remove_pending_batch_directory_contents
