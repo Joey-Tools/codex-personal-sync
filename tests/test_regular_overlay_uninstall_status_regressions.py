@@ -2781,6 +2781,159 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertFalse(list(ticket_root.glob("*.json")))
         self.assertFalse(list(ticket_root.glob("*.empty-proof")))
 
+    def test_terminal_retirement_authority_recovers_after_ticket_delete_crash(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        real_delete = MODULE._isolate_and_delete_pending_cleanup_file
+        retirement_path = MODULE._pending_cleanup_terminal_retirement_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        receipt_retirement_path = (
+            MODULE._pending_cleanup_terminal_validation_retirement_path(
+                self.home,
+                ticket.batch_root.name,
+            )
+        )
+        proof_path = MODULE._pending_cleanup_empty_proof_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        crashed = False
+
+        def crash_after_ticket_delete(
+            home: Path,
+            path: Path,
+            parent_fd: int,
+            expected,
+            *,
+            label: str,
+            mutation_revalidator=None,
+            **kwargs: object,
+        ) -> None:
+            nonlocal crashed
+            real_delete(
+                home,
+                path,
+                parent_fd,
+                expected,
+                label=label,
+                mutation_revalidator=mutation_revalidator,
+                **kwargs,
+            )
+            if path == ticket.path and not crashed:
+                crashed = True
+                raise SystemExit("injected crash after terminal ticket deletion")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_isolate_and_delete_pending_cleanup_file",
+                side_effect=crash_after_ticket_delete,
+            ),
+            self.assertRaisesRegex(
+                SystemExit,
+                "crash after terminal ticket deletion",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(crashed)
+        self.assertFalse(ticket.path.exists())
+        self.assertTrue(retirement_path.is_file())
+        self.assertEqual(retirement_path.stat().st_nlink, 1)
+        self.assertTrue(receipt_retirement_path.is_file())
+        self.assertTrue(proof_path.is_file())
+
+        install(self.public, self.home, SHA_A)
+
+        self.assertFalse(retirement_path.exists())
+        self.assertFalse(receipt_retirement_path.exists())
+        self.assertFalse(proof_path.exists())
+        self.assertEqual(self.target.stat().st_nlink, 1)
+
+    def test_terminal_retirement_authority_recovers_after_marker_tombstone_crash(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        real_delete = MODULE._isolate_and_delete_pending_cleanup_file
+        marker_path = MODULE._pending_cleanup_terminal_validation_retirement_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        retirement_path = MODULE._pending_cleanup_terminal_retirement_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        crashed = False
+
+        def retain_marker_tombstone_then_fail(
+            home: Path,
+            path: Path,
+            parent_fd: int,
+            expected,
+            *,
+            label: str,
+            mutation_revalidator=None,
+            **kwargs: object,
+        ) -> None:
+            nonlocal crashed
+            if path == marker_path and not crashed:
+                retained = next(MODULE._retained_pending_cleanup_names(path))
+                MODULE._rename_noreplace_at(
+                    parent_fd,
+                    path.name,
+                    parent_fd,
+                    retained,
+                )
+                os.fsync(parent_fd)
+                crashed = True
+                raise SystemExit("injected marker tombstone crash")
+            real_delete(
+                home,
+                path,
+                parent_fd,
+                expected,
+                label=label,
+                mutation_revalidator=mutation_revalidator,
+                **kwargs,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_isolate_and_delete_pending_cleanup_file",
+                side_effect=retain_marker_tombstone_then_fail,
+            ),
+            self.assertRaisesRegex(SystemExit, "marker tombstone crash"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(crashed)
+        self.assertFalse(marker_path.exists())
+        self.assertTrue(
+            any(
+                path.name.startswith(
+                    MODULE.PENDING_CLEANUP_RETAINED_PREFIX + marker_path.name + "-"
+                )
+                for path in marker_path.parent.iterdir()
+            )
+        )
+        self.assertTrue(retirement_path.is_file())
+        self.assertFalse(ticket.path.exists())
+
+        install(self.public, self.home, SHA_A)
+
+        self.assertFalse(retirement_path.exists())
+        self.assertFalse(
+            any(
+                path.name.startswith(MODULE.PENDING_CLEANUP_RETAINED_PREFIX)
+                for path in marker_path.parent.iterdir()
+            )
+        )
+        self.assertEqual(self.target.stat().st_nlink, 1)
+
     def test_v8_control_retirement_rechecks_foreign_hardlink_after_final_verify(
         self,
     ) -> None:

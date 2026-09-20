@@ -234,6 +234,7 @@ PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX = ".terminal-validation"
 PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX = (
     ".terminal-validation-retired"
 )
+PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX = ".terminal-retirement"
 PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION = 4
 LEGACY_PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION = 3
 LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION = 4
@@ -17915,6 +17916,8 @@ def _require_pending_ephemeral_ticket_representations_absent(
     index_root: Path,
     index_fd: int,
     batch_name: str,
+    *,
+    allowed_names: tuple[str, ...] = (),
 ) -> None:
     """Reject every recoverable representation of one cleanup ticket."""
     _require_pending_cleanup_fd_access_policy(
@@ -17931,6 +17934,8 @@ def _require_pending_ephemeral_ticket_representations_absent(
     )
     for name in names:
         if _pending_cleanup_ticket_representation_batch_name(name) == batch_name:
+            if name in allowed_names:
+                continue
             raise SyncError(
                 "pending ephemeral cleanup ticket representation remained before "
                 f"terminal receipt deletion: {batch_name}: {name}"
@@ -25860,6 +25865,22 @@ def _pending_cleanup_terminal_validation_retirement_path(
     )
 
 
+def _pending_cleanup_terminal_retirement_path(
+    home: Path,
+    batch_name: str,
+) -> Path:
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        raise SyncError(
+            "pending terminal cleanup retirement has an invalid batch name"
+        )
+    return _pending_cleanup_index_path(home) / (
+        batch_name + PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX
+    )
+
+
 def _pending_private_use_retirement_path(home: Path, batch_name: str) -> Path:
     if (
         len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
@@ -26128,6 +26149,8 @@ def _pending_quarantine_allocation_cleanup_control_batch_name(
         PENDING_CLEANUP_TICKET_SUFFIX,
         PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
         PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
+        PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX,
+        PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX,
         PENDING_PRIVATE_USE_RETIREMENT_SUFFIX,
     ):
         marker_index = candidate.find(marker)
@@ -27272,17 +27295,32 @@ def _isolate_and_delete_pending_cleanup_file(
     maximum_bytes: int = MAX_MANAGED_STATE_BYTES,
     mutation_revalidator: Callable[[str], None] | None = None,
     require_single_link: bool = False,
+    expected_link_count: int | None = None,
 ) -> None:
+    if expected_link_count is not None and expected_link_count < 1:
+        raise ValueError("pending cleanup expected link count must be positive")
+    if require_single_link and expected_link_count not in {None, 1}:
+        raise ValueError(
+            "pending cleanup single-link and exact-link requirements conflict"
+        )
+    required_link_count = (
+        expected_link_count
+        if expected_link_count is not None
+        else (1 if require_single_link else None)
+    )
     if (
         not _managed_state_snapshot_has_complete_file_evidence(expected)
         or expected.parent_identity != _directory_identity(parent_fd)
         or expected.file_type != stat.S_IFREG
     ):
         raise SyncError(f"{label} has no deletion identity")
-    if require_single_link and expected.link_count != 1:
+    if required_link_count is not None and expected.link_count not in {
+        None,
+        required_link_count,
+    }:
         raise SyncError(
             f"{label} has an unauthorized hard-link alias: "
-            f"links={expected.link_count!r}"
+            f"links={expected.link_count!r}, expected={required_link_count!r}"
         )
 
     def require_parent_access_policy(stage: str) -> None:
@@ -27320,14 +27358,15 @@ def _isolate_and_delete_pending_cleanup_file(
             )
         except OSError as error:
             raise SyncError(f"{label} changed before isolation") from error
-        if require_single_link and (
+        if required_link_count is not None and (
             preflight_fd < 0
-            or preflight.st_nlink != 1
-            or named_preflight.st_nlink != 1
+            or preflight.st_nlink != required_link_count
+            or named_preflight.st_nlink != required_link_count
         ):
             raise SyncError(
                 f"{label} has an unauthorized hard-link alias: "
-                f"links={named_preflight.st_nlink!r}"
+                f"links={named_preflight.st_nlink!r}, "
+                f"expected={required_link_count!r}"
             )
         if (
             not _regular_stat_matches_managed_state_file_snapshot(
@@ -27408,19 +27447,19 @@ def _isolate_and_delete_pending_cleanup_file(
                 raise SyncError(
                     f"{label} changed {stage}; preserved as {retained_name}"
                 ) from error
-            if require_single_link and (
-                before.st_nlink != 1 or named.st_nlink != 1
+            if required_link_count is not None and (
+                before.st_nlink != required_link_count
+                or named.st_nlink != required_link_count
             ):
                 raise SyncError(
                     f"{label} has an unauthorized hard-link alias; "
-                    f"preserved as {retained_name}"
+                    f"preserved as {retained_name}; "
+                    f"expected={required_link_count!r}"
                 )
             if (
                 not stat.S_ISREG(before.st_mode)
-                or (require_single_link and before.st_nlink != 1)
                 or not _regular_stat_metadata_matches(after, before)
                 or not _regular_stat_metadata_matches(named, before)
-                or (require_single_link and named.st_nlink != 1)
                 or not _regular_stat_matches_managed_state_file_snapshot(
                     after,
                     expected,
@@ -28915,6 +28954,7 @@ def _read_pending_cleanup_ticket(
     ticket_path: Path,
     *,
     expected_ticket_identity: tuple[int, int] | None = None,
+    expected_link_count: int | None = 1,
     allow_temporary: bool = False,
     _captured_snapshot: ManagedStateFileSnapshot | None = None,
 ) -> PendingBatchCleanupTicket | None:
@@ -28931,9 +28971,13 @@ def _read_pending_cleanup_ticket(
             raise SyncError("pending cleanup ticket temp has an invalid file name")
     else:
         suffix = PENDING_CLEANUP_TICKET_SUFFIX
-        if not ticket_path.name.endswith(suffix):
+        if ticket_path.name.endswith(suffix):
+            batch_name = ticket_path.name[: -len(suffix)]
+        elif ticket_path.name.endswith(PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX):
+            suffix = PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX
+            batch_name = ticket_path.name[: -len(suffix)]
+        else:
             raise SyncError("pending cleanup ticket has an invalid file name")
-        batch_name = ticket_path.name[: -len(suffix)]
     if (
         len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
         or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
@@ -28962,7 +29006,15 @@ def _read_pending_cleanup_ticket(
                 )
         if not snapshot.exists:
             return None
-        _require_pending_cleanup_control_link_count(snapshot, ticket_path)
+        if expected_link_count is not None:
+            if expected_link_count < 1:
+                raise ValueError("pending cleanup expected link count must be positive")
+            if snapshot.link_count != expected_link_count:
+                raise SyncError(
+                    "pending cleanup control has an unauthorized hard-link alias: "
+                    f"{ticket_path} (links={snapshot.link_count!r}, "
+                    f"expected={expected_link_count!r})"
+                )
         if snapshot.payload is None or (
             len(snapshot.payload) > MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES
         ):
@@ -29617,6 +29669,194 @@ def _read_pending_cleanup_ticket(
                 else None
             ),
         )
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _read_pending_cleanup_terminal_retirement_ticket(
+    home: Path,
+    retirement_path: Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+    expected_link_count: int | None = None,
+) -> tuple[PendingBatchCleanupTicket, ManagedStateFileSnapshot] | None:
+    index_fd = _open_directory_beneath(home, retirement_path.parent)
+    try:
+        snapshot = _read_managed_state_file_snapshot(
+            home,
+            retirement_path,
+            index_fd,
+            expected_identity=expected_identity,
+        )
+    finally:
+        _close_fd_quietly(index_fd)
+    if not snapshot.exists:
+        return None
+    if (
+        snapshot.file_type != stat.S_IFREG
+        or snapshot.mode != 0o600
+        or snapshot.uid != os.geteuid()
+        or snapshot.parent_identity is None
+    ):
+        raise SyncError(
+            f"pending terminal cleanup retirement changed: {retirement_path.name}"
+        )
+    if expected_link_count is not None and snapshot.link_count != expected_link_count:
+        raise SyncError(
+            "pending terminal cleanup retirement has an unauthorized hard-link "
+            f"alias: {retirement_path} (links={snapshot.link_count!r}, "
+            f"expected={expected_link_count!r})"
+        )
+    ticket = _read_pending_cleanup_ticket(
+        home,
+        retirement_path,
+        expected_ticket_identity=snapshot.file_identity,
+        expected_link_count=expected_link_count,
+    )
+    if (
+        ticket is None
+        or ticket.version not in {4, 8}
+        or not ticket.terminal_regular_targets
+    ):
+        raise SyncError(
+            "pending terminal cleanup retirement lacks complete ticket authority: "
+            f"{retirement_path.name}"
+        )
+    return ticket, snapshot
+
+
+def _ensure_pending_cleanup_terminal_retirement(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+) -> ManagedStateFileSnapshot:
+    """Create or validate the ticket-bound retirement recovery hard link."""
+    if ticket.version not in {4, 8} or not ticket.terminal_regular_targets:
+        raise SyncError(
+            "pending terminal cleanup retirement requires terminal ticket authority"
+        )
+    retirement_path = _pending_cleanup_terminal_retirement_path(
+        home,
+        ticket.batch_root.name,
+    )
+    index_fd = _open_directory_beneath(home, ticket.path.parent)
+    try:
+        current = _read_managed_state_file_snapshot(
+            home,
+            ticket.path,
+            index_fd,
+            expected_identity=ticket.snapshot.file_identity,
+        )
+        if (
+            not _managed_state_snapshot_matches_bound_file_evidence(
+                current,
+                ticket.snapshot,
+            )
+            or current.link_count not in {1, 2}
+        ):
+            raise SyncError(
+                "pending cleanup control has an unauthorized hard-link alias "
+                "before terminal retirement: "
+                f"{ticket.batch_root.name}"
+            )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            ticket.path,
+            index_fd,
+            current,
+        )
+        existing = _read_managed_state_file_snapshot(
+            home,
+            retirement_path,
+            index_fd,
+            expected_identity=ticket.snapshot.file_identity,
+        )
+        if existing.exists:
+            if current.link_count != 2 or existing.link_count != 2:
+                raise SyncError(
+                    "pending terminal cleanup retirement hard-link authority "
+                    f"changed: {ticket.batch_root.name}"
+                )
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                retirement_path,
+                index_fd,
+                existing,
+            )
+            parsed = _read_pending_cleanup_terminal_retirement_ticket(
+                home,
+                retirement_path,
+                expected_identity=ticket.snapshot.file_identity,
+                expected_link_count=2,
+            )
+            if parsed is None:
+                raise SyncError(
+                    "pending terminal cleanup retirement disappeared: "
+                    f"{ticket.batch_root.name}"
+                )
+            return parsed[1]
+        if current.link_count != 1:
+            raise SyncError(
+                "pending cleanup control has an unauthorized hard-link alias "
+                "before terminal retirement: "
+                f"{ticket.batch_root.name}"
+            )
+        try:
+            os.link(
+                ticket.path.name,
+                retirement_path.name,
+                src_dir_fd=index_fd,
+                dst_dir_fd=index_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            pass
+        os.fsync(index_fd)
+        current_after = _read_managed_state_file_snapshot(
+            home,
+            ticket.path,
+            index_fd,
+            expected_identity=ticket.snapshot.file_identity,
+        )
+        retirement_after = _read_managed_state_file_snapshot(
+            home,
+            retirement_path,
+            index_fd,
+            expected_identity=ticket.snapshot.file_identity,
+        )
+        if (
+            current_after.link_count != 2
+            or retirement_after.link_count != 2
+            or not _managed_state_snapshot_matches_bound_file_evidence(
+                current_after,
+                ticket.snapshot,
+            )
+            or not _managed_state_snapshot_matches_file_evidence(
+                retirement_after,
+                ticket.snapshot,
+            )
+        ):
+            raise SyncError(
+                "pending terminal cleanup retirement changed during publication: "
+                f"{ticket.batch_root.name}"
+            )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            retirement_path,
+            index_fd,
+            retirement_after,
+        )
+        parsed = _read_pending_cleanup_terminal_retirement_ticket(
+            home,
+            retirement_path,
+            expected_identity=ticket.snapshot.file_identity,
+            expected_link_count=2,
+        )
+        if parsed is None:
+            raise SyncError(
+                "pending terminal cleanup retirement disappeared after publication: "
+                f"{ticket.batch_root.name}"
+            )
+        return parsed[1]
     finally:
         _close_fd_quietly(index_fd)
 
@@ -34945,10 +35185,17 @@ def _ensure_pending_terminal_validation_receipt(
             ),
         )
     os.fsync(batch_fd)
+    retirement_control = _read_pending_cleanup_terminal_retirement_ticket(
+        home,
+        _pending_cleanup_terminal_retirement_path(home, ticket.batch_root.name),
+        expected_identity=ticket.snapshot.file_identity,
+        expected_link_count=None,
+    )
     current_ticket = _read_pending_cleanup_ticket(
         home,
         ticket.path,
         expected_ticket_identity=ticket.snapshot.file_identity,
+        expected_link_count=2 if retirement_control is not None else 1,
     )
     if current_ticket is None or not _pending_cleanup_ticket_matches(
         current_ticket,
@@ -36420,12 +36667,30 @@ def _delete_pending_cleanup_empty_proof(
             # rather than an atomic cross-object guarantee.
             if proof_authority.version in {2, 3}:
                 if require_ticket_representations:
-                    _require_pending_ephemeral_ticket_representations_absent(
-                        home,
-                        proof_path.parent,
-                        index_fd,
-                        ticket.batch_root.name,
+                    allowed_names = (
+                        (
+                            ticket.batch_root.name
+                            + PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX,
+                        )
+                        if ticket.version in {4, 8}
+                        and ticket.terminal_regular_targets
+                        else ()
                     )
+                    if allowed_names:
+                        _require_pending_ephemeral_ticket_representations_absent(
+                            home,
+                            proof_path.parent,
+                            index_fd,
+                            ticket.batch_root.name,
+                            allowed_names=allowed_names,
+                        )
+                    else:
+                        _require_pending_ephemeral_ticket_representations_absent(
+                            home,
+                            proof_path.parent,
+                            index_fd,
+                            ticket.batch_root.name,
+                        )
                 _verify_final_regular_target_group(
                     home,
                     proof_authority.terminal_regular_targets,
@@ -36441,12 +36706,30 @@ def _delete_pending_cleanup_empty_proof(
                     _proof_member,
                     require_ticket_representations=False,
                 )
-                _require_pending_ephemeral_ticket_representations_absent(
-                    home,
-                    proof_path.parent,
-                    index_fd,
-                    ticket.batch_root.name,
+                allowed_names = (
+                    (
+                        ticket.batch_root.name
+                        + PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX,
+                    )
+                    if ticket.version in {4, 8}
+                    and ticket.terminal_regular_targets
+                    else ()
                 )
+                if allowed_names:
+                    _require_pending_ephemeral_ticket_representations_absent(
+                        home,
+                        proof_path.parent,
+                        index_fd,
+                        ticket.batch_root.name,
+                        allowed_names=allowed_names,
+                    )
+                else:
+                    _require_pending_ephemeral_ticket_representations_absent(
+                        home,
+                        proof_path.parent,
+                        index_fd,
+                        ticket.batch_root.name,
+                    )
                 _require_joined_quarantine_allocation_unchanged(
                     home,
                     ticket,
@@ -36768,6 +37051,7 @@ def _require_pending_cleanup_ticket_unchanged(
         home,
         ticket.path,
         expected_ticket_identity=ticket.snapshot.file_identity,
+        expected_link_count=None,
     )
     if current is None or not _pending_cleanup_ticket_matches(current, ticket):
         raise SyncError(f"pending cleanup ticket changed: {ticket.batch_root.name}")
@@ -38474,6 +38758,7 @@ def _remove_cleanup_ready_batch(
         home,
         ticket.path,
         expected_ticket_identity=ticket.snapshot.file_identity,
+        expected_link_count=None,
     )
     if current_ticket is None or not _pending_cleanup_ticket_matches(
         current_ticket,
@@ -39200,6 +39485,7 @@ def _delete_pending_cleanup_ticket(
     ticket: PendingBatchCleanupTicket,
     *,
     boundary_revalidator: Callable[[], None] | None = None,
+    expected_link_count: int | None = None,
 ) -> None:
     index_fd = _open_directory_beneath(home, ticket.path.parent)
     try:
@@ -39219,6 +39505,13 @@ def _delete_pending_cleanup_ticket(
             ticket.snapshot,
         ):
             raise SyncError(f"pending cleanup ticket changed: {ticket.batch_root.name}")
+        if expected_link_count is None:
+            expected_link_count = current.link_count
+        if expected_link_count is None or expected_link_count < 1:
+            raise SyncError(
+                f"pending cleanup ticket has incomplete hard-link authority: "
+                f"{ticket.batch_root.name}"
+            )
         mutation_revalidator: Callable[[str], None] | None = None
         if ticket.version in {5, 7}:
 
@@ -39241,24 +39534,27 @@ def _delete_pending_cleanup_ticket(
             mutation_revalidator = revalidate_boundary
             mutation_revalidator(ticket.path.name)
         label = f"pending cleanup ticket {ticket.batch_root.name}"
+        deletion_snapshot = current
         if mutation_revalidator is None:
             _isolate_and_delete_pending_cleanup_file(
                 home,
                 ticket.path,
                 index_fd,
-                ticket.snapshot,
+                deletion_snapshot,
                 label=label,
-                require_single_link=True,
+                require_single_link=expected_link_count == 1,
+                expected_link_count=expected_link_count,
             )
         else:
             _isolate_and_delete_pending_cleanup_file(
                 home,
                 ticket.path,
                 index_fd,
-                ticket.snapshot,
+                deletion_snapshot,
                 label=label,
                 mutation_revalidator=mutation_revalidator,
-                require_single_link=True,
+                require_single_link=expected_link_count == 1,
+                expected_link_count=expected_link_count,
             )
         remaining = _read_managed_state_file_snapshot(
             home,
@@ -39268,6 +39564,92 @@ def _delete_pending_cleanup_ticket(
         if remaining.exists:
             raise SyncError(
                 f"pending cleanup ticket reappeared: {ticket.batch_root.name}"
+            )
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _delete_pending_cleanup_terminal_retirement(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    *,
+    allow_remaining_proof: bool = False,
+) -> None:
+    retirement_path = _pending_cleanup_terminal_retirement_path(
+        home,
+        ticket.batch_root.name,
+    )
+    parsed = _read_pending_cleanup_terminal_retirement_ticket(
+        home,
+        retirement_path,
+        expected_link_count=1,
+    )
+    if parsed is None:
+        return
+    _retirement_ticket, retirement_snapshot = parsed
+    index_fd = _open_directory_beneath(home, retirement_path.parent)
+    try:
+
+        def require_final_retirement_boundary(_member: str) -> None:
+            _verify_final_regular_target_group(
+                home,
+                ticket.terminal_regular_targets,
+            )
+            for sibling in (
+                ticket.path,
+                _pending_cleanup_terminal_validation_path(
+                    home,
+                    ticket.batch_root.name,
+                ),
+                _pending_cleanup_terminal_validation_retirement_path(
+                    home,
+                    ticket.batch_root.name,
+                ),
+            ):
+                sibling_snapshot = _read_managed_state_file_snapshot(
+                    home,
+                    sibling,
+                    index_fd,
+                )
+                if sibling_snapshot.exists:
+                    raise SyncError(
+                        "pending terminal cleanup retirement controls reappeared: "
+                        f"{ticket.batch_root.name}"
+                    )
+            if not allow_remaining_proof:
+                proof_snapshot = _read_managed_state_file_snapshot(
+                    home,
+                    _pending_cleanup_empty_proof_path(
+                        home,
+                        ticket.batch_root.name,
+                    ),
+                    index_fd,
+                )
+                if proof_snapshot.exists:
+                    raise SyncError(
+                        "pending terminal cleanup retirement controls reappeared: "
+                        f"{ticket.batch_root.name}"
+                    )
+
+        require_final_retirement_boundary(retirement_path.name)
+        _isolate_and_delete_pending_cleanup_file(
+            home,
+            retirement_path,
+            index_fd,
+            retirement_snapshot,
+            label=f"pending terminal cleanup retirement {ticket.batch_root.name}",
+            mutation_revalidator=require_final_retirement_boundary,
+            expected_link_count=1,
+        )
+        remaining = _read_managed_state_file_snapshot(
+            home,
+            retirement_path,
+            index_fd,
+        )
+        if remaining.exists:
+            raise SyncError(
+                "pending terminal cleanup retirement reappeared: "
+                f"{ticket.batch_root.name}"
             )
     finally:
         _close_fd_quietly(index_fd)
@@ -39298,6 +39680,7 @@ def _retire_terminal_regular_cleanup_controls(
         allocation_control=None,
         allocation_join_metadata=None,
     )
+    retirement_control_snapshot: ManagedStateFileSnapshot | None = None
 
     def require_current_v3_proof_and_final_group() -> None:
         proof = _read_pending_cleanup_empty_proof(
@@ -39306,10 +39689,20 @@ def _retire_terminal_regular_cleanup_controls(
             quarantine_root_identity,
         )
         if proof is None:
-            raise SyncError(
-                "pending cleanup batch root is missing without an exact empty "
-                f"proof: {ticket.batch_root.name}"
+            if retirement_control_snapshot is None:
+                raise SyncError(
+                    "pending cleanup batch root is missing without an exact empty "
+                    f"proof: {ticket.batch_root.name}"
+                )
+            # Once the independent ticket-bound retirement control exists, a
+            # missing proof is an already-committed later phase.  Re-verify
+            # the final target group directly from the still-live ticket while
+            # the retirement control keeps that ticket authority alive.
+            _verify_final_regular_target_group(
+                home,
+                ticket.terminal_regular_targets,
             )
+            return
         proof_authority = _parse_pending_cleanup_empty_proof_authority(
             _pending_cleanup_empty_proof_path(home, ticket.batch_root.name),
             proof.payload,
@@ -39336,15 +39729,15 @@ def _retire_terminal_regular_cleanup_controls(
             proof_authority.terminal_regular_targets,
         )
 
-    # Validate the proof before receipt retirement so a historic v1/v2 proof
-    # reports its precise missing authority even when the batch root is gone.
-    require_current_v3_proof_and_final_group()
-
     receipt_path = _pending_cleanup_terminal_validation_path(
         home,
         ticket.batch_root.name,
     )
     retirement_path = _pending_cleanup_terminal_validation_retirement_path(
+        home,
+        ticket.batch_root.name,
+    )
+    retirement_control_path = _pending_cleanup_terminal_retirement_path(
         home,
         ticket.batch_root.name,
     )
@@ -39423,12 +39816,33 @@ def _retire_terminal_regular_cleanup_controls(
         receipt_path=retirement_path,
         expected_link_count=None,
     )
+    retirement_control = _read_pending_cleanup_terminal_retirement_ticket(
+        home,
+        retirement_control_path,
+        expected_link_count=None,
+    )
+    if retirement_control is None:
+        # Preserve the historical diagnostic ordering: a malformed or
+        # under-powered proof must be reported before a missing receipt can
+        # obscure the more specific authority failure.
+        require_current_v3_proof_and_final_group()
     if canonical_receipt is None and retired_receipt is None:
-        raise SyncError(
-            "pending terminal validation receipt is missing before control "
-            "retirement; manual recovery is required: "
-            f"{ticket.batch_root.name}"
-        )
+        if retirement_control is None:
+            raise SyncError(
+                "pending terminal validation receipt is missing before control "
+                "retirement; manual recovery is required: "
+                f"{ticket.batch_root.name}"
+            )
+        # The ticket-bound retirement control proves that the receipt and its
+        # retirement link were already admitted before a later crash.  The
+        # remaining proof/target checks below still gate every subsequent
+        # deletion boundary.
+    retirement_control_snapshot = _ensure_pending_cleanup_terminal_retirement(
+        home,
+        ticket,
+    )
+    if retirement_control is not None:
+        require_current_v3_proof_and_final_group()
     if canonical_receipt is not None and retired_receipt is None:
         require_terminal_receipt_retirement_authority(
             receipt_path,
@@ -39463,11 +39877,13 @@ def _retire_terminal_regular_cleanup_controls(
             receipt_path=retirement_path,
             expected_link_count=2,
         )
-    elif canonical_receipt is None:
+    elif canonical_receipt is None and retired_receipt is not None:
         require_terminal_receipt_retirement_authority(
             retirement_path,
             expected_link_count=1,
         )
+    elif canonical_receipt is None and retired_receipt is None:
+        pass
     else:
         if canonical_receipt.link_count != 2 or retired_receipt.link_count != 2:
             raise SyncError(
@@ -39498,6 +39914,48 @@ def _retire_terminal_regular_cleanup_controls(
         _verify_final_regular_targets(home, ticket)
         require_current_v3_proof_and_final_group()
 
+    def require_retirement_control(expected_link_count: int) -> None:
+        parsed = _read_pending_cleanup_terminal_retirement_ticket(
+            home,
+            retirement_control_path,
+            expected_identity=retirement_control_snapshot.file_identity,
+            expected_link_count=expected_link_count,
+        )
+        if parsed is None or not _managed_state_snapshot_matches_file_evidence(
+            parsed[1], retirement_control_snapshot
+        ):
+            raise SyncError(
+                "pending terminal cleanup retirement authority changed: "
+                f"{ticket.batch_root.name}"
+            )
+
+    def require_retirement_marker_if_present() -> None:
+        marker = _read_pending_cleanup_terminal_validation(
+            home,
+            ticket,
+            quarantine_root_identity,
+            receipt_path=retirement_path,
+            expected_link_count=None,
+        )
+        if marker is None:
+            canonical = _read_pending_cleanup_terminal_validation(
+                home,
+                ticket,
+                quarantine_root_identity,
+                receipt_path=receipt_path,
+                expected_link_count=None,
+            )
+            if canonical is not None:
+                raise SyncError(
+                    "pending terminal validation receipt was retired without its "
+                    f"retirement marker: {ticket.batch_root.name}"
+                )
+            return
+        require_terminal_receipt_retirement_authority(
+            retirement_path,
+            expected_link_count=1,
+        )
+
     def require_terminal_validation_boundary(
         _receipt_member: str,
         _index_fd: int,
@@ -39513,6 +39971,7 @@ def _retire_terminal_regular_cleanup_controls(
             retirement_path,
             expected_link_count=expected_retirement_link_count,
         )
+        require_retirement_control(expected_retirement_link_count)
 
     if canonical_receipt is not None:
         _delete_pending_cleanup_terminal_validation(
@@ -39532,28 +39991,89 @@ def _retire_terminal_regular_cleanup_controls(
         # durable target-group authority when that canonical name disappears.
         boundary_revalidator=lambda: (
             require_current_v3_proof_and_final_group(),
-            require_terminal_receipt_retirement_authority(
-                retirement_path,
-                expected_link_count=1,
-            ),
+            require_retirement_marker_if_present(),
+            require_retirement_control(2),
         ),
     )
-    _delete_pending_cleanup_terminal_validation(
-        home,
-        ticket,
-        quarantine_root_identity,
-        receipt_path=retirement_path,
-        expected_link_count=1,
-    )
-    _delete_pending_cleanup_empty_proof(
-        home,
-        ticket,
-        quarantine_root_identity,
-        boundary_revalidator=lambda: _require_pending_cleanup_proof_batch_roots_absent(
+    if (
+        _read_pending_cleanup_terminal_validation(
             home,
-            expected_proof_authority,
-        ),
-    )
+            ticket,
+            quarantine_root_identity,
+            receipt_path=retirement_path,
+            expected_link_count=None,
+        )
+        is not None
+    ):
+
+        def require_retirement_marker_boundary(
+            _receipt_member: str,
+            _index_fd: int,
+        ) -> None:
+            require_current_v3_proof_and_final_group()
+            require_retirement_control(1)
+
+        _delete_pending_cleanup_terminal_validation(
+            home,
+            ticket,
+            quarantine_root_identity,
+            mutation_revalidator=require_retirement_marker_boundary,
+            receipt_path=retirement_path,
+            expected_link_count=1,
+        )
+    if (
+        _read_pending_cleanup_empty_proof(
+            home,
+            ticket,
+            quarantine_root_identity,
+        )
+        is not None
+    ):
+
+        def require_proof_retirement_boundary() -> None:
+            require_current_v3_proof_and_final_group()
+            _require_pending_cleanup_proof_batch_roots_absent(
+                home,
+                expected_proof_authority,
+            )
+            require_retirement_control(1)
+            marker = _read_pending_cleanup_terminal_validation(
+                home,
+                ticket,
+                quarantine_root_identity,
+                receipt_path=retirement_path,
+                expected_link_count=None,
+            )
+            if marker is not None:
+                raise SyncError(
+                    "pending terminal validation retirement marker remained: "
+                    f"{ticket.batch_root.name}"
+                )
+
+        _delete_pending_cleanup_empty_proof(
+            home,
+            ticket,
+            quarantine_root_identity,
+            boundary_revalidator=require_proof_retirement_boundary,
+        )
+        remaining_proof = _read_pending_cleanup_empty_proof(
+            home,
+            ticket,
+            quarantine_root_identity,
+        )
+        if remaining_proof is not None:
+            remaining_authority = _parse_pending_cleanup_empty_proof_authority(
+                _pending_cleanup_empty_proof_path(home, ticket.batch_root.name),
+                remaining_proof.payload,
+            )
+            if remaining_authority == compatible_v2_authority:
+                _delete_pending_cleanup_terminal_retirement(
+                    home,
+                    ticket,
+                    allow_remaining_proof=True,
+                )
+            return
+    _delete_pending_cleanup_terminal_retirement(home, ticket)
 
 
 def _try_cleanup_finalized_pending_batch(
@@ -39720,7 +40240,9 @@ def _pending_cleanup_ticket_representation_batch_name(name: str) -> str | None:
         candidate = candidate[len(PENDING_CLEANUP_RETAINED_PREFIX) :]
     marker_index = candidate.find(PENDING_CLEANUP_TICKET_SUFFIX)
     if marker_index <= 0:
-        return None
+        marker_index = candidate.find(PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX)
+        if marker_index <= 0:
+            return None
     batch_name = candidate[:marker_index]
     if (
         len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
@@ -39736,6 +40258,18 @@ def _pending_cleanup_terminal_validation_retirement_batch_name(
     if not name.endswith(PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX):
         return None
     batch_name = name[: -len(PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX)]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        return None
+    return batch_name
+
+
+def _pending_cleanup_terminal_retirement_batch_name(name: str) -> str | None:
+    if not name.endswith(PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX):
+        return None
+    batch_name = name[: -len(PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX)]
     if (
         len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
         or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
@@ -39852,6 +40386,8 @@ def _pending_cleanup_retained_control_name(
         PENDING_CLEANUP_TICKET_SUFFIX,
         PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
         PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
+        PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX,
+        PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX,
         PENDING_PRIVATE_USE_RETIREMENT_SUFFIX,
     ):
         if not canonical.endswith(suffix):
@@ -39880,16 +40416,20 @@ def _pending_cleanup_unresolved_ticket_representation(
     if batch_name is None:
         return None
     canonical_ticket_name = batch_name + PENDING_CLEANUP_TICKET_SUFFIX
+    canonical_retirement_name = (
+        batch_name + PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX
+    )
     if name in {
         canonical_ticket_name,
         batch_name + PENDING_CLEANUP_TICKET_TEMP_SUFFIX,
+        canonical_retirement_name,
     }:
         return None
     retained_control = _pending_cleanup_retained_control_name(name)
     if (
         retained_control is not None
         and retained_control[1] == batch_name
-        and retained_control[0] == canonical_ticket_name
+        and retained_control[0] in {canonical_ticket_name, canonical_retirement_name}
     ):
         return None
     retained_temp = _pending_cleanup_retained_ticket_temp_name(name)
@@ -39964,6 +40504,10 @@ def _require_no_pending_unresolved_ticket_representations(home: Path) -> None:
                 canonical_ticket = (
                     retirement_batch_name + PENDING_CLEANUP_TICKET_SUFFIX
                 )
+                retirement_control = (
+                    retirement_batch_name
+                    + PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX
+                )
                 has_ticket = canonical_ticket in names or any(
                     (
                         retained := _pending_cleanup_retained_control_name(
@@ -39972,6 +40516,16 @@ def _require_no_pending_unresolved_ticket_representations(home: Path) -> None:
                     )
                     is not None
                     and retained[0] == canonical_ticket
+                    for candidate in names
+                )
+                has_ticket = has_ticket or retirement_control in names or any(
+                    (
+                        retained := _pending_cleanup_retained_control_name(
+                            candidate
+                        )
+                    )
+                    is not None
+                    and retained[0] == retirement_control
                     for candidate in names
                 )
                 if not has_ticket:
@@ -39992,6 +40546,120 @@ def _require_no_pending_unresolved_ticket_representations(home: Path) -> None:
                 )
     finally:
         _close_fd_quietly(index_fd)
+
+
+def _restore_pending_cleanup_terminal_retirement_aliases(
+    home: Path,
+    *,
+    index_fd: int | None = None,
+) -> int:
+    """Restore a ticket from its independent retirement hard-link authority."""
+    index_root = _pending_cleanup_index_path(home)
+    owns_index_fd = index_fd is None
+    if owns_index_fd:
+        try:
+            index_fd = _open_directory_beneath(home, index_root)
+        except FileNotFoundError:
+            return 0
+    assert index_fd is not None
+    restored = 0
+    try:
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending cleanup retirement scan exceeds the size limit",
+        )
+        aliases = sorted(
+            name
+            for name in names
+            if _pending_cleanup_terminal_retirement_batch_name(name) is not None
+        )
+        for alias_name in aliases:
+            batch_name = _pending_cleanup_terminal_retirement_batch_name(alias_name)
+            assert batch_name is not None
+            alias_path = index_root / alias_name
+            ticket_path = _pending_cleanup_ticket_path(home, batch_name)
+            alias_snapshot = _read_managed_state_file_snapshot(
+                home,
+                alias_path,
+                index_fd,
+            )
+            if not alias_snapshot.exists:
+                continue
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                alias_path,
+                index_fd,
+                alias_snapshot,
+            )
+            canonical_snapshot = _read_managed_state_file_snapshot(
+                home,
+                ticket_path,
+                index_fd,
+            )
+            if canonical_snapshot.exists:
+                if (
+                    alias_snapshot.file_identity != canonical_snapshot.file_identity
+                    or alias_snapshot.payload != canonical_snapshot.payload
+                    or alias_snapshot.link_count != 2
+                    or canonical_snapshot.link_count != 2
+                ):
+                    raise SyncError(
+                        "pending terminal cleanup retirement overlaps changed "
+                        f"ticket authority: {batch_name}"
+                    )
+                parsed = _read_pending_cleanup_terminal_retirement_ticket(
+                    home,
+                    alias_path,
+                    expected_identity=alias_snapshot.file_identity,
+                    expected_link_count=2,
+                )
+                if parsed is None:
+                    raise SyncError(
+                        "pending terminal cleanup retirement disappeared: "
+                        f"{batch_name}"
+                    )
+                continue
+            parsed = _read_pending_cleanup_terminal_retirement_ticket(
+                home,
+                alias_path,
+                expected_identity=alias_snapshot.file_identity,
+                expected_link_count=1,
+            )
+            if parsed is None:
+                raise SyncError(
+                    "pending terminal cleanup retirement disappeared: "
+                    f"{batch_name}"
+                )
+            try:
+                os.link(
+                    alias_name,
+                    ticket_path.name,
+                    src_dir_fd=index_fd,
+                    dst_dir_fd=index_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                pass
+            os.fsync(index_fd)
+            restored_ticket = _read_pending_cleanup_ticket(
+                home,
+                ticket_path,
+                expected_ticket_identity=alias_snapshot.file_identity,
+                expected_link_count=2,
+            )
+            if restored_ticket is None:
+                raise SyncError(
+                    "pending terminal cleanup retirement ticket recovery failed: "
+                    f"{batch_name}"
+                )
+            restored += 1
+        if not _bound_directory_matches(home, index_root, index_fd):
+            raise SyncError("pending cleanup index changed")
+    finally:
+        if owns_index_fd:
+            _close_fd_quietly(index_fd)
+    return restored
 
 
 def _restore_pending_cleanup_control_tombstones(
@@ -40052,7 +40720,15 @@ def _restore_pending_cleanup_control_tombstones(
             parsed = _pending_cleanup_retained_control_name(retained_names[0])
             assert parsed is not None
             _parsed_canonical, batch_name = parsed
-            if not action_budget.charge_batch(batch_name):
+            if (
+                not canonical.endswith(
+                    (
+                        PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX,
+                        PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX,
+                    )
+                )
+                and not action_budget.charge_batch(batch_name)
+            ):
                 continue
             canonical_path = index_root / canonical
             retained_path = index_root / retained_names[0]
@@ -40119,10 +40795,68 @@ def _restore_pending_cleanup_control_tombstones(
                     home,
                     canonical_path,
                     expected_ticket_identity=recovered.file_identity,
+                    expected_link_count=None,
                 )
                 if ticket is None:
                     raise SyncError(
                         f"pending cleanup ticket recovery failed: {canonical}"
+                    )
+            elif canonical.endswith(PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX):
+                retirement_ticket = _read_pending_cleanup_terminal_retirement_ticket(
+                    home,
+                    canonical_path,
+                    expected_identity=recovered.file_identity,
+                    expected_link_count=None,
+                )
+                if retirement_ticket is None:
+                    raise SyncError(
+                        "pending terminal cleanup retirement recovery failed: "
+                        f"{canonical}"
+                    )
+            elif canonical.endswith(
+                PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX
+            ):
+                ticket = _read_pending_cleanup_ticket(
+                    home,
+                    _pending_cleanup_ticket_path(home, batch_name),
+                    expected_link_count=None,
+                )
+                if ticket is None:
+                    retirement_ticket = (
+                        _read_pending_cleanup_terminal_retirement_ticket(
+                            home,
+                            _pending_cleanup_terminal_retirement_path(
+                                home,
+                                batch_name,
+                            ),
+                            expected_link_count=None,
+                        )
+                    )
+                    ticket = retirement_ticket[0] if retirement_ticket else None
+                if ticket is None:
+                    raise SyncError(
+                        "pending terminal validation retirement lacks ticket "
+                        f"authority: {canonical}"
+                    )
+                quarantine_fd = _open_directory_beneath(
+                    home,
+                    ticket.batch_root.parent,
+                )
+                try:
+                    quarantine_identity = _directory_identity(quarantine_fd)
+                finally:
+                    _close_fd_quietly(quarantine_fd)
+                marker = _read_pending_cleanup_terminal_validation(
+                    home,
+                    ticket,
+                    quarantine_identity,
+                    receipt_path=canonical_path,
+                    expected_link_count=None,
+                )
+                if marker is None:
+                    raise SyncError(
+                        "pending terminal validation retirement recovery failed: "
+                        f"{canonical}"
                     )
             elif canonical.endswith(PENDING_PRIVATE_USE_RETIREMENT_SUFFIX):
                 receipt = _read_pending_private_use_retirement_receipt(
@@ -40135,6 +40869,10 @@ def _restore_pending_cleanup_control_tombstones(
                         f"private-use retirement recovery failed: {canonical}"
                     )
             restored += 1
+        restored += _restore_pending_cleanup_terminal_retirement_aliases(
+            home,
+            index_fd=index_fd,
+        )
         if not _bound_directory_matches(home, index_root, index_fd):
             raise SyncError("pending cleanup index changed")
     finally:
@@ -41084,12 +41822,30 @@ def _cleanup_orphan_pending_cleanup_empty_proofs(
                 # make this proof the only durable empty-batch evidence. Keep
                 # the proof unless every representation remains absent at both
                 # irreversible deletion boundaries on this exact index FD.
-                _require_pending_ephemeral_ticket_representations_absent(
-                    home,
-                    index_root,
-                    index_fd,
-                    batch_name,
+                allowed_names = (
+                    (
+                        batch_name
+                        + PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX,
+                    )
+                    if proof_authority.source_ticket_version in {4, 8}
+                    and proof_authority.terminal_regular_targets
+                    else ()
                 )
+                if allowed_names:
+                    _require_pending_ephemeral_ticket_representations_absent(
+                        home,
+                        index_root,
+                        index_fd,
+                        batch_name,
+                        allowed_names=allowed_names,
+                    )
+                else:
+                    _require_pending_ephemeral_ticket_representations_absent(
+                        home,
+                        index_root,
+                        index_fd,
+                        batch_name,
+                    )
                 _require_orphan_v3_empty_proof_allocation_join(
                     home,
                     proof_authority,
@@ -41748,6 +42504,8 @@ def _pending_cleanup_ready_batch_is_observed(
                     PENDING_CLEANUP_TICKET_SUFFIX,
                     PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
                     PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
+                    PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX,
+                    PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX,
                     PENDING_PRIVATE_USE_RETIREMENT_SUFFIX,
                 ):
                     if not entry.name.endswith(suffix):
@@ -41874,7 +42632,6 @@ def _cleanup_ready_pending_batches(
 ) -> int:
     if not _pending_link_pointer_is_absent(home):
         return 0
-    _require_no_pending_unresolved_ticket_representations(home)
     action_budget = budget or PendingCleanupActionBudget(
         MAX_PENDING_CLEANUP_BATCHES_PER_RUN
     )
@@ -41883,6 +42640,7 @@ def _cleanup_ready_pending_batches(
         home,
         budget=action_budget,
     )
+    _require_no_pending_unresolved_ticket_representations(home)
     _cleanup_pending_cleanup_ticket_temps(
         home,
         budget=action_budget,
@@ -41963,6 +42721,7 @@ def _cleanup_ready_pending_batches(
             ticket = _read_pending_cleanup_ticket(
                 home,
                 index_root / ticket_name,
+                expected_link_count=None,
             )
         except (FileNotFoundError, OSError, SyncError) as error:
             raise _pending_cleanup_authority_classification_error(
@@ -42128,6 +42887,15 @@ def _require_no_pending_terminal_mutation_authority(home: Path) -> None:
     finally:
         _close_fd_quietly(index_fd)
     for name in names:
+        retirement_control_batch_name = _pending_cleanup_terminal_retirement_batch_name(
+            name
+        )
+        if retirement_control_batch_name is not None:
+            raise SyncError(
+                "pending terminal cleanup retirement authority must be reconciled "
+                "before new mutation: "
+                f"{retirement_control_batch_name}"
+            )
         retirement_batch_name = (
             _pending_private_use_retirement_representation_batch_name(name)
         )
@@ -42195,6 +42963,8 @@ def _require_no_pending_terminal_mutation_authority(home: Path) -> None:
                 PENDING_CLEANUP_TICKET_SUFFIX,
                 PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
                 PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
+                PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX,
+                PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX,
             )
         ):
             raise SyncError(
@@ -43175,12 +43945,54 @@ def _verify_final_regular_targets(
         tuple(expected.size for expected in ticket.terminal_regular_targets),
         phase="final",
     )
-    for _pass in range(3):
-        current_ticket = _read_pending_cleanup_ticket(
+
+    def read_current_ticket() -> PendingBatchCleanupTicket | None:
+        current = _read_pending_cleanup_ticket(
             home,
             ticket.path,
             expected_ticket_identity=ticket.snapshot.file_identity,
+            expected_link_count=None,
         )
+        if current is not None:
+            if current.snapshot.link_count in {None, 1}:
+                return current
+            if current.snapshot.link_count != 2:
+                raise SyncError(
+                    "pending cleanup control has an unauthorized hard-link alias: "
+                    f"{ticket.batch_root.name}"
+                )
+            retirement = _read_pending_cleanup_terminal_retirement_ticket(
+                home,
+                _pending_cleanup_terminal_retirement_path(
+                    home,
+                    ticket.batch_root.name,
+                ),
+                expected_identity=current.snapshot.file_identity,
+                expected_link_count=2,
+            )
+            if retirement is None or not _managed_state_snapshot_matches_file_evidence(
+                retirement[1], current.snapshot
+            ):
+                raise SyncError(
+                    "pending cleanup control has an unauthorized hard-link alias: "
+                    f"{ticket.batch_root.name}"
+                )
+            return current
+        retirement = _read_pending_cleanup_terminal_retirement_ticket(
+            home,
+            _pending_cleanup_terminal_retirement_path(
+                home,
+                ticket.batch_root.name,
+            ),
+            expected_identity=ticket.snapshot.file_identity,
+            expected_link_count=None,
+        )
+        if retirement is None:
+            return None
+        return replace(retirement[0], path=ticket.path)
+
+    for _pass in range(3):
+        current_ticket = read_current_ticket()
         if current_ticket is None or not _pending_cleanup_ticket_matches(
             current_ticket,
             ticket,
@@ -43192,11 +44004,7 @@ def _verify_final_regular_targets(
             passes=1,
             preflight=False,
         )
-    current_ticket = _read_pending_cleanup_ticket(
-        home,
-        ticket.path,
-        expected_ticket_identity=ticket.snapshot.file_identity,
-    )
+    current_ticket = read_current_ticket()
     if current_ticket is None or not _pending_cleanup_ticket_matches(
         current_ticket,
         ticket,
