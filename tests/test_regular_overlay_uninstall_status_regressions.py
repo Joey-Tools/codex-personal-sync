@@ -1601,6 +1601,16 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
                 pointer_retirement_path=pointer_retirement.path,
             ),
         )
+        self.assertNotEqual(
+            MODULE._pending_terminal_validation_namespace_anchor_digest_legacy(
+                (),
+                (),
+            ),
+            MODULE._pending_terminal_validation_namespace_anchor_digest_legacy(
+                (entry,),
+                (),
+            ),
+        )
 
     def test_terminal_receipt_capacity_projects_deep_backup_namespace(self) -> None:
         terminal_target = PurePosixPath("agents", "reviewer.toml")

@@ -32989,7 +32989,14 @@ def _pending_terminal_validation_namespace_anchor_digest_legacy(
     namespace_entries: tuple[PendingTerminalValidationNamespaceEntry, ...],
     terminal_aliases: tuple[PendingTerminalValidationAlias, ...],
 ) -> str:
-    """Reproduce the pre-v1.0 v8 anchor for tickets without path authority."""
+    """Reproduce the legacy v8 anchor without trusting lookalike names.
+
+    Historic tickets did not persist the pointer-retirement path.  They may
+    therefore be readable for compatibility, but a state entry that merely
+    matches the old dynamic-name pattern must remain part of the bound
+    namespace.  Treating that name as protocol-owned would let an unrelated
+    inode enter the receipt ledger and be deleted by the cleanup walker.
+    """
     alias_paths = {alias.path for alias in terminal_aliases}
     excluded_paths = alias_paths | {
         PurePosixPath(PENDING_LINK_METADATA_NAME),
@@ -32997,15 +33004,7 @@ def _pending_terminal_validation_namespace_anchor_digest_legacy(
     }
 
     def is_excluded(path: PurePosixPath) -> bool:
-        return path in excluded_paths or (
-            len(path.parts) == 2
-            and path.parts[0] == "state"
-            and re.fullmatch(
-                r"pending-(?:complete|publish-error)-[0-9]+-[0-9]+",
-                path.parts[1],
-            )
-            is not None
-        )
+        return path in excluded_paths
 
     payload = [
         _pending_terminal_validation_namespace_anchor_entry_payload(entry)
