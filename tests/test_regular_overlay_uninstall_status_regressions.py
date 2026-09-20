@@ -2934,6 +2934,78 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         )
         self.assertEqual(self.target.stat().st_nlink, 1)
 
+    def test_terminal_receipt_rejects_byte_identical_replacement_before_delete(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        real_delete = MODULE._delete_pending_cleanup_terminal_validation
+        marker_path = MODULE._pending_cleanup_terminal_validation_retirement_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        replaced = False
+        original_identity: tuple[int, int] | None = None
+
+        def replace_marker_before_delete(
+            home: Path,
+            current_ticket: MODULE.PendingBatchCleanupTicket,
+            quarantine_root_identity: tuple[int, int],
+            *,
+            mutation_revalidator=None,
+            receipt_path=None,
+            expected_identity=None,
+            expected_link_count=1,
+            **kwargs: object,
+        ) -> None:
+            nonlocal replaced, original_identity
+            if receipt_path == marker_path and not replaced:
+                metadata = marker_path.stat()
+                original_identity = (metadata.st_dev, metadata.st_ino)
+                payload = marker_path.read_bytes()
+                marker_path.unlink()
+                marker_path.write_bytes(payload)
+                marker_path.chmod(0o600)
+                replaced = True
+            real_delete(
+                home,
+                current_ticket,
+                quarantine_root_identity,
+                mutation_revalidator=mutation_revalidator,
+                receipt_path=receipt_path,
+                expected_identity=expected_identity,
+                expected_link_count=expected_link_count,
+                **kwargs,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_delete_pending_cleanup_terminal_validation",
+                side_effect=replace_marker_before_delete,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "managed sync state changed before read",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(replaced)
+        self.assertIsNotNone(original_identity)
+        current_metadata = marker_path.stat()
+        self.assertNotEqual(
+            (current_metadata.st_dev, current_metadata.st_ino),
+            original_identity,
+        )
+        self.assertFalse(ticket.path.exists())
+        self.assertTrue(marker_path.is_file())
+        self.assertTrue(
+            MODULE._pending_cleanup_empty_proof_path(
+                self.home,
+                ticket.batch_root.name,
+            ).is_file()
+        )
+
     def test_v8_control_retirement_rechecks_foreign_hardlink_after_final_verify(
         self,
     ) -> None:

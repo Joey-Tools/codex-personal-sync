@@ -4925,6 +4925,14 @@ class PendingTerminalFileExpectation:
 
 
 @dataclass(frozen=True)
+class PendingTerminalValidationReceiptAuthority:
+    """Durable identity/content authority for the terminal validation receipt."""
+
+    parent_identity: tuple[int, int]
+    file: PendingTerminalFileExpectation
+
+
+@dataclass(frozen=True)
 class PendingTerminalCommitEvidenceAuthority:
     """Ticket-bound authority for the transaction commit-evidence inode."""
 
@@ -5014,6 +5022,7 @@ class PendingCleanupEmptyProofAuthority:
     ticket_identity: tuple[int, int]
     ticket_sha256: str
     terminal_regular_targets: tuple[PendingRegularTargetExpectation, ...]
+    terminal_validation_receipt: PendingTerminalValidationReceiptAuthority | None = None
     source_ticket_version: int | None = None
     allocation_control: PendingPrivateUseControlEvidence | None = None
     allocation_join_metadata: PendingCleanupEmptyProofAllocationJoin | None = None
@@ -28368,6 +28377,27 @@ def _pending_terminal_file_expectation_payload(
     }
 
 
+def _pending_terminal_validation_receipt_authority_from_snapshot(
+    snapshot: ManagedStateFileSnapshot,
+    label: str,
+) -> PendingTerminalValidationReceiptAuthority:
+    if snapshot.parent_identity is None or snapshot.mode != 0o600:
+        raise SyncError(f"pending terminal {label} authority is incomplete")
+    return PendingTerminalValidationReceiptAuthority(
+        parent_identity=snapshot.parent_identity,
+        file=_pending_terminal_file_expectation_from_snapshot(snapshot, label),
+    )
+
+
+def _pending_terminal_validation_receipt_authority_payload(
+    authority: PendingTerminalValidationReceiptAuthority,
+) -> dict[str, object]:
+    return {
+        "parent_identity": _identity_payload(authority.parent_identity),
+        "file": _pending_terminal_file_expectation_payload(authority.file),
+    }
+
+
 def _pending_terminal_commit_evidence_authority_payload(
     authority: PendingTerminalCommitEvidenceAuthority,
 ) -> dict[str, object]:
@@ -28782,6 +28812,37 @@ def _parse_pending_terminal_file_expectation(
         uid=uid,
         gid=gid,
         link_count=link_count,
+    )
+
+
+def _parse_pending_terminal_validation_receipt_authority(
+    raw: object,
+    *,
+    batch_name: str,
+) -> PendingTerminalValidationReceiptAuthority:
+    fields = {"parent_identity", "file"}
+    if not isinstance(raw, dict) or set(raw) != fields:
+        raise SyncError(
+            "pending terminal validation receipt authority changed: "
+            f"{batch_name}"
+        )
+    parent_identity = _parse_pending_identity(
+        raw.get("parent_identity"),
+        "pending terminal validation receipt parent identity",
+    )
+    file = _parse_pending_terminal_file_expectation(
+        raw.get("file"),
+        batch_name=batch_name,
+        label="validation receipt",
+    )
+    if parent_identity is None:
+        raise SyncError(
+            "pending terminal validation receipt authority changed: "
+            f"{batch_name}"
+        )
+    return PendingTerminalValidationReceiptAuthority(
+        parent_identity=parent_identity,
+        file=file,
     )
 
 
@@ -34776,6 +34837,76 @@ def _pending_terminal_file_matches_expectation(
     )
 
 
+def _pending_terminal_validation_receipt_matches_authority(
+    snapshot: ManagedStateFileSnapshot,
+    authority: PendingTerminalValidationReceiptAuthority,
+    *,
+    expected_link_count: int | None = None,
+) -> bool:
+    return (
+        snapshot.parent_identity == authority.parent_identity
+        and _pending_terminal_file_matches_expectation(
+            snapshot,
+            authority.file,
+            expected_link_count=expected_link_count,
+        )
+    )
+
+
+def _pending_terminal_validation_receipt_authority_matches(
+    actual: PendingTerminalValidationReceiptAuthority,
+    expected: PendingTerminalValidationReceiptAuthority,
+) -> bool:
+    """Compare receipt authority while allowing its hard-link count to evolve."""
+    return (
+        actual.parent_identity == expected.parent_identity
+        and actual.file.file_identity == expected.file.file_identity
+        and actual.file.sha256 == expected.file.sha256
+        and actual.file.size == expected.file.size
+        and actual.file.mode == expected.file.mode
+        and actual.file.uid == expected.file.uid
+        and _gid_matches_regular_file_access_policy(
+            actual.file.gid,
+            expected.file.gid,
+            expected.file.mode,
+        )
+    )
+
+
+def _pending_terminal_validation_receipt_has_complete_authority(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+    receipt: ManagedStateFileSnapshot,
+) -> bool:
+    try:
+        authority = _parse_pending_terminal_validation_authority(
+            home,
+            ticket,
+            quarantine_root_identity,
+            receipt,
+        )
+        if (
+            authority is None
+            or authority.namespace_entries is None
+            or not authority.control_files
+            or ticket.terminal_namespace_sha256 is None
+            or ticket.pointer_retirement_authority is None
+            or ticket.pointer_retirement_path is None
+        ):
+            return False
+        return (
+            _pending_terminal_validation_namespace_anchor_digest_for_ticket(
+                ticket,
+                authority.namespace_entries,
+                authority.aliases,
+            )
+            == ticket.terminal_namespace_sha256
+        )
+    except (OSError, SyncError):
+        return False
+
+
 def _require_pending_terminal_pointer_retirement_authority(
     home: Path,
     ticket: PendingBatchCleanupTicket,
@@ -35817,6 +35948,7 @@ def _read_pending_cleanup_terminal_validation(
     quarantine_root_identity: tuple[int, int],
     *,
     receipt_path: Path | None = None,
+    expected_identity: tuple[int, int] | None = None,
     expected_link_count: int | None = 1,
 ) -> ManagedStateFileSnapshot | None:
     if receipt_path is None:
@@ -35830,6 +35962,7 @@ def _read_pending_cleanup_terminal_validation(
             home,
             receipt_path,
             index_fd,
+            expected_identity=expected_identity,
         )
         if not receipt.exists:
             return None
@@ -36002,6 +36135,7 @@ def _delete_pending_cleanup_terminal_validation(
     *,
     mutation_revalidator: Callable[[str, int], None] | None = None,
     receipt_path: Path | None = None,
+    expected_identity: tuple[int, int] | None = None,
     expected_link_count: int = 1,
 ) -> None:
     receipt = _read_pending_cleanup_terminal_validation(
@@ -36009,6 +36143,7 @@ def _delete_pending_cleanup_terminal_validation(
         ticket,
         quarantine_root_identity,
         receipt_path=receipt_path,
+        expected_identity=expected_identity,
         expected_link_count=expected_link_count,
     )
     if receipt is None:
@@ -36056,6 +36191,9 @@ def _pending_cleanup_empty_proof_authority_from_ticket(
     quarantine_root_identity: tuple[int, int],
     *,
     joined_allocation: PendingQuarantineAllocationTicket | None = None,
+    terminal_validation_receipt: (
+        PendingTerminalValidationReceiptAuthority | None
+    ) = None,
 ) -> PendingCleanupEmptyProofAuthority:
     if ticket.snapshot.file_identity is None or ticket.snapshot.payload is None:
         raise SyncError("pending cleanup ticket has no empty-proof identity")
@@ -36160,6 +36298,7 @@ def _pending_cleanup_empty_proof_authority_from_ticket(
         ticket_identity=ticket.snapshot.file_identity,
         ticket_sha256=hashlib.sha256(ticket.snapshot.payload).hexdigest(),
         terminal_regular_targets=terminal_regular_targets,
+        terminal_validation_receipt=terminal_validation_receipt,
         source_ticket_version=source_ticket_version,
         allocation_control=allocation_control,
         allocation_join_metadata=allocation_join_metadata,
@@ -36185,6 +36324,7 @@ def _pending_cleanup_empty_proof_payload_from_authority(
     if authority.version == 1:
         if (
             authority.terminal_regular_targets
+            or authority.terminal_validation_receipt is not None
             or authority.source_ticket_version is not None
             or authority.allocation_control is not None
             or authority.allocation_join_metadata is not None
@@ -36192,7 +36332,8 @@ def _pending_cleanup_empty_proof_payload_from_authority(
             raise SyncError("pending cleanup empty proof v1 has unsupported authority")
     elif authority.version == 2:
         if (
-            authority.source_ticket_version is not None
+            authority.terminal_validation_receipt is not None
+            or authority.source_ticket_version is not None
             or authority.allocation_control is not None
             or authority.allocation_join_metadata is not None
         ):
@@ -36215,6 +36356,17 @@ def _pending_cleanup_empty_proof_payload_from_authority(
             )
             for expectation in authority.terminal_regular_targets
         ]
+        if authority.source_ticket_version in {4, 8}:
+            if authority.terminal_validation_receipt is not None:
+                payload["terminal_validation_receipt"] = (
+                    _pending_terminal_validation_receipt_authority_payload(
+                        authority.terminal_validation_receipt
+                    )
+                )
+        elif authority.terminal_validation_receipt is not None:
+            raise SyncError(
+                "pending cleanup empty proof v3 has unexpected receipt authority"
+            )
         if (
             authority.source_ticket_version in {5, 7}
             and authority.terminal_regular_targets
@@ -36289,12 +36441,16 @@ def _pending_cleanup_empty_proof_payload(
     quarantine_root_identity: tuple[int, int],
     *,
     joined_allocation: PendingQuarantineAllocationTicket | None = None,
+    terminal_validation_receipt: (
+        PendingTerminalValidationReceiptAuthority | None
+    ) = None,
 ) -> bytes:
     return _pending_cleanup_empty_proof_payload_from_authority(
         _pending_cleanup_empty_proof_authority_from_ticket(
             ticket,
             quarantine_root_identity,
             joined_allocation=joined_allocation,
+            terminal_validation_receipt=terminal_validation_receipt,
         )
     )
 
@@ -36326,6 +36482,7 @@ def _parse_pending_cleanup_empty_proof_authority(
         "ticket_identity",
         "ticket_sha256",
     }
+    optional_v3_fields: set[str] = set()
     if version == 2:
         expected_fields.add("terminal_regular_targets")
     elif version == 3:
@@ -36337,7 +36494,11 @@ def _parse_pending_cleanup_empty_proof_authority(
                 "allocation_join_metadata",
             }
         )
-    if version not in {1, 2, 3} or set(data) != expected_fields:
+        optional_v3_fields.add("terminal_validation_receipt")
+    if version not in {1, 2, 3} or (
+        set(data) != expected_fields
+        and set(data) != expected_fields | optional_v3_fields
+    ):
         raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
     batch_identity = _parse_pending_identity(
         data.get("batch_root_identity"),
@@ -36373,6 +36534,9 @@ def _parse_pending_cleanup_empty_proof_authority(
         else ()
     )
     source_ticket_version: int | None = None
+    terminal_validation_receipt: (
+        PendingTerminalValidationReceiptAuthority | None
+    ) = None
     allocation_control: PendingPrivateUseControlEvidence | None = None
     allocation_join_metadata: PendingCleanupEmptyProofAllocationJoin | None = None
     if version == 3:
@@ -36381,6 +36545,15 @@ def _parse_pending_cleanup_empty_proof_authority(
             raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
         if source_ticket_version in {5, 7} and targets:
             raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
+        if "terminal_validation_receipt" in data:
+            if source_ticket_version not in {4, 8}:
+                raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
+            terminal_validation_receipt = (
+                _parse_pending_terminal_validation_receipt_authority(
+                    data.get("terminal_validation_receipt"),
+                    batch_name=batch_name,
+                )
+            )
         allocation_payload = data.get("allocation_control")
         join_payload = data.get("allocation_join_metadata")
         if source_ticket_version in {4, 8}:
@@ -36441,6 +36614,7 @@ def _parse_pending_cleanup_empty_proof_authority(
         ticket_identity=ticket_identity,
         ticket_sha256=ticket_sha256,
         terminal_regular_targets=targets,
+        terminal_validation_receipt=terminal_validation_receipt,
         source_ticket_version=source_ticket_version,
         allocation_control=allocation_control,
         allocation_join_metadata=allocation_join_metadata,
@@ -36500,7 +36674,35 @@ def _read_pending_cleanup_empty_proof(
                 )
         elif joined_allocation is not None:
             raise ValueError("non-ephemeral empty proof received an allocation join")
+        current_receipt_authority: (
+            PendingTerminalValidationReceiptAuthority | None
+        ) = None
+        if ticket.version in {4, 8} and ticket.terminal_regular_targets:
+            current_receipt = _read_pending_cleanup_terminal_validation(
+                home,
+                ticket,
+                quarantine_root_identity,
+                expected_link_count=None,
+            )
+            if current_receipt is not None and _pending_terminal_validation_receipt_has_complete_authority(
+                home,
+                ticket,
+                quarantine_root_identity,
+                current_receipt,
+            ):
+                current_receipt_authority = (
+                    _pending_terminal_validation_receipt_authority_from_snapshot(
+                        current_receipt,
+                        "validation receipt",
+                    )
+                )
         expected_authority = _pending_cleanup_empty_proof_authority_from_ticket(
+            ticket,
+            quarantine_root_identity,
+            joined_allocation=current_allocation,
+            terminal_validation_receipt=current_receipt_authority,
+        )
+        base_authority = _pending_cleanup_empty_proof_authority_from_ticket(
             ticket,
             quarantine_root_identity,
             joined_allocation=current_allocation,
@@ -36509,26 +36711,53 @@ def _read_pending_cleanup_empty_proof(
             expected_authority,
             version=1,
             terminal_regular_targets=(),
+            terminal_validation_receipt=None,
             source_ticket_version=None,
             allocation_control=None,
             allocation_join_metadata=None,
         )
-        compatible_authorities = [expected_authority, compatible_v1_authority]
+        compatible_authorities = [
+            expected_authority,
+            base_authority,
+            compatible_v1_authority,
+        ]
         if ticket.version in {4, 5, 7, 8}:
             compatible_authorities.append(
                 replace(
-                    expected_authority,
+                    base_authority,
                     version=2,
                     source_ticket_version=None,
                     allocation_control=None,
                     allocation_join_metadata=None,
                 )
             )
+        authority_without_receipt = replace(
+            authority,
+            terminal_validation_receipt=None,
+        )
+        receipt_authority_match = (
+            authority.terminal_validation_receipt is not None
+            and current_receipt_authority is not None
+            and _pending_terminal_validation_receipt_authority_matches(
+                authority.terminal_validation_receipt,
+                current_receipt_authority,
+            )
+        )
+        authority_match = (
+            authority in compatible_authorities
+            or (
+                authority_without_receipt in compatible_authorities
+                and (
+                    current_receipt_authority is None
+                    or receipt_authority_match
+                )
+            )
+        )
         if (
             proof.file_type != stat.S_IFREG
             or proof.mode != 0o600
             or proof.uid != os.geteuid()
-            or authority not in compatible_authorities
+            or not authority_match
             or proof.parent_identity != _directory_identity(index_fd)
         ):
             raise SyncError(
@@ -36551,6 +36780,9 @@ def _publish_pending_cleanup_empty_proof(
     quarantine_root_identity: tuple[int, int],
     *,
     joined_allocation: PendingQuarantineAllocationTicket | None = None,
+    terminal_validation_receipt: (
+        PendingTerminalValidationReceiptAuthority | None
+    ) = None,
 ) -> ManagedStateFileSnapshot:
     ticket_version = getattr(ticket, "version", None)
     if ticket_version == 7:
@@ -36591,6 +36823,7 @@ def _publish_pending_cleanup_empty_proof(
             ticket,
             quarantine_root_identity,
             joined_allocation=joined_allocation,
+            terminal_validation_receipt=terminal_validation_receipt,
         ),
     )
     verified = _read_pending_cleanup_empty_proof(
@@ -39391,14 +39624,37 @@ def _remove_cleanup_ready_batch(
             bound_batch_root,
             expected_mode=0o700,
         )
+        terminal_validation_receipt_authority: (
+            PendingTerminalValidationReceiptAuthority | None
+        ) = None
+        if ticket.version in {4, 8} and ticket.terminal_regular_targets:
+            terminal_validation_receipt = _read_pending_cleanup_terminal_validation(
+                home,
+                ticket,
+                quarantine_root_identity,
+                expected_link_count=None,
+            )
+            if terminal_validation_receipt is None:
+                raise SyncError(
+                    "pending terminal validation receipt is missing before empty "
+                    f"proof publication: {ticket.batch_root.name}"
+                )
+            terminal_validation_receipt_authority = (
+                _pending_terminal_validation_receipt_authority_from_snapshot(
+                    terminal_validation_receipt,
+                    "validation receipt",
+                )
+            )
         expected_proof_authority = _pending_cleanup_empty_proof_authority_from_ticket(
             ticket,
             quarantine_root_identity,
+            terminal_validation_receipt=terminal_validation_receipt_authority,
         )
         _publish_pending_cleanup_empty_proof(
             home,
             ticket,
             quarantine_root_identity,
+            terminal_validation_receipt=terminal_validation_receipt_authority,
         )
 
         def require_terminal_batch_rmdir_boundary() -> None:
@@ -39582,6 +39838,7 @@ def _delete_pending_cleanup_terminal_retirement(
     parsed = _read_pending_cleanup_terminal_retirement_ticket(
         home,
         retirement_path,
+        expected_identity=ticket.snapshot.file_identity,
         expected_link_count=1,
     )
     if parsed is None:
@@ -39669,20 +39926,23 @@ def _retire_terminal_regular_cleanup_controls(
     if ticket.version not in {4, 8}:
         raise ValueError("terminal regular control retirement requires v4 or v8")
 
-    expected_proof_authority = _pending_cleanup_empty_proof_authority_from_ticket(
+    base_proof_authority = _pending_cleanup_empty_proof_authority_from_ticket(
         ticket,
         quarantine_root_identity,
     )
+    expected_proof_authority = base_proof_authority
     compatible_v2_authority = replace(
-        expected_proof_authority,
+        base_proof_authority,
         version=2,
         source_ticket_version=None,
         allocation_control=None,
         allocation_join_metadata=None,
     )
     retirement_control_snapshot: ManagedStateFileSnapshot | None = None
+    receipt_authority: PendingTerminalValidationReceiptAuthority | None = None
 
     def require_current_v3_proof_and_final_group() -> None:
+        nonlocal expected_proof_authority, receipt_authority
         proof = _read_pending_cleanup_empty_proof(
             home,
             ticket,
@@ -39707,8 +39967,48 @@ def _retire_terminal_regular_cleanup_controls(
             _pending_cleanup_empty_proof_path(home, ticket.batch_root.name),
             proof.payload,
         )
+        bound_receipt_authority = proof_authority.terminal_validation_receipt
+        if bound_receipt_authority is not None:
+            if (
+                receipt_authority is not None
+                and not _pending_terminal_validation_receipt_authority_matches(
+                    receipt_authority,
+                    bound_receipt_authority,
+                )
+            ):
+                raise SyncError(
+                    "pending terminal validation receipt identity changed before "
+                    "control retirement; manual recovery is required: "
+                    f"{ticket.batch_root.name}"
+                )
+            receipt_authority = bound_receipt_authority
+            expected_proof_authority = replace(
+                base_proof_authority,
+                terminal_validation_receipt=bound_receipt_authority,
+            )
+        for current_receipt in (canonical_receipt, retired_receipt):
+            if (
+                current_receipt is not None
+                and receipt_authority is not None
+                and _pending_terminal_validation_receipt_has_complete_authority(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                    current_receipt,
+                )
+                and not _pending_terminal_validation_receipt_matches_authority(
+                    current_receipt,
+                    receipt_authority,
+                )
+            ):
+                raise SyncError(
+                    "pending terminal validation receipt identity changed before "
+                    "control retirement; manual recovery is required: "
+                    f"{ticket.batch_root.name}"
+                )
         if (
             proof_authority != expected_proof_authority
+            and proof_authority != base_proof_authority
             and proof_authority != compatible_v2_authority
         ):
             # Old v1 proofs remain parseable so callers can report or inspect
@@ -39755,6 +40055,7 @@ def _retire_terminal_regular_cleanup_controls(
         A missing marker or incomplete receipt remains manual recovery; it is
         never treated as implicit authorization.
         """
+        nonlocal receipt_authority
         receipt = _read_pending_cleanup_terminal_validation(
             home,
             ticket,
@@ -39787,6 +40088,23 @@ def _retire_terminal_regular_cleanup_controls(
                 "authority; manual recovery is required: "
                 f"{ticket.batch_root.name}"
             )
+        if receipt_authority is None:
+            receipt_authority = (
+                _pending_terminal_validation_receipt_authority_from_snapshot(
+                    receipt,
+                    "validation receipt",
+                )
+            )
+        elif not _pending_terminal_validation_receipt_matches_authority(
+            receipt,
+            receipt_authority,
+            expected_link_count=expected_link_count,
+        ):
+            raise SyncError(
+                "pending terminal validation receipt identity changed before "
+                "control retirement; manual recovery is required: "
+                f"{ticket.batch_root.name}"
+            )
         if (
             _pending_terminal_validation_namespace_anchor_digest_for_ticket(
                 ticket,
@@ -39816,9 +40134,24 @@ def _retire_terminal_regular_cleanup_controls(
         receipt_path=retirement_path,
         expected_link_count=None,
     )
+    if receipt_authority is None:
+        source_receipt = canonical_receipt or retired_receipt
+        if source_receipt is not None and _pending_terminal_validation_receipt_has_complete_authority(
+            home,
+            ticket,
+            quarantine_root_identity,
+            source_receipt,
+        ):
+            receipt_authority = (
+                _pending_terminal_validation_receipt_authority_from_snapshot(
+                    source_receipt,
+                    "validation receipt",
+                )
+            )
     retirement_control = _read_pending_cleanup_terminal_retirement_ticket(
         home,
         retirement_control_path,
+        expected_identity=ticket.snapshot.file_identity,
         expected_link_count=None,
     )
     if retirement_control is None:
@@ -39935,6 +40268,11 @@ def _retire_terminal_regular_cleanup_controls(
             ticket,
             quarantine_root_identity,
             receipt_path=retirement_path,
+            expected_identity=(
+                receipt_authority.file.file_identity
+                if receipt_authority is not None
+                else None
+            ),
             expected_link_count=None,
         )
         if marker is None:
@@ -39943,6 +40281,11 @@ def _retire_terminal_regular_cleanup_controls(
                 ticket,
                 quarantine_root_identity,
                 receipt_path=receipt_path,
+                expected_identity=(
+                    receipt_authority.file.file_identity
+                    if receipt_authority is not None
+                    else None
+                ),
                 expected_link_count=None,
             )
             if canonical is not None:
@@ -39980,6 +40323,11 @@ def _retire_terminal_regular_cleanup_controls(
             quarantine_root_identity,
             mutation_revalidator=require_terminal_validation_boundary,
             receipt_path=receipt_path,
+            expected_identity=(
+                receipt_authority.file.file_identity
+                if receipt_authority is not None
+                else None
+            ),
             expected_link_count=2,
         )
     _delete_pending_cleanup_ticket(
@@ -40001,6 +40349,11 @@ def _retire_terminal_regular_cleanup_controls(
             ticket,
             quarantine_root_identity,
             receipt_path=retirement_path,
+            expected_identity=(
+                receipt_authority.file.file_identity
+                if receipt_authority is not None
+                else None
+            ),
             expected_link_count=None,
         )
         is not None
@@ -40019,6 +40372,11 @@ def _retire_terminal_regular_cleanup_controls(
             quarantine_root_identity,
             mutation_revalidator=require_retirement_marker_boundary,
             receipt_path=retirement_path,
+            expected_identity=(
+                receipt_authority.file.file_identity
+                if receipt_authority is not None
+                else None
+            ),
             expected_link_count=1,
         )
     if (
@@ -40042,6 +40400,11 @@ def _retire_terminal_regular_cleanup_controls(
                 ticket,
                 quarantine_root_identity,
                 receipt_path=retirement_path,
+                expected_identity=(
+                    receipt_authority.file.file_identity
+                    if receipt_authority is not None
+                    else None
+                ),
                 expected_link_count=None,
             )
             if marker is not None:
