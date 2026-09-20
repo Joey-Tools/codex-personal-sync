@@ -196,6 +196,53 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             os.fsync(stream.fileno())
         ticket.path.chmod(0o600)
 
+    def _marker_only_v4_ticket(self) -> MODULE.PendingBatchCleanupTicket:
+        ticket = self._deferred_terminal_ticket()
+        payload = json.loads(ticket.path.read_text(encoding="utf-8"))
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        payload["version"] = MODULE.LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        payload["terminal_regular_targets"] = []
+        for field in (
+            "commit_evidence",
+            "terminal_namespace_sha256",
+            "pointer_retirement_path",
+            "pointer_retirement",
+        ):
+            payload.pop(field, None)
+        self._rewrite_ticket_same_inode(ticket, payload)
+        (ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME).write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "created_at": "2026-09-20T00:00:00Z",
+                    "actions": [],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        shutil.rmtree(ticket.batch_root / "links")
+        shutil.rmtree(ticket.batch_root / "state", ignore_errors=True)
+        pending_root = ticket.batch_root / "pending"
+        for child in pending_root.iterdir():
+            if child.name != "state":
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+        state_root = pending_root / "state"
+        for child in state_root.iterdir():
+            if child.name not in {"committed", "commit-evidence"}:
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+        legacy_ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket.path)
+        self.assertIsNotNone(legacy_ticket)
+        assert legacy_ticket is not None
+        return legacy_ticket
+
     def _crash_after_walker_alias_unlink(
         self,
         ticket: MODULE.PendingBatchCleanupTicket,
@@ -2993,6 +3040,52 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
                 )
         finally:
             MODULE._close_fd_quietly(scan_fd)
+
+    def test_marker_only_v4_recovers_after_control_unlink_crash(self) -> None:
+        ticket = self._marker_only_v4_ticket()
+        real_unlink = os.unlink
+        crashed = False
+
+        def unlink_then_crash(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            *args: object,
+            dir_fd: int | None = None,
+            **kwargs: object,
+        ) -> None:
+            nonlocal crashed
+            real_unlink(path, *args, dir_fd=dir_fd, **kwargs)
+            if (
+                not crashed
+                and isinstance(path, str)
+                and path.startswith(MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+            ):
+                crashed = True
+                raise SystemExit("injected marker-only control unlink crash")
+
+        with (
+            mock.patch.object(MODULE.os, "unlink", side_effect=unlink_then_crash),
+            self.assertRaisesRegex(
+                SystemExit,
+                "injected marker-only control unlink crash",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(crashed)
+        self.assertTrue(
+            MODULE._pending_cleanup_terminal_validation_path(
+                self.home,
+                ticket.batch_root.name,
+            ).is_file()
+        )
+        self.assertTrue(
+            MODULE._pending_cleanup_empty_proof_path(
+                self.home,
+                ticket.batch_root.name,
+            ).is_file()
+        )
+        self.assertTrue(MODULE._cleanup_ready_pending_batches(self.home))
+        self.assertFalse(ticket.batch_root.exists())
 
     def test_ticket_tombstone_is_restored_and_cleanup_retries(self) -> None:
         real_delete = MODULE._isolate_and_delete_pending_cleanup_file

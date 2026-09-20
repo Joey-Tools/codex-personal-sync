@@ -32384,37 +32384,44 @@ def _remove_pending_batch_directory_contents(
         raise SyncError("pending cleanup directory is absent from the identity ledger")
     entries = list(planned_entries)
     current_entries: dict[str, tuple[int, int, int]] = {}
-    with os.scandir(directory_fd) as iterator:
-        for entry in iterator:
-            if entry.name in skipped_names:
-                continue
-            try:
-                metadata = entry.stat(follow_symlinks=False)
-            except OSError as error:
-                raise SyncError(
-                    f"pending cleanup entry changed: {entry.name}"
-                ) from error
-            active_name = (
-                _pending_regular_publication_private_deletion_alias_base(entry.name)
-                or entry.name
-            )
-            active_plan = _pending_cleanup_internal_entry_plan(
-                active_name,
-                PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+    if budget[0] <= 0:
+        raise SyncError("pending cleanup directory scan exceeds the entry budget")
+    current_names = _directory_member_names(
+        directory_fd,
+        maximum_entries=min(MAX_PENDING_CLEANUP_ENTRIES, budget[0]),
+        overflow_message="pending cleanup directory scan exceeds the entry budget",
+    )
+    budget[0] -= len(current_names)
+    for name in current_names:
+        if name in skipped_names:
+            continue
+        try:
+            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as error:
+            raise SyncError(
+                f"pending cleanup entry changed: {name}"
+            ) from error
+        active_name = (
+            _pending_regular_publication_private_deletion_alias_base(name)
+            or name
+        )
+        active_plan = _pending_cleanup_internal_entry_plan(
+            active_name,
+            PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+            directory_identity,
+        )
+        active_links_plan = None
+        if not relative_parts:
+            active_links_plan = _pending_cleanup_internal_entry_plan(
+                name,
+                PENDING_CLEANUP_ACTIVE_LINKS_ENTRY_PREFIX,
                 directory_identity,
             )
-            active_links_plan = None
-            if not relative_parts:
-                active_links_plan = _pending_cleanup_internal_entry_plan(
-                    entry.name,
-                    PENDING_CLEANUP_ACTIVE_LINKS_ENTRY_PREFIX,
-                    directory_identity,
-                )
-            current_entries[entry.name] = (
-                active_links_plan
-                or active_plan
-                or _pending_cleanup_entry_plan(metadata)
-            )
+        current_entries[name] = (
+            active_links_plan
+            or active_plan
+            or _pending_cleanup_entry_plan(metadata)
+        )
     expected_entries = {
         name: planned
         for (
@@ -32744,30 +32751,37 @@ def _remove_pending_batch_directory_contents(
                 label=f"pending cleanup entry reappeared: {name}",
             )
 
-    with os.scandir(directory_fd) as iterator:
-        for entry in iterator:
-            if entry.name in skipped_names:
-                continue
-            retained_plan = _pending_cleanup_internal_entry_plan(
-                entry.name,
-                PENDING_CLEANUP_RETAINED_ENTRY_PREFIX,
-                directory_identity,
-            )
-            if retained_plan is not None:
-                raise SyncError(
-                    "pending cleanup retained entry requires manual cleanup: "
-                    f"{entry.name}"
-                )
-            try:
-                metadata = entry.stat(follow_symlinks=False)
-            except OSError as error:
-                raise SyncError(
-                    f"pending cleanup directory gained an entry: {entry.name}"
-                ) from error
+    if budget[0] <= 0:
+        raise SyncError("pending cleanup directory scan exceeds the entry budget")
+    remaining_names = _directory_member_names(
+        directory_fd,
+        maximum_entries=min(MAX_PENDING_CLEANUP_ENTRIES, budget[0]),
+        overflow_message="pending cleanup directory scan exceeds the entry budget",
+    )
+    budget[0] -= len(remaining_names)
+    for name in remaining_names:
+        if name in skipped_names:
+            continue
+        retained_plan = _pending_cleanup_internal_entry_plan(
+            name,
+            PENDING_CLEANUP_RETAINED_ENTRY_PREFIX,
+            directory_identity,
+        )
+        if retained_plan is not None:
             raise SyncError(
-                "pending cleanup directory gained an unknown entry; the batch "
-                f"was retained without deletion: {entry.name}"
+                "pending cleanup retained entry requires manual cleanup: "
+                f"{name}"
             )
+        try:
+            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as error:
+            raise SyncError(
+                f"pending cleanup directory gained an entry: {name}"
+            ) from error
+        raise SyncError(
+            "pending cleanup directory gained an unknown entry; the batch "
+            f"was retained without deletion: {name}"
+        )
     if mutated:
         os.fsync(directory_fd)
     if effective_expected_mode is None:
@@ -33516,6 +33530,21 @@ def _require_pending_terminal_validation_control_set(
         for control in controls
         for path in control.paths
     }
+    marker_only = (
+        ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        and not ticket.terminal_regular_targets
+    )
+    if marker_only:
+        metadata_paths = actual_paths - expected_paths
+        if metadata_paths not in (
+            {PurePosixPath(PENDING_LINK_METADATA_NAME)},
+            {PurePosixPath("metadata.json")},
+        ):
+            raise SyncError(
+                "pending terminal validation marker-only metadata authority is "
+                f"incomplete: {ticket.batch_root.name}"
+            )
+        expected_paths.update(metadata_paths)
     if actual_paths != expected_paths:
         raise SyncError(
             "pending terminal validation control authority is incomplete: "
@@ -35239,6 +35268,8 @@ def _ensure_pending_terminal_validation_receipt(
     *,
     legacy_generic_validation: LegacyGenericCleanupValidation | None = None,
     namespace_anchor_sha256: str | None = None,
+    entry_budget: list[int] | None = None,
+    marker_only_authorized: bool = False,
 ) -> None:
     if ticket.version in {1, 2}:
         existing_receipt = _read_pending_cleanup_terminal_validation(
@@ -35264,6 +35295,71 @@ def _ensure_pending_terminal_validation_receipt(
                 quarantine_root_identity,
                 legacy_generic_validation=legacy_generic_validation,
             )
+        return
+    if (
+        ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        and not ticket.terminal_regular_targets
+    ):
+        existing_receipt = _read_pending_cleanup_terminal_validation(
+            home,
+            ticket,
+            quarantine_root_identity,
+        )
+        if existing_receipt is not None:
+            authority = _parse_pending_terminal_validation_authority(
+                home,
+                ticket,
+                quarantine_root_identity,
+                existing_receipt,
+            )
+            if authority is None or not authority.control_files:
+                raise SyncError(
+                    "legacy marker-only v4 validation receipt lacks control "
+                    "authority; manual recovery is required: "
+                    f"{ticket.batch_root.name}"
+                )
+            _require_pending_terminal_validation_control_files(
+                home,
+                bound_batch_root,
+                batch_fd,
+                authority.control_files,
+                entry_budget=entry_budget,
+            )
+            return
+        if not marker_only_authorized:
+            # Some historic v4 tickets were admitted before marker/evidence
+            # controls became mandatory. Preserve their compatibility path:
+            # publish only the legacy empty proof and let the old walker
+            # semantics finish or report the existing recovery error.
+            return
+        metadata_path = PurePosixPath(PENDING_LINK_METADATA_NAME)
+        if (
+            _read_pending_cleanup_logical_control_snapshot(
+                home,
+                bound_batch_root,
+                batch_fd,
+                metadata_path,
+                entry_budget=entry_budget,
+            )
+            is None
+        ):
+            metadata_path = PurePosixPath("metadata.json")
+        controls = _pending_terminal_validation_control_files_from_paths(
+            home,
+            bound_batch_root,
+            batch_fd,
+            (*_pending_marker_only_control_paths(ticket), metadata_path),
+            entry_budget=entry_budget,
+        )
+        _publish_pending_cleanup_terminal_validation(
+            home,
+            ticket,
+            quarantine_root_identity,
+            terminal_aliases=(),
+            terminal_directories=(),
+            namespace_entries=(),
+            control_files=controls,
+        )
         return
     if ticket.version not in {4, 8} or not ticket.terminal_regular_targets:
         return
@@ -35433,7 +35529,7 @@ def _ensure_pending_terminal_validation_receipt(
     }:
         # The terminal receipt binds the complete surviving alias namespace after
         # recovery aliases exist and before the first destructive walker step.
-        cleanup_budget = [MAX_PENDING_CLEANUP_ENTRIES]
+        cleanup_budget = entry_budget or [MAX_PENDING_CLEANUP_ENTRIES]
         identity_ledger: PendingCleanupIdentityLedger = {}
         _capture_pending_cleanup_identity_ledger(
             batch_fd,
@@ -35679,6 +35775,8 @@ def _pending_cleanup_logical_child_name(
     directory_fd: int,
     logical_name: str,
     directory_identity: tuple[int, int],
+    *,
+    entry_budget: list[int] | None = None,
 ) -> str | None:
     """Resolve a canonical or active-token child for one logical name."""
     try:
@@ -35691,15 +35789,28 @@ def _pending_cleanup_logical_child_name(
         ) from error
     else:
         return logical_name
-    candidates: list[str] = []
-    with os.scandir(directory_fd) as iterator:
-        for entry in iterator:
-            binding = _pending_cleanup_active_entry_binding(
-                entry.name,
-                directory_identity,
-            )
-            if binding is not None and binding[1] == logical_name:
-                candidates.append(entry.name)
+    if entry_budget is not None and entry_budget[0] <= 0:
+        raise SyncError("pending cleanup control scan exceeds the entry budget")
+    names = _directory_member_names(
+        directory_fd,
+        maximum_entries=(
+            min(MAX_PENDING_CLEANUP_ENTRIES, entry_budget[0])
+            if entry_budget is not None
+            else MAX_PENDING_CLEANUP_ENTRIES
+        ),
+        overflow_message="pending cleanup control scan exceeds the entry budget",
+    )
+    if entry_budget is not None:
+        entry_budget[0] -= len(names)
+    candidates = [
+        name
+        for name in names
+        if (
+            (binding := _pending_cleanup_active_entry_binding(name, directory_identity))
+            is not None
+            and binding[1] == logical_name
+        )
+    ]
     if len(candidates) > 1:
         raise SyncError(
             "pending cleanup control has ambiguous active-token bindings: "
@@ -35713,6 +35824,8 @@ def _read_pending_cleanup_logical_control_snapshot(
     bound_batch_root: Path,
     batch_fd: int,
     logical_path: PurePosixPath,
+    *,
+    entry_budget: list[int] | None = None,
 ) -> ManagedStateFileSnapshot | None:
     """Read a control file through canonical names or walker active tokens."""
     parent_fd = os.dup(batch_fd)
@@ -35724,6 +35837,7 @@ def _read_pending_cleanup_logical_control_snapshot(
                 parent_fd,
                 component,
                 directory_identity,
+                entry_budget=entry_budget,
             )
             if physical_name is None:
                 return None
@@ -35740,6 +35854,7 @@ def _read_pending_cleanup_logical_control_snapshot(
             parent_fd,
             logical_path.name,
             directory_identity,
+            entry_budget=entry_budget,
         )
         if physical_name is None:
             return None
@@ -35767,6 +35882,8 @@ def _pending_terminal_validation_control_files_from_paths(
     bound_batch_root: Path,
     batch_fd: int,
     logical_paths: tuple[PurePosixPath, ...],
+    *,
+    entry_budget: list[int] | None = None,
 ) -> tuple[PendingTerminalValidationControlFile, ...]:
     snapshots: list[tuple[PurePosixPath, ManagedStateFileSnapshot]] = []
     for logical_path in sorted(set(logical_paths), key=PurePosixPath.as_posix):
@@ -35775,6 +35892,7 @@ def _pending_terminal_validation_control_files_from_paths(
             bound_batch_root,
             batch_fd,
             logical_path,
+            entry_budget=entry_budget,
         )
         if (
             snapshot is None
@@ -35860,7 +35978,14 @@ def _pending_terminal_validation_control_paths_for_ticket(
     include_metadata: bool = False,
 ) -> tuple[PurePosixPath, ...]:
     paths: set[PurePosixPath] = set()
-    if ticket.version in {1, 2} or ticket.commit_evidence is not None:
+    if (
+        ticket.version in {1, 2}
+        or ticket.commit_evidence is not None
+        or (
+            ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+            and not ticket.terminal_regular_targets
+        )
+    ):
         paths.add(PENDING_STATE_COMMIT_EVIDENCE)
     if ticket.marker_path is not None:
         paths.add(ticket.marker_path)
@@ -35869,11 +35994,55 @@ def _pending_terminal_validation_control_paths_for_ticket(
     return tuple(sorted(paths, key=PurePosixPath.as_posix))
 
 
+def _pending_marker_only_control_paths(
+    ticket: PendingBatchCleanupTicket,
+) -> tuple[PurePosixPath, ...]:
+    """Return the marker/evidence logical names for an old marker-only ticket."""
+    if (
+        ticket.version != LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        or ticket.terminal_regular_targets
+    ):
+        raise ValueError("marker-only control paths require a marker-only v4 ticket")
+    return _pending_terminal_validation_control_paths_for_ticket(ticket)
+
+
+def _pending_marker_only_control_set_is_present(
+    home: Path,
+    bound_batch_root: Path,
+    batch_fd: int,
+    ticket: PendingBatchCleanupTicket,
+    *,
+    entry_budget: list[int] | None = None,
+) -> bool:
+    """Detect whether a historic marker-only ticket has both control names.
+
+    A few pre-receipt v4 tickets carry only the old generic metadata and
+    committed marker.  They must retain their compatibility path when the
+    newer commit-evidence hard link is absent; a complete marker/evidence set
+    is what opts a ticket into the durable receipt protocol.
+    """
+    for logical_path in _pending_marker_only_control_paths(ticket):
+        if (
+            _read_pending_cleanup_logical_control_snapshot(
+                home,
+                bound_batch_root,
+                batch_fd,
+                logical_path,
+                entry_budget=entry_budget,
+            )
+            is None
+        ):
+            return False
+    return True
+
+
 def _require_pending_terminal_validation_control_files(
     home: Path,
     bound_batch_root: Path,
     batch_fd: int,
     controls: tuple[PendingTerminalValidationControlFile, ...],
+    *,
+    entry_budget: list[int] | None = None,
 ) -> None:
     """Revalidate control content and the exact remaining hard-link set."""
     if not _bound_directory_matches(home, bound_batch_root, batch_fd):
@@ -35886,6 +36055,7 @@ def _require_pending_terminal_validation_control_files(
                 bound_batch_root,
                 batch_fd,
                 path_authority.path,
+                entry_budget=entry_budget,
             )
             if snapshot is None:
                 continue
@@ -38873,6 +39043,7 @@ def _find_pending_cleanup_control_snapshot(
     logical_path: PurePosixPath,
     *,
     expected_identity: tuple[int, int] | None,
+    entry_budget: list[int] | None = None,
 ) -> tuple[PurePosixPath, ManagedStateFileSnapshot] | None:
     """Resolve one control inode through canonical or active-token names.
 
@@ -38887,7 +39058,9 @@ def _find_pending_cleanup_control_snapshot(
     root_mount = _directory_mount_identity(batch_fd)
     root_identity = _directory_identity(batch_fd)
     directory_flags = _directory_open_flags(nofollow=True)
-    remaining_entries = [MAX_PENDING_CLEANUP_ENTRIES]
+    remaining_entries = (
+        entry_budget if entry_budget is not None else [MAX_PENDING_CLEANUP_ENTRIES]
+    )
     matches: list[tuple[PurePosixPath, ManagedStateFileSnapshot]] = []
 
     def scan(
@@ -39061,6 +39234,8 @@ def _legacy_marker_only_v4_empty_metadata_is_admitted(
     ticket: PendingBatchCleanupTicket,
     batch_fd: int,
     metadata: ManagedStateFileSnapshot,
+    *,
+    entry_budget: list[int] | None = None,
 ) -> bool:
     """Admit only the narrow pre-v4 empty-action metadata shape.
 
@@ -39097,6 +39272,7 @@ def _legacy_marker_only_v4_empty_metadata_is_admitted(
         batch_fd,
         marker_path,
         expected_identity=ticket.marker_file_identity,
+        entry_budget=entry_budget,
     )
     if marker_match is None:
         return False
@@ -39121,6 +39297,7 @@ def _legacy_marker_only_v4_empty_metadata_is_admitted(
         batch_fd,
         PurePosixPath(PENDING_LINK_METADATA_NAME),
         expected_identity=None,
+        entry_budget=entry_budget,
     )
     if metadata_match is None:
         metadata_match = _find_pending_cleanup_control_snapshot(
@@ -39129,12 +39306,13 @@ def _legacy_marker_only_v4_empty_metadata_is_admitted(
             batch_fd,
             PurePosixPath("metadata.json"),
             expected_identity=None,
+            entry_budget=entry_budget,
         )
     if metadata_match is None:
         return False
     _metadata_physical_path, metadata = metadata_match
 
-    cleanup_budget = [MAX_PENDING_CLEANUP_ENTRIES]
+    cleanup_budget = entry_budget or [MAX_PENDING_CLEANUP_ENTRIES]
     identity_ledger: PendingCleanupIdentityLedger = {}
     _capture_pending_cleanup_identity_ledger(
         batch_fd,
@@ -39179,6 +39357,8 @@ def _require_legacy_generic_cleanup_ticket_is_nonterminal(
     ticket: PendingBatchCleanupTicket,
     bound_batch_root: Path,
     batch_fd: int,
+    *,
+    entry_budget: list[int] | None = None,
 ) -> ManagedStateFileSnapshot | None:
     """Stop readable legacy metadata with untrusted finalization or terminal group.
 
@@ -39257,6 +39437,7 @@ def _require_legacy_generic_cleanup_ticket_is_nonterminal(
                 batch_fd,
                 PurePosixPath(PENDING_LINK_METADATA_NAME),
                 expected_identity=None,
+                entry_budget=entry_budget,
             )
             if resolved_metadata is None:
                 resolved_metadata = _find_pending_cleanup_control_snapshot(
@@ -39265,6 +39446,7 @@ def _require_legacy_generic_cleanup_ticket_is_nonterminal(
                     batch_fd,
                     PurePosixPath("metadata.json"),
                     expected_identity=None,
+                    entry_budget=entry_budget,
                 )
             if resolved_metadata is not None:
                 resolved_path, metadata = resolved_metadata
@@ -39290,6 +39472,7 @@ def _require_legacy_generic_cleanup_ticket_is_nonterminal(
                 ticket,
                 batch_fd,
                 metadata,
+                entry_budget=entry_budget,
             ):
                 return metadata
         except (OSError, SyncError) as error:
@@ -39305,6 +39488,7 @@ def _require_legacy_generic_cleanup_ticket_is_nonterminal(
                 ticket,
                 batch_fd,
                 metadata,
+                entry_budget=entry_budget,
             ):
                 return metadata
             raise manual_recovery_error(
@@ -39502,6 +39686,11 @@ def _remove_cleanup_ready_batch(
                 ticket,
                 quarantine_root_identity,
             )
+        marker_only_ticket = (
+            ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+            and not ticket.terminal_regular_targets
+        )
+        cleanup_budget = [MAX_PENDING_CLEANUP_ENTRIES]
         batch_name = ticket.batch_root.name
         isolated_name = _pending_cleanup_isolated_batch_name(batch_name)
         bound_batch_root = ticket.batch_root
@@ -39605,7 +39794,6 @@ def _remove_cleanup_ready_batch(
                     )
                 return True
         legacy_generic_validation: LegacyGenericCleanupValidation | None = None
-        legacy_marker_only_v4_metadata: ManagedStateFileSnapshot | None = None
         existing_legacy_receipt = (
             _read_pending_cleanup_terminal_validation(
                 home,
@@ -39615,6 +39803,16 @@ def _remove_cleanup_ready_batch(
             if ticket.version in {1, 2}
             else None
         )
+        existing_marker_only_receipt = (
+            _read_pending_cleanup_terminal_validation(
+                home,
+                ticket,
+                quarantine_root_identity,
+            )
+            if marker_only_ticket
+            else None
+        )
+        marker_only_receipt_required = existing_marker_only_receipt is not None
         if existing_legacy_receipt is not None:
             assert existing_legacy_receipt.payload is not None
             legacy_generic_validation = _parse_legacy_generic_cleanup_validation(
@@ -39636,29 +39834,41 @@ def _remove_cleanup_ready_batch(
                 legacy_generic_validation,
                 defer_retainable_active_mismatch_to_walker=True,
             )
-        else:
+        elif existing_marker_only_receipt is None:
             legacy_metadata = _require_legacy_generic_cleanup_ticket_is_nonterminal(
                 home,
                 ticket,
                 bound_batch_root,
                 batch_fd,
+                entry_budget=cleanup_budget,
             )
-            if legacy_metadata is not None:
-                if (
-                    ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
-                    and not ticket.terminal_regular_targets
-                ):
-                    legacy_marker_only_v4_metadata = legacy_metadata
-                else:
-                    legacy_generic_validation = (
-                        _legacy_generic_cleanup_validation_from_current_state(
-                            home,
-                            ticket,
-                            bound_batch_root,
-                            batch_fd,
-                            legacy_metadata,
-                        )
+            if marker_only_ticket:
+                marker_only_receipt_required = (
+                    legacy_metadata is not None
+                    and _pending_marker_only_control_set_is_present(
+                        home,
+                        bound_batch_root,
+                        batch_fd,
+                        ticket,
+                        entry_budget=cleanup_budget,
                     )
+                )
+            elif legacy_metadata is not None:
+                legacy_generic_validation = (
+                    _legacy_generic_cleanup_validation_from_current_state(
+                        home,
+                        ticket,
+                        bound_batch_root,
+                        batch_fd,
+                        legacy_metadata,
+                    )
+                )
+        if marker_only_ticket and existing_marker_only_receipt is None:
+            _publish_pending_cleanup_empty_proof(
+                home,
+                ticket,
+                quarantine_root_identity,
+            )
         if _directory_identity(
             batch_fd
         ) != ticket.batch_root_identity or not _bound_directory_matches(
@@ -39684,7 +39894,6 @@ def _remove_cleanup_ready_batch(
                 home,
                 bound_batch_root,
             )
-        cleanup_budget = [MAX_PENDING_CLEANUP_ENTRIES]
         identity_ledger: PendingCleanupIdentityLedger = {}
         batch_mount_identity = _directory_mount_identity(batch_fd)
         if ticket.version in {1, 2}:
@@ -39707,6 +39916,7 @@ def _remove_cleanup_ready_batch(
                     ticket,
                     bound_batch_root,
                     batch_fd,
+                    entry_budget=cleanup_budget,
                 )
             )
             if revalidated_legacy_metadata is None:
@@ -39746,6 +39956,7 @@ def _remove_cleanup_ready_batch(
                     ticket,
                     bound_batch_root,
                     batch_fd,
+                    entry_budget=cleanup_budget,
                 )
             )
             if (
@@ -39787,6 +39998,8 @@ def _remove_cleanup_ready_batch(
             quarantine_root_identity,
             legacy_generic_validation=legacy_generic_validation,
             namespace_anchor_sha256=terminal_namespace_anchor_sha256,
+            entry_budget=cleanup_budget,
+            marker_only_authorized=marker_only_receipt_required,
         )
         if legacy_generic_validation is not None:
             # Receipt publication itself is a mutable control-file operation.
@@ -39801,31 +40014,56 @@ def _remove_cleanup_ready_batch(
                 batch_fd,
                 legacy_generic_validation,
             )
-        if legacy_marker_only_v4_metadata is not None:
-            current_marker_only_metadata = (
-                _require_legacy_generic_cleanup_ticket_is_nonterminal(
+        marker_only_validation_authority: PendingTerminalValidationAuthority | None = None
+        if marker_only_ticket and marker_only_receipt_required:
+            marker_only_receipt = _read_pending_cleanup_terminal_validation(
+                home,
+                ticket,
+                quarantine_root_identity,
+            )
+            if marker_only_receipt is None:
+                raise SyncError(
+                    "legacy marker-only v4 validation receipt is missing: "
+                    f"{ticket.batch_root.name}"
+                )
+            marker_only_validation_authority = (
+                _parse_pending_terminal_validation_authority(
                     home,
                     ticket,
-                    bound_batch_root,
-                    batch_fd,
+                    quarantine_root_identity,
+                    marker_only_receipt,
                 )
             )
-            if current_marker_only_metadata is None or not (
-                _managed_state_snapshot_matches_bound_file_evidence(
-                    current_marker_only_metadata,
-                    legacy_marker_only_v4_metadata,
-                )
+            if (
+                marker_only_validation_authority is None
+                or not marker_only_validation_authority.control_files
             ):
                 raise SyncError(
-                    "legacy marker-only v4 metadata or finalization marker "
-                    "changed before cleanup"
+                    "legacy marker-only v4 validation receipt lacks control "
+                    "authority; manual recovery is required: "
+                    f"{ticket.batch_root.name}"
                 )
+
+            def revalidate_marker_only_controls(
+                _logical_path: PurePosixPath,
+                _stage: str,
+            ) -> None:
+                if os.path.lexists(ticket.path):
+                    _require_pending_cleanup_ticket_link_authority(home, ticket)
+                _require_pending_terminal_validation_control_files(
+                    home,
+                    bound_batch_root,
+                    batch_fd,
+                    marker_only_validation_authority.control_files,
+                    entry_budget=cleanup_budget,
+                )
+
+            legacy_mutation_revalidator = revalidate_marker_only_controls
         if ticket.version not in {1, 2}:
             # v4/v8 receipt setup may add a terminal recovery hard link.  The
             # deletion ledger must be captured after that controlled mutation,
             # otherwise current-head validation sees an alias absent from its
             # own pre-receipt snapshot and misclassifies the public nlink.
-            cleanup_budget = [MAX_PENDING_CLEANUP_ENTRIES]
             identity_ledger = {}
             batch_mount_identity = _directory_mount_identity(batch_fd)
             _capture_pending_cleanup_identity_ledger(
@@ -39891,6 +40129,7 @@ def _remove_cleanup_ready_batch(
                         bound_batch_root,
                         batch_fd,
                         _pending_terminal_validation_control_paths_for_ticket(ticket),
+                        entry_budget=cleanup_budget,
                     ),
                 )
                 receipt = _read_pending_cleanup_terminal_validation(
@@ -39959,304 +40198,6 @@ def _remove_cleanup_ready_batch(
                 )
 
             legacy_mutation_revalidator = revalidate_legacy_control_file
-        elif legacy_marker_only_v4_metadata is not None:
-            legacy_marker_only_metadata_path = PurePosixPath(
-                PENDING_LINK_METADATA_NAME
-            )
-            if _named_entry_identity(
-                batch_fd,
-                legacy_marker_only_metadata_path.name,
-            ) is None:
-                metadata_json_path = PurePosixPath("metadata.json")
-                if _named_entry_identity(batch_fd, metadata_json_path.name) is not None:
-                    legacy_marker_only_metadata_path = metadata_json_path
-                else:
-                    batch_identity = _directory_identity(batch_fd)
-                    metadata_identity = legacy_marker_only_v4_metadata.file_identity
-                    if metadata_identity is not None:
-                        for name in _directory_member_names(
-                            batch_fd,
-                            maximum_entries=MAX_PENDING_CLEANUP_ENTRIES,
-                            overflow_message=(
-                                "legacy marker-only v4 metadata scan exceeds the "
-                                "entry limit"
-                            ),
-                        ):
-                            binding = _pending_cleanup_active_entry_binding(
-                                name,
-                                batch_identity,
-                            )
-                            if (
-                                binding is not None
-                                and binding[0]
-                                == (*metadata_identity, stat.S_IFREG)
-                            ):
-                                legacy_marker_only_metadata_path = PurePosixPath(
-                                    binding[1]
-                                )
-                                break
-            consumed_marker_only_controls: set[str] = set()
-
-            def find_marker_only_control_snapshot(
-                relative_path: PurePosixPath,
-                expected_identity: tuple[int, int] | None,
-            ) -> tuple[PurePosixPath, ManagedStateFileSnapshot] | None:
-                if expected_identity is None:
-                    return None
-                # Once a directory is isolated, all descendants move under a
-                # private active token. Search the still-bound batch tree by
-                # object identity instead of assuming the canonical parent
-                # path remains present. The walk is descriptor-relative,
-                # no-follow, mount-bounded, and capped by the normal cleanup
-                # entry budget.
-                root_mount = _directory_mount_identity(batch_fd)
-                directory_flags = _directory_open_flags(nofollow=True)
-                remaining_entries = [MAX_PENDING_CLEANUP_ENTRIES]
-
-                def scan(
-                    directory_fd: int,
-                    directory_path: PurePosixPath,
-                    depth: int,
-                ) -> tuple[PurePosixPath, ManagedStateFileSnapshot] | None:
-                    if depth > MAX_PENDING_CLEANUP_DEPTH:
-                        raise SyncError(
-                            "legacy marker-only v4 control scan exceeds the depth limit"
-                        )
-                    if remaining_entries[0] <= 0:
-                        raise SyncError(
-                            "legacy marker-only v4 control scan exceeds the entry budget"
-                        )
-                    names = _directory_member_names(
-                        directory_fd,
-                        maximum_entries=min(
-                            MAX_PENDING_CLEANUP_ENTRIES,
-                            remaining_entries[0],
-                        ),
-                        overflow_message=(
-                            "legacy marker-only v4 control scan exceeds the entry budget"
-                        ),
-                    )
-                    remaining_entries[0] -= len(names)
-                    for name in names:
-                        candidate_path = directory_path / name
-                        try:
-                            named = os.stat(
-                                name,
-                                dir_fd=directory_fd,
-                                follow_symlinks=False,
-                            )
-                        except FileNotFoundError:
-                            continue
-                        except OSError as error:
-                            raise SyncError(
-                                "legacy marker-only v4 control became unreadable: "
-                                f"{candidate_path}"
-                            ) from error
-                        if named.st_dev != root_mount[0]:
-                            raise SyncError(
-                                "legacy marker-only v4 control crosses a device "
-                                f"boundary: {candidate_path}"
-                            )
-                        candidate_identity = (named.st_dev, named.st_ino)
-                        if candidate_identity == expected_identity:
-                            if not stat.S_ISREG(named.st_mode):
-                                raise SyncError(
-                                    "legacy marker-only v4 control is not a regular "
-                                    f"file: {candidate_path}"
-                                )
-                            candidate = _read_managed_state_file_snapshot(
-                                home,
-                                bound_batch_root / Path(*candidate_path.parts),
-                                directory_fd,
-                                expected_identity=expected_identity,
-                            )
-                            return candidate_path, candidate
-                        if not stat.S_ISDIR(named.st_mode):
-                            continue
-                        child_fd = -1
-                        try:
-                            child_fd = os.open(
-                                name,
-                                directory_flags,
-                                dir_fd=directory_fd,
-                            )
-                            child_identity = _directory_identity(child_fd)
-                            if child_identity != candidate_identity:
-                                raise SyncError(
-                                    "legacy marker-only v4 control directory "
-                                    f"changed: {candidate_path}"
-                                )
-                            if _directory_mount_identity(child_fd) != root_mount:
-                                raise SyncError(
-                                    "legacy marker-only v4 control directory "
-                                    f"crosses a mount boundary: {candidate_path}"
-                                )
-                            found = scan(
-                                child_fd,
-                                candidate_path,
-                                depth + 1,
-                            )
-                            if found is not None:
-                                return found
-                        except FileNotFoundError:
-                            continue
-                        finally:
-                            if child_fd >= 0:
-                                _close_fd_quietly(child_fd)
-                    return None
-
-                found = scan(batch_fd, PurePosixPath(), 0)
-                if found is None:
-                    return None
-
-                # A canonical control name that is still present must not be
-                # silently shadowed by an active-token alias. If its parent
-                # path is absent, the entry was intentionally isolated and the
-                # identity search above is authoritative.
-                canonical_parent_fd = -1
-                canonical_parent_exists = True
-                try:
-                    canonical_parent_fd = os.dup(batch_fd)
-                    for part in relative_path.parent.parts:
-                        try:
-                            next_fd = os.open(
-                                part,
-                                directory_flags,
-                                dir_fd=canonical_parent_fd,
-                            )
-                        except FileNotFoundError:
-                            canonical_parent_exists = False
-                            break
-                        _close_fd_quietly(canonical_parent_fd)
-                        canonical_parent_fd = next_fd
-                    if canonical_parent_exists:
-                        try:
-                            canonical_named = os.stat(
-                                relative_path.name,
-                                dir_fd=canonical_parent_fd,
-                                follow_symlinks=False,
-                            )
-                        except FileNotFoundError:
-                            pass
-                        except OSError as error:
-                            raise SyncError(
-                                "legacy marker-only v4 canonical control became "
-                                f"unreadable: {relative_path}"
-                            ) from error
-                        else:
-                            if (
-                                canonical_named.st_dev,
-                                canonical_named.st_ino,
-                            ) != expected_identity:
-                                raise SyncError(
-                                    "legacy marker-only v4 canonical control identity "
-                                    f"changed: {relative_path}"
-                                )
-                finally:
-                    if canonical_parent_fd >= 0:
-                        _close_fd_quietly(canonical_parent_fd)
-                return found
-
-            def revalidate_legacy_marker_only_boundary(
-                _logical_path: PurePosixPath,
-                _stage: str,
-            ) -> None:
-                # Ticket deletion invokes this callback once more after its
-                # canonical name has been isolated into a private tombstone.
-                # The deletion helper already owns that tombstone's identity;
-                # only revalidate the ticket while its canonical name exists.
-                if os.path.lexists(ticket.path):
-                    _require_pending_cleanup_ticket_link_authority(home, ticket)
-                controls = (
-                    (
-                        "metadata",
-                        legacy_marker_only_metadata_path,
-                        legacy_marker_only_v4_metadata.file_identity,
-                    ),
-                    (
-                        "marker",
-                        ticket.marker_path,
-                        ticket.marker_file_identity,
-                    ),
-                )
-                for control_name, relative_path, expected_identity in controls:
-                    if relative_path is None:
-                        raise SyncError(
-                            "legacy marker-only v4 control authority is incomplete"
-                        )
-                    if control_name in consumed_marker_only_controls:
-                        # The control was already observed under an active
-                        # token immediately before its destructive unlink. A
-                        # later batch/ticket boundary may run after the batch
-                        # descriptor is closed, so do not rescan a consumed
-                        # inode that is expected to be gone.
-                        continue
-                    found = find_marker_only_control_snapshot(
-                        relative_path,
-                        expected_identity,
-                    )
-                    if found is None:
-                        raise SyncError(
-                            "legacy marker-only v4 control disappeared before "
-                            f"cleanup: {ticket.batch_root.name}"
-                        )
-                    found_path, current = found
-                    if control_name == "metadata":
-                        metadata_matches = (
-                            _managed_state_snapshot_matches_bound_file_evidence(
-                                current,
-                                legacy_marker_only_v4_metadata,
-                            )
-                            if found_path == relative_path
-                            else _managed_state_snapshot_matches_file_evidence(
-                                current,
-                                legacy_marker_only_v4_metadata,
-                            )
-                        )
-                        if not metadata_matches:
-                            raise SyncError(
-                                "legacy marker-only v4 metadata changed before "
-                                f"cleanup: {ticket.batch_root.name}"
-                            )
-                    else:
-                        if (
-                            (
-                                found_path == relative_path
-                                and current.parent_identity
-                                != ticket.marker_parent_identity
-                            )
-                            or current.file_type != stat.S_IFREG
-                            or current.mode != ticket.marker_mode
-                            or current.uid != os.geteuid()
-                            or current.payload is None
-                            or hashlib.sha256(current.payload).hexdigest()
-                            != ticket.marker_sha256
-                        ):
-                            raise SyncError(
-                                "legacy marker-only v4 finalization marker changed "
-                                f"before cleanup: {ticket.batch_root.name}"
-                            )
-                    current_path = bound_batch_root / Path(*found_path.parts)
-                    current_parent_fd = _open_directory_beneath(
-                        home,
-                        current_path.parent,
-                    )
-                    try:
-                        _require_pending_cleanup_file_snapshot_access_policy(
-                            home,
-                            current_path,
-                            current_parent_fd,
-                            current,
-                        )
-                    finally:
-                        _close_fd_quietly(current_parent_fd)
-                    if (
-                        _stage == "before_delete"
-                        and found_path != relative_path
-                    ):
-                        consumed_marker_only_controls.add(control_name)
-
-            legacy_mutation_revalidator = revalidate_legacy_marker_only_boundary
         mutation_revalidator = legacy_mutation_revalidator
         if ticket.version in {
             LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
@@ -40285,6 +40226,7 @@ def _remove_cleanup_ready_batch(
                     bound_batch_root,
                     batch_fd,
                     terminal_authority.control_files,
+                    entry_budget=cleanup_budget,
                 )
                 current_receipt = _read_pending_cleanup_terminal_validation(
                     home,
@@ -40352,7 +40294,7 @@ def _remove_cleanup_ready_batch(
                         "pending terminal validation namespace authority changed "
                         f"before cleanup: {ticket.batch_root.name}"
                     )
-                current_budget = [MAX_PENDING_CLEANUP_ENTRIES]
+                current_budget = cleanup_budget
                 current_ledger: PendingCleanupIdentityLedger = {}
                 _capture_pending_cleanup_identity_ledger(
                     batch_fd,
@@ -40380,6 +40322,7 @@ def _remove_cleanup_ready_batch(
                     bound_batch_root,
                     batch_fd,
                     current_authority.control_files,
+                    entry_budget=cleanup_budget,
                 )
 
             mutation_revalidator = revalidate_terminal_alias_boundary
@@ -40457,8 +40400,8 @@ def _remove_cleanup_ready_batch(
 
         def require_terminal_batch_rmdir_boundary() -> None:
             _require_pending_cleanup_ticket_unchanged(home, ticket)
-            if legacy_marker_only_v4_metadata is not None:
-                revalidate_legacy_marker_only_boundary(
+            if marker_only_validation_authority is not None:
+                revalidate_marker_only_controls(
                     PurePosixPath("<batch-root>"),
                     "before_rmdir",
                 )
@@ -40525,26 +40468,10 @@ def _remove_cleanup_ready_batch(
             home,
             ticket,
             quarantine_root_identity,
-            mutation_revalidator=(
-                (lambda _member, _index_fd: revalidate_legacy_marker_only_boundary(
-                    PurePosixPath("<terminal-validation>"),
-                    "before_delete",
-                ))
-                if legacy_marker_only_v4_metadata is not None
-                else None
-            ),
         )
         _delete_pending_cleanup_ticket(
             home,
             ticket,
-            boundary_revalidator=(
-                (lambda: revalidate_legacy_marker_only_boundary(
-                    PurePosixPath("<ticket>"),
-                    "before_delete",
-                ))
-                if legacy_marker_only_v4_metadata is not None
-                else None
-            ),
         )
         _delete_pending_cleanup_empty_proof(
             home,
