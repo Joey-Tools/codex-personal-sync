@@ -2996,6 +2996,45 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         ):
             MODULE._cleanup_ready_pending_batches(self.home)
 
+    def test_marker_only_v4_receipt_rejects_new_batch_namespace_entry(self) -> None:
+        ticket = self._marker_only_v4_ticket()
+        receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        self.assertFalse(receipt_path.exists())
+
+        # Publish the marker-only receipt while the batch has its original
+        # namespace, then add a links-content entry before the retry. The
+        # receipt must not adopt that entry as new deletion authority.
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=SystemExit("injected after marker-only receipt"),
+            ),
+            self.assertRaisesRegex(
+                SystemExit,
+                "injected after marker-only receipt",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+        self.assertTrue(receipt_path.is_file())
+
+        links_root = ticket.batch_root / "links"
+        links_root.mkdir(mode=0o700)
+        foreign = links_root / "foreign"
+        foreign.write_bytes(b"foreign\n")
+        foreign.chmod(0o600)
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal validation namespace changed",
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertTrue(foreign.is_file())
+
     def test_marker_only_v4_requires_ticket_before_first_walker_mutation(self) -> None:
         ticket = self._marker_only_v4_ticket()
         real_remove = MODULE._remove_pending_batch_directory_contents
@@ -3331,12 +3370,65 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertTrue(receipt_retirement_path.is_file())
         self.assertTrue(proof_path.is_file())
 
+        zero_budget = MODULE.PendingCleanupActionBudget(0)
+        self.assertEqual(
+            MODULE._restore_pending_cleanup_terminal_retirement_aliases(
+                self.home,
+                budget=zero_budget,
+            ),
+            0,
+        )
+        self.assertFalse(ticket.path.exists())
+        self.assertTrue(retirement_path.is_file())
+        self.assertEqual(
+            MODULE._restore_pending_cleanup_terminal_retirement_aliases(
+                self.home,
+                budget=MODULE.PendingCleanupActionBudget(1),
+            ),
+            1,
+        )
+        self.assertTrue(ticket.path.is_file())
+
         install(self.public, self.home, SHA_A)
 
         self.assertFalse(retirement_path.exists())
         self.assertFalse(receipt_retirement_path.exists())
         self.assertFalse(proof_path.exists())
         self.assertEqual(self.target.stat().st_nlink, 1)
+
+    def test_terminal_retirement_recovery_rejects_same_inode_payload_rewrite(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        retirement_path = MODULE._pending_cleanup_terminal_retirement_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        MODULE._ensure_pending_cleanup_terminal_retirement(self.home, ticket)
+        ticket.path.unlink()
+        self.assertEqual(retirement_path.stat().st_nlink, 1)
+        real_link = MODULE.os.link
+        tampered = False
+
+        def tamper_before_restore_link(src, dst, *args, **kwargs):
+            nonlocal tampered
+            if dst == ticket.path.name and not tampered:
+                retirement_path.write_bytes(b"tampered retirement authority\n")
+                retirement_path.chmod(0o600)
+                tampered = True
+            return real_link(src, dst, *args, **kwargs)
+
+        with (
+            mock.patch.object(MODULE.os, "link", side_effect=tamper_before_restore_link),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "retirement authority changed during recovery",
+            ),
+        ):
+            MODULE._restore_pending_cleanup_terminal_retirement_aliases(self.home)
+        self.assertTrue(tampered)
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(retirement_path.is_file())
 
     def test_terminal_retirement_authority_recovers_after_marker_tombstone_crash(
         self,

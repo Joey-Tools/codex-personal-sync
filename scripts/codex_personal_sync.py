@@ -35330,6 +35330,9 @@ def _ensure_pending_terminal_validation_receipt(
     namespace_anchor_sha256: str | None = None,
     entry_budget: list[int] | None = None,
     marker_only_authorized: bool = False,
+    marker_only_namespace_entries: (
+        tuple[PendingTerminalValidationNamespaceEntry, ...] | None
+    ) = None,
 ) -> None:
     if ticket.version in {1, 2}:
         existing_receipt = _read_pending_cleanup_terminal_validation(
@@ -35378,6 +35381,12 @@ def _ensure_pending_terminal_validation_receipt(
                     "authority; manual recovery is required: "
                     f"{ticket.batch_root.name}"
                 )
+            if authority.namespace_entries is None:
+                raise SyncError(
+                    "legacy marker-only v4 validation receipt lacks namespace "
+                    "authority; manual recovery is required: "
+                    f"{ticket.batch_root.name}"
+                )
             _require_pending_terminal_validation_control_files(
                 home,
                 bound_batch_root,
@@ -35392,6 +35401,28 @@ def _ensure_pending_terminal_validation_receipt(
             # publish only the legacy empty proof and let the old walker
             # semantics finish or report the existing recovery error.
             return
+        if marker_only_namespace_entries is None:
+            marker_only_ledger: PendingCleanupIdentityLedger = {}
+            _capture_pending_cleanup_identity_ledger(
+                batch_fd,
+                ticket.batch_root_identity,
+                _directory_mount_identity(batch_fd),
+                entry_budget
+                if entry_budget is not None
+                else [MAX_PENDING_CLEANUP_ENTRIES],
+                marker_only_ledger,
+                depth=0,
+                relative_parts=(),
+                skipped_names=frozenset(),
+                name_validator=_pending_batch_cleanup_name_is_authorized,
+                directory_expected_mode=0o700,
+            )
+            marker_only_namespace_entries = (
+                _pending_terminal_validation_namespace_entries_from_identity_ledger(
+                    marker_only_ledger,
+                    (),
+                )
+            )
         metadata_path = PurePosixPath(PENDING_LINK_METADATA_NAME)
         if (
             _read_pending_cleanup_logical_control_snapshot(
@@ -35432,7 +35463,7 @@ def _ensure_pending_terminal_validation_receipt(
             quarantine_root_identity,
             terminal_aliases=(),
             terminal_directories=(),
-            namespace_entries=(),
+            namespace_entries=marker_only_namespace_entries,
             control_files=controls,
         )
         return
@@ -40005,6 +40036,10 @@ def _remove_cleanup_ready_batch(
                 bound_batch_root,
             )
         identity_ledger: PendingCleanupIdentityLedger = {}
+        marker_only_namespace_entries: (
+            tuple[PendingTerminalValidationNamespaceEntry, ...] | None
+        ) = None
+        marker_only_initial_ledger: PendingCleanupIdentityLedger | None = None
         batch_mount_identity = _directory_mount_identity(batch_fd)
         if ticket.version in {1, 2}:
             _capture_pending_cleanup_identity_ledger(
@@ -40018,6 +40053,30 @@ def _remove_cleanup_ready_batch(
                 skipped_names=frozenset(),
                 name_validator=_pending_batch_cleanup_name_is_authorized,
                 directory_expected_mode=0o700,
+            )
+        if (
+            marker_only_ticket
+            and existing_marker_only_receipt is None
+            and marker_only_receipt_required
+        ):
+            marker_only_initial_ledger = {}
+            _capture_pending_cleanup_identity_ledger(
+                batch_fd,
+                ticket.batch_root_identity,
+                batch_mount_identity,
+                cleanup_budget,
+                marker_only_initial_ledger,
+                depth=0,
+                relative_parts=(),
+                skipped_names=frozenset(),
+                name_validator=_pending_batch_cleanup_name_is_authorized,
+                directory_expected_mode=0o700,
+            )
+            marker_only_namespace_entries = (
+                _pending_terminal_validation_namespace_entries_from_identity_ledger(
+                    marker_only_initial_ledger,
+                    (),
+                )
             )
         if legacy_generic_validation is not None and existing_legacy_receipt is None:
             revalidated_legacy_metadata = (
@@ -40112,6 +40171,7 @@ def _remove_cleanup_ready_batch(
             namespace_anchor_sha256=terminal_namespace_anchor_sha256,
             entry_budget=cleanup_budget,
             marker_only_authorized=marker_only_receipt_required,
+            marker_only_namespace_entries=marker_only_namespace_entries,
         )
         if legacy_generic_validation is not None:
             # Receipt publication itself is a mutable control-file operation.
@@ -40159,6 +40219,12 @@ def _remove_cleanup_ready_batch(
                     "authority; manual recovery is required: "
                     f"{ticket.batch_root.name}"
                 )
+            if marker_only_validation_authority.namespace_entries is None:
+                raise SyncError(
+                    "legacy marker-only v4 validation receipt lacks namespace "
+                    "authority; manual recovery is required: "
+                    f"{ticket.batch_root.name}"
+                )
 
             def revalidate_marker_only_controls(
                 _logical_path: PurePosixPath,
@@ -40172,27 +40238,102 @@ def _remove_cleanup_ready_batch(
                     marker_only_validation_authority.control_files,
                     entry_budget=cleanup_budget,
                 )
+                current_ledger: PendingCleanupIdentityLedger = {}
+                _capture_pending_cleanup_identity_ledger(
+                    batch_fd,
+                    ticket.batch_root_identity,
+                    batch_mount_identity,
+                    cleanup_budget,
+                    current_ledger,
+                    depth=0,
+                    relative_parts=(),
+                    skipped_names=frozenset(),
+                    name_validator=_pending_batch_cleanup_name_is_authorized,
+                    directory_expected_mode=0o700,
+                )
+                _validate_pending_terminal_alias_ledger(
+                    home,
+                    ticket,
+                    current_ledger,
+                    (),
+                    (),
+                    require_complete_aliases=False,
+                    namespace_entries=marker_only_validation_authority.namespace_entries,
+                )
 
             legacy_mutation_revalidator = revalidate_marker_only_controls
+        if ticket.version == 3:
+            staging_marker_consumed = False
+
+            def revalidate_staging_marker(
+                logical_path: PurePosixPath,
+                stage: str,
+            ) -> None:
+                nonlocal staging_marker_consumed
+                _require_pending_cleanup_ticket_unchanged(home, ticket)
+                if (
+                    ticket.marker_path is None
+                    or ticket.marker_parent_identity is None
+                    or ticket.marker_file_identity is None
+                    or ticket.marker_mode is None
+                    or ticket.marker_sha256 is None
+                ):
+                    raise SyncError(
+                        "pending staging cleanup marker authority is incomplete"
+                    )
+                marker_snapshot = _read_pending_cleanup_logical_control_snapshot(
+                    home,
+                    bound_batch_root,
+                    batch_fd,
+                    ticket.marker_path,
+                    entry_budget=cleanup_budget,
+                )
+                if marker_snapshot is None:
+                    if not staging_marker_consumed:
+                        raise SyncError(
+                            "pending staging cleanup marker changed before "
+                            f"cleanup: {ticket.batch_root.name}"
+                        )
+                elif (
+                    marker_snapshot.parent_identity != ticket.marker_parent_identity
+                    or marker_snapshot.file_identity != ticket.marker_file_identity
+                    or marker_snapshot.file_type != stat.S_IFREG
+                    or marker_snapshot.mode != ticket.marker_mode
+                    or marker_snapshot.uid != os.geteuid()
+                    or marker_snapshot.payload is None
+                    or hashlib.sha256(marker_snapshot.payload).hexdigest()
+                    != ticket.marker_sha256
+                ):
+                    raise SyncError(
+                        "pending staging cleanup marker changed before "
+                        f"cleanup: {ticket.batch_root.name}"
+                    )
+                if logical_path == ticket.marker_path and stage == "before_unlink":
+                    staging_marker_consumed = True
+
+            legacy_mutation_revalidator = revalidate_staging_marker
         if ticket.version not in {1, 2}:
             # v4/v8 receipt setup may add a terminal recovery hard link.  The
             # deletion ledger must be captured after that controlled mutation,
             # otherwise current-head validation sees an alias absent from its
             # own pre-receipt snapshot and misclassifies the public nlink.
-            identity_ledger = {}
-            batch_mount_identity = _directory_mount_identity(batch_fd)
-            _capture_pending_cleanup_identity_ledger(
-                batch_fd,
-                ticket.batch_root_identity,
-                batch_mount_identity,
-                cleanup_budget,
-                identity_ledger,
-                depth=0,
-                relative_parts=(),
-                skipped_names=frozenset(),
-                name_validator=_pending_batch_cleanup_name_is_authorized,
-                directory_expected_mode=0o700,
-            )
+            if marker_only_initial_ledger is not None:
+                identity_ledger = marker_only_initial_ledger
+            else:
+                identity_ledger = {}
+                batch_mount_identity = _directory_mount_identity(batch_fd)
+                _capture_pending_cleanup_identity_ledger(
+                    batch_fd,
+                    ticket.batch_root_identity,
+                    batch_mount_identity,
+                    cleanup_budget,
+                    identity_ledger,
+                    depth=0,
+                    relative_parts=(),
+                    skipped_names=frozenset(),
+                    name_validator=_pending_batch_cleanup_name_is_authorized,
+                    directory_expected_mode=0o700,
+                )
         terminal_alias_paths: frozenset[PurePosixPath] = frozenset()
         if ticket.version in {
             LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
@@ -41798,8 +41939,13 @@ def _restore_pending_cleanup_terminal_retirement_aliases(
     home: Path,
     *,
     index_fd: int | None = None,
+    limit: int = MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+    budget: PendingCleanupActionBudget | None = None,
 ) -> int:
     """Restore a ticket from its independent retirement hard-link authority."""
+    if limit < 0:
+        raise SyncError("pending cleanup control action budget is invalid")
+    action_budget = budget or PendingCleanupActionBudget(limit)
     index_root = _pending_cleanup_index_path(home)
     owns_index_fd = index_fd is None
     if owns_index_fd:
@@ -41823,6 +41969,8 @@ def _restore_pending_cleanup_terminal_retirement_aliases(
         for alias_name in aliases:
             batch_name = _pending_cleanup_terminal_retirement_batch_name(alias_name)
             assert batch_name is not None
+            if not action_budget.charge_batch(batch_name):
+                continue
             alias_path = index_root / alias_name
             ticket_path = _pending_cleanup_ticket_path(home, batch_name)
             alias_snapshot = _read_managed_state_file_snapshot(
@@ -41888,6 +42036,23 @@ def _restore_pending_cleanup_terminal_retirement_aliases(
             except FileExistsError:
                 pass
             os.fsync(index_fd)
+            restored_snapshot = _read_managed_state_file_snapshot(
+                home,
+                ticket_path,
+                index_fd,
+                expected_identity=alias_snapshot.file_identity,
+            )
+            if (
+                not _managed_state_snapshot_matches_bound_file_evidence(
+                    restored_snapshot,
+                    alias_snapshot,
+                )
+                or restored_snapshot.link_count != 2
+            ):
+                raise SyncError(
+                    "pending terminal cleanup retirement authority changed "
+                    f"during recovery: {batch_name}"
+                )
             restored_ticket = _read_pending_cleanup_ticket(
                 home,
                 ticket_path,
@@ -41899,7 +42064,25 @@ def _restore_pending_cleanup_terminal_retirement_aliases(
                     "pending terminal cleanup retirement ticket recovery failed: "
                     f"{batch_name}"
                 )
+            final_snapshot = _read_managed_state_file_snapshot(
+                home,
+                ticket_path,
+                index_fd,
+                expected_identity=alias_snapshot.file_identity,
+            )
+            if (
+                not _managed_state_snapshot_matches_bound_file_evidence(
+                    final_snapshot,
+                    alias_snapshot,
+                )
+                or final_snapshot.link_count != 2
+            ):
+                raise SyncError(
+                    "pending terminal cleanup retirement authority changed "
+                    f"after recovery: {batch_name}"
+                )
             restored += 1
+            action_budget.mark_batch_completed(batch_name)
         if not _bound_directory_matches(home, index_root, index_fd):
             raise SyncError("pending cleanup index changed")
     finally:
@@ -42118,6 +42301,8 @@ def _restore_pending_cleanup_control_tombstones(
         restored += _restore_pending_cleanup_terminal_retirement_aliases(
             home,
             index_fd=index_fd,
+            limit=limit,
+            budget=action_budget,
         )
         if not _bound_directory_matches(home, index_root, index_fd):
             raise SyncError("pending cleanup index changed")

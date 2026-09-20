@@ -680,6 +680,32 @@ class PendingStagingCleanupTests(unittest.TestCase):
         self.assertEqual(self.target.stat().st_nlink, 1)
         self.assertFalse(marker_batches[0].exists())
 
+    def test_staging_cleanup_rechecks_marker_authority_before_walker_mutation(
+        self,
+    ) -> None:
+        for replacement in (False, True):
+            with self.subTest(replacement=replacement):
+                ticket = self._publish_legacy_cleanup_ticket(version=3)
+                marker = ticket.batch_root / Path(
+                    *MODULE.PENDING_STATE_STAGING_MARKER.parts
+                )
+                original = marker.read_bytes()
+                if replacement:
+                    marker.unlink()
+                    marker.write_bytes(b"replaced staging marker\n")
+                else:
+                    marker.write_bytes(b"rewritten staging marker\n")
+                marker.chmod(0o600)
+
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "pending staging cleanup marker changed",
+                ):
+                    MODULE._remove_cleanup_ready_batch(self.home, ticket)
+                self.assertTrue(ticket.path.is_file())
+                self.assertTrue(ticket.batch_root.is_dir())
+                self.assertNotEqual(marker.read_bytes(), original)
+
     def test_no_ticket_batch_with_symlinked_marker_parent_fails_closed(self) -> None:
         batch_root = MODULE._quarantine_batch_root(self.home, [])
         outside = self.root / "outside-marker"
