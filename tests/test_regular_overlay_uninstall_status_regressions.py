@@ -1278,6 +1278,31 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         finally:
             foreign.unlink()
 
+    def test_v8_pointer_retirement_fallback_uses_shared_entry_budget(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        self.assertIsNotNone(ticket.pointer_retirement_path)
+        assert ticket.pointer_retirement_path is not None
+        state_root = ticket.batch_root / Path(
+            *ticket.pointer_retirement_path.parent.parts
+        )
+        shutil.rmtree(state_root)
+        batch_fd = MODULE._open_directory_beneath(self.home, ticket.batch_root)
+        try:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup control scan exceeds the entry budget",
+            ):
+                MODULE._require_pending_terminal_pointer_retirement_authority(
+                    self.home,
+                    ticket,
+                    ticket.batch_root,
+                    batch_fd,
+                    allow_consumed=False,
+                    entry_budget=[0],
+                )
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+
     def test_v8_terminal_validation_rejects_foreign_alias_after_metadata_consumption(
         self,
     ) -> None:
@@ -2907,6 +2932,97 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             self.assertTrue(foreign.is_file())
         finally:
             foreign.unlink()
+
+    def test_marker_only_v4_without_commit_evidence_publishes_control_receipt(
+        self,
+    ) -> None:
+        ticket = self._marker_only_v4_ticket()
+        evidence = ticket.batch_root / Path(*MODULE.PENDING_STATE_COMMIT_EVIDENCE.parts)
+        if evidence.exists():
+            evidence.unlink()
+
+        receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+
+        def stop_after_receipt(*args: object, **kwargs: object) -> None:
+            self.assertTrue(receipt_path.is_file())
+            raise SystemExit("injected after marker-only receipt")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=stop_after_receipt,
+            ),
+            self.assertRaisesRegex(SystemExit, "after marker-only receipt"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        receipt = MODULE._read_pending_cleanup_terminal_validation(
+            self.home,
+            ticket,
+            (ticket.batch_root.parent.stat().st_dev, ticket.batch_root.parent.stat().st_ino),
+        )
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        authority = MODULE._parse_pending_terminal_validation_authority(
+            self.home,
+            ticket,
+            (ticket.batch_root.parent.stat().st_dev, ticket.batch_root.parent.stat().st_ino),
+            receipt,
+        )
+        self.assertIsNotNone(authority)
+        assert authority is not None
+        control_paths = {
+            path.path
+            for control in authority.control_files
+            for path in control.paths
+        }
+        self.assertIn(ticket.marker_path, control_paths)
+        self.assertIn(
+            PurePosixPath(MODULE.PENDING_LINK_METADATA_NAME),
+            control_paths,
+        )
+        self.assertNotIn(MODULE.PENDING_STATE_COMMIT_EVIDENCE, control_paths)
+
+        marker = ticket.batch_root / Path(*ticket.marker_path.parts)
+        marker.write_bytes(b"marker rewritten after receipt\n")
+        marker.chmod(0o600)
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "receipt-bound entry changed|marker authority changed",
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+    def test_marker_only_v4_requires_ticket_before_first_walker_mutation(self) -> None:
+        ticket = self._marker_only_v4_ticket()
+        real_remove = MODULE._remove_pending_batch_directory_contents
+
+        def unlink_ticket_then_walk(*args: object, **kwargs: object) -> object:
+            ticket.path.unlink()
+            with mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                real_remove,
+            ):
+                return real_remove(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=unlink_ticket_then_walk,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup ticket",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.batch_root.is_dir())
 
     def test_marker_only_v4_recovers_after_metadata_isolation_crash(self) -> None:
         ticket = self._deferred_terminal_ticket()

@@ -33524,6 +33524,7 @@ def _require_pending_terminal_validation_control_set(
     """
     if not controls:
         return
+    evidence_path = PurePosixPath(PENDING_STATE_COMMIT_EVIDENCE)
     expected_paths = set(_pending_terminal_validation_control_paths_for_ticket(ticket))
     actual_paths = {
         path.path
@@ -33535,7 +33536,11 @@ def _require_pending_terminal_validation_control_set(
         and not ticket.terminal_regular_targets
     )
     if marker_only:
-        metadata_paths = actual_paths - expected_paths
+        # Historic marker-only v4 tickets may predate commit-evidence. The
+        # marker and metadata still form complete content/inode/access
+        # authority; evidence is an optional third logical name when present.
+        expected_paths.discard(evidence_path)
+        metadata_paths = actual_paths - expected_paths - {evidence_path}
         if metadata_paths not in (
             {PurePosixPath(PENDING_LINK_METADATA_NAME)},
             {PurePosixPath("metadata.json")},
@@ -33545,6 +33550,8 @@ def _require_pending_terminal_validation_control_set(
                 f"incomplete: {ticket.batch_root.name}"
             )
         expected_paths.update(metadata_paths)
+        if evidence_path in actual_paths:
+            expected_paths.add(evidence_path)
     if actual_paths != expected_paths:
         raise SyncError(
             "pending terminal validation control authority is incomplete: "
@@ -33580,13 +33587,23 @@ def _require_pending_terminal_validation_control_set(
             "pending terminal validation marker authority changed: "
             f"{ticket.batch_root.name}"
         )
-    evidence_path = PurePosixPath(PENDING_STATE_COMMIT_EVIDENCE)
     evidence_controls = [
         control
         for control in controls
         if any(path.path == evidence_path for path in control.paths)
     ]
     if ticket.commit_evidence is None:
+        if marker_only:
+            if evidence_controls and (
+                len(evidence_controls) != 1
+                or evidence_controls[0] != marker_control
+            ):
+                raise SyncError(
+                    "pending terminal validation commit evidence and marker "
+                    "authority are split: "
+                    f"{ticket.batch_root.name}"
+                )
+            return
         # v1/v2 generic receipts and historic v4/v8 tickets predate the
         # ticket-bound evidence field.  Preserve their established receipt
         # protocol; for an old commit-phase ticket the existing hard-link
@@ -34385,7 +34402,14 @@ def _legacy_generic_cleanup_validation_from_current_state(
     bound_batch_root: Path,
     batch_fd: int,
     metadata: ManagedStateFileSnapshot,
+    *,
+    entry_budget: list[int] | None = None,
 ) -> LegacyGenericCleanupValidation | None:
+    validation_budget = (
+        entry_budget
+        if entry_budget is not None
+        else [MAX_PENDING_CLEANUP_ENTRIES]
+    )
     if not _managed_state_snapshot_has_complete_file_evidence(metadata):
         raise SyncError("legacy generic cleanup metadata has incomplete evidence")
     if (
@@ -34430,6 +34454,7 @@ def _legacy_generic_cleanup_validation_from_current_state(
                 ticket,
                 include_metadata=False,
             ),
+            entry_budget=validation_budget,
         )
         _require_pending_terminal_validation_control_set(ticket, control_files)
         return LegacyGenericCleanupValidation(
@@ -34459,6 +34484,7 @@ def _require_legacy_generic_cleanup_validation_current_state(
     validation: LegacyGenericCleanupValidation,
     *,
     defer_retainable_active_mismatch_to_walker: bool = False,
+    entry_budget: list[int] | None = None,
 ) -> None:
     """Accept only exact receipt-bound survivors after an interrupted walker.
 
@@ -34467,6 +34493,11 @@ def _require_legacy_generic_cleanup_validation_current_state(
     preserve its identity, type, and access policy.  Directory ctime and link
     count are intentionally not compared because child deletion changes them.
     """
+    validation_budget = (
+        entry_budget
+        if entry_budget is not None
+        else [MAX_PENDING_CLEANUP_ENTRIES]
+    )
     if not validation.entries:
         raise SyncError("legacy generic cleanup receipt lacks namespace authority")
     if not validation.control_files:
@@ -34489,6 +34520,7 @@ def _require_legacy_generic_cleanup_validation_current_state(
         bound_batch_root,
         batch_fd,
         validation.control_files,
+        entry_budget=validation_budget,
     )
     root_mount_identity = _directory_mount_identity(batch_fd)
     authority_by_path = {entry.path: entry for entry in validation.entries}
@@ -34672,8 +34704,15 @@ def _require_legacy_generic_cleanup_validation_current_state(
         require_directory_access_policy(directory_fd, physical_path, logical_path)
         observed_paths: set[PurePosixPath] = set()
         current_entries: list[tuple[str, os.stat_result]] = []
+        scan_budget = validation_budget
+        if scan_budget[0] <= 0:
+            raise SyncError("pending cleanup control scan exceeds the entry budget")
         with os.scandir(directory_fd) as iterator:
             for item in iterator:
+                if len(current_entries) >= scan_budget[0]:
+                    raise SyncError(
+                        "pending cleanup control scan exceeds the entry budget"
+                    )
                 try:
                     current_entries.append((item.name, item.stat(follow_symlinks=False)))
                 except OSError as error:
@@ -34681,8 +34720,7 @@ def _require_legacy_generic_cleanup_validation_current_state(
                         "legacy generic cleanup receipt-bound entry changed: "
                         f"{item.name}"
                     ) from error
-        if len(current_entries) > MAX_PENDING_CLEANUP_ENTRIES:
-            raise SyncError("legacy generic cleanup batch exceeds the size limit")
+        scan_budget[0] -= len(current_entries)
         for name, metadata in current_entries:
             retained_plan = _pending_cleanup_internal_entry_plan(
                 name,
@@ -34831,9 +34869,15 @@ def _validate_pending_terminal_validation_receipt_namespace_capacity(
     batch_fd: int,
     batch_mount_identity: tuple[int, int | None],
     quarantine_root_identity: tuple[int, int],
+    *,
+    entry_budget: list[int] | None = None,
 ) -> None:
     """Preflight the complete v8 receipt before creating recovery aliases."""
-    budget = [MAX_PENDING_CLEANUP_ENTRIES]
+    budget = (
+        entry_budget
+        if entry_budget is not None
+        else [MAX_PENDING_CLEANUP_ENTRIES]
+    )
     identity_ledger: PendingCleanupIdentityLedger = {}
     _capture_pending_cleanup_identity_ledger(
         batch_fd,
@@ -34924,6 +34968,7 @@ def _validate_pending_terminal_validation_receipt_namespace_capacity(
         bound_batch_root,
         batch_fd,
         _pending_terminal_validation_control_paths_for_ticket(ticket),
+        entry_budget=budget,
     )
     _require_pending_terminal_validation_control_set(ticket, control_files)
     _pending_cleanup_terminal_validation_payload(
@@ -35037,6 +35082,7 @@ def _require_pending_terminal_pointer_retirement_authority(
     batch_fd: int,
     *,
     allow_consumed: bool,
+    entry_budget: list[int] | None = None,
 ) -> None:
     """Revalidate the retired pointer and transaction metadata as one inode."""
     if ticket.pointer_retirement_path is None or (
@@ -35053,6 +35099,23 @@ def _require_pending_terminal_pointer_retirement_authority(
     state_fd = -1
     state_physical_path = state_path
     retirement_snapshot = ManagedStateFileSnapshot(exists=False)
+    pointer_budget = (
+        entry_budget
+        if entry_budget is not None
+        else [MAX_PENDING_CLEANUP_ENTRIES]
+    )
+
+    def bounded_member_names(directory_fd: int) -> tuple[str, ...]:
+        if pointer_budget[0] <= 0:
+            raise SyncError("pending cleanup control scan exceeds the entry budget")
+        names = _directory_member_names(
+            directory_fd,
+            maximum_entries=min(MAX_PENDING_CLEANUP_ENTRIES, pointer_budget[0]),
+            overflow_message="pending cleanup control scan exceeds the entry budget",
+        )
+        pointer_budget[0] -= len(names)
+        return names
+
     try:
         try:
             state_fd = os.open(
@@ -35064,24 +35127,23 @@ def _require_pending_terminal_pointer_retirement_authority(
             # A walker may have isolated the logical state directory under an
             # active-entry token between its two mutation callbacks. Resolve
             # that token by its durable logical-name binding.
-            with os.scandir(batch_fd) as iterator:
-                for entry in iterator:
-                    binding = _pending_cleanup_active_entry_binding(
-                        entry.name,
-                        ticket.batch_root_identity,
+            for entry_name in bounded_member_names(batch_fd):
+                binding = _pending_cleanup_active_entry_binding(
+                    entry_name,
+                    ticket.batch_root_identity,
+                )
+                if (
+                    binding is not None
+                    and binding[1] == state_path.name
+                    and binding[0][2] == stat.S_IFDIR
+                ):
+                    state_physical_path = bound_batch_root / entry_name
+                    state_fd = os.open(
+                        entry_name,
+                        _directory_open_flags(nofollow=True),
+                        dir_fd=batch_fd,
                     )
-                    if (
-                        binding is not None
-                        and binding[1] == state_path.name
-                        and binding[0][2] == stat.S_IFDIR
-                    ):
-                        state_physical_path = bound_batch_root / entry.name
-                        state_fd = os.open(
-                            entry.name,
-                            _directory_open_flags(nofollow=True),
-                            dir_fd=batch_fd,
-                        )
-                        break
+                    break
         if state_fd >= 0:
             _require_pending_cleanup_fd_access_policy(
                 state_fd,
@@ -35106,37 +35168,36 @@ def _require_pending_terminal_pointer_retirement_authority(
                 maximum_bytes=MAX_MANAGED_STATE_BYTES,
             )
             if not retirement_snapshot.exists:
-                with os.scandir(state_fd) as iterator:
-                    for entry in iterator:
-                        binding = _pending_cleanup_active_entry_binding(
-                            entry.name,
-                            _directory_identity(state_fd),
+                for entry_name in bounded_member_names(state_fd):
+                    binding = _pending_cleanup_active_entry_binding(
+                        entry_name,
+                        _directory_identity(state_fd),
+                    )
+                    legacy_plan = _pending_cleanup_internal_entry_plan(
+                        entry_name,
+                        PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                        _directory_identity(state_fd),
+                    )
+                    if (
+                        (
+                            binding is not None
+                            and binding[1] == retirement_name
+                            and binding[0][2] == stat.S_IFREG
                         )
-                        legacy_plan = _pending_cleanup_internal_entry_plan(
-                            entry.name,
-                            PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
-                            _directory_identity(state_fd),
+                        or (
+                            binding is None
+                            and authority.pointer.file_identity is not None
+                            and legacy_plan
+                            == (*authority.pointer.file_identity, stat.S_IFREG)
                         )
-                        if (
-                            (
-                                binding is not None
-                                and binding[1] == retirement_name
-                                and binding[0][2] == stat.S_IFREG
-                            )
-                            or (
-                                binding is None
-                                and authority.pointer.file_identity is not None
-                                and legacy_plan
-                                == (*authority.pointer.file_identity, stat.S_IFREG)
-                            )
-                        ):
-                            retirement_snapshot = _read_managed_state_file_snapshot(
-                                home,
-                                state_physical_path / entry.name,
-                                state_fd,
-                                maximum_bytes=MAX_MANAGED_STATE_BYTES,
-                            )
-                            break
+                    ):
+                        retirement_snapshot = _read_managed_state_file_snapshot(
+                            home,
+                            state_physical_path / entry_name,
+                            state_fd,
+                            maximum_bytes=MAX_MANAGED_STATE_BYTES,
+                        )
+                        break
         metadata_path = bound_batch_root / PENDING_LINK_METADATA_NAME
         metadata_snapshot = _read_managed_state_file_snapshot(
             home,
@@ -35146,31 +35207,30 @@ def _require_pending_terminal_pointer_retirement_authority(
         )
         metadata_candidates: list[str] = []
         if not metadata_snapshot.exists:
-            with os.scandir(batch_fd) as iterator:
-                for entry in iterator:
-                    binding = _pending_cleanup_active_entry_binding(
-                        entry.name,
-                        ticket.batch_root_identity,
+            for entry_name in bounded_member_names(batch_fd):
+                binding = _pending_cleanup_active_entry_binding(
+                    entry_name,
+                    ticket.batch_root_identity,
+                )
+                legacy_plan = _pending_cleanup_internal_entry_plan(
+                    entry_name,
+                    PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                    ticket.batch_root_identity,
+                )
+                if (
+                    (
+                        binding is not None
+                        and binding[1] == PENDING_LINK_METADATA_NAME
+                        and binding[0][2] == stat.S_IFREG
                     )
-                    legacy_plan = _pending_cleanup_internal_entry_plan(
-                        entry.name,
-                        PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
-                        ticket.batch_root_identity,
+                    or (
+                        binding is None
+                        and authority.metadata.file_identity is not None
+                        and legacy_plan
+                        == (*authority.metadata.file_identity, stat.S_IFREG)
                     )
-                    if (
-                        (
-                            binding is not None
-                            and binding[1] == PENDING_LINK_METADATA_NAME
-                            and binding[0][2] == stat.S_IFREG
-                        )
-                        or (
-                            binding is None
-                            and authority.metadata.file_identity is not None
-                            and legacy_plan
-                            == (*authority.metadata.file_identity, stat.S_IFREG)
-                        )
-                    ):
-                        metadata_candidates.append(entry.name)
+                ):
+                    metadata_candidates.append(entry_name)
             if len(metadata_candidates) > 1:
                 raise SyncError(
                     "pending transaction metadata has ambiguous active tokens; "
@@ -35344,11 +35404,26 @@ def _ensure_pending_terminal_validation_receipt(
             is None
         ):
             metadata_path = PurePosixPath("metadata.json")
+        marker_only_control_paths = [
+            *_pending_marker_only_control_paths(ticket),
+            metadata_path,
+        ]
+        if (
+            _read_pending_cleanup_logical_control_snapshot(
+                home,
+                bound_batch_root,
+                batch_fd,
+                PENDING_STATE_COMMIT_EVIDENCE,
+                entry_budget=entry_budget,
+            )
+            is not None
+        ):
+            marker_only_control_paths.append(PENDING_STATE_COMMIT_EVIDENCE)
         controls = _pending_terminal_validation_control_files_from_paths(
             home,
             bound_batch_root,
             batch_fd,
-            (*_pending_marker_only_control_paths(ticket), metadata_path),
+            tuple(marker_only_control_paths),
             entry_budget=entry_budget,
         )
         _publish_pending_cleanup_terminal_validation(
@@ -35407,6 +35482,7 @@ def _ensure_pending_terminal_validation_receipt(
         bound_batch_root,
         batch_fd,
         allow_consumed=existing_receipt is not None,
+        entry_budget=entry_budget,
     )
 
     if existing_receipt is not None:
@@ -35529,7 +35605,11 @@ def _ensure_pending_terminal_validation_receipt(
     }:
         # The terminal receipt binds the complete surviving alias namespace after
         # recovery aliases exist and before the first destructive walker step.
-        cleanup_budget = entry_budget or [MAX_PENDING_CLEANUP_ENTRIES]
+        cleanup_budget = (
+            entry_budget
+            if entry_budget is not None
+            else [MAX_PENDING_CLEANUP_ENTRIES]
+        )
         identity_ledger: PendingCleanupIdentityLedger = {}
         _capture_pending_cleanup_identity_ledger(
             batch_fd,
@@ -35594,6 +35674,7 @@ def _ensure_pending_terminal_validation_receipt(
                     bound_batch_root,
                     batch_fd,
                     _pending_terminal_validation_control_paths_for_ticket(ticket),
+                    entry_budget=cleanup_budget,
                 ),
             )
         return
@@ -35997,13 +36078,15 @@ def _pending_terminal_validation_control_paths_for_ticket(
 def _pending_marker_only_control_paths(
     ticket: PendingBatchCleanupTicket,
 ) -> tuple[PurePosixPath, ...]:
-    """Return the marker/evidence logical names for an old marker-only ticket."""
+    """Return the mandatory marker logical name for an old marker-only ticket."""
     if (
         ticket.version != LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
         or ticket.terminal_regular_targets
     ):
         raise ValueError("marker-only control paths require a marker-only v4 ticket")
-    return _pending_terminal_validation_control_paths_for_ticket(ticket)
+    if ticket.marker_path is None:
+        return ()
+    return (ticket.marker_path,)
 
 
 def _pending_marker_only_control_set_is_present(
@@ -36014,13 +36097,19 @@ def _pending_marker_only_control_set_is_present(
     *,
     entry_budget: list[int] | None = None,
 ) -> bool:
-    """Detect whether a historic marker-only ticket has both control names.
+    """Detect whether a historic marker-only ticket has receipt controls.
 
-    A few pre-receipt v4 tickets carry only the old generic metadata and
-    committed marker.  They must retain their compatibility path when the
-    newer commit-evidence hard link is absent; a complete marker/evidence set
-    is what opts a ticket into the durable receipt protocol.
+    The marker and generic metadata are sufficient durable controls for old
+    v4 tickets. ``commit-evidence`` is optional because some historical
+    batches were written before that hard link existed.
     """
+    if ticket.marker_path is None:
+        return False
+    control_budget = (
+        entry_budget
+        if entry_budget is not None
+        else [MAX_PENDING_CLEANUP_ENTRIES]
+    )
     for logical_path in _pending_marker_only_control_paths(ticket):
         if (
             _read_pending_cleanup_logical_control_snapshot(
@@ -36028,12 +36117,27 @@ def _pending_marker_only_control_set_is_present(
                 bound_batch_root,
                 batch_fd,
                 logical_path,
-                entry_budget=entry_budget,
+                entry_budget=control_budget,
             )
             is None
         ):
             return False
-    return True
+    for logical_path in (
+        PurePosixPath(PENDING_LINK_METADATA_NAME),
+        PurePosixPath("metadata.json"),
+    ):
+        if (
+            _read_pending_cleanup_logical_control_snapshot(
+                home,
+                bound_batch_root,
+                batch_fd,
+                logical_path,
+                entry_budget=control_budget,
+            )
+            is not None
+        ):
+            return True
+    return False
 
 
 def _require_pending_terminal_validation_control_files(
@@ -39245,6 +39349,11 @@ def _legacy_marker_only_v4_empty_metadata_is_admitted(
     Keep that compatibility case bounded to its marker-only namespace; a
     missing, malformed, or other unsupported envelope remains manual recovery.
     """
+    cleanup_budget = (
+        entry_budget
+        if entry_budget is not None
+        else [MAX_PENDING_CLEANUP_ENTRIES]
+    )
     if metadata.payload is None:
         return False
     try:
@@ -39272,7 +39381,7 @@ def _legacy_marker_only_v4_empty_metadata_is_admitted(
         batch_fd,
         marker_path,
         expected_identity=ticket.marker_file_identity,
-        entry_budget=entry_budget,
+        entry_budget=cleanup_budget,
     )
     if marker_match is None:
         return False
@@ -39297,7 +39406,7 @@ def _legacy_marker_only_v4_empty_metadata_is_admitted(
         batch_fd,
         PurePosixPath(PENDING_LINK_METADATA_NAME),
         expected_identity=None,
-        entry_budget=entry_budget,
+        entry_budget=cleanup_budget,
     )
     if metadata_match is None:
         metadata_match = _find_pending_cleanup_control_snapshot(
@@ -39306,13 +39415,12 @@ def _legacy_marker_only_v4_empty_metadata_is_admitted(
             batch_fd,
             PurePosixPath("metadata.json"),
             expected_identity=None,
-            entry_budget=entry_budget,
+            entry_budget=cleanup_budget,
         )
     if metadata_match is None:
         return False
     _metadata_physical_path, metadata = metadata_match
 
-    cleanup_budget = entry_budget or [MAX_PENDING_CLEANUP_ENTRIES]
     identity_ledger: PendingCleanupIdentityLedger = {}
     _capture_pending_cleanup_identity_ledger(
         batch_fd,
@@ -39833,6 +39941,7 @@ def _remove_cleanup_ready_batch(
                 batch_fd,
                 legacy_generic_validation,
                 defer_retainable_active_mismatch_to_walker=True,
+                entry_budget=cleanup_budget,
             )
         elif existing_marker_only_receipt is None:
             legacy_metadata = _require_legacy_generic_cleanup_ticket_is_nonterminal(
@@ -39861,6 +39970,7 @@ def _remove_cleanup_ready_batch(
                         bound_batch_root,
                         batch_fd,
                         legacy_metadata,
+                        entry_budget=cleanup_budget,
                     )
                 )
         if marker_only_ticket and existing_marker_only_receipt is None:
@@ -39931,6 +40041,7 @@ def _remove_cleanup_ready_batch(
                     bound_batch_root,
                     batch_fd,
                     revalidated_legacy_metadata,
+                    entry_budget=cleanup_budget,
                 )
             )
             if revalidated_legacy_validation is None:
@@ -39989,6 +40100,7 @@ def _remove_cleanup_ready_batch(
                     batch_fd,
                     batch_mount_identity,
                     quarantine_root_identity,
+                    entry_budget=cleanup_budget,
                 )
         _ensure_pending_terminal_validation_receipt(
             home,
@@ -40013,8 +40125,12 @@ def _remove_cleanup_ready_batch(
                 bound_batch_root,
                 batch_fd,
                 legacy_generic_validation,
+                entry_budget=cleanup_budget,
             )
         marker_only_validation_authority: PendingTerminalValidationAuthority | None = None
+        legacy_mutation_revalidator: (
+            Callable[[PurePosixPath, str], None] | None
+        ) = None
         if marker_only_ticket and marker_only_receipt_required:
             marker_only_receipt = _read_pending_cleanup_terminal_validation(
                 home,
@@ -40048,8 +40164,7 @@ def _remove_cleanup_ready_batch(
                 _logical_path: PurePosixPath,
                 _stage: str,
             ) -> None:
-                if os.path.lexists(ticket.path):
-                    _require_pending_cleanup_ticket_link_authority(home, ticket)
+                _require_pending_cleanup_ticket_unchanged(home, ticket)
                 _require_pending_terminal_validation_control_files(
                     home,
                     bound_batch_root,
@@ -40174,9 +40289,6 @@ def _remove_cleanup_ready_batch(
             terminal_alias_paths = frozenset(
                 alias.path for alias in terminal_authority.aliases
             )
-        legacy_mutation_revalidator: (
-            Callable[[PurePosixPath, str], None] | None
-        ) = None
         if legacy_generic_validation is not None:
 
             def revalidate_legacy_control_file(
@@ -40195,6 +40307,7 @@ def _remove_cleanup_ready_batch(
                     bound_batch_root,
                     batch_fd,
                     legacy_generic_validation,
+                    entry_budget=cleanup_budget,
                 )
 
             legacy_mutation_revalidator = revalidate_legacy_control_file
@@ -40286,6 +40399,7 @@ def _remove_cleanup_ready_batch(
                     bound_batch_root,
                     batch_fd,
                     allow_consumed=True,
+                    entry_budget=cleanup_budget,
                 )
                 if frozenset(
                     alias.path for alias in current_authority.aliases
