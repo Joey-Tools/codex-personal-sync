@@ -2798,6 +2798,68 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertTrue(ticket.batch_root.is_dir())
         self.assertEqual(self.target.read_bytes(), PUBLIC_PAYLOAD.encode())
 
+    def test_scanner_rejects_v4_empty_downgrade_without_legacy_metadata(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        payload = json.loads(ticket.path.read_text(encoding="utf-8"))
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        payload["version"] = MODULE.LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        payload["terminal_regular_targets"] = []
+        for field in (
+            "commit_evidence",
+            "terminal_namespace_sha256",
+            "pointer_retirement_path",
+            "pointer_retirement",
+        ):
+            payload.pop(field, None)
+        for metadata_name in (MODULE.PENDING_LINK_METADATA_NAME, "metadata.json"):
+            metadata_path = ticket.batch_root / metadata_name
+            if metadata_path.exists():
+                metadata_path.unlink()
+        self._rewrite_ticket_same_inode(ticket, payload)
+        before = pending_authority_snapshot(self.home)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal regular-file validation was retained|metadata is missing|could not be safely classified",
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        after = pending_authority_snapshot(self.home)
+        self.assertEqual(after, before)
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertEqual(self.target.read_bytes(), PUBLIC_PAYLOAD.encode())
+
+    def test_marker_only_v4_ticket_rejects_external_hardlink(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        payload = json.loads(ticket.path.read_text(encoding="utf-8"))
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        payload["version"] = MODULE.LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        payload["terminal_regular_targets"] = []
+        for field in (
+            "commit_evidence",
+            "terminal_namespace_sha256",
+            "pointer_retirement_path",
+            "pointer_retirement",
+        ):
+            payload.pop(field, None)
+        self._rewrite_ticket_same_inode(ticket, payload)
+        foreign = self.root / "foreign-marker-only-v4-ticket.json"
+        os.link(ticket.path, foreign)
+        try:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup control has an unauthorized hard-link alias",
+            ):
+                MODULE._cleanup_ready_pending_batches(self.home)
+            self.assertTrue(ticket.path.is_file())
+            self.assertTrue(ticket.batch_root.is_dir())
+            self.assertTrue(foreign.is_file())
+        finally:
+            foreign.unlink()
+
     def test_ticket_tombstone_is_restored_and_cleanup_retries(self) -> None:
         real_delete = MODULE._isolate_and_delete_pending_cleanup_file
         tripped = False
