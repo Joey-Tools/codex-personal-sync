@@ -179,6 +179,22 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         assert ticket is not None
         return ticket
 
+    def _rewrite_ticket_same_inode(
+        self,
+        ticket: MODULE.PendingBatchCleanupTicket,
+        payload: dict[str, object],
+    ) -> None:
+        encoded = MODULE._bounded_json_document(
+            payload,
+            max_bytes=MODULE.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+            overflow_error="pending cleanup ticket exceeds the size limit",
+        )
+        with ticket.path.open("wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        ticket.path.chmod(0o600)
+
     def _crash_after_walker_alias_unlink(
         self,
         ticket: MODULE.PendingBatchCleanupTicket,
@@ -2717,6 +2733,70 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
 
         self.assertTrue(tickets[0].is_file())
         self.assertEqual(len(list(ticket_root.glob("*.empty-proof"))), 1)
+
+    def test_scanner_rejects_same_inode_v8_ticket_downgrade_to_empty_group(
+        self,
+    ) -> None:
+        ticket = self._deferred_terminal_ticket()
+        before = pending_authority_snapshot(self.home)
+        ticket_key = ticket.path.relative_to(self.home).as_posix()
+        payload = json.loads(ticket.path.read_text(encoding="utf-8"))
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        payload["terminal_regular_targets"] = []
+        self._rewrite_ticket_same_inode(ticket, payload)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "could not be safely classified",
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        after = pending_authority_snapshot(self.home)
+        self.assertEqual(
+            (ticket.path.stat().st_dev, ticket.path.stat().st_ino),
+            ticket.snapshot.file_identity,
+        )
+        for path, snapshot in before.items():
+            if path != ticket_key:
+                self.assertEqual(after.get(path), snapshot, path)
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertEqual(self.target.read_bytes(), PUBLIC_PAYLOAD.encode())
+
+    def test_scanner_rejects_same_inode_v4_downgrade_to_empty_group(self) -> None:
+        ticket = self._deferred_terminal_ticket()
+        before = pending_authority_snapshot(self.home)
+        ticket_key = ticket.path.relative_to(self.home).as_posix()
+        payload = json.loads(ticket.path.read_text(encoding="utf-8"))
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        payload["version"] = MODULE.LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        payload["terminal_regular_targets"] = []
+        for field in (
+            "commit_evidence",
+            "terminal_namespace_sha256",
+            "pointer_retirement_path",
+            "pointer_retirement",
+        ):
+            payload.pop(field, None)
+        self._rewrite_ticket_same_inode(ticket, payload)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal regular-file validation was retained.*cannot prove",
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        after = pending_authority_snapshot(self.home)
+        self.assertEqual(
+            (ticket.path.stat().st_dev, ticket.path.stat().st_ino),
+            ticket.snapshot.file_identity,
+        )
+        for path, snapshot in before.items():
+            if path != ticket_key:
+                self.assertEqual(after.get(path), snapshot, path)
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertEqual(self.target.read_bytes(), PUBLIC_PAYLOAD.encode())
 
     def test_ticket_tombstone_is_restored_and_cleanup_retries(self) -> None:
         real_delete = MODULE._isolate_and_delete_pending_cleanup_file

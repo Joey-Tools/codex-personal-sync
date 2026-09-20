@@ -29598,6 +29598,14 @@ def _read_pending_cleanup_ticket(
             }
             else ()
         )
+        if (
+            version == PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+            and not terminal_regular_targets
+        ):
+            raise SyncError(
+                "pending terminal cleanup ticket lacks terminal regular "
+                f"authority: {batch_name}"
+            )
         if version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
             has_link_counts = {
                 target.link_count is not None for target in terminal_regular_targets
@@ -35765,7 +35773,9 @@ def _pending_terminal_validation_control_paths_for_ticket(
     *,
     include_metadata: bool = False,
 ) -> tuple[PurePosixPath, ...]:
-    paths: set[PurePosixPath] = {PENDING_STATE_COMMIT_EVIDENCE}
+    paths: set[PurePosixPath] = set()
+    if ticket.version in {1, 2} or ticket.commit_evidence is not None:
+        paths.add(PENDING_STATE_COMMIT_EVIDENCE)
     if ticket.marker_path is not None:
         paths.add(ticket.marker_path)
     if include_metadata:
@@ -38777,7 +38787,10 @@ def _require_legacy_generic_cleanup_ticket_is_nonterminal(
 ) -> ManagedStateFileSnapshot | None:
     """Stop readable legacy metadata with untrusted finalization or terminal group.
 
-    v1/v2 tickets predate a complete target group.  A canonical batch that
+    v1/v2 tickets predate a complete target group.  A historic v4 marker-only
+    ticket has the same empty target shape and is admitted only after its
+    independently readable metadata proves that no terminal regular group is
+    present.  A canonical batch that
     still has parseable metadata must still match the ticket's finalization
     marker, then can reveal that it would delete a terminal regular link
     without durable count authority. Retain either unsafe case for guided
@@ -38790,7 +38803,11 @@ def _require_legacy_generic_cleanup_ticket_is_nonterminal(
     retained for manual recovery rather than downgraded to schema
     incompatibility.
     """
-    if ticket.version not in {1, 2}:
+    marker_only_v4 = (
+        ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+        and not ticket.terminal_regular_targets
+    )
+    if ticket.version not in {1, 2} and not marker_only_v4:
         return None
     if bound_batch_root != ticket.batch_root:
         return None
@@ -38932,7 +38949,13 @@ def _require_legacy_generic_cleanup_ticket_is_nonterminal(
         or batch.batch_root_identity != ticket.batch_root_identity
     ):
         raise manual_recovery_error("parsed batch binding changed")
-    expected_phase = "after" if ticket.version == 1 else "before"
+    expected_phase = (
+        "after"
+        if ticket.version == 1
+        else "before"
+        if ticket.version == 2
+        else ticket.phase
+    )
     if ticket.phase != expected_phase:
         raise manual_recovery_error("ticket finalization phase changed")
     try:
