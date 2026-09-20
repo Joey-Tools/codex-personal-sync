@@ -8686,6 +8686,11 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
             ),
             mock.patch.object(
                 MODULE,
+                "_require_pending_cleanup_ticket_link_authority",
+                return_value=1,
+            ),
+            mock.patch.object(
+                MODULE,
                 "_read_regular_file_snapshot_beneath",
                 return_value=target_snapshot,
             ),
@@ -8698,6 +8703,11 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
                 MODULE,
                 "_read_pending_cleanup_ticket",
                 return_value=changed_ticket,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_require_pending_cleanup_ticket_link_authority",
+                return_value=1,
             ),
             self.assertRaisesRegex(MODULE.SyncError, "cleanup ticket changed"),
         ):
