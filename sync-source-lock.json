@@ -23,7 +23,7 @@
     "engine": {
       "mode": "0755",
       "path": "scripts/codex_personal_sync.py",
-      "sha256": "34f81a848fe7959b6afcfb643e7e65f39db1364531efb93f7e811cd8ba13f257"
+      "sha256": "4a0572e22f60adcdb8937ecbe639d981119b890799a5d28e3845f95f33841c44"
     },
     "engine_tests": {
       "mode": "0644",
@@ -43,7 +43,7 @@
     "pending_staging_cleanup_tests": {
       "mode": "0644",
       "path": "tests/test_pending_staging_cleanup.py",
-      "sha256": "6565bd3725c81cfa75722331af211f69dd1b3fa76fe37d749dcf3af21334a4d9"
+      "sha256": "f129cd232a8acf404f05f214051d028a498a1d97b686527a634a0c236e97304d"
     },
     "quarantine_empty_batch_reclaim_tests": {
       "mode": "0644",
@@ -63,7 +63,7 @@
     "regular_overlay_uninstall_status_regressions_tests": {
       "mode": "0644",
       "path": "tests/test_regular_overlay_uninstall_status_regressions.py",
-      "sha256": "2d33c9a609f25f0feb65848afa1a7ccade072a83fb2939d7eb699c7319919038"
+      "sha256": "92074c557324d8884edf5bd21db4e17b48577347097abcde1f8605900f3abbc3"
     },
     "release_retention_tests": {
       "mode": "0644",

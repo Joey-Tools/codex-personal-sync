@@ -4909,6 +4909,10 @@ class PendingTerminalValidationAuthority:
     directories: tuple[PendingTerminalValidationDirectory, ...]
     namespace_entries: tuple[PendingTerminalValidationNamespaceEntry, ...] | None = None
     control_files: tuple[PendingTerminalValidationControlFile, ...] = ()
+    # A v3 staging receipt uses the same file evidence shape as the terminal
+    # validation receipt, but records durable marker consumption rather than a
+    # terminal alias namespace.
+    staging_marker: "PendingTerminalValidationReceiptAuthority | None" = None
 
 
 @dataclass(frozen=True)
@@ -28475,6 +28479,27 @@ def _pending_terminal_validation_receipt_authority_from_snapshot(
     )
 
 
+def _pending_staging_marker_receipt_authority_matches_ticket(
+    ticket: PendingBatchCleanupTicket,
+    authority: PendingTerminalValidationReceiptAuthority,
+) -> bool:
+    """Match durable marker evidence to the immutable v3 ticket fields."""
+    return (
+        ticket.version == 3
+        and ticket.marker_path is not None
+        and ticket.marker_parent_identity is not None
+        and ticket.marker_file_identity is not None
+        and ticket.marker_mode is not None
+        and ticket.marker_sha256 is not None
+        and authority.parent_identity == ticket.marker_parent_identity
+        and authority.file.file_identity == ticket.marker_file_identity
+        and authority.file.mode == ticket.marker_mode
+        and authority.file.uid == os.geteuid()
+        and authority.file.sha256 == ticket.marker_sha256
+        and authority.file.link_count == 1
+    )
+
+
 def _pending_terminal_validation_receipt_authority_payload(
     authority: PendingTerminalValidationReceiptAuthority,
 ) -> dict[str, object]:
@@ -34102,6 +34127,66 @@ def _parse_pending_terminal_validation_authority(
             data,
         )
         return PendingTerminalValidationAuthority((), ())
+    if ticket.version == 3:
+        if receipt.payload == _pending_cleanup_terminal_validation_payload(
+            ticket,
+            quarantine_root_identity,
+        ):
+            return PendingTerminalValidationAuthority((), ())
+        expected_fields = {
+            "version",
+            "phase",
+            "batch",
+            "batch_root_identity",
+            "quarantine_root_identity",
+            "ticket_identity",
+            "ticket_sha256",
+            "marker_path",
+            "marker_authority",
+        }
+        if (
+            set(data) != expected_fields
+            or data.get("version") != 1
+            or data.get("phase") != "staging-marker-consumed"
+            or data.get("batch") != ticket.batch_root.name
+            or data.get("batch_root_identity")
+            != _identity_payload(ticket.batch_root_identity)
+            or data.get("quarantine_root_identity")
+            != _identity_payload(quarantine_root_identity)
+            or data.get("ticket_identity")
+            != _identity_payload(ticket.snapshot.file_identity)
+            or data.get("ticket_sha256")
+            != hashlib.sha256(ticket.snapshot.payload).hexdigest()
+            or ticket.marker_path is None
+            or data.get("marker_path") != ticket.marker_path.as_posix()
+        ):
+            raise SyncError(
+                f"pending staging marker receipt changed: {ticket.batch_root.name}"
+            )
+        marker_authority = _parse_pending_terminal_validation_receipt_authority(
+            data.get("marker_authority"),
+            batch_name=ticket.batch_root.name,
+        )
+        if not _pending_staging_marker_receipt_authority_matches_ticket(
+            ticket,
+            marker_authority,
+        ):
+            raise SyncError(
+                f"pending staging marker receipt changed: {ticket.batch_root.name}"
+            )
+        if receipt.payload != _pending_cleanup_terminal_validation_payload(
+            ticket,
+            quarantine_root_identity,
+            staging_marker_authority=marker_authority,
+        ):
+            raise SyncError(
+                f"pending staging marker receipt changed: {ticket.batch_root.name}"
+            )
+        return PendingTerminalValidationAuthority(
+            (),
+            (),
+            staging_marker=marker_authority,
+        )
     if ticket.version not in {
         LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
         PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
@@ -35054,11 +35139,21 @@ def _pending_terminal_validation_receipt_has_complete_authority(
             quarantine_root_identity,
             receipt,
         )
+        if ticket.version == 3:
+            return authority is not None and authority.staging_marker is not None
         if (
             authority is None
             or authority.namespace_entries is None
             or not authority.control_files
-            or ticket.terminal_namespace_sha256 is None
+        ):
+            return False
+        if (
+            ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+            and not ticket.terminal_regular_targets
+        ):
+            return True
+        if (
+            ticket.terminal_namespace_sha256 is None
             or ticket.pointer_retirement_authority is None
             or ticket.pointer_retirement_path is None
         ):
@@ -36236,9 +36331,50 @@ def _pending_cleanup_terminal_validation_payload(
     ) = None,
     control_files: tuple[PendingTerminalValidationControlFile, ...] = (),
     legacy_generic_validation: LegacyGenericCleanupValidation | None = None,
+    staging_marker_authority: (
+        PendingTerminalValidationReceiptAuthority | None
+    ) = None,
 ) -> bytes:
     if ticket.snapshot.file_identity is None or ticket.snapshot.payload is None:
         raise SyncError("pending cleanup ticket has no validation identity")
+    if ticket.version == 3 and staging_marker_authority is not None:
+        if (
+            ticket.marker_path is None
+            or not _pending_staging_marker_receipt_authority_matches_ticket(
+                ticket,
+                staging_marker_authority,
+            )
+        ):
+            raise SyncError("pending staging marker authority is incomplete")
+        return _bounded_json_document(
+            {
+                "version": 1,
+                "phase": "staging-marker-consumed",
+                "batch": ticket.batch_root.name,
+                "batch_root_identity": _identity_payload(ticket.batch_root_identity),
+                "quarantine_root_identity": _identity_payload(
+                    quarantine_root_identity
+                ),
+                "ticket_identity": _identity_payload(ticket.snapshot.file_identity),
+                "ticket_sha256": hashlib.sha256(ticket.snapshot.payload).hexdigest(),
+                "marker_path": ticket.marker_path.as_posix(),
+                "marker_authority": (
+                    _pending_terminal_validation_receipt_authority_payload(
+                        staging_marker_authority
+                    )
+                ),
+            },
+            max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+            overflow_error="pending staging marker receipt exceeds the size limit",
+        )
+    if ticket.version == 3 and (
+        terminal_aliases is not None
+        or terminal_directories is not None
+        or namespace_entries is not None
+        or control_files
+        or legacy_generic_validation is not None
+    ):
+        raise SyncError("pending staging cleanup has unsupported receipt authority")
     if ticket.version in {1, 2}:
         if (
             terminal_aliases is not None
@@ -36410,8 +36546,19 @@ def _publish_pending_cleanup_terminal_validation(
     ) = None,
     control_files: tuple[PendingTerminalValidationControlFile, ...] = (),
     legacy_generic_validation: LegacyGenericCleanupValidation | None = None,
+    staging_marker_authority: (
+        PendingTerminalValidationReceiptAuthority | None
+    ) = None,
 ) -> ManagedStateFileSnapshot:
     _require_pending_terminal_validation_control_set(ticket, control_files)
+    if ticket.version == 3 and (
+        staging_marker_authority is not None
+        and not _pending_staging_marker_receipt_authority_matches_ticket(
+            ticket,
+            staging_marker_authority,
+        )
+    ):
+        raise SyncError("pending staging marker authority is incomplete")
     if ticket.version in {1, 2}:
         if (
             legacy_generic_validation is None
@@ -36423,6 +36570,14 @@ def _publish_pending_cleanup_terminal_validation(
             raise SyncError("legacy generic cleanup validation lacks authority")
     elif legacy_generic_validation is not None:
         raise SyncError("pending cleanup validation has unsupported legacy authority")
+    if ticket.version == 3 and (
+        terminal_aliases is not None
+        or terminal_directories is not None
+        or namespace_entries is not None
+        or control_files
+        or legacy_generic_validation is not None
+    ):
+        raise SyncError("pending staging cleanup has unsupported receipt authority")
     if ticket.version in {
         LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
         PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
@@ -36452,6 +36607,21 @@ def _publish_pending_cleanup_terminal_validation(
         quarantine_root_identity,
     )
     if existing is not None:
+        if ticket.version == 3 and staging_marker_authority is not None:
+            existing_authority = _parse_pending_terminal_validation_authority(
+                home,
+                ticket,
+                quarantine_root_identity,
+                existing,
+            )
+            if (
+                existing_authority is None
+                or existing_authority.staging_marker != staging_marker_authority
+            ):
+                raise SyncError(
+                    "pending staging marker receipt authority changed: "
+                    f"{ticket.batch_root.name}"
+                )
         if ticket.version in {
             LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
             PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
@@ -36489,6 +36659,7 @@ def _publish_pending_cleanup_terminal_validation(
             namespace_entries=namespace_entries,
             control_files=control_files,
             legacy_generic_validation=legacy_generic_validation,
+            staging_marker_authority=staging_marker_authority,
         ),
     )
     verified = _read_pending_cleanup_terminal_validation(
@@ -36526,6 +36697,21 @@ def _publish_pending_cleanup_terminal_validation(
             "publication: "
             f"{ticket.batch_root.name}"
         )
+    if ticket.version == 3 and staging_marker_authority is not None:
+        parsed = _parse_pending_terminal_validation_authority(
+            home,
+            ticket,
+            quarantine_root_identity,
+            verified,
+        )
+        if (
+            parsed is None
+            or parsed.staging_marker != staging_marker_authority
+        ):
+            raise SyncError(
+                "pending staging marker receipt changed after publication: "
+                f"{ticket.batch_root.name}"
+            )
     return verified
 
 
@@ -37078,7 +37264,7 @@ def _read_pending_cleanup_empty_proof(
         current_receipt_authority: (
             PendingTerminalValidationReceiptAuthority | None
         ) = None
-        if ticket.version in {4, 8} and ticket.terminal_regular_targets:
+        if ticket.version in {4, 8}:
             current_receipt = _read_pending_cleanup_terminal_validation(
                 home,
                 ticket,
@@ -37144,16 +37330,35 @@ def _read_pending_cleanup_empty_proof(
                 current_receipt_authority,
             )
         )
-        authority_match = (
-            authority in compatible_authorities
-            or (
-                authority_without_receipt in compatible_authorities
+        marker_only_ticket = (
+            ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+            and not ticket.terminal_regular_targets
+        )
+        if marker_only_ticket:
+            # A marker-only receipt is itself mutable cleanup authority.  Once
+            # the receipt exists, the empty proof must carry its complete
+            # inode/content/policy anchor; a self-consistent replacement
+            # receipt may not expand the deletion namespace.
+            authority_match = (
+                authority.version == 3
+                and authority.source_ticket_version == ticket.version
+                and authority.terminal_validation_receipt is not None
                 and (
-                    current_receipt_authority is None
-                    or receipt_authority_match
+                    receipt_authority_match
+                    or current_receipt_authority is None
                 )
             )
-        )
+        else:
+            authority_match = (
+                authority in compatible_authorities
+                or (
+                    authority_without_receipt in compatible_authorities
+                    and (
+                        current_receipt_authority is None
+                        or receipt_authority_match
+                    )
+                )
+            )
         if (
             proof.file_type != stat.S_IFREG
             or proof.mode != 0o600
@@ -37212,6 +37417,26 @@ def _publish_pending_cleanup_empty_proof(
         joined_allocation=joined_allocation,
     )
     if existing is not None:
+        if (
+            terminal_validation_receipt is not None
+            and ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION
+            and not ticket.terminal_regular_targets
+        ):
+            existing_authority = _parse_pending_cleanup_empty_proof_authority(
+                _pending_cleanup_empty_proof_path(home, ticket.batch_root.name),
+                existing.payload,
+            )
+            expected_authority = _pending_cleanup_empty_proof_authority_from_ticket(
+                ticket,
+                quarantine_root_identity,
+                joined_allocation=joined_allocation,
+                terminal_validation_receipt=terminal_validation_receipt,
+            )
+            if existing_authority != expected_authority:
+                raise SyncError(
+                    "pending cleanup empty proof receipt authority changed: "
+                    f"{ticket.batch_root.name}"
+                )
         return existing
     proof_path = _pending_cleanup_empty_proof_path(
         home,
@@ -39952,6 +40177,40 @@ def _remove_cleanup_ready_batch(
             else None
         )
         marker_only_receipt_required = existing_marker_only_receipt is not None
+        if marker_only_ticket and existing_marker_only_receipt is not None:
+            # A marker-only receipt is only admissible when the durable empty
+            # proof already anchors its exact inode/content/policy evidence.
+            # This closes the crash window in which a receipt could otherwise
+            # be rewritten and expanded before the walker retries.
+            existing_marker_only_proof = _read_pending_cleanup_empty_proof(
+                home,
+                ticket,
+                quarantine_root_identity,
+            )
+            if existing_marker_only_proof is None:
+                raise SyncError(
+                    "legacy marker-only v4 receipt lacks durable empty-proof "
+                    f"authority: {ticket.batch_root.name}"
+                )
+        elif marker_only_ticket:
+            existing_marker_only_proof = _read_pending_cleanup_empty_proof(
+                home,
+                ticket,
+                quarantine_root_identity,
+            )
+            if existing_marker_only_proof is not None:
+                proof_authority = _parse_pending_cleanup_empty_proof_authority(
+                    _pending_cleanup_empty_proof_path(
+                        home,
+                        ticket.batch_root.name,
+                    ),
+                    existing_marker_only_proof.payload,
+                )
+                if proof_authority.terminal_validation_receipt is not None:
+                    raise SyncError(
+                        "legacy marker-only v4 validation receipt is missing: "
+                        f"{ticket.batch_root.name}"
+                    )
         if existing_legacy_receipt is not None:
             assert existing_legacy_receipt.payload is not None
             legacy_generic_validation = _parse_legacy_generic_cleanup_validation(
@@ -40004,12 +40263,6 @@ def _remove_cleanup_ready_batch(
                         entry_budget=cleanup_budget,
                     )
                 )
-        if marker_only_ticket and existing_marker_only_receipt is None:
-            _publish_pending_cleanup_empty_proof(
-                home,
-                ticket,
-                quarantine_root_identity,
-            )
         if _directory_identity(
             batch_fd
         ) != ticket.batch_root_identity or not _bound_directory_matches(
@@ -40173,6 +40426,36 @@ def _remove_cleanup_ready_batch(
             marker_only_authorized=marker_only_receipt_required,
             marker_only_namespace_entries=marker_only_namespace_entries,
         )
+        if marker_only_ticket:
+            if marker_only_receipt_required:
+                marker_only_receipt = _read_pending_cleanup_terminal_validation(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                )
+                if marker_only_receipt is None:
+                    raise SyncError(
+                        "legacy marker-only v4 validation receipt is missing: "
+                        f"{ticket.batch_root.name}"
+                    )
+                marker_only_receipt_authority = (
+                    _pending_terminal_validation_receipt_authority_from_snapshot(
+                        marker_only_receipt,
+                        "validation receipt",
+                    )
+                )
+                _publish_pending_cleanup_empty_proof(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                    terminal_validation_receipt=marker_only_receipt_authority,
+                )
+            else:
+                _publish_pending_cleanup_empty_proof(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                )
         if legacy_generic_validation is not None:
             # Receipt publication itself is a mutable control-file operation.
             # Re-read the complete receipt-bound namespace before admitting
@@ -40263,13 +40546,10 @@ def _remove_cleanup_ready_batch(
 
             legacy_mutation_revalidator = revalidate_marker_only_controls
         if ticket.version == 3:
-            staging_marker_consumed = False
-
             def revalidate_staging_marker(
                 logical_path: PurePosixPath,
                 stage: str,
             ) -> None:
-                nonlocal staging_marker_consumed
                 _require_pending_cleanup_ticket_unchanged(home, ticket)
                 if (
                     ticket.marker_path is None
@@ -40289,7 +40569,29 @@ def _remove_cleanup_ready_batch(
                     entry_budget=cleanup_budget,
                 )
                 if marker_snapshot is None:
-                    if not staging_marker_consumed:
+                    consumed_receipt = _read_pending_cleanup_terminal_validation(
+                        home,
+                        ticket,
+                        quarantine_root_identity,
+                    )
+                    consumed_authority = (
+                        _parse_pending_terminal_validation_authority(
+                            home,
+                            ticket,
+                            quarantine_root_identity,
+                            consumed_receipt,
+                        )
+                        if consumed_receipt is not None
+                        else None
+                    )
+                    if (
+                        consumed_authority is None
+                        or consumed_authority.staging_marker is None
+                        or not _pending_staging_marker_receipt_authority_matches_ticket(
+                            ticket,
+                            consumed_authority.staging_marker,
+                        )
+                    ):
                         raise SyncError(
                             "pending staging cleanup marker changed before "
                             f"cleanup: {ticket.batch_root.name}"
@@ -40308,8 +40610,23 @@ def _remove_cleanup_ready_batch(
                         "pending staging cleanup marker changed before "
                         f"cleanup: {ticket.batch_root.name}"
                     )
-                if logical_path == ticket.marker_path and stage == "before_unlink":
-                    staging_marker_consumed = True
+                if (
+                    marker_snapshot is not None
+                    and logical_path == ticket.marker_path
+                    and stage == "before_unlink"
+                ):
+                    marker_authority = (
+                        _pending_terminal_validation_receipt_authority_from_snapshot(
+                            marker_snapshot,
+                            "staging marker",
+                        )
+                    )
+                    _publish_pending_cleanup_terminal_validation(
+                        home,
+                        ticket,
+                        quarantine_root_identity,
+                        staging_marker_authority=marker_authority,
+                    )
 
             legacy_mutation_revalidator = revalidate_staging_marker
         if ticket.version not in {1, 2}:
@@ -40655,6 +40972,11 @@ def _remove_cleanup_ready_batch(
 
         def require_terminal_batch_rmdir_boundary() -> None:
             _require_pending_cleanup_ticket_unchanged(home, ticket)
+            if ticket.version == 3:
+                revalidate_staging_marker(
+                    PurePosixPath("<batch-root>"),
+                    "before_rmdir",
+                )
             if marker_only_validation_authority is not None:
                 revalidate_marker_only_controls(
                     PurePosixPath("<batch-root>"),
@@ -42149,15 +42471,7 @@ def _restore_pending_cleanup_control_tombstones(
             parsed = _pending_cleanup_retained_control_name(retained_names[0])
             assert parsed is not None
             _parsed_canonical, batch_name = parsed
-            if (
-                not canonical.endswith(
-                    (
-                        PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX,
-                        PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX,
-                    )
-                )
-                and not action_budget.charge_batch(batch_name)
-            ):
+            if not action_budget.charge_batch(batch_name):
                 continue
             canonical_path = index_root / canonical
             retained_path = index_root / retained_names[0]

@@ -706,6 +706,79 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 self.assertTrue(ticket.batch_root.is_dir())
                 self.assertNotEqual(marker.read_bytes(), original)
 
+    def test_staging_marker_consumption_receipt_recovers_after_unlink_crash(
+        self,
+    ) -> None:
+        ticket = self._publish_legacy_cleanup_ticket(version=3)
+        real_unlink = MODULE.os.unlink
+        crashed = False
+        receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+
+        def unlink_then_crash(path, *args, **kwargs):
+            nonlocal crashed
+            real_unlink(path, *args, **kwargs)
+            if (
+                not crashed
+                and isinstance(path, str)
+                and path.startswith(MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+                and receipt_path.is_file()
+            ):
+                crashed = True
+                raise SystemExit("injected staging marker unlink crash")
+
+        with (
+            mock.patch.object(MODULE.os, "unlink", side_effect=unlink_then_crash),
+            self.assertRaisesRegex(
+                SystemExit,
+                "injected staging marker unlink crash",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(crashed)
+        self.assertTrue(receipt_path.is_file())
+        receipt = MODULE._read_pending_cleanup_terminal_validation(
+            self.home,
+            ticket,
+            (ticket.batch_root.parent.stat().st_dev, ticket.batch_root.parent.stat().st_ino),
+        )
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        authority = MODULE._parse_pending_terminal_validation_authority(
+            self.home,
+            ticket,
+            (ticket.batch_root.parent.stat().st_dev, ticket.batch_root.parent.stat().st_ino),
+            receipt,
+        )
+        self.assertIsNotNone(authority)
+        assert authority is not None
+        self.assertIsNotNone(authority.staging_marker)
+        self.assertTrue(MODULE._cleanup_ready_pending_batches(self.home))
+        self.assertFalse(ticket.batch_root.exists())
+
+    def test_staging_marker_missing_before_first_mutation_is_retained(self) -> None:
+        ticket = self._publish_legacy_cleanup_ticket(version=3)
+        marker = ticket.batch_root / Path(*MODULE.PENDING_STATE_STAGING_MARKER.parts)
+        marker.unlink()
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending staging cleanup marker changed",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertFalse(
+            MODULE._pending_cleanup_terminal_validation_path(
+                self.home,
+                ticket.batch_root.name,
+            ).exists()
+        )
+
     def test_no_ticket_batch_with_symlinked_marker_parent_fails_closed(self) -> None:
         batch_root = MODULE._quarantine_batch_root(self.home, [])
         outside = self.root / "outside-marker"

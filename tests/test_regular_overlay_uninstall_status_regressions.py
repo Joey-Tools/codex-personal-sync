@@ -3035,6 +3035,82 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertTrue(ticket.batch_root.is_dir())
         self.assertTrue(foreign.is_file())
 
+    def test_marker_only_v4_receipt_anchor_rejects_same_inode_rewrite(self) -> None:
+        ticket = self._marker_only_v4_ticket()
+        receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=SystemExit("injected after marker-only receipt"),
+            ),
+            self.assertRaisesRegex(
+                SystemExit,
+                "injected after marker-only receipt",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        links_root = ticket.batch_root / "links"
+        links_root.mkdir(mode=0o700)
+        foreign = links_root / "foreign"
+        foreign.write_bytes(b"foreign\n")
+        foreign.chmod(0o600)
+        links_metadata = links_root.stat()
+        metadata = foreign.stat()
+        namespace_entries = payload.get("namespace_entries")
+        self.assertIsInstance(namespace_entries, list)
+        assert isinstance(namespace_entries, list)
+        namespace_entries.append(
+            [
+                "links",
+                MODULE._identity_payload(
+                    (ticket.batch_root.stat().st_dev, ticket.batch_root.stat().st_ino)
+                ),
+                [links_metadata.st_dev, links_metadata.st_ino, stat.S_IFDIR],
+                stat.S_IMODE(links_metadata.st_mode),
+                links_metadata.st_uid,
+                links_metadata.st_gid,
+            ]
+        )
+        namespace_entries.append(
+            [
+                "links/foreign",
+                MODULE._identity_payload(
+                    (links_metadata.st_dev, links_metadata.st_ino)
+                ),
+                [metadata.st_dev, metadata.st_ino, stat.S_IFREG],
+                stat.S_IMODE(metadata.st_mode),
+                metadata.st_uid,
+                metadata.st_gid,
+            ]
+        )
+        namespace_entries.sort(key=lambda entry: entry[0])
+        encoded = MODULE._bounded_json_document(
+            payload,
+            max_bytes=MODULE.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+            overflow_error="pending cleanup validation receipt exceeds the size limit",
+        )
+        with receipt_path.open("wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        receipt_path.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending cleanup empty proof changed|receipt authority changed",
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(foreign.is_file())
+
     def test_marker_only_v4_requires_ticket_before_first_walker_mutation(self) -> None:
         ticket = self._marker_only_v4_ticket()
         real_remove = MODULE._remove_pending_batch_directory_contents
@@ -3369,6 +3445,21 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertEqual(retirement_path.stat().st_nlink, 1)
         self.assertTrue(receipt_retirement_path.is_file())
         self.assertTrue(proof_path.is_file())
+
+        retained_retirement_path = retirement_path.with_name(
+            next(MODULE._retained_pending_cleanup_names(retirement_path))
+        )
+        retirement_path.rename(retained_retirement_path)
+        self.assertEqual(
+            MODULE._restore_pending_cleanup_control_tombstones(
+                self.home,
+                budget=MODULE.PendingCleanupActionBudget(0),
+            ),
+            0,
+        )
+        self.assertFalse(retirement_path.exists())
+        self.assertTrue(retained_retirement_path.is_file())
+        retained_retirement_path.rename(retirement_path)
 
         zero_budget = MODULE.PendingCleanupActionBudget(0)
         self.assertEqual(
