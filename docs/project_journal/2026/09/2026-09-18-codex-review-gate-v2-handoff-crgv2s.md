@@ -21,7 +21,8 @@ superseded_by:
 
 - PR 事件通过 `JoeyTeng/codex-review-gate-action@v2` 产生 `codex/github-review-gate` check。
 - Verifier 工作流授予 `actions: read`，其余事件、作业与 action 参数保持不变。
-- controller 仅处理新建的 bot 评论和精确 head 的手动调度；请求者权限策略为 `any`。
+- controller 处理新建的 bot 评论和精确 head 的手动调度；启用 `CODEX_REVIEW_GATE_AUTO_REQUEST=true` 后，也会为首次 PR verifier 失败自动请求评审，并以 `workflow_run.head_sha` 作为预期 head。v2 action 会继续核验该运行与 PR 的关联及当前 PR head；请求者权限策略为 `any`。
+- 自动请求关联不依赖 `workflow_run.name` 载荷字段。
 - 临时 bridge 已删除，不再由本仓库产生 `codex/review-gate` legacy status。
 
 ## Evidence
