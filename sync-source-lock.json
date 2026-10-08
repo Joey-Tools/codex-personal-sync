@@ -38,7 +38,7 @@
     "pending_agent_claim_compatibility_tests": {
       "mode": "0644",
       "path": "tests/test_pending_agent_claim_compatibility.py",
-      "sha256": "4faadb2b1d3fc80eb46284d000d52f405388ce7d5af478a7c4b44a2f8f93222a"
+      "sha256": "2fd7fc714bec8c877b9e5d339b98d78fb3309800d6cbdbc1615e06772b85f5e3"
     },
     "pending_staging_cleanup_tests": {
       "mode": "0644",
@@ -63,7 +63,7 @@
     "regular_overlay_uninstall_status_regressions_tests": {
       "mode": "0644",
       "path": "tests/test_regular_overlay_uninstall_status_regressions.py",
-      "sha256": "4ba8c457cb672b775ea60cfae0255339b8505216a6b9c73bb1a08f9339ef3c9a"
+      "sha256": "c180028b2c03c1a46fd4cbcd68c195ef30b76b11cdbad484e8c15060ddb01e5b"
     },
     "release_retention_tests": {
       "mode": "0644",

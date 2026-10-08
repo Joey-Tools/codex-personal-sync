@@ -1310,22 +1310,34 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
             (),
             phase="after",
         )
+        batch_name = "20261008T000000Z-123-456"
+        ticket_path = MODULE._pending_cleanup_ticket_path(home, batch_name)
+        MODULE._ensure_safe_internal_directory(
+            home,
+            ticket_path.parent,
+            create=True,
+        )
+        ticket_path.write_bytes(b"ticket\n")
+        ticket_path.chmod(0o600)
+        ticket_parent_fd = MODULE._open_directory_beneath(home, ticket_path.parent)
+        try:
+            ticket_snapshot = MODULE._read_managed_state_file_snapshot(
+                home,
+                ticket_path,
+                ticket_parent_fd,
+            )
+        finally:
+            MODULE._close_fd_quietly(ticket_parent_fd)
         ticket = MODULE.PendingBatchCleanupTicket(
             version=4,
             phase="after",
-            path=self.root / "terminal-budget-ticket.json",
-            snapshot=MODULE.ManagedStateFileSnapshot(
-                exists=True,
-                payload=b"ticket\n",
-                mode=0o600,
-                parent_identity=(0, 1),
-                file_identity=(1, 2),
-                file_type=stat.S_IFREG,
-                size=7,
-                uid=os.geteuid(),
-                gid=os.getegid(),
+            path=ticket_path,
+            snapshot=ticket_snapshot,
+            batch_root=(
+                MODULE._personal_sync_root(home)
+                / MODULE.QUARANTINE_RELATIVE_PATH
+                / batch_name
             ),
-            batch_root=self.root / "terminal-budget-batch",
             batch_root_identity=(3, 4),
             marker_path=PurePosixPath("pending/state/commit.json"),
             marker_parent_identity=(5, 6),

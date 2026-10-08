@@ -1913,9 +1913,13 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
                 parent_identity,
                 planned,
             )
-            self.assertGreater(
-                len(os.fsencode(legacy_name)),
-                MODULE.MAX_PENDING_CLEANUP_ACTIVE_LOGICAL_NAME_BYTES,
+            self.assertEqual(
+                MODULE._pending_cleanup_internal_entry_plan(
+                    legacy_name,
+                    MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                    parent_identity,
+                ),
+                planned,
             )
             MODULE._rename_noreplace_at(
                 parent_fd,
