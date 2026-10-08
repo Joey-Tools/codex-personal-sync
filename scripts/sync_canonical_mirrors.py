@@ -5378,7 +5378,7 @@ def _logical_git_snapshot_manifest(
             )
         else:
             raise MirrorSyncError("Git control snapshot produced an unknown record")
-    return tuple(logical)
+    return tuple(sorted(logical, key=lambda record: str(record[1])))
 
 
 def _git_control_plane_manifest(
