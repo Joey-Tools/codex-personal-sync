@@ -36986,7 +36986,12 @@ def _ensure_pending_terminal_validation_receipt(
     marker_only_namespace_entries: (
         tuple[PendingTerminalValidationNamespaceEntry, ...] | None
     ) = None,
+    observe_unconsumed_progress: bool = False,
 ) -> None:
+    if observe_unconsumed_progress and (
+        ticket.version not in {4, 8} or not ticket.terminal_regular_targets
+    ):
+        raise SyncError("progress publication observation requires original terminal authority")
     if ticket.version in {1, 2}:
         existing_receipt = _read_pending_cleanup_terminal_validation(
             home,
@@ -37110,6 +37115,8 @@ def _ensure_pending_terminal_validation_receipt(
         ticket,
         quarantine_root_identity,
     )
+    if observe_unconsumed_progress and existing_receipt is not None:
+        raise SyncError("progress publication changed during read-only observation")
     if namespace_anchor_sha256 is None:
         if ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
             raise SyncError(
@@ -37213,6 +37220,8 @@ def _ensure_pending_terminal_validation_receipt(
         alias_identity = _named_entry_identity(batch_fd, alias_name)
         target = home / Path(*expectation.target.parts)
         if alias_identity is None:
+            if observe_unconsumed_progress:
+                raise SyncError("progress publication observation lacks an original recovery alias")
             if expectation.link_count is not None:
                 target_snapshot = _read_regular_file_snapshot_beneath(
                     home,
@@ -37267,7 +37276,8 @@ def _ensure_pending_terminal_validation_receipt(
                 else None
             ),
         )
-    os.fsync(batch_fd)
+    if not observe_unconsumed_progress:
+        os.fsync(batch_fd)
     retirement_control = _read_pending_cleanup_terminal_retirement_ticket(
         home,
         _pending_cleanup_terminal_retirement_path(home, ticket.batch_root.name),
@@ -37363,6 +37373,16 @@ def _ensure_pending_terminal_validation_receipt(
         _require_pending_terminal_validation_control_files(
             home, bound_batch_root, batch_fd, controls, entry_budget=cleanup_budget,
         )
+        if observe_unconsumed_progress:
+            _require_pending_terminal_validation_control_set(ticket, controls)
+            header = _pending_terminal_directory_progress_header_payload(
+                ticket, quarantine_root_identity, terminal_directories, namespace_entries,
+            )
+            if _read_unconsumed_pending_terminal_directory_progress(
+                home, ticket, header, allow_publication_temp=True,
+            ) is None:
+                raise SyncError("progress publication disappeared during read-only observation")
+            return
         # Only this independently ticket/namespace/control-validated path may
         # bind a zero-consumption sidecar left by receipt publication failure.
         _publish_pending_cleanup_terminal_validation(
@@ -44673,6 +44693,8 @@ def _pending_cleanup_unresolved_ticket_representation(
 
 def _pending_cleanup_unresolved_ticket_representation_issue(
     home: Path,
+    *,
+    read_only_publication_batches: frozenset[str] = frozenset(),
 ) -> tuple[str, str] | None:
     """Observe blocking ticket residue without granting it any authority."""
     index_root = _pending_cleanup_index_path(home)
@@ -44689,9 +44711,27 @@ def _pending_cleanup_unresolved_ticket_representation_issue(
             overflow_message="pending cleanup authority scan exceeds the size limit",
         )
         names_set = set(names)
+        if read_only_publication_batches:
+            observed_names: dict[str, list[str]] = {}
+            for name in names:
+                batch = _pending_cleanup_directory_progress_representation_batch_name(name)
+                if batch in read_only_publication_batches:
+                    observed_names.setdefault(batch, []).append(name)
+            for batch in read_only_publication_batches:
+                canonical = batch + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                if observed_names.get(batch) not in (
+                    [canonical], [canonical + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX],
+                ):
+                    raise SyncError("progress publication changed during read-only observation")
         for name in names:
             unresolved = _pending_cleanup_unresolved_ticket_representation(name)
             if unresolved is not None:
+                batch, _representation = unresolved
+                if batch in read_only_publication_batches and name == (
+                    batch + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                    + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+                ):
+                    continue
                 return unresolved
         retained_by_name = {}
         for name in names:
@@ -44713,6 +44753,11 @@ def _pending_cleanup_unresolved_ticket_representation_issue(
                 continue
             ticket_name = batch_name + PENDING_CLEANUP_TICKET_SUFFIX
             receipt_name = batch_name + PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX
+            if (
+                batch_name in read_only_publication_batches
+                and name == progress_name and ticket_name in names_set
+            ):
+                continue
             if (
                 ticket_name not in names_set
                 and ticket_name not in retained_canonicals
@@ -44805,18 +44850,17 @@ def _require_pending_cleanup_terminal_validation_family_safe(
         _close_fd_quietly(index_fd)
 
 
-def _recover_unconsumed_pending_terminal_progress_publications(
+def _unconsumed_pending_terminal_progress_publication_candidates(
     home: Path,
-    budget: PendingCleanupActionBudget,
-) -> None:
-    """Try exact publication candidates before the unchanged mutation fence."""
+) -> tuple[str, ...]:
+    """Bound candidate discovery; names alone grant no recovery authority."""
     if not _pending_link_pointer_is_absent(home):
-        return
+        return ()
     index_root = _pending_cleanup_index_path(home)
     try:
         index_fd = _open_directory_beneath(home, index_root)
     except FileNotFoundError:
-        return
+        return ()
     try:
         if not _bound_directory_matches(home, index_root, index_fd):
             raise SyncError("pending cleanup index changed before progress recovery")
@@ -44825,15 +44869,18 @@ def _recover_unconsumed_pending_terminal_progress_publications(
             maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
             overflow_message="pending cleanup authority scan exceeds the size limit",
         )
+        progress_names: dict[str, list[str]] = {}
         for name in names:
+            progress_batch = _pending_cleanup_directory_progress_representation_batch_name(name)
+            if progress_batch is not None:
+                progress_names.setdefault(progress_batch, []).append(name)
             unresolved = _pending_cleanup_unresolved_ticket_representation(name)
             if unresolved is not None:
-                progress_batch = _pending_cleanup_directory_progress_representation_batch_name(name)
                 if progress_batch is None or name != (
                     progress_batch + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
                     + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
                 ):
-                    return
+                    return ()
         names_set = set(names)
         candidates = []
         for name in names:
@@ -44856,15 +44903,77 @@ def _recover_unconsumed_pending_terminal_progress_publications(
                         PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX,
                     )
                 )
-                or _pending_terminal_directory_progress_representations(
-                    index_fd, batch_name
-                ) != (name,)
+                or progress_names[batch_name] != [name]
             ):
                 continue
             candidates.append(batch_name)
     finally:
         _close_fd_quietly(index_fd)
-    for batch_name in candidates:
+    return tuple(candidates)
+
+
+def _observe_unconsumed_pending_terminal_progress_publications(
+    home: Path,
+) -> frozenset[str]:
+    """Validate original header-only publications without creating or deleting."""
+    observed = set()
+    budget = PendingCleanupActionBudget(MAX_PENDING_CLEANUP_BATCHES_PER_RUN)
+    index_root = _pending_cleanup_index_path(home)
+    for batch_name in _unconsumed_pending_terminal_progress_publication_candidates(home):
+        if not budget.charge_batch(batch_name):
+            break
+        ticket = _read_pending_cleanup_ticket(
+            home, index_root / (batch_name + PENDING_CLEANUP_TICKET_SUFFIX),
+            expected_link_count=1,
+        )
+        if ticket is None or ticket.version not in {4, 8} or not ticket.terminal_regular_targets:
+            continue
+        _require_pending_cleanup_ticket_link_authority(home, ticket)
+        _require_pending_cleanup_terminal_validation_family_safe(home, ticket)
+        quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
+        quarantine_fd = _open_directory_beneath(home, quarantine_root)
+        batch_fd = -1
+        try:
+            _require_pending_cleanup_fd_access_policy(
+                quarantine_fd, quarantine_root, expected_mode=0o700,
+            )
+            quarantine_identity = _directory_identity(quarantine_fd)
+            if (
+                not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+                or (ticket.quarantine_root_identity is not None
+                    and quarantine_identity != ticket.quarantine_root_identity)
+            ):
+                raise SyncError("pending cleanup quarantine root changed during observation")
+            batch_fd = _open_directory_beneath(home, ticket.batch_root)
+            _require_pending_cleanup_fd_access_policy(
+                batch_fd, ticket.batch_root, expected_mode=0o700,
+            )
+            if (
+                _directory_identity(batch_fd) != ticket.batch_root_identity
+                or not _bound_directory_matches(home, ticket.batch_root, batch_fd)
+            ):
+                raise SyncError("pending cleanup batch changed during observation")
+            _ensure_pending_terminal_validation_receipt(
+                home, ticket, ticket.batch_root, batch_fd, quarantine_identity,
+                namespace_anchor_sha256=ticket.terminal_namespace_sha256,
+                entry_budget=[MAX_PENDING_CLEANUP_ENTRIES],
+                observe_unconsumed_progress=True,
+            )
+            _require_pending_cleanup_ticket_unchanged(home, ticket)
+            observed.add(batch_name)
+        finally:
+            _close_fd_quietly(batch_fd)
+            _close_fd_quietly(quarantine_fd)
+    return frozenset(observed)
+
+
+def _recover_unconsumed_pending_terminal_progress_publications(
+    home: Path,
+    budget: PendingCleanupActionBudget,
+) -> None:
+    """Try exact publication candidates before the unchanged mutation fence."""
+    index_root = _pending_cleanup_index_path(home)
+    for batch_name in _unconsumed_pending_terminal_progress_publication_candidates(home):
         if not budget.charge_batch(batch_name):
             break
         ticket = _read_pending_cleanup_ticket(
@@ -44881,8 +44990,17 @@ def _recover_unconsumed_pending_terminal_progress_publications(
             budget.mark_batch_completed(batch_name)
 
 
-def _require_no_pending_unresolved_ticket_representations(home: Path) -> None:
-    unresolved = _pending_cleanup_unresolved_ticket_representation_issue(home)
+def _require_no_pending_unresolved_ticket_representations(
+    home: Path,
+    *,
+    dry_run: bool = False,
+    read_only_publication_batches: frozenset[str] = frozenset(),
+) -> None:
+    if read_only_publication_batches and not dry_run:
+        raise SyncError("read-only publication observation cannot authorize mutation")
+    unresolved = _pending_cleanup_unresolved_ticket_representation_issue(
+        home, read_only_publication_batches=read_only_publication_batches,
+    )
     if unresolved is not None:
         raise _pending_cleanup_unresolved_ticket_representation_error(unresolved)
     allocation_unresolved = (
@@ -46815,6 +46933,7 @@ def _pending_cleanup_ready_batch_is_observed(
     home: Path,
     *,
     allow_v8_control_recovery: bool = False,
+    read_only_publication_batches: frozenset[str] = frozenset(),
 ) -> bool:
     if not _pending_link_pointer_is_absent(home):
         return False
@@ -46838,6 +46957,13 @@ def _pending_cleanup_ready_batch_is_observed(
                     entry.name
                 )
                 if unresolved is not None:
+                    batch, _representation = unresolved
+                    if batch in read_only_publication_batches and entry.name == (
+                        batch + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                        + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+                    ):
+                        cleanup_ready = True
+                        continue
                     # Do not collapse unclassified ticket-derived bytes into a
                     # generic cleanup plan.  A caller may have checked moments
                     # earlier; this complete scan is the final observation
@@ -53846,7 +53972,10 @@ def _preflight_pending_recovery(
         MAX_PENDING_CLEANUP_BATCHES_PER_RUN
     )
     if dry_run:
-        _require_no_pending_unresolved_ticket_representations(home)
+        observed_publications = _observe_unconsumed_pending_terminal_progress_publications(home)
+        _require_no_pending_unresolved_ticket_representations(
+            home, dry_run=True, read_only_publication_batches=observed_publications,
+        )
         observed_failed_move_isolation = _recover_failed_move_isolation(
             home,
             dry_run=True,
@@ -53862,6 +53991,7 @@ def _preflight_pending_recovery(
             observed_cleanup_ready_batch = _pending_cleanup_ready_batch_is_observed(
                 home,
                 allow_v8_control_recovery=False,
+                read_only_publication_batches=observed_publications,
             )
             loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(
                 home
@@ -58654,8 +58784,17 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
     cleanup_budget = PendingCleanupActionBudget(MAX_PENDING_CLEANUP_BATCHES_PER_RUN)
 
     def apply_uninstall() -> None:
-        _require_no_pending_unresolved_ticket_representations(home)
-        if dry_run and _pending_cleanup_ready_batch_is_observed(home):
+        observed_publications = frozenset()
+        if dry_run:
+            observed_publications = _observe_unconsumed_pending_terminal_progress_publications(home)
+        else:
+            _recover_unconsumed_pending_terminal_progress_publications(home, cleanup_budget)
+        _require_no_pending_unresolved_ticket_representations(
+            home, dry_run=dry_run, read_only_publication_batches=observed_publications,
+        )
+        if dry_run and _pending_cleanup_ready_batch_is_observed(
+            home, read_only_publication_batches=observed_publications,
+        ):
             print(
                 "would clean a finalized or interrupted pending transaction under "
                 "the install lock"

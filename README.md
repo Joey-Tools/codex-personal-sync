@@ -376,8 +376,15 @@ Observing a control requests locked validation, not cleanup authority. The final
 installation lock repeats recovery and the fence before installing, so a
 cooperative writer's intervening publication is not skipped. Actual recovery or
 valid installation can initialize the persistent owner-only lock paths.
-The cleanup entrypoint also
-tries this bounded recovery before the fence. Exact receipt publication temps
+Dry-run install and uninstall independently validate an exact unconsumed
+publication against the original ticket, target links, namespace and controls
+before previewing cleanup. They neither create missing recovery aliases nor
+promote, publish or delete controls, and do not acquire an installation lock.
+Their read-only observation cannot relax a mutation fence; actual recovery
+must validate the state again under the lock.
+The cleanup and non-dry-run uninstall entrypoints also
+try this bounded recovery before the fence, using the same per-run action
+budget. Exact receipt publication temps
 may be discarded and rebuilt only after independent original-ticket validation;
 their bytes never grant cleanup authority. Unknown receipt-derived descendants
 block recovery instead of being hidden by a new canonical receipt. Partial or

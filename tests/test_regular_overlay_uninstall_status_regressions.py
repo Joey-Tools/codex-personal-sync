@@ -6136,6 +6136,148 @@ class DirectoryProgressPublicationRecoveryTests(unittest.TestCase):
         self.assertFalse(temp.exists())
         self._assert_retired()
 
+    def _assert_publication_dry_run_is_read_only(self, operation) -> None:
+        protected = pending_authority_snapshot(self.fixture.home)
+        target = self.fixture.target
+        target_before = (target.stat().st_ino, target.stat().st_nlink, target.read_bytes())
+        output = io.StringIO()
+        with (
+            contextlib.redirect_stdout(output),
+            mock.patch.object(MODULE, "installation_lock", side_effect=AssertionError("dry-run acquired a lock")),
+            mock.patch.object(MODULE, "_promote_unconsumed_pending_terminal_directory_progress", side_effect=AssertionError("dry-run promoted progress")),
+            mock.patch.object(MODULE, "_publish_atomic_exclusive_internal_file", side_effect=AssertionError("dry-run published a control")),
+            mock.patch.object(MODULE, "_remove_pending_batch_directory_contents", side_effect=AssertionError("dry-run invoked the cleanup walker")),
+        ):
+            operation()
+        self.assertIn("would clean a finalized or interrupted pending transaction", output.getvalue())
+        self.assertEqual(pending_authority_snapshot(self.fixture.home), protected)
+        self.assertEqual((target.stat().st_ino, target.stat().st_nlink, target.read_bytes()), target_before)
+        self.assertFalse(self.receipt.exists())
+
+    def test_install_dry_run_observes_exact_progress_publication_temp(self) -> None:
+        self._stage_publication_temp()
+        self._assert_publication_dry_run_is_read_only(
+            lambda: MODULE.install_release_tree(
+                self.fixture.public, self.fixture.home, SHA_A, dry_run=True,
+            )
+        )
+
+    def test_install_dry_run_observes_canonical_unconsumed_progress(self) -> None:
+        self._stage_orphan()
+        self._assert_publication_dry_run_is_read_only(
+            lambda: MODULE.install_release_tree(
+                self.fixture.public, self.fixture.home, SHA_A, dry_run=True,
+            )
+        )
+
+    def test_uninstall_dry_run_observes_exact_progress_publication_temp(self) -> None:
+        self._stage_publication_temp()
+        self._assert_publication_dry_run_is_read_only(
+            lambda: MODULE.uninstall_overlay(self.fixture.home, "private", dry_run=True)
+        )
+
+    def test_uninstall_recovers_progress_temp_under_lock_with_shared_budget(self) -> None:
+        temp, _header = self._stage_publication_temp()
+        recover = MODULE._recover_unconsumed_pending_terminal_progress_publications
+        observations = []
+
+        def assert_locked_recovery(home, budget):
+            self.assertIsNotNone(MODULE._locked_sync_home_fd(home))
+            result = recover(home, budget)
+            observations.append((id(budget), budget.consumed, budget.completed))
+            return result
+
+        with mock.patch.object(MODULE, "_recover_unconsumed_pending_terminal_progress_publications", side_effect=assert_locked_recovery):
+            MODULE.uninstall_overlay(self.fixture.home, "private", dry_run=False)
+        self.assertTrue(observations)
+        self.assertEqual(len({row[0] for row in observations}), 1)
+        self.assertEqual(observations[-1][1:], (1, 1))
+        self.assertFalse(temp.exists())
+        self._assert_retired()
+
+    def test_dry_run_progress_temp_rejects_changed_authority_without_mutation(self) -> None:
+        for mutation in ("partial", "consumed", "marker", "hardlink", "foreign", "missing-ticket"):
+            with self.subTest(mutation=mutation):
+                case = DirectoryProgressPublicationRecoveryTests()
+                case.setUp()
+                try:
+                    temp, header = case._stage_publication_temp()
+                    if mutation == "partial":
+                        temp.write_bytes(header + b'{"slot":')
+                    elif mutation == "consumed":
+                        temp.write_bytes(header + MODULE._pending_directory_progress_line({"slot": 0}))
+                    elif mutation == "marker":
+                        marker = case.ticket.batch_root / Path(*case.ticket.marker_path.parts)
+                        marker.write_bytes(b"changed original marker\n")
+                    elif mutation == "hardlink":
+                        os.link(temp, case.fixture.root / "external-progress-alias")
+                    elif mutation == "foreign":
+                        temp.with_name(case.progress.name + ".foreign").write_bytes(b"foreign progress\n")
+                    else:
+                        case.ticket.path.unlink()
+                    before = pending_authority_snapshot(case.fixture.home)
+                    with self.assertRaises(MODULE.SyncError):
+                        MODULE.install_release_tree(
+                            case.fixture.public, case.fixture.home, SHA_A, dry_run=True,
+                        )
+                    self.assertEqual(pending_authority_snapshot(case.fixture.home), before)
+                finally:
+                    case.doCleanups()
+
+    def test_uninstall_progress_temp_rejects_foreign_receipt_before_recovery(self) -> None:
+        temp, _header = self._stage_publication_temp()
+        self.receipt.with_name(self.receipt.name + ".foreign").write_bytes(b"foreign receipt\n")
+        before = pending_authority_snapshot(self.fixture.home)
+        with self.assertRaises(MODULE.SyncError):
+            MODULE.uninstall_overlay(self.fixture.home, "private", dry_run=False)
+        self.assertEqual(pending_authority_snapshot(self.fixture.home), before)
+        self.assertTrue(temp.is_file())
+
+    def test_observed_publication_does_not_relax_mutation_fence(self) -> None:
+        self._stage_publication_temp()
+        before = pending_authority_snapshot(self.fixture.home)
+        observed = MODULE._observe_unconsumed_pending_terminal_progress_publications(self.fixture.home)
+        self.assertEqual(observed, frozenset({self.ticket.batch_root.name}))
+        with self.assertRaisesRegex(MODULE.SyncError, "cannot authorize mutation"):
+            MODULE._require_no_pending_unresolved_ticket_representations(
+                self.fixture.home, read_only_publication_batches=observed,
+            )
+        with self.assertRaisesRegex(MODULE.SyncError, "reconciled before new mutation"):
+            MODULE._require_no_pending_unresolved_ticket_representations(self.fixture.home)
+        self.assertEqual(pending_authority_snapshot(self.fixture.home), before)
+
+    def test_uninstall_publication_recovery_respects_zero_shared_budget(self) -> None:
+        self._stage_publication_temp()
+        before = pending_authority_snapshot(self.fixture.home)
+        budget = MODULE.PendingCleanupActionBudget(0)
+        with (
+            mock.patch.object(MODULE, "PendingCleanupActionBudget", return_value=budget),
+            self.assertRaises(MODULE.SyncError),
+        ):
+            MODULE.uninstall_overlay(self.fixture.home, "private", dry_run=False)
+        self.assertEqual((budget.consumed, budget.completed), (0, 0))
+        self.assertEqual(pending_authority_snapshot(self.fixture.home), before)
+
+    def test_publication_candidate_discovery_scans_names_once(self) -> None:
+        names = tuple(sorted(
+            name
+            for index in range(32)
+            for name in (
+                f"20261009T000000Z-123-{index + 1000}" + MODULE.PENDING_CLEANUP_TICKET_SUFFIX,
+                f"20261009T000000Z-123-{index + 1000}"
+                + MODULE.PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX,
+            )
+        ))
+        with (
+            mock.patch.object(MODULE, "_directory_member_names", return_value=names) as inventory,
+            mock.patch.object(MODULE, "_read_pending_cleanup_ticket") as read_ticket,
+        ):
+            candidates = MODULE._unconsumed_pending_terminal_progress_publication_candidates(self.fixture.home)
+        self.assertEqual(len(candidates), 32)
+        self.assertEqual(inventory.call_count, 1)
+        read_ticket.assert_not_called()
+
     def test_partial_progress_temp_is_retained_without_receipt(self) -> None:
         temp, header = self._stage_publication_temp()
         temp.write_bytes(header + b'{"slot":')
