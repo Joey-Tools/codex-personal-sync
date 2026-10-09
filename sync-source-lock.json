@@ -43,7 +43,7 @@
     "pending_staging_cleanup_tests": {
       "mode": "0644",
       "path": "tests/test_pending_staging_cleanup.py",
-      "sha256": "a43e87ce8558606ea623fc78e7db6dce1091e72cd22e25bb2d104ac5a8e7f5cc"
+      "sha256": "ad80fa1b7836f35d75909d022d6f81abc3d78becaad3d9e9ec34e126528bebbe"
     },
     "quarantine_empty_batch_reclaim_tests": {
       "mode": "0644",

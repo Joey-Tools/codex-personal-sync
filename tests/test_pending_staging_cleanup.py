@@ -5780,7 +5780,24 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     MODULE._cleanup_ready_pending_batches(case_home)
 
                 self.assertTrue(represented)
-                self.assertFalse(ticket.path.exists())
+                if representation_kind == "suffixed":
+                    # An unknown descendant now blocks the ticket retirement
+                    # boundary itself; keep its original object and bytes.
+                    self.assertTrue(ticket.path.is_file())
+                    current_ticket = MODULE._read_pending_cleanup_ticket(
+                        case_home,
+                        ticket.path,
+                        expected_ticket_identity=ticket.snapshot.file_identity,
+                    )
+                    self.assertIsNotNone(current_ticket)
+                    assert current_ticket is not None
+                    self.assertTrue(
+                        MODULE._pending_cleanup_ticket_matches(current_ticket, ticket)
+                    )
+                else:
+                    # The supported strict-retained form remains eligible for
+                    # its existing independently bound recovery protocol.
+                    self.assertFalse(ticket.path.exists())
                 self.assertFalse(ticket.batch_root.exists())
                 self.assertTrue(representation.is_file())
                 self.assertTrue(proof_path.is_file())
