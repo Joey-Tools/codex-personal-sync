@@ -370,11 +370,12 @@ validated publication temp is renamed without replacement into the canonical
 path, preserving its original inode, then revalidated before receipt creation.
 It does not infer authority from progress slots. The normal install preflight
 runs actual recovery and the subsequent new-mutation fence under the same
-installation lock; dry-run remains observational. Actual non-dry-run preflight
-may initialize the sync home and its persistent `personal-sync/` (0700) and
-`install.lock` (0600), even when no pending transaction requires recovery.
-Invalid commit SHAs are rejected before that initialization; later release or
-owner-validation errors do not imply that no lock paths were created.
+installation lock; dry-run remains observational. Non-dry-run preflight also
+leaves an absent or empty sync home unchanged when no recovery state is observed.
+Observing a control requests locked validation, not cleanup authority. The final
+installation lock repeats recovery and the fence before installing, so a
+cooperative writer's intervening publication is not skipped. Actual recovery or
+valid installation can initialize the persistent owner-only lock paths.
 The cleanup entrypoint also
 tries this bounded recovery before the fence. Exact receipt publication temps
 may be discarded and rebuilt only after independent original-ticket validation;
@@ -407,9 +408,20 @@ directories to progress slots, with the batch root included in header and
 record byte estimates. All namespace entries still count toward the separate
 receipt entry and byte limits; a large flat set of files does not consume one
 directory slot per file.
+During one locked cleanup invocation, a cursor caches the directory slots and
+consumed paths, checks original file/parent identity and access policy, and
+validates only each newly appended canonical suffix. Related representations
+are still scanned at every boundary. An observed file timestamp change requests
+full byte/header validation; benign owner-only metadata can settle within two
+extra bounded reads, while persistent instability is reported separately from
+verified content mutation. Initial and final full replay remain mandatory.
+This bounds progress replay work, not the independent namespace/ledger walks.
 This protocol follows the existing cooperative single-UID writer model. It
 does not claim access isolation or rollback resistance against a hostile
 process with the same UID and full control over all durable authority records.
+Incremental append relies on cooperative writers holding the installation
+lock; it does not claim to detect a non-cooperative same-UID prefix write folded
+into this invocation's own append signal.
 
 ## Scheduler operator runbook
 

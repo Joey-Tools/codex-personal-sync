@@ -2436,11 +2436,6 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 "_install_release_set_unlocked",
                 side_effect=install_set,
             ),
-            mock.patch.object(
-                MODULE,
-                "installation_lock",
-                return_value=contextlib.nullcontext(),
-            ),
         ):
             MODULE.install_from_github("Joey-Tools/example", self.home, dry_run=False)
 
@@ -5547,9 +5542,9 @@ class PendingStagingCleanupTests(unittest.TestCase):
         real_delete_ticket = MODULE._delete_pending_cleanup_ticket
         deleted_ticket = None
 
-        def delete_ticket_then_replay(home: Path, ticket) -> None:
+        def delete_ticket_then_replay(home: Path, ticket, **kwargs) -> None:
             nonlocal deleted_ticket
-            real_delete_ticket(home, ticket)
+            real_delete_ticket(home, ticket, **kwargs)
             deleted_ticket = ticket
             os.link(replay_source, case_target)
 
@@ -5598,14 +5593,14 @@ class PendingStagingCleanupTests(unittest.TestCase):
         retained_ticket: Path | None = None
         deleted_ticket = None
 
-        def retain_ticket_then_delete(home: Path, ticket) -> None:
+        def retain_ticket_then_delete(home: Path, ticket, **kwargs) -> None:
             nonlocal retained_ticket, deleted_ticket
             retained_name = next(MODULE._retained_pending_cleanup_names(ticket.path))
             retained_ticket = ticket.path.with_name(retained_name)
             retained_ticket.write_bytes(ticket.snapshot.payload or b"")
             retained_ticket.chmod(0o600)
             deleted_ticket = ticket
-            real_delete_ticket(home, ticket)
+            real_delete_ticket(home, ticket, **kwargs)
 
         with (
             mock.patch.object(
@@ -5653,14 +5648,14 @@ class PendingStagingCleanupTests(unittest.TestCase):
         malformed_ticket: Path | None = None
         deleted_ticket = None
 
-        def retain_malformed_ticket_then_delete(home: Path, ticket) -> None:
+        def retain_malformed_ticket_then_delete(home: Path, ticket, **kwargs) -> None:
             nonlocal malformed_ticket, deleted_ticket
             retained_name = next(MODULE._retained_pending_cleanup_names(ticket.path))
             malformed_ticket = ticket.path.with_name(retained_name + ".extra")
             malformed_ticket.write_bytes(ticket.snapshot.payload or b"")
             malformed_ticket.chmod(0o600)
             deleted_ticket = ticket
-            real_delete_ticket(home, ticket)
+            real_delete_ticket(home, ticket, **kwargs)
 
         with (
             mock.patch.object(
@@ -5763,13 +5758,13 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 real_delete_ticket = MODULE._delete_pending_cleanup_ticket
                 represented = False
 
-                def represent_then_delete(home: Path, current_ticket) -> None:
+                def represent_then_delete(home: Path, current_ticket, **kwargs) -> None:
                     nonlocal represented
                     if current_ticket.path == ticket.path and not represented:
                         representation.write_bytes(current_ticket.snapshot.payload or b"")
                         representation.chmod(0o600)
                         represented = True
-                    real_delete_ticket(home, current_ticket)
+                    real_delete_ticket(home, current_ticket, **kwargs)
 
                 with (
                     mock.patch.object(
