@@ -234,9 +234,12 @@ PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX = ".terminal-validation"
 PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX = (
     ".terminal-validation-retired"
 )
+PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX = ".directory-progress"
 PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX = ".terminal-retirement"
-PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION = 4
+PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION = 5
 LEGACY_PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION = 3
+LEGACY_V4_PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION = 4
+PENDING_CLEANUP_DIRECTORY_PROGRESS_VERSION = 1
 LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION = 4
 PENDING_TERMINAL_CLEANUP_TICKET_VERSION = 8
 LEGACY_GENERIC_CLEANUP_MANUAL_RECOVERY_CODE = (
@@ -271,6 +274,10 @@ MAX_PENDING_LINK_BATCH_NAME_BYTES = 128
 MAX_PENDING_LINK_RECORDS = 10_000
 MAX_PENDING_TERMINAL_VALIDATION_ALIASES = MAX_PENDING_LINK_RECORDS * 8
 MAX_PENDING_TERMINAL_VALIDATION_DIRECTORIES = MAX_PENDING_TERMINAL_VALIDATION_ALIASES
+MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES = MAX_MANAGED_STATE_BYTES
+MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_LINE_BYTES = (
+    MAX_MANIFEST_TARGET_PATH_BYTES + 256
+)
 MAX_PENDING_LINK_CLAIMS = 20_000
 MAX_PENDING_RELEASES = 10_000
 MAX_PENDING_CLEANUP_BATCH_SCAN = 10_000
@@ -4913,6 +4920,7 @@ class PendingTerminalValidationAuthority:
     # validation receipt, but records durable marker consumption rather than a
     # terminal alias namespace.
     staging_marker: "PendingTerminalValidationReceiptAuthority | None" = None
+    directory_progress: "PendingTerminalDirectoryProgressAuthority | None" = None
 
 
 @dataclass(frozen=True)
@@ -4926,6 +4934,75 @@ class PendingTerminalFileExpectation:
     uid: int
     gid: int
     link_count: int
+
+
+@dataclass(frozen=True)
+class PendingTerminalDirectoryProgressAuthority:
+    """Immutable receipt binding for append-only terminal directory progress."""
+
+    path: PurePosixPath
+    file_identity: tuple[int, int]
+    header_sha256: str
+    header_size: int
+    mode: int
+    uid: int
+    gid: int
+    link_count: int
+
+
+@dataclass(frozen=True)
+class PendingTerminalDirectoryProgressState:
+    """One strictly parsed progress log and its consumed logical slots."""
+
+    snapshot: ManagedStateFileSnapshot
+    consumed_slots: frozenset[int]
+    change_signal: tuple[int, int] | None = None
+
+
+@dataclass
+class PendingTerminalDirectoryProgressCursor:
+    """Invocation-local incremental view of one receipt-bound progress file."""
+
+    authority: PendingTerminalDirectoryProgressAuthority
+    parent_identity: tuple[int, int]
+    directories: tuple[PendingTerminalValidationDirectory, ...]
+    slot_by_path: dict[PurePosixPath, int]
+    path_by_slot: dict[int, PurePosixPath]
+    consumed_slots: set[int]
+    consumed_paths: set[PurePosixPath]
+    expected_payload: bytearray
+    change_signal: tuple[int, int]
+
+    @property
+    def offset(self) -> int:
+        return len(self.expected_payload)
+
+
+def _stat_content_change_signal(metadata: os.stat_result) -> tuple[int, int]:
+    """Return file-content invalidation hints, never a mutation verdict."""
+    return (
+        int(getattr(metadata, "st_mtime_ns", metadata.st_mtime * 1_000_000_000)),
+        int(getattr(metadata, "st_ctime_ns", metadata.st_ctime * 1_000_000_000)),
+    )
+
+
+def _require_pending_terminal_directory_progress_monotonic(
+    ticket: PendingBatchCleanupTicket,
+    latest_payload: list[bytes | bytearray | None],
+    current: PendingTerminalDirectoryProgressState,
+) -> None:
+    payload = current.snapshot.payload
+    if payload is None:
+        raise SyncError("pending terminal directory progress has no payload")
+    previous = latest_payload[0]
+    if previous is not None and (
+        len(payload) < len(previous) or payload[: len(previous)] != previous
+    ):
+        raise SyncError(
+            "pending terminal directory progress rolled back within this "
+            f"invocation: {ticket.batch_root.name}"
+        )
+    latest_payload[0] = payload
 
 
 @dataclass(frozen=True)
@@ -13040,6 +13117,8 @@ def _read_managed_state_file_snapshot(
     *,
     expected_identity: tuple[int, int] | None = None,
     maximum_bytes: int = MAX_MANAGED_STATE_BYTES,
+    change_signal_out: list[tuple[int, int] | None] | None = None,
+    content_signal_retries: int = 0,
 ) -> ManagedStateFileSnapshot:
     if not _bound_directory_matches(home, path.parent, parent_fd):
         raise SyncError(f"managed sync state parent changed before read: {path}")
@@ -13053,6 +13132,8 @@ def _read_managed_state_file_snapshot(
     except FileNotFoundError:
         if not _bound_directory_matches(home, path.parent, parent_fd):
             raise SyncError(f"managed sync state parent changed before read: {path}")
+        if change_signal_out is not None:
+            change_signal_out[0] = None
         return ManagedStateFileSnapshot(
             exists=False,
             parent_identity=parent_identity,
@@ -13075,6 +13156,7 @@ def _read_managed_state_file_snapshot(
     flags |= getattr(os, "O_NOFOLLOW", 0)
     flags |= getattr(os, "O_NONBLOCK", 0)
     file_fd = -1
+    content_signal_changed_during_read = False
     try:
         try:
             file_fd = os.open(path.name, flags, dir_fd=parent_fd)
@@ -13111,6 +13193,10 @@ def _read_managed_state_file_snapshot(
             raise SyncError(f"managed sync state content changed during read: {path}")
         if not _regular_stat_metadata_matches(os.fstat(file_fd), named_metadata):
             raise SyncError(f"managed sync state changed during read: {path}")
+        if change_signal_out is not None and _stat_content_change_signal(
+            os.fstat(file_fd)
+        ) != _stat_content_change_signal(opened_metadata):
+            content_signal_changed_during_read = True
         try:
             current_metadata = os.stat(
                 path.name,
@@ -13123,12 +13209,32 @@ def _read_managed_state_file_snapshot(
             ) from error
         if not _regular_stat_metadata_matches(current_metadata, named_metadata):
             raise SyncError(f"managed sync state changed during read: {path}")
+        if change_signal_out is not None and _stat_content_change_signal(
+            current_metadata
+        ) != _stat_content_change_signal(opened_metadata):
+            content_signal_changed_during_read = True
         if not _bound_directory_matches(home, path.parent, parent_fd):
             raise SyncError(f"managed sync state parent changed during read: {path}")
     finally:
         if file_fd >= 0:
             _close_fd_quietly(file_fd)
 
+    if content_signal_changed_during_read:
+        if content_signal_retries > 0:
+            return _read_managed_state_file_snapshot(
+                home,
+                path,
+                parent_fd,
+                expected_identity=expected_identity,
+                maximum_bytes=maximum_bytes,
+                change_signal_out=change_signal_out,
+                content_signal_retries=content_signal_retries - 1,
+            )
+        raise SyncError(
+            f"managed sync state could not establish stable read: {path}"
+        )
+    if change_signal_out is not None:
+        change_signal_out[0] = _stat_content_change_signal(opened_metadata)
     return ManagedStateFileSnapshot(
         exists=True,
         payload=payload,
@@ -22345,7 +22451,7 @@ def _projected_pending_terminal_validation_namespace_paths(
     record_actions: dict[tuple[str, PurePosixPath], str],
     *,
     state_before_exists: bool,
-) -> frozenset[PurePosixPath]:
+) -> tuple[frozenset[PurePosixPath], frozenset[PurePosixPath]]:
     """Project every batch namespace path before staging publishes it.
 
     The terminal receipt records the complete batch namespace, not only its
@@ -22355,13 +22461,19 @@ def _projected_pending_terminal_validation_namespace_paths(
     the serializer; actual identities and modes can only be shorter.
     """
     paths: set[PurePosixPath] = set()
+    directory_paths: set[PurePosixPath] = set()
 
     def add_path(path: PurePosixPath) -> None:
         paths.add(path)
         ancestor = path.parent
         while ancestor.parts:
             paths.add(ancestor)
+            directory_paths.add(ancestor)
             ancestor = ancestor.parent
+
+    def add_directory_path(path: PurePosixPath) -> None:
+        add_path(path)
+        directory_paths.add(path)
 
     fixed_directories = (
         PurePosixPath("pending"),
@@ -22375,7 +22487,7 @@ def _projected_pending_terminal_validation_namespace_paths(
         PurePosixPath("pending", "claims", "after"),
     )
     for path in fixed_directories:
-        add_path(path)
+        add_directory_path(path)
     add_path(PurePosixPath(PENDING_LINK_METADATA_NAME))
     # Keep the compatibility name in the projection as well; it is accepted
     # by the cleanup parser and costs only a bounded control entry.
@@ -22492,7 +22604,7 @@ def _projected_pending_terminal_validation_namespace_paths(
             if isinstance(evidence, str):
                 add_path(PurePosixPath(evidence))
 
-    return frozenset(paths)
+    return frozenset(paths), frozenset(directory_paths)
 
 
 def _validate_pending_terminal_validation_receipt_capacity(
@@ -22502,6 +22614,7 @@ def _validate_pending_terminal_validation_receipt_capacity(
     *,
     phase: str,
     namespace_paths: frozenset[PurePosixPath] | None = None,
+    namespace_directory_paths: frozenset[PurePosixPath] | None = None,
 ) -> None:
     alias_paths = _projected_pending_terminal_validation_alias_paths(
         home,
@@ -22513,6 +22626,12 @@ def _validate_pending_terminal_validation_receipt_capacity(
         return
     if namespace_paths is None:
         namespace_paths = frozenset()
+    if namespace_directory_paths is None:
+        namespace_directory_paths = frozenset()
+    if not namespace_directory_paths.issubset(namespace_paths):
+        raise SyncError(
+            "projected pending terminal validation directories are not in namespace"
+        )
     directory_paths: set[PurePosixPath] = set()
     for alias_path in alias_paths:
         ancestor = alias_path.parent
@@ -22523,6 +22642,9 @@ def _validate_pending_terminal_validation_receipt_capacity(
         raise SyncError("pending terminal validation directories exceed the limit")
     if len(namespace_paths) > MAX_PENDING_TERMINAL_VALIDATION_ENTRIES:
         raise SyncError("pending terminal validation namespace entries exceed the limit")
+    progress_slot_paths = directory_paths | set(namespace_directory_paths)
+    if len(progress_slot_paths) > MAX_PENDING_TERMINAL_VALIDATION_DIRECTORIES:
+        raise SyncError("pending terminal directory progress slots exceed the limit")
     maximum_identity = _identity_payload(_MAX_PENDING_IDENTITY)
     projected_namespace_entries = [
         [
@@ -22548,6 +22670,37 @@ def _validate_pending_terminal_validation_receipt_capacity(
         "gid": _MAX_PENDING_IDENTITY[1],
         "link_count": 2,
     }
+    projected_progress_slots = [
+        {"identity": maximum_identity, "path": ""},
+        *[
+            {"identity": maximum_identity, "path": path.as_posix()}
+            for path in sorted(
+                progress_slot_paths,
+                key=PurePosixPath.as_posix,
+            )
+        ],
+    ]
+    projected_progress_header = _pending_directory_progress_line(
+        {
+            "batch": _MAX_PENDING_BATCH_NAME,
+            "batch_root_identity": maximum_identity,
+            "slots": projected_progress_slots,
+            "phase": "terminal-directory-progress",
+            "quarantine_root_identity": maximum_identity,
+            "ticket_identity": maximum_identity,
+            "ticket_sha256": _MAX_PENDING_DIGEST,
+            "version": PENDING_CLEANUP_DIRECTORY_PROGRESS_VERSION,
+        },
+        maximum_bytes=MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+    )
+    projected_progress_size = len(projected_progress_header) + sum(
+        len(_pending_directory_progress_line({"slot": slot}))
+        for slot in range(len(projected_progress_slots))
+    )
+    if projected_progress_size > MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES:
+        raise SyncError(
+            "pending terminal directory progress exceeds the size limit"
+        )
     _bounded_json_document(
         {
             "version": PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION,
@@ -22598,6 +22751,19 @@ def _validate_pending_terminal_validation_receipt_capacity(
                     ],
                 },
             ],
+            "directory_progress": {
+                "path": (
+                    _MAX_PENDING_BATCH_NAME
+                    + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                ),
+                "file_identity": maximum_identity,
+                "header_sha256": _MAX_PENDING_DIGEST,
+                "header_size": MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+                "mode": 0o600,
+                "uid": _MAX_PENDING_IDENTITY[0],
+                "gid": _MAX_PENDING_IDENTITY[1],
+                "link_count": 1,
+            },
         },
         max_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
         overflow_error=(
@@ -23253,7 +23419,10 @@ def _validate_pending_link_metadata_capacity(
                 len(records),
             )
         )
-    namespace_paths = _projected_pending_terminal_validation_namespace_paths(
+    (
+        namespace_paths,
+        namespace_directory_paths,
+    ) = _projected_pending_terminal_validation_namespace_paths(
         home,
         capacity,
         state_before_value,
@@ -23268,6 +23437,7 @@ def _validate_pending_link_metadata_capacity(
         state_before_value,
         phase="before",
         namespace_paths=namespace_paths,
+        namespace_directory_paths=namespace_directory_paths,
     )
     _validate_pending_terminal_validation_receipt_capacity(
         home,
@@ -23275,6 +23445,7 @@ def _validate_pending_link_metadata_capacity(
         state_after_value,
         phase="after",
         namespace_paths=namespace_paths,
+        namespace_directory_paths=namespace_directory_paths,
     )
     payload = _projected_pending_metadata_payload(
         state_before_exists=state_before.exists,
@@ -25964,6 +26135,1299 @@ def _pending_cleanup_terminal_validation_retirement_path(
     )
 
 
+def _pending_cleanup_directory_progress_path(
+    home: Path,
+    batch_name: str,
+) -> Path:
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        raise SyncError(
+            "pending cleanup directory progress has an invalid batch name"
+        )
+    return _pending_cleanup_index_path(home) / (
+        batch_name + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+    )
+
+
+def _pending_directory_progress_line(
+    payload: object,
+    *,
+    maximum_bytes: int = MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_LINE_BYTES,
+) -> bytes:
+    """Encode one canonical LF-delimited progress record."""
+    try:
+        encoded = (
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise SyncError(f"failed to encode terminal directory progress: {error}") from error
+    if len(encoded) > maximum_bytes:
+        raise SyncError("pending terminal directory progress line exceeds the limit")
+    return encoded
+
+
+def _pending_terminal_directory_progress_header_payload(
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+    directories: tuple[PendingTerminalValidationDirectory, ...],
+    namespace_entries: tuple[PendingTerminalValidationNamespaceEntry, ...],
+) -> bytes:
+    if ticket.snapshot.file_identity is None or ticket.snapshot.payload is None:
+        raise SyncError("pending cleanup ticket has no directory progress identity")
+    if len(directories) > MAX_PENDING_TERMINAL_VALIDATION_DIRECTORIES:
+        raise SyncError("pending terminal directory authority exceeds the limit")
+    progress_directories = _pending_terminal_directory_progress_directories(
+        directories,
+        namespace_entries,
+    )
+    return _pending_directory_progress_line(
+        {
+            "batch": ticket.batch_root.name,
+            "batch_root_identity": _identity_payload(ticket.batch_root_identity),
+            "slots": [
+                {
+                    "identity": _identity_payload(ticket.batch_root_identity),
+                    "path": "",
+                },
+                *[
+                    {
+                        "identity": _identity_payload(directory.identity),
+                        "path": directory.path.as_posix(),
+                    }
+                    for directory in progress_directories
+                ],
+            ],
+            "phase": "terminal-directory-progress",
+            "quarantine_root_identity": _identity_payload(quarantine_root_identity),
+            "ticket_identity": _identity_payload(ticket.snapshot.file_identity),
+            "ticket_sha256": hashlib.sha256(ticket.snapshot.payload).hexdigest(),
+            "version": PENDING_CLEANUP_DIRECTORY_PROGRESS_VERSION,
+        },
+        maximum_bytes=MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+    )
+
+
+def _pending_terminal_directory_progress_directories(
+    alias_directories: tuple[PendingTerminalValidationDirectory, ...],
+    namespace_entries: tuple[PendingTerminalValidationNamespaceEntry, ...],
+) -> tuple[PendingTerminalValidationDirectory, ...]:
+    identities: dict[PurePosixPath, tuple[int, int]] = {}
+    for directory in alias_directories:
+        identities[directory.path] = directory.identity
+    for entry in namespace_entries:
+        if entry.plan[2] != stat.S_IFDIR:
+            continue
+        previous = identities.get(entry.path)
+        if previous is not None and previous != entry.plan[:2]:
+            raise SyncError(
+                "pending terminal directory progress namespace identity changed: "
+                f"{entry.path.as_posix()}"
+            )
+        identities[entry.path] = entry.plan[:2]
+    if len(identities) > MAX_PENDING_TERMINAL_VALIDATION_DIRECTORIES:
+        raise SyncError("pending terminal directory progress slots exceed the limit")
+    return tuple(
+        PendingTerminalValidationDirectory(path, identities[path])
+        for path in sorted(identities, key=PurePosixPath.as_posix)
+    )
+
+
+def _pending_terminal_directory_progress_authority_payload(
+    authority: PendingTerminalDirectoryProgressAuthority,
+) -> dict[str, object]:
+    return {
+        "path": authority.path.as_posix(),
+        "file_identity": _identity_payload(authority.file_identity),
+        "header_sha256": authority.header_sha256,
+        "header_size": authority.header_size,
+        "mode": authority.mode,
+        "uid": authority.uid,
+        "gid": authority.gid,
+        "link_count": authority.link_count,
+    }
+
+
+def _parse_pending_terminal_directory_progress_authority(
+    ticket: PendingBatchCleanupTicket,
+    value: object,
+    *,
+    directories: tuple[PendingTerminalValidationDirectory, ...],
+) -> PendingTerminalDirectoryProgressAuthority:
+    fields = {
+        "path",
+        "file_identity",
+        "header_sha256",
+        "header_size",
+        "mode",
+        "uid",
+        "gid",
+        "link_count",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise SyncError("pending terminal directory progress binding changed")
+    path_value = value.get("path")
+    identity_value = value.get("file_identity")
+    digest_value = value.get("header_sha256")
+    header_size = value.get("header_size")
+    mode = value.get("mode")
+    uid = value.get("uid")
+    gid = value.get("gid")
+    link_count = value.get("link_count")
+    expected_path = PurePosixPath(
+        ticket.batch_root.name + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+    )
+    if (
+        path_value != expected_path.as_posix()
+        or not isinstance(identity_value, list)
+        or len(identity_value) != 2
+        or any(type(item) is not int or item < 0 for item in identity_value)
+        or not isinstance(digest_value, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest_value) is None
+        or type(header_size) is not int
+        or not 1 <= header_size <= MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES
+        or mode != 0o600
+        or type(uid) is not int
+        or uid != os.geteuid()
+        or type(gid) is not int
+        or gid < 0
+        or type(link_count) is not int
+        or link_count != 1
+    ):
+        raise SyncError("pending terminal directory progress binding changed")
+    return PendingTerminalDirectoryProgressAuthority(
+        path=expected_path,
+        file_identity=(identity_value[0], identity_value[1]),
+        header_sha256=digest_value,
+        header_size=header_size,
+        mode=mode,
+        uid=uid,
+        gid=gid,
+        link_count=link_count,
+    )
+
+
+def _parse_pending_terminal_directory_progress_payload(
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+    authority: PendingTerminalValidationAuthority,
+    snapshot: ManagedStateFileSnapshot,
+    *,
+    change_signal: tuple[int, int] | None = None,
+) -> PendingTerminalDirectoryProgressState:
+    progress = authority.directory_progress
+    if (
+        progress is None
+        or not snapshot.exists
+        or snapshot.payload is None
+        or snapshot.file_identity != progress.file_identity
+        or snapshot.mode != progress.mode
+        or snapshot.uid != progress.uid
+        or snapshot.gid is None
+        or not _gid_matches_regular_file_access_policy(
+            snapshot.gid,
+            progress.gid,
+            progress.mode,
+        )
+        or snapshot.link_count != progress.link_count
+        or snapshot.size != len(snapshot.payload)
+        or snapshot.size > MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES
+    ):
+        raise SyncError(
+            f"pending terminal directory progress changed: {ticket.batch_root.name}"
+        )
+    header = _pending_terminal_directory_progress_header_payload(
+        ticket,
+        quarantine_root_identity,
+        authority.directories,
+        authority.namespace_entries or (),
+    )
+    if (
+        len(header) != progress.header_size
+        or hashlib.sha256(header).hexdigest() != progress.header_sha256
+        or snapshot.payload[: len(header)] != header
+    ):
+        raise SyncError(
+            f"pending terminal directory progress header changed: {ticket.batch_root.name}"
+        )
+    remainder = snapshot.payload[len(header) :]
+    if len(snapshot.payload) != len(header) + len(remainder):
+        raise SyncError(
+            f"pending terminal directory progress changed: {ticket.batch_root.name}"
+        )
+    if remainder and not remainder.endswith(b"\n"):
+        raise SyncError(
+            f"pending terminal directory progress is truncated: {ticket.batch_root.name}"
+        )
+    directories = _pending_terminal_directory_progress_directories(
+        authority.directories,
+        authority.namespace_entries or (),
+    )
+    consumed: set[int] = set()
+    offset = 0
+    while offset < len(remainder):
+        newline = remainder.find(b"\n", offset)
+        if newline < 0:
+            raise SyncError(
+                f"pending terminal directory progress is truncated: {ticket.batch_root.name}"
+            )
+        line = remainder[offset : newline + 1]
+        if len(line) > MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_LINE_BYTES:
+            raise SyncError(
+                f"pending terminal directory progress line exceeds the limit: {ticket.batch_root.name}"
+            )
+        try:
+            record = json.loads(line.decode("utf-8"))
+        except (ValueError, RecursionError) as error:
+            raise SyncError(
+                f"pending terminal directory progress is malformed: {ticket.batch_root.name}"
+            ) from error
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"slot"}
+            or type(record.get("slot")) is not int
+            or not 0 <= record["slot"] <= len(directories)
+            or _pending_directory_progress_line(record) != line
+            or record["slot"] in consumed
+        ):
+            raise SyncError(
+                f"pending terminal directory progress has an invalid slot: {ticket.batch_root.name}"
+            )
+        consumed.add(record["slot"])
+        offset = newline + 1
+    if len(consumed) > len(directories) + 1:
+        raise SyncError("pending terminal directory progress exceeds its slot limit")
+    return PendingTerminalDirectoryProgressState(
+        snapshot,
+        frozenset(consumed),
+        change_signal,
+    )
+
+
+def _read_pending_terminal_directory_progress(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+    authority: PendingTerminalValidationAuthority,
+    *,
+    allow_missing: bool = False,
+) -> PendingTerminalDirectoryProgressState | None:
+    progress = authority.directory_progress
+    if progress is None:
+        if ticket.terminal_regular_targets:
+            raise SyncError(
+                "pending terminal validation receipt lacks directory progress; "
+                f"manual recovery is required: {ticket.batch_root.name}"
+            )
+        return None
+    path = _pending_cleanup_index_path(home) / Path(*progress.path.parts)
+    index_fd = _open_directory_beneath(home, path.parent)
+    try:
+        representations = _pending_terminal_directory_progress_representations(
+            index_fd,
+            ticket.batch_root.name,
+        )
+        if not representations:
+            if allow_missing:
+                return None
+            raise SyncError(
+                "pending terminal directory progress is missing; manual recovery "
+                f"is required: {ticket.batch_root.name}"
+            )
+        if representations != (path.name,):
+            raise SyncError(
+                "pending terminal directory progress has ambiguous related "
+                "representations; manual recovery is required: "
+                f"{ticket.batch_root.name}: {representations}"
+            )
+        change_signal_out: list[tuple[int, int] | None] = [None]
+        snapshot = _read_managed_state_file_snapshot(
+            home,
+            path,
+            index_fd,
+            expected_identity=progress.file_identity,
+            maximum_bytes=MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+            change_signal_out=change_signal_out,
+            content_signal_retries=2,
+        )
+        if not snapshot.exists:
+            if allow_missing:
+                return None
+            raise SyncError(
+                "pending terminal directory progress is missing; manual recovery "
+                f"is required: {ticket.batch_root.name}"
+            )
+        if (
+            snapshot.file_type != stat.S_IFREG
+            or snapshot.mode != 0o600
+            or snapshot.uid != os.geteuid()
+            or snapshot.link_count != progress.link_count
+            or snapshot.parent_identity != _directory_identity(index_fd)
+        ):
+            raise SyncError(
+                f"pending terminal directory progress changed: {ticket.batch_root.name}"
+            )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            path,
+            index_fd,
+            snapshot,
+        )
+        state = _parse_pending_terminal_directory_progress_payload(
+            ticket,
+            quarantine_root_identity,
+            authority,
+            snapshot,
+            change_signal=change_signal_out[0],
+        )
+        rebound_representations = _pending_terminal_directory_progress_representations(
+            index_fd,
+            ticket.batch_root.name,
+        )
+        if rebound_representations != (path.name,):
+            raise SyncError(
+                "pending terminal directory progress representations changed: "
+                f"{ticket.batch_root.name}: {rebound_representations}"
+            )
+        return state
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _pending_terminal_directory_progress_cursor_from_state(
+    authority: PendingTerminalValidationAuthority,
+    state: PendingTerminalDirectoryProgressState,
+) -> PendingTerminalDirectoryProgressCursor:
+    progress = authority.directory_progress
+    payload = state.snapshot.payload
+    parent_identity = state.snapshot.parent_identity
+    if (
+        progress is None
+        or payload is None
+        or parent_identity is None
+        or state.change_signal is None
+    ):
+        raise SyncError("pending terminal directory progress cursor is incomplete")
+    directories = _pending_terminal_directory_progress_directories(
+        authority.directories,
+        authority.namespace_entries or (),
+    )
+    slot_by_path = {PurePosixPath(): 0}
+    path_by_slot = {0: PurePosixPath()}
+    for slot, directory in enumerate(directories, start=1):
+        if directory.path in slot_by_path:
+            raise SyncError(
+                "pending terminal directory progress path is ambiguous: "
+                f"{directory.path.as_posix()}"
+            )
+        slot_by_path[directory.path] = slot
+        path_by_slot[slot] = directory.path
+    consumed_slots = set(state.consumed_slots)
+    if any(slot not in path_by_slot for slot in consumed_slots):
+        raise SyncError("pending terminal directory progress has an invalid slot")
+    consumed_paths = {
+        path_by_slot[slot]
+        for slot in consumed_slots
+        if slot != 0
+    }
+    return PendingTerminalDirectoryProgressCursor(
+        authority=progress,
+        parent_identity=parent_identity,
+        directories=directories,
+        slot_by_path=slot_by_path,
+        path_by_slot=path_by_slot,
+        consumed_slots=consumed_slots,
+        consumed_paths=consumed_paths,
+        expected_payload=bytearray(payload),
+        change_signal=state.change_signal,
+    )
+
+
+def _parse_pending_terminal_directory_progress_suffix(
+    ticket: PendingBatchCleanupTicket,
+    directories: tuple[PendingTerminalValidationDirectory, ...],
+    consumed_slots: set[int],
+    suffix: bytes,
+) -> tuple[int, ...]:
+    """Validate only newly appended canonical records and extend in place."""
+    parsed_slots: list[int] = []
+    seen = set()
+    offset = 0
+    while offset < len(suffix):
+        newline = suffix.find(b"\n", offset)
+        if newline < 0:
+            raise SyncError(
+                "pending terminal directory progress is truncated: "
+                f"{ticket.batch_root.name}"
+            )
+        line = suffix[offset : newline + 1]
+        if len(line) > MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_LINE_BYTES:
+            raise SyncError(
+                "pending terminal directory progress line exceeds the limit: "
+                f"{ticket.batch_root.name}"
+            )
+        try:
+            record = json.loads(line.decode("utf-8"))
+        except (ValueError, RecursionError) as error:
+            raise SyncError(
+                "pending terminal directory progress is malformed: "
+                f"{ticket.batch_root.name}"
+            ) from error
+        slot = record.get("slot") if isinstance(record, dict) else None
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"slot"}
+            or type(slot) is not int
+            or not 0 <= slot <= len(directories)
+            or _pending_directory_progress_line(record) != line
+            or slot in consumed_slots
+            or slot in seen
+        ):
+            raise SyncError(
+                "pending terminal directory progress has an invalid slot: "
+                f"{ticket.batch_root.name}"
+            )
+        seen.add(slot)
+        parsed_slots.append(slot)
+        offset = newline + 1
+    if len(consumed_slots) + len(parsed_slots) > len(directories) + 1:
+        raise SyncError("pending terminal directory progress exceeds its slot limit")
+    consumed_slots.update(parsed_slots)
+    return tuple(parsed_slots)
+
+
+def _advance_pending_terminal_directory_progress_cursor(
+    ticket: PendingBatchCleanupTicket,
+    cursor: PendingTerminalDirectoryProgressCursor,
+    suffix: bytes,
+) -> None:
+    slots = _parse_pending_terminal_directory_progress_suffix(
+        ticket,
+        cursor.directories,
+        cursor.consumed_slots,
+        suffix,
+    )
+    for slot in slots:
+        if slot != 0:
+            cursor.consumed_paths.add(cursor.path_by_slot[slot])
+    cursor.expected_payload.extend(suffix)
+
+
+def _read_pending_terminal_directory_progress_range(
+    file_fd: int,
+    offset: int,
+    size: int,
+) -> bytes:
+    pread = getattr(os, "pread", None)
+    if pread is not None:
+        return pread(file_fd, size, offset)
+    current_offset = os.lseek(file_fd, 0, os.SEEK_CUR)
+    try:
+        os.lseek(file_fd, offset, os.SEEK_SET)
+        return os.read(file_fd, size)
+    finally:
+        os.lseek(file_fd, current_offset, os.SEEK_SET)
+
+
+def _require_pending_terminal_directory_progress_cursor_current(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+    authority: PendingTerminalValidationAuthority,
+    cursor: PendingTerminalDirectoryProgressCursor,
+) -> PendingTerminalDirectoryProgressCursor:
+    """Rebind O(1) file policy/identity; replay bytes only on a stat hint."""
+    progress = authority.directory_progress
+    if progress is None or progress != cursor.authority:
+        raise SyncError(
+            "pending terminal directory progress receipt binding changed: "
+            f"{ticket.batch_root.name}"
+        )
+    path = _pending_cleanup_index_path(home) / Path(*progress.path.parts)
+    index_fd = _open_directory_beneath(home, path.parent)
+    file_fd = -1
+    try:
+        if (
+            _directory_identity(index_fd) != cursor.parent_identity
+            or not _bound_directory_matches(home, path.parent, index_fd)
+        ):
+            raise SyncError(
+                "pending terminal directory progress parent changed: "
+                f"{ticket.batch_root.name}"
+            )
+        _require_pending_cleanup_parent_access_policy(home, path.parent, index_fd)
+        representations = _pending_terminal_directory_progress_representations(
+            index_fd,
+            ticket.batch_root.name,
+        )
+        if representations != (path.name,):
+            raise SyncError(
+                "pending terminal directory progress has ambiguous related "
+                "representations; manual recovery is required: "
+                f"{ticket.batch_root.name}: {representations}"
+            )
+        try:
+            named_before = os.stat(
+                path.name,
+                dir_fd=index_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as error:
+            raise SyncError(
+                "pending terminal directory progress is missing: "
+                f"{ticket.batch_root.name}"
+            ) from error
+        except OSError as error:
+            raise SyncError(
+                "pending terminal directory progress is unreadable: "
+                f"{ticket.batch_root.name}: {error}"
+            ) from error
+        if (
+            not stat.S_ISREG(named_before.st_mode)
+            or (named_before.st_dev, named_before.st_ino) != progress.file_identity
+            or stat.S_IMODE(named_before.st_mode) != 0o600
+            or named_before.st_uid != progress.uid
+            or named_before.st_nlink != progress.link_count
+            or not _gid_matches_regular_file_access_policy(
+                named_before.st_gid,
+                progress.gid,
+                progress.mode,
+            )
+            or named_before.st_size != cursor.offset
+        ):
+            if named_before.st_size < cursor.offset:
+                raise SyncError(
+                    "pending terminal directory progress rolled back within "
+                    f"this invocation: {ticket.batch_root.name}"
+                )
+            raise SyncError(
+                "pending terminal directory progress changed: "
+                f"{ticket.batch_root.name}"
+            )
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        try:
+            file_fd = os.open(path.name, flags, dir_fd=index_fd)
+        except FileNotFoundError as error:
+            raise SyncError(
+                "pending terminal directory progress is missing: "
+                f"{ticket.batch_root.name}"
+            ) from error
+        except OSError as error:
+            raise SyncError(
+                "pending terminal directory progress is unreadable: "
+                f"{ticket.batch_root.name}: {error}"
+            ) from error
+        metadata = _require_pending_cleanup_fd_access_policy(
+            file_fd,
+            path,
+            expected_mode=0o600,
+        )
+        if (
+            (metadata.st_dev, metadata.st_ino) != progress.file_identity
+            or metadata.st_uid != progress.uid
+            or metadata.st_nlink != progress.link_count
+            or metadata.st_size != cursor.offset
+            or not _gid_matches_regular_file_access_policy(
+                metadata.st_gid,
+                progress.gid,
+                progress.mode,
+            )
+            or not _regular_stat_metadata_matches(metadata, named_before)
+        ):
+            raise SyncError(
+                "pending terminal directory progress changed: "
+                f"{ticket.batch_root.name}"
+            )
+        if not _bound_directory_matches(home, path.parent, index_fd):
+            raise SyncError(
+                "pending terminal directory progress parent changed: "
+                f"{ticket.batch_root.name}"
+            )
+        try:
+            named_after = os.stat(
+                path.name,
+                dir_fd=index_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as error:
+            raise SyncError(
+                "pending terminal directory progress is missing during "
+                f"revalidation: {ticket.batch_root.name}"
+            ) from error
+        except OSError as error:
+            raise SyncError(
+                "pending terminal directory progress revalidation failed "
+                f"(unreadable): {ticket.batch_root.name}: {error}"
+            ) from error
+        if not _regular_stat_metadata_matches(named_after, metadata):
+            raise SyncError(
+                "pending terminal directory progress changed: "
+                f"{ticket.batch_root.name}"
+            )
+        observed_signal = _stat_content_change_signal(named_after)
+        if observed_signal != cursor.change_signal:
+            state = _read_pending_terminal_directory_progress(
+                home,
+                ticket,
+                quarantine_root_identity,
+                authority,
+            )
+            if state is None or state.snapshot.payload != cursor.expected_payload:
+                raise SyncError(
+                    "pending terminal directory progress changed since the "
+                    f"current invocation: {ticket.batch_root.name}"
+                )
+            if state.consumed_slots != cursor.consumed_slots:
+                raise SyncError(
+                    "pending terminal directory progress changed since the "
+                    f"current invocation: {ticket.batch_root.name}"
+                )
+            if state.change_signal is None:
+                raise SyncError(
+                    "pending terminal directory progress lacks a stable "
+                    f"content signal: {ticket.batch_root.name}"
+                )
+            cursor.change_signal = state.change_signal
+        rebound_representations = _pending_terminal_directory_progress_representations(
+            index_fd,
+            ticket.batch_root.name,
+        )
+        if rebound_representations != (path.name,):
+            raise SyncError(
+                "pending terminal directory progress representations changed: "
+                f"{ticket.batch_root.name}: {rebound_representations}"
+            )
+        if (
+            _directory_identity(index_fd) != cursor.parent_identity
+            or not _bound_directory_matches(home, path.parent, index_fd)
+        ):
+            raise SyncError(
+                "pending terminal directory progress parent changed: "
+                f"{ticket.batch_root.name}"
+            )
+        return cursor
+    finally:
+        if file_fd >= 0:
+            _close_fd_quietly(file_fd)
+        _close_fd_quietly(index_fd)
+
+
+def _pending_terminal_directory_path_is_present(
+    batch_fd: int,
+    path: PurePosixPath,
+) -> bool:
+    """Check one receipt path without enumerating its children."""
+    if not path.parts:
+        return True
+    current_fd = os.dup(batch_fd)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        for component in path.parts[:-1]:
+            try:
+                next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                return False
+            except OSError as error:
+                raise SyncError(
+                    "pending terminal directory ancestor is unreadable or changed: "
+                    f"{path.as_posix()}: {error}"
+                ) from error
+            _close_fd_quietly(current_fd)
+            current_fd = next_fd
+        try:
+            os.stat(path.parts[-1], dir_fd=current_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            raise SyncError(
+                "pending terminal directory slot is unreadable or changed: "
+                f"{path.as_posix()}: {error}"
+            ) from error
+        return True
+    finally:
+        _close_fd_quietly(current_fd)
+
+
+def _require_pending_terminal_consumed_directories_absent(
+    ticket: PendingBatchCleanupTicket,
+    batch_fd: int,
+    authority: PendingTerminalValidationAuthority,
+    progress_state: (
+        PendingTerminalDirectoryProgressState
+        | PendingTerminalDirectoryProgressCursor
+    ),
+) -> None:
+    consumed_slots = progress_state.consumed_slots
+    if 0 in consumed_slots:
+        raise SyncError(
+            "pending terminal batch-root slot was already consumed but a root is "
+            f"present; manual recovery is required: {ticket.batch_root.name}"
+        )
+    if isinstance(progress_state, PendingTerminalDirectoryProgressCursor):
+        consumed_paths = (
+            (slot, progress_state.path_by_slot[slot])
+            for slot in progress_state.consumed_slots
+            if slot != 0
+        )
+    else:
+        progress_directories = _pending_terminal_directory_progress_directories(
+            authority.directories,
+            authority.namespace_entries or (),
+        )
+        consumed_paths = (
+            (slot, directory.path)
+            for slot, directory in enumerate(progress_directories, start=1)
+            if slot in consumed_slots
+        )
+    for _slot, path in consumed_paths:
+        if _pending_terminal_directory_path_is_present(batch_fd, path):
+            raise SyncError(
+                "pending terminal directory slot was already consumed but is "
+                "present again; manual recovery is required: "
+                f"{path.as_posix()}"
+            )
+
+
+def _pending_terminal_consumed_directory_paths(
+    authority: PendingTerminalValidationAuthority,
+    progress_state: (
+        PendingTerminalDirectoryProgressState
+        | PendingTerminalDirectoryProgressCursor
+    ),
+) -> frozenset[PurePosixPath] | set[PurePosixPath]:
+    if isinstance(progress_state, PendingTerminalDirectoryProgressCursor):
+        return progress_state.consumed_paths
+    directories = _pending_terminal_directory_progress_directories(
+        authority.directories,
+        authority.namespace_entries or (),
+    )
+    return frozenset(
+        directory.path
+        for slot, directory in enumerate(directories, start=1)
+        if slot in progress_state.consumed_slots
+    )
+
+
+def _append_pending_terminal_directory_consumption(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+    authority: PendingTerminalValidationAuthority,
+    path: PurePosixPath,
+    child_fd: int,
+    invocation_consumed: set[int],
+    cursor: PendingTerminalDirectoryProgressCursor,
+) -> None:
+    progress = authority.directory_progress
+    if progress is None:
+        if ticket.terminal_regular_targets:
+            raise SyncError(
+                "pending terminal directory progress is unavailable; manual "
+                f"recovery is required: {ticket.batch_root.name}"
+            )
+        return
+    if progress != cursor.authority:
+        raise SyncError(
+            "pending terminal directory progress receipt binding changed: "
+            f"{ticket.batch_root.name}"
+        )
+    slot = cursor.slot_by_path.get(path)
+    if slot is None:
+        raise SyncError(
+            "pending terminal directory is outside the receipt-bound progress set: "
+            f"{path.as_posix()}"
+        )
+    if slot in invocation_consumed or slot in cursor.consumed_slots:
+        raise SyncError("pending terminal directory slot was consumed twice")
+    expected_identity = (
+        ticket.batch_root_identity
+        if slot == 0
+        else cursor.directories[slot - 1].identity
+    )
+    if _directory_identity(child_fd) != expected_identity:
+        raise SyncError(
+            f"pending terminal directory slot changed: {path.as_posix()}"
+        )
+    _require_pending_terminal_directory_progress_cursor_current(
+        home,
+        ticket,
+        quarantine_root_identity,
+        authority,
+        cursor,
+    )
+    progress_path = _pending_cleanup_index_path(home) / Path(*progress.path.parts)
+    index_fd = _open_directory_beneath(home, progress_path.parent)
+    file_fd = -1
+    try:
+        if (
+            _directory_identity(index_fd) != cursor.parent_identity
+            or not _bound_directory_matches(home, progress_path.parent, index_fd)
+        ):
+            raise SyncError(
+                "pending terminal directory progress parent changed: "
+                f"{ticket.batch_root.name}"
+            )
+        representations = _pending_terminal_directory_progress_representations(
+            index_fd,
+            ticket.batch_root.name,
+        )
+        if representations != (progress_path.name,):
+            raise SyncError(
+                "pending terminal directory progress has ambiguous related "
+                "representations; manual recovery is required: "
+                f"{ticket.batch_root.name}: {representations}"
+            )
+        flags = os.O_RDWR | getattr(os, "O_APPEND", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        file_fd = os.open(progress_path.name, flags, dir_fd=index_fd)
+        metadata = _require_pending_cleanup_fd_access_policy(
+            file_fd,
+            progress_path,
+            expected_mode=0o600,
+        )
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino) != progress.file_identity
+            or metadata.st_nlink != progress.link_count
+            or not _gid_matches_regular_file_access_policy(
+                metadata.st_gid,
+                progress.gid,
+                progress.mode,
+            )
+            or metadata.st_size != cursor.offset
+            or not _bound_directory_matches(home, progress_path.parent, index_fd)
+        ):
+            raise SyncError(
+                f"pending terminal directory progress changed: {ticket.batch_root.name}"
+            )
+        observed_signal = _stat_content_change_signal(metadata)
+        if observed_signal != cursor.change_signal:
+            _require_pending_terminal_directory_progress_cursor_current(
+                home,
+                ticket,
+                quarantine_root_identity,
+                authority,
+                cursor,
+            )
+            if _stat_content_change_signal(os.fstat(file_fd)) != cursor.change_signal:
+                raise SyncError(
+                    "pending terminal directory progress changed during append: "
+                    f"{ticket.batch_root.name}"
+                )
+        line = _pending_directory_progress_line({"slot": slot})
+        if cursor.offset + len(line) > MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES:
+            raise SyncError("pending terminal directory progress exceeds its size limit")
+        written = os.write(file_fd, line)
+        if written != len(line):
+            raise SyncError("pending terminal directory progress append was incomplete")
+        os.fsync(file_fd)
+        os.fsync(index_fd)
+        appended = _read_pending_terminal_directory_progress_range(
+            file_fd,
+            cursor.offset,
+            len(line),
+        )
+        after = _require_pending_cleanup_fd_access_policy(
+            file_fd,
+            progress_path,
+            expected_mode=0o600,
+        )
+        named_after = os.stat(
+            progress_path.name,
+            dir_fd=index_fd,
+            follow_symlinks=False,
+        )
+        if (
+            appended != line
+            or not stat.S_ISREG(after.st_mode)
+            or (after.st_dev, after.st_ino) != progress.file_identity
+            or after.st_uid != progress.uid
+            or after.st_nlink != progress.link_count
+            or after.st_size != cursor.offset + len(line)
+            or not _gid_matches_regular_file_access_policy(
+                after.st_gid,
+                progress.gid,
+                progress.mode,
+            )
+            or not _regular_stat_metadata_matches(named_after, after)
+            or _stat_content_change_signal(named_after)
+            != _stat_content_change_signal(after)
+            or _directory_identity(index_fd) != cursor.parent_identity
+            or not _bound_directory_matches(home, progress_path.parent, index_fd)
+        ):
+            raise SyncError(
+                "pending terminal directory progress append did not persist: "
+                f"{path.as_posix()}"
+            )
+        rebound_representations = _pending_terminal_directory_progress_representations(
+            index_fd,
+            ticket.batch_root.name,
+        )
+        if rebound_representations != (progress_path.name,):
+            raise SyncError(
+                "pending terminal directory progress representations changed: "
+                f"{ticket.batch_root.name}: {rebound_representations}"
+            )
+    except OSError as error:
+        raise SyncError(
+            f"pending terminal directory progress append failed: {error}"
+        ) from error
+    finally:
+        if file_fd >= 0:
+            _close_fd_quietly(file_fd)
+        _close_fd_quietly(index_fd)
+    _advance_pending_terminal_directory_progress_cursor(
+        ticket,
+        cursor,
+        line,
+    )
+    cursor.change_signal = _stat_content_change_signal(after)
+    invocation_consumed.add(slot)
+
+
+def _pending_terminal_directory_progress_representations(
+    index_fd: int,
+    batch_name: str,
+) -> tuple[str, ...]:
+    names = _directory_member_names(
+        index_fd,
+        maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+        overflow_message="pending cleanup authority scan exceeds the size limit",
+    )
+    return tuple(
+        name
+        for name in names
+        if _pending_cleanup_directory_progress_representation_batch_name(name)
+        == batch_name
+    )
+
+
+def _read_unconsumed_pending_terminal_directory_progress(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    header: bytes,
+    *,
+    allow_publication_temp: bool = False,
+) -> ManagedStateFileSnapshot | None:
+    """Bind a header-only candidate; never derive batch authority from it."""
+    path = _pending_cleanup_directory_progress_path(home, ticket.batch_root.name)
+    index_fd = _open_directory_beneath(home, path.parent)
+    try:
+        if not _bound_directory_matches(home, path.parent, index_fd):
+            raise SyncError("pending cleanup index changed before progress recovery")
+        representations = _pending_terminal_directory_progress_representations(
+            index_fd, ticket.batch_root.name
+        )
+        if not representations:
+            return None
+        temp_path = path.with_name(path.name + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX)
+        if allow_publication_temp and representations == (temp_path.name,):
+            path = temp_path
+        if representations != (path.name,):
+            raise SyncError(
+                "pending terminal directory progress has ambiguous related "
+                "representations; manual recovery is required: "
+                f"{ticket.batch_root.name}: {representations}"
+            )
+        snapshot = _read_managed_state_file_snapshot(
+            home, path, index_fd,
+            maximum_bytes=MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+        )
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+            or snapshot.file_type != stat.S_IFREG
+            or snapshot.mode != 0o600
+            or snapshot.uid != os.geteuid()
+            or snapshot.gid is None
+            or snapshot.link_count != 1
+            or snapshot.parent_identity != _directory_identity(index_fd)
+            or snapshot.payload != header
+            or snapshot.size != len(header)
+        ):
+            raise SyncError(
+                "pending terminal directory progress without receipt is not an "
+                "exact unconsumed header; manual recovery is required: "
+                f"{ticket.batch_root.name}"
+            )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home, path, index_fd, snapshot
+        )
+        rebound = _read_managed_state_file_snapshot(
+            home, path, index_fd, expected_identity=snapshot.file_identity,
+            maximum_bytes=MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+        )
+        if (
+            not _managed_state_snapshot_matches_bound_file_evidence(rebound, snapshot)
+            or not _bound_directory_matches(home, path.parent, index_fd)
+            or _pending_terminal_directory_progress_representations(
+                index_fd, ticket.batch_root.name
+            ) != (path.name,)
+        ):
+            raise SyncError(
+                "pending terminal directory progress changed during recovery: "
+                f"{ticket.batch_root.name}"
+            )
+        return rebound
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _promote_unconsumed_pending_terminal_directory_progress(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    header: bytes,
+    staged: ManagedStateFileSnapshot,
+) -> ManagedStateFileSnapshot:
+    """Publish the same validated temp object, never synthesize batch authority."""
+    path = _pending_cleanup_directory_progress_path(home, ticket.batch_root.name)
+    temp_path = path.with_name(path.name + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX)
+    index_fd = _open_directory_beneath(home, path.parent)
+    try:
+        if (
+            not _bound_directory_matches(home, path.parent, index_fd)
+            or _directory_identity(index_fd) != staged.parent_identity
+            or _pending_terminal_directory_progress_representations(
+                index_fd, ticket.batch_root.name,
+            ) != (temp_path.name,)
+        ):
+            raise SyncError("pending terminal directory progress temp namespace changed")
+        rebound = _read_unconsumed_pending_terminal_directory_progress(
+            home, ticket, header, allow_publication_temp=True,
+        )
+        if rebound is None or not _managed_state_snapshot_matches_bound_file_evidence(
+            rebound, staged,
+        ):
+            raise SyncError("pending terminal directory progress temp changed before publication")
+        _require_pending_cleanup_ticket_unchanged(home, ticket)
+        _rename_noreplace_at(index_fd, temp_path.name, index_fd, path.name)
+        os.fsync(index_fd)
+        published = _read_unconsumed_pending_terminal_directory_progress(
+            home, ticket, header,
+        )
+        if (
+            published is None
+            or not _managed_state_snapshot_matches_bound_file_evidence(published, staged)
+            or not _bound_directory_matches(home, path.parent, index_fd)
+            or _directory_identity(index_fd) != staged.parent_identity
+        ):
+            raise SyncError("pending terminal directory progress temp changed during publication")
+        return published
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _require_pending_terminal_directory_progress_representations_absent(
+    home: Path,
+    batch_name: str,
+) -> None:
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return
+    try:
+        representations = _pending_terminal_directory_progress_representations(
+            index_fd,
+            batch_name,
+        )
+        if representations:
+            raise SyncError(
+                "pending terminal directory progress representations remain: "
+                f"{batch_name}: {representations}"
+            )
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _retire_pending_terminal_directory_progress(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+    authority: PendingTerminalValidationAuthority,
+    *,
+    final_boundary: Callable[[], None],
+) -> None:
+    """Remove a fully consumed progress log only at the roots-absent boundary."""
+    progress = authority.directory_progress
+    if progress is None:
+        _require_pending_terminal_directory_progress_representations_absent(
+            home,
+            ticket.batch_root.name,
+        )
+        return
+    path = _pending_cleanup_index_path(home) / Path(*progress.path.parts)
+    index_fd = _open_directory_beneath(home, path.parent)
+    try:
+        if not _bound_directory_matches(home, path.parent, index_fd):
+            raise SyncError("pending cleanup index changed during progress retirement")
+        representations = _pending_terminal_directory_progress_representations(
+            index_fd,
+            ticket.batch_root.name,
+        )
+        canonical = path.name
+        retained_names = _retained_pending_cleanup_names_for_path(
+            home,
+            path,
+            index_fd,
+            label="pending terminal directory progress",
+        )
+        allowed = {canonical, *retained_names}
+        if set(representations) - allowed:
+            raise SyncError(
+                "pending terminal directory progress has an ambiguous representation; "
+                f"manual recovery is required: {ticket.batch_root.name}"
+            )
+        canonical_snapshot = _read_managed_state_file_snapshot(
+            home,
+            path,
+            index_fd,
+            expected_identity=progress.file_identity,
+            maximum_bytes=MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+        )
+        if not canonical_snapshot.exists:
+            if len(retained_names) > 1:
+                raise SyncError(
+                    "pending terminal directory progress has multiple retained "
+                    f"representations: {ticket.batch_root.name}"
+                )
+            if retained_names:
+                retained_path = path.with_name(retained_names[0])
+                retained_snapshot = _read_managed_state_file_snapshot(
+                    home,
+                    retained_path,
+                    index_fd,
+                    expected_identity=progress.file_identity,
+                    maximum_bytes=MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+                )
+                _parse_pending_terminal_directory_progress_payload(
+                    ticket,
+                    quarantine_root_identity,
+                    authority,
+                    retained_snapshot,
+                )
+                if (
+                    retained_snapshot.file_type != stat.S_IFREG
+                    or retained_snapshot.mode != 0o600
+                    or retained_snapshot.uid != os.geteuid()
+                    or retained_snapshot.link_count != 1
+                ):
+                    raise SyncError(
+                        "pending terminal directory progress retained object "
+                        f"changed: {ticket.batch_root.name}"
+                    )
+                restored = _restore_retained_pending_cleanup_file(
+                    home,
+                    path,
+                    index_fd,
+                    retained_snapshot,
+                    label="pending terminal directory progress",
+                )
+                if restored is None:
+                    raise SyncError(
+                        "pending terminal directory progress disappeared during "
+                        f"recovery: {ticket.batch_root.name}"
+                    )
+                canonical_snapshot = restored
+            else:
+                # Only the roots-absent finalization phase may interpret a
+                # missing log as an already completed retirement step.
+                final_boundary()
+                return
+        state = _parse_pending_terminal_directory_progress_payload(
+            ticket,
+            quarantine_root_identity,
+            authority,
+            canonical_snapshot,
+        )
+        progress_directories = _pending_terminal_directory_progress_directories(
+            authority.directories,
+            authority.namespace_entries or (),
+        )
+        expected_slots = frozenset(range(len(progress_directories) + 1))
+        if state.consumed_slots != expected_slots:
+            raise SyncError(
+                "pending terminal directory progress is incomplete at rootless "
+                f"retirement: {ticket.batch_root.name}"
+            )
+        if (
+            canonical_snapshot.file_type != stat.S_IFREG
+            or canonical_snapshot.mode != 0o600
+            or canonical_snapshot.uid != os.geteuid()
+            or canonical_snapshot.link_count != 1
+        ):
+            raise SyncError(
+                "pending terminal directory progress access policy changed: "
+                f"{ticket.batch_root.name}"
+            )
+
+        def revalidate_progress_retirement(member: str) -> None:
+            final_boundary()
+            current_representations = _pending_terminal_directory_progress_representations(
+                index_fd,
+                ticket.batch_root.name,
+            )
+            if current_representations != (member,):
+                raise SyncError(
+                    "pending terminal directory progress representations changed "
+                    "during retirement: "
+                    f"{ticket.batch_root.name}: {current_representations}"
+                )
+            member_path = path.with_name(member)
+            current = _read_managed_state_file_snapshot(
+                home,
+                member_path,
+                index_fd,
+                expected_identity=progress.file_identity,
+                maximum_bytes=MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+            )
+            if (
+                not _managed_state_snapshot_matches_file_evidence(
+                    current,
+                    canonical_snapshot,
+                )
+                or current.link_count != 1
+            ):
+                raise SyncError(
+                    "pending terminal directory progress changed during retirement: "
+                    f"{ticket.batch_root.name}"
+                )
+            _parse_pending_terminal_directory_progress_payload(
+                ticket,
+                quarantine_root_identity,
+                authority,
+                current,
+            )
+
+        final_boundary()
+        _isolate_and_delete_pending_cleanup_file(
+            home,
+            path,
+            index_fd,
+            canonical_snapshot,
+            label=f"pending terminal directory progress {ticket.batch_root.name}",
+            maximum_bytes=MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+            mutation_revalidator=revalidate_progress_retirement,
+            expected_link_count=1,
+        )
+        remaining = _pending_terminal_directory_progress_representations(
+            index_fd,
+            ticket.batch_root.name,
+        )
+        if remaining:
+            raise SyncError(
+                "pending terminal directory progress representations reappeared: "
+                f"{ticket.batch_root.name}: {remaining}"
+            )
+    finally:
+        _close_fd_quietly(index_fd)
+
+
 def _pending_cleanup_terminal_retirement_path(
     home: Path,
     batch_name: str,
@@ -26249,6 +27713,7 @@ def _pending_quarantine_allocation_cleanup_control_batch_name(
         PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
         PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
         PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX,
+        PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX,
         PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX,
         PENDING_PRIVATE_USE_RETIREMENT_SUFFIX,
     ):
@@ -31985,6 +33450,7 @@ def _capture_pending_cleanup_identity_ledger(
     skipped_names: frozenset[str],
     name_validator: (Callable[[tuple[str, ...], str, tuple[int, int]], bool] | None),
     directory_expected_mode: int | None,
+    consumed_directory_paths: frozenset[PurePosixPath] = frozenset(),
 ) -> None:
     if depth > MAX_PENDING_CLEANUP_DEPTH:
         raise SyncError("pending cleanup directory depth exceeds the limit")
@@ -32167,6 +33633,16 @@ def _capture_pending_cleanup_identity_ledger(
                 )
                 else logical_name
             )
+            ledger_path = PurePosixPath(*relative_parts, ledger_name)
+            if (
+                planned[2] == stat.S_IFDIR
+                and ledger_path in consumed_directory_paths
+            ):
+                raise SyncError(
+                    "pending terminal directory slot was already consumed but is "
+                    "present again; manual recovery is required: "
+                    f"{ledger_path.as_posix()}"
+                )
             entries.append(
                 (
                     entry.name,
@@ -32175,7 +33651,7 @@ def _capture_pending_cleanup_identity_ledger(
                     links_content_root,
                     logical_name,
                     active_plan_matches_entry,
-                    PurePosixPath(*relative_parts, ledger_name),
+                    ledger_path,
                     stat.S_IMODE(metadata.st_mode),
                     metadata.st_uid,
                     metadata.st_gid,
@@ -32230,6 +33706,7 @@ def _capture_pending_cleanup_identity_ledger(
                 skipped_names=frozenset(),
                 name_validator=name_validator,
                 directory_expected_mode=directory_expected_mode,
+                consumed_directory_paths=consumed_directory_paths,
             )
         finally:
             if child_fd >= 0:
@@ -32281,6 +33758,9 @@ def _remove_pending_batch_directory_contents(
     directory_expected_mode: int | None = 0o700,
     regular_file_expected_mode: int | None = 0o600,
     mutation_revalidator: Callable[[PurePosixPath, str], None] | None = None,
+    directory_consumption_callback: (
+        Callable[[PurePosixPath, PurePosixPath, int], None] | None
+    ) = None,
 ) -> None:
     if depth > MAX_PENDING_CLEANUP_DEPTH:
         raise SyncError("pending cleanup directory depth exceeds the limit")
@@ -32490,7 +33970,7 @@ def _remove_pending_batch_directory_contents(
         links_content_root,
         logical_name,
         _active_plan_matches_entry,
-        _ledger_path,
+        ledger_path,
         _mode,
         _uid,
         _gid,
@@ -32620,6 +34100,7 @@ def _remove_pending_batch_directory_contents(
                     directory_expected_mode=directory_expected_mode,
                     regular_file_expected_mode=regular_file_expected_mode,
                     mutation_revalidator=mutation_revalidator,
+                    directory_consumption_callback=directory_consumption_callback,
                 )
                 try:
                     current = os.stat(
@@ -32665,6 +34146,44 @@ def _remove_pending_batch_directory_contents(
                 child_display_path = Path("<pending-cleanup-dir>") / Path(
                     *child_relative_parts
                 )
+                child_expected_mode = _cleanup_directory_expected_mode(
+                    directory_expected_mode,
+                    child_relative_parts,
+                )
+                if child_expected_mode is None:
+                    _require_current_user_cleanup_fd_access_policy(
+                        child_fd,
+                        child_display_path,
+                    )
+                else:
+                    _require_pending_cleanup_fd_access_policy(
+                        child_fd,
+                        child_display_path,
+                        expected_mode=child_expected_mode,
+                    )
+                require_current_directory_access_policy()
+                if directory_consumption_callback is not None:
+                    # Durable receipt-bound intent closes the crash window in
+                    # which the filesystem recycles this directory's inode.
+                    # The child descriptor stays pinned across the append.
+                    directory_consumption_callback(
+                        logical_entry_path,
+                        ledger_path,
+                        child_fd,
+                    )
+                require_current_entry_identity_after_callback(
+                    active_name,
+                    planned,
+                    label=f"pending cleanup child directory changed: {name}",
+                )
+                if _directory_identity(child_fd) != child_identity:
+                    _retain_pending_cleanup_entry(
+                        directory_fd,
+                        active_name,
+                        directory_identity,
+                        planned,
+                        label=f"pending cleanup child directory changed: {name}",
+                    )
                 child_expected_mode = _cleanup_directory_expected_mode(
                     directory_expected_mode,
                     child_relative_parts,
@@ -33562,12 +35081,14 @@ def _require_pending_terminal_validation_control_set(
     if marker_only:
         # Historic marker-only v4 tickets may predate commit-evidence. The
         # marker and metadata still form complete content/inode/access
-        # authority; evidence is an optional third logical name when present.
+        # authority; both original metadata names may coexist, and evidence
+        # is an optional additional logical name when present.
         expected_paths.discard(evidence_path)
         metadata_paths = actual_paths - expected_paths - {evidence_path}
         if metadata_paths not in (
             {PurePosixPath(PENDING_LINK_METADATA_NAME)},
             {PurePosixPath("metadata.json")},
+            {PurePosixPath(PENDING_LINK_METADATA_NAME), PurePosixPath("metadata.json")},
         ):
             raise SyncError(
                 "pending terminal validation marker-only metadata authority is "
@@ -34227,11 +35748,14 @@ def _parse_pending_terminal_validation_authority(
         "control_files",
     }
     current_v4_fields = legacy_v3_fields | {"namespace_entries"}
+    current_v5_fields = current_v4_fields | {"directory_progress"}
     legacy_v3_fields_without_controls = legacy_v3_fields - {"control_files"}
     current_v4_fields_without_controls = current_v4_fields - {"control_files"}
+    current_v5_fields_without_controls = current_v5_fields - {"control_files"}
     if version not in {
         2,
         LEGACY_PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION,
+        LEGACY_V4_PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION,
         PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION,
     }:
         raise SyncError(
@@ -34246,9 +35770,12 @@ def _parse_pending_terminal_validation_authority(
         and set(data)
         not in (legacy_v3_fields, legacy_v3_fields_without_controls)
     ) or (
-        version == PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION
+        version == LEGACY_V4_PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION
         and set(data)
         not in (current_v4_fields, current_v4_fields_without_controls)
+    ) or (
+        version == PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION
+        and set(data) not in (current_v5_fields, current_v5_fields_without_controls)
     ):
         raise SyncError(
             f"pending cleanup terminal validation changed: {ticket.batch_root.name}"
@@ -34292,7 +35819,10 @@ def _parse_pending_terminal_validation_authority(
             ticket,
             data.get("namespace_entries"),
         )
-        if version == PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION
+        if version in {
+            LEGACY_V4_PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION,
+            PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION,
+        }
         else None
     )
     control_files = (
@@ -34304,11 +35834,39 @@ def _parse_pending_terminal_validation_authority(
         else ()
     )
     _require_pending_terminal_validation_control_set(ticket, control_files)
+    directory_progress = None
+    if version == PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION:
+        directory_progress = _parse_pending_terminal_directory_progress_authority(
+            ticket,
+            data.get("directory_progress"),
+            directories=parsed_directories,
+        )
+        expected_header = _pending_terminal_directory_progress_header_payload(
+            ticket,
+            quarantine_root_identity,
+            parsed_directories,
+            namespace_entries or (),
+        )
+        if (
+            len(expected_header) != directory_progress.header_size
+            or hashlib.sha256(expected_header).hexdigest()
+            != directory_progress.header_sha256
+        ):
+            raise SyncError(
+                "pending terminal directory progress header binding changed: "
+                f"{ticket.batch_root.name}"
+            )
+        if not ticket.terminal_regular_targets:
+            raise SyncError(
+                "marker-only ticket cannot carry terminal directory progress: "
+                f"{ticket.batch_root.name}"
+            )
     authority = PendingTerminalValidationAuthority(
         aliases=parsed_aliases,
         directories=parsed_directories,
         namespace_entries=namespace_entries,
         control_files=control_files,
+        directory_progress=directory_progress,
     )
     if receipt.payload != _pending_cleanup_terminal_validation_payload(
         ticket,
@@ -34317,6 +35875,7 @@ def _parse_pending_terminal_validation_authority(
         terminal_directories=authority.directories,
         namespace_entries=authority.namespace_entries,
         control_files=authority.control_files,
+        directory_progress=authority.directory_progress,
     ):
         raise SyncError(
             f"pending cleanup terminal validation changed: {ticket.batch_root.name}"
@@ -35427,7 +36986,12 @@ def _ensure_pending_terminal_validation_receipt(
     marker_only_namespace_entries: (
         tuple[PendingTerminalValidationNamespaceEntry, ...] | None
     ) = None,
+    observe_unconsumed_progress: bool = False,
 ) -> None:
+    if observe_unconsumed_progress and (
+        ticket.version not in {4, 8} or not ticket.terminal_regular_targets
+    ):
+        raise SyncError("progress publication observation requires original terminal authority")
     if ticket.version in {1, 2}:
         existing_receipt = _read_pending_cleanup_terminal_validation(
             home,
@@ -35521,33 +37085,12 @@ def _ensure_pending_terminal_validation_receipt(
             ticket,
             marker_only_namespace_entries,
         )
-        metadata_path = PurePosixPath(PENDING_LINK_METADATA_NAME)
-        if (
-            _read_pending_cleanup_logical_control_snapshot(
-                home,
-                bound_batch_root,
-                batch_fd,
-                metadata_path,
-                entry_budget=entry_budget,
-            )
-            is None
-        ):
-            metadata_path = PurePosixPath("metadata.json")
-        marker_only_control_paths = [
-            *_pending_marker_only_control_paths(ticket),
-            metadata_path,
-        ]
-        if (
-            _read_pending_cleanup_logical_control_snapshot(
-                home,
-                bound_batch_root,
-                batch_fd,
-                PENDING_STATE_COMMIT_EVIDENCE,
-                entry_budget=entry_budget,
-            )
-            is not None
-        ):
-            marker_only_control_paths.append(PENDING_STATE_COMMIT_EVIDENCE)
+        # Both compatibility metadata names can coexist. Bind each original
+        # path's content and identity instead of choosing whichever name the
+        # current scan happens to discover first.
+        marker_only_control_paths = _pending_marker_only_live_control_paths(
+            home, bound_batch_root, batch_fd, ticket, entry_budget=entry_budget,
+        )
         controls = _pending_terminal_validation_control_files_from_paths(
             home,
             bound_batch_root,
@@ -35572,6 +37115,8 @@ def _ensure_pending_terminal_validation_receipt(
         ticket,
         quarantine_root_identity,
     )
+    if observe_unconsumed_progress and existing_receipt is not None:
+        raise SyncError("progress publication changed during read-only observation")
     if namespace_anchor_sha256 is None:
         if ticket.version == LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION:
             raise SyncError(
@@ -35605,6 +37150,19 @@ def _ensure_pending_terminal_validation_receipt(
             "recovery is required: "
             f"{ticket.batch_root.name}"
         )
+    if existing_receipt is None and ticket.commit_evidence is None:
+        index_fd = _open_directory_beneath(home, _pending_cleanup_index_path(home))
+        try:
+            if _pending_terminal_directory_progress_representations(
+                index_fd, ticket.batch_root.name,
+            ):
+                raise SyncError(
+                    "pending terminal unconsumed progress lacks original ticket "
+                    "authority; manual recovery is required: "
+                    f"{ticket.batch_root.name}"
+                )
+        finally:
+            _close_fd_quietly(index_fd)
     _require_pending_terminal_pointer_retirement_authority(
         home,
         ticket,
@@ -35625,6 +37183,12 @@ def _ensure_pending_terminal_validation_receipt(
             quarantine_root_identity,
             existing_receipt,
         )
+        if existing_authority is not None and existing_authority.directory_progress is None:
+            raise SyncError(
+                "pending terminal validation receipt lacks cross-crash directory "
+                "progress; manual recovery is required: "
+                f"{ticket.batch_root.name}"
+            )
         if existing_authority is None or existing_authority.namespace_entries is None:
             raise SyncError(
                 "legacy terminal validation receipt lacks namespace authority; "
@@ -35656,6 +37220,8 @@ def _ensure_pending_terminal_validation_receipt(
         alias_identity = _named_entry_identity(batch_fd, alias_name)
         target = home / Path(*expectation.target.parts)
         if alias_identity is None:
+            if observe_unconsumed_progress:
+                raise SyncError("progress publication observation lacks an original recovery alias")
             if expectation.link_count is not None:
                 target_snapshot = _read_regular_file_snapshot_beneath(
                     home,
@@ -35710,7 +37276,8 @@ def _ensure_pending_terminal_validation_receipt(
                 else None
             ),
         )
-    os.fsync(batch_fd)
+    if not observe_unconsumed_progress:
+        os.fsync(batch_fd)
     retirement_control = _read_pending_cleanup_terminal_retirement_ticket(
         home,
         _pending_cleanup_terminal_retirement_path(home, ticket.batch_root.name),
@@ -35791,21 +37358,43 @@ def _ensure_pending_terminal_validation_receipt(
                     "pending terminal validation namespace authority changed: "
                     f"{ticket.batch_root.name}"
                 )
+        controls = _pending_terminal_validation_control_files_from_paths(
+            home,
+            bound_batch_root,
+            batch_fd,
+            _pending_terminal_validation_control_paths_for_ticket(ticket),
+            entry_budget=cleanup_budget,
+        )
+        _require_pending_cleanup_ticket_unchanged(home, ticket)
+        _require_pending_terminal_pointer_retirement_authority(
+            home, ticket, bound_batch_root, batch_fd,
+            allow_consumed=False, entry_budget=cleanup_budget,
+        )
+        _require_pending_terminal_validation_control_files(
+            home, bound_batch_root, batch_fd, controls, entry_budget=cleanup_budget,
+        )
+        if observe_unconsumed_progress:
+            _require_pending_terminal_validation_control_set(ticket, controls)
+            header = _pending_terminal_directory_progress_header_payload(
+                ticket, quarantine_root_identity, terminal_directories, namespace_entries,
+            )
+            if _read_unconsumed_pending_terminal_directory_progress(
+                home, ticket, header, allow_publication_temp=True,
+            ) is None:
+                raise SyncError("progress publication disappeared during read-only observation")
+            return
+        # Only this independently ticket/namespace/control-validated path may
+        # bind a zero-consumption sidecar left by receipt publication failure.
         _publish_pending_cleanup_terminal_validation(
             home,
             ticket,
             quarantine_root_identity,
             terminal_aliases=terminal_aliases,
-                terminal_directories=terminal_directories,
-                namespace_entries=namespace_entries,
-                control_files=_pending_terminal_validation_control_files_from_paths(
-                    home,
-                    bound_batch_root,
-                    batch_fd,
-                    _pending_terminal_validation_control_paths_for_ticket(ticket),
-                    entry_budget=cleanup_budget,
-                ),
-            )
+            terminal_directories=terminal_directories,
+            namespace_entries=namespace_entries,
+            control_files=controls,
+            resume_unconsumed_progress=True,
+        )
         return
     raise AssertionError("unreachable pending terminal ticket version")
 
@@ -35820,6 +37409,10 @@ def _validate_pending_terminal_alias_ledger(
     require_complete_aliases: bool,
     namespace_entries: (
         tuple[PendingTerminalValidationNamespaceEntry, ...] | None
+    ) = None,
+    consumed_directory_slots: set[int] | frozenset[int] = frozenset(),
+    progress_directories: (
+        tuple[PendingTerminalValidationDirectory, ...] | None
     ) = None,
 ) -> None:
     """Bind remaining terminal aliases and their namespace to receipt authority."""
@@ -35864,6 +37457,18 @@ def _validate_pending_terminal_alias_ledger(
         path: (entry.parent_identity, entry.plan)
         for path, entry in current_namespace_by_path.items()
     }
+    if progress_directories is None:
+        progress_directories = _pending_terminal_directory_progress_directories(
+            terminal_directories,
+            namespace_entries or (),
+        )
+    for slot, directory in enumerate(progress_directories, start=1):
+        if slot in consumed_directory_slots and directory.path in current_by_path:
+            raise SyncError(
+                "pending terminal directory slot was already consumed but is "
+                "present again; manual recovery is required: "
+                f"{directory.path.as_posix()}"
+            )
     if namespace_entries is not None:
         expected_namespace_by_path = {
             entry.path: entry for entry in namespace_entries
@@ -36326,7 +37931,6 @@ def _pending_marker_only_live_control_paths(
 ) -> tuple[PurePosixPath, ...]:
     """Resolve the exact legacy marker-only control names before mutation."""
     paths = list(_pending_marker_only_control_paths(ticket))
-    metadata_path: PurePosixPath | None = None
     for candidate in (
         PurePosixPath(PENDING_LINK_METADATA_NAME),
         PurePosixPath("metadata.json"),
@@ -36341,10 +37945,7 @@ def _pending_marker_only_live_control_paths(
             )
             is not None
         ):
-            metadata_path = candidate
-            break
-    if metadata_path is not None:
-        paths.append(metadata_path)
+            paths.append(candidate)
     if (
         _read_pending_cleanup_logical_control_snapshot(
             home,
@@ -36423,6 +38024,7 @@ def _pending_cleanup_terminal_validation_payload(
         tuple[PendingTerminalValidationNamespaceEntry, ...] | None
     ) = None,
     control_files: tuple[PendingTerminalValidationControlFile, ...] = (),
+    directory_progress: PendingTerminalDirectoryProgressAuthority | None = None,
     legacy_generic_validation: LegacyGenericCleanupValidation | None = None,
     staging_marker_authority: (
         PendingTerminalValidationReceiptAuthority | None
@@ -36465,6 +38067,7 @@ def _pending_cleanup_terminal_validation_payload(
         or terminal_directories is not None
         or namespace_entries is not None
         or control_files
+        or directory_progress is not None
         or legacy_generic_validation is not None
     ):
         raise SyncError("pending staging cleanup has unsupported receipt authority")
@@ -36474,6 +38077,7 @@ def _pending_cleanup_terminal_validation_payload(
             or terminal_directories is not None
             or namespace_entries is not None
             or control_files
+            or directory_progress is not None
             or legacy_generic_validation is None
         ):
             raise SyncError("legacy generic cleanup validation lacks authority")
@@ -36494,11 +38098,19 @@ def _pending_cleanup_terminal_validation_payload(
             )
         if terminal_aliases is None or terminal_directories is None:
             raise SyncError("pending terminal alias receipt lacks namespace authority")
+        if namespace_entries is None and directory_progress is not None:
+            raise SyncError(
+                "pending terminal alias receipt has incomplete directory progress authority"
+            )
         payload: dict[str, object] = {
             "version": (
                 PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION
-                if namespace_entries is not None
-                else LEGACY_PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION
+                if directory_progress is not None
+                else (
+                    LEGACY_V4_PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION
+                    if namespace_entries is not None
+                    else LEGACY_PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION
+                )
             ),
             "phase": "terminal-validation",
             "batch": ticket.batch_root.name,
@@ -36523,6 +38135,12 @@ def _pending_cleanup_terminal_validation_payload(
         if control_files:
             payload["control_files"] = _pending_terminal_validation_control_files_payload(
                 control_files
+            )
+        if directory_progress is not None:
+            payload["directory_progress"] = (
+                _pending_terminal_directory_progress_authority_payload(
+                    directory_progress
+                )
             )
         return _bounded_json_document(
             payload,
@@ -36638,10 +38256,12 @@ def _publish_pending_cleanup_terminal_validation(
         tuple[PendingTerminalValidationNamespaceEntry, ...] | None
     ) = None,
     control_files: tuple[PendingTerminalValidationControlFile, ...] = (),
+    directory_progress: PendingTerminalDirectoryProgressAuthority | None = None,
     legacy_generic_validation: LegacyGenericCleanupValidation | None = None,
     staging_marker_authority: (
         PendingTerminalValidationReceiptAuthority | None
     ) = None,
+    resume_unconsumed_progress: bool = False,
 ) -> ManagedStateFileSnapshot:
     _require_pending_terminal_validation_control_set(ticket, control_files)
     if ticket.version == 3 and (
@@ -36659,6 +38279,7 @@ def _publish_pending_cleanup_terminal_validation(
             or terminal_directories is not None
             or namespace_entries is not None
             or control_files
+            or directory_progress is not None
         ):
             raise SyncError("legacy generic cleanup validation lacks authority")
     elif legacy_generic_validation is not None:
@@ -36668,6 +38289,7 @@ def _publish_pending_cleanup_terminal_validation(
         or terminal_directories is not None
         or namespace_entries is not None
         or control_files
+        or directory_progress is not None
         or legacy_generic_validation is not None
     ):
         raise SyncError("pending staging cleanup has unsupported receipt authority")
@@ -36690,6 +38312,7 @@ def _publish_pending_cleanup_terminal_validation(
         or terminal_directories is not None
         or namespace_entries is not None
         or control_files
+        or directory_progress is not None
     ):
         raise SyncError(
             "pending terminal alias receipt has unsupported ticket authority"
@@ -36725,11 +38348,17 @@ def _publish_pending_cleanup_terminal_validation(
                 quarantine_root_identity,
                 existing,
             )
+            if existing_authority is None or existing_authority.directory_progress is None:
+                raise SyncError(
+                    "pending terminal validation receipt lacks directory progress; "
+                    f"manual recovery is required: {ticket.batch_root.name}"
+                )
             expected_authority = PendingTerminalValidationAuthority(
                 aliases=terminal_aliases,
                 directories=terminal_directories,
                 namespace_entries=namespace_entries,
                 control_files=control_files,
+                directory_progress=existing_authority.directory_progress,
             )
             if existing_authority != expected_authority:
                 raise SyncError(
@@ -36737,6 +38366,119 @@ def _publish_pending_cleanup_terminal_validation(
                     f"{ticket.batch_root.name}"
                 )
         return existing
+    if ticket.terminal_regular_targets and namespace_entries is not None:
+        if directory_progress is not None:
+            raise SyncError(
+                "pending terminal directory progress cannot be adopted before receipt"
+            )
+        assert terminal_directories is not None
+        progress_path = _pending_cleanup_directory_progress_path(
+            home,
+            ticket.batch_root.name,
+        )
+        header = _pending_terminal_directory_progress_header_payload(
+            ticket,
+            quarantine_root_identity,
+            terminal_directories,
+            namespace_entries,
+        )
+        progress_snapshot = None
+        progress_is_temp = False
+        if resume_unconsumed_progress:
+            progress_snapshot = _read_unconsumed_pending_terminal_directory_progress(
+                home, ticket, header, allow_publication_temp=True,
+            )
+            if progress_snapshot is not None and (
+                ticket.terminal_namespace_sha256 is None
+                or ticket.pointer_retirement_path is None
+                or ticket.pointer_retirement_authority is None
+                or ticket.commit_evidence is None
+                or any(
+                    target.link_count is None
+                    for target in ticket.terminal_regular_targets
+                )
+            ):
+                raise SyncError(
+                    "pending terminal unconsumed progress lacks original ticket "
+                    "authority; manual recovery is required: "
+                    f"{ticket.batch_root.name}"
+                )
+        index_fd = _open_directory_beneath(home, progress_path.parent)
+        try:
+            if not _bound_directory_matches(home, progress_path.parent, index_fd):
+                raise SyncError("pending cleanup index changed before progress setup")
+            progress_names = _directory_member_names(
+                index_fd,
+                maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+                overflow_message="pending cleanup authority scan exceeds the size limit",
+            )
+            progress_temp_name = progress_path.name + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+            progress_is_temp = progress_snapshot is not None and progress_temp_name in progress_names
+            for name in progress_names:
+                if (
+                    _pending_cleanup_directory_progress_representation_batch_name(
+                        name
+                    )
+                    == ticket.batch_root.name
+                    and not (
+                        progress_snapshot is not None
+                        and name == (progress_temp_name if progress_is_temp else progress_path.name)
+                    )
+                ):
+                    raise SyncError(
+                        "pending terminal directory progress exists without its "
+                        "immutable receipt; manual recovery is required: "
+                        f"{ticket.batch_root.name}: {name}"
+                    )
+        finally:
+            _close_fd_quietly(index_fd)
+        if progress_is_temp:
+            assert progress_snapshot is not None
+            progress_snapshot = _promote_unconsumed_pending_terminal_directory_progress(
+                home, ticket, header, progress_snapshot,
+            )
+        elif progress_snapshot is None:
+            progress_snapshot = _publish_atomic_exclusive_internal_file(
+                home,
+                progress_path,
+                header,
+            )
+        else:
+            rebound = _read_unconsumed_pending_terminal_directory_progress(
+                home, ticket, header,
+            )
+            if rebound is None or not _managed_state_snapshot_matches_bound_file_evidence(
+                rebound, progress_snapshot,
+            ):
+                raise SyncError(
+                    "pending terminal directory progress changed before receipt: "
+                    f"{ticket.batch_root.name}"
+                )
+        if (
+            progress_snapshot.payload != header
+            or progress_snapshot.file_identity is None
+            or progress_snapshot.mode != 0o600
+            or progress_snapshot.uid != os.geteuid()
+            or progress_snapshot.gid is None
+            or progress_snapshot.link_count != 1
+            or not _managed_state_snapshot_has_complete_file_evidence(
+                progress_snapshot
+            )
+        ):
+            raise SyncError(
+                "pending terminal directory progress changed after publication: "
+                f"{ticket.batch_root.name}"
+            )
+        directory_progress = PendingTerminalDirectoryProgressAuthority(
+            path=PurePosixPath(progress_path.name),
+            file_identity=progress_snapshot.file_identity,
+            header_sha256=hashlib.sha256(header).hexdigest(),
+            header_size=len(header),
+            mode=progress_snapshot.mode,
+            uid=progress_snapshot.uid,
+            gid=progress_snapshot.gid,
+            link_count=progress_snapshot.link_count,
+        )
     receipt_path = _pending_cleanup_terminal_validation_path(
         home,
         ticket.batch_root.name,
@@ -36751,6 +38493,7 @@ def _publish_pending_cleanup_terminal_validation(
             terminal_directories=terminal_directories,
             namespace_entries=namespace_entries,
             control_files=control_files,
+            directory_progress=directory_progress,
             legacy_generic_validation=legacy_generic_validation,
             staging_marker_authority=staging_marker_authority,
         ),
@@ -36783,6 +38526,7 @@ def _publish_pending_cleanup_terminal_validation(
             directories=terminal_directories,
             namespace_entries=namespace_entries,
             control_files=control_files,
+            directory_progress=directory_progress,
         )
     ):
         raise SyncError(
@@ -36790,6 +38534,19 @@ def _publish_pending_cleanup_terminal_validation(
             "publication: "
             f"{ticket.batch_root.name}"
         )
+    if directory_progress is not None:
+        # No walker has run yet: the original candidate must still be the
+        # same header-only object, even if publication itself was interrupted.
+        rebound = _read_unconsumed_pending_terminal_directory_progress(
+            home, ticket, header,
+        )
+        if rebound is None or not _managed_state_snapshot_matches_bound_file_evidence(
+            rebound, progress_snapshot,
+        ):
+            raise SyncError(
+                "pending terminal directory progress changed during receipt "
+                f"publication: {ticket.batch_root.name}"
+            )
     if ticket.version == 3 and staging_marker_authority is not None:
         parsed = _parse_pending_terminal_validation_authority(
             home,
@@ -38106,6 +39863,7 @@ def _remove_pending_ephemeral_quarantine_leaf(
     quarantine_fd = -1
 
     def require_bound_parents() -> None:
+        _require_pending_cleanup_terminal_validation_family_safe(home, ticket)
         _require_managed_regular_parent_chain_access(
             home,
             target.parent,
@@ -38853,12 +40611,17 @@ def _remove_pending_ephemeral_quarantine_leaf(
         # unlink into an apparent initial public state. Keep both bound parent
         # descriptors live through receipt retirement and reprove every derived
         # public/private name at each mutation boundary.
-        _delete_pending_cleanup_ticket(home, ticket)
+        _delete_pending_cleanup_ticket(
+            home,
+            ticket,
+            boundary_revalidator=require_bound_parents,
+        )
 
         def require_terminal_receipt_boundary(
             _receipt_member: str,
             index_fd: int,
         ) -> None:
+            _require_pending_cleanup_terminal_validation_family_safe(home, ticket)
             _require_pending_ephemeral_terminal_names_absent(
                 home,
                 target,
@@ -38911,6 +40674,7 @@ def _remove_pending_ephemeral_quarantine_batch(
     joined_allocation = _read_joined_quarantine_allocation_for_cleanup(home, ticket)
 
     def require_allocation_join() -> None:
+        _require_pending_cleanup_terminal_validation_family_safe(home, ticket)
         _require_joined_quarantine_allocation_unchanged(
             home,
             ticket,
@@ -38971,14 +40735,21 @@ def _remove_pending_ephemeral_quarantine_batch(
         root_binding = current_batch_root_binding()
         if root_binding is None:
             proof_authority = current_empty_proof_authority()
-            _delete_pending_cleanup_ticket(home, ticket)
+            _delete_pending_cleanup_ticket(
+                home,
+                ticket,
+                boundary_revalidator=require_allocation_join,
+            )
             _delete_pending_cleanup_empty_proof(
                 home,
                 ticket,
                 quarantine_root_identity,
-                boundary_revalidator=lambda: _require_pending_cleanup_proof_batch_roots_absent(
-                    home,
-                    proof_authority,
+                boundary_revalidator=lambda: (
+                    require_allocation_join(),
+                    _require_pending_cleanup_proof_batch_roots_absent(
+                        home,
+                        proof_authority,
+                    ),
                 ),
             )
             require_allocation_join()
@@ -39332,14 +41103,21 @@ def _remove_pending_ephemeral_quarantine_batch(
         _close_fd_quietly(batch_fd)
         _close_fd_quietly(quarantine_fd)
     proof_authority = current_empty_proof_authority()
-    _delete_pending_cleanup_ticket(home, ticket)
+    _delete_pending_cleanup_ticket(
+        home,
+        ticket,
+        boundary_revalidator=require_allocation_join,
+    )
     _delete_pending_cleanup_empty_proof(
         home,
         ticket,
         quarantine_root_identity,
-        boundary_revalidator=lambda: _require_pending_cleanup_proof_batch_roots_absent(
-            home,
-            proof_authority,
+        boundary_revalidator=lambda: (
+            require_allocation_join(),
+            _require_pending_cleanup_proof_batch_roots_absent(
+                home,
+                proof_authority,
+            ),
         ),
     )
     require_allocation_join()
@@ -40151,6 +41929,7 @@ def _remove_cleanup_ready_batch(
     ):
         raise SyncError(f"pending cleanup ticket changed: {ticket.batch_root.name}")
     _require_pending_cleanup_ticket_link_authority(home, ticket)
+    _require_pending_cleanup_terminal_validation_family_safe(home, ticket)
     if ticket.version in {5, 7}:
         return _remove_pending_ephemeral_quarantine_batch(home, ticket)
     if ticket.version == 6:
@@ -40238,6 +42017,10 @@ def _remove_cleanup_ready_batch(
                             _receipt_member: str,
                             _index_fd: int,
                         ) -> None:
+                            _require_pending_cleanup_terminal_validation_family_safe(
+                                home,
+                                ticket,
+                            )
                             require_no_private_batch_root_residue()
 
                         _delete_pending_cleanup_terminal_validation(
@@ -40249,7 +42032,13 @@ def _remove_cleanup_ready_batch(
                         _delete_pending_cleanup_ticket(
                             home,
                             ticket,
-                            boundary_revalidator=require_no_private_batch_root_residue,
+                            boundary_revalidator=lambda: (
+                                _require_pending_cleanup_terminal_validation_family_safe(
+                                    home,
+                                    ticket,
+                                ),
+                                require_no_private_batch_root_residue(),
+                            ),
                         )
                         _delete_pending_cleanup_empty_proof(
                             home,
@@ -40273,8 +42062,23 @@ def _remove_cleanup_ready_batch(
                         home,
                         ticket,
                         quarantine_root_identity,
+                        mutation_revalidator=lambda _member, _fd: (
+                            _require_pending_cleanup_terminal_validation_family_safe(
+                                home,
+                                ticket,
+                            )
+                        ),
                     )
-                    _delete_pending_cleanup_ticket(home, ticket)
+                    _delete_pending_cleanup_ticket(
+                        home,
+                        ticket,
+                        boundary_revalidator=lambda: (
+                            _require_pending_cleanup_terminal_validation_family_safe(
+                                home,
+                                ticket,
+                            )
+                        ),
+                    )
                     proof_authority = _parse_pending_cleanup_empty_proof_authority(
                         _pending_cleanup_empty_proof_path(home, batch_name),
                         proof.payload,
@@ -40283,9 +42087,15 @@ def _remove_cleanup_ready_batch(
                         home,
                         ticket,
                         quarantine_root_identity,
-                        boundary_revalidator=lambda: _require_pending_cleanup_proof_batch_roots_absent(
-                            home,
-                            proof_authority,
+                        boundary_revalidator=lambda: (
+                            _require_pending_cleanup_terminal_validation_family_safe(
+                                home,
+                                ticket,
+                            ),
+                            _require_pending_cleanup_proof_batch_roots_absent(
+                                home,
+                                proof_authority,
+                            ),
                         ),
                     )
                 return True
@@ -40409,6 +42219,101 @@ def _remove_cleanup_ready_batch(
             bound_batch_root,
             expected_mode=0o700,
         )
+        early_terminal_authority: PendingTerminalValidationAuthority | None = None
+        early_directory_progress_state: PendingTerminalDirectoryProgressState | None = None
+        early_consumed_directory_paths: frozenset[PurePosixPath] = frozenset()
+        invocation_latest_progress_payload: list[bytes | None] = [None]
+        _require_pending_cleanup_terminal_validation_family_safe(home, ticket)
+        if ticket.version in {4, 8} and ticket.terminal_regular_targets:
+            early_receipt = _read_pending_cleanup_terminal_validation(
+                home,
+                ticket,
+                quarantine_root_identity,
+            )
+            if early_receipt is None:
+                index_root = _pending_cleanup_index_path(home)
+                index_fd = _open_directory_beneath(home, index_root)
+                try:
+                    progress_names = _pending_terminal_directory_progress_representations(
+                        index_fd, ticket.batch_root.name,
+                    )
+                    canonical_name = _pending_cleanup_directory_progress_path(
+                        home, ticket.batch_root.name,
+                    ).name
+                    if progress_names and progress_names not in {
+                        (canonical_name,),
+                        (canonical_name + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX,),
+                    }:
+                        raise SyncError(
+                            "pending terminal directory progress has ambiguous related "
+                            "representations; manual recovery is required: "
+                            f"{ticket.batch_root.name}: {progress_names}"
+                        )
+                    if progress_names and ticket.commit_evidence is None:
+                        raise SyncError(
+                            "pending terminal unconsumed progress lacks original "
+                            "ticket authority; manual recovery is required: "
+                            f"{ticket.batch_root.name}"
+                        )
+                    # A single canonical sidecar or exact publication temp
+                    # is only a candidate. The
+                    # ensure path must independently prove the entire original
+                    # ticket, namespace and controls before binding its header.
+                finally:
+                    _close_fd_quietly(index_fd)
+            else:
+                early_terminal_authority = (
+                    _parse_pending_terminal_validation_authority(
+                        home,
+                        ticket,
+                        quarantine_root_identity,
+                        early_receipt,
+                    )
+                )
+                if early_terminal_authority is None:
+                    raise SyncError(
+                        "legacy terminal validation receipt lacks namespace "
+                        "authority; manual recovery is required: "
+                        f"{ticket.batch_root.name}"
+                    )
+                if early_terminal_authority.namespace_entries is None:
+                    raise SyncError(
+                        "legacy terminal validation receipt lacks complete "
+                        "namespace authority; manual recovery is required: "
+                        f"{ticket.batch_root.name}"
+                    )
+                if early_terminal_authority.directory_progress is None:
+                    raise SyncError(
+                        "pending terminal validation receipt lacks cross-crash "
+                        "directory progress; manual recovery is required: "
+                        f"{ticket.batch_root.name}"
+                    )
+                early_directory_progress_state = (
+                    _read_pending_terminal_directory_progress(
+                        home,
+                        ticket,
+                        quarantine_root_identity,
+                        early_terminal_authority,
+                    )
+                )
+                assert early_directory_progress_state is not None
+                _require_pending_terminal_directory_progress_monotonic(
+                    ticket,
+                    invocation_latest_progress_payload,
+                    early_directory_progress_state,
+                )
+                _require_pending_terminal_consumed_directories_absent(
+                    ticket,
+                    batch_fd,
+                    early_terminal_authority,
+                    early_directory_progress_state,
+                )
+                early_consumed_directory_paths = (
+                    _pending_terminal_consumed_directory_paths(
+                        early_terminal_authority,
+                        early_directory_progress_state,
+                    )
+                )
         terminal_namespace_anchor_sha256 = (
             ticket.terminal_namespace_sha256
             if ticket.version
@@ -40647,25 +42552,57 @@ def _remove_cleanup_ready_batch(
                 ticket,
                 marker_only_validation_authority.namespace_entries,
             )
-            marker_only_expected_control_paths = frozenset(
-                _pending_marker_only_live_control_paths(
-                    home,
-                    bound_batch_root,
-                    batch_fd,
-                    ticket,
-                    entry_budget=cleanup_budget,
-                )
-            )
             marker_only_receipt_control_paths = frozenset(
                 path.path
                 for control in marker_only_validation_authority.control_files
                 for path in control.paths
             )
-            if marker_only_receipt_control_paths != marker_only_expected_control_paths:
+
+            def current_marker_only_live_control_paths() -> frozenset[PurePosixPath]:
+                live_paths = set(
+                    _pending_marker_only_live_control_paths(
+                        home,
+                        bound_batch_root,
+                        batch_fd,
+                        ticket,
+                        entry_budget=cleanup_budget,
+                    )
+                )
+                for marker_path in _pending_marker_only_control_paths(ticket):
+                    if (
+                        _read_pending_cleanup_logical_control_snapshot(
+                            home,
+                            bound_batch_root,
+                            batch_fd,
+                            marker_path,
+                            entry_budget=cleanup_budget,
+                        )
+                        is None
+                    ):
+                        live_paths.discard(marker_path)
+                return frozenset(live_paths)
+
+            marker_only_initial_live_control_paths = (
+                current_marker_only_live_control_paths()
+            )
+            if not marker_only_initial_live_control_paths.issubset(
+                marker_only_receipt_control_paths
+            ):
+                unreceipted_control_paths = sorted(
+                    path.as_posix()
+                    for path in (
+                        marker_only_initial_live_control_paths
+                        - marker_only_receipt_control_paths
+                    )
+                )
                 raise SyncError(
                     "legacy marker-only v4 validation control namespace changed: "
-                    f"{ticket.batch_root.name}"
+                    f"{ticket.batch_root.name}: "
+                    f"unreceipted={unreceipted_control_paths}"
                 )
+            marker_only_latest_live_control_paths = (
+                marker_only_initial_live_control_paths
+            )
             marker_only_receipt_authority = (
                 _pending_terminal_validation_receipt_authority_from_snapshot(
                     marker_only_receipt,
@@ -40677,6 +42614,7 @@ def _remove_cleanup_ready_batch(
                 _logical_path: PurePosixPath,
                 _stage: str,
             ) -> None:
+                nonlocal marker_only_latest_live_control_paths
                 _require_pending_cleanup_ticket_unchanged(home, ticket)
                 current_receipt = _read_pending_cleanup_terminal_validation(
                     home,
@@ -40716,7 +42654,17 @@ def _remove_cleanup_ready_batch(
                     for control in current_authority.control_files
                     for path in control.paths
                 )
-                if not current_control_paths <= marker_only_expected_control_paths:
+                if current_control_paths != marker_only_receipt_control_paths:
+                    raise SyncError(
+                        "legacy marker-only v4 validation control authority changed "
+                        f"before cleanup: {ticket.batch_root.name}"
+                    )
+                current_live_control_paths = (
+                    current_marker_only_live_control_paths()
+                )
+                if not current_live_control_paths.issubset(
+                    marker_only_latest_live_control_paths
+                ):
                     raise SyncError(
                         "legacy marker-only v4 validation control namespace "
                         f"expanded before cleanup: {ticket.batch_root.name}"
@@ -40750,6 +42698,7 @@ def _remove_cleanup_ready_batch(
                     require_complete_aliases=False,
                     namespace_entries=marker_only_validation_authority.namespace_entries,
                 )
+                marker_only_latest_live_control_paths = current_live_control_paths
 
             legacy_mutation_revalidator = revalidate_marker_only_controls
         if ticket.version == 3:
@@ -40857,8 +42806,10 @@ def _remove_cleanup_ready_batch(
                     skipped_names=frozenset(),
                     name_validator=_pending_batch_cleanup_name_is_authorized,
                     directory_expected_mode=0o700,
+                    consumed_directory_paths=early_consumed_directory_paths,
                 )
         terminal_alias_paths: frozenset[PurePosixPath] = frozenset()
+        terminal_progress_cursor: PendingTerminalDirectoryProgressCursor | None = None
         if ticket.version in {
             LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
             PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
@@ -40942,6 +42893,36 @@ def _remove_cleanup_ready_batch(
                     "manual recovery is required: "
                     f"{ticket.batch_root.name}"
                 )
+            if terminal_authority.directory_progress is None:
+                raise SyncError(
+                    "pending terminal validation receipt lacks cross-crash "
+                    "directory progress; manual recovery is required: "
+                    f"{ticket.batch_root.name}"
+                )
+            terminal_progress_state = _read_pending_terminal_directory_progress(
+                home,
+                ticket,
+                quarantine_root_identity,
+                terminal_authority,
+            )
+            assert terminal_progress_state is not None
+            _require_pending_terminal_directory_progress_monotonic(
+                ticket,
+                invocation_latest_progress_payload,
+                terminal_progress_state,
+            )
+            terminal_progress_cursor = (
+                _pending_terminal_directory_progress_cursor_from_state(
+                    terminal_authority,
+                    terminal_progress_state,
+                )
+            )
+            _require_pending_terminal_consumed_directories_absent(
+                ticket,
+                batch_fd,
+                terminal_authority,
+                terminal_progress_cursor,
+            )
             _validate_pending_terminal_alias_ledger(
                 home,
                 ticket,
@@ -40950,6 +42931,8 @@ def _remove_cleanup_ready_batch(
                 terminal_authority.directories,
                 require_complete_aliases=False,
                 namespace_entries=terminal_authority.namespace_entries,
+                consumed_directory_slots=terminal_progress_cursor.consumed_slots,
+                progress_directories=terminal_progress_cursor.directories,
             )
             terminal_alias_paths = frozenset(
                 alias.path for alias in terminal_authority.aliases
@@ -41073,6 +43056,31 @@ def _remove_cleanup_ready_batch(
                         "pending terminal validation namespace authority changed "
                         f"before cleanup: {ticket.batch_root.name}"
                     )
+                if current_authority != terminal_authority:
+                    raise SyncError(
+                        "pending terminal validation authority changed before "
+                        f"cleanup: {ticket.batch_root.name}"
+                    )
+                if terminal_progress_cursor is None:
+                    raise SyncError(
+                        "pending terminal directory progress cursor is missing: "
+                        f"{ticket.batch_root.name}"
+                    )
+                current_progress_cursor = (
+                    _require_pending_terminal_directory_progress_cursor_current(
+                        home,
+                        ticket,
+                        quarantine_root_identity,
+                        current_authority,
+                        terminal_progress_cursor,
+                    )
+                )
+                _require_pending_terminal_consumed_directories_absent(
+                    ticket,
+                    batch_fd,
+                    current_authority,
+                    current_progress_cursor,
+                )
                 current_budget = cleanup_budget
                 current_ledger: PendingCleanupIdentityLedger = {}
                 _capture_pending_cleanup_identity_ledger(
@@ -41086,6 +43094,12 @@ def _remove_cleanup_ready_batch(
                     skipped_names=frozenset(),
                     name_validator=_pending_batch_cleanup_name_is_authorized,
                     directory_expected_mode=0o700,
+                    consumed_directory_paths=(
+                        _pending_terminal_consumed_directory_paths(
+                            current_authority,
+                            current_progress_cursor,
+                        )
+                    ),
                 )
                 _validate_pending_terminal_alias_ledger(
                     home,
@@ -41095,6 +43109,8 @@ def _remove_cleanup_ready_batch(
                     current_authority.directories,
                     require_complete_aliases=False,
                     namespace_entries=current_authority.namespace_entries,
+                    consumed_directory_slots=current_progress_cursor.consumed_slots,
+                    progress_directories=current_progress_cursor.directories,
                 )
                 _require_pending_terminal_validation_control_files(
                     home,
@@ -41105,6 +43121,60 @@ def _remove_cleanup_ready_batch(
                 )
 
             mutation_revalidator = revalidate_terminal_alias_boundary
+            invocation_consumed_directory_slots: set[int] = set()
+
+            def consume_terminal_directory_slot(
+                _logical_path: PurePosixPath,
+                ledger_path: PurePosixPath,
+                child_fd: int,
+            ) -> None:
+                _require_pending_cleanup_ticket_unchanged(home, ticket)
+                current_receipt = _read_pending_cleanup_terminal_validation(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                )
+                if current_receipt is None:
+                    raise SyncError(
+                        "pending terminal validation receipt disappeared before "
+                        f"directory removal: {ticket.batch_root.name}"
+                    )
+                current_authority = _parse_pending_terminal_validation_authority(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                    current_receipt,
+                )
+                if current_authority != terminal_authority:
+                    raise SyncError(
+                        "pending terminal validation authority changed before "
+                        f"directory removal: {ticket.batch_root.name}"
+                    )
+                _append_pending_terminal_directory_consumption(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                    current_authority,
+                    ledger_path,
+                    child_fd,
+                    invocation_consumed_directory_slots,
+                    terminal_progress_cursor,
+                )
+
+            directory_consumption_callback = consume_terminal_directory_slot
+        else:
+            directory_consumption_callback = None
+        prior_mutation_revalidator = mutation_revalidator
+
+        def revalidate_receipt_family_before_mutation(
+            logical_path: PurePosixPath,
+            stage: str,
+        ) -> None:
+            _require_pending_cleanup_terminal_validation_family_safe(home, ticket)
+            if prior_mutation_revalidator is not None:
+                prior_mutation_revalidator(logical_path, stage)
+
+        mutation_revalidator = revalidate_receipt_family_before_mutation
         _remove_pending_batch_directory_contents(
             batch_fd,
             ticket.batch_root_identity,
@@ -41114,11 +43184,38 @@ def _remove_cleanup_ready_batch(
             identity_ledger=identity_ledger,
             name_validator=_pending_batch_cleanup_name_is_authorized,
             mutation_revalidator=mutation_revalidator,
+            directory_consumption_callback=directory_consumption_callback,
         )
+        if ticket.version in {4, 8} and ticket.terminal_regular_targets:
+            progress_after_walk = _read_pending_terminal_directory_progress(
+                home,
+                ticket,
+                quarantine_root_identity,
+                terminal_authority,
+            )
+            progress_directories = _pending_terminal_directory_progress_directories(
+                terminal_authority.directories,
+                terminal_authority.namespace_entries or (),
+            )
+            if (
+                terminal_progress_cursor is None
+                or progress_after_walk is None
+                or progress_after_walk.consumed_slots
+                != frozenset(range(1, len(progress_directories) + 1))
+                or progress_after_walk.consumed_slots
+                != terminal_progress_cursor.consumed_slots
+                or progress_after_walk.snapshot.payload
+                != terminal_progress_cursor.expected_payload
+            ):
+                raise SyncError(
+                    "pending terminal directory progress is incomplete after "
+                    f"cleanup: {ticket.batch_root.name}"
+                )
         with os.scandir(batch_fd) as iterator:
             if next(iterator, None) is not None:
                 raise SyncError(f"pending cleanup batch is not empty: {batch_name}")
         if bound_batch_root == ticket.batch_root:
+            _require_pending_cleanup_terminal_validation_family_safe(home, ticket)
             _rename_noreplace_at(
                 quarantine_fd,
                 batch_name,
@@ -41178,6 +43275,7 @@ def _remove_cleanup_ready_batch(
         )
 
         def require_terminal_batch_rmdir_boundary() -> None:
+            _require_pending_cleanup_terminal_validation_family_safe(home, ticket)
             _require_pending_cleanup_ticket_unchanged(home, ticket)
             if ticket.version == 3:
                 revalidate_staging_marker(
@@ -41220,6 +43318,48 @@ def _remove_cleanup_ready_batch(
                     f"empty proof: {batch_name}"
                 )
             _verify_final_regular_targets(home, ticket)
+            if ticket.version in {4, 8} and ticket.terminal_regular_targets:
+                _append_pending_terminal_directory_consumption(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                    terminal_authority,
+                    PurePosixPath(),
+                    batch_fd,
+                    invocation_consumed_directory_slots,
+                    terminal_progress_cursor,
+                )
+                progress_after_root_intent = (
+                    _read_pending_terminal_directory_progress(
+                        home,
+                        ticket,
+                        quarantine_root_identity,
+                        terminal_authority,
+                    )
+                )
+                if (
+                    terminal_progress_cursor is None
+                    or progress_after_root_intent is None
+                    or progress_after_root_intent.snapshot.payload
+                    != terminal_progress_cursor.expected_payload
+                    or progress_after_root_intent.consumed_slots
+                    != terminal_progress_cursor.consumed_slots
+                    or 0 not in progress_after_root_intent.consumed_slots
+                ):
+                    raise SyncError(
+                        "pending terminal batch-root progress intent did not "
+                        f"persist: {ticket.batch_root.name}"
+                    )
+                if (
+                    _directory_identity(batch_fd) != ticket.batch_root_identity
+                    or _named_entry_identity(quarantine_fd, isolated_name)
+                    != ticket.batch_root_identity
+                    or not _bound_directory_matches(home, bound_batch_root, batch_fd)
+                ):
+                    raise SyncError(
+                        f"pending cleanup batch root changed: {batch_name}"
+                    )
+                _verify_final_regular_targets(home, ticket)
 
         _rmdir_bound_empty_pending_cleanup_directory(
             home,
@@ -41252,19 +43392,37 @@ def _remove_cleanup_ready_batch(
             home,
             ticket,
             quarantine_root_identity,
+            mutation_revalidator=lambda _member, _fd: (
+                _require_pending_cleanup_terminal_validation_family_safe(
+                    home,
+                    ticket,
+                )
+            ),
         )
         _delete_pending_cleanup_ticket(
             home,
             ticket,
+            boundary_revalidator=lambda: (
+                _require_pending_cleanup_terminal_validation_family_safe(
+                    home,
+                    ticket,
+                )
+            ),
         )
         _delete_pending_cleanup_empty_proof(
             home,
             ticket,
             quarantine_root_identity,
             allow_consumed_marker_only_receipt=True,
-            boundary_revalidator=lambda: _require_pending_cleanup_proof_batch_roots_absent(
-                home,
-                expected_proof_authority,
+            boundary_revalidator=lambda: (
+                _require_pending_cleanup_terminal_validation_family_safe(
+                    home,
+                    ticket,
+                ),
+                _require_pending_cleanup_proof_batch_roots_absent(
+                    home,
+                    expected_proof_authority,
+                ),
             ),
         )
     return True
@@ -41402,6 +43560,7 @@ def _delete_pending_cleanup_terminal_retirement(
     try:
 
         def require_final_retirement_boundary(_member: str) -> None:
+            _require_pending_cleanup_terminal_validation_family_safe(home, ticket)
             _verify_final_regular_target_group(
                 home,
                 ticket.terminal_regular_targets,
@@ -41479,6 +43638,7 @@ def _retire_terminal_regular_cleanup_controls(
     """
     if ticket.version not in {4, 8}:
         raise ValueError("terminal regular control retirement requires v4 or v8")
+    _require_pending_cleanup_terminal_validation_family_safe(home, ticket)
 
     base_proof_authority = _pending_cleanup_empty_proof_authority_from_ticket(
         ticket,
@@ -41494,9 +43654,11 @@ def _retire_terminal_regular_cleanup_controls(
     )
     retirement_control_snapshot: ManagedStateFileSnapshot | None = None
     receipt_authority: PendingTerminalValidationReceiptAuthority | None = None
+    directory_progress_retired = False
 
     def require_current_v3_proof_and_final_group() -> None:
         nonlocal expected_proof_authority, receipt_authority
+        _require_pending_cleanup_terminal_validation_family_safe(home, ticket)
         proof = _read_pending_cleanup_empty_proof(
             home,
             ticket,
@@ -41735,6 +43897,7 @@ def _retire_terminal_regular_cleanup_controls(
             receipt_path,
             expected_link_count=1,
         )
+        _require_pending_cleanup_terminal_validation_family_safe(home, ticket)
         index_fd = _open_directory_beneath(home, receipt_path.parent)
         try:
             try:
@@ -41797,6 +43960,109 @@ def _retire_terminal_regular_cleanup_controls(
                 f"{ticket.batch_root.name}"
             )
 
+    if ticket.terminal_regular_targets:
+        source_receipt = canonical_receipt or retired_receipt
+        if source_receipt is not None:
+            source_receipt_path = (
+                receipt_path if canonical_receipt is not None else retirement_path
+            )
+            terminal_authority = require_terminal_receipt_retirement_authority(
+                source_receipt_path,
+                expected_link_count=source_receipt.link_count,
+            )
+
+            def final_directory_progress_retirement_boundary() -> None:
+                ticket_link_count = _require_pending_cleanup_ticket_link_authority(
+                    home,
+                    ticket,
+                )
+                current_ticket = _read_pending_cleanup_ticket(
+                    home,
+                    ticket.path,
+                    expected_ticket_identity=ticket.snapshot.file_identity,
+                    expected_link_count=ticket_link_count,
+                )
+                if current_ticket is None or not _pending_cleanup_ticket_matches(
+                    current_ticket,
+                    ticket,
+                ):
+                    raise SyncError(
+                        "pending cleanup ticket changed before directory progress "
+                        f"retirement: {ticket.batch_root.name}"
+                    )
+                current_authority = require_terminal_receipt_retirement_authority(
+                    source_receipt_path,
+                    expected_link_count=source_receipt.link_count,
+                )
+                if current_authority != terminal_authority:
+                    raise SyncError(
+                        "pending terminal validation receipt changed before "
+                        "directory progress retirement; manual recovery is "
+                        f"required: {ticket.batch_root.name}"
+                    )
+                require_current_v3_proof_and_final_group()
+                if terminal_authority.directory_progress is not None:
+                    # A live v5 progress log is retired before any of its
+                    # receipt/ticket/proof authorities.  Missing proof at this
+                    # point is an ambiguous interrupted state, not permission
+                    # to discard the append-only history.
+                    current_proof = _read_pending_cleanup_empty_proof(
+                        home,
+                        ticket,
+                        quarantine_root_identity,
+                    )
+                    if current_proof is None:
+                        raise SyncError(
+                            "pending terminal directory progress cannot be retired "
+                            "without its empty proof; manual recovery is required: "
+                            f"{ticket.batch_root.name}"
+                        )
+                    current_proof_authority = _parse_pending_cleanup_empty_proof_authority(
+                        _pending_cleanup_empty_proof_path(
+                            home,
+                            ticket.batch_root.name,
+                        ),
+                        current_proof.payload,
+                    )
+                    _require_pending_cleanup_proof_batch_roots_absent(
+                        home,
+                        current_proof_authority,
+                    )
+                _verify_final_regular_target_group(
+                    home,
+                    ticket.terminal_regular_targets,
+                )
+
+            _retire_pending_terminal_directory_progress(
+                home,
+                ticket,
+                quarantine_root_identity,
+                terminal_authority,
+                final_boundary=final_directory_progress_retirement_boundary,
+            )
+        else:
+            # If both receipt names are already absent, the preceding
+            # authority-backed phase must also have removed the sidecar.
+            # Never accept a progress-only representation independently.
+            _require_pending_terminal_directory_progress_representations_absent(
+                home,
+                ticket.batch_root.name,
+            )
+        directory_progress_retired = True
+
+    def require_directory_progress_retired() -> None:
+        if not ticket.terminal_regular_targets:
+            return
+        if not directory_progress_retired:
+            raise SyncError(
+                "pending terminal directory progress was not retired before its "
+                f"receipt: {ticket.batch_root.name}"
+            )
+        _require_pending_terminal_directory_progress_representations_absent(
+            home,
+            ticket.batch_root.name,
+        )
+
     def require_ticket_proof_and_final_group() -> None:
         _verify_final_regular_targets(home, ticket)
         require_current_v3_proof_and_final_group()
@@ -41857,7 +44123,9 @@ def _retire_terminal_regular_cleanup_controls(
         _receipt_member: str,
         _index_fd: int,
     ) -> None:
+        _require_pending_cleanup_terminal_validation_family_safe(home, ticket)
         require_ticket_proof_and_final_group()
+        require_directory_progress_retired()
         # The generic isolation helper invokes this callback before the
         # canonical-to-tombstone rename and again while the retained tombstone
         # is still open.  In both phases the tombstone and retirement marker
@@ -41892,9 +44160,11 @@ def _retire_terminal_regular_cleanup_controls(
         # is re-read at both mutation boundaries because it becomes the only
         # durable target-group authority when that canonical name disappears.
         boundary_revalidator=lambda: (
+            _require_pending_cleanup_terminal_validation_family_safe(home, ticket),
             require_current_v3_proof_and_final_group(),
             require_retirement_marker_if_present(),
             require_retirement_control(2),
+            require_directory_progress_retired(),
         ),
     )
     if (
@@ -41917,8 +44187,10 @@ def _retire_terminal_regular_cleanup_controls(
             _receipt_member: str,
             _index_fd: int,
         ) -> None:
+            _require_pending_cleanup_terminal_validation_family_safe(home, ticket)
             require_current_v3_proof_and_final_group()
             require_retirement_control(1)
+            require_directory_progress_retired()
 
         _delete_pending_cleanup_terminal_validation(
             home,
@@ -41943,12 +44215,14 @@ def _retire_terminal_regular_cleanup_controls(
     ):
 
         def require_proof_retirement_boundary() -> None:
+            _require_pending_cleanup_terminal_validation_family_safe(home, ticket)
             require_current_v3_proof_and_final_group()
             _require_pending_cleanup_proof_batch_roots_absent(
                 home,
                 expected_proof_authority,
             )
             require_retirement_control(1)
+            require_directory_progress_retired()
             marker = _read_pending_cleanup_terminal_validation(
                 home,
                 ticket,
@@ -41984,12 +44258,14 @@ def _retire_terminal_regular_cleanup_controls(
                 remaining_proof.payload,
             )
             if remaining_authority == compatible_v2_authority:
+                _require_pending_cleanup_terminal_validation_family_safe(home, ticket)
                 _delete_pending_cleanup_terminal_retirement(
                     home,
                     ticket,
                     allow_remaining_proof=True,
                 )
             return
+    _require_pending_cleanup_terminal_validation_family_safe(home, ticket)
     _delete_pending_cleanup_terminal_retirement(home, ticket)
 
 
@@ -42159,7 +44435,46 @@ def _pending_cleanup_ticket_representation_batch_name(name: str) -> str | None:
     if marker_index <= 0:
         marker_index = candidate.find(PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX)
         if marker_index <= 0:
+            marker_index = candidate.find(PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX)
+        if marker_index <= 0:
             return None
+    batch_name = candidate[:marker_index]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        return None
+    return batch_name
+
+
+def _pending_cleanup_directory_progress_representation_batch_name(
+    name: str,
+) -> str | None:
+    candidate = name
+    if candidate.startswith(PENDING_CLEANUP_RETAINED_PREFIX):
+        candidate = candidate[len(PENDING_CLEANUP_RETAINED_PREFIX) :]
+    marker_index = candidate.find(PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX)
+    if marker_index <= 0:
+        return None
+    batch_name = candidate[:marker_index]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        return None
+    return batch_name
+
+
+def _pending_cleanup_terminal_validation_representation_batch_name(
+    name: str,
+) -> str | None:
+    """Recognize receipt-derived ambiguity without authorizing its bytes."""
+    candidate = name
+    if candidate.startswith(PENDING_CLEANUP_RETAINED_PREFIX):
+        candidate = candidate[len(PENDING_CLEANUP_RETAINED_PREFIX) :]
+    marker_index = candidate.find(PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX)
+    if marker_index <= 0:
+        return None
     batch_name = candidate[:marker_index]
     if (
         len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
@@ -42331,22 +44646,43 @@ def _pending_cleanup_unresolved_ticket_representation(
     """
     batch_name = _pending_cleanup_ticket_representation_batch_name(name)
     if batch_name is None:
+        batch_name = _pending_cleanup_terminal_validation_representation_batch_name(name)
+    if batch_name is None:
         return None
     canonical_ticket_name = batch_name + PENDING_CLEANUP_TICKET_SUFFIX
     canonical_retirement_name = (
         batch_name + PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX
     )
+    canonical_progress_name = (
+        batch_name + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+    )
+    canonical_receipt_name = batch_name + PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX
+    receipt_temporary_name = canonical_receipt_name + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+    receipt_retirement_name = (
+        batch_name + PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX
+    )
     if name in {
         canonical_ticket_name,
         batch_name + PENDING_CLEANUP_TICKET_TEMP_SUFFIX,
         canonical_retirement_name,
+        canonical_receipt_name,
+        receipt_temporary_name,
+        receipt_retirement_name,
     }:
+        return None
+    if name == canonical_progress_name:
+        return None
+    progress_retained = _pending_cleanup_retained_canonical_name(name)
+    if progress_retained in {canonical_progress_name, receipt_temporary_name}:
         return None
     retained_control = _pending_cleanup_retained_control_name(name)
     if (
         retained_control is not None
         and retained_control[1] == batch_name
-        and retained_control[0] in {canonical_ticket_name, canonical_retirement_name}
+        and retained_control[0] in {
+            canonical_ticket_name, canonical_retirement_name,
+            canonical_receipt_name, receipt_retirement_name,
+        }
     ):
         return None
     retained_temp = _pending_cleanup_retained_ticket_temp_name(name)
@@ -42357,6 +44693,8 @@ def _pending_cleanup_unresolved_ticket_representation(
 
 def _pending_cleanup_unresolved_ticket_representation_issue(
     home: Path,
+    *,
+    read_only_publication_batches: frozenset[str] = frozenset(),
 ) -> tuple[str, str] | None:
     """Observe blocking ticket residue without granting it any authority."""
     index_root = _pending_cleanup_index_path(home)
@@ -42372,10 +44710,59 @@ def _pending_cleanup_unresolved_ticket_representation_issue(
             maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
             overflow_message="pending cleanup authority scan exceeds the size limit",
         )
+        names_set = set(names)
+        if read_only_publication_batches:
+            observed_names: dict[str, list[str]] = {}
+            for name in names:
+                batch = _pending_cleanup_directory_progress_representation_batch_name(name)
+                if batch in read_only_publication_batches:
+                    observed_names.setdefault(batch, []).append(name)
+            for batch in read_only_publication_batches:
+                canonical = batch + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                if observed_names.get(batch) not in (
+                    [canonical], [canonical + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX],
+                ):
+                    raise SyncError("progress publication changed during read-only observation")
         for name in names:
             unresolved = _pending_cleanup_unresolved_ticket_representation(name)
             if unresolved is not None:
+                batch, _representation = unresolved
+                if batch in read_only_publication_batches and name == (
+                    batch + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                    + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+                ):
+                    continue
                 return unresolved
+        retained_by_name = {}
+        for name in names:
+            canonical = _pending_cleanup_retained_canonical_name(name)
+            if canonical is not None:
+                retained_by_name[name] = canonical
+        retained_canonicals = set(retained_by_name.values())
+        for name in names:
+            batch_name = (
+                _pending_cleanup_directory_progress_representation_batch_name(name)
+            )
+            if batch_name is None:
+                continue
+            progress_name = batch_name + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+            if (
+                name != progress_name
+                and retained_by_name.get(name) != progress_name
+            ):
+                continue
+            ticket_name = batch_name + PENDING_CLEANUP_TICKET_SUFFIX
+            receipt_name = batch_name + PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX
+            if (
+                batch_name in read_only_publication_batches
+                and name == progress_name and ticket_name in names_set
+            ):
+                continue
+            if (
+                ticket_name not in names_set
+                and ticket_name not in retained_canonicals
+            ) or receipt_name not in names_set:
+                return batch_name, name
         return None
     finally:
         _close_fd_quietly(index_fd)
@@ -42391,8 +44778,251 @@ def _pending_cleanup_unresolved_ticket_representation_error(
     )
 
 
-def _require_no_pending_unresolved_ticket_representations(home: Path) -> None:
-    unresolved = _pending_cleanup_unresolved_ticket_representation_issue(home)
+def _require_pending_cleanup_terminal_validation_family_safe(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+) -> None:
+    """Fence all same-batch control families before destructive cleanup.
+
+    Broad ticket, progress and receipt classifiers are negative evidence only.
+    Reuse one bounded inventory so unsupported or ambiguous descendants cannot
+    survive retirement of their original ticket or batch. Exact protocol-owned
+    names remain candidates for existing bound parsers and recovery, never
+    authority by filename alone. v5/v7 have no receipt protocol; only terminal
+    regular v4/v8 tickets have a directory-progress protocol.
+    """
+    index_root = _pending_cleanup_index_path(home)
+    index_fd = _open_directory_beneath(home, index_root)
+    try:
+        _require_pending_cleanup_fd_access_policy(
+            index_fd,
+            index_root,
+            expected_mode=0o700,
+        )
+        if not _bound_directory_matches(home, index_root, index_fd):
+            raise SyncError("pending cleanup index changed during control-family scan")
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending cleanup authority scan exceeds the size limit",
+        )
+        batch_name = ticket.batch_root.name
+        for name in names:
+            receipt_member = (
+                _pending_cleanup_terminal_validation_representation_batch_name(name)
+                == batch_name
+            )
+            if not receipt_member and (
+                _pending_cleanup_ticket_representation_batch_name(name) != batch_name
+            ):
+                continue
+            if receipt_member and ticket.version not in {1, 2, 3, 4, 6, 8}:
+                raise SyncError(
+                    "pending ephemeral cleanup has no terminal-validation "
+                    f"recovery protocol; manual recovery is required: "
+                    f"{batch_name}: {name}"
+                )
+            receipt_retirement_name = (
+                batch_name + PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX
+            )
+            if (
+                name == receipt_retirement_name
+                or _pending_cleanup_retained_canonical_name(name)
+                == receipt_retirement_name
+            ) and not (
+                ticket.version in {4, 8}
+                and ticket.terminal_regular_targets
+            ):
+                raise SyncError(
+                    "pending terminal-validation retirement has no recovery "
+                    f"protocol for this ticket; manual recovery is required: "
+                    f"{batch_name}: {name}"
+                )
+            if (
+                _pending_cleanup_directory_progress_representation_batch_name(name)
+                == batch_name
+            ):
+                if not (ticket.version in {4, 8} and ticket.terminal_regular_targets):
+                    raise SyncError(
+                        "pending directory progress has no recovery protocol for "
+                        f"this ticket; manual recovery is required: {batch_name}: {name}"
+                    )
+                if name == (
+                    batch_name + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                    + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+                ):
+                    # Preserve the exact publication candidate. The existing
+                    # recovery path must independently prove the original
+                    # ticket, namespace, controls and unconsumed header before
+                    # promotion; this observational fence grants no authority.
+                    continue
+            unresolved = _pending_cleanup_unresolved_ticket_representation(name)
+            if unresolved is not None:
+                raise _pending_cleanup_unresolved_ticket_representation_error(
+                    unresolved
+                )
+        _require_pending_cleanup_fd_access_policy(
+            index_fd,
+            index_root,
+            expected_mode=0o700,
+        )
+        if not _bound_directory_matches(home, index_root, index_fd):
+            raise SyncError("pending cleanup index changed during control-family scan")
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _unconsumed_pending_terminal_progress_publication_candidates(
+    home: Path,
+) -> tuple[str, ...]:
+    """Bound candidate discovery; names alone grant no recovery authority."""
+    if not _pending_link_pointer_is_absent(home):
+        return ()
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return ()
+    try:
+        if not _bound_directory_matches(home, index_root, index_fd):
+            raise SyncError("pending cleanup index changed before progress recovery")
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending cleanup authority scan exceeds the size limit",
+        )
+        progress_names: dict[str, list[str]] = {}
+        for name in names:
+            progress_batch = _pending_cleanup_directory_progress_representation_batch_name(name)
+            if progress_batch is not None:
+                progress_names.setdefault(progress_batch, []).append(name)
+            unresolved = _pending_cleanup_unresolved_ticket_representation(name)
+            if unresolved is not None:
+                if progress_batch is None or name != (
+                    progress_batch + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                    + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+                ):
+                    return ()
+        names_set = set(names)
+        candidates = []
+        for name in names:
+            batch_name = _pending_cleanup_directory_progress_representation_batch_name(name)
+            if batch_name is None:
+                continue
+            if (
+                name not in {
+                    batch_name + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX,
+                    batch_name + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                    + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX,
+                }
+                or batch_name + PENDING_CLEANUP_TICKET_SUFFIX not in names_set
+                or any(
+                    batch_name + suffix in names_set
+                    for suffix in (
+                        PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
+                        PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX,
+                        PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
+                        PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX,
+                    )
+                )
+                or progress_names[batch_name] != [name]
+            ):
+                continue
+            candidates.append(batch_name)
+    finally:
+        _close_fd_quietly(index_fd)
+    return tuple(candidates)
+
+
+def _observe_unconsumed_pending_terminal_progress_publications(
+    home: Path,
+) -> frozenset[str]:
+    """Validate original header-only publications without creating or deleting."""
+    observed = set()
+    budget = PendingCleanupActionBudget(MAX_PENDING_CLEANUP_BATCHES_PER_RUN)
+    index_root = _pending_cleanup_index_path(home)
+    for batch_name in _unconsumed_pending_terminal_progress_publication_candidates(home):
+        if not budget.charge_batch(batch_name):
+            break
+        ticket = _read_pending_cleanup_ticket(
+            home, index_root / (batch_name + PENDING_CLEANUP_TICKET_SUFFIX),
+            expected_link_count=1,
+        )
+        if ticket is None or ticket.version not in {4, 8} or not ticket.terminal_regular_targets:
+            continue
+        _require_pending_cleanup_ticket_link_authority(home, ticket)
+        _require_pending_cleanup_terminal_validation_family_safe(home, ticket)
+        quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
+        quarantine_fd = _open_directory_beneath(home, quarantine_root)
+        batch_fd = -1
+        try:
+            _require_pending_cleanup_fd_access_policy(
+                quarantine_fd, quarantine_root, expected_mode=0o700,
+            )
+            quarantine_identity = _directory_identity(quarantine_fd)
+            if (
+                not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+                or (ticket.quarantine_root_identity is not None
+                    and quarantine_identity != ticket.quarantine_root_identity)
+            ):
+                raise SyncError("pending cleanup quarantine root changed during observation")
+            batch_fd = _open_directory_beneath(home, ticket.batch_root)
+            _require_pending_cleanup_fd_access_policy(
+                batch_fd, ticket.batch_root, expected_mode=0o700,
+            )
+            if (
+                _directory_identity(batch_fd) != ticket.batch_root_identity
+                or not _bound_directory_matches(home, ticket.batch_root, batch_fd)
+            ):
+                raise SyncError("pending cleanup batch changed during observation")
+            _ensure_pending_terminal_validation_receipt(
+                home, ticket, ticket.batch_root, batch_fd, quarantine_identity,
+                namespace_anchor_sha256=ticket.terminal_namespace_sha256,
+                entry_budget=[MAX_PENDING_CLEANUP_ENTRIES],
+                observe_unconsumed_progress=True,
+            )
+            _require_pending_cleanup_ticket_unchanged(home, ticket)
+            observed.add(batch_name)
+        finally:
+            _close_fd_quietly(batch_fd)
+            _close_fd_quietly(quarantine_fd)
+    return frozenset(observed)
+
+
+def _recover_unconsumed_pending_terminal_progress_publications(
+    home: Path,
+    budget: PendingCleanupActionBudget,
+) -> None:
+    """Try exact publication candidates before the unchanged mutation fence."""
+    index_root = _pending_cleanup_index_path(home)
+    for batch_name in _unconsumed_pending_terminal_progress_publication_candidates(home):
+        if not budget.charge_batch(batch_name):
+            break
+        ticket = _read_pending_cleanup_ticket(
+            home,
+            index_root / (batch_name + PENDING_CLEANUP_TICKET_SUFFIX),
+            expected_link_count=1,
+        )
+        if ticket is None or ticket.version not in {4, 8} or not ticket.terminal_regular_targets:
+            continue
+        # Merely discovering a name does not admit it. This route invokes the
+        # complete original-ticket/live-namespace checks and strict zero-record
+        # sidecar binding before any destructive walker action.
+        if _remove_cleanup_ready_batch(home, ticket):
+            budget.mark_batch_completed(batch_name)
+
+
+def _require_no_pending_unresolved_ticket_representations(
+    home: Path,
+    *,
+    dry_run: bool = False,
+    read_only_publication_batches: frozenset[str] = frozenset(),
+) -> None:
+    if read_only_publication_batches and not dry_run:
+        raise SyncError("read-only publication observation cannot authorize mutation")
+    unresolved = _pending_cleanup_unresolved_ticket_representation_issue(
+        home, read_only_publication_batches=read_only_publication_batches,
+    )
     if unresolved is not None:
         raise _pending_cleanup_unresolved_ticket_representation_error(unresolved)
     allocation_unresolved = (
@@ -44325,6 +46955,7 @@ def _pending_cleanup_ready_batch_is_observed(
     home: Path,
     *,
     allow_v8_control_recovery: bool = False,
+    read_only_publication_batches: frozenset[str] = frozenset(),
 ) -> bool:
     if not _pending_link_pointer_is_absent(home):
         return False
@@ -44348,6 +46979,13 @@ def _pending_cleanup_ready_batch_is_observed(
                     entry.name
                 )
                 if unresolved is not None:
+                    batch, _representation = unresolved
+                    if batch in read_only_publication_batches and entry.name == (
+                        batch + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                        + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+                    ):
+                        cleanup_ready = True
+                        continue
                     # Do not collapse unclassified ticket-derived bytes into a
                     # generic cleanup plan.  A caller may have checked moments
                     # earlier; this complete scan is the final observation
@@ -44458,6 +47096,7 @@ def _pending_cleanup_ready_batch_is_observed(
                     PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
                     PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
                     PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX,
+                    PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX,
                     PENDING_CLEANUP_TERMINAL_RETIREMENT_SUFFIX,
                     PENDING_PRIVATE_USE_RETIREMENT_SUFFIX,
                 ):
@@ -44593,6 +47232,7 @@ def _cleanup_ready_pending_batches(
         home,
         budget=action_budget,
     )
+    _recover_unconsumed_pending_terminal_progress_publications(home, action_budget)
     _require_no_pending_unresolved_ticket_representations(home)
     _cleanup_pending_cleanup_ticket_temps(
         home,
@@ -51279,6 +53919,70 @@ def _resolve_install_release_expectations(
     return resolved
 
 
+def _pending_recovery_is_observed(home: Path) -> bool:
+    """Observe work without creating lock paths or admitting cleanup authority."""
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        names = ()
+    else:
+        try:
+            if not _bound_directory_matches(home, index_root, index_fd):
+                raise SyncError("pending cleanup index changed before recovery observation")
+            names = _directory_member_names(
+                index_fd,
+                maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+                overflow_message="pending cleanup observation exceeds the size limit",
+            )
+            if not _bound_directory_matches(home, index_root, index_fd):
+                raise SyncError("pending cleanup index changed during recovery observation")
+        finally:
+            _close_fd_quietly(index_fd)
+    # Even an unclassified control only requests locked validation. In
+    # particular, an exact progress-publication temp must reach recovery before
+    # the ordinary unresolved-representation fence; its name grants no authority.
+    if names:
+        return True
+    return bool(
+        _recover_failed_move_isolation(home, dry_run=True)
+        or _load_release_retention_transaction(home) is not None
+        or _discover_pending_staging_markers(home)
+        or _discover_pending_staging_marker_temps(home)
+        or _load_pending_link_batch(home) is not None
+    )
+
+
+def _recover_pending_state_unlocked(
+    home: Path,
+    cleanup_budget: PendingCleanupActionBudget,
+) -> bool:
+    if _locked_sync_home_fd(home) is None:
+        raise SyncError("pending recovery requires the installation lock")
+    # Publication recovery and the subsequent fence share the same lock.
+    _recover_unconsumed_pending_terminal_progress_publications(home, cleanup_budget)
+    _require_no_pending_unresolved_ticket_representations(home)
+    recovered_failed_move_isolation = _recover_failed_move_isolation(home, dry_run=False)
+    recovered_retention_transaction = _recover_release_retention_transaction(
+        home, dry_run=False,
+    )
+    cleaned_pending_batches = _cleanup_ready_pending_batches(home, budget=cleanup_budget)
+    loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(home)
+    (
+        _loaded_state,
+        _initial_state_snapshot,
+        recovered_pending_transaction,
+    ) = _recover_pending_link_transaction(
+        home, loaded_state, initial_state_snapshot, dry_run=False,
+    )
+    return bool(
+        recovered_failed_move_isolation
+        or recovered_retention_transaction is not None
+        or recovered_pending_transaction
+        or cleaned_pending_batches
+    )
+
+
 def _preflight_pending_recovery(
     home: Path,
     *,
@@ -51286,45 +53990,51 @@ def _preflight_pending_recovery(
     cleanup_budget: PendingCleanupActionBudget | None = None,
 ) -> bool:
     home = home.expanduser()
-    _require_no_pending_unresolved_ticket_representations(home)
     action_budget = cleanup_budget or PendingCleanupActionBudget(
         MAX_PENDING_CLEANUP_BATCHES_PER_RUN
     )
-    observed_failed_move_isolation = _recover_failed_move_isolation(
-        home,
-        dry_run=True,
-    )
-    observed_retention_transaction = None
-    observed_cleanup_ready_batch = False
-    observed_pending_transaction = False
-    if not observed_failed_move_isolation:
-        observed_retention_transaction = _recover_release_retention_transaction(
-            home,
-            dry_run=True,
-        )
-        observed_cleanup_ready_batch = _pending_cleanup_ready_batch_is_observed(
-            home,
-            allow_v8_control_recovery=not dry_run,
-        )
-        loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(home)
-        (
-            _loaded_state,
-            _initial_state_snapshot,
-            observed_pending_transaction,
-        ) = _recover_pending_link_transaction(
-            home,
-            loaded_state,
-            initial_state_snapshot,
-            dry_run=True,
-        )
-    if (
-        not observed_failed_move_isolation
-        and not observed_retention_transaction
-        and not observed_pending_transaction
-        and not observed_cleanup_ready_batch
-    ):
-        return False
     if dry_run:
+        observed_publications = _observe_unconsumed_pending_terminal_progress_publications(home)
+        _require_no_pending_unresolved_ticket_representations(
+            home, dry_run=True, read_only_publication_batches=observed_publications,
+        )
+        observed_failed_move_isolation = _recover_failed_move_isolation(
+            home,
+            dry_run=True,
+        )
+        observed_retention_transaction = None
+        observed_cleanup_ready_batch = False
+        observed_pending_transaction = False
+        if not observed_failed_move_isolation:
+            observed_retention_transaction = _recover_release_retention_transaction(
+                home,
+                dry_run=True,
+            )
+            observed_cleanup_ready_batch = _pending_cleanup_ready_batch_is_observed(
+                home,
+                allow_v8_control_recovery=False,
+                read_only_publication_batches=observed_publications,
+            )
+            loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(
+                home
+            )
+            (
+                _loaded_state,
+                _initial_state_snapshot,
+                observed_pending_transaction,
+            ) = _recover_pending_link_transaction(
+                home,
+                loaded_state,
+                initial_state_snapshot,
+                dry_run=True,
+            )
+        if (
+            not observed_failed_move_isolation
+            and not observed_retention_transaction
+            and not observed_pending_transaction
+            and not observed_cleanup_ready_batch
+        ):
+            return False
         if observed_failed_move_isolation:
             print("would recover failed move isolation under the install lock")
             return True
@@ -51338,36 +54048,10 @@ def _preflight_pending_recovery(
                 "the install lock"
             )
         return True
+    if not _pending_recovery_is_observed(home):
+        return False
     with installation_lock(home):
-        recovered_failed_move_isolation = _recover_failed_move_isolation(
-            home,
-            dry_run=False,
-        )
-        recovered_retention_transaction = _recover_release_retention_transaction(
-            home,
-            dry_run=False,
-        )
-        cleaned_pending_batches = _cleanup_ready_pending_batches(
-            home,
-            budget=action_budget,
-        )
-        loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(home)
-        (
-            _loaded_state,
-            _initial_state_snapshot,
-            recovered_pending_transaction,
-        ) = _recover_pending_link_transaction(
-            home,
-            loaded_state,
-            initial_state_snapshot,
-            dry_run=False,
-        )
-    return bool(
-        recovered_failed_move_isolation
-        or recovered_retention_transaction is not None
-        or recovered_pending_transaction
-        or cleaned_pending_batches
-    )
+        return _recover_pending_state_unlocked(home, action_budget)
 
 
 def _install_release_set_unlocked(
@@ -52034,6 +54718,9 @@ def install_release_tree(
         cleanup_budget=action_budget,
     )
     with installation_lock(home):
+        # A cooperative writer may have published recovery state after the
+        # observational preflight. Recheck under the final mutation lock.
+        _recover_pending_state_unlocked(home, action_budget)
         _install_release_set_unlocked(
             home,
             releases,
@@ -53665,6 +56352,7 @@ def install_private_from_github(
             return
 
         with installation_lock(home):
+            _recover_pending_state_unlocked(home, cleanup_budget)
             _install_release_set_unlocked(
                 home,
                 releases,
@@ -56118,8 +58806,17 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
     cleanup_budget = PendingCleanupActionBudget(MAX_PENDING_CLEANUP_BATCHES_PER_RUN)
 
     def apply_uninstall() -> None:
-        _require_no_pending_unresolved_ticket_representations(home)
-        if dry_run and _pending_cleanup_ready_batch_is_observed(home):
+        observed_publications = frozenset()
+        if dry_run:
+            observed_publications = _observe_unconsumed_pending_terminal_progress_publications(home)
+        else:
+            _recover_unconsumed_pending_terminal_progress_publications(home, cleanup_budget)
+        _require_no_pending_unresolved_ticket_representations(
+            home, dry_run=dry_run, read_only_publication_batches=observed_publications,
+        )
+        if dry_run and _pending_cleanup_ready_batch_is_observed(
+            home, read_only_publication_batches=observed_publications,
+        ):
             print(
                 "would clean a finalized or interrupted pending transaction under "
                 "the install lock"

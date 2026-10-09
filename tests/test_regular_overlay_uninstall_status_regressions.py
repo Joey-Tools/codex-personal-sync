@@ -11,8 +11,11 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
+
+from tests import test_pending_staging_cleanup as pending_staging_fixture
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -195,6 +198,26 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             stream.flush()
             os.fsync(stream.fileno())
         ticket.path.chmod(0o600)
+
+    def _metadata_first_ledger_capture(self, ticket, capture):
+        """Force the observed Linux crash order without assuming FS order."""
+        def capture_metadata_first(*args, **kwargs):
+            result = capture(*args, **kwargs)
+            ledger = args[4] if len(args) > 4 else kwargs["ledger"]
+            entries = ledger.get(ticket.batch_root_identity)
+            if entries is not None:
+                ledger[ticket.batch_root_identity] = tuple(
+                    sorted(
+                        entries,
+                        key=lambda entry: (
+                            entry[6] != PurePosixPath(MODULE.PENDING_LINK_METADATA_NAME),
+                            entry[0],
+                        ),
+                    )
+                )
+            return result
+
+        return capture_metadata_first
 
     def _marker_only_v4_ticket(self) -> MODULE.PendingBatchCleanupTicket:
         ticket = self._deferred_terminal_ticket()
@@ -853,6 +876,8 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
                 terminal_aliases=authority.aliases,
                 terminal_directories=authority.directories,
                 namespace_entries=forged_entries,
+                control_files=authority.control_files,
+                directory_progress=authority.directory_progress,
             ),
         )
 
@@ -1677,7 +1702,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             ): action.action
             for action in capacity.flattened_actions
         }
-        namespace_paths = MODULE._projected_pending_terminal_validation_namespace_paths(
+        namespace_paths, namespace_directory_paths = MODULE._projected_pending_terminal_validation_namespace_paths(
             self.home,
             capacity,
             before_state,
@@ -1693,11 +1718,16 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             phase="before",
         )
         self.assertTrue(set(projected_aliases).issubset(namespace_paths))
+        self.assertTrue(namespace_directory_paths.issubset(namespace_paths))
         self.assertNotIn(MODULE.PENDING_STATE_BEFORE_EVIDENCE, namespace_paths)
 
+        # Both the immutable receipt and its required progress header are
+        # capacity-checked before staging; either earlier bounded rejection
+        # preserves the same no-publication guarantee.
         with self.assertRaisesRegex(
             MODULE.SyncError,
-            "pending terminal validation receipt exceeds the size limit",
+            "pending terminal validation receipt exceeds the size limit|"
+            "pending terminal directory progress line exceeds the limit",
         ):
             MODULE._validate_pending_link_metadata_capacity(
                 self.home,
@@ -1789,7 +1819,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             MODULE.SyncError,
-            "pending terminal regular alias namespace changed: pending/stage",
+            "pending terminal directory slot was already consumed but is present again; manual recovery is required: pending/stage",
         ):
             MODULE._remove_cleanup_ready_batch(self.home, ticket)
 
@@ -1852,7 +1882,8 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             MODULE.SyncError,
-            "pending terminal regular alias namespace changed: pending/stage",
+            "pending terminal directory slot was already consumed but is "
+            "present again; manual recovery is required: pending/stage",
         ):
             MODULE._remove_cleanup_ready_batch(self.home, ticket)
 
@@ -1877,7 +1908,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             MODULE.SyncError,
-            "pending terminal regular alias namespace changed: pending",
+            "pending terminal directory slot was already consumed but is present again; manual recovery is required: pending",
         ):
             MODULE._remove_cleanup_ready_batch(self.home, ticket)
 
@@ -1913,9 +1944,13 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
                 parent_identity,
                 planned,
             )
-            self.assertGreater(
-                len(os.fsencode(legacy_name)),
-                MODULE.MAX_PENDING_CLEANUP_ACTIVE_LOGICAL_NAME_BYTES,
+            self.assertEqual(
+                MODULE._pending_cleanup_internal_entry_plan(
+                    legacy_name,
+                    MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                    parent_identity,
+                ),
+                planned,
             )
             MODULE._rename_noreplace_at(
                 parent_fd,
@@ -3375,21 +3410,28 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             MODULE._close_fd_quietly(batch_fd)
 
         real_isolate = MODULE._isolate_pending_cleanup_entry
+        real_capture = MODULE._capture_pending_cleanup_identity_ledger
+        compatibility_metadata = legacy_ticket.batch_root / "metadata.json"
+        compatibility_identity = (
+            compatibility_metadata.stat().st_dev, compatibility_metadata.stat().st_ino,
+        )
         crashed = False
 
         def isolate_then_crash(*args: object, **kwargs: object):
             nonlocal crashed
             result = real_isolate(*args, **kwargs)
             name = args[1] if len(args) > 1 else None
-            if not crashed and name in {
-                MODULE.PENDING_LINK_METADATA_NAME,
-                "metadata.json",
-            }:
+            if not crashed and name == MODULE.PENDING_LINK_METADATA_NAME:
                 crashed = True
                 raise SystemExit("injected marker-only isolation crash")
             return result
 
         with (
+            mock.patch.object(
+                MODULE,
+                "_capture_pending_cleanup_identity_ledger",
+                side_effect=self._metadata_first_ledger_capture(legacy_ticket, real_capture),
+            ),
             mock.patch.object(
                 MODULE,
                 "_isolate_pending_cleanup_entry",
@@ -3403,6 +3445,11 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             MODULE._remove_cleanup_ready_batch(self.home, legacy_ticket)
 
         self.assertTrue(crashed)
+        self.assertFalse((legacy_ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME).exists())
+        self.assertEqual(
+            (compatibility_metadata.stat().st_dev, compatibility_metadata.stat().st_ino),
+            compatibility_identity,
+        )
         batch_metadata = legacy_ticket.batch_root.stat()
         batch_identity = (batch_metadata.st_dev, batch_metadata.st_ino)
         self.assertTrue(
@@ -3444,9 +3491,61 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         finally:
             MODULE._close_fd_quietly(scan_fd)
 
+    def _marker_only_active_entry_is_receipt_control(
+        self,
+        ticket: MODULE.PendingBatchCleanupTicket,
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        dir_fd: int | None,
+        quarantine_root_identity: tuple[int, int],
+    ) -> bool:
+        if not isinstance(path, str) or dir_fd is None:
+            return False
+        parent_stat = os.fstat(dir_fd)
+        parent_identity = (parent_stat.st_dev, parent_stat.st_ino)
+        active_binding = MODULE._pending_cleanup_active_entry_binding(
+            path,
+            parent_identity,
+        )
+        if active_binding is None:
+            return False
+        receipt = MODULE._read_pending_cleanup_terminal_validation(
+            self.home,
+            ticket,
+            quarantine_root_identity,
+        )
+        if receipt is None:
+            return False
+        authority = MODULE._parse_pending_terminal_validation_authority(
+            self.home,
+            ticket,
+            quarantine_root_identity,
+            receipt,
+        )
+        if authority is None:
+            return False
+        active_plan, logical_name = active_binding
+        return any(
+            active_plan[2] == stat.S_IFREG
+            and control.file_identity == active_plan[:2]
+            and control_path.parent_identity == parent_identity
+            and control_path.path.name == logical_name
+            for control in authority.control_files
+            for control_path in control.paths
+        )
+
     def test_marker_only_v4_recovers_after_control_unlink_crash(self) -> None:
         ticket = self._marker_only_v4_ticket()
+        quarantine_root_stat = ticket.batch_root.parent.stat()
+        quarantine_root_identity = (
+            quarantine_root_stat.st_dev,
+            quarantine_root_stat.st_ino,
+        )
         real_unlink = os.unlink
+        real_capture = MODULE._capture_pending_cleanup_identity_ledger
+        compatibility_metadata = ticket.batch_root / "metadata.json"
+        compatibility_identity = (
+            compatibility_metadata.stat().st_dev, compatibility_metadata.stat().st_ino,
+        )
         crashed = False
 
         def unlink_then_crash(
@@ -3457,15 +3556,21 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         ) -> None:
             nonlocal crashed
             real_unlink(path, *args, dir_fd=dir_fd, **kwargs)
-            if (
-                not crashed
-                and isinstance(path, str)
-                and path.startswith(MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+            if not crashed and self._marker_only_active_entry_is_receipt_control(
+                ticket,
+                path,
+                dir_fd,
+                quarantine_root_identity,
             ):
                 crashed = True
                 raise SystemExit("injected marker-only control unlink crash")
 
         with (
+            mock.patch.object(
+                MODULE,
+                "_capture_pending_cleanup_identity_ledger",
+                side_effect=self._metadata_first_ledger_capture(ticket, real_capture),
+            ),
             mock.patch.object(MODULE.os, "unlink", side_effect=unlink_then_crash),
             self.assertRaisesRegex(
                 SystemExit,
@@ -3475,6 +3580,11 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             MODULE._remove_cleanup_ready_batch(self.home, ticket)
 
         self.assertTrue(crashed)
+        self.assertFalse((ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME).exists())
+        self.assertEqual(
+            (compatibility_metadata.stat().st_dev, compatibility_metadata.stat().st_ino),
+            compatibility_identity,
+        )
         self.assertTrue(
             MODULE._pending_cleanup_terminal_validation_path(
                 self.home,
@@ -3489,6 +3599,184 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         )
         self.assertTrue(MODULE._cleanup_ready_pending_batches(self.home))
         self.assertFalse(ticket.batch_root.exists())
+
+    def test_marker_only_v4_binds_compatibility_metadata_content_before_mutation(
+        self,
+    ) -> None:
+        ticket = self._marker_only_v4_ticket()
+        with (
+            mock.patch.object(
+                MODULE, "_remove_pending_batch_directory_contents",
+                side_effect=SystemExit("injected after complete metadata receipt"),
+            ),
+            self.assertRaisesRegex(SystemExit, "complete metadata receipt"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+        metadata = ticket.batch_root / "metadata.json"
+        metadata.write_bytes(metadata.read_bytes() + b" ")
+        protected_ticket = ticket.path.read_bytes()
+        protected_metadata = metadata.read_bytes()
+        original_target = (self.target.stat().st_ino, self.target.stat().st_nlink)
+        with self.assertRaisesRegex(MODULE.SyncError, "receipt-bound entry changed"):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+        self.assertEqual(ticket.path.read_bytes(), protected_ticket)
+        self.assertEqual(metadata.read_bytes(), protected_metadata)
+        self.assertEqual(
+            (self.target.stat().st_ino, self.target.stat().st_nlink), original_target,
+        )
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_marker_only_v4_rejects_control_reappearance_during_retry(self) -> None:
+        ticket = self._marker_only_v4_ticket()
+        receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=SystemExit("injected after marker-only receipt"),
+            ),
+            self.assertRaisesRegex(SystemExit, "after marker-only receipt"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+        self.assertTrue(receipt_path.is_file())
+
+        metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        saved_metadata_path = self.root / "saved-marker-only-metadata.json"
+        metadata_path.rename(saved_metadata_path)
+        legacy_metadata_path = ticket.batch_root / "metadata.json"
+        saved_legacy_metadata_path = (
+            self.root / "saved-marker-only-legacy-metadata.json"
+        )
+        if legacy_metadata_path.exists():
+            legacy_metadata_path.rename(saved_legacy_metadata_path)
+        quarantine_root_stat = ticket.batch_root.parent.stat()
+        quarantine_root_identity = (
+            quarantine_root_stat.st_dev,
+            quarantine_root_stat.st_ino,
+        )
+        real_unlink = os.unlink
+        restored = False
+
+        def restore_metadata_after_control_unlink(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            *args: object,
+            dir_fd: int | None = None,
+            **kwargs: object,
+        ) -> None:
+            nonlocal restored
+            real_unlink(path, *args, dir_fd=dir_fd, **kwargs)
+            if restored or not self._marker_only_active_entry_is_receipt_control(
+                ticket,
+                path,
+                dir_fd,
+                quarantine_root_identity,
+            ):
+                return
+            saved_metadata_path.rename(metadata_path)
+            restored = True
+
+        with (
+            mock.patch.object(
+                MODULE.os,
+                "unlink",
+                side_effect=restore_metadata_after_control_unlink,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "legacy marker-only v4 validation control namespace "
+                "expanded before cleanup",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(restored)
+        self.assertTrue(metadata_path.is_file())
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_marker_only_v4_rejects_control_reappearance_after_contraction(
+        self,
+    ) -> None:
+        ticket = self._marker_only_v4_ticket()
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=SystemExit("injected after marker-only receipt"),
+            ),
+            self.assertRaisesRegex(SystemExit, "after marker-only receipt"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        quarantine_root_stat = ticket.batch_root.parent.stat()
+        quarantine_root_identity = (
+            quarantine_root_stat.st_dev,
+            quarantine_root_stat.st_ino,
+        )
+        receipt = MODULE._read_pending_cleanup_terminal_validation(
+            self.home,
+            ticket,
+            quarantine_root_identity,
+        )
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        authority = MODULE._parse_pending_terminal_validation_authority(
+            self.home,
+            ticket,
+            quarantine_root_identity,
+            receipt,
+        )
+        self.assertIsNotNone(authority)
+        assert authority is not None
+        initial_live_paths = frozenset(
+            path.path
+            for control in authority.control_files
+            for path in control.paths
+        )
+        self.assertTrue(initial_live_paths)
+        contracted_live_paths = frozenset(sorted(initial_live_paths)[:-1])
+        self.assertNotEqual(initial_live_paths, contracted_live_paths)
+        # Exercise full -> contracted -> reappeared observations without
+        # depending on inode reuse or filesystem enumeration order.
+        observations = iter(
+            (
+                initial_live_paths,
+                contracted_live_paths,
+                initial_live_paths,
+            )
+        )
+
+        def exercise_control_callbacks(*args: object, **kwargs: object) -> None:
+            revalidate = kwargs.get("mutation_revalidator")
+            self.assertTrue(callable(revalidate))
+            assert callable(revalidate)
+            revalidate(PurePosixPath("<contraction>"), "before_isolate")
+            revalidate(PurePosixPath("<reappearance>"), "before_delete")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_pending_marker_only_live_control_paths",
+                side_effect=lambda *args, **kwargs: next(observations),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=exercise_control_callbacks,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "legacy marker-only v4 validation control namespace "
+                "expanded before cleanup",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
 
     def test_ticket_tombstone_is_restored_and_cleanup_retries(self) -> None:
         real_delete = MODULE._isolate_and_delete_pending_cleanup_file
@@ -3864,23 +4152,38 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         )
         foreign = self.root / "foreign-after-final-verify.toml"
         real_verify = MODULE._verify_final_regular_targets
+        real_retire = MODULE._retire_terminal_regular_cleanup_controls
+        retirement_in_progress = False
         injected = False
 
-        def add_foreign_hardlink_after_first_final_verify(
+        def enter_control_retirement(*args: object, **kwargs: object) -> None:
+            nonlocal retirement_in_progress
+            retirement_in_progress = True
+            try:
+                real_retire(*args, **kwargs)
+            finally:
+                retirement_in_progress = False
+
+        def add_foreign_hardlink_after_retirement_final_verify(
             home: Path,
             current_ticket: MODULE.PendingBatchCleanupTicket,
         ) -> None:
             nonlocal injected
             real_verify(home, current_ticket)
-            if not injected:
+            if retirement_in_progress and not injected:
                 os.link(self.target, foreign)
                 injected = True
 
         with (
             mock.patch.object(
                 MODULE,
+                "_retire_terminal_regular_cleanup_controls",
+                side_effect=enter_control_retirement,
+            ),
+            mock.patch.object(
+                MODULE,
                 "_verify_final_regular_targets",
-                side_effect=add_foreign_hardlink_after_first_final_verify,
+                side_effect=add_foreign_hardlink_after_retirement_final_verify,
             ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
@@ -5399,6 +5702,2712 @@ class RegularClaimFailClosedTests(unittest.TestCase):
             MODULE._load_managed_state(self.home).owners[MODULE.PUBLIC_OWNER],
             SHA_A,
         )
+
+class ReceiptFamilyResidueFenceTests(unittest.TestCase):
+    def _ticket_for_direct_receipt_fence(self, case, version: int):
+        staging = pending_staging_fixture.PendingStagingCleanupTests(methodName="runTest")
+        staging.home = case.home
+        staging.target = case.target
+        if version in {1, 2, 3}:
+            with mock.patch.object(pending_staging_fixture, "MODULE", MODULE):
+                return staging._publish_legacy_cleanup_ticket(version=version)
+        if version == 4:
+            return case._marker_only_v4_ticket()
+        if version == 5:
+            with mock.patch.object(pending_staging_fixture, "MODULE", MODULE):
+                return staging._make_v5_empty_ticket(case.home, case.target)
+        if version == 6:
+            expected = MODULE._read_regular_file_snapshot_beneath(
+                case.home,
+                case.target,
+                require_managed_access=False,
+            )
+            return MODULE._publish_pending_ephemeral_quarantine_leaf_cleanup_ticket(
+                case.home,
+                case.target,
+                expected,
+            )
+        if version == 7:
+            allocation = MODULE._quarantine_batch_root(
+                case.home,
+                [],
+                retain_binding=True,
+                retain_scaffold_binding=True,
+            )
+            try:
+                return MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+                    case.home,
+                    allocation.binding,
+                )
+            finally:
+                allocation.revoke_reclaim()
+                allocation.close()
+        if version == 8:
+            return case._deferred_terminal_ticket()
+        raise AssertionError(version)
+
+    def _receipt_family_names(self, home: Path, ticket) -> tuple[str, ...]:
+        index_root = MODULE._pending_cleanup_index_path(home)
+        index_fd = MODULE._open_directory_beneath(home, index_root)
+        try:
+            names = MODULE._directory_member_names(
+                index_fd,
+                maximum_entries=MODULE.MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            )
+        finally:
+            MODULE._close_fd_quietly(index_fd)
+        return tuple(
+            name
+            for name in names
+            if MODULE._pending_cleanup_terminal_validation_representation_batch_name(
+                name
+            )
+            == ticket.batch_root.name
+        )
+
+    def _assert_control_residue_blocks_direct_cleanup(
+        self,
+        version: int,
+        *,
+        progress: bool,
+        suffix: str,
+        retained: bool = False,
+    ) -> None:
+        case = RegularOverlayUninstallFinalizationTests(methodName="runTest")
+        case.setUp()
+        try:
+            ticket = self._ticket_for_direct_receipt_fence(case, version)
+            canonical_name = (
+                ticket.batch_root.name
+                + MODULE.PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                if progress
+                else ticket.path.name
+            )
+            residue_name = canonical_name + suffix
+            if retained:
+                residue_name = (
+                    MODULE.PENDING_CLEANUP_RETAINED_PREFIX
+                    + residue_name
+                    + "-123-0123456789abcdef"
+                )
+            residue = ticket.path.parent / residue_name
+            residue.write_bytes(b"unknown same-batch control residue\n")
+            residue.chmod(0o600)
+            # No write is permitted: preserve control identity, bytes, access
+            # policy, and the original batch or quarantined public target.
+            protected = pending_authority_snapshot(case.home)
+
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "manual recovery is required|reconciled before new mutation",
+            ):
+                MODULE._remove_cleanup_ready_batch(case.home, ticket)
+
+            self.assertEqual(pending_authority_snapshot(case.home), protected)
+            self.assertTrue(ticket.path.is_file())
+            if version == 6:
+                self.assertTrue(
+                    (case.home / Path(*ticket.public_target.parts)).is_file()
+                )
+            else:
+                self.assertTrue(ticket.batch_root.exists())
+            self.assertTrue(residue.is_file())
+        finally:
+            case.tearDown()
+
+    def test_direct_cleanup_ticket_versions_reject_foreign_progress_descendants(
+        self,
+    ) -> None:
+        for version in range(1, 9):
+            for retained in (False, True):
+                with self.subTest(version=version, retained=retained):
+                    self._assert_control_residue_blocks_direct_cleanup(
+                        version,
+                        progress=True,
+                        suffix=".foreign",
+                        retained=retained,
+                    )
+
+    def test_direct_cleanup_ticket_versions_reject_foreign_ticket_descendants(
+        self,
+    ) -> None:
+        for version in range(1, 9):
+            with self.subTest(version=version):
+                self._assert_control_residue_blocks_direct_cleanup(
+                    version,
+                    progress=False,
+                    suffix=".foreign",
+                )
+
+    def test_progress_names_require_terminal_regular_protocol(self) -> None:
+        # Version 4 in this fixture is marker-only, not terminal-regular.
+        for version in range(1, 8):
+            for suffix, retained in (
+                ("", False),
+                (MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX, False),
+                ("", True),
+            ):
+                with self.subTest(version=version, suffix=suffix, retained=retained):
+                    self._assert_control_residue_blocks_direct_cleanup(
+                        version,
+                        progress=True,
+                        suffix=suffix,
+                        retained=retained,
+                    )
+
+    def test_complete_control_family_fence_inventories_names_once(self) -> None:
+        case = RegularOverlayUninstallFinalizationTests(methodName="runTest")
+        case.setUp()
+        try:
+            ticket = self._ticket_for_direct_receipt_fence(case, 8)
+            with mock.patch.object(
+                MODULE,
+                "_directory_member_names",
+                wraps=MODULE._directory_member_names,
+            ) as inventory:
+                MODULE._require_pending_cleanup_terminal_validation_family_safe(
+                    case.home,
+                    ticket,
+                )
+            self.assertEqual(inventory.call_count, 1)
+        finally:
+            case.tearDown()
+
+    def test_ephemeral_ticket_retirement_rechecks_progress_family(self) -> None:
+        for version in (5, 6, 7):
+            with self.subTest(version=version):
+                case = RegularOverlayUninstallFinalizationTests(methodName="runTest")
+                case.setUp()
+                try:
+                    ticket = self._ticket_for_direct_receipt_fence(case, version)
+                    foreign = ticket.path.parent / (
+                        ticket.batch_root.name
+                        + MODULE.PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                        + ".foreign"
+                    )
+                    real_delete_ticket = MODULE._delete_pending_cleanup_ticket
+                    injected = []
+
+                    def inject_before_ticket_retirement(home, current_ticket, **kwargs):
+                        foreign.write_bytes(b"late foreign progress descendant\n")
+                        foreign.chmod(0o600)
+                        injected.append(True)
+                        return real_delete_ticket(home, current_ticket, **kwargs)
+
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_delete_pending_cleanup_ticket",
+                            side_effect=inject_before_ticket_retirement,
+                        ),
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            "manual recovery is required|reconciled before new mutation",
+                        ),
+                    ):
+                        MODULE._remove_cleanup_ready_batch(case.home, ticket)
+
+                    self.assertEqual(injected, [True])
+                    self.assertTrue(ticket.path.is_file())
+                    self.assertTrue(foreign.is_file())
+                finally:
+                    case.tearDown()
+
+    def test_direct_cleanup_ticket_versions_preserve_receipt_family_protocols(
+        self,
+    ) -> None:
+        for version in range(1, 9):
+            with self.subTest(version=version):
+                case = RegularOverlayUninstallFinalizationTests(methodName="runTest")
+                case.setUp()
+                try:
+                    ticket = self._ticket_for_direct_receipt_fence(case, version)
+                    self.assertTrue(
+                        MODULE._remove_cleanup_ready_batch(case.home, ticket)
+                    )
+                    self.assertFalse(ticket.path.exists())
+                    self.assertEqual(
+                        self._receipt_family_names(case.home, ticket),
+                        (),
+                    )
+                finally:
+                    case.tearDown()
+
+    def test_direct_cleanup_ticket_versions_reject_foreign_receipt_descendants(
+        self,
+    ) -> None:
+        for version in range(1, 9):
+            with self.subTest(version=version):
+                case = RegularOverlayUninstallFinalizationTests(methodName="runTest")
+                case.setUp()
+                try:
+                    ticket = self._ticket_for_direct_receipt_fence(case, version)
+                    canonical = MODULE._pending_cleanup_terminal_validation_path(
+                        case.home,
+                        ticket.batch_root.name,
+                    )
+                    foreign = canonical.with_name(canonical.name + ".foreign")
+                    foreign.write_bytes(b"foreign receipt descendant\n")
+                    foreign.chmod(0o600)
+                    protected = pending_authority_snapshot(case.home)
+
+                    with self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "manual recovery is required|reconciled before new mutation",
+                    ):
+                        MODULE._remove_cleanup_ready_batch(case.home, ticket)
+
+                    self.assertEqual(
+                        pending_authority_snapshot(case.home),
+                        protected,
+                    )
+                    self.assertTrue(ticket.path.is_file())
+                    if version == 6:
+                        self.assertTrue(
+                            (case.home / Path(*ticket.public_target.parts)).is_file()
+                        )
+                    else:
+                        self.assertTrue(ticket.batch_root.exists())
+                    self.assertTrue(foreign.is_file())
+                finally:
+                    case.tearDown()
+
+    def test_v5_v7_exact_terminal_validation_names_are_not_authority(self) -> None:
+        for version in (5, 7):
+            with self.subTest(version=version):
+                case = RegularOverlayUninstallFinalizationTests(methodName="runTest")
+                case.setUp()
+                try:
+                    ticket = self._ticket_for_direct_receipt_fence(case, version)
+                    receipt = MODULE._pending_cleanup_terminal_validation_path(
+                        case.home,
+                        ticket.batch_root.name,
+                    )
+                    receipt.write_bytes(b"unknown same-batch receipt bytes\n")
+                    receipt.chmod(0o600)
+                    protected = pending_authority_snapshot(case.home)
+
+                    with self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "no terminal-validation recovery protocol; manual recovery is required",
+                    ):
+                        MODULE._remove_cleanup_ready_batch(case.home, ticket)
+
+                    self.assertEqual(
+                        pending_authority_snapshot(case.home),
+                        protected,
+                    )
+                    self.assertTrue(ticket.path.is_file())
+                    self.assertTrue(ticket.batch_root.exists())
+                    self.assertTrue(receipt.is_file())
+                finally:
+                    case.tearDown()
+
+    def test_receipt_retirement_name_requires_terminal_regular_protocol(self) -> None:
+        for version in (1, 2, 3, 4, 6):
+            with self.subTest(version=version):
+                case = RegularOverlayUninstallFinalizationTests(methodName="runTest")
+                case.setUp()
+                try:
+                    ticket = self._ticket_for_direct_receipt_fence(case, version)
+                    retirement = MODULE._pending_cleanup_index_path(case.home) / (
+                        ticket.batch_root.name
+                        + MODULE.PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX
+                    )
+                    retirement.write_bytes(b"unknown receipt retirement marker\n")
+                    retirement.chmod(0o600)
+                    protected = pending_authority_snapshot(case.home)
+
+                    with self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "retirement has no recovery protocol for this ticket; manual recovery is required",
+                    ):
+                        MODULE._remove_cleanup_ready_batch(case.home, ticket)
+
+                    self.assertEqual(
+                        pending_authority_snapshot(case.home),
+                        protected,
+                    )
+                    self.assertTrue(ticket.path.is_file())
+                    self.assertTrue(retirement.is_file())
+                finally:
+                    case.tearDown()
+
+    def test_v6_ticket_retirement_rechecks_receipt_family(self) -> None:
+        case = RegularOverlayUninstallFinalizationTests(methodName="runTest")
+        case.setUp()
+        try:
+            ticket = self._ticket_for_direct_receipt_fence(case, 6)
+            receipt = MODULE._pending_cleanup_terminal_validation_path(
+                case.home,
+                ticket.batch_root.name,
+            )
+            foreign = receipt.with_name(receipt.name + ".foreign")
+            real_delete_ticket = MODULE._delete_pending_cleanup_ticket
+
+            def inject_foreign_before_ticket_retirement(
+                home,
+                current_ticket,
+                **kwargs,
+            ):
+                foreign.write_bytes(b"foreign receipt descendant\n")
+                foreign.chmod(0o600)
+                return real_delete_ticket(home, current_ticket, **kwargs)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_delete_pending_cleanup_ticket",
+                    side_effect=inject_foreign_before_ticket_retirement,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "reconciled before new mutation",
+                ),
+            ):
+                MODULE._remove_cleanup_ready_batch(case.home, ticket)
+
+            self.assertTrue(ticket.path.is_file())
+            self.assertTrue(receipt.is_file())
+            self.assertTrue(foreign.is_file())
+        finally:
+            case.tearDown()
+
+
+class DirectoryProgressPublicationRecoveryTests(unittest.TestCase):
+    """Pair recoverable publication crashes with rejected authority changes."""
+
+    def setUp(self) -> None:
+        self.fixture = RegularOverlayUninstallFinalizationTests(methodName="runTest")
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.tearDown)
+        self.ticket = self.fixture._deferred_terminal_ticket()
+        self.progress = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home, self.ticket.batch_root.name,
+        )
+        self.receipt = MODULE._pending_cleanup_terminal_validation_path(
+            self.fixture.home, self.ticket.batch_root.name,
+        )
+
+    def _stage_orphan(self) -> bytes:
+        publish = MODULE._publish_atomic_exclusive_internal_file
+
+        def crash_after_progress(home, path, payload, **kwargs):
+            result = publish(home, path, payload, **kwargs)
+            if path == self.progress:
+                raise SystemExit("injected durable progress before receipt")
+            return result
+
+        with (
+            mock.patch.object(
+                MODULE, "_publish_atomic_exclusive_internal_file",
+                side_effect=crash_after_progress,
+            ),
+            self.assertRaisesRegex(SystemExit, "durable progress before receipt"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertTrue(self.progress.is_file())
+        self.assertFalse(self.receipt.exists())
+        payload = self.progress.read_bytes()
+        self.assertEqual(payload.count(b"\n"), 1)
+        return payload
+
+    def _protected(self):
+        target = self.fixture.target
+        metadata = target.stat()
+        root_metadata = self.ticket.batch_root.stat()
+        return (
+            self.ticket.path.read_bytes(),
+            self.progress.read_bytes(),
+            (root_metadata.st_dev, root_metadata.st_ino, root_metadata.st_mode),
+            (
+                metadata.st_dev, metadata.st_ino, metadata.st_mode,
+                metadata.st_uid, metadata.st_nlink, target.read_bytes(),
+            ),
+        )
+
+    def _stage_publication_temp(self) -> tuple[Path, bytes]:
+        temp = self.progress.with_name(
+            self.progress.name + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX,
+        )
+        rename = MODULE._rename_noreplace_at
+
+        def crash_before_progress_rename(source_fd, source, target_fd, target):
+            if source == temp.name and target == self.progress.name:
+                raise SystemExit("injected fsynced progress temp before rename")
+            return rename(source_fd, source, target_fd, target)
+
+        with (
+            mock.patch.object(MODULE, "_rename_noreplace_at", side_effect=crash_before_progress_rename),
+            self.assertRaisesRegex(SystemExit, "fsynced progress temp"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertTrue(temp.is_file())
+        self.assertFalse(self.progress.exists())
+        self.assertFalse(self.receipt.exists())
+        header = temp.read_bytes()
+        self.assertEqual(header.count(b"\n"), 1)
+        return temp, header
+
+    def _temp_protected(self, temp: Path):
+        target = self.fixture.target
+        temp_metadata = temp.stat()
+        target_metadata = target.stat()
+        root_metadata = self.ticket.batch_root.stat()
+        return (
+            self.ticket.path.read_bytes(), temp.read_bytes(),
+            (temp_metadata.st_dev, temp_metadata.st_ino, temp_metadata.st_mode,
+             temp_metadata.st_uid, temp_metadata.st_nlink),
+            (root_metadata.st_dev, root_metadata.st_ino, root_metadata.st_mode),
+            (target_metadata.st_dev, target_metadata.st_ino, target_metadata.st_mode,
+             target_metadata.st_uid, target_metadata.st_nlink, target.read_bytes()),
+        )
+
+    def _stage_receipt_publication_temp(self) -> Path:
+        temp = self.receipt.with_name(
+            self.receipt.name + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX,
+        )
+        rename = MODULE._rename_noreplace_at
+
+        def crash_before_receipt_rename(source_fd, source, target_fd, target):
+            if source == temp.name and target == self.receipt.name:
+                raise SystemExit("injected fsynced receipt temp before rename")
+            return rename(source_fd, source, target_fd, target)
+
+        with (
+            mock.patch.object(MODULE, "_rename_noreplace_at", side_effect=crash_before_receipt_rename),
+            self.assertRaisesRegex(SystemExit, "fsynced receipt temp"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertTrue(temp.is_file())
+        self.assertTrue(self.progress.is_file())
+        self.assertFalse(self.receipt.exists())
+        return temp
+
+    def test_exact_receipt_publication_temp_retries_original_authority(self) -> None:
+        temp = self._stage_receipt_publication_temp()
+        MODULE._preflight_pending_recovery(self.fixture.home, dry_run=False)
+        self.assertFalse(temp.exists())
+        self._assert_retired()
+
+    def test_partial_receipt_temp_is_discarded_not_adopted(self) -> None:
+        temp = self._stage_receipt_publication_temp()
+        temp.write_bytes(b'{"incomplete_receipt":')
+        MODULE._preflight_pending_recovery(self.fixture.home, dry_run=False)
+        self.assertFalse(temp.exists())
+        self._assert_retired()
+
+    def test_strict_retained_receipt_temp_retries_original_authority(self) -> None:
+        temp = self._stage_receipt_publication_temp()
+        retained = temp.with_name(
+            MODULE.PENDING_CLEANUP_RETAINED_PREFIX + temp.name + "-123-" + "a" * 16,
+        )
+        temp.rename(retained)
+        MODULE._preflight_pending_recovery(self.fixture.home, dry_run=False)
+        self.assertFalse(retained.exists())
+        self.assertFalse(temp.exists())
+        self._assert_retired()
+
+    def test_receipt_temp_cannot_replace_original_marker_content_authority(self) -> None:
+        temp = self._stage_receipt_publication_temp()
+        marker = self.ticket.batch_root / Path(*self.ticket.marker_path.parts)
+        marker.write_bytes(b"changed marker after receipt temp\n")
+        protected = self._temp_protected(temp)
+        progress_before = self.progress.read_bytes()
+        with (
+            mock.patch.object(MODULE, "_remove_pending_batch_directory_contents") as walker,
+            self.assertRaisesRegex(MODULE.SyncError, "(control|marker|commit evidence).*(changed|authority)"),
+        ):
+            MODULE._preflight_pending_recovery(self.fixture.home, dry_run=False)
+        walker.assert_not_called()
+        self.assertEqual(self._temp_protected(temp), protected)
+        self.assertEqual(self.progress.read_bytes(), progress_before)
+        self.assertFalse(self.receipt.exists())
+
+    def _assert_receipt_descendant_blocks_recovery(self, extra: Path, temp: Path) -> None:
+        extra.write_bytes(b"foreign receipt descendant\n")
+        extra.chmod(0o600)
+        protected = self._temp_protected(temp)
+        progress_before = self.progress.read_bytes()
+        with self.assertRaisesRegex(MODULE.SyncError, "reconciled before new mutation"):
+            MODULE._require_no_pending_unresolved_ticket_representations(self.fixture.home)
+        with (
+            mock.patch.object(MODULE, "_remove_pending_batch_directory_contents") as walker,
+            self.assertRaisesRegex(MODULE.SyncError, "reconciled before new mutation"),
+        ):
+            MODULE._preflight_pending_recovery(self.fixture.home, dry_run=False)
+        walker.assert_not_called()
+        with self.assertRaisesRegex(MODULE.SyncError, "reconciled before new mutation"):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertEqual(extra.read_bytes(), b"foreign receipt descendant\n")
+        self.assertEqual(self._temp_protected(temp), protected)
+        self.assertEqual(self.progress.read_bytes(), progress_before)
+        self.assertFalse(self.receipt.exists())
+
+    def test_foreign_receipt_temp_descendant_blocks_republication(self) -> None:
+        temp = self._stage_receipt_publication_temp()
+        self._assert_receipt_descendant_blocks_recovery(
+            temp.with_name(temp.name + ".foreign"), temp,
+        )
+
+    def test_suffix_added_retained_receipt_temp_blocks_republication(self) -> None:
+        temp = self._stage_receipt_publication_temp()
+        extra = temp.with_name(
+            MODULE.PENDING_CLEANUP_RETAINED_PREFIX + temp.name
+            + "-123-" + "a" * 16 + ".foreign",
+        )
+        self._assert_receipt_descendant_blocks_recovery(extra, temp)
+
+    def test_fsynced_progress_temp_retries_with_original_object(self) -> None:
+        temp, _header = self._stage_publication_temp()
+        identity = (temp.stat().st_dev, temp.stat().st_ino)
+        publish = MODULE._publish_atomic_exclusive_internal_file
+
+        def confirm_same_object(home, path, payload, **kwargs):
+            self.assertNotEqual(path, self.progress)
+            if path == self.receipt:
+                self.assertFalse(temp.exists())
+                self.assertEqual((self.progress.stat().st_dev, self.progress.stat().st_ino), identity)
+            return publish(home, path, payload, **kwargs)
+
+        with mock.patch.object(MODULE, "_publish_atomic_exclusive_internal_file", side_effect=confirm_same_object):
+            self.assertTrue(MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket))
+        self._assert_retired()
+
+    def test_cleanup_entrypoint_recovers_exact_progress_temp(self) -> None:
+        temp, _header = self._stage_publication_temp()
+        with self.assertRaisesRegex(MODULE.SyncError, "reconciled before new mutation"):
+            MODULE._require_no_pending_unresolved_ticket_representations(self.fixture.home)
+        budget = MODULE.PendingCleanupActionBudget(1)
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.fixture.home, budget=budget), 1)
+        self.assertEqual((budget.consumed, budget.completed), (1, 1))
+        self.assertFalse(temp.exists())
+        self._assert_retired()
+
+    def _assert_publication_dry_run_is_read_only(self, operation) -> None:
+        protected = pending_authority_snapshot(self.fixture.home)
+        target = self.fixture.target
+        target_before = (target.stat().st_ino, target.stat().st_nlink, target.read_bytes())
+        output = io.StringIO()
+        with (
+            contextlib.redirect_stdout(output),
+            mock.patch.object(MODULE, "installation_lock", side_effect=AssertionError("dry-run acquired a lock")),
+            mock.patch.object(MODULE, "_promote_unconsumed_pending_terminal_directory_progress", side_effect=AssertionError("dry-run promoted progress")),
+            mock.patch.object(MODULE, "_publish_atomic_exclusive_internal_file", side_effect=AssertionError("dry-run published a control")),
+            mock.patch.object(MODULE, "_remove_pending_batch_directory_contents", side_effect=AssertionError("dry-run invoked the cleanup walker")),
+        ):
+            operation()
+        self.assertIn("would clean a finalized or interrupted pending transaction", output.getvalue())
+        self.assertEqual(pending_authority_snapshot(self.fixture.home), protected)
+        self.assertEqual((target.stat().st_ino, target.stat().st_nlink, target.read_bytes()), target_before)
+        self.assertFalse(self.receipt.exists())
+
+    def test_install_dry_run_observes_exact_progress_publication_temp(self) -> None:
+        self._stage_publication_temp()
+        self._assert_publication_dry_run_is_read_only(
+            lambda: MODULE.install_release_tree(
+                self.fixture.public, self.fixture.home, SHA_A, dry_run=True,
+            )
+        )
+
+    def test_install_dry_run_observes_canonical_unconsumed_progress(self) -> None:
+        self._stage_orphan()
+        self._assert_publication_dry_run_is_read_only(
+            lambda: MODULE.install_release_tree(
+                self.fixture.public, self.fixture.home, SHA_A, dry_run=True,
+            )
+        )
+
+    def test_uninstall_dry_run_observes_exact_progress_publication_temp(self) -> None:
+        self._stage_publication_temp()
+        self._assert_publication_dry_run_is_read_only(
+            lambda: MODULE.uninstall_overlay(self.fixture.home, "private", dry_run=True)
+        )
+
+    def test_uninstall_recovers_progress_temp_under_lock_with_shared_budget(self) -> None:
+        temp, _header = self._stage_publication_temp()
+        recover = MODULE._recover_unconsumed_pending_terminal_progress_publications
+        observations = []
+
+        def assert_locked_recovery(home, budget):
+            self.assertIsNotNone(MODULE._locked_sync_home_fd(home))
+            result = recover(home, budget)
+            observations.append((id(budget), budget.consumed, budget.completed))
+            return result
+
+        with mock.patch.object(MODULE, "_recover_unconsumed_pending_terminal_progress_publications", side_effect=assert_locked_recovery):
+            MODULE.uninstall_overlay(self.fixture.home, "private", dry_run=False)
+        self.assertTrue(observations)
+        self.assertEqual(len({row[0] for row in observations}), 1)
+        self.assertEqual(observations[-1][1:], (1, 1))
+        self.assertFalse(temp.exists())
+        self._assert_retired()
+
+    def test_dry_run_progress_temp_rejects_changed_authority_without_mutation(self) -> None:
+        for mutation in ("partial", "consumed", "marker", "hardlink", "foreign", "missing-ticket"):
+            with self.subTest(mutation=mutation):
+                case = DirectoryProgressPublicationRecoveryTests()
+                case.setUp()
+                try:
+                    temp, header = case._stage_publication_temp()
+                    if mutation == "partial":
+                        temp.write_bytes(header + b'{"slot":')
+                    elif mutation == "consumed":
+                        temp.write_bytes(header + MODULE._pending_directory_progress_line({"slot": 0}))
+                    elif mutation == "marker":
+                        marker = case.ticket.batch_root / Path(*case.ticket.marker_path.parts)
+                        marker.write_bytes(b"changed original marker\n")
+                    elif mutation == "hardlink":
+                        os.link(temp, case.fixture.root / "external-progress-alias")
+                    elif mutation == "foreign":
+                        temp.with_name(case.progress.name + ".foreign").write_bytes(b"foreign progress\n")
+                    else:
+                        case.ticket.path.unlink()
+                    before = pending_authority_snapshot(case.fixture.home)
+                    with self.assertRaises(MODULE.SyncError):
+                        MODULE.install_release_tree(
+                            case.fixture.public, case.fixture.home, SHA_A, dry_run=True,
+                        )
+                    self.assertEqual(pending_authority_snapshot(case.fixture.home), before)
+                finally:
+                    case.doCleanups()
+
+    def test_uninstall_progress_temp_rejects_foreign_receipt_before_recovery(self) -> None:
+        temp, _header = self._stage_publication_temp()
+        self.receipt.with_name(self.receipt.name + ".foreign").write_bytes(b"foreign receipt\n")
+        before = pending_authority_snapshot(self.fixture.home)
+        with self.assertRaises(MODULE.SyncError):
+            MODULE.uninstall_overlay(self.fixture.home, "private", dry_run=False)
+        self.assertEqual(pending_authority_snapshot(self.fixture.home), before)
+        self.assertTrue(temp.is_file())
+
+    def test_observed_publication_does_not_relax_mutation_fence(self) -> None:
+        self._stage_publication_temp()
+        before = pending_authority_snapshot(self.fixture.home)
+        observed = MODULE._observe_unconsumed_pending_terminal_progress_publications(self.fixture.home)
+        self.assertEqual(observed, frozenset({self.ticket.batch_root.name}))
+        with self.assertRaisesRegex(MODULE.SyncError, "cannot authorize mutation"):
+            MODULE._require_no_pending_unresolved_ticket_representations(
+                self.fixture.home, read_only_publication_batches=observed,
+            )
+        with self.assertRaisesRegex(MODULE.SyncError, "reconciled before new mutation"):
+            MODULE._require_no_pending_unresolved_ticket_representations(self.fixture.home)
+        self.assertEqual(pending_authority_snapshot(self.fixture.home), before)
+
+    def test_uninstall_publication_recovery_respects_zero_shared_budget(self) -> None:
+        self._stage_publication_temp()
+        before = pending_authority_snapshot(self.fixture.home)
+        budget = MODULE.PendingCleanupActionBudget(0)
+        with (
+            mock.patch.object(MODULE, "PendingCleanupActionBudget", return_value=budget),
+            self.assertRaises(MODULE.SyncError),
+        ):
+            MODULE.uninstall_overlay(self.fixture.home, "private", dry_run=False)
+        self.assertEqual((budget.consumed, budget.completed), (0, 0))
+        self.assertEqual(pending_authority_snapshot(self.fixture.home), before)
+
+    def test_publication_candidate_discovery_scans_names_once(self) -> None:
+        names = tuple(sorted(
+            name
+            for index in range(32)
+            for name in (
+                f"20261009T000000Z-123-{index + 1000}" + MODULE.PENDING_CLEANUP_TICKET_SUFFIX,
+                f"20261009T000000Z-123-{index + 1000}"
+                + MODULE.PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX,
+            )
+        ))
+        with (
+            mock.patch.object(MODULE, "_directory_member_names", return_value=names) as inventory,
+            mock.patch.object(MODULE, "_read_pending_cleanup_ticket") as read_ticket,
+        ):
+            candidates = MODULE._unconsumed_pending_terminal_progress_publication_candidates(self.fixture.home)
+        self.assertEqual(len(candidates), 32)
+        self.assertEqual(inventory.call_count, 1)
+        read_ticket.assert_not_called()
+
+    def test_partial_progress_temp_is_retained_without_receipt(self) -> None:
+        temp, header = self._stage_publication_temp()
+        temp.write_bytes(header + b'{"slot":')
+        protected = self._temp_protected(temp)
+        with self.assertRaisesRegex(MODULE.SyncError, "not an exact unconsumed header"):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertEqual(self._temp_protected(temp), protected)
+        self.assertFalse(self.receipt.exists())
+        self.assertFalse(self.progress.exists())
+
+    def test_progress_temp_and_canonical_are_ambiguous(self) -> None:
+        temp, header = self._stage_publication_temp()
+        self.progress.write_bytes(header)
+        self.progress.chmod(0o600)
+        protected = self._temp_protected(temp)
+        with self.assertRaisesRegex(MODULE.SyncError, "ambiguous related representations"):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertEqual(self._temp_protected(temp), protected)
+        self.assertEqual(self.progress.read_bytes(), header)
+        self.assertFalse(self.receipt.exists())
+
+    def test_progress_temp_external_hardlink_is_retained(self) -> None:
+        temp, _header = self._stage_publication_temp()
+        alias = self.fixture.root / "external-progress-temp-alias"
+        os.link(temp, alias)
+        protected = self._temp_protected(temp)
+        with self.assertRaisesRegex(MODULE.SyncError, "not an exact unconsumed header"):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertEqual(self._temp_protected(temp), protected)
+        self.assertTrue(alias.is_file())
+        self.assertFalse(self.receipt.exists())
+
+    def test_progress_temp_does_not_replace_original_marker_authority(self) -> None:
+        temp, _header = self._stage_publication_temp()
+        marker = self.ticket.batch_root / Path(*self.ticket.marker_path.parts)
+        marker.write_bytes(b"changed marker content\n")
+        protected = self._temp_protected(temp)
+        with self.assertRaisesRegex(MODULE.SyncError, "(control|marker|commit evidence).*(changed|authority)"):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertEqual(self._temp_protected(temp), protected)
+        self.assertFalse(self.progress.exists())
+        self.assertFalse(self.receipt.exists())
+
+    def test_progress_temp_content_changed_at_rename_precedes_walker(self) -> None:
+        temp, header = self._stage_publication_temp()
+        rename = MODULE._rename_noreplace_at
+
+        def mutate_at_progress_rename(source_fd, source, target_fd, target):
+            if source == temp.name and target == self.progress.name:
+                temp.write_bytes(header + MODULE._pending_directory_progress_line({"slot": 0}))
+            return rename(source_fd, source, target_fd, target)
+
+        target = self.fixture.target
+        target_before = (target.stat().st_ino, target.stat().st_nlink, target.read_bytes())
+        with (
+            mock.patch.object(MODULE, "_rename_noreplace_at", side_effect=mutate_at_progress_rename),
+            mock.patch.object(MODULE, "_remove_pending_batch_directory_contents") as walker,
+            self.assertRaisesRegex(MODULE.SyncError, "not an exact unconsumed header"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        walker.assert_not_called()
+        self.assertEqual(
+            (target.stat().st_ino, target.stat().st_nlink, target.read_bytes()), target_before,
+        )
+        self.assertTrue(self.ticket.path.is_file())
+        self.assertTrue(self.ticket.batch_root.is_dir())
+        self.assertFalse(self.receipt.exists())
+
+    def test_crash_after_temp_promotion_retries_canonical_header(self) -> None:
+        temp, _header = self._stage_publication_temp()
+        identity = (temp.stat().st_dev, temp.stat().st_ino)
+        rename = MODULE._rename_noreplace_at
+
+        def crash_after_progress_rename(source_fd, source, target_fd, target):
+            result = rename(source_fd, source, target_fd, target)
+            if source == temp.name and target == self.progress.name:
+                raise SystemExit("injected promoted progress before receipt")
+            return result
+
+        with (
+            mock.patch.object(MODULE, "_rename_noreplace_at", side_effect=crash_after_progress_rename),
+            self.assertRaisesRegex(SystemExit, "promoted progress before receipt"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertFalse(temp.exists())
+        self.assertEqual((self.progress.stat().st_dev, self.progress.stat().st_ino), identity)
+        self.assertFalse(self.receipt.exists())
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket))
+        self._assert_retired()
+
+    def _reject_without_deletion(self, message: str) -> None:
+        protected = self._protected()
+        with self.assertRaisesRegex(MODULE.SyncError, message):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertEqual(self._protected(), protected)
+        self.assertFalse(self.receipt.exists())
+        self.assertTrue(self.ticket.path.is_file())
+
+    def _assert_retired(self) -> None:
+        self.assertFalse(self.ticket.path.exists())
+        self.assertFalse(self.ticket.batch_root.exists())
+        self.assertFalse(self.progress.exists())
+        self.assertFalse(self.receipt.exists())
+        self.assertEqual(self.fixture.target.read_text(), PUBLIC_PAYLOAD)
+        self.assertEqual(self.fixture.target.stat().st_nlink, 1)
+
+    def test_durable_header_before_receipt_retries_without_reset(self) -> None:
+        self._stage_orphan()
+        original_identity = (self.progress.stat().st_dev, self.progress.stat().st_ino)
+        publish = MODULE._publish_atomic_exclusive_internal_file
+
+        def confirm_original_progress(home, path, payload, **kwargs):
+            self.assertNotEqual(path, self.progress)
+            if path == self.receipt:
+                actual = self.progress.stat()
+                self.assertEqual((actual.st_dev, actual.st_ino), original_identity)
+            return publish(home, path, payload, **kwargs)
+
+        with mock.patch.object(
+            MODULE, "_publish_atomic_exclusive_internal_file",
+            side_effect=confirm_original_progress,
+        ):
+            self.assertTrue(MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket))
+        self._assert_retired()
+
+    def test_native_install_preflight_recovers_before_global_mutation_fence(self) -> None:
+        self._stage_orphan()
+        with self.assertRaisesRegex(MODULE.SyncError, "reconciled before new mutation"):
+            MODULE._require_no_pending_unresolved_ticket_representations(self.fixture.home)
+        MODULE._preflight_pending_recovery(self.fixture.home, dry_run=False)
+        self._assert_retired()
+
+    def test_cleanup_entrypoint_recovers_with_one_shared_batch_budget(self) -> None:
+        self._stage_orphan()
+        budget = MODULE.PendingCleanupActionBudget(1)
+        self.assertEqual(
+            MODULE._cleanup_ready_pending_batches(self.fixture.home, budget=budget), 1,
+        )
+        self.assertEqual(budget.consumed, 1)
+        self.assertEqual(budget.completed, 1)
+        self._assert_retired()
+
+    def test_pre_receipt_partial_record_is_not_empty_history(self) -> None:
+        header = self._stage_orphan()
+        self.progress.write_bytes(header + b'{"slot":')
+        self._reject_without_deletion("not an exact unconsumed header")
+
+    def test_pre_receipt_valid_consumption_record_is_not_empty_history(self) -> None:
+        header = self._stage_orphan()
+        self.progress.write_bytes(header + MODULE._pending_directory_progress_line({"slot": 0}))
+        self._reject_without_deletion("not an exact unconsumed header")
+
+    def test_pre_receipt_wrong_ticket_header_is_retained(self) -> None:
+        payload = json.loads(self._stage_orphan())
+        payload["ticket_sha256"] = "0" * 64
+        self.progress.write_bytes(
+            MODULE._pending_directory_progress_line(
+                payload, maximum_bytes=MODULE.MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+            )
+        )
+        self._reject_without_deletion("not an exact unconsumed header")
+
+    def test_pre_receipt_related_representation_is_retained(self) -> None:
+        self._stage_orphan()
+        extra = self.progress.with_name(self.progress.name + ".tmp")
+        extra.write_bytes(b"unrelated retained evidence\n")
+        extra.chmod(0o600)
+        self._reject_without_deletion(
+            "ticket representation must be reconciled before new mutation",
+        )
+        self.assertEqual(extra.read_bytes(), b"unrelated retained evidence\n")
+
+    def test_pre_receipt_original_marker_content_must_still_match_ticket(self) -> None:
+        self._stage_orphan()
+        marker = self.ticket.batch_root / Path(*self.ticket.marker_path.parts)
+        marker.write_bytes(b"changed marker content\n")
+        self._reject_without_deletion("(control|marker|commit evidence).*(changed|authority)")
+
+    def test_pre_receipt_original_metadata_content_must_still_match_ticket(self) -> None:
+        self._stage_orphan()
+        metadata = self.ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        metadata.write_bytes(b"changed metadata content\n")
+        self._reject_without_deletion("transaction metadata changed")
+
+    def test_pre_receipt_directory_replacement_is_not_new_authority(self) -> None:
+        self._stage_orphan()
+        original = self.ticket.batch_root / "pending" / "stage"
+        preserved = self.fixture.root / "stage-preserved"
+        original.rename(preserved)
+        original.mkdir(mode=0o700)
+        for entry in preserved.iterdir():
+            entry.rename(original / entry.name)
+        self._reject_without_deletion("(namespace|alias).*(changed|authority)")
+
+    def test_legacy_orphan_without_commit_content_authority_is_retained(self) -> None:
+        header = json.loads(self._stage_orphan())
+        payload = json.loads(self.ticket.path.read_bytes())
+        payload.pop("commit_evidence")
+        self.fixture._rewrite_ticket_same_inode(self.ticket, payload)
+        self.ticket = MODULE._read_pending_cleanup_ticket(self.fixture.home, self.ticket.path)
+        self.assertIsNotNone(self.ticket)
+        header["ticket_sha256"] = hashlib.sha256(self.ticket.snapshot.payload).hexdigest()
+        self.progress.write_bytes(
+            MODULE._pending_directory_progress_line(
+                header, maximum_bytes=MODULE.MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+            )
+        )
+        self._reject_without_deletion("lacks original ticket authority")
+
+    def test_progress_replacement_during_receipt_publication_precedes_walker(self) -> None:
+        header = self._stage_orphan()
+        publish = MODULE._publish_atomic_exclusive_internal_file
+
+        def replace_progress(home, path, payload, **kwargs):
+            result = publish(home, path, payload, **kwargs)
+            if path == self.receipt:
+                original = self.progress.with_name("saved-original-progress")
+                self.progress.rename(original)
+                self.progress.write_bytes(header)
+                self.progress.chmod(0o600)
+            return result
+
+        target = self.fixture.target
+        original_target = (target.stat().st_ino, target.stat().st_nlink, target.read_bytes())
+        with (
+            mock.patch.object(
+                MODULE, "_publish_atomic_exclusive_internal_file", side_effect=replace_progress,
+            ),
+            mock.patch.object(MODULE, "_remove_pending_batch_directory_contents") as walker,
+            self.assertRaisesRegex(MODULE.SyncError, "progress changed during receipt publication"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        walker.assert_not_called()
+        self.assertTrue(self.receipt.exists())
+        self.assertTrue(self.ticket.path.is_file())
+        self.assertTrue(self.ticket.batch_root.is_dir())
+        self.assertEqual(
+            (target.stat().st_ino, target.stat().st_nlink, target.read_bytes()), original_target,
+        )
+
+
+class PreflightLockedRecoveryRegressions(unittest.TestCase):
+    def setUp(self):
+        self.temp_directory = tempfile.TemporaryDirectory(prefix="codex-preflight-lock-")
+        self.addCleanup(self.temp_directory.cleanup)
+        self.home = Path(self.temp_directory.name) / "home"
+        self.home.mkdir()
+
+    def _stub_preflight_pipeline(
+        self, *, recovery_callback=None, fence_callback=None, observed_pending=True,
+    ):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(mock.patch.object(
+            MODULE, "_pending_recovery_is_observed", return_value=observed_pending,
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_revalidate_active_scheduler_attempt_unlocked", return_value=None,
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_recover_unconsumed_pending_terminal_progress_publications",
+            side_effect=recovery_callback or (lambda _home, _budget: None),
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_require_no_pending_unresolved_ticket_representations",
+            side_effect=fence_callback or (lambda _home, **_observation_options: None),
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_recover_failed_move_isolation", return_value=False,
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_recover_release_retention_transaction", return_value=None,
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_cleanup_ready_pending_batches", return_value=0,
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_load_managed_state_with_snapshot", return_value=(object(), object()),
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_recover_pending_link_transaction",
+            side_effect=lambda _home, state, snapshot, *, dry_run: (state, snapshot, False),
+        ))
+        return stack
+
+    def test_recovery_and_global_fence_run_under_same_lock_in_order(self):
+        events = []
+        lock_observations = []
+
+        def recover(_home, _budget):
+            events.append("recovery")
+            lock_observations.append(MODULE._locked_sync_home_fd(self.home) is not None)
+
+        def fence(_home):
+            events.append("fence")
+            lock_observations.append(MODULE._locked_sync_home_fd(self.home) is not None)
+
+        self._stub_preflight_pipeline(recovery_callback=recover, fence_callback=fence)
+        self.assertFalse(MODULE._preflight_pending_recovery(self.home, dry_run=False))
+        self.assertEqual(events, ["recovery", "fence"])
+        self.assertEqual(lock_observations, [True, True])
+
+    def test_competing_install_lock_prevents_preflight_recovery_mutation(self):
+        attempted = threading.Event()
+        recovery_started = threading.Event()
+        completed = threading.Event()
+        lock_observations = []
+        thread_errors = []
+
+        def recover(_home, _budget):
+            lock_observations.append(MODULE._locked_sync_home_fd(self.home) is not None)
+            recovery_started.set()
+
+        self._stub_preflight_pipeline(recovery_callback=recover)
+
+        def run_preflight():
+            attempted.set()
+            try:
+                MODULE._preflight_pending_recovery(self.home, dry_run=False)
+            except BaseException as error:
+                thread_errors.append(error)
+            finally:
+                completed.set()
+
+        with MODULE.installation_lock(self.home):
+            worker = threading.Thread(target=run_preflight, daemon=True)
+            worker.start()
+            self.assertTrue(attempted.wait(timeout=2))
+            self.assertFalse(recovery_started.wait(timeout=0.2))
+            self.assertFalse(completed.is_set())
+        self.assertTrue(recovery_started.wait(timeout=2))
+        self.assertTrue(completed.wait(timeout=2))
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(thread_errors, [])
+        self.assertEqual(lock_observations, [True])
+
+    def test_dry_run_does_not_acquire_lock_or_call_mutating_recovery(self):
+        recovery_calls = []
+        cleanup_calls = []
+        failed_move_calls = []
+        retention_calls = []
+        pending_calls = []
+        stack = self._stub_preflight_pipeline(
+            recovery_callback=lambda *_args: recovery_calls.append("publication"),
+        )
+        stack.enter_context(mock.patch.object(
+            MODULE, "installation_lock",
+            side_effect=AssertionError("dry-run must not acquire installation lock"),
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_cleanup_ready_pending_batches",
+            side_effect=lambda *_args, **_kwargs: cleanup_calls.append("cleanup"),
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_recover_failed_move_isolation",
+            side_effect=lambda _home, *, dry_run: (failed_move_calls.append(dry_run) or False),
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_recover_release_retention_transaction",
+            side_effect=lambda _home, *, dry_run: (retention_calls.append(dry_run) or None),
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_recover_pending_link_transaction",
+            side_effect=lambda _home, state, snapshot, *, dry_run: (
+                pending_calls.append(dry_run) or (state, snapshot, False)
+            ),
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_pending_cleanup_ready_batch_is_observed", return_value=False,
+        ))
+        self.assertFalse(MODULE._preflight_pending_recovery(self.home, dry_run=True))
+        self.assertEqual(recovery_calls, [])
+        self.assertEqual(cleanup_calls, [])
+        self.assertEqual(failed_move_calls, [True])
+        self.assertEqual(retention_calls, [True])
+        self.assertEqual(pending_calls, [True])
+
+    def test_absent_or_empty_home_preflight_does_not_create_lock_paths(self):
+        absent_home = self.home / "absent"
+        for home in (absent_home, self.home):
+            with self.subTest(home=home), mock.patch.object(
+                MODULE, "installation_lock",
+                side_effect=AssertionError("no pending state must not create a lock"),
+            ):
+                self.assertFalse(MODULE._preflight_pending_recovery(home, dry_run=False))
+                self.assertFalse((home / "personal-sync").exists())
+        self.assertFalse(absent_home.exists())
+
+    def test_observation_does_not_classify_progress_temp_as_cleanup_authority(self):
+        index_root = MODULE._pending_cleanup_index_path(self.home)
+        index_root.mkdir(parents=True, mode=0o700)
+        residue = index_root / "batch-one.directory-progress.publish-tmp"
+        residue.write_bytes(b"not authoritative")
+        with mock.patch.object(
+            MODULE, "_pending_cleanup_ready_batch_is_observed",
+            side_effect=AssertionError("observation must not admit or reject recovery bytes"),
+        ):
+            self.assertTrue(MODULE._pending_recovery_is_observed(self.home))
+        self.assertEqual(residue.read_bytes(), b"not authoritative")
+        self.assertFalse((self.home / "personal-sync" / "install.lock").exists())
+
+    def test_observation_propagates_unreadable_index_instead_of_reporting_absence(self):
+        with mock.patch.object(
+            MODULE, "_open_directory_beneath", side_effect=PermissionError("unreadable"),
+        ), mock.patch.object(
+            MODULE, "installation_lock",
+            side_effect=AssertionError("failed observation must not create a lock"),
+        ):
+            with self.assertRaises(PermissionError):
+                MODULE._preflight_pending_recovery(self.home, dry_run=False)
+
+    def test_unlocked_recovery_rejects_caller_without_installation_lock(self):
+        with self.assertRaisesRegex(MODULE.SyncError, "requires the installation lock"):
+            MODULE._recover_pending_state_unlocked(
+                self.home, MODULE.PendingCleanupActionBudget(1),
+            )
+
+    def test_observation_rejects_linked_index_without_following_target(self):
+        index_root = MODULE._pending_cleanup_index_path(self.home)
+        index_root.parent.mkdir(parents=True, mode=0o700)
+        foreign = self.home.parent / "foreign-index"
+        foreign.mkdir()
+        sentinel = foreign / "keep"
+        sentinel.write_bytes(b"foreign")
+        index_root.symlink_to(foreign, target_is_directory=True)
+        with self.assertRaises((MODULE.SyncError, OSError)):
+            MODULE._pending_recovery_is_observed(self.home)
+        self.assertEqual(sentinel.read_bytes(), b"foreign")
+        self.assertTrue(index_root.is_symlink())
+        self.assertFalse((self.home / "personal-sync" / "install.lock").exists())
+
+    def test_install_rechecks_new_pending_state_under_final_lock(self):
+        source_root = self.home.parent / "release"
+        write_non_regular_release(source_root)
+        events = []
+        residue = MODULE._pending_cleanup_index_path(self.home) / "pending-after-preflight"
+
+        def recover(_home, _budget):
+            self.assertIsNotNone(MODULE._locked_sync_home_fd(self.home))
+            self.assertTrue(residue.exists())
+            residue.unlink()
+            events.append("recovery")
+
+        def fence(_home):
+            self.assertIsNotNone(MODULE._locked_sync_home_fd(self.home))
+            self.assertFalse(residue.exists())
+            events.append("fence")
+
+        def install_step(_home, _releases, *, dry_run, **_kwargs):
+            if dry_run:
+                self.assertIsNone(MODULE._locked_sync_home_fd(self.home))
+                residue.parent.mkdir(parents=True, mode=0o700)
+                residue.write_bytes(b"pending")
+                events.append("plan")
+            else:
+                self.assertIsNotNone(MODULE._locked_sync_home_fd(self.home))
+                self.assertFalse(residue.exists())
+                events.append("install")
+
+        self._stub_preflight_pipeline(
+            recovery_callback=recover, fence_callback=fence, observed_pending=False,
+        )
+        with mock.patch.object(MODULE, "_install_release_set_unlocked", side_effect=install_step):
+            MODULE.install_release_tree(source_root, self.home, SHA_A, dry_run=False)
+        self.assertEqual(events, ["plan", "recovery", "fence", "install"])
+
+    def test_private_install_rechecks_recovery_under_final_lock(self):
+        base_root = self.home.parent / "base-release"
+        overlay_root = self.home.parent / "overlay-release"
+        write_non_regular_release(base_root)
+        write_non_regular_release(overlay_root, owner="private", base_sha=SHA_A)
+        base_release = mock.Mock(
+            release_root=base_root,
+            release_expectation=MODULE._source_release_identity(base_root, None),
+            assets=mock.Mock(sha=SHA_A),
+        )
+        overlay_release = mock.Mock(
+            release_root=overlay_root,
+            release_expectation=MODULE._source_release_identity(overlay_root, None),
+            assets=mock.Mock(sha=SHA_B),
+        )
+        events = []
+
+        def recover(_home, _budget):
+            self.assertIsNotNone(MODULE._locked_sync_home_fd(self.home))
+            events.append("recovery")
+
+        def fence(_home):
+            self.assertIsNotNone(MODULE._locked_sync_home_fd(self.home))
+            events.append("fence")
+
+        def install_step(_home, _releases, *, dry_run, **_kwargs):
+            self.assertFalse(dry_run)
+            self.assertIsNotNone(MODULE._locked_sync_home_fd(self.home))
+            events.append("install")
+
+        self._stub_preflight_pipeline(
+            recovery_callback=recover, fence_callback=fence, observed_pending=False,
+        )
+        with mock.patch.object(
+            MODULE, "download_and_extract_release",
+            side_effect=[overlay_release, base_release],
+        ), mock.patch.object(MODULE, "_install_release_set_unlocked", side_effect=install_step):
+            MODULE.install_private_from_github(
+                "Joey-Tools/codex-private-workflows", self.home,
+                base_repo="Joey-Tools/codex-toolbox", owner="private", dry_run=False,
+            )
+        self.assertEqual(events, ["recovery", "fence", "install"])
+
+
+class DirectoryProgressRegressionTests(unittest.TestCase):
+    """Focused v5 progress regressions composed with the canonical fixture."""
+
+    def setUp(self) -> None:
+        self.fixture = RegularOverlayUninstallFinalizationTests(methodName="runTest")
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.tearDown)
+        self.ticket = self.fixture._deferred_terminal_ticket()
+        self._ensure_v5_receipt()
+
+    def _ensure_v5_receipt(self) -> None:
+        ticket = self.ticket
+        quarantine_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            ticket.batch_root.parent,
+        )
+        batch_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            ticket.batch_root,
+        )
+        try:
+            MODULE._ensure_pending_terminal_validation_receipt(
+                self.fixture.home,
+                ticket,
+                ticket.batch_root,
+                batch_fd,
+                MODULE._directory_identity(quarantine_fd),
+                namespace_anchor_sha256=ticket.terminal_namespace_sha256,
+            )
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+            MODULE._close_fd_quietly(quarantine_fd)
+
+    def _progress_context(self):
+        ticket = self.ticket
+        quarantine_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            ticket.batch_root.parent,
+        )
+        try:
+            quarantine_identity = MODULE._directory_identity(quarantine_fd)
+            receipt = MODULE._read_pending_cleanup_terminal_validation(
+                self.fixture.home,
+                ticket,
+                quarantine_identity,
+            )
+            self.assertIsNotNone(receipt)
+            authority = MODULE._parse_pending_terminal_validation_authority(
+                self.fixture.home,
+                ticket,
+                quarantine_identity,
+                receipt,
+            )
+        finally:
+            MODULE._close_fd_quietly(quarantine_fd)
+        self.assertIsNotNone(authority)
+        self.assertIsNotNone(authority.directory_progress)
+        return quarantine_identity, authority
+
+    def _protected_snapshot(self):
+        home = self.fixture.home
+        batch_name = self.ticket.batch_root.name
+        target = self.fixture.target
+        metadata = target.lstat()
+        payload = (
+            os.readlink(target)
+            if stat.S_ISLNK(metadata.st_mode)
+            else target.read_bytes()
+        )
+        def optional_payload(path):
+            return path.read_bytes() if path.exists() else None
+
+        return (
+            self.ticket.path.read_bytes(),
+            optional_payload(
+                MODULE._pending_cleanup_terminal_validation_path(home, batch_name)
+            ),
+            optional_payload(MODULE._pending_cleanup_empty_proof_path(home, batch_name)),
+            (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_uid,
+                metadata.st_nlink,
+                metadata.st_size,
+                payload,
+            ),
+        )
+
+    def _assert_protected_snapshot_unchanged(self, expected) -> None:
+        self.assertEqual(self._protected_snapshot(), expected)
+
+    def _expect_manual_recovery_without_authority_loss(self, message: str) -> None:
+        protected = self._protected_snapshot()
+        with self.assertRaisesRegex(MODULE.SyncError, message):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self._assert_protected_snapshot_unchanged(protected)
+        self.assertTrue(self.ticket.path.is_file())
+        self.assertTrue(self.ticket.batch_root.is_dir())
+
+    def _bounded_parser_limit_records(self) -> list[tuple[str, bytes]]:
+        records = []
+        integer_limit = getattr(sys, "get_int_max_str_digits", lambda: 0)()
+        if (
+            integer_limit
+            and integer_limit + 12
+            <= MODULE.MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_LINE_BYTES
+        ):
+            records.append(
+                ("integer-limit", b'{"slot":' + b"1" * (integer_limit + 1) + b"}\n")
+            )
+        depth = sys.getrecursionlimit() + 1
+        if (
+            depth * 2 + 12
+            <= MODULE.MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_LINE_BYTES
+        ):
+            line = b'{"slot":' + b"[" * depth + b"0" + b"]" * depth + b"}\n"
+            try:
+                json.loads(line.decode("utf-8"))
+            except RecursionError:
+                records.append(("recursion-limit", line))
+        if not records:
+            self.skipTest("runtime parser limits exceed the bounded progress record size")
+        return records
+
+    def test_parser_recursion_errors_preserve_recovery_authority(self) -> None:
+        identity, authority, cursor = self._progress_cursor()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home, self.ticket.batch_root.name,
+        )
+        line = MODULE._pending_directory_progress_line({"slot": 0})
+        progress_path.write_bytes(progress_path.read_bytes() + line)
+        expected_payload = progress_path.read_bytes()
+        index_fd = MODULE._open_directory_beneath(
+            self.fixture.home, progress_path.parent,
+        )
+        try:
+            snapshot = MODULE._read_managed_state_file_snapshot(
+                self.fixture.home,
+                progress_path,
+                index_fd,
+                expected_identity=authority.directory_progress.file_identity,
+                maximum_bytes=MODULE.MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+            )
+        finally:
+            MODULE._close_fd_quietly(index_fd)
+        protected = self._protected_snapshot()
+        for parser in ("payload", "suffix"):
+            with self.subTest(parser=parser):
+                error = RecursionError("bounded progress parser runtime limit")
+                consumed = set()
+                with (
+                    mock.patch.object(MODULE.json, "loads", side_effect=error),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError, "progress is malformed",
+                    ) as caught,
+                ):
+                    if parser == "payload":
+                        MODULE._parse_pending_terminal_directory_progress_payload(
+                            self.ticket, identity, authority, snapshot,
+                        )
+                    else:
+                        MODULE._parse_pending_terminal_directory_progress_suffix(
+                            self.ticket, cursor.directories, consumed, line,
+                        )
+                self.assertIs(caught.exception.__cause__, error)
+                self.assertEqual(consumed, set())
+                self._assert_protected_snapshot_unchanged(protected)
+                self.assertEqual(progress_path.read_bytes(), expected_payload)
+
+    def test_progress_parser_limits_preserve_recovery_authority(self) -> None:
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home, self.ticket.batch_root.name,
+        )
+        original = progress_path.read_bytes()
+        protected = self._protected_snapshot()
+        for label, line in self._bounded_parser_limit_records():
+            with self.subTest(limit=label):
+                self.assertLessEqual(len(line), MODULE.MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_LINE_BYTES)
+                with self.assertRaises((ValueError, RecursionError)):
+                    json.loads(line.decode("utf-8"))
+                progress_path.write_bytes(original + line)
+                try:
+                    with self.assertRaisesRegex(MODULE.SyncError, "progress is malformed") as caught:
+                        MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+                    self.assertIsInstance(caught.exception.__cause__, (ValueError, RecursionError))
+                    self._assert_protected_snapshot_unchanged(protected)
+                    self.assertTrue(self.ticket.path.is_file())
+                    self.assertTrue(self.ticket.batch_root.is_dir())
+                    self.assertEqual(progress_path.read_bytes(), original + line)
+                finally:
+                    progress_path.write_bytes(original)
+
+    def test_suffix_parser_limits_do_not_change_consumed_history(self) -> None:
+        _identity, _authority, cursor = self._progress_cursor()
+        protected = self._protected_snapshot()
+        for label, line in self._bounded_parser_limit_records():
+            with self.subTest(limit=label):
+                consumed = {0}
+                with self.assertRaisesRegex(MODULE.SyncError, "progress is malformed") as caught:
+                    MODULE._parse_pending_terminal_directory_progress_suffix(
+                        self.ticket, cursor.directories, consumed, line,
+                    )
+                self.assertIsInstance(caught.exception.__cause__, (ValueError, RecursionError))
+                self.assertEqual(consumed, {0})
+                self._assert_protected_snapshot_unchanged(protected)
+
+    def test_progress_parsers_accept_valid_canonical_slot(self) -> None:
+        identity, authority, cursor = self._progress_cursor()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home, self.ticket.batch_root.name,
+        )
+        line = MODULE._pending_directory_progress_line({"slot": 0})
+        with progress_path.open("ab") as stream:
+            stream.write(line)
+            stream.flush()
+            os.fsync(stream.fileno())
+        state = MODULE._read_pending_terminal_directory_progress(
+            self.fixture.home, self.ticket, identity, authority,
+        )
+        self.assertEqual(state.consumed_slots, frozenset({0}))
+        consumed = set()
+        self.assertEqual(
+            MODULE._parse_pending_terminal_directory_progress_suffix(
+                self.ticket, cursor.directories, consumed, line,
+            ),
+            (0,),
+        )
+        self.assertEqual(consumed, {0})
+
+    def _synthetic_control_index_names(self, *, retained=False):
+        names = []
+        for index in range(32):
+            batch = f"20261009T000000Z-123-{1000 + index}"
+            ticket = batch + MODULE.PENDING_CLEANUP_TICKET_SUFFIX
+            progress = batch + MODULE.PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+            if retained:
+                ticket = f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}{ticket}-123-{index:016x}"
+                progress = f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}{progress}-123-{index:016x}"
+            names.extend((ticket, progress, batch + MODULE.PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX))
+        return tuple(sorted(names))
+
+    def _assert_linear_control_classification(self, *, retained):
+        names = self._synthetic_control_index_names(retained=retained)
+        with (
+            mock.patch.object(MODULE, "_directory_member_names", return_value=names),
+            mock.patch.object(
+                MODULE, "_pending_cleanup_retained_canonical_name",
+                wraps=MODULE._pending_cleanup_retained_canonical_name,
+            ) as classify,
+        ):
+            self.assertIsNone(MODULE._pending_cleanup_unresolved_ticket_representation_issue(self.fixture.home))
+        self.assertLessEqual(classify.call_count, 8 * len(names))
+
+    def test_control_index_classification_is_linear_for_canonical_batches(self) -> None:
+        self._assert_linear_control_classification(retained=False)
+
+    def test_control_index_classification_is_linear_for_retained_batches(self) -> None:
+        self._assert_linear_control_classification(retained=True)
+
+    def test_control_index_missing_ticket_or_receipt_remains_blocking(self) -> None:
+        batch = "20261009T000000Z-123-1000"
+        progress = batch + MODULE.PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+        for present in (MODULE.PENDING_CLEANUP_TICKET_SUFFIX, MODULE.PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX):
+            with self.subTest(present=present), mock.patch.object(
+                MODULE, "_directory_member_names", return_value=tuple(sorted((progress, batch + present))),
+            ):
+                self.assertEqual(
+                    MODULE._pending_cleanup_unresolved_ticket_representation_issue(self.fixture.home),
+                    (batch, progress),
+                )
+
+    def test_consumed_root_slot_present_rejects_original_root_identity(self) -> None:
+        quarantine_identity, authority, cursor = self._progress_cursor()
+        batch_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            self.ticket.batch_root,
+        )
+        try:
+            self.assertEqual(
+                MODULE._directory_identity(batch_fd),
+                self.ticket.batch_root_identity,
+            )
+            MODULE._append_pending_terminal_directory_consumption(
+                self.fixture.home,
+                self.ticket,
+                quarantine_identity,
+                authority,
+                MODULE.PurePosixPath(),
+                batch_fd,
+                set(),
+                cursor,
+            )
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+
+        progress = MODULE._read_pending_terminal_directory_progress(
+            self.fixture.home,
+            self.ticket,
+            quarantine_identity,
+            authority,
+        )
+        self.assertIsNotNone(progress)
+        assert progress is not None
+        self.assertEqual(progress.consumed_slots, frozenset({0}))
+        root_stat = self.ticket.batch_root.stat()
+        self.assertEqual(
+            (root_stat.st_dev, root_stat.st_ino),
+            self.ticket.batch_root_identity,
+        )
+        batch_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            self.ticket.batch_root,
+        )
+        try:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal batch-root slot was already consumed but a root is present",
+            ):
+                MODULE._require_pending_terminal_consumed_directories_absent(
+                    self.ticket,
+                    batch_fd,
+                    authority,
+                    progress,
+                )
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+
+    def test_consumed_control_only_directory_slot_rejects_original_identity(
+        self,
+    ) -> None:
+        quarantine_identity, authority, cursor = self._progress_cursor()
+        logical_path = MODULE.PurePosixPath("pending/evidence")
+        directory = self.ticket.batch_root / Path(*logical_path.parts)
+        contents = tuple(directory.iterdir())
+        self.assertEqual(len(contents), 1)
+        self.assertTrue(contents[0].is_file())
+        original_identity = (directory.stat().st_dev, directory.stat().st_ino)
+        directory_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            directory,
+        )
+        try:
+            self.assertEqual(
+                MODULE._directory_identity(directory_fd),
+                original_identity,
+            )
+            MODULE._append_pending_terminal_directory_consumption(
+                self.fixture.home,
+                self.ticket,
+                quarantine_identity,
+                authority,
+                logical_path,
+                directory_fd,
+                set(),
+                cursor,
+            )
+        finally:
+            MODULE._close_fd_quietly(directory_fd)
+
+        progress = MODULE._read_pending_terminal_directory_progress(
+            self.fixture.home,
+            self.ticket,
+            quarantine_identity,
+            authority,
+        )
+        self.assertIsNotNone(progress)
+        assert progress is not None
+        directories = MODULE._pending_terminal_directory_progress_directories(
+            authority.directories,
+            authority.namespace_entries or (),
+        )
+        slot = next(
+            index
+            for index, item in enumerate(directories, start=1)
+            if item.path == logical_path
+        )
+        self.assertIn(slot, progress.consumed_slots)
+        self.assertEqual(
+            (directory.stat().st_dev, directory.stat().st_ino),
+            original_identity,
+        )
+        batch_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            self.ticket.batch_root,
+        )
+        try:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal directory slot was already consumed but is present again",
+            ):
+                MODULE._require_pending_terminal_consumed_directories_absent(
+                    self.ticket,
+                    batch_fd,
+                    authority,
+                    progress,
+                )
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+
+    def test_pre_rmdir_crash_persists_intent_and_rejects_without_scanning(self) -> None:
+        quarantine_identity, authority = self._progress_context()
+        logical_path = MODULE.PurePosixPath("pending/stage")
+        directory = self.ticket.batch_root / Path(*logical_path.parts)
+        original_identity = (directory.stat().st_dev, directory.stat().st_ino)
+        progress_identity = authority.directory_progress.file_identity
+        real_rmdir = os.rmdir
+        real_fsync = os.fsync
+        rmdir_intercepted = []
+        progress_fsyncs = []
+
+        def track_progress_fsync(file_descriptor: int) -> None:
+            metadata = os.fstat(file_descriptor)
+            if (metadata.st_dev, metadata.st_ino) == progress_identity:
+                progress_fsyncs.append(True)
+            real_fsync(file_descriptor)
+
+        def crash_before_exact_rmdir(path, *args, dir_fd=None, **kwargs) -> None:
+            if dir_fd is not None:
+                current = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) == original_identity:
+                    rmdir_intercepted.append(os.fsdecode(path))
+                    raise SystemExit("injected before bound directory rmdir")
+            real_rmdir(path, *args, dir_fd=dir_fd, **kwargs)
+
+        with (
+            mock.patch.object(MODULE.os, "fsync", side_effect=track_progress_fsync),
+            mock.patch.object(MODULE.os, "rmdir", side_effect=crash_before_exact_rmdir),
+            self.assertRaisesRegex(SystemExit, "before bound directory rmdir"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+
+        self.assertTrue(rmdir_intercepted)
+        self.assertTrue(progress_fsyncs)
+        pending_active = self.fixture._active_batch_child(
+            self.ticket,
+            "pending",
+        )
+        pending_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            pending_active,
+        )
+        try:
+            pending_identity = MODULE._directory_identity(pending_fd)
+        finally:
+            MODULE._close_fd_quietly(pending_fd)
+        matching_directories = []
+        for candidate in pending_active.iterdir():
+            metadata = candidate.lstat()
+            binding = MODULE._pending_cleanup_active_entry_binding(
+                candidate.name,
+                pending_identity,
+            )
+            if binding is not None and binding[1] == "stage" and stat.S_ISDIR(metadata.st_mode) and (
+                metadata.st_dev,
+                metadata.st_ino,
+            ) == original_identity:
+                matching_directories.append(candidate)
+        self.assertEqual(len(matching_directories), 1)
+        retained_directory = matching_directories[0]
+        progress = MODULE._read_pending_terminal_directory_progress(
+            self.fixture.home,
+            self.ticket,
+            quarantine_identity,
+            authority,
+        )
+        self.assertIsNotNone(progress)
+        assert progress is not None
+        directories = MODULE._pending_terminal_directory_progress_directories(
+            authority.directories,
+            authority.namespace_entries or (),
+        )
+        slot = next(
+            index
+            for index, item in enumerate(directories, start=1)
+            if item.path == logical_path
+        )
+        self.assertIn(slot, progress.consumed_slots)
+
+        foreign = retained_directory / "foreign-child.txt"
+        foreign.write_text("must remain untouched\n", encoding="utf-8")
+        foreign.chmod(0o600)
+        real_scandir = os.scandir
+        scanned_consumed_directory = []
+
+        def track_scandir(directory_fd):
+            if isinstance(directory_fd, int):
+                metadata = os.fstat(directory_fd)
+                if (metadata.st_dev, metadata.st_ino) == original_identity:
+                    scanned_consumed_directory.append(True)
+            return real_scandir(directory_fd)
+
+        protected = self._protected_snapshot()
+        with (
+            mock.patch.object(MODULE.os, "scandir", side_effect=track_scandir),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal directory slot was already consumed but is present again; manual recovery is required: pending/stage",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertFalse(scanned_consumed_directory)
+        self.assertTrue(foreign.is_file())
+        self._assert_protected_snapshot_unchanged(protected)
+
+    def test_missing_progress_preserves_ticket_receipt_and_target(self) -> None:
+        self._progress_context()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        progress_path.unlink()
+        self._expect_manual_recovery_without_authority_loss(
+            "pending terminal directory progress is missing; manual recovery is required"
+        )
+
+    def test_partial_progress_preserves_ticket_receipt_and_target(self) -> None:
+        self._progress_context()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        with progress_path.open("ab") as stream:
+            stream.write(b'{"slot":')
+            stream.flush()
+            os.fsync(stream.fileno())
+        self._expect_manual_recovery_without_authority_loss(
+            "pending terminal directory progress is truncated"
+        )
+
+    def test_replaced_progress_preserves_ticket_receipt_and_target(self) -> None:
+        _quarantine_identity, authority = self._progress_context()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        original_identity = authority.directory_progress.file_identity
+        original_payload = progress_path.read_bytes()
+        retained = self.fixture.home / "retained-original-progress"
+        progress_path.rename(retained)
+        progress_path.write_bytes(original_payload)
+        progress_path.chmod(0o600)
+        replacement = progress_path.stat()
+        self.assertNotEqual(
+            (replacement.st_dev, replacement.st_ino),
+            original_identity,
+        )
+        self._expect_manual_recovery_without_authority_loss("changed")
+
+    def test_progress_header_mutation_preserves_ticket_receipt_and_target(self) -> None:
+        self._progress_context()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        with progress_path.open("r+b") as stream:
+            stream.write(b"!")
+            stream.flush()
+            os.fsync(stream.fileno())
+        self._expect_manual_recovery_without_authority_loss(
+            "pending terminal directory progress header changed"
+        )
+
+    def test_latest_progress_rollback_and_valid_rewrite_are_rejected(self) -> None:
+        quarantine_identity, authority = self._progress_context()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        initial = MODULE._read_pending_terminal_directory_progress(
+            self.fixture.home,
+            self.ticket,
+            quarantine_identity,
+            authority,
+        )
+        self.assertIsNotNone(initial)
+        assert initial is not None and initial.snapshot.payload is not None
+        cursor = MODULE._pending_terminal_directory_progress_cursor_from_state(
+            authority,
+            initial,
+        )
+        logical_path = MODULE.PurePosixPath("pending/evidence")
+        evidence = self.ticket.batch_root / Path(*logical_path.parts)
+        evidence_fd = MODULE._open_directory_beneath(self.fixture.home, evidence)
+        try:
+            MODULE._append_pending_terminal_directory_consumption(
+                self.fixture.home,
+                self.ticket,
+                quarantine_identity,
+                authority,
+                logical_path,
+                evidence_fd,
+                set(),
+                cursor,
+            )
+        finally:
+            MODULE._close_fd_quietly(evidence_fd)
+        observed_payload = bytes(cursor.expected_payload)
+        self.assertIsNotNone(observed_payload)
+
+        with progress_path.open("wb") as stream:
+            stream.write(initial.snapshot.payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        rolled_back = MODULE._read_pending_terminal_directory_progress(
+            self.fixture.home,
+            self.ticket,
+            quarantine_identity,
+            authority,
+        )
+        self.assertIsNotNone(rolled_back)
+        assert rolled_back is not None
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal directory progress rolled back within this invocation",
+        ):
+            MODULE._require_pending_terminal_directory_progress_cursor_current(
+                self.fixture.home,
+                self.ticket,
+                quarantine_identity,
+                authority,
+                cursor,
+            )
+
+        directories = MODULE._pending_terminal_directory_progress_directories(
+            authority.directories,
+            authority.namespace_entries or (),
+        )
+        alternate_slot = next(
+            index
+            for index, item in enumerate(directories, start=1)
+            if item.path == MODULE.PurePosixPath("pending/stage")
+        )
+        rewritten_payload = initial.snapshot.payload + MODULE._pending_directory_progress_line(
+            {"slot": alternate_slot}
+        )
+        with progress_path.open("wb") as stream:
+            stream.write(rewritten_payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        rewritten = MODULE._read_pending_terminal_directory_progress(
+            self.fixture.home,
+            self.ticket,
+            quarantine_identity,
+            authority,
+        )
+        self.assertIsNotNone(rewritten)
+        assert rewritten is not None
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "rolled back|changed since the current invocation",
+        ):
+            MODULE._require_pending_terminal_directory_progress_cursor_current(
+                self.fixture.home,
+                self.ticket,
+                quarantine_identity,
+                authority,
+                cursor,
+            )
+        self.assertEqual(bytes(cursor.expected_payload), observed_payload)
+
+    def test_mode_nlink_and_uid_policy_changes_are_rejected(self) -> None:
+        quarantine_identity, authority = self._progress_context()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        progress_path.chmod(0o640)
+        with self.assertRaisesRegex(MODULE.SyncError, "changed"):
+            MODULE._read_pending_terminal_directory_progress(
+                self.fixture.home,
+                self.ticket,
+                quarantine_identity,
+                authority,
+            )
+        progress_path.chmod(0o600)
+
+        hardlink = self.fixture.home / "progress-hardlink"
+        os.link(progress_path, hardlink)
+        try:
+            with self.assertRaisesRegex(MODULE.SyncError, "changed"):
+                MODULE._read_pending_terminal_directory_progress(
+                    self.fixture.home,
+                    self.ticket,
+                    quarantine_identity,
+                    authority,
+                )
+        finally:
+            hardlink.unlink()
+
+        current_uid = os.geteuid()
+        with mock.patch.object(MODULE.os, "geteuid", return_value=current_uid + 1):
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "owner UID|access policy|changed",
+            ):
+                MODULE._read_pending_terminal_directory_progress(
+                    self.fixture.home,
+                    self.ticket,
+                    quarantine_identity,
+                    authority,
+                )
+
+        restored = MODULE._read_pending_terminal_directory_progress(
+            self.fixture.home,
+            self.ticket,
+            quarantine_identity,
+            authority,
+        )
+        self.assertIsNotNone(restored)
+
+    def test_owner_only_progress_accepts_benign_gid_drift(self) -> None:
+        quarantine_identity, authority = self._progress_context()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        old_gid = progress_path.stat().st_gid
+        if os.geteuid() == 0:
+            new_gid = old_gid + 1
+        else:
+            new_gid = next(
+                (
+                    group_id
+                    for group_id in set(os.getgroups()) | {os.getgid()}
+                    if group_id != old_gid
+                ),
+                None,
+            )
+        if new_gid is None:
+            self.skipTest("no alternate permitted group is available")
+        try:
+            os.chown(progress_path, -1, new_gid)
+        except PermissionError:
+            self.skipTest("native user cannot change the fixture group")
+        self.assertNotEqual(progress_path.stat().st_gid, old_gid)
+        progress = MODULE._read_pending_terminal_directory_progress(
+            self.fixture.home,
+            self.ticket,
+            quarantine_identity,
+            authority,
+        )
+        self.assertIsNotNone(progress)
+        assert progress is not None
+        self.assertEqual(progress.snapshot.gid, new_gid)
+        self.assertEqual(progress.consumed_slots, frozenset())
+
+    def test_extra_progress_representation_blocks_final_authority_retirement(
+        self,
+    ) -> None:
+        _quarantine_identity, authority = self._progress_context()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        fake_name = (
+            MODULE.PENDING_CLEANUP_RETAINED_PREFIX
+            + progress_path.name
+            + "-777-0123456789abcdef"
+        )
+        real_isolate = MODULE._isolate_and_delete_pending_cleanup_file
+        injected = []
+        protected_at_injection = []
+
+        def inject_alternate_before_progress_retirement(
+            home,
+            path,
+            parent_fd,
+            expected,
+            *,
+            label,
+            **kwargs,
+        ):
+            if label.startswith("pending terminal directory progress "):
+                protected_at_injection.append(self._protected_snapshot())
+                file_fd = os.open(
+                    fake_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                try:
+                    os.write(file_fd, b"foreign progress representation\n")
+                    os.fsync(file_fd)
+                finally:
+                    MODULE._close_fd_quietly(file_fd)
+                os.fsync(parent_fd)
+                injected.append(True)
+            return real_isolate(
+                home,
+                path,
+                parent_fd,
+                expected,
+                label=label,
+                **kwargs,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_isolate_and_delete_pending_cleanup_file",
+                side_effect=inject_alternate_before_progress_retirement,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal directory progress representations changed during retirement",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+
+        self.assertTrue(injected)
+        self.assertTrue(protected_at_injection)
+        self._assert_protected_snapshot_unchanged(protected_at_injection[0])
+        self.assertFalse(self.ticket.batch_root.exists())
+        self.assertTrue(self.ticket.path.is_file())
+        self.assertTrue(
+            MODULE._pending_cleanup_terminal_validation_path(
+                self.fixture.home,
+                self.ticket.batch_root.name,
+            ).is_file()
+        )
+        index_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            progress_path.parent,
+        )
+        try:
+            progress_snapshot = MODULE._read_managed_state_file_snapshot(
+                self.fixture.home,
+                progress_path,
+                index_fd,
+                expected_identity=authority.directory_progress.file_identity,
+                maximum_bytes=MODULE.MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+            )
+        finally:
+            MODULE._close_fd_quietly(index_fd)
+        progress = MODULE._parse_pending_terminal_directory_progress_payload(
+            self.ticket,
+            _quarantine_identity,
+            authority,
+            progress_snapshot,
+        )
+        directories = MODULE._pending_terminal_directory_progress_directories(
+            authority.directories,
+            authority.namespace_entries or (),
+        )
+        self.assertEqual(
+            progress.consumed_slots,
+            frozenset(range(len(directories) + 1)),
+        )
+        self.assertEqual(
+            (progress.snapshot.file_identity),
+            authority.directory_progress.file_identity,
+        )
+        self.assertTrue(progress_path.with_name(fake_name).is_file())
+
+    def test_retry_after_progress_isolated_before_unlink_recovers(self) -> None:
+        quarantine_identity, authority = self._progress_context()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        progress_identity = authority.directory_progress.file_identity
+        retained_prefix = (
+            MODULE.PENDING_CLEANUP_RETAINED_PREFIX + progress_path.name + "-"
+        )
+        real_unlink = os.unlink
+        retained_names = []
+        protected_at_interruption = []
+
+        def crash_before_exact_progress_unlink(
+            path,
+            *args,
+            dir_fd=None,
+            **kwargs,
+        ) -> None:
+            name = os.fsdecode(path)
+            if dir_fd is not None and name.startswith(retained_prefix):
+                metadata = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                if (metadata.st_dev, metadata.st_ino) == progress_identity:
+                    retained_names.append(name)
+                    protected_at_interruption.append(self._protected_snapshot())
+                    raise SystemExit("injected before exact progress unlink")
+            real_unlink(path, *args, dir_fd=dir_fd, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE.os,
+                "unlink",
+                side_effect=crash_before_exact_progress_unlink,
+            ),
+            self.assertRaisesRegex(SystemExit, "before exact progress unlink"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+
+        self.assertEqual(len(retained_names), 1)
+        self.assertEqual(len(protected_at_interruption), 1)
+        self._assert_protected_snapshot_unchanged(protected_at_interruption[0])
+        self.assertFalse(self.ticket.batch_root.exists())
+        self.assertTrue(self.ticket.path.is_file())
+        self.assertFalse(progress_path.exists())
+        retained_path = progress_path.with_name(retained_names[0])
+        self.assertTrue(retained_path.is_file())
+
+        index_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            progress_path.parent,
+        )
+        try:
+            retained_snapshot = MODULE._read_managed_state_file_snapshot(
+                self.fixture.home,
+                retained_path,
+                index_fd,
+                expected_identity=progress_identity,
+                maximum_bytes=MODULE.MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+            )
+        finally:
+            MODULE._close_fd_quietly(index_fd)
+        retained_state = MODULE._parse_pending_terminal_directory_progress_payload(
+            self.ticket,
+            quarantine_identity,
+            authority,
+            retained_snapshot,
+        )
+        directories = MODULE._pending_terminal_directory_progress_directories(
+            authority.directories,
+            authority.namespace_entries or (),
+        )
+        self.assertEqual(
+            retained_state.consumed_slots,
+            frozenset(range(len(directories) + 1)),
+        )
+
+        self.assertTrue(
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        )
+        self.assertFalse(self.ticket.path.exists())
+        self.assertFalse(progress_path.exists())
+        self.assertFalse(retained_path.exists())
+        self.assertEqual(self.fixture.target.stat().st_nlink, 1)
+
+    def _progress_cursor(self):
+        quarantine_identity, authority = self._progress_context()
+        state = MODULE._read_pending_terminal_directory_progress(
+            self.fixture.home,
+            self.ticket,
+            quarantine_identity,
+            authority,
+        )
+        self.assertIsNotNone(state)
+        assert state is not None
+        cursor = MODULE._pending_terminal_directory_progress_cursor_from_state(
+            authority,
+            state,
+        )
+        return quarantine_identity, authority, cursor
+
+    def test_incremental_progress_replay_work_is_linear_in_suffix_bytes(
+        self,
+    ) -> None:
+        # Use bounded synthetic slots and counters instead of a large on-disk tree.
+        directories = tuple(
+            MODULE.PendingTerminalValidationDirectory(
+                MODULE.PurePosixPath(f"synthetic/{slot:04d}"),
+                (1000 + slot, 2000 + slot),
+            )
+            for slot in range(1, 513)
+        )
+        slot_by_path = {
+            directory.path: slot
+            for slot, directory in enumerate(directories, start=1)
+        }
+        path_by_slot = {
+            slot: directory.path
+            for slot, directory in enumerate(directories, start=1)
+        }
+        _quarantine_identity, authority, _seed = self._progress_cursor()
+        cursor = MODULE.PendingTerminalDirectoryProgressCursor(
+            authority=authority.directory_progress,
+            parent_identity=(3000, 4000),
+            directories=directories,
+            slot_by_path=slot_by_path,
+            path_by_slot=path_by_slot,
+            consumed_slots=set(),
+            consumed_paths=set(),
+            expected_payload=bytearray(b"synthetic-header\n"),
+            change_signal=(1, 1),
+        )
+
+        real_parse_suffix = MODULE._parse_pending_terminal_directory_progress_suffix
+        parsed_bytes = 0
+
+        def count_suffix_bytes(ticket, slot_directories, consumed, suffix):
+            nonlocal parsed_bytes
+            parsed_bytes += len(suffix)
+            return real_parse_suffix(ticket, slot_directories, consumed, suffix)
+
+        appended_bytes = 0
+        with (
+            mock.patch.object(
+                MODULE,
+                "_parse_pending_terminal_directory_progress_suffix",
+                side_effect=count_suffix_bytes,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_parse_pending_terminal_directory_progress_payload",
+                wraps=MODULE._parse_pending_terminal_directory_progress_payload,
+            ) as full_parser,
+            mock.patch.object(
+                MODULE,
+                "_pending_terminal_directory_progress_header_payload",
+                wraps=MODULE._pending_terminal_directory_progress_header_payload,
+            ) as header_builder,
+            mock.patch.object(
+                MODULE,
+                "_pending_terminal_directory_progress_directories",
+                side_effect=AssertionError("incremental advance rebuilt slot map"),
+            ),
+        ):
+            for slot in range(1, 513):
+                line = MODULE._pending_directory_progress_line({"slot": slot})
+                appended_bytes += len(line)
+                MODULE._advance_pending_terminal_directory_progress_cursor(
+                    self.ticket,
+                    cursor,
+                    line,
+                )
+
+        self.assertEqual(parsed_bytes, appended_bytes)
+        self.assertEqual(len(cursor.consumed_slots), 512)
+        self.assertEqual(
+            cursor.offset,
+            len(b"synthetic-header\n") + appended_bytes,
+        )
+        self.assertEqual(full_parser.call_count, 0)
+        self.assertEqual(header_builder.call_count, 0)
+
+    def test_cleanup_uses_bounded_full_progress_replay_and_one_suffix_per_slot(self) -> None:
+        _quarantine_identity, _authority, cursor = self._progress_cursor()
+        expected_slots = len(cursor.directories) + 1
+        with mock.patch.object(
+            MODULE, "_read_pending_terminal_directory_progress",
+            wraps=MODULE._read_pending_terminal_directory_progress,
+        ) as full_reader, mock.patch.object(
+            MODULE, "_parse_pending_terminal_directory_progress_payload",
+            wraps=MODULE._parse_pending_terminal_directory_progress_payload,
+        ) as full_parser, mock.patch.object(
+            MODULE, "_parse_pending_terminal_directory_progress_suffix",
+            wraps=MODULE._parse_pending_terminal_directory_progress_suffix,
+        ) as suffix_parser:
+            self.assertTrue(MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket))
+        self.assertEqual(suffix_parser.call_count, expected_slots)
+        # Initial/prewalk and postwalk/postroot reads are bounded independently
+        # of the consumed slot count. Rootless retirement additionally parses
+        # once before isolation and at each of its three mutation boundaries.
+        self.assertLessEqual(full_reader.call_count, 4)
+        self.assertLessEqual(full_parser.call_count, full_reader.call_count + 4)
+        self.assertFalse(self.ticket.path.exists())
+        self.assertFalse(self.ticket.batch_root.exists())
+        self.assertEqual(self.fixture.target.stat().st_nlink, 1)
+
+    def test_progress_cursor_rejects_same_length_content_rewrite(self) -> None:
+        quarantine_identity, authority, cursor = self._progress_cursor()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        original = bytes(cursor.expected_payload)
+        rewritten = bytes([original[0] ^ 1]) + original[1:]
+        self.assertEqual(len(rewritten), len(original))
+        before = progress_path.stat()
+        with progress_path.open("r+b") as stream:
+            stream.write(rewritten)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.utime(
+            progress_path,
+            ns=(before.st_atime_ns, before.st_mtime_ns + 2_000_000_000),
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "header changed|content changed|changed since the current invocation",
+        ):
+            MODULE._require_pending_terminal_directory_progress_cursor_current(
+                self.fixture.home,
+                self.ticket,
+                quarantine_identity,
+                authority,
+                cursor,
+            )
+
+    def test_progress_cursor_rejects_truncate_rollback(self) -> None:
+        quarantine_identity, authority, cursor = self._progress_cursor()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        with progress_path.open("r+b") as stream:
+            stream.truncate(cursor.offset - 1)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "rolled back|truncated|changed",
+        ):
+            MODULE._require_pending_terminal_directory_progress_cursor_current(
+                self.fixture.home,
+                self.ticket,
+                quarantine_identity,
+                authority,
+                cursor,
+            )
+
+    def test_progress_cursor_rejects_same_bytes_in_replacement_inode(self) -> None:
+        quarantine_identity, authority, cursor = self._progress_cursor()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        original_identity = cursor.authority.file_identity
+        payload = bytes(cursor.expected_payload)
+        retained = self.fixture.home / "retained-progress-original"
+        progress_path.rename(retained)
+        progress_path.write_bytes(payload)
+        progress_path.chmod(0o600)
+        replacement = progress_path.stat()
+        self.assertNotEqual(
+            (replacement.st_dev, replacement.st_ino),
+            original_identity,
+        )
+
+        with self.assertRaisesRegex(MODULE.SyncError, "changed|identity"):
+            MODULE._require_pending_terminal_directory_progress_cursor_current(
+                self.fixture.home,
+                self.ticket,
+                quarantine_identity,
+                authority,
+                cursor,
+            )
+
+    def test_progress_cursor_accepts_owner_only_gid_drift_after_replay(self) -> None:
+        quarantine_identity, authority, cursor = self._progress_cursor()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        old_gid = progress_path.stat().st_gid
+        if os.geteuid() == 0:
+            new_gid = old_gid + 1
+        else:
+            new_gid = next(
+                (
+                    group_id
+                    for group_id in set(os.getgroups()) | {os.getgid()}
+                    if group_id != old_gid
+                ),
+                None,
+            )
+        if new_gid is None:
+            self.skipTest("no alternate permitted group is available")
+        try:
+            os.chown(progress_path, -1, new_gid)
+        except PermissionError:
+            self.skipTest("native user cannot change the fixture group")
+
+        expected_payload = bytes(cursor.expected_payload)
+        MODULE._require_pending_terminal_directory_progress_cursor_current(
+            self.fixture.home,
+            self.ticket,
+            quarantine_identity,
+            authority,
+            cursor,
+        )
+        self.assertEqual(bytes(cursor.expected_payload), expected_payload)
+        self.assertEqual(progress_path.stat().st_gid, new_gid)
+
+    def test_progress_cursor_accepts_gid_drift_during_full_replay(self) -> None:
+        quarantine_identity, authority, cursor = self._progress_cursor()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        old_gid = progress_path.stat().st_gid
+        if os.geteuid() == 0:
+            new_gid = old_gid + 1
+        else:
+            new_gid = next(
+                (
+                    group_id
+                    for group_id in set(os.getgroups()) | {os.getgid()}
+                    if group_id != old_gid
+                ),
+                None,
+            )
+        if new_gid is None:
+            self.skipTest("no alternate permitted group is available")
+        before = progress_path.stat()
+        os.utime(
+            progress_path,
+            ns=(before.st_atime_ns, before.st_mtime_ns + 2_000_000_000),
+        )
+
+        real_read = MODULE._read_managed_state_bytes
+        read_count = 0
+
+        def change_gid_after_first_read(
+            file_fd,
+            path,
+            maximum_bytes=MODULE.MAX_MANAGED_STATE_BYTES,
+        ):
+            nonlocal read_count
+            payload = real_read(file_fd, path, maximum_bytes)
+            read_count += 1
+            if read_count == 1:
+                try:
+                    os.chown(progress_path, -1, new_gid)
+                except PermissionError:
+                    self.skipTest("native user cannot change the fixture group")
+            return payload
+
+        expected_payload = bytes(cursor.expected_payload)
+        with mock.patch.object(
+            MODULE,
+            "_read_managed_state_bytes",
+            side_effect=change_gid_after_first_read,
+        ):
+            MODULE._require_pending_terminal_directory_progress_cursor_current(
+                self.fixture.home,
+                self.ticket,
+                quarantine_identity,
+                authority,
+                cursor,
+            )
+
+        self.assertEqual(read_count, 4)
+        self.assertEqual(bytes(cursor.expected_payload), expected_payload)
+        self.assertEqual(progress_path.stat().st_gid, new_gid)
+
+    def test_progress_cursor_reports_unstable_metadata_during_full_replay(self) -> None:
+        quarantine_identity, authority, cursor = self._progress_cursor()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        before = progress_path.stat()
+        os.utime(
+            progress_path,
+            ns=(before.st_atime_ns, before.st_mtime_ns + 2_000_000_000),
+        )
+
+        real_read = MODULE._read_managed_state_bytes
+        read_count = 0
+
+        def touch_after_each_attempt_first_read(
+            file_fd,
+            path,
+            maximum_bytes=MODULE.MAX_MANAGED_STATE_BYTES,
+        ):
+            nonlocal read_count
+            payload = real_read(file_fd, path, maximum_bytes)
+            read_count += 1
+            if read_count % 2 == 1:
+                current = progress_path.stat()
+                os.utime(
+                    progress_path,
+                    ns=(
+                        current.st_atime_ns,
+                        current.st_mtime_ns + 1_000_000_000,
+                    ),
+                )
+            return payload
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_read_managed_state_bytes",
+                side_effect=touch_after_each_attempt_first_read,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "could not establish stable read",
+            ),
+        ):
+            MODULE._require_pending_terminal_directory_progress_cursor_current(
+                self.fixture.home,
+                self.ticket,
+                quarantine_identity,
+                authority,
+                cursor,
+            )
+
+        self.assertEqual(read_count, 6)
+
+    def test_progress_cursor_rejects_payload_rewrite_during_full_replay(self) -> None:
+        quarantine_identity, authority, cursor = self._progress_cursor()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        before = progress_path.stat()
+        os.utime(
+            progress_path,
+            ns=(before.st_atime_ns, before.st_mtime_ns + 2_000_000_000),
+        )
+        original = bytes(cursor.expected_payload)
+        rewritten = bytes([original[0] ^ 1]) + original[1:]
+        real_read = MODULE._read_managed_state_bytes
+        read_count = 0
+
+        def rewrite_after_first_read(
+            file_fd,
+            path,
+            maximum_bytes=MODULE.MAX_MANAGED_STATE_BYTES,
+        ):
+            nonlocal read_count
+            payload = real_read(file_fd, path, maximum_bytes)
+            read_count += 1
+            if read_count == 1:
+                with progress_path.open("r+b") as stream:
+                    stream.write(rewritten)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            return payload
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_read_managed_state_bytes",
+                side_effect=rewrite_after_first_read,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "content changed during read|header changed|changed since the current invocation",
+            ),
+        ):
+            MODULE._require_pending_terminal_directory_progress_cursor_current(
+                self.fixture.home,
+                self.ticket,
+                quarantine_identity,
+                authority,
+                cursor,
+            )
+
+        self.assertEqual(read_count, 2)
+
+    def test_progress_cursor_reports_missing_during_named_revalidation(self) -> None:
+        quarantine_identity, authority, cursor = self._progress_cursor()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        real_stat = MODULE.os.stat
+        named_stat_count = 0
+
+        def disappear_after_named_before(path, *args, **kwargs):
+            nonlocal named_stat_count
+            if path == progress_path.name and kwargs.get("dir_fd") is not None:
+                named_stat_count += 1
+                if named_stat_count == 2:
+                    raise FileNotFoundError("injected removal before revalidation")
+            return real_stat(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE.os,
+                "stat",
+                side_effect=disappear_after_named_before,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "progress is missing during revalidation",
+            ),
+        ):
+            MODULE._require_pending_terminal_directory_progress_cursor_current(
+                self.fixture.home,
+                self.ticket,
+                quarantine_identity,
+                authority,
+                cursor,
+            )
+
+        self.assertEqual(named_stat_count, 2)
+
+    def test_progress_cursor_ignores_unrelated_index_entry_churn(self) -> None:
+        quarantine_identity, authority, cursor = self._progress_cursor()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        unrelated = progress_path.with_name("unrelated-progress-churn")
+        unrelated.write_bytes(b"unrelated\n")
+        unrelated.chmod(0o600)
+        try:
+            with mock.patch.object(
+                MODULE,
+                "_pending_terminal_directory_progress_representations",
+                wraps=MODULE._pending_terminal_directory_progress_representations,
+            ) as representations:
+                MODULE._require_pending_terminal_directory_progress_cursor_current(
+                    self.fixture.home,
+                    self.ticket,
+                    quarantine_identity,
+                    authority,
+                    cursor,
+                )
+            self.assertEqual(representations.call_count, 2)
+        finally:
+            unrelated.unlink()
+
+    def test_progress_cursor_rejects_extra_representation_before_delete(
+        self,
+    ) -> None:
+        _quarantine_identity, _authority, _cursor = self._progress_cursor()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        extra_name = (
+            progress_path.name + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+        )
+        real_isolate = MODULE._isolate_pending_cleanup_entry
+        injected = []
+
+        def isolate_then_inject(*args, **kwargs):
+            result = real_isolate(*args, **kwargs)
+            if not injected:
+                index_fd = MODULE._open_directory_beneath(
+                    self.fixture.home,
+                    progress_path.parent,
+                )
+                file_fd = -1
+                try:
+                    file_fd = os.open(
+                        extra_name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=index_fd,
+                    )
+                    os.write(file_fd, b"unexpected progress publication\n")
+                    os.fsync(file_fd)
+                    os.fsync(index_fd)
+                    injected.append(True)
+                finally:
+                    if file_fd >= 0:
+                        MODULE._close_fd_quietly(file_fd)
+                    MODULE._close_fd_quietly(index_fd)
+            return result
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_isolate_pending_cleanup_entry",
+                side_effect=isolate_then_inject,
+            ),
+            mock.patch.object(MODULE.os, "rmdir", wraps=os.rmdir) as rmdir,
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal directory progress has ambiguous related "
+                "representations",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+
+        self.assertTrue(injected)
+        self.assertEqual(rmdir.call_count, 0)
+        self.assertTrue(self.ticket.path.is_file())
+        self.assertTrue(self.ticket.batch_root.is_dir())
+        self.assertTrue(progress_path.is_file())
+        self.assertTrue((progress_path.parent / extra_name).is_file())
 
 
 if __name__ == "__main__":

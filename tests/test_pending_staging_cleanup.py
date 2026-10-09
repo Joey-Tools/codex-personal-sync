@@ -2193,6 +2193,11 @@ class PendingStagingCleanupTests(unittest.TestCase):
         real_read = MODULE._read_pending_cleanup_ticket
         real_remove = MODULE._remove_cleanup_ready_batch
         real_verify = MODULE._verify_final_regular_targets
+        current_budget = [MODULE.PendingCleanupActionBudget(MODULE.MAX_PENDING_CLEANUP_BATCHES_PER_RUN)]
+
+        def verify_charged_batch(*args, **kwargs):
+            self.assertIn(terminal_ticket.batch_root.name, current_budget[0].charged_batches)
+            return real_verify(*args, **kwargs)
 
         def read_ticket(home: Path, path: Path, **kwargs):
             deferred = deferred_tickets.get(path.name)
@@ -2219,17 +2224,21 @@ class PendingStagingCleanupTests(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "_verify_final_regular_targets",
-                wraps=real_verify,
+                side_effect=verify_charged_batch,
             ) as verify,
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
-            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+            self.assertEqual(
+                MODULE._cleanup_ready_pending_batches(self.home, budget=current_budget[0]), 1,
+            )
+            current_budget[0] = MODULE.PendingCleanupActionBudget(MODULE.MAX_PENDING_CLEANUP_BATCHES_PER_RUN)
+            self.assertEqual(
+                MODULE._cleanup_ready_pending_batches(self.home, budget=current_budget[0]), 1,
+            )
 
-        # The terminal group is revalidated at proof publication, the bound
-        # batch-root rmdir boundary, and both final control-retirement
-        # callback boundaries (before and after descriptor/content checks).
-        self.assertEqual(verify.call_count, 4)
+        # Verification phases may grow; every call must follow the one shared
+        # batch charge rather than consume another cleanup action.
+        verify.assert_called()
         self.assertFalse(retained_cursor.exists())
         self.assertFalse(terminal_ticket.path.exists())
         self.assertEqual(self.target.stat().st_nlink, 1)
@@ -2311,20 +2320,25 @@ class PendingStagingCleanupTests(unittest.TestCase):
             temp_path.chmod(0o600)
 
         real_verify = MODULE._verify_final_regular_targets
+        action_budget = MODULE.PendingCleanupActionBudget(MODULE.MAX_PENDING_CLEANUP_BATCHES_PER_RUN)
+
+        def verify_charged_batch(*args, **kwargs):
+            self.assertIn(ticket.batch_root.name, action_budget.charged_batches)
+            return real_verify(*args, **kwargs)
+
         with mock.patch.object(
             MODULE,
             "_verify_final_regular_targets",
-            wraps=real_verify,
+            side_effect=verify_charged_batch,
         ) as verify:
             self.assertEqual(
-                MODULE._cleanup_ready_pending_batches(self.home),
+                MODULE._cleanup_ready_pending_batches(self.home, budget=action_budget),
                 MODULE.MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
             )
 
-        # The terminal group is revalidated at proof publication, the bound
-        # batch-root rmdir boundary, and both final control-retirement
-        # callback boundaries (before and after descriptor/content checks).
-        self.assertEqual(verify.call_count, 4)
+        # The restored batch must be charged before any target verification;
+        # progress publication adds validation, not another budget charge.
+        verify.assert_called()
         self.assertFalse(ticket.path.exists())
         self.assertFalse(retained_ticket.exists())
         self.assertEqual(self.target.stat().st_nlink, 1)
@@ -2421,11 +2435,6 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 MODULE,
                 "_install_release_set_unlocked",
                 side_effect=install_set,
-            ),
-            mock.patch.object(
-                MODULE,
-                "installation_lock",
-                return_value=contextlib.nullcontext(),
             ),
         ):
             MODULE.install_from_github("Joey-Tools/example", self.home, dry_run=False)
@@ -2820,6 +2829,12 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     mock.patch.object(
                         MODULE,
                         "_restore_pending_cleanup_control_tombstones",
+                    ),
+                    # Keep the synthetic fd scoped to cursor cleanup, not the
+                    # separate receipt-publication recovery preflight.
+                    mock.patch.object(
+                        MODULE,
+                        "_recover_unconsumed_pending_terminal_progress_publications",
                     ),
                     mock.patch.object(
                         MODULE,
@@ -5527,9 +5542,9 @@ class PendingStagingCleanupTests(unittest.TestCase):
         real_delete_ticket = MODULE._delete_pending_cleanup_ticket
         deleted_ticket = None
 
-        def delete_ticket_then_replay(home: Path, ticket) -> None:
+        def delete_ticket_then_replay(home: Path, ticket, **kwargs) -> None:
             nonlocal deleted_ticket
-            real_delete_ticket(home, ticket)
+            real_delete_ticket(home, ticket, **kwargs)
             deleted_ticket = ticket
             os.link(replay_source, case_target)
 
@@ -5578,14 +5593,14 @@ class PendingStagingCleanupTests(unittest.TestCase):
         retained_ticket: Path | None = None
         deleted_ticket = None
 
-        def retain_ticket_then_delete(home: Path, ticket) -> None:
+        def retain_ticket_then_delete(home: Path, ticket, **kwargs) -> None:
             nonlocal retained_ticket, deleted_ticket
             retained_name = next(MODULE._retained_pending_cleanup_names(ticket.path))
             retained_ticket = ticket.path.with_name(retained_name)
             retained_ticket.write_bytes(ticket.snapshot.payload or b"")
             retained_ticket.chmod(0o600)
             deleted_ticket = ticket
-            real_delete_ticket(home, ticket)
+            real_delete_ticket(home, ticket, **kwargs)
 
         with (
             mock.patch.object(
@@ -5633,14 +5648,14 @@ class PendingStagingCleanupTests(unittest.TestCase):
         malformed_ticket: Path | None = None
         deleted_ticket = None
 
-        def retain_malformed_ticket_then_delete(home: Path, ticket) -> None:
+        def retain_malformed_ticket_then_delete(home: Path, ticket, **kwargs) -> None:
             nonlocal malformed_ticket, deleted_ticket
             retained_name = next(MODULE._retained_pending_cleanup_names(ticket.path))
             malformed_ticket = ticket.path.with_name(retained_name + ".extra")
             malformed_ticket.write_bytes(ticket.snapshot.payload or b"")
             malformed_ticket.chmod(0o600)
             deleted_ticket = ticket
-            real_delete_ticket(home, ticket)
+            real_delete_ticket(home, ticket, **kwargs)
 
         with (
             mock.patch.object(
@@ -5650,7 +5665,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
-                "ticket representation remained",
+                "ticket representation must be reconciled before new mutation",
             ),
         ):
             MODULE._delete_exact_regular_publication_without_pending_receipt(
@@ -5663,7 +5678,13 @@ class PendingStagingCleanupTests(unittest.TestCase):
         self.assertIsNotNone(malformed_ticket)
         assert deleted_ticket is not None
         assert malformed_ticket is not None
-        self.assertFalse(deleted_ticket.path.exists())
+        self.assertTrue(deleted_ticket.path.is_file())
+        self.assertTrue(
+            MODULE._pending_cleanup_ticket_matches(
+                MODULE._read_pending_cleanup_ticket(case_home, deleted_ticket.path),
+                deleted_ticket,
+            )
+        )
         self.assertTrue(malformed_ticket.is_file())
         self.assertEqual(malformed_ticket.read_bytes(), deleted_ticket.snapshot.payload)
 
@@ -5677,9 +5698,11 @@ class PendingStagingCleanupTests(unittest.TestCase):
         )
         self.assertTrue(receipt_path.is_file())
 
-        # This simulates the formerly unsafe outcome: the phase receipt was
-        # retired while a suffixed ticket tombstone still retained its bytes.
+        # The earlier fence preserves the original canonical ticket. Simulate
+        # the formerly unsafe outcome with both original authorities removed
+        # while a suffixed ticket tombstone still retains its bytes.
         # That residue must independently block a later mutation.
+        deleted_ticket.path.unlink()
         receipt_path.unlink()
         with self.assertRaisesRegex(
             MODULE.SyncError,
@@ -5743,13 +5766,13 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 real_delete_ticket = MODULE._delete_pending_cleanup_ticket
                 represented = False
 
-                def represent_then_delete(home: Path, current_ticket) -> None:
+                def represent_then_delete(home: Path, current_ticket, **kwargs) -> None:
                     nonlocal represented
                     if current_ticket.path == ticket.path and not represented:
                         representation.write_bytes(current_ticket.snapshot.payload or b"")
                         representation.chmod(0o600)
                         represented = True
-                    real_delete_ticket(home, current_ticket)
+                    real_delete_ticket(home, current_ticket, **kwargs)
 
                 with (
                     mock.patch.object(
@@ -5765,7 +5788,24 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     MODULE._cleanup_ready_pending_batches(case_home)
 
                 self.assertTrue(represented)
-                self.assertFalse(ticket.path.exists())
+                if representation_kind == "suffixed":
+                    # An unknown descendant now blocks the ticket retirement
+                    # boundary itself; keep its original object and bytes.
+                    self.assertTrue(ticket.path.is_file())
+                    current_ticket = MODULE._read_pending_cleanup_ticket(
+                        case_home,
+                        ticket.path,
+                        expected_ticket_identity=ticket.snapshot.file_identity,
+                    )
+                    self.assertIsNotNone(current_ticket)
+                    assert current_ticket is not None
+                    self.assertTrue(
+                        MODULE._pending_cleanup_ticket_matches(current_ticket, ticket)
+                    )
+                else:
+                    # The supported strict-retained form remains eligible for
+                    # its existing independently bound recovery protocol.
+                    self.assertFalse(ticket.path.exists())
                 self.assertFalse(ticket.batch_root.exists())
                 self.assertTrue(representation.is_file())
                 self.assertTrue(proof_path.is_file())
@@ -7495,9 +7535,9 @@ class PendingStagingCleanupTests(unittest.TestCase):
         )
         injected = False
 
-        def scan_then_inject(home: Path) -> None:
+        def scan_then_inject(home: Path, **observation_options) -> None:
             nonlocal injected
-            real_preflight_scan(home)
+            real_preflight_scan(home, **observation_options)
             if not injected:
                 representation.write_bytes(b"late malformed v8 control evidence\n")
                 representation.chmod(0o600)
@@ -7550,9 +7590,9 @@ class PendingStagingCleanupTests(unittest.TestCase):
         def inject_after_first_blocker_observation():
             observations = 0
 
-            def observe_then_inject(home: Path):
+            def observe_then_inject(home: Path, **observation_options):
                 nonlocal observations
-                unresolved = real_observe(home)
+                unresolved = real_observe(home, **observation_options)
                 observations += 1
                 if observations == 1:
                     malformed_ticket.write_bytes(b"late ticket evidence\n")

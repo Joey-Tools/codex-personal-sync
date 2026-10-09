@@ -678,6 +678,47 @@ class MirrorGeneratorTests(unittest.TestCase):
         self.assertEqual(requested_sizes, [4096, 1])
         self.assertEqual(operation.remaining_bytes, 10_000 - 4097)
 
+    def test_logical_git_snapshot_manifest_orders_prefix_siblings_globally(
+        self,
+    ) -> None:
+        prefix = "worktrees/codex-toolbox-codex-toolbox-v2-canary"
+        replacement = f"{prefix}-replacement"
+        digest = hashlib.sha256(b"commit message\n").digest()
+        manifest: list[tuple[object, ...]] = [
+            ("directory", "worktrees", (1, 2, 3), (0o700,)),
+            ("directory", prefix, (4, 5, 6), (0o700,)),
+            (
+                "file",
+                f"{prefix}/COMMIT_EDITMSG",
+                (7, 8, 9),
+                (0o600,),
+                15,
+                digest,
+            ),
+            ("directory", replacement, (10, 11, 12), (0o700,)),
+            (
+                "file",
+                f"{replacement}/COMMIT_EDITMSG",
+                (13, 14, 15),
+                (0o600,),
+                15,
+                digest,
+            ),
+        ]
+
+        logical = MIRROR_MODULE._logical_git_snapshot_manifest(manifest)
+
+        self.assertEqual(
+            logical,
+            (
+                ("directory", "worktrees", 0o700),
+                ("directory", prefix, 0o700),
+                ("directory", replacement, 0o700),
+                ("file", f"{replacement}/COMMIT_EDITMSG", 0o600, 15, digest),
+                ("file", f"{prefix}/COMMIT_EDITMSG", 0o600, 15, digest),
+            ),
+        )
+
     def test_git_snapshot_scan_applies_remaining_entry_cap_before_sort(
         self,
     ) -> None:
@@ -4155,6 +4196,78 @@ class MirrorGeneratorTests(unittest.TestCase):
                 .strip()
             )
             self.assertEqual(observed, self.source_commit)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+    def test_linked_worktree_prefix_siblings_materialize_private_git_snapshot(
+        self,
+    ) -> None:
+        worktree_parent = self.root / "worktrees"
+        worktree_parent.mkdir()
+        worktree_prefix = "codex-toolbox-codex-toolbox-v2-canary"
+        worktrees = (
+            worktree_parent / worktree_prefix,
+            worktree_parent / f"{worktree_prefix}-replacement",
+        )
+        for worktree in worktrees:
+            self._git(
+                self.canonical_root,
+                "worktree",
+                "add",
+                "--detach",
+                str(worktree),
+                "HEAD",
+            )
+            git_directory = Path(
+                self._git(worktree, "rev-parse", "--absolute-git-dir")
+                .decode("utf-8")
+                .strip()
+            )
+            (git_directory / "COMMIT_EDITMSG").write_bytes(b"linked worktree\n")
+
+        bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        try:
+            MIRROR_MODULE._ensure_git_control_binding(bound_root)
+        finally:
+            MIRROR_MODULE._finish_bound_roots(bound_root)
+
+        real_scan = MIRROR_MODULE._scan_private_git_tree
+        mutated_destination = False
+
+        def mutate_private_worktree_message(
+            private_fd: int,
+            operation: MIRROR_MODULE.OperationBudget | None = None,
+            **kwargs: object,
+        ) -> tuple[tuple[object, ...], ...]:
+            nonlocal mutated_destination
+            if not mutated_destination:
+                message_fd = os.open(
+                    f"worktrees/{worktree_prefix}/COMMIT_EDITMSG",
+                    os.O_WRONLY | os.O_TRUNC,
+                    dir_fd=private_fd,
+                )
+                try:
+                    os.write(message_fd, b"tampered worktree\n")
+                    os.fsync(message_fd)
+                finally:
+                    os.close(message_fd)
+                mutated_destination = True
+            return real_scan(private_fd, operation, **kwargs)
+
+        bound_root = MIRROR_MODULE._bind_root(self.canonical_root)
+        try:
+            with (
+                mock.patch.object(
+                    MIRROR_MODULE,
+                    "_scan_private_git_tree",
+                    side_effect=mutate_private_worktree_message,
+                ),
+                self.assertRaisesRegex(
+                    MIRROR_MODULE.MirrorSyncError,
+                    "private Git control destination differs from its source",
+                ),
+            ):
+                MIRROR_MODULE._ensure_git_control_binding(bound_root)
         finally:
             MIRROR_MODULE._finish_bound_roots(bound_root)
 

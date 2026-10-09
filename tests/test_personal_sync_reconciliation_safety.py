@@ -11375,17 +11375,20 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         self,
     ) -> None:
         self._stage_crash_batch()
+        real_installation_lock = MODULE.installation_lock
 
         @contextlib.contextmanager
         def clear_pending_before_lock(_home: Path) -> Iterator[None]:
-            state, state_snapshot = MODULE._load_managed_state_with_snapshot(self.home)
-            MODULE._recover_pending_link_transaction(
-                self.home,
-                state,
-                state_snapshot,
-                dry_run=False,
-            )
-            yield
+            with real_installation_lock(_home):
+                state, state_snapshot = MODULE._load_managed_state_with_snapshot(self.home)
+                MODULE._recover_pending_link_transaction(
+                    self.home,
+                    state,
+                    state_snapshot,
+                    dry_run=False,
+                )
+            with real_installation_lock(_home):
+                yield
 
         with mock.patch.object(
             MODULE,
@@ -11406,25 +11409,28 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         MODULE._state_path(first_home).unlink()
         legacy_target = first_home / "skills" / "public-base"
         self.assertTrue(legacy_target.is_symlink())
+        real_installation_lock = MODULE.installation_lock
 
         @contextlib.contextmanager
         def stage_pending_before_lock(_home: Path) -> Iterator[None]:
-            state, state_snapshot = MODULE._load_managed_state_with_snapshot(first_home)
-            self.assertFalse(state_snapshot.exists)
-            self.assertFalse(
-                os.path.lexists(MODULE._pending_link_pointer_path(first_home))
-            )
-            batch = MODULE._stage_pending_link_batch(
-                first_home,
-                [],
-                [],
-                {},
-                state_snapshot,
-                state,
-                state,
-            )
-            MODULE._publish_pending_link_pointer(first_home, batch)
-            yield
+            with real_installation_lock(_home):
+                state, state_snapshot = MODULE._load_managed_state_with_snapshot(first_home)
+                self.assertFalse(state_snapshot.exists)
+                self.assertFalse(
+                    os.path.lexists(MODULE._pending_link_pointer_path(first_home))
+                )
+                batch = MODULE._stage_pending_link_batch(
+                    first_home,
+                    [],
+                    [],
+                    {},
+                    state_snapshot,
+                    state,
+                    state,
+                )
+                MODULE._publish_pending_link_pointer(first_home, batch)
+            with real_installation_lock(_home):
+                yield
 
         with mock.patch.object(
             MODULE,

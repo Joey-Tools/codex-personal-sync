@@ -101,6 +101,63 @@ class CIPrivateTempTests(unittest.TestCase):
         self.assertEqual(result["uid"], os.getuid())
         self.assertFalse(Path(result["path"]).exists())
 
+    def test_runner_preserves_child_nonzero_exit_statuses(self) -> None:
+        probe = self.root / "exit.py"
+        probe.write_text(
+            "import sys\nraise SystemExit(int(sys.argv[1]))\n",
+            encoding="utf-8",
+        )
+
+        for exit_status in (7, 42):
+            with self.subTest(exit_status=exit_status):
+                completed = self._run(probe, Path(str(exit_status)))
+
+                self.assertEqual(completed.returncode, exit_status, completed.stderr)
+
+    def test_runner_preserves_child_failure_when_cleanup_retains_replacement(
+        self,
+    ) -> None:
+        probe = self.root / "replace-and-fail.py"
+        result_path = self.root / "replacement-result.json"
+        probe.write_text(
+            textwrap.dedent(
+                """\
+                import json
+                import os
+                from pathlib import Path
+                import sys
+
+                temporary = Path(os.environ["TMPDIR"])
+                original = temporary.with_name(f"{temporary.name}.original")
+                temporary.rename(original)
+                temporary.mkdir(mode=0o700)
+                Path(sys.argv[1]).write_text(
+                    json.dumps(
+                        {
+                            "original": original.as_posix(),
+                            "replacement": temporary.as_posix(),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                raise SystemExit(42)
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        completed = self._run(probe, result_path)
+
+        self.assertEqual(completed.returncode, 42, completed.stderr)
+        self.assertIn("retained replacement at CI temp root", completed.stderr)
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        original = Path(result["original"])
+        replacement = Path(result["replacement"])
+        self.assertTrue(original.is_dir())
+        self.assertTrue(replacement.is_dir())
+        self.assertEqual(list(original.iterdir()), [])
+        self.assertEqual(list(replacement.iterdir()), [])
+
     def test_runner_retains_and_reports_a_replacement(self) -> None:
         probe = self.root / "replace.py"
         result_path = self.root / "replacement-result.json"

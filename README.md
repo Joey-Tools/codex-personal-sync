@@ -343,6 +343,93 @@ symlinks and replacement races still fail closed. Directory timestamps and
 ordinary child-entry churn are not treated as replacement or access-policy
 changes.
 
+## Interrupted terminal regular-file cleanup
+
+Terminal cleanup must distinguish a consumed directory slot from a newly
+created directory at the same name. A `(device, inode)` pair is only a live
+object binding: after removal and descriptor closure, a filesystem can reuse
+that pair. Directory timestamps are not used as an unconditional generation
+signal, because ordinary child removal changes directory metadata.
+
+Terminal validation receipt v5 binds a required batch-specific progress
+control by its original file identity, owner-only access policy and immutable
+header digest. The header binds the original ticket and exact directory-slot
+authority. Before an authorized directory is removed, the sole cleanup writer
+appends and fsyncs its consumption intent while holding the old directory
+descriptor. An interrupted retry may observe that consumed slot as absent;
+any reappearance is retained, even when numeric inode identity was recycled.
+Normal remaining-child cleanup still permits authorized namespace contraction.
+
+A crash after fsyncing progress, before or after its canonical rename and
+before publishing the immutable receipt, can resume only with one exact
+header-only canonical progress file or its exact `.publish-tmp` object. Recovery
+independently validates the original ticket, complete live namespace, exact
+managed-target hard-link set, pointer/metadata and ticket-bound control content
+before binding that file's identity and access policy into the receipt. A fully
+validated publication temp is renamed without replacement into the canonical
+path, preserving its original inode, then revalidated before receipt creation.
+It does not infer authority from progress slots. The normal install preflight
+runs actual recovery and the subsequent new-mutation fence under the same
+installation lock; dry-run remains observational. Non-dry-run preflight also
+leaves an absent or empty sync home unchanged when no recovery state is observed.
+Observing a control requests locked validation, not cleanup authority. The final
+installation lock repeats recovery and the fence before installing, so a
+cooperative writer's intervening publication is not skipped. Actual recovery or
+valid installation can initialize the persistent owner-only lock paths.
+Dry-run install and uninstall independently validate an exact unconsumed
+publication against the original ticket, target links, namespace and controls
+before previewing cleanup. They neither create missing recovery aliases nor
+promote, publish or delete controls, and do not acquire an installation lock.
+Their read-only observation cannot relax a mutation fence; actual recovery
+must validate the state again under the lock.
+The cleanup and non-dry-run uninstall entrypoints also
+try this bounded recovery before the fence, using the same per-run action
+budget. Exact receipt publication temps
+may be discarded and rebuilt only after independent original-ticket validation;
+their bytes never grant cleanup authority. Unknown receipt-derived descendants
+block recovery instead of being hidden by a new canonical receipt. Partial or
+consumed progress records, extra representations, changed objects,
+and legacy tickets lacking original content authority remain explicit errors.
+
+Missing, unreadable, replaced or incomplete progress is not an empty history.
+If either batch-root candidate still exists, retain the original controls and
+report the specific recovery condition. A crash after recording intent but
+before `rmdir` can therefore retain even the original directory conservatively;
+do not delete or reset progress to make that state look new. Restore only an
+exact trusted receipt/progress history or leave the batch for explicit manual
+recovery. Old receipts without the new binding remain readable for diagnosis
+but cannot acquire cross-crash directory authority from the current namespace.
+Legacy marker-only tickets with no terminal regular-target directory slots
+continue to use their separate receipt/control recovery path.
+When both original metadata names exist, that path binds both to the receipt
+before mutation. Removing either authorized name may contract the live set;
+the surviving original name is not a newly introduced control. Cleanup order
+does not grant authority to new, reappearing, replaced or modified controls.
+
+Progress retirement requires repeated strict absence of both canonical and
+isolated batch-root names plus revalidation of final managed files. Its exact
+canonical, temporary, retained and malformed related representations remain
+part of the final control fence; an orphan is evidence, not cleanup authority.
+Capacity planning charges only actual namespace directories and alias parent
+directories to progress slots, with the batch root included in header and
+record byte estimates. All namespace entries still count toward the separate
+receipt entry and byte limits; a large flat set of files does not consume one
+directory slot per file.
+During one locked cleanup invocation, a cursor caches the directory slots and
+consumed paths, checks original file/parent identity and access policy, and
+validates only each newly appended canonical suffix. Related representations
+are still scanned at every boundary. An observed file timestamp change requests
+full byte/header validation; benign owner-only metadata can settle within two
+extra bounded reads, while persistent instability is reported separately from
+verified content mutation. Initial and final full replay remain mandatory.
+This bounds progress replay work, not the independent namespace/ledger walks.
+This protocol follows the existing cooperative single-UID writer model. It
+does not claim access isolation or rollback resistance against a hostile
+process with the same UID and full control over all durable authority records.
+Incremental append relies on cooperative writers holding the installation
+lock; it does not claim to detect a non-cooperative same-UID prefix write folded
+into this invocation's own append signal.
+
 ## Scheduler operator runbook
 
 Audit an existing host before changing it:
