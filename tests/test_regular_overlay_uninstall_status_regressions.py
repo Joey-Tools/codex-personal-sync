@@ -196,6 +196,26 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             os.fsync(stream.fileno())
         ticket.path.chmod(0o600)
 
+    def _metadata_first_ledger_capture(self, ticket, capture):
+        """Force the observed Linux crash order without assuming FS order."""
+        def capture_metadata_first(*args, **kwargs):
+            result = capture(*args, **kwargs)
+            ledger = args[4] if len(args) > 4 else kwargs["ledger"]
+            entries = ledger.get(ticket.batch_root_identity)
+            if entries is not None:
+                ledger[ticket.batch_root_identity] = tuple(
+                    sorted(
+                        entries,
+                        key=lambda entry: (
+                            entry[6] != PurePosixPath(MODULE.PENDING_LINK_METADATA_NAME),
+                            entry[0],
+                        ),
+                    )
+                )
+            return result
+
+        return capture_metadata_first
+
     def _marker_only_v4_ticket(self) -> MODULE.PendingBatchCleanupTicket:
         ticket = self._deferred_terminal_ticket()
         payload = json.loads(ticket.path.read_text(encoding="utf-8"))
@@ -1679,7 +1699,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             ): action.action
             for action in capacity.flattened_actions
         }
-        namespace_paths = MODULE._projected_pending_terminal_validation_namespace_paths(
+        namespace_paths, namespace_directory_paths = MODULE._projected_pending_terminal_validation_namespace_paths(
             self.home,
             capacity,
             before_state,
@@ -1695,6 +1715,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             phase="before",
         )
         self.assertTrue(set(projected_aliases).issubset(namespace_paths))
+        self.assertTrue(namespace_directory_paths.issubset(namespace_paths))
         self.assertNotIn(MODULE.PENDING_STATE_BEFORE_EVIDENCE, namespace_paths)
 
         # Both the immutable receipt and its required progress header are
@@ -3386,21 +3407,28 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             MODULE._close_fd_quietly(batch_fd)
 
         real_isolate = MODULE._isolate_pending_cleanup_entry
+        real_capture = MODULE._capture_pending_cleanup_identity_ledger
+        compatibility_metadata = legacy_ticket.batch_root / "metadata.json"
+        compatibility_identity = (
+            compatibility_metadata.stat().st_dev, compatibility_metadata.stat().st_ino,
+        )
         crashed = False
 
         def isolate_then_crash(*args: object, **kwargs: object):
             nonlocal crashed
             result = real_isolate(*args, **kwargs)
             name = args[1] if len(args) > 1 else None
-            if not crashed and name in {
-                MODULE.PENDING_LINK_METADATA_NAME,
-                "metadata.json",
-            }:
+            if not crashed and name == MODULE.PENDING_LINK_METADATA_NAME:
                 crashed = True
                 raise SystemExit("injected marker-only isolation crash")
             return result
 
         with (
+            mock.patch.object(
+                MODULE,
+                "_capture_pending_cleanup_identity_ledger",
+                side_effect=self._metadata_first_ledger_capture(legacy_ticket, real_capture),
+            ),
             mock.patch.object(
                 MODULE,
                 "_isolate_pending_cleanup_entry",
@@ -3414,6 +3442,11 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             MODULE._remove_cleanup_ready_batch(self.home, legacy_ticket)
 
         self.assertTrue(crashed)
+        self.assertFalse((legacy_ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME).exists())
+        self.assertEqual(
+            (compatibility_metadata.stat().st_dev, compatibility_metadata.stat().st_ino),
+            compatibility_identity,
+        )
         batch_metadata = legacy_ticket.batch_root.stat()
         batch_identity = (batch_metadata.st_dev, batch_metadata.st_ino)
         self.assertTrue(
@@ -3505,6 +3538,11 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             quarantine_root_stat.st_ino,
         )
         real_unlink = os.unlink
+        real_capture = MODULE._capture_pending_cleanup_identity_ledger
+        compatibility_metadata = ticket.batch_root / "metadata.json"
+        compatibility_identity = (
+            compatibility_metadata.stat().st_dev, compatibility_metadata.stat().st_ino,
+        )
         crashed = False
 
         def unlink_then_crash(
@@ -3525,6 +3563,11 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
                 raise SystemExit("injected marker-only control unlink crash")
 
         with (
+            mock.patch.object(
+                MODULE,
+                "_capture_pending_cleanup_identity_ledger",
+                side_effect=self._metadata_first_ledger_capture(ticket, real_capture),
+            ),
             mock.patch.object(MODULE.os, "unlink", side_effect=unlink_then_crash),
             self.assertRaisesRegex(
                 SystemExit,
@@ -3534,6 +3577,11 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
             MODULE._remove_cleanup_ready_batch(self.home, ticket)
 
         self.assertTrue(crashed)
+        self.assertFalse((ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME).exists())
+        self.assertEqual(
+            (compatibility_metadata.stat().st_dev, compatibility_metadata.stat().st_ino),
+            compatibility_identity,
+        )
         self.assertTrue(
             MODULE._pending_cleanup_terminal_validation_path(
                 self.home,
@@ -3548,6 +3596,32 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         )
         self.assertTrue(MODULE._cleanup_ready_pending_batches(self.home))
         self.assertFalse(ticket.batch_root.exists())
+
+    def test_marker_only_v4_binds_compatibility_metadata_content_before_mutation(
+        self,
+    ) -> None:
+        ticket = self._marker_only_v4_ticket()
+        with (
+            mock.patch.object(
+                MODULE, "_remove_pending_batch_directory_contents",
+                side_effect=SystemExit("injected after complete metadata receipt"),
+            ),
+            self.assertRaisesRegex(SystemExit, "complete metadata receipt"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+        metadata = ticket.batch_root / "metadata.json"
+        metadata.write_bytes(metadata.read_bytes() + b" ")
+        protected_ticket = ticket.path.read_bytes()
+        protected_metadata = metadata.read_bytes()
+        original_target = (self.target.stat().st_ino, self.target.stat().st_nlink)
+        with self.assertRaisesRegex(MODULE.SyncError, "receipt-bound entry changed"):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+        self.assertEqual(ticket.path.read_bytes(), protected_ticket)
+        self.assertEqual(metadata.read_bytes(), protected_metadata)
+        self.assertEqual(
+            (self.target.stat().st_ino, self.target.stat().st_nlink), original_target,
+        )
+        self.assertTrue(ticket.batch_root.is_dir())
 
     def test_marker_only_v4_rejects_control_reappearance_during_retry(self) -> None:
         ticket = self._marker_only_v4_ticket()
@@ -5624,6 +5698,207 @@ class RegularClaimFailClosedTests(unittest.TestCase):
         self.assertEqual(
             MODULE._load_managed_state(self.home).owners[MODULE.PUBLIC_OWNER],
             SHA_A,
+        )
+
+
+class DirectoryProgressPublicationRecoveryTests(unittest.TestCase):
+    """Pair recoverable publication crashes with rejected authority changes."""
+
+    def setUp(self) -> None:
+        self.fixture = RegularOverlayUninstallFinalizationTests(methodName="runTest")
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.tearDown)
+        self.ticket = self.fixture._deferred_terminal_ticket()
+        self.progress = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home, self.ticket.batch_root.name,
+        )
+        self.receipt = MODULE._pending_cleanup_terminal_validation_path(
+            self.fixture.home, self.ticket.batch_root.name,
+        )
+
+    def _stage_orphan(self) -> bytes:
+        publish = MODULE._publish_atomic_exclusive_internal_file
+
+        def crash_after_progress(home, path, payload, **kwargs):
+            result = publish(home, path, payload, **kwargs)
+            if path == self.progress:
+                raise SystemExit("injected durable progress before receipt")
+            return result
+
+        with (
+            mock.patch.object(
+                MODULE, "_publish_atomic_exclusive_internal_file",
+                side_effect=crash_after_progress,
+            ),
+            self.assertRaisesRegex(SystemExit, "durable progress before receipt"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertTrue(self.progress.is_file())
+        self.assertFalse(self.receipt.exists())
+        payload = self.progress.read_bytes()
+        self.assertEqual(payload.count(b"\n"), 1)
+        return payload
+
+    def _protected(self):
+        target = self.fixture.target
+        metadata = target.stat()
+        root_metadata = self.ticket.batch_root.stat()
+        return (
+            self.ticket.path.read_bytes(),
+            self.progress.read_bytes(),
+            (root_metadata.st_dev, root_metadata.st_ino, root_metadata.st_mode),
+            (
+                metadata.st_dev, metadata.st_ino, metadata.st_mode,
+                metadata.st_uid, metadata.st_nlink, target.read_bytes(),
+            ),
+        )
+
+    def _reject_without_deletion(self, message: str) -> None:
+        protected = self._protected()
+        with self.assertRaisesRegex(MODULE.SyncError, message):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertEqual(self._protected(), protected)
+        self.assertFalse(self.receipt.exists())
+        self.assertTrue(self.ticket.path.is_file())
+
+    def _assert_retired(self) -> None:
+        self.assertFalse(self.ticket.path.exists())
+        self.assertFalse(self.ticket.batch_root.exists())
+        self.assertFalse(self.progress.exists())
+        self.assertFalse(self.receipt.exists())
+        self.assertEqual(self.fixture.target.read_text(), PUBLIC_PAYLOAD)
+        self.assertEqual(self.fixture.target.stat().st_nlink, 1)
+
+    def test_durable_header_before_receipt_retries_without_reset(self) -> None:
+        self._stage_orphan()
+        original_identity = (self.progress.stat().st_dev, self.progress.stat().st_ino)
+        publish = MODULE._publish_atomic_exclusive_internal_file
+
+        def confirm_original_progress(home, path, payload, **kwargs):
+            self.assertNotEqual(path, self.progress)
+            if path == self.receipt:
+                actual = self.progress.stat()
+                self.assertEqual((actual.st_dev, actual.st_ino), original_identity)
+            return publish(home, path, payload, **kwargs)
+
+        with mock.patch.object(
+            MODULE, "_publish_atomic_exclusive_internal_file",
+            side_effect=confirm_original_progress,
+        ):
+            self.assertTrue(MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket))
+        self._assert_retired()
+
+    def test_native_install_preflight_recovers_before_global_mutation_fence(self) -> None:
+        self._stage_orphan()
+        with self.assertRaisesRegex(MODULE.SyncError, "reconciled before new mutation"):
+            MODULE._require_no_pending_unresolved_ticket_representations(self.fixture.home)
+        MODULE._preflight_pending_recovery(self.fixture.home, dry_run=False)
+        self._assert_retired()
+
+    def test_cleanup_entrypoint_recovers_with_one_shared_batch_budget(self) -> None:
+        self._stage_orphan()
+        budget = MODULE.PendingCleanupActionBudget(1)
+        self.assertEqual(
+            MODULE._cleanup_ready_pending_batches(self.fixture.home, budget=budget), 1,
+        )
+        self.assertEqual(budget.consumed, 1)
+        self.assertEqual(budget.completed, 1)
+        self._assert_retired()
+
+    def test_pre_receipt_partial_record_is_not_empty_history(self) -> None:
+        header = self._stage_orphan()
+        self.progress.write_bytes(header + b'{"slot":')
+        self._reject_without_deletion("not an exact unconsumed header")
+
+    def test_pre_receipt_valid_consumption_record_is_not_empty_history(self) -> None:
+        header = self._stage_orphan()
+        self.progress.write_bytes(header + MODULE._pending_directory_progress_line({"slot": 0}))
+        self._reject_without_deletion("not an exact unconsumed header")
+
+    def test_pre_receipt_wrong_ticket_header_is_retained(self) -> None:
+        payload = json.loads(self._stage_orphan())
+        payload["ticket_sha256"] = "0" * 64
+        self.progress.write_bytes(
+            MODULE._pending_directory_progress_line(
+                payload, maximum_bytes=MODULE.MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+            )
+        )
+        self._reject_without_deletion("not an exact unconsumed header")
+
+    def test_pre_receipt_related_representation_is_retained(self) -> None:
+        self._stage_orphan()
+        extra = self.progress.with_name(self.progress.name + ".tmp")
+        extra.write_bytes(b"unrelated retained evidence\n")
+        extra.chmod(0o600)
+        self._reject_without_deletion("ambiguous related representations")
+        self.assertEqual(extra.read_bytes(), b"unrelated retained evidence\n")
+
+    def test_pre_receipt_original_marker_content_must_still_match_ticket(self) -> None:
+        self._stage_orphan()
+        marker = self.ticket.batch_root / Path(*self.ticket.marker_path.parts)
+        marker.write_bytes(b"changed marker content\n")
+        self._reject_without_deletion("(control|marker|commit evidence).*(changed|authority)")
+
+    def test_pre_receipt_original_metadata_content_must_still_match_ticket(self) -> None:
+        self._stage_orphan()
+        metadata = self.ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        metadata.write_bytes(b"changed metadata content\n")
+        self._reject_without_deletion("transaction metadata changed")
+
+    def test_pre_receipt_directory_replacement_is_not_new_authority(self) -> None:
+        self._stage_orphan()
+        original = self.ticket.batch_root / "pending" / "stage"
+        preserved = self.fixture.root / "stage-preserved"
+        original.rename(preserved)
+        original.mkdir(mode=0o700)
+        for entry in preserved.iterdir():
+            entry.rename(original / entry.name)
+        self._reject_without_deletion("(namespace|alias).*(changed|authority)")
+
+    def test_legacy_orphan_without_commit_content_authority_is_retained(self) -> None:
+        header = json.loads(self._stage_orphan())
+        payload = json.loads(self.ticket.path.read_bytes())
+        payload.pop("commit_evidence")
+        self.fixture._rewrite_ticket_same_inode(self.ticket, payload)
+        self.ticket = MODULE._read_pending_cleanup_ticket(self.fixture.home, self.ticket.path)
+        self.assertIsNotNone(self.ticket)
+        header["ticket_sha256"] = hashlib.sha256(self.ticket.snapshot.payload).hexdigest()
+        self.progress.write_bytes(
+            MODULE._pending_directory_progress_line(
+                header, maximum_bytes=MODULE.MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+            )
+        )
+        self._reject_without_deletion("lacks original ticket authority")
+
+    def test_progress_replacement_during_receipt_publication_precedes_walker(self) -> None:
+        header = self._stage_orphan()
+        publish = MODULE._publish_atomic_exclusive_internal_file
+
+        def replace_progress(home, path, payload, **kwargs):
+            result = publish(home, path, payload, **kwargs)
+            if path == self.receipt:
+                original = self.progress.with_name("saved-original-progress")
+                self.progress.rename(original)
+                self.progress.write_bytes(header)
+                self.progress.chmod(0o600)
+            return result
+
+        target = self.fixture.target
+        original_target = (target.stat().st_ino, target.stat().st_nlink, target.read_bytes())
+        with (
+            mock.patch.object(
+                MODULE, "_publish_atomic_exclusive_internal_file", side_effect=replace_progress,
+            ),
+            mock.patch.object(MODULE, "_remove_pending_batch_directory_contents") as walker,
+            self.assertRaisesRegex(MODULE.SyncError, "progress changed during receipt publication"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        walker.assert_not_called()
+        self.assertTrue(self.receipt.exists())
+        self.assertTrue(self.ticket.path.is_file())
+        self.assertTrue(self.ticket.batch_root.is_dir())
+        self.assertEqual(
+            (target.stat().st_ino, target.stat().st_nlink, target.read_bytes()), original_target,
         )
 
 

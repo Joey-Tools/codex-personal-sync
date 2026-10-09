@@ -1716,6 +1716,220 @@ class RegularAgentMaterializationBudgetTests(unittest.TestCase):
             install(self.release, self.home, SHA_A)
 
 
+class PendingTerminalValidationProjectionBudgetTests(unittest.TestCase):
+    def _many_file_namespace_projection(
+        self,
+        file_count: int,
+    ) -> tuple[
+        Path,
+        MODULE.PendingLinkCapacityPlan,
+        MODULE.ManagedState,
+        frozenset[PurePosixPath],
+        frozenset[PurePosixPath],
+    ]:
+        home = Path("/projection-home")
+        actions = tuple(
+            MODULE.ReconcileAction(
+                action="create",
+                target=home / "agents" / f"reviewer-{index}.toml",
+                link_target="../personal_codex/agents/reviewer.toml",
+                kind="file",
+                materialization="regular",
+            )
+            for index in range(file_count)
+        )
+        capacity = MODULE.PendingLinkCapacityPlan(
+            ordered_groups=(("managed", actions),),
+            flattened_actions=actions,
+            retired_absence_specs=(),
+        )
+        empty_state = MODULE.ManagedState(owners={}, links={})
+        namespace_paths, namespace_directory_paths = (
+            MODULE._projected_pending_terminal_validation_namespace_paths(
+                home,
+                capacity,
+                empty_state,
+                empty_state,
+                empty_state,
+                {},
+                state_before_exists=False,
+            )
+        )
+        return (
+            home,
+            capacity,
+            empty_state,
+            namespace_paths,
+            namespace_directory_paths,
+        )
+
+    def test_many_files_only_consume_namespace_entries_not_progress_slots(self) -> None:
+        (
+            home,
+            capacity,
+            state,
+            namespace_paths,
+            namespace_directory_paths,
+        ) = self._many_file_namespace_projection(40)
+        alias_path = PurePosixPath(".terminal-recovery-alias-0")
+        namespace_paths = namespace_paths | {alias_path}
+        self.assertGreater(len(namespace_paths), len(namespace_directory_paths) * 10)
+        captured_headers: list[dict[str, object]] = []
+        real_progress_line = MODULE._pending_directory_progress_line
+
+        def capture_progress_header(payload: object, **kwargs: object) -> bytes:
+            encoded = real_progress_line(payload, **kwargs)
+            if isinstance(payload, dict) and "slots" in payload:
+                captured_headers.append(json.loads(encoded))
+            return encoded
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MAX_PENDING_TERMINAL_VALIDATION_DIRECTORIES",
+                len(namespace_directory_paths),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_projected_pending_terminal_validation_alias_paths",
+                return_value=(alias_path,),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_pending_directory_progress_line",
+                side_effect=capture_progress_header,
+            ),
+        ):
+            MODULE._validate_pending_terminal_validation_receipt_capacity(
+                home,
+                capacity,
+                state,
+                phase="after",
+                namespace_paths=namespace_paths,
+                namespace_directory_paths=namespace_directory_paths,
+            )
+
+        self.assertEqual(len(captured_headers), 1)
+        slot_paths = [slot["path"] for slot in captured_headers[0]["slots"]]
+        self.assertEqual(
+            slot_paths,
+            [
+                "",
+                *sorted(path.as_posix() for path in namespace_directory_paths),
+            ],
+        )
+        self.assertEqual(len(slot_paths), len(namespace_directory_paths) + 1)
+
+    def test_actual_namespace_directory_limit_still_rejects(self) -> None:
+        (
+            home,
+            capacity,
+            state,
+            namespace_paths,
+            namespace_directory_paths,
+        ) = self._many_file_namespace_projection(8)
+        alias_path = PurePosixPath(".terminal-recovery-alias-0")
+        namespace_paths = namespace_paths | {alias_path}
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MAX_PENDING_TERMINAL_VALIDATION_DIRECTORIES",
+                len(namespace_directory_paths) - 1,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_projected_pending_terminal_validation_alias_paths",
+                return_value=(alias_path,),
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal directory progress slots exceed the limit",
+            ),
+        ):
+            MODULE._validate_pending_terminal_validation_receipt_capacity(
+                home,
+                capacity,
+                state,
+                phase="after",
+                namespace_paths=namespace_paths,
+                namespace_directory_paths=namespace_directory_paths,
+            )
+
+    def test_progress_header_and_root_slot_records_share_the_size_budget(self) -> None:
+        home = Path("/projection-home")
+        capacity = MODULE.PendingLinkCapacityPlan(
+            ordered_groups=(),
+            flattened_actions=(),
+            retired_absence_specs=(),
+        )
+        state = MODULE.ManagedState(owners={}, links={})
+        alias_path = PurePosixPath(".terminal-recovery-alias-0")
+        namespace_directory_paths = frozenset({PurePosixPath("pending")})
+        namespace_paths = frozenset(
+            {
+                *namespace_directory_paths,
+                PurePosixPath("pending", "control-file"),
+                alias_path,
+            }
+        )
+        line_lengths: list[int] = []
+        real_progress_line = MODULE._pending_directory_progress_line
+
+        def record_progress_line(payload: object, **kwargs: object) -> bytes:
+            encoded = real_progress_line(payload, **kwargs)
+            line_lengths.append(len(encoded))
+            return encoded
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_projected_pending_terminal_validation_alias_paths",
+                return_value=(alias_path,),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_pending_directory_progress_line",
+                side_effect=record_progress_line,
+            ),
+        ):
+            MODULE._validate_pending_terminal_validation_receipt_capacity(
+                home,
+                capacity,
+                state,
+                phase="after",
+                namespace_paths=namespace_paths,
+                namespace_directory_paths=namespace_directory_paths,
+            )
+
+        projected_progress_size = sum(line_lengths)
+        self.assertGreater(len(line_lengths), 1)
+        with (
+            mock.patch.object(
+                MODULE,
+                "MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES",
+                projected_progress_size - 1,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_projected_pending_terminal_validation_alias_paths",
+                return_value=(alias_path,),
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal directory progress exceeds the size limit",
+            ),
+        ):
+            MODULE._validate_pending_terminal_validation_receipt_capacity(
+                home,
+                capacity,
+                state,
+                phase="after",
+                namespace_paths=namespace_paths,
+                namespace_directory_paths=namespace_directory_paths,
+            )
+
+
 class PrivateRegularAgentTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()

@@ -2193,6 +2193,11 @@ class PendingStagingCleanupTests(unittest.TestCase):
         real_read = MODULE._read_pending_cleanup_ticket
         real_remove = MODULE._remove_cleanup_ready_batch
         real_verify = MODULE._verify_final_regular_targets
+        current_budget = [MODULE.PendingCleanupActionBudget(MODULE.MAX_PENDING_CLEANUP_BATCHES_PER_RUN)]
+
+        def verify_charged_batch(*args, **kwargs):
+            self.assertIn(terminal_ticket.batch_root.name, current_budget[0].charged_batches)
+            return real_verify(*args, **kwargs)
 
         def read_ticket(home: Path, path: Path, **kwargs):
             deferred = deferred_tickets.get(path.name)
@@ -2219,17 +2224,21 @@ class PendingStagingCleanupTests(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "_verify_final_regular_targets",
-                wraps=real_verify,
+                side_effect=verify_charged_batch,
             ) as verify,
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
-            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+            self.assertEqual(
+                MODULE._cleanup_ready_pending_batches(self.home, budget=current_budget[0]), 1,
+            )
+            current_budget[0] = MODULE.PendingCleanupActionBudget(MODULE.MAX_PENDING_CLEANUP_BATCHES_PER_RUN)
+            self.assertEqual(
+                MODULE._cleanup_ready_pending_batches(self.home, budget=current_budget[0]), 1,
+            )
 
-        # The terminal group is revalidated at proof publication, the bound
-        # batch-root rmdir boundary, and both final control-retirement
-        # callback boundaries (before and after descriptor/content checks).
-        self.assertEqual(verify.call_count, 4)
+        # Verification phases may grow; every call must follow the one shared
+        # batch charge rather than consume another cleanup action.
+        verify.assert_called()
         self.assertFalse(retained_cursor.exists())
         self.assertFalse(terminal_ticket.path.exists())
         self.assertEqual(self.target.stat().st_nlink, 1)
@@ -2311,20 +2320,25 @@ class PendingStagingCleanupTests(unittest.TestCase):
             temp_path.chmod(0o600)
 
         real_verify = MODULE._verify_final_regular_targets
+        action_budget = MODULE.PendingCleanupActionBudget(MODULE.MAX_PENDING_CLEANUP_BATCHES_PER_RUN)
+
+        def verify_charged_batch(*args, **kwargs):
+            self.assertIn(ticket.batch_root.name, action_budget.charged_batches)
+            return real_verify(*args, **kwargs)
+
         with mock.patch.object(
             MODULE,
             "_verify_final_regular_targets",
-            wraps=real_verify,
+            side_effect=verify_charged_batch,
         ) as verify:
             self.assertEqual(
-                MODULE._cleanup_ready_pending_batches(self.home),
+                MODULE._cleanup_ready_pending_batches(self.home, budget=action_budget),
                 MODULE.MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
             )
 
-        # The terminal group is revalidated at proof publication, the bound
-        # batch-root rmdir boundary, and both final control-retirement
-        # callback boundaries (before and after descriptor/content checks).
-        self.assertEqual(verify.call_count, 4)
+        # The restored batch must be charged before any target verification;
+        # progress publication adds validation, not another budget charge.
+        verify.assert_called()
         self.assertFalse(ticket.path.exists())
         self.assertFalse(retained_ticket.exists())
         self.assertEqual(self.target.stat().st_nlink, 1)
@@ -2820,6 +2834,12 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     mock.patch.object(
                         MODULE,
                         "_restore_pending_cleanup_control_tombstones",
+                    ),
+                    # Keep the synthetic fd scoped to cursor cleanup, not the
+                    # separate receipt-publication recovery preflight.
+                    mock.patch.object(
+                        MODULE,
+                        "_recover_unconsumed_pending_terminal_progress_publications",
                     ),
                     mock.patch.object(
                         MODULE,

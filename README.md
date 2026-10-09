@@ -360,6 +360,16 @@ descriptor. An interrupted retry may observe that consumed slot as absent;
 any reappearance is retained, even when numeric inode identity was recycled.
 Normal remaining-child cleanup still permits authorized namespace contraction.
 
+A crash after publishing progress but before publishing the immutable receipt
+can resume only with the exact canonical header-only progress file. Recovery
+independently validates the original ticket, complete live namespace, exact
+managed-target hard-link set, pointer/metadata and ticket-bound control content
+before binding that file's identity and access policy into the receipt. It does
+not infer authority from progress slots. The normal install preflight and
+cleanup entrypoint try this bounded recovery before the unchanged new-mutation
+fence. Partial or consumed records, extra representations, changed objects,
+and legacy tickets lacking original content authority remain explicit errors.
+
 Missing, unreadable, replaced or incomplete progress is not an empty history.
 If either batch-root candidate still exists, retain the original controls and
 report the specific recovery condition. A crash after recording intent but
@@ -370,11 +380,20 @@ recovery. Old receipts without the new binding remain readable for diagnosis
 but cannot acquire cross-crash directory authority from the current namespace.
 Legacy marker-only tickets with no terminal regular-target directory slots
 continue to use their separate receipt/control recovery path.
+When both original metadata names exist, that path binds both to the receipt
+before mutation. Removing either authorized name may contract the live set;
+the surviving original name is not a newly introduced control. Cleanup order
+does not grant authority to new, reappearing, replaced or modified controls.
 
 Progress retirement requires repeated strict absence of both canonical and
 isolated batch-root names plus revalidation of final managed files. Its exact
 canonical, temporary, retained and malformed related representations remain
 part of the final control fence; an orphan is evidence, not cleanup authority.
+Capacity planning charges only actual namespace directories and alias parent
+directories to progress slots, with the batch root included in header and
+record byte estimates. All namespace entries still count toward the separate
+receipt entry and byte limits; a large flat set of files does not consume one
+directory slot per file.
 This protocol follows the existing cooperative single-UID writer model. It
 does not claim access isolation or rollback resistance against a hostile
 process with the same UID and full control over all durable authority records.
