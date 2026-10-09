@@ -6745,6 +6745,178 @@ class DirectoryProgressRegressionTests(unittest.TestCase):
         self.assertTrue(self.ticket.path.is_file())
         self.assertTrue(self.ticket.batch_root.is_dir())
 
+    def _bounded_parser_limit_records(self) -> list[tuple[str, bytes]]:
+        records = []
+        integer_limit = getattr(sys, "get_int_max_str_digits", lambda: 0)()
+        if (
+            integer_limit
+            and integer_limit + 12
+            <= MODULE.MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_LINE_BYTES
+        ):
+            records.append(
+                ("integer-limit", b'{"slot":' + b"1" * (integer_limit + 1) + b"}\n")
+            )
+        depth = sys.getrecursionlimit() + 1
+        if (
+            depth * 2 + 12
+            <= MODULE.MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_LINE_BYTES
+        ):
+            line = b'{"slot":' + b"[" * depth + b"0" + b"]" * depth + b"}\n"
+            try:
+                json.loads(line.decode("utf-8"))
+            except RecursionError:
+                records.append(("recursion-limit", line))
+        if not records:
+            self.skipTest("runtime parser limits exceed the bounded progress record size")
+        return records
+
+    def test_parser_recursion_errors_preserve_recovery_authority(self) -> None:
+        identity, authority, cursor = self._progress_cursor()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home, self.ticket.batch_root.name,
+        )
+        line = MODULE._pending_directory_progress_line({"slot": 0})
+        progress_path.write_bytes(progress_path.read_bytes() + line)
+        expected_payload = progress_path.read_bytes()
+        index_fd = MODULE._open_directory_beneath(
+            self.fixture.home, progress_path.parent,
+        )
+        try:
+            snapshot = MODULE._read_managed_state_file_snapshot(
+                self.fixture.home,
+                progress_path,
+                index_fd,
+                expected_identity=authority.directory_progress.file_identity,
+                maximum_bytes=MODULE.MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+            )
+        finally:
+            MODULE._close_fd_quietly(index_fd)
+        protected = self._protected_snapshot()
+        for parser in ("payload", "suffix"):
+            with self.subTest(parser=parser):
+                error = RecursionError("bounded progress parser runtime limit")
+                consumed = set()
+                with (
+                    mock.patch.object(MODULE.json, "loads", side_effect=error),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError, "progress is malformed",
+                    ) as caught,
+                ):
+                    if parser == "payload":
+                        MODULE._parse_pending_terminal_directory_progress_payload(
+                            self.ticket, identity, authority, snapshot,
+                        )
+                    else:
+                        MODULE._parse_pending_terminal_directory_progress_suffix(
+                            self.ticket, cursor.directories, consumed, line,
+                        )
+                self.assertIs(caught.exception.__cause__, error)
+                self.assertEqual(consumed, set())
+                self._assert_protected_snapshot_unchanged(protected)
+                self.assertEqual(progress_path.read_bytes(), expected_payload)
+
+    def test_progress_parser_limits_preserve_recovery_authority(self) -> None:
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home, self.ticket.batch_root.name,
+        )
+        original = progress_path.read_bytes()
+        protected = self._protected_snapshot()
+        for label, line in self._bounded_parser_limit_records():
+            with self.subTest(limit=label):
+                self.assertLessEqual(len(line), MODULE.MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_LINE_BYTES)
+                with self.assertRaises((ValueError, RecursionError)):
+                    json.loads(line.decode("utf-8"))
+                progress_path.write_bytes(original + line)
+                try:
+                    with self.assertRaisesRegex(MODULE.SyncError, "progress is malformed") as caught:
+                        MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+                    self.assertIsInstance(caught.exception.__cause__, (ValueError, RecursionError))
+                    self._assert_protected_snapshot_unchanged(protected)
+                    self.assertTrue(self.ticket.path.is_file())
+                    self.assertTrue(self.ticket.batch_root.is_dir())
+                    self.assertEqual(progress_path.read_bytes(), original + line)
+                finally:
+                    progress_path.write_bytes(original)
+
+    def test_suffix_parser_limits_do_not_change_consumed_history(self) -> None:
+        _identity, _authority, cursor = self._progress_cursor()
+        protected = self._protected_snapshot()
+        for label, line in self._bounded_parser_limit_records():
+            with self.subTest(limit=label):
+                consumed = {0}
+                with self.assertRaisesRegex(MODULE.SyncError, "progress is malformed") as caught:
+                    MODULE._parse_pending_terminal_directory_progress_suffix(
+                        self.ticket, cursor.directories, consumed, line,
+                    )
+                self.assertIsInstance(caught.exception.__cause__, (ValueError, RecursionError))
+                self.assertEqual(consumed, {0})
+                self._assert_protected_snapshot_unchanged(protected)
+
+    def test_progress_parsers_accept_valid_canonical_slot(self) -> None:
+        identity, authority, cursor = self._progress_cursor()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home, self.ticket.batch_root.name,
+        )
+        line = MODULE._pending_directory_progress_line({"slot": 0})
+        with progress_path.open("ab") as stream:
+            stream.write(line)
+            stream.flush()
+            os.fsync(stream.fileno())
+        state = MODULE._read_pending_terminal_directory_progress(
+            self.fixture.home, self.ticket, identity, authority,
+        )
+        self.assertEqual(state.consumed_slots, frozenset({0}))
+        consumed = set()
+        self.assertEqual(
+            MODULE._parse_pending_terminal_directory_progress_suffix(
+                self.ticket, cursor.directories, consumed, line,
+            ),
+            (0,),
+        )
+        self.assertEqual(consumed, {0})
+
+    def _synthetic_control_index_names(self, *, retained=False):
+        names = []
+        for index in range(32):
+            batch = f"20261009T000000Z-123-{1000 + index}"
+            ticket = batch + MODULE.PENDING_CLEANUP_TICKET_SUFFIX
+            progress = batch + MODULE.PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+            if retained:
+                ticket = f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}{ticket}-123-{index:016x}"
+                progress = f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}{progress}-123-{index:016x}"
+            names.extend((ticket, progress, batch + MODULE.PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX))
+        return tuple(sorted(names))
+
+    def _assert_linear_control_classification(self, *, retained):
+        names = self._synthetic_control_index_names(retained=retained)
+        with (
+            mock.patch.object(MODULE, "_directory_member_names", return_value=names),
+            mock.patch.object(
+                MODULE, "_pending_cleanup_retained_canonical_name",
+                wraps=MODULE._pending_cleanup_retained_canonical_name,
+            ) as classify,
+        ):
+            self.assertIsNone(MODULE._pending_cleanup_unresolved_ticket_representation_issue(self.fixture.home))
+        self.assertLessEqual(classify.call_count, 8 * len(names))
+
+    def test_control_index_classification_is_linear_for_canonical_batches(self) -> None:
+        self._assert_linear_control_classification(retained=False)
+
+    def test_control_index_classification_is_linear_for_retained_batches(self) -> None:
+        self._assert_linear_control_classification(retained=True)
+
+    def test_control_index_missing_ticket_or_receipt_remains_blocking(self) -> None:
+        batch = "20261009T000000Z-123-1000"
+        progress = batch + MODULE.PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+        for present in (MODULE.PENDING_CLEANUP_TICKET_SUFFIX, MODULE.PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX):
+            with self.subTest(present=present), mock.patch.object(
+                MODULE, "_directory_member_names", return_value=tuple(sorted((progress, batch + present))),
+            ):
+                self.assertEqual(
+                    MODULE._pending_cleanup_unresolved_ticket_representation_issue(self.fixture.home),
+                    (batch, progress),
+                )
+
     def test_consumed_root_slot_present_rejects_original_root_identity(self) -> None:
         quarantine_identity, authority, cursor = self._progress_cursor()
         batch_fd = MODULE._open_directory_beneath(

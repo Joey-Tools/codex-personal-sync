@@ -26379,7 +26379,7 @@ def _parse_pending_terminal_directory_progress_payload(
             )
         try:
             record = json.loads(line.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        except (ValueError, RecursionError) as error:
             raise SyncError(
                 f"pending terminal directory progress is malformed: {ticket.batch_root.name}"
             ) from error
@@ -26569,7 +26569,7 @@ def _parse_pending_terminal_directory_progress_suffix(
             )
         try:
             record = json.loads(line.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        except (ValueError, RecursionError) as error:
             raise SyncError(
                 "pending terminal directory progress is malformed: "
                 f"{ticket.batch_root.name}"
@@ -44693,33 +44693,30 @@ def _pending_cleanup_unresolved_ticket_representation_issue(
             unresolved = _pending_cleanup_unresolved_ticket_representation(name)
             if unresolved is not None:
                 return unresolved
+        retained_by_name = {}
+        for name in names:
+            canonical = _pending_cleanup_retained_canonical_name(name)
+            if canonical is not None:
+                retained_by_name[name] = canonical
+        retained_canonicals = set(retained_by_name.values())
         for name in names:
             batch_name = (
                 _pending_cleanup_directory_progress_representation_batch_name(name)
             )
             if batch_name is None:
                 continue
-            if name not in {
-                batch_name + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX,
-                *(
-                    retained_name
-                    for retained_name in names
-                    if _pending_cleanup_retained_canonical_name(retained_name)
-                    == batch_name + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
-                ),
-            }:
+            progress_name = batch_name + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+            if (
+                name != progress_name
+                and retained_by_name.get(name) != progress_name
+            ):
                 continue
-            ticket_names = {
-                batch_name + PENDING_CLEANUP_TICKET_SUFFIX,
-                *(
-                    retained_name
-                    for retained_name in names
-                    if _pending_cleanup_retained_canonical_name(retained_name)
-                    == batch_name + PENDING_CLEANUP_TICKET_SUFFIX
-                ),
-            }
+            ticket_name = batch_name + PENDING_CLEANUP_TICKET_SUFFIX
             receipt_name = batch_name + PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX
-            if not ticket_names.intersection(names_set) or receipt_name not in names_set:
+            if (
+                ticket_name not in names_set
+                and ticket_name not in retained_canonicals
+            ) or receipt_name not in names_set:
                 return batch_name, name
         return None
     finally:
