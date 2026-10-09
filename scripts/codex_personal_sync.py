@@ -44782,13 +44782,14 @@ def _require_pending_cleanup_terminal_validation_family_safe(
     home: Path,
     ticket: PendingBatchCleanupTicket,
 ) -> None:
-    """Reject ambiguous terminal-validation names for this exact batch.
+    """Fence all same-batch control families before destructive cleanup.
 
-    The broad receipt-family classifier is negative evidence only. Versions
-    with an existing protocol still let the narrow classifier preserve exact,
-    temporary, retirement and strict-retained forms for their existing parser
-    and recovery path. v5/v7 have no terminal-validation protocol, so no
-    same-batch family member can be auto-recovered for those tickets.
+    Broad ticket, progress and receipt classifiers are negative evidence only.
+    Reuse one bounded inventory so unsupported or ambiguous descendants cannot
+    survive retirement of their original ticket or batch. Exact protocol-owned
+    names remain candidates for existing bound parsers and recovery, never
+    authority by filename alone. v5/v7 have no receipt protocol; only terminal
+    regular v4/v8 tickets have a directory-progress protocol.
     """
     index_root = _pending_cleanup_index_path(home)
     index_fd = _open_directory_beneath(home, index_root)
@@ -44799,7 +44800,7 @@ def _require_pending_cleanup_terminal_validation_family_safe(
             expected_mode=0o700,
         )
         if not _bound_directory_matches(home, index_root, index_fd):
-            raise SyncError("pending cleanup index changed during receipt scan")
+            raise SyncError("pending cleanup index changed during control-family scan")
         names = _directory_member_names(
             index_fd,
             maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
@@ -44807,12 +44808,15 @@ def _require_pending_cleanup_terminal_validation_family_safe(
         )
         batch_name = ticket.batch_root.name
         for name in names:
-            if (
+            receipt_member = (
                 _pending_cleanup_terminal_validation_representation_batch_name(name)
-                != batch_name
+                == batch_name
+            )
+            if not receipt_member and (
+                _pending_cleanup_ticket_representation_batch_name(name) != batch_name
             ):
                 continue
-            if ticket.version not in {1, 2, 3, 4, 6, 8}:
+            if receipt_member and ticket.version not in {1, 2, 3, 4, 6, 8}:
                 raise SyncError(
                     "pending ephemeral cleanup has no terminal-validation "
                     f"recovery protocol; manual recovery is required: "
@@ -44834,6 +44838,24 @@ def _require_pending_cleanup_terminal_validation_family_safe(
                     f"protocol for this ticket; manual recovery is required: "
                     f"{batch_name}: {name}"
                 )
+            if (
+                _pending_cleanup_directory_progress_representation_batch_name(name)
+                == batch_name
+            ):
+                if not (ticket.version in {4, 8} and ticket.terminal_regular_targets):
+                    raise SyncError(
+                        "pending directory progress has no recovery protocol for "
+                        f"this ticket; manual recovery is required: {batch_name}: {name}"
+                    )
+                if name == (
+                    batch_name + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                    + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+                ):
+                    # Preserve the exact publication candidate. The existing
+                    # recovery path must independently prove the original
+                    # ticket, namespace, controls and unconsumed header before
+                    # promotion; this observational fence grants no authority.
+                    continue
             unresolved = _pending_cleanup_unresolved_ticket_representation(name)
             if unresolved is not None:
                 raise _pending_cleanup_unresolved_ticket_representation_error(
@@ -44845,7 +44867,7 @@ def _require_pending_cleanup_terminal_validation_family_safe(
             expected_mode=0o700,
         )
         if not _bound_directory_matches(home, index_root, index_fd):
-            raise SyncError("pending cleanup index changed during receipt scan")
+            raise SyncError("pending cleanup index changed during control-family scan")
     finally:
         _close_fd_quietly(index_fd)
 

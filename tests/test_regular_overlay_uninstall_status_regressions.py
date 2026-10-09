@@ -5765,6 +5765,154 @@ class ReceiptFamilyResidueFenceTests(unittest.TestCase):
             == ticket.batch_root.name
         )
 
+    def _assert_control_residue_blocks_direct_cleanup(
+        self,
+        version: int,
+        *,
+        progress: bool,
+        suffix: str,
+        retained: bool = False,
+    ) -> None:
+        case = RegularOverlayUninstallFinalizationTests(methodName="runTest")
+        case.setUp()
+        try:
+            ticket = self._ticket_for_direct_receipt_fence(case, version)
+            canonical_name = (
+                ticket.batch_root.name
+                + MODULE.PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                if progress
+                else ticket.path.name
+            )
+            residue_name = canonical_name + suffix
+            if retained:
+                residue_name = (
+                    MODULE.PENDING_CLEANUP_RETAINED_PREFIX
+                    + residue_name
+                    + "-123-0123456789abcdef"
+                )
+            residue = ticket.path.parent / residue_name
+            residue.write_bytes(b"unknown same-batch control residue\n")
+            residue.chmod(0o600)
+            # No write is permitted: preserve control identity, bytes, access
+            # policy, and the original batch or quarantined public target.
+            protected = pending_authority_snapshot(case.home)
+
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "manual recovery is required|reconciled before new mutation",
+            ):
+                MODULE._remove_cleanup_ready_batch(case.home, ticket)
+
+            self.assertEqual(pending_authority_snapshot(case.home), protected)
+            self.assertTrue(ticket.path.is_file())
+            if version == 6:
+                self.assertTrue(
+                    (case.home / Path(*ticket.public_target.parts)).is_file()
+                )
+            else:
+                self.assertTrue(ticket.batch_root.exists())
+            self.assertTrue(residue.is_file())
+        finally:
+            case.tearDown()
+
+    def test_direct_cleanup_ticket_versions_reject_foreign_progress_descendants(
+        self,
+    ) -> None:
+        for version in range(1, 9):
+            for retained in (False, True):
+                with self.subTest(version=version, retained=retained):
+                    self._assert_control_residue_blocks_direct_cleanup(
+                        version,
+                        progress=True,
+                        suffix=".foreign",
+                        retained=retained,
+                    )
+
+    def test_direct_cleanup_ticket_versions_reject_foreign_ticket_descendants(
+        self,
+    ) -> None:
+        for version in range(1, 9):
+            with self.subTest(version=version):
+                self._assert_control_residue_blocks_direct_cleanup(
+                    version,
+                    progress=False,
+                    suffix=".foreign",
+                )
+
+    def test_progress_names_require_terminal_regular_protocol(self) -> None:
+        # Version 4 in this fixture is marker-only, not terminal-regular.
+        for version in range(1, 8):
+            for suffix, retained in (
+                ("", False),
+                (MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX, False),
+                ("", True),
+            ):
+                with self.subTest(version=version, suffix=suffix, retained=retained):
+                    self._assert_control_residue_blocks_direct_cleanup(
+                        version,
+                        progress=True,
+                        suffix=suffix,
+                        retained=retained,
+                    )
+
+    def test_complete_control_family_fence_inventories_names_once(self) -> None:
+        case = RegularOverlayUninstallFinalizationTests(methodName="runTest")
+        case.setUp()
+        try:
+            ticket = self._ticket_for_direct_receipt_fence(case, 8)
+            with mock.patch.object(
+                MODULE,
+                "_directory_member_names",
+                wraps=MODULE._directory_member_names,
+            ) as inventory:
+                MODULE._require_pending_cleanup_terminal_validation_family_safe(
+                    case.home,
+                    ticket,
+                )
+            self.assertEqual(inventory.call_count, 1)
+        finally:
+            case.tearDown()
+
+    def test_ephemeral_ticket_retirement_rechecks_progress_family(self) -> None:
+        for version in (5, 6, 7):
+            with self.subTest(version=version):
+                case = RegularOverlayUninstallFinalizationTests(methodName="runTest")
+                case.setUp()
+                try:
+                    ticket = self._ticket_for_direct_receipt_fence(case, version)
+                    foreign = ticket.path.parent / (
+                        ticket.batch_root.name
+                        + MODULE.PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                        + ".foreign"
+                    )
+                    real_delete_ticket = MODULE._delete_pending_cleanup_ticket
+                    injected = []
+
+                    def inject_before_ticket_retirement(home, current_ticket, **kwargs):
+                        foreign.write_bytes(b"late foreign progress descendant\n")
+                        foreign.chmod(0o600)
+                        injected.append(True)
+                        return real_delete_ticket(home, current_ticket, **kwargs)
+
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_delete_pending_cleanup_ticket",
+                            side_effect=inject_before_ticket_retirement,
+                        ),
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            "manual recovery is required|reconciled before new mutation",
+                        ),
+                    ):
+                        MODULE._remove_cleanup_ready_batch(case.home, ticket)
+
+                    self.assertEqual(injected, [True])
+                    self.assertTrue(ticket.path.is_file())
+                    self.assertTrue(foreign.is_file())
+                finally:
+                    case.tearDown()
+
     def test_direct_cleanup_ticket_versions_preserve_receipt_family_protocols(
         self,
     ) -> None:
