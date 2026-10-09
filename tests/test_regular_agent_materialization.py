@@ -8266,8 +8266,9 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
 
     def test_rollback_terminal_receipt_directory_capacity_boundary(self) -> None:
         # With the shortest distinct depth-64 paths in this fixture, 1,263 is
-        # the last complete v3 receipt below 16 MiB; the next target crosses
-        # the byte boundary before the directory-count boundary.
+        # the last complete v5 receipt, including its progress binding, below
+        # 16 MiB. The progress header and all consumption records also fit;
+        # the next target crosses the receipt byte boundary first.
         accepted_count = 1_263
         accepted_capacity, accepted_state = self._deep_regular_rollback_capacity(
             accepted_count

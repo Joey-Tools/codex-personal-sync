@@ -100,8 +100,8 @@ tmp_owner=""
 tmp_mode=""
 
 cleanup() {
-  local command_status current_identity current_owner current_mode cleanup_status
-  command_status=$?
+  local command_status=$?
+  local current_identity current_owner current_mode cleanup_status
   cleanup_status=0
   trap - EXIT
 

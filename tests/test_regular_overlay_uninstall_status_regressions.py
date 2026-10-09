@@ -853,6 +853,8 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
                 terminal_aliases=authority.aliases,
                 terminal_directories=authority.directories,
                 namespace_entries=forged_entries,
+                control_files=authority.control_files,
+                directory_progress=authority.directory_progress,
             ),
         )
 
@@ -1695,9 +1697,13 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         self.assertTrue(set(projected_aliases).issubset(namespace_paths))
         self.assertNotIn(MODULE.PENDING_STATE_BEFORE_EVIDENCE, namespace_paths)
 
+        # Both the immutable receipt and its required progress header are
+        # capacity-checked before staging; either earlier bounded rejection
+        # preserves the same no-publication guarantee.
         with self.assertRaisesRegex(
             MODULE.SyncError,
-            "pending terminal validation receipt exceeds the size limit",
+            "pending terminal validation receipt exceeds the size limit|"
+            "pending terminal directory progress line exceeds the limit",
         ):
             MODULE._validate_pending_link_metadata_capacity(
                 self.home,
@@ -1789,7 +1795,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             MODULE.SyncError,
-            "pending terminal regular alias namespace changed: pending/stage",
+            "pending terminal directory slot was already consumed but is present again; manual recovery is required: pending/stage",
         ):
             MODULE._remove_cleanup_ready_batch(self.home, ticket)
 
@@ -1852,7 +1858,8 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             MODULE.SyncError,
-            "pending terminal regular alias namespace changed: pending/stage",
+            "pending terminal directory slot was already consumed but is "
+            "present again; manual recovery is required: pending/stage",
         ):
             MODULE._remove_cleanup_ready_batch(self.home, ticket)
 
@@ -1877,7 +1884,7 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             MODULE.SyncError,
-            "pending terminal regular alias namespace changed: pending",
+            "pending terminal directory slot was already consumed but is present again; manual recovery is required: pending",
         ):
             MODULE._remove_cleanup_ready_batch(self.home, ticket)
 
@@ -3448,8 +3455,55 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         finally:
             MODULE._close_fd_quietly(scan_fd)
 
+    def _marker_only_active_entry_is_receipt_control(
+        self,
+        ticket: MODULE.PendingBatchCleanupTicket,
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        dir_fd: int | None,
+        quarantine_root_identity: tuple[int, int],
+    ) -> bool:
+        if not isinstance(path, str) or dir_fd is None:
+            return False
+        parent_stat = os.fstat(dir_fd)
+        parent_identity = (parent_stat.st_dev, parent_stat.st_ino)
+        active_binding = MODULE._pending_cleanup_active_entry_binding(
+            path,
+            parent_identity,
+        )
+        if active_binding is None:
+            return False
+        receipt = MODULE._read_pending_cleanup_terminal_validation(
+            self.home,
+            ticket,
+            quarantine_root_identity,
+        )
+        if receipt is None:
+            return False
+        authority = MODULE._parse_pending_terminal_validation_authority(
+            self.home,
+            ticket,
+            quarantine_root_identity,
+            receipt,
+        )
+        if authority is None:
+            return False
+        active_plan, logical_name = active_binding
+        return any(
+            active_plan[2] == stat.S_IFREG
+            and control.file_identity == active_plan[:2]
+            and control_path.parent_identity == parent_identity
+            and control_path.path.name == logical_name
+            for control in authority.control_files
+            for control_path in control.paths
+        )
+
     def test_marker_only_v4_recovers_after_control_unlink_crash(self) -> None:
         ticket = self._marker_only_v4_ticket()
+        quarantine_root_stat = ticket.batch_root.parent.stat()
+        quarantine_root_identity = (
+            quarantine_root_stat.st_dev,
+            quarantine_root_stat.st_ino,
+        )
         real_unlink = os.unlink
         crashed = False
 
@@ -3461,10 +3515,11 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         ) -> None:
             nonlocal crashed
             real_unlink(path, *args, dir_fd=dir_fd, **kwargs)
-            if (
-                not crashed
-                and isinstance(path, str)
-                and path.startswith(MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+            if not crashed and self._marker_only_active_entry_is_receipt_control(
+                ticket,
+                path,
+                dir_fd,
+                quarantine_root_identity,
             ):
                 crashed = True
                 raise SystemExit("injected marker-only control unlink crash")
@@ -3493,6 +3548,158 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         )
         self.assertTrue(MODULE._cleanup_ready_pending_batches(self.home))
         self.assertFalse(ticket.batch_root.exists())
+
+    def test_marker_only_v4_rejects_control_reappearance_during_retry(self) -> None:
+        ticket = self._marker_only_v4_ticket()
+        receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=SystemExit("injected after marker-only receipt"),
+            ),
+            self.assertRaisesRegex(SystemExit, "after marker-only receipt"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+        self.assertTrue(receipt_path.is_file())
+
+        metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        saved_metadata_path = self.root / "saved-marker-only-metadata.json"
+        metadata_path.rename(saved_metadata_path)
+        legacy_metadata_path = ticket.batch_root / "metadata.json"
+        saved_legacy_metadata_path = (
+            self.root / "saved-marker-only-legacy-metadata.json"
+        )
+        if legacy_metadata_path.exists():
+            legacy_metadata_path.rename(saved_legacy_metadata_path)
+        quarantine_root_stat = ticket.batch_root.parent.stat()
+        quarantine_root_identity = (
+            quarantine_root_stat.st_dev,
+            quarantine_root_stat.st_ino,
+        )
+        real_unlink = os.unlink
+        restored = False
+
+        def restore_metadata_after_control_unlink(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            *args: object,
+            dir_fd: int | None = None,
+            **kwargs: object,
+        ) -> None:
+            nonlocal restored
+            real_unlink(path, *args, dir_fd=dir_fd, **kwargs)
+            if restored or not self._marker_only_active_entry_is_receipt_control(
+                ticket,
+                path,
+                dir_fd,
+                quarantine_root_identity,
+            ):
+                return
+            saved_metadata_path.rename(metadata_path)
+            restored = True
+
+        with (
+            mock.patch.object(
+                MODULE.os,
+                "unlink",
+                side_effect=restore_metadata_after_control_unlink,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "legacy marker-only v4 validation control namespace "
+                "expanded before cleanup",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(restored)
+        self.assertTrue(metadata_path.is_file())
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_marker_only_v4_rejects_control_reappearance_after_contraction(
+        self,
+    ) -> None:
+        ticket = self._marker_only_v4_ticket()
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=SystemExit("injected after marker-only receipt"),
+            ),
+            self.assertRaisesRegex(SystemExit, "after marker-only receipt"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        quarantine_root_stat = ticket.batch_root.parent.stat()
+        quarantine_root_identity = (
+            quarantine_root_stat.st_dev,
+            quarantine_root_stat.st_ino,
+        )
+        receipt = MODULE._read_pending_cleanup_terminal_validation(
+            self.home,
+            ticket,
+            quarantine_root_identity,
+        )
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        authority = MODULE._parse_pending_terminal_validation_authority(
+            self.home,
+            ticket,
+            quarantine_root_identity,
+            receipt,
+        )
+        self.assertIsNotNone(authority)
+        assert authority is not None
+        initial_live_paths = frozenset(
+            path.path
+            for control in authority.control_files
+            for path in control.paths
+        )
+        self.assertTrue(initial_live_paths)
+        contracted_live_paths = frozenset(sorted(initial_live_paths)[:-1])
+        self.assertNotEqual(initial_live_paths, contracted_live_paths)
+        # Exercise full -> contracted -> reappeared observations without
+        # depending on inode reuse or filesystem enumeration order.
+        observations = iter(
+            (
+                initial_live_paths,
+                contracted_live_paths,
+                initial_live_paths,
+            )
+        )
+
+        def exercise_control_callbacks(*args: object, **kwargs: object) -> None:
+            revalidate = kwargs.get("mutation_revalidator")
+            self.assertTrue(callable(revalidate))
+            assert callable(revalidate)
+            revalidate(PurePosixPath("<contraction>"), "before_isolate")
+            revalidate(PurePosixPath("<reappearance>"), "before_delete")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_pending_marker_only_live_control_paths",
+                side_effect=lambda *args, **kwargs: next(observations),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=exercise_control_callbacks,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "legacy marker-only v4 validation control namespace "
+                "expanded before cleanup",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
 
     def test_ticket_tombstone_is_restored_and_cleanup_retries(self) -> None:
         real_delete = MODULE._isolate_and_delete_pending_cleanup_file
@@ -3868,23 +4075,38 @@ class RegularOverlayUninstallFinalizationTests(unittest.TestCase):
         )
         foreign = self.root / "foreign-after-final-verify.toml"
         real_verify = MODULE._verify_final_regular_targets
+        real_retire = MODULE._retire_terminal_regular_cleanup_controls
+        retirement_in_progress = False
         injected = False
 
-        def add_foreign_hardlink_after_first_final_verify(
+        def enter_control_retirement(*args: object, **kwargs: object) -> None:
+            nonlocal retirement_in_progress
+            retirement_in_progress = True
+            try:
+                real_retire(*args, **kwargs)
+            finally:
+                retirement_in_progress = False
+
+        def add_foreign_hardlink_after_retirement_final_verify(
             home: Path,
             current_ticket: MODULE.PendingBatchCleanupTicket,
         ) -> None:
             nonlocal injected
             real_verify(home, current_ticket)
-            if not injected:
+            if retirement_in_progress and not injected:
                 os.link(self.target, foreign)
                 injected = True
 
         with (
             mock.patch.object(
                 MODULE,
+                "_retire_terminal_regular_cleanup_controls",
+                side_effect=enter_control_retirement,
+            ),
+            mock.patch.object(
+                MODULE,
                 "_verify_final_regular_targets",
-                side_effect=add_foreign_hardlink_after_first_final_verify,
+                side_effect=add_foreign_hardlink_after_retirement_final_verify,
             ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
@@ -5403,6 +5625,771 @@ class RegularClaimFailClosedTests(unittest.TestCase):
             MODULE._load_managed_state(self.home).owners[MODULE.PUBLIC_OWNER],
             SHA_A,
         )
+
+
+class DirectoryProgressRegressionTests(unittest.TestCase):
+    """Focused v5 progress regressions composed with the canonical fixture."""
+
+    def setUp(self) -> None:
+        self.fixture = RegularOverlayUninstallFinalizationTests(methodName="runTest")
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.tearDown)
+        self.ticket = self.fixture._deferred_terminal_ticket()
+        self._ensure_v5_receipt()
+
+    def _ensure_v5_receipt(self) -> None:
+        ticket = self.ticket
+        quarantine_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            ticket.batch_root.parent,
+        )
+        batch_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            ticket.batch_root,
+        )
+        try:
+            MODULE._ensure_pending_terminal_validation_receipt(
+                self.fixture.home,
+                ticket,
+                ticket.batch_root,
+                batch_fd,
+                MODULE._directory_identity(quarantine_fd),
+                namespace_anchor_sha256=ticket.terminal_namespace_sha256,
+            )
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+            MODULE._close_fd_quietly(quarantine_fd)
+
+    def _progress_context(self):
+        ticket = self.ticket
+        quarantine_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            ticket.batch_root.parent,
+        )
+        try:
+            quarantine_identity = MODULE._directory_identity(quarantine_fd)
+            receipt = MODULE._read_pending_cleanup_terminal_validation(
+                self.fixture.home,
+                ticket,
+                quarantine_identity,
+            )
+            self.assertIsNotNone(receipt)
+            authority = MODULE._parse_pending_terminal_validation_authority(
+                self.fixture.home,
+                ticket,
+                quarantine_identity,
+                receipt,
+            )
+        finally:
+            MODULE._close_fd_quietly(quarantine_fd)
+        self.assertIsNotNone(authority)
+        self.assertIsNotNone(authority.directory_progress)
+        return quarantine_identity, authority
+
+    def _protected_snapshot(self):
+        home = self.fixture.home
+        batch_name = self.ticket.batch_root.name
+        target = self.fixture.target
+        metadata = target.lstat()
+        payload = (
+            os.readlink(target)
+            if stat.S_ISLNK(metadata.st_mode)
+            else target.read_bytes()
+        )
+        def optional_payload(path):
+            return path.read_bytes() if path.exists() else None
+
+        return (
+            self.ticket.path.read_bytes(),
+            optional_payload(
+                MODULE._pending_cleanup_terminal_validation_path(home, batch_name)
+            ),
+            optional_payload(MODULE._pending_cleanup_empty_proof_path(home, batch_name)),
+            (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_uid,
+                metadata.st_nlink,
+                metadata.st_size,
+                payload,
+            ),
+        )
+
+    def _assert_protected_snapshot_unchanged(self, expected) -> None:
+        self.assertEqual(self._protected_snapshot(), expected)
+
+    def _expect_manual_recovery_without_authority_loss(self, message: str) -> None:
+        protected = self._protected_snapshot()
+        with self.assertRaisesRegex(MODULE.SyncError, message):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self._assert_protected_snapshot_unchanged(protected)
+        self.assertTrue(self.ticket.path.is_file())
+        self.assertTrue(self.ticket.batch_root.is_dir())
+
+    def test_consumed_root_slot_present_rejects_original_root_identity(self) -> None:
+        quarantine_identity, authority = self._progress_context()
+        batch_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            self.ticket.batch_root,
+        )
+        try:
+            self.assertEqual(
+                MODULE._directory_identity(batch_fd),
+                self.ticket.batch_root_identity,
+            )
+            MODULE._append_pending_terminal_directory_consumption(
+                self.fixture.home,
+                self.ticket,
+                quarantine_identity,
+                authority,
+                MODULE.PurePosixPath(),
+                batch_fd,
+                set(),
+            )
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+
+        progress = MODULE._read_pending_terminal_directory_progress(
+            self.fixture.home,
+            self.ticket,
+            quarantine_identity,
+            authority,
+        )
+        self.assertIsNotNone(progress)
+        assert progress is not None
+        self.assertEqual(progress.consumed_slots, frozenset({0}))
+        root_stat = self.ticket.batch_root.stat()
+        self.assertEqual(
+            (root_stat.st_dev, root_stat.st_ino),
+            self.ticket.batch_root_identity,
+        )
+        batch_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            self.ticket.batch_root,
+        )
+        try:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal batch-root slot was already consumed but a root is present",
+            ):
+                MODULE._require_pending_terminal_consumed_directories_absent(
+                    self.ticket,
+                    batch_fd,
+                    authority,
+                    progress,
+                )
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+
+    def test_consumed_control_only_directory_slot_rejects_original_identity(
+        self,
+    ) -> None:
+        quarantine_identity, authority = self._progress_context()
+        logical_path = MODULE.PurePosixPath("pending/evidence")
+        directory = self.ticket.batch_root / Path(*logical_path.parts)
+        contents = tuple(directory.iterdir())
+        self.assertEqual(len(contents), 1)
+        self.assertTrue(contents[0].is_file())
+        original_identity = (directory.stat().st_dev, directory.stat().st_ino)
+        directory_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            directory,
+        )
+        try:
+            self.assertEqual(
+                MODULE._directory_identity(directory_fd),
+                original_identity,
+            )
+            MODULE._append_pending_terminal_directory_consumption(
+                self.fixture.home,
+                self.ticket,
+                quarantine_identity,
+                authority,
+                logical_path,
+                directory_fd,
+                set(),
+            )
+        finally:
+            MODULE._close_fd_quietly(directory_fd)
+
+        progress = MODULE._read_pending_terminal_directory_progress(
+            self.fixture.home,
+            self.ticket,
+            quarantine_identity,
+            authority,
+        )
+        self.assertIsNotNone(progress)
+        assert progress is not None
+        directories = MODULE._pending_terminal_directory_progress_directories(
+            authority.directories,
+            authority.namespace_entries or (),
+        )
+        slot = next(
+            index
+            for index, item in enumerate(directories, start=1)
+            if item.path == logical_path
+        )
+        self.assertIn(slot, progress.consumed_slots)
+        self.assertEqual(
+            (directory.stat().st_dev, directory.stat().st_ino),
+            original_identity,
+        )
+        batch_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            self.ticket.batch_root,
+        )
+        try:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal directory slot was already consumed but is present again",
+            ):
+                MODULE._require_pending_terminal_consumed_directories_absent(
+                    self.ticket,
+                    batch_fd,
+                    authority,
+                    progress,
+                )
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+
+    def test_pre_rmdir_crash_persists_intent_and_rejects_without_scanning(self) -> None:
+        quarantine_identity, authority = self._progress_context()
+        logical_path = MODULE.PurePosixPath("pending/stage")
+        directory = self.ticket.batch_root / Path(*logical_path.parts)
+        original_identity = (directory.stat().st_dev, directory.stat().st_ino)
+        progress_identity = authority.directory_progress.file_identity
+        real_rmdir = os.rmdir
+        real_fsync = os.fsync
+        rmdir_intercepted = []
+        progress_fsyncs = []
+
+        def track_progress_fsync(file_descriptor: int) -> None:
+            metadata = os.fstat(file_descriptor)
+            if (metadata.st_dev, metadata.st_ino) == progress_identity:
+                progress_fsyncs.append(True)
+            real_fsync(file_descriptor)
+
+        def crash_before_exact_rmdir(path, *args, dir_fd=None, **kwargs) -> None:
+            if dir_fd is not None:
+                current = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) == original_identity:
+                    rmdir_intercepted.append(os.fsdecode(path))
+                    raise SystemExit("injected before bound directory rmdir")
+            real_rmdir(path, *args, dir_fd=dir_fd, **kwargs)
+
+        with (
+            mock.patch.object(MODULE.os, "fsync", side_effect=track_progress_fsync),
+            mock.patch.object(MODULE.os, "rmdir", side_effect=crash_before_exact_rmdir),
+            self.assertRaisesRegex(SystemExit, "before bound directory rmdir"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+
+        self.assertTrue(rmdir_intercepted)
+        self.assertTrue(progress_fsyncs)
+        pending_active = self.fixture._active_batch_child(
+            self.ticket,
+            "pending",
+        )
+        pending_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            pending_active,
+        )
+        try:
+            pending_identity = MODULE._directory_identity(pending_fd)
+        finally:
+            MODULE._close_fd_quietly(pending_fd)
+        matching_directories = []
+        for candidate in pending_active.iterdir():
+            metadata = candidate.lstat()
+            binding = MODULE._pending_cleanup_active_entry_binding(
+                candidate.name,
+                pending_identity,
+            )
+            if binding is not None and binding[1] == "stage" and stat.S_ISDIR(metadata.st_mode) and (
+                metadata.st_dev,
+                metadata.st_ino,
+            ) == original_identity:
+                matching_directories.append(candidate)
+        self.assertEqual(len(matching_directories), 1)
+        retained_directory = matching_directories[0]
+        progress = MODULE._read_pending_terminal_directory_progress(
+            self.fixture.home,
+            self.ticket,
+            quarantine_identity,
+            authority,
+        )
+        self.assertIsNotNone(progress)
+        assert progress is not None
+        directories = MODULE._pending_terminal_directory_progress_directories(
+            authority.directories,
+            authority.namespace_entries or (),
+        )
+        slot = next(
+            index
+            for index, item in enumerate(directories, start=1)
+            if item.path == logical_path
+        )
+        self.assertIn(slot, progress.consumed_slots)
+
+        foreign = retained_directory / "foreign-child.txt"
+        foreign.write_text("must remain untouched\n", encoding="utf-8")
+        foreign.chmod(0o600)
+        real_scandir = os.scandir
+        scanned_consumed_directory = []
+
+        def track_scandir(directory_fd):
+            if isinstance(directory_fd, int):
+                metadata = os.fstat(directory_fd)
+                if (metadata.st_dev, metadata.st_ino) == original_identity:
+                    scanned_consumed_directory.append(True)
+            return real_scandir(directory_fd)
+
+        protected = self._protected_snapshot()
+        with (
+            mock.patch.object(MODULE.os, "scandir", side_effect=track_scandir),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal directory slot was already consumed but is present again; manual recovery is required: pending/stage",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertFalse(scanned_consumed_directory)
+        self.assertTrue(foreign.is_file())
+        self._assert_protected_snapshot_unchanged(protected)
+
+    def test_missing_progress_preserves_ticket_receipt_and_target(self) -> None:
+        self._progress_context()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        progress_path.unlink()
+        self._expect_manual_recovery_without_authority_loss(
+            "pending terminal directory progress is missing; manual recovery is required"
+        )
+
+    def test_partial_progress_preserves_ticket_receipt_and_target(self) -> None:
+        self._progress_context()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        with progress_path.open("ab") as stream:
+            stream.write(b'{"slot":')
+            stream.flush()
+            os.fsync(stream.fileno())
+        self._expect_manual_recovery_without_authority_loss(
+            "pending terminal directory progress is truncated"
+        )
+
+    def test_replaced_progress_preserves_ticket_receipt_and_target(self) -> None:
+        _quarantine_identity, authority = self._progress_context()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        original_identity = authority.directory_progress.file_identity
+        original_payload = progress_path.read_bytes()
+        retained = self.fixture.home / "retained-original-progress"
+        progress_path.rename(retained)
+        progress_path.write_bytes(original_payload)
+        progress_path.chmod(0o600)
+        replacement = progress_path.stat()
+        self.assertNotEqual(
+            (replacement.st_dev, replacement.st_ino),
+            original_identity,
+        )
+        self._expect_manual_recovery_without_authority_loss("changed")
+
+    def test_progress_header_mutation_preserves_ticket_receipt_and_target(self) -> None:
+        self._progress_context()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        with progress_path.open("r+b") as stream:
+            stream.write(b"!")
+            stream.flush()
+            os.fsync(stream.fileno())
+        self._expect_manual_recovery_without_authority_loss(
+            "pending terminal directory progress header changed"
+        )
+
+    def test_latest_progress_rollback_and_valid_rewrite_are_rejected(self) -> None:
+        quarantine_identity, authority = self._progress_context()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        initial = MODULE._read_pending_terminal_directory_progress(
+            self.fixture.home,
+            self.ticket,
+            quarantine_identity,
+            authority,
+        )
+        self.assertIsNotNone(initial)
+        assert initial is not None and initial.snapshot.payload is not None
+        latest = [None]
+        MODULE._require_pending_terminal_directory_progress_monotonic(
+            self.ticket,
+            latest,
+            initial,
+        )
+        logical_path = MODULE.PurePosixPath("pending/evidence")
+        evidence = self.ticket.batch_root / Path(*logical_path.parts)
+        evidence_fd = MODULE._open_directory_beneath(self.fixture.home, evidence)
+        try:
+            MODULE._append_pending_terminal_directory_consumption(
+                self.fixture.home,
+                self.ticket,
+                quarantine_identity,
+                authority,
+                logical_path,
+                evidence_fd,
+                set(),
+                latest,
+            )
+        finally:
+            MODULE._close_fd_quietly(evidence_fd)
+        observed_payload = latest[0]
+        self.assertIsNotNone(observed_payload)
+
+        with progress_path.open("wb") as stream:
+            stream.write(initial.snapshot.payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        rolled_back = MODULE._read_pending_terminal_directory_progress(
+            self.fixture.home,
+            self.ticket,
+            quarantine_identity,
+            authority,
+        )
+        self.assertIsNotNone(rolled_back)
+        assert rolled_back is not None
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal directory progress rolled back within this invocation",
+        ):
+            MODULE._require_pending_terminal_directory_progress_monotonic(
+                self.ticket,
+                latest,
+                rolled_back,
+            )
+
+        directories = MODULE._pending_terminal_directory_progress_directories(
+            authority.directories,
+            authority.namespace_entries or (),
+        )
+        alternate_slot = next(
+            index
+            for index, item in enumerate(directories, start=1)
+            if item.path == MODULE.PurePosixPath("pending/stage")
+        )
+        rewritten_payload = initial.snapshot.payload + MODULE._pending_directory_progress_line(
+            {"slot": alternate_slot}
+        )
+        with progress_path.open("wb") as stream:
+            stream.write(rewritten_payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        rewritten = MODULE._read_pending_terminal_directory_progress(
+            self.fixture.home,
+            self.ticket,
+            quarantine_identity,
+            authority,
+        )
+        self.assertIsNotNone(rewritten)
+        assert rewritten is not None
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal directory progress rolled back within this invocation",
+        ):
+            MODULE._require_pending_terminal_directory_progress_monotonic(
+                self.ticket,
+                latest,
+                rewritten,
+            )
+        self.assertEqual(latest[0], observed_payload)
+
+    def test_mode_nlink_and_uid_policy_changes_are_rejected(self) -> None:
+        quarantine_identity, authority = self._progress_context()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        progress_path.chmod(0o640)
+        with self.assertRaisesRegex(MODULE.SyncError, "changed"):
+            MODULE._read_pending_terminal_directory_progress(
+                self.fixture.home,
+                self.ticket,
+                quarantine_identity,
+                authority,
+            )
+        progress_path.chmod(0o600)
+
+        hardlink = self.fixture.home / "progress-hardlink"
+        os.link(progress_path, hardlink)
+        try:
+            with self.assertRaisesRegex(MODULE.SyncError, "changed"):
+                MODULE._read_pending_terminal_directory_progress(
+                    self.fixture.home,
+                    self.ticket,
+                    quarantine_identity,
+                    authority,
+                )
+        finally:
+            hardlink.unlink()
+
+        current_uid = os.geteuid()
+        with mock.patch.object(MODULE.os, "geteuid", return_value=current_uid + 1):
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "owner UID|access policy|changed",
+            ):
+                MODULE._read_pending_terminal_directory_progress(
+                    self.fixture.home,
+                    self.ticket,
+                    quarantine_identity,
+                    authority,
+                )
+
+        restored = MODULE._read_pending_terminal_directory_progress(
+            self.fixture.home,
+            self.ticket,
+            quarantine_identity,
+            authority,
+        )
+        self.assertIsNotNone(restored)
+
+    def test_owner_only_progress_accepts_benign_gid_drift(self) -> None:
+        quarantine_identity, authority = self._progress_context()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        old_gid = progress_path.stat().st_gid
+        if os.geteuid() == 0:
+            new_gid = old_gid + 1
+        else:
+            new_gid = next(
+                (
+                    group_id
+                    for group_id in set(os.getgroups()) | {os.getgid()}
+                    if group_id != old_gid
+                ),
+                None,
+            )
+        if new_gid is None:
+            self.skipTest("no alternate permitted group is available")
+        try:
+            os.chown(progress_path, -1, new_gid)
+        except PermissionError:
+            self.skipTest("native user cannot change the fixture group")
+        self.assertNotEqual(progress_path.stat().st_gid, old_gid)
+        progress = MODULE._read_pending_terminal_directory_progress(
+            self.fixture.home,
+            self.ticket,
+            quarantine_identity,
+            authority,
+        )
+        self.assertIsNotNone(progress)
+        assert progress is not None
+        self.assertEqual(progress.snapshot.gid, new_gid)
+        self.assertEqual(progress.consumed_slots, frozenset())
+
+    def test_extra_progress_representation_blocks_final_authority_retirement(
+        self,
+    ) -> None:
+        _quarantine_identity, authority = self._progress_context()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        fake_name = (
+            MODULE.PENDING_CLEANUP_RETAINED_PREFIX
+            + progress_path.name
+            + "-777-0123456789abcdef"
+        )
+        real_isolate = MODULE._isolate_and_delete_pending_cleanup_file
+        injected = []
+        protected_at_injection = []
+
+        def inject_alternate_before_progress_retirement(
+            home,
+            path,
+            parent_fd,
+            expected,
+            *,
+            label,
+            **kwargs,
+        ):
+            if label.startswith("pending terminal directory progress "):
+                protected_at_injection.append(self._protected_snapshot())
+                file_fd = os.open(
+                    fake_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                try:
+                    os.write(file_fd, b"foreign progress representation\n")
+                    os.fsync(file_fd)
+                finally:
+                    MODULE._close_fd_quietly(file_fd)
+                os.fsync(parent_fd)
+                injected.append(True)
+            return real_isolate(
+                home,
+                path,
+                parent_fd,
+                expected,
+                label=label,
+                **kwargs,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_isolate_and_delete_pending_cleanup_file",
+                side_effect=inject_alternate_before_progress_retirement,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal directory progress representations changed during retirement",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+
+        self.assertTrue(injected)
+        self.assertTrue(protected_at_injection)
+        self._assert_protected_snapshot_unchanged(protected_at_injection[0])
+        self.assertFalse(self.ticket.batch_root.exists())
+        self.assertTrue(self.ticket.path.is_file())
+        self.assertTrue(
+            MODULE._pending_cleanup_terminal_validation_path(
+                self.fixture.home,
+                self.ticket.batch_root.name,
+            ).is_file()
+        )
+        index_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            progress_path.parent,
+        )
+        try:
+            progress_snapshot = MODULE._read_managed_state_file_snapshot(
+                self.fixture.home,
+                progress_path,
+                index_fd,
+                expected_identity=authority.directory_progress.file_identity,
+                maximum_bytes=MODULE.MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+            )
+        finally:
+            MODULE._close_fd_quietly(index_fd)
+        progress = MODULE._parse_pending_terminal_directory_progress_payload(
+            self.ticket,
+            _quarantine_identity,
+            authority,
+            progress_snapshot,
+        )
+        directories = MODULE._pending_terminal_directory_progress_directories(
+            authority.directories,
+            authority.namespace_entries or (),
+        )
+        self.assertEqual(
+            progress.consumed_slots,
+            frozenset(range(len(directories) + 1)),
+        )
+        self.assertEqual(
+            (progress.snapshot.file_identity),
+            authority.directory_progress.file_identity,
+        )
+        self.assertTrue(progress_path.with_name(fake_name).is_file())
+
+    def test_retry_after_progress_isolated_before_unlink_recovers(self) -> None:
+        quarantine_identity, authority = self._progress_context()
+        progress_path = MODULE._pending_cleanup_directory_progress_path(
+            self.fixture.home,
+            self.ticket.batch_root.name,
+        )
+        progress_identity = authority.directory_progress.file_identity
+        retained_prefix = (
+            MODULE.PENDING_CLEANUP_RETAINED_PREFIX + progress_path.name + "-"
+        )
+        real_unlink = os.unlink
+        retained_names = []
+        protected_at_interruption = []
+
+        def crash_before_exact_progress_unlink(
+            path,
+            *args,
+            dir_fd=None,
+            **kwargs,
+        ) -> None:
+            name = os.fsdecode(path)
+            if dir_fd is not None and name.startswith(retained_prefix):
+                metadata = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                if (metadata.st_dev, metadata.st_ino) == progress_identity:
+                    retained_names.append(name)
+                    protected_at_interruption.append(self._protected_snapshot())
+                    raise SystemExit("injected before exact progress unlink")
+            real_unlink(path, *args, dir_fd=dir_fd, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE.os,
+                "unlink",
+                side_effect=crash_before_exact_progress_unlink,
+            ),
+            self.assertRaisesRegex(SystemExit, "before exact progress unlink"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+
+        self.assertEqual(len(retained_names), 1)
+        self.assertEqual(len(protected_at_interruption), 1)
+        self._assert_protected_snapshot_unchanged(protected_at_interruption[0])
+        self.assertFalse(self.ticket.batch_root.exists())
+        self.assertTrue(self.ticket.path.is_file())
+        self.assertFalse(progress_path.exists())
+        retained_path = progress_path.with_name(retained_names[0])
+        self.assertTrue(retained_path.is_file())
+
+        index_fd = MODULE._open_directory_beneath(
+            self.fixture.home,
+            progress_path.parent,
+        )
+        try:
+            retained_snapshot = MODULE._read_managed_state_file_snapshot(
+                self.fixture.home,
+                retained_path,
+                index_fd,
+                expected_identity=progress_identity,
+                maximum_bytes=MODULE.MAX_PENDING_CLEANUP_DIRECTORY_PROGRESS_BYTES,
+            )
+        finally:
+            MODULE._close_fd_quietly(index_fd)
+        retained_state = MODULE._parse_pending_terminal_directory_progress_payload(
+            self.ticket,
+            quarantine_identity,
+            authority,
+            retained_snapshot,
+        )
+        directories = MODULE._pending_terminal_directory_progress_directories(
+            authority.directories,
+            authority.namespace_entries or (),
+        )
+        self.assertEqual(
+            retained_state.consumed_slots,
+            frozenset(range(len(directories) + 1)),
+        )
+
+        self.assertTrue(
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        )
+        self.assertFalse(self.ticket.path.exists())
+        self.assertFalse(progress_path.exists())
+        self.assertFalse(retained_path.exists())
+        self.assertEqual(self.fixture.target.stat().st_nlink, 1)
 
 
 if __name__ == "__main__":

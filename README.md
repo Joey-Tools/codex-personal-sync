@@ -343,6 +343,42 @@ symlinks and replacement races still fail closed. Directory timestamps and
 ordinary child-entry churn are not treated as replacement or access-policy
 changes.
 
+## Interrupted terminal regular-file cleanup
+
+Terminal cleanup must distinguish a consumed directory slot from a newly
+created directory at the same name. A `(device, inode)` pair is only a live
+object binding: after removal and descriptor closure, a filesystem can reuse
+that pair. Directory timestamps are not used as an unconditional generation
+signal, because ordinary child removal changes directory metadata.
+
+Terminal validation receipt v5 binds a required batch-specific progress
+control by its original file identity, owner-only access policy and immutable
+header digest. The header binds the original ticket and exact directory-slot
+authority. Before an authorized directory is removed, the sole cleanup writer
+appends and fsyncs its consumption intent while holding the old directory
+descriptor. An interrupted retry may observe that consumed slot as absent;
+any reappearance is retained, even when numeric inode identity was recycled.
+Normal remaining-child cleanup still permits authorized namespace contraction.
+
+Missing, unreadable, replaced or incomplete progress is not an empty history.
+If either batch-root candidate still exists, retain the original controls and
+report the specific recovery condition. A crash after recording intent but
+before `rmdir` can therefore retain even the original directory conservatively;
+do not delete or reset progress to make that state look new. Restore only an
+exact trusted receipt/progress history or leave the batch for explicit manual
+recovery. Old receipts without the new binding remain readable for diagnosis
+but cannot acquire cross-crash directory authority from the current namespace.
+Legacy marker-only tickets with no terminal regular-target directory slots
+continue to use their separate receipt/control recovery path.
+
+Progress retirement requires repeated strict absence of both canonical and
+isolated batch-root names plus revalidation of final managed files. Its exact
+canonical, temporary, retained and malformed related representations remain
+part of the final control fence; an orphan is evidence, not cleanup authority.
+This protocol follows the existing cooperative single-UID writer model. It
+does not claim access isolation or rollback resistance against a hostile
+process with the same UID and full control over all durable authority records.
+
 ## Scheduler operator runbook
 
 Audit an existing host before changing it:
