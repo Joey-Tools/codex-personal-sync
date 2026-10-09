@@ -6541,7 +6541,7 @@ class PreflightLockedRecoveryRegressions(unittest.TestCase):
         ))
         stack.enter_context(mock.patch.object(
             MODULE, "_require_no_pending_unresolved_ticket_representations",
-            side_effect=fence_callback or (lambda _home: None),
+            side_effect=fence_callback or (lambda _home, **_observation_options: None),
         ))
         stack.enter_context(mock.patch.object(
             MODULE, "_recover_failed_move_isolation", return_value=False,

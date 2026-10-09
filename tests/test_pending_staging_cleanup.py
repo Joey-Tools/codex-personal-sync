@@ -7510,9 +7510,9 @@ class PendingStagingCleanupTests(unittest.TestCase):
         )
         injected = False
 
-        def scan_then_inject(home: Path) -> None:
+        def scan_then_inject(home: Path, **observation_options) -> None:
             nonlocal injected
-            real_preflight_scan(home)
+            real_preflight_scan(home, **observation_options)
             if not injected:
                 representation.write_bytes(b"late malformed v8 control evidence\n")
                 representation.chmod(0o600)
@@ -7565,9 +7565,9 @@ class PendingStagingCleanupTests(unittest.TestCase):
         def inject_after_first_blocker_observation():
             observations = 0
 
-            def observe_then_inject(home: Path):
+            def observe_then_inject(home: Path, **observation_options):
                 nonlocal observations
-                unresolved = real_observe(home)
+                unresolved = real_observe(home, **observation_options)
                 observations += 1
                 if observations == 1:
                     malformed_ticket.write_bytes(b"late ticket evidence\n")

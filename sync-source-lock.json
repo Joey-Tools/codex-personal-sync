@@ -43,7 +43,7 @@
     "pending_staging_cleanup_tests": {
       "mode": "0644",
       "path": "tests/test_pending_staging_cleanup.py",
-      "sha256": "6d9627a5c5fde547f77a4267bcadb12237b0a9afddf810d4513a67f5be0f2951"
+      "sha256": "a43e87ce8558606ea623fc78e7db6dce1091e72cd22e25bb2d104ac5a8e7f5cc"
     },
     "quarantine_empty_batch_reclaim_tests": {
       "mode": "0644",
@@ -63,7 +63,7 @@
     "regular_overlay_uninstall_status_regressions_tests": {
       "mode": "0644",
       "path": "tests/test_regular_overlay_uninstall_status_regressions.py",
-      "sha256": "27d5640db774d0298e28e0e777e4219accacbd6be90347ad130a798856580f7c"
+      "sha256": "12b75f8177ad3d5ef4941d3063ba4cd51e0d4a5d6f000bf36d41befd23d70255"
     },
     "release_retention_tests": {
       "mode": "0644",
