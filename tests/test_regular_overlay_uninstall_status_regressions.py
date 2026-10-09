@@ -6593,7 +6593,9 @@ class DirectoryProgressPublicationRecoveryTests(unittest.TestCase):
         extra = self.progress.with_name(self.progress.name + ".tmp")
         extra.write_bytes(b"unrelated retained evidence\n")
         extra.chmod(0o600)
-        self._reject_without_deletion("ambiguous related representations")
+        self._reject_without_deletion(
+            "ticket representation must be reconciled before new mutation",
+        )
         self.assertEqual(extra.read_bytes(), b"unrelated retained evidence\n")
 
     def test_pre_receipt_original_marker_content_must_still_match_ticket(self) -> None:

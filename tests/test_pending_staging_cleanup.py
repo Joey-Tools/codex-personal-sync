@@ -5665,7 +5665,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
-                "ticket representation remained",
+                "ticket representation must be reconciled before new mutation",
             ),
         ):
             MODULE._delete_exact_regular_publication_without_pending_receipt(
@@ -5678,7 +5678,13 @@ class PendingStagingCleanupTests(unittest.TestCase):
         self.assertIsNotNone(malformed_ticket)
         assert deleted_ticket is not None
         assert malformed_ticket is not None
-        self.assertFalse(deleted_ticket.path.exists())
+        self.assertTrue(deleted_ticket.path.is_file())
+        self.assertTrue(
+            MODULE._pending_cleanup_ticket_matches(
+                MODULE._read_pending_cleanup_ticket(case_home, deleted_ticket.path),
+                deleted_ticket,
+            )
+        )
         self.assertTrue(malformed_ticket.is_file())
         self.assertEqual(malformed_ticket.read_bytes(), deleted_ticket.snapshot.payload)
 
@@ -5692,9 +5698,11 @@ class PendingStagingCleanupTests(unittest.TestCase):
         )
         self.assertTrue(receipt_path.is_file())
 
-        # This simulates the formerly unsafe outcome: the phase receipt was
-        # retired while a suffixed ticket tombstone still retained its bytes.
+        # The earlier fence preserves the original canonical ticket. Simulate
+        # the formerly unsafe outcome with both original authorities removed
+        # while a suffixed ticket tombstone still retains its bytes.
         # That residue must independently block a later mutation.
+        deleted_ticket.path.unlink()
         receipt_path.unlink()
         with self.assertRaisesRegex(
             MODULE.SyncError,
