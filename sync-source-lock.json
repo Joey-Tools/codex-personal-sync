@@ -23,7 +23,7 @@
     "engine": {
       "mode": "0755",
       "path": "scripts/codex_personal_sync.py",
-      "sha256": "89bf5a702118d106e930625108fb53ae9205e78d17affc7dfbc44d0dbeb173bf"
+      "sha256": "8456341d14aa0d3b3ddb63f272238af2be83faadb91d46dc32a80156f496f6a3"
     },
     "engine_tests": {
       "mode": "0644",
@@ -63,7 +63,7 @@
     "regular_overlay_uninstall_status_regressions_tests": {
       "mode": "0644",
       "path": "tests/test_regular_overlay_uninstall_status_regressions.py",
-      "sha256": "a66526b0a19485915137072b436d301923f5b846ef912383079b318a60c05e56"
+      "sha256": "b09a0ce08762eeb3331b25377c06835195b2ef26cfb826392d563f7d73fa5e45"
     },
     "release_retention_tests": {
       "mode": "0644",

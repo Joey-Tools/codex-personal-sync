@@ -26666,6 +26666,8 @@ def _read_unconsumed_pending_terminal_directory_progress(
     home: Path,
     ticket: PendingBatchCleanupTicket,
     header: bytes,
+    *,
+    allow_publication_temp: bool = False,
 ) -> ManagedStateFileSnapshot | None:
     """Bind a header-only candidate; never derive batch authority from it."""
     path = _pending_cleanup_directory_progress_path(home, ticket.batch_root.name)
@@ -26678,6 +26680,9 @@ def _read_unconsumed_pending_terminal_directory_progress(
         )
         if not representations:
             return None
+        temp_path = path.with_name(path.name + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX)
+        if allow_publication_temp and representations == (temp_path.name,):
+            path = temp_path
         if representations != (path.name,):
             raise SyncError(
                 "pending terminal directory progress has ambiguous related "
@@ -26723,6 +26728,50 @@ def _read_unconsumed_pending_terminal_directory_progress(
                 f"{ticket.batch_root.name}"
             )
         return rebound
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _promote_unconsumed_pending_terminal_directory_progress(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    header: bytes,
+    staged: ManagedStateFileSnapshot,
+) -> ManagedStateFileSnapshot:
+    """Publish the same validated temp object, never synthesize batch authority."""
+    path = _pending_cleanup_directory_progress_path(home, ticket.batch_root.name)
+    temp_path = path.with_name(path.name + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX)
+    index_fd = _open_directory_beneath(home, path.parent)
+    try:
+        if (
+            not _bound_directory_matches(home, path.parent, index_fd)
+            or _directory_identity(index_fd) != staged.parent_identity
+            or _pending_terminal_directory_progress_representations(
+                index_fd, ticket.batch_root.name,
+            ) != (temp_path.name,)
+        ):
+            raise SyncError("pending terminal directory progress temp namespace changed")
+        rebound = _read_unconsumed_pending_terminal_directory_progress(
+            home, ticket, header, allow_publication_temp=True,
+        )
+        if rebound is None or not _managed_state_snapshot_matches_bound_file_evidence(
+            rebound, staged,
+        ):
+            raise SyncError("pending terminal directory progress temp changed before publication")
+        _require_pending_cleanup_ticket_unchanged(home, ticket)
+        _rename_noreplace_at(index_fd, temp_path.name, index_fd, path.name)
+        os.fsync(index_fd)
+        published = _read_unconsumed_pending_terminal_directory_progress(
+            home, ticket, header,
+        )
+        if (
+            published is None
+            or not _managed_state_snapshot_matches_bound_file_evidence(published, staged)
+            or not _bound_directory_matches(home, path.parent, index_fd)
+            or _directory_identity(index_fd) != staged.parent_identity
+        ):
+            raise SyncError("pending terminal directory progress temp changed during publication")
+        return published
     finally:
         _close_fd_quietly(index_fd)
 
@@ -37864,9 +37913,10 @@ def _publish_pending_cleanup_terminal_validation(
             namespace_entries,
         )
         progress_snapshot = None
+        progress_is_temp = False
         if resume_unconsumed_progress:
             progress_snapshot = _read_unconsumed_pending_terminal_directory_progress(
-                home, ticket, header,
+                home, ticket, header, allow_publication_temp=True,
             )
             if progress_snapshot is not None and (
                 ticket.terminal_namespace_sha256 is None
@@ -37892,6 +37942,8 @@ def _publish_pending_cleanup_terminal_validation(
                 maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
                 overflow_message="pending cleanup authority scan exceeds the size limit",
             )
+            progress_temp_name = progress_path.name + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+            progress_is_temp = progress_snapshot is not None and progress_temp_name in progress_names
             for name in progress_names:
                 if (
                     _pending_cleanup_directory_progress_representation_batch_name(
@@ -37899,7 +37951,8 @@ def _publish_pending_cleanup_terminal_validation(
                     )
                     == ticket.batch_root.name
                     and not (
-                        progress_snapshot is not None and name == progress_path.name
+                        progress_snapshot is not None
+                        and name == (progress_temp_name if progress_is_temp else progress_path.name)
                     )
                 ):
                     raise SyncError(
@@ -37909,7 +37962,12 @@ def _publish_pending_cleanup_terminal_validation(
                     )
         finally:
             _close_fd_quietly(index_fd)
-        if progress_snapshot is None:
+        if progress_is_temp:
+            assert progress_snapshot is not None
+            progress_snapshot = _promote_unconsumed_pending_terminal_directory_progress(
+                home, ticket, header, progress_snapshot,
+            )
+        elif progress_snapshot is None:
             progress_snapshot = _publish_atomic_exclusive_internal_file(
                 home,
                 progress_path,
@@ -41643,6 +41701,22 @@ def _remove_cleanup_ready_batch(
         early_consumed_directory_paths: frozenset[PurePosixPath] = frozenset()
         invocation_latest_progress_payload: list[bytes | None] = [None]
         if ticket.version in {4, 8} and ticket.terminal_regular_targets:
+            index_fd = _open_directory_beneath(home, _pending_cleanup_index_path(home))
+            try:
+                for name in _directory_member_names(
+                    index_fd,
+                    maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+                    overflow_message="pending cleanup authority scan exceeds the size limit",
+                ):
+                    if (
+                        _pending_cleanup_terminal_validation_representation_batch_name(name)
+                        == batch_name
+                    ):
+                        unresolved = _pending_cleanup_unresolved_ticket_representation(name)
+                        if unresolved is not None:
+                            raise _pending_cleanup_unresolved_ticket_representation_error(unresolved)
+            finally:
+                _close_fd_quietly(index_fd)
             early_receipt = _read_pending_cleanup_terminal_validation(
                 home,
                 ticket,
@@ -41658,7 +41732,10 @@ def _remove_cleanup_ready_batch(
                     canonical_name = _pending_cleanup_directory_progress_path(
                         home, ticket.batch_root.name,
                     ).name
-                    if progress_names and progress_names != (canonical_name,):
+                    if progress_names and progress_names not in {
+                        (canonical_name,),
+                        (canonical_name + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX,),
+                    }:
                         raise SyncError(
                             "pending terminal directory progress has ambiguous related "
                             "representations; manual recovery is required: "
@@ -41670,7 +41747,8 @@ def _remove_cleanup_ready_batch(
                             "ticket authority; manual recovery is required: "
                             f"{ticket.batch_root.name}"
                         )
-                    # A single canonical sidecar is only a candidate. The
+                    # A single canonical sidecar or exact publication temp
+                    # is only a candidate. The
                     # ensure path must independently prove the entire original
                     # ticket, namespace and controls before binding its header.
                 finally:
@@ -43810,6 +43888,25 @@ def _pending_cleanup_directory_progress_representation_batch_name(
     return batch_name
 
 
+def _pending_cleanup_terminal_validation_representation_batch_name(
+    name: str,
+) -> str | None:
+    """Recognize receipt-derived ambiguity without authorizing its bytes."""
+    candidate = name
+    if candidate.startswith(PENDING_CLEANUP_RETAINED_PREFIX):
+        candidate = candidate[len(PENDING_CLEANUP_RETAINED_PREFIX) :]
+    marker_index = candidate.find(PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX)
+    if marker_index <= 0:
+        return None
+    batch_name = candidate[:marker_index]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        return None
+    return batch_name
+
+
 def _pending_cleanup_terminal_validation_retirement_batch_name(
     name: str,
 ) -> str | None:
@@ -43972,6 +44069,8 @@ def _pending_cleanup_unresolved_ticket_representation(
     """
     batch_name = _pending_cleanup_ticket_representation_batch_name(name)
     if batch_name is None:
+        batch_name = _pending_cleanup_terminal_validation_representation_batch_name(name)
+    if batch_name is None:
         return None
     canonical_ticket_name = batch_name + PENDING_CLEANUP_TICKET_SUFFIX
     canonical_retirement_name = (
@@ -43980,22 +44079,33 @@ def _pending_cleanup_unresolved_ticket_representation(
     canonical_progress_name = (
         batch_name + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
     )
+    canonical_receipt_name = batch_name + PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX
+    receipt_temporary_name = canonical_receipt_name + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+    receipt_retirement_name = (
+        batch_name + PENDING_CLEANUP_TERMINAL_VALIDATION_RETIREMENT_SUFFIX
+    )
     if name in {
         canonical_ticket_name,
         batch_name + PENDING_CLEANUP_TICKET_TEMP_SUFFIX,
         canonical_retirement_name,
+        canonical_receipt_name,
+        receipt_temporary_name,
+        receipt_retirement_name,
     }:
         return None
     if name == canonical_progress_name:
         return None
     progress_retained = _pending_cleanup_retained_canonical_name(name)
-    if progress_retained == canonical_progress_name:
+    if progress_retained in {canonical_progress_name, receipt_temporary_name}:
         return None
     retained_control = _pending_cleanup_retained_control_name(name)
     if (
         retained_control is not None
         and retained_control[1] == batch_name
-        and retained_control[0] in {canonical_ticket_name, canonical_retirement_name}
+        and retained_control[0] in {
+            canonical_ticket_name, canonical_retirement_name,
+            canonical_receipt_name, receipt_retirement_name,
+        }
     ):
         return None
     retained_temp = _pending_cleanup_retained_ticket_temp_name(name)
@@ -44089,11 +44199,15 @@ def _recover_unconsumed_pending_terminal_progress_publications(
             maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
             overflow_message="pending cleanup authority scan exceeds the size limit",
         )
-        if any(
-            _pending_cleanup_unresolved_ticket_representation(name) is not None
-            for name in names
-        ):
-            return
+        for name in names:
+            unresolved = _pending_cleanup_unresolved_ticket_representation(name)
+            if unresolved is not None:
+                progress_batch = _pending_cleanup_directory_progress_representation_batch_name(name)
+                if progress_batch is None or name != (
+                    progress_batch + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                    + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+                ):
+                    return
         names_set = set(names)
         candidates = []
         for name in names:
@@ -44101,7 +44215,11 @@ def _recover_unconsumed_pending_terminal_progress_publications(
             if batch_name is None:
                 continue
             if (
-                name != batch_name + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                name not in {
+                    batch_name + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX,
+                    batch_name + PENDING_CLEANUP_DIRECTORY_PROGRESS_SUFFIX
+                    + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX,
+                }
                 or batch_name + PENDING_CLEANUP_TICKET_SUFFIX not in names_set
                 or any(
                     batch_name + suffix in names_set
@@ -53037,44 +53155,44 @@ def _preflight_pending_recovery(
     action_budget = cleanup_budget or PendingCleanupActionBudget(
         MAX_PENDING_CLEANUP_BATCHES_PER_RUN
     )
-    if not dry_run:
-        _recover_unconsumed_pending_terminal_progress_publications(home, action_budget)
-    _require_no_pending_unresolved_ticket_representations(home)
-    observed_failed_move_isolation = _recover_failed_move_isolation(
-        home,
-        dry_run=True,
-    )
-    observed_retention_transaction = None
-    observed_cleanup_ready_batch = False
-    observed_pending_transaction = False
-    if not observed_failed_move_isolation:
-        observed_retention_transaction = _recover_release_retention_transaction(
-            home,
-            dry_run=True,
-        )
-        observed_cleanup_ready_batch = _pending_cleanup_ready_batch_is_observed(
-            home,
-            allow_v8_control_recovery=not dry_run,
-        )
-        loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(home)
-        (
-            _loaded_state,
-            _initial_state_snapshot,
-            observed_pending_transaction,
-        ) = _recover_pending_link_transaction(
-            home,
-            loaded_state,
-            initial_state_snapshot,
-            dry_run=True,
-        )
-    if (
-        not observed_failed_move_isolation
-        and not observed_retention_transaction
-        and not observed_pending_transaction
-        and not observed_cleanup_ready_batch
-    ):
-        return False
     if dry_run:
+        _require_no_pending_unresolved_ticket_representations(home)
+        observed_failed_move_isolation = _recover_failed_move_isolation(
+            home,
+            dry_run=True,
+        )
+        observed_retention_transaction = None
+        observed_cleanup_ready_batch = False
+        observed_pending_transaction = False
+        if not observed_failed_move_isolation:
+            observed_retention_transaction = _recover_release_retention_transaction(
+                home,
+                dry_run=True,
+            )
+            observed_cleanup_ready_batch = _pending_cleanup_ready_batch_is_observed(
+                home,
+                allow_v8_control_recovery=False,
+            )
+            loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(
+                home
+            )
+            (
+                _loaded_state,
+                _initial_state_snapshot,
+                observed_pending_transaction,
+            ) = _recover_pending_link_transaction(
+                home,
+                loaded_state,
+                initial_state_snapshot,
+                dry_run=True,
+            )
+        if (
+            not observed_failed_move_isolation
+            and not observed_retention_transaction
+            and not observed_pending_transaction
+            and not observed_cleanup_ready_batch
+        ):
+            return False
         if observed_failed_move_isolation:
             print("would recover failed move isolation under the install lock")
             return True
@@ -53089,6 +53207,14 @@ def _preflight_pending_recovery(
             )
         return True
     with installation_lock(home):
+        # Exact progress-publication recovery can change the canonical ticket,
+        # its sidecars, or the cleanup namespace. Recover it under the same lock
+        # and before the normal unresolved-representation fence.
+        _recover_unconsumed_pending_terminal_progress_publications(
+            home,
+            action_budget,
+        )
+        _require_no_pending_unresolved_ticket_representations(home)
         recovered_failed_move_isolation = _recover_failed_move_isolation(
             home,
             dry_run=False,

@@ -360,14 +360,27 @@ descriptor. An interrupted retry may observe that consumed slot as absent;
 any reappearance is retained, even when numeric inode identity was recycled.
 Normal remaining-child cleanup still permits authorized namespace contraction.
 
-A crash after publishing progress but before publishing the immutable receipt
-can resume only with the exact canonical header-only progress file. Recovery
+A crash after fsyncing progress, before or after its canonical rename and
+before publishing the immutable receipt, can resume only with one exact
+header-only canonical progress file or its exact `.publish-tmp` object. Recovery
 independently validates the original ticket, complete live namespace, exact
 managed-target hard-link set, pointer/metadata and ticket-bound control content
-before binding that file's identity and access policy into the receipt. It does
-not infer authority from progress slots. The normal install preflight and
-cleanup entrypoint try this bounded recovery before the unchanged new-mutation
-fence. Partial or consumed records, extra representations, changed objects,
+before binding that file's identity and access policy into the receipt. A fully
+validated publication temp is renamed without replacement into the canonical
+path, preserving its original inode, then revalidated before receipt creation.
+It does not infer authority from progress slots. The normal install preflight
+runs actual recovery and the subsequent new-mutation fence under the same
+installation lock; dry-run remains observational. Actual non-dry-run preflight
+may initialize the sync home and its persistent `personal-sync/` (0700) and
+`install.lock` (0600), even when no pending transaction requires recovery.
+Invalid commit SHAs are rejected before that initialization; later release or
+owner-validation errors do not imply that no lock paths were created.
+The cleanup entrypoint also
+tries this bounded recovery before the fence. Exact receipt publication temps
+may be discarded and rebuilt only after independent original-ticket validation;
+their bytes never grant cleanup authority. Unknown receipt-derived descendants
+block recovery instead of being hidden by a new canonical receipt. Partial or
+consumed progress records, extra representations, changed objects,
 and legacy tickets lacking original content authority remain explicit errors.
 
 Missing, unreadable, replaced or incomplete progress is not an empty history.

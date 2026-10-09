@@ -11,6 +11,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -5753,6 +5754,254 @@ class DirectoryProgressPublicationRecoveryTests(unittest.TestCase):
             ),
         )
 
+    def _stage_publication_temp(self) -> tuple[Path, bytes]:
+        temp = self.progress.with_name(
+            self.progress.name + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX,
+        )
+        rename = MODULE._rename_noreplace_at
+
+        def crash_before_progress_rename(source_fd, source, target_fd, target):
+            if source == temp.name and target == self.progress.name:
+                raise SystemExit("injected fsynced progress temp before rename")
+            return rename(source_fd, source, target_fd, target)
+
+        with (
+            mock.patch.object(MODULE, "_rename_noreplace_at", side_effect=crash_before_progress_rename),
+            self.assertRaisesRegex(SystemExit, "fsynced progress temp"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertTrue(temp.is_file())
+        self.assertFalse(self.progress.exists())
+        self.assertFalse(self.receipt.exists())
+        header = temp.read_bytes()
+        self.assertEqual(header.count(b"\n"), 1)
+        return temp, header
+
+    def _temp_protected(self, temp: Path):
+        target = self.fixture.target
+        temp_metadata = temp.stat()
+        target_metadata = target.stat()
+        root_metadata = self.ticket.batch_root.stat()
+        return (
+            self.ticket.path.read_bytes(), temp.read_bytes(),
+            (temp_metadata.st_dev, temp_metadata.st_ino, temp_metadata.st_mode,
+             temp_metadata.st_uid, temp_metadata.st_nlink),
+            (root_metadata.st_dev, root_metadata.st_ino, root_metadata.st_mode),
+            (target_metadata.st_dev, target_metadata.st_ino, target_metadata.st_mode,
+             target_metadata.st_uid, target_metadata.st_nlink, target.read_bytes()),
+        )
+
+    def _stage_receipt_publication_temp(self) -> Path:
+        temp = self.receipt.with_name(
+            self.receipt.name + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX,
+        )
+        rename = MODULE._rename_noreplace_at
+
+        def crash_before_receipt_rename(source_fd, source, target_fd, target):
+            if source == temp.name and target == self.receipt.name:
+                raise SystemExit("injected fsynced receipt temp before rename")
+            return rename(source_fd, source, target_fd, target)
+
+        with (
+            mock.patch.object(MODULE, "_rename_noreplace_at", side_effect=crash_before_receipt_rename),
+            self.assertRaisesRegex(SystemExit, "fsynced receipt temp"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertTrue(temp.is_file())
+        self.assertTrue(self.progress.is_file())
+        self.assertFalse(self.receipt.exists())
+        return temp
+
+    def test_exact_receipt_publication_temp_retries_original_authority(self) -> None:
+        temp = self._stage_receipt_publication_temp()
+        MODULE._preflight_pending_recovery(self.fixture.home, dry_run=False)
+        self.assertFalse(temp.exists())
+        self._assert_retired()
+
+    def test_partial_receipt_temp_is_discarded_not_adopted(self) -> None:
+        temp = self._stage_receipt_publication_temp()
+        temp.write_bytes(b'{"incomplete_receipt":')
+        MODULE._preflight_pending_recovery(self.fixture.home, dry_run=False)
+        self.assertFalse(temp.exists())
+        self._assert_retired()
+
+    def test_strict_retained_receipt_temp_retries_original_authority(self) -> None:
+        temp = self._stage_receipt_publication_temp()
+        retained = temp.with_name(
+            MODULE.PENDING_CLEANUP_RETAINED_PREFIX + temp.name + "-123-" + "a" * 16,
+        )
+        temp.rename(retained)
+        MODULE._preflight_pending_recovery(self.fixture.home, dry_run=False)
+        self.assertFalse(retained.exists())
+        self.assertFalse(temp.exists())
+        self._assert_retired()
+
+    def test_receipt_temp_cannot_replace_original_marker_content_authority(self) -> None:
+        temp = self._stage_receipt_publication_temp()
+        marker = self.ticket.batch_root / Path(*self.ticket.marker_path.parts)
+        marker.write_bytes(b"changed marker after receipt temp\n")
+        protected = self._temp_protected(temp)
+        progress_before = self.progress.read_bytes()
+        with (
+            mock.patch.object(MODULE, "_remove_pending_batch_directory_contents") as walker,
+            self.assertRaisesRegex(MODULE.SyncError, "(control|marker|commit evidence).*(changed|authority)"),
+        ):
+            MODULE._preflight_pending_recovery(self.fixture.home, dry_run=False)
+        walker.assert_not_called()
+        self.assertEqual(self._temp_protected(temp), protected)
+        self.assertEqual(self.progress.read_bytes(), progress_before)
+        self.assertFalse(self.receipt.exists())
+
+    def _assert_receipt_descendant_blocks_recovery(self, extra: Path, temp: Path) -> None:
+        extra.write_bytes(b"foreign receipt descendant\n")
+        extra.chmod(0o600)
+        protected = self._temp_protected(temp)
+        progress_before = self.progress.read_bytes()
+        with self.assertRaisesRegex(MODULE.SyncError, "reconciled before new mutation"):
+            MODULE._require_no_pending_unresolved_ticket_representations(self.fixture.home)
+        with (
+            mock.patch.object(MODULE, "_remove_pending_batch_directory_contents") as walker,
+            self.assertRaisesRegex(MODULE.SyncError, "reconciled before new mutation"),
+        ):
+            MODULE._preflight_pending_recovery(self.fixture.home, dry_run=False)
+        walker.assert_not_called()
+        with self.assertRaisesRegex(MODULE.SyncError, "reconciled before new mutation"):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertEqual(extra.read_bytes(), b"foreign receipt descendant\n")
+        self.assertEqual(self._temp_protected(temp), protected)
+        self.assertEqual(self.progress.read_bytes(), progress_before)
+        self.assertFalse(self.receipt.exists())
+
+    def test_foreign_receipt_temp_descendant_blocks_republication(self) -> None:
+        temp = self._stage_receipt_publication_temp()
+        self._assert_receipt_descendant_blocks_recovery(
+            temp.with_name(temp.name + ".foreign"), temp,
+        )
+
+    def test_suffix_added_retained_receipt_temp_blocks_republication(self) -> None:
+        temp = self._stage_receipt_publication_temp()
+        extra = temp.with_name(
+            MODULE.PENDING_CLEANUP_RETAINED_PREFIX + temp.name
+            + "-123-" + "a" * 16 + ".foreign",
+        )
+        self._assert_receipt_descendant_blocks_recovery(extra, temp)
+
+    def test_fsynced_progress_temp_retries_with_original_object(self) -> None:
+        temp, _header = self._stage_publication_temp()
+        identity = (temp.stat().st_dev, temp.stat().st_ino)
+        publish = MODULE._publish_atomic_exclusive_internal_file
+
+        def confirm_same_object(home, path, payload, **kwargs):
+            self.assertNotEqual(path, self.progress)
+            if path == self.receipt:
+                self.assertFalse(temp.exists())
+                self.assertEqual((self.progress.stat().st_dev, self.progress.stat().st_ino), identity)
+            return publish(home, path, payload, **kwargs)
+
+        with mock.patch.object(MODULE, "_publish_atomic_exclusive_internal_file", side_effect=confirm_same_object):
+            self.assertTrue(MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket))
+        self._assert_retired()
+
+    def test_cleanup_entrypoint_recovers_exact_progress_temp(self) -> None:
+        temp, _header = self._stage_publication_temp()
+        with self.assertRaisesRegex(MODULE.SyncError, "reconciled before new mutation"):
+            MODULE._require_no_pending_unresolved_ticket_representations(self.fixture.home)
+        budget = MODULE.PendingCleanupActionBudget(1)
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.fixture.home, budget=budget), 1)
+        self.assertEqual((budget.consumed, budget.completed), (1, 1))
+        self.assertFalse(temp.exists())
+        self._assert_retired()
+
+    def test_partial_progress_temp_is_retained_without_receipt(self) -> None:
+        temp, header = self._stage_publication_temp()
+        temp.write_bytes(header + b'{"slot":')
+        protected = self._temp_protected(temp)
+        with self.assertRaisesRegex(MODULE.SyncError, "not an exact unconsumed header"):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertEqual(self._temp_protected(temp), protected)
+        self.assertFalse(self.receipt.exists())
+        self.assertFalse(self.progress.exists())
+
+    def test_progress_temp_and_canonical_are_ambiguous(self) -> None:
+        temp, header = self._stage_publication_temp()
+        self.progress.write_bytes(header)
+        self.progress.chmod(0o600)
+        protected = self._temp_protected(temp)
+        with self.assertRaisesRegex(MODULE.SyncError, "ambiguous related representations"):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertEqual(self._temp_protected(temp), protected)
+        self.assertEqual(self.progress.read_bytes(), header)
+        self.assertFalse(self.receipt.exists())
+
+    def test_progress_temp_external_hardlink_is_retained(self) -> None:
+        temp, _header = self._stage_publication_temp()
+        alias = self.fixture.root / "external-progress-temp-alias"
+        os.link(temp, alias)
+        protected = self._temp_protected(temp)
+        with self.assertRaisesRegex(MODULE.SyncError, "not an exact unconsumed header"):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertEqual(self._temp_protected(temp), protected)
+        self.assertTrue(alias.is_file())
+        self.assertFalse(self.receipt.exists())
+
+    def test_progress_temp_does_not_replace_original_marker_authority(self) -> None:
+        temp, _header = self._stage_publication_temp()
+        marker = self.ticket.batch_root / Path(*self.ticket.marker_path.parts)
+        marker.write_bytes(b"changed marker content\n")
+        protected = self._temp_protected(temp)
+        with self.assertRaisesRegex(MODULE.SyncError, "(control|marker|commit evidence).*(changed|authority)"):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertEqual(self._temp_protected(temp), protected)
+        self.assertFalse(self.progress.exists())
+        self.assertFalse(self.receipt.exists())
+
+    def test_progress_temp_content_changed_at_rename_precedes_walker(self) -> None:
+        temp, header = self._stage_publication_temp()
+        rename = MODULE._rename_noreplace_at
+
+        def mutate_at_progress_rename(source_fd, source, target_fd, target):
+            if source == temp.name and target == self.progress.name:
+                temp.write_bytes(header + MODULE._pending_directory_progress_line({"slot": 0}))
+            return rename(source_fd, source, target_fd, target)
+
+        target = self.fixture.target
+        target_before = (target.stat().st_ino, target.stat().st_nlink, target.read_bytes())
+        with (
+            mock.patch.object(MODULE, "_rename_noreplace_at", side_effect=mutate_at_progress_rename),
+            mock.patch.object(MODULE, "_remove_pending_batch_directory_contents") as walker,
+            self.assertRaisesRegex(MODULE.SyncError, "not an exact unconsumed header"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        walker.assert_not_called()
+        self.assertEqual(
+            (target.stat().st_ino, target.stat().st_nlink, target.read_bytes()), target_before,
+        )
+        self.assertTrue(self.ticket.path.is_file())
+        self.assertTrue(self.ticket.batch_root.is_dir())
+        self.assertFalse(self.receipt.exists())
+
+    def test_crash_after_temp_promotion_retries_canonical_header(self) -> None:
+        temp, _header = self._stage_publication_temp()
+        identity = (temp.stat().st_dev, temp.stat().st_ino)
+        rename = MODULE._rename_noreplace_at
+
+        def crash_after_progress_rename(source_fd, source, target_fd, target):
+            result = rename(source_fd, source, target_fd, target)
+            if source == temp.name and target == self.progress.name:
+                raise SystemExit("injected promoted progress before receipt")
+            return result
+
+        with (
+            mock.patch.object(MODULE, "_rename_noreplace_at", side_effect=crash_after_progress_rename),
+            self.assertRaisesRegex(SystemExit, "promoted progress before receipt"),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket)
+        self.assertFalse(temp.exists())
+        self.assertEqual((self.progress.stat().st_dev, self.progress.stat().st_ino), identity)
+        self.assertFalse(self.receipt.exists())
+        self.assertTrue(MODULE._remove_cleanup_ready_batch(self.fixture.home, self.ticket))
+        self._assert_retired()
+
     def _reject_without_deletion(self, message: str) -> None:
         protected = self._protected()
         with self.assertRaisesRegex(MODULE.SyncError, message):
@@ -5900,6 +6149,139 @@ class DirectoryProgressPublicationRecoveryTests(unittest.TestCase):
         self.assertEqual(
             (target.stat().st_ino, target.stat().st_nlink, target.read_bytes()), original_target,
         )
+
+
+class PreflightLockedRecoveryRegressions(unittest.TestCase):
+    def setUp(self):
+        self.temp_directory = tempfile.TemporaryDirectory(prefix="codex-preflight-lock-")
+        self.addCleanup(self.temp_directory.cleanup)
+        self.home = Path(self.temp_directory.name) / "home"
+        self.home.mkdir()
+
+    def _stub_preflight_pipeline(self, *, recovery_callback=None, fence_callback=None):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(mock.patch.object(
+            MODULE, "_revalidate_active_scheduler_attempt_unlocked", return_value=None,
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_recover_unconsumed_pending_terminal_progress_publications",
+            side_effect=recovery_callback or (lambda _home, _budget: None),
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_require_no_pending_unresolved_ticket_representations",
+            side_effect=fence_callback or (lambda _home: None),
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_recover_failed_move_isolation", return_value=False,
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_recover_release_retention_transaction", return_value=None,
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_cleanup_ready_pending_batches", return_value=0,
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_load_managed_state_with_snapshot", return_value=(object(), object()),
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_recover_pending_link_transaction",
+            side_effect=lambda _home, state, snapshot, *, dry_run: (state, snapshot, False),
+        ))
+        return stack
+
+    def test_recovery_and_global_fence_run_under_same_lock_in_order(self):
+        events = []
+        lock_observations = []
+
+        def recover(_home, _budget):
+            events.append("recovery")
+            lock_observations.append(MODULE._locked_sync_home_fd(self.home) is not None)
+
+        def fence(_home):
+            events.append("fence")
+            lock_observations.append(MODULE._locked_sync_home_fd(self.home) is not None)
+
+        self._stub_preflight_pipeline(recovery_callback=recover, fence_callback=fence)
+        self.assertFalse(MODULE._preflight_pending_recovery(self.home, dry_run=False))
+        self.assertEqual(events, ["recovery", "fence"])
+        self.assertEqual(lock_observations, [True, True])
+
+    def test_competing_install_lock_prevents_preflight_recovery_mutation(self):
+        attempted = threading.Event()
+        recovery_started = threading.Event()
+        completed = threading.Event()
+        lock_observations = []
+        thread_errors = []
+
+        def recover(_home, _budget):
+            lock_observations.append(MODULE._locked_sync_home_fd(self.home) is not None)
+            recovery_started.set()
+
+        self._stub_preflight_pipeline(recovery_callback=recover)
+
+        def run_preflight():
+            attempted.set()
+            try:
+                MODULE._preflight_pending_recovery(self.home, dry_run=False)
+            except BaseException as error:
+                thread_errors.append(error)
+            finally:
+                completed.set()
+
+        with MODULE.installation_lock(self.home):
+            worker = threading.Thread(target=run_preflight, daemon=True)
+            worker.start()
+            self.assertTrue(attempted.wait(timeout=2))
+            self.assertFalse(recovery_started.wait(timeout=0.2))
+            self.assertFalse(completed.is_set())
+        self.assertTrue(recovery_started.wait(timeout=2))
+        self.assertTrue(completed.wait(timeout=2))
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(thread_errors, [])
+        self.assertEqual(lock_observations, [True])
+
+    def test_dry_run_does_not_acquire_lock_or_call_mutating_recovery(self):
+        recovery_calls = []
+        cleanup_calls = []
+        failed_move_calls = []
+        retention_calls = []
+        pending_calls = []
+        stack = self._stub_preflight_pipeline(
+            recovery_callback=lambda *_args: recovery_calls.append("publication"),
+        )
+        stack.enter_context(mock.patch.object(
+            MODULE, "installation_lock",
+            side_effect=AssertionError("dry-run must not acquire installation lock"),
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_cleanup_ready_pending_batches",
+            side_effect=lambda *_args, **_kwargs: cleanup_calls.append("cleanup"),
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_recover_failed_move_isolation",
+            side_effect=lambda _home, *, dry_run: (failed_move_calls.append(dry_run) or False),
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_recover_release_retention_transaction",
+            side_effect=lambda _home, *, dry_run: (retention_calls.append(dry_run) or None),
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_recover_pending_link_transaction",
+            side_effect=lambda _home, state, snapshot, *, dry_run: (
+                pending_calls.append(dry_run) or (state, snapshot, False)
+            ),
+        ))
+        stack.enter_context(mock.patch.object(
+            MODULE, "_pending_cleanup_ready_batch_is_observed", return_value=False,
+        ))
+        self.assertFalse(MODULE._preflight_pending_recovery(self.home, dry_run=True))
+        self.assertEqual(recovery_calls, [])
+        self.assertEqual(cleanup_calls, [])
+        self.assertEqual(failed_move_calls, [True])
+        self.assertEqual(retention_calls, [True])
+        self.assertEqual(pending_calls, [True])
 
 
 class DirectoryProgressRegressionTests(unittest.TestCase):
