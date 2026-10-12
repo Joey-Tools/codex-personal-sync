@@ -14494,6 +14494,32 @@ class ScheduledGithubAccountTests(unittest.TestCase):
             for key, value in forced.items():
                 self.assertEqual(environment[key], value)
 
+    def test_standard_global_pool_roots_are_preserved_for_scheduled_children(self) -> None:
+        # Mocked child calls only: no alternate real HOME or account pool is created.
+        roots = {"HOME": "/fixture/native-home", "XDG_CONFIG_HOME": "/fixture/global-config"}
+        with (
+            mock.patch.dict(MODULE.os.environ, roots | {"GH_CONFIG_DIR": "/fixture/isolated-config"}),
+            mock.patch.object(
+                MODULE,
+                "_run_bounded_gh_process_impl",
+                side_effect=[*self.resolved(), MODULE._GhProcessResult(0, b"[]", b"")],
+            ) as run,
+        ):
+            before = dict(MODULE.os.environ)
+            with MODULE._scheduled_github_account():
+                self.assertEqual(MODULE._run_gh_json(["api", "repos/owner/repo/releases"]), [])
+            self.assertEqual(dict(MODULE.os.environ), before)
+        self.assertEqual(run.call_count, 3)
+        for call in run.call_args_list:
+            environment = call.kwargs["env"]
+            self.assertNotIn("GH_CONFIG_DIR", environment)
+            for key, value in roots.items():
+                self.assertEqual(environment[key], value)
+        self.assertEqual(run.call_args_list[0].args[0][-2:], ["--user", "JoeyTeng-Codex"])
+        self.assertEqual(run.call_args_list[1].args[0], ["api", "user", "--hostname", "github.com"])
+        self.assertEqual(run.call_args_list[2].kwargs["env"]["GH_TOKEN"], self.selected_token)
+        self.assertIsNone(MODULE._SCHEDULED_GH_TOKEN.get())
+
     def test_missing_or_invalid_token_never_uses_active_account(self) -> None:
         for raw, status in [
             (b"", 0),

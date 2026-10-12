@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "repository": "Joey-Tools/codex-personal-sync",
+  "pull_request": 37,
+  "base_sha": "110f2df02ee6388835d1eb6635e09e7f838658fb",
+  "previous_source_head": "bb51699f0749a9d756fe1d6e6cbf7669d92051a9",
+  "scope": "Documentation, one account regression and its canonical source lock; runtime engine unchanged",
+  "decision": {
+    "finding_id": 4249168489,
+    "review_id": 5492197134,
+    "classification": "correct root-precedence observation; forced OS-account HOME is outside the human-selected design",
+    "human_choice": "Preserve standard global pool",
+    "preserved_roots": ["HOME", "XDG_CONFIG_HOME"],
+    "cleared_override": "GH_CONFIG_DIR",
+    "protected_property": "Exact GitHub hostname, named login and numeric account ID, not credential-store pathname attestation",
+    "no_alternate_real_home_or_pool_created": true
+  },
+  "validation": {
+    "CPython 3.14.2 focused account tests": {
+      "tests": 13, "test_seconds": 0.462, "exit_code": 0,
+      "supervisor_seconds": 0.817, "bytes": 2565, "incomplete": null,
+      "log_sha256": "7e1a7057294e8927735e200853edd9646af142bfb0d94582dbc17ce64af1b5fa"
+    },
+    "CPython 3.9.6 focused account tests": {
+      "tests": 13, "test_seconds": 0.772, "exit_code": 0,
+      "supervisor_seconds": 3.033, "bytes": 1774, "incomplete": null,
+      "log_sha256": "d9f94cc3e58bcdf7dfc32c290a581e1f58671c84797fd80ebcb8f738ad73d343"
+    },
+    "complete source-lock module": {
+      "tests": 282, "skips": 1, "test_seconds": 534.473, "exit_code": 0,
+      "supervisor_seconds": 534.99, "bytes": 49120, "incomplete": null,
+      "log_sha256": "d6f94b2a0e3153aeeb28bb6d5f97bc52deac2cfb6c1859cd1e3c1fbe963f89b5"
+    },
+    "five_selected_input_contents_revalidated": true,
+    "source_only_compilation": 4,
+    "selected_three_python_files_ruff": "passed"
+  },
+  "input_sha256": {
+    "scripts/codex_personal_sync.py": "5b07f03d8ae0542ee956b330025023ba4ae6e4cb2d95813cdc47b788156faead",
+    "sync-source-lock.json": "c66427cdc9a3344056c0ac9d83d7b9a76dfc7cb5a263ef820aa292ec7aec1f94",
+    "tests/test_codex_personal_sync.py": "b0790367f79118ad05636f9c351f8fc996987a7daf6d06fd2fc2e46af3039cae",
+    "tests/test_scheduler_doctor.py": "934b8dd5c65655299f05048d7cea359037eb82998197a136500463399d3d075a",
+    "tests/test_source_lock.py": "db6bc1e97b0d7206f24451c119a4d1ef9cb37e634e8ab750818699479ba6a9c1"
+  },
+  "historical_runtime_evidence": "The earlier 887-test three-module pass belongs to bb51699 only; its runtime engine bytes are unchanged here. No new 888-test full affected-suite pass is claimed.",
+  "coverage_limit": "Local scope only; not full repository suite, hosted CI, remote review, merge readiness or native release acceptance",
+  "credentials_included": false,
+  "native_auth_changed": false
+}

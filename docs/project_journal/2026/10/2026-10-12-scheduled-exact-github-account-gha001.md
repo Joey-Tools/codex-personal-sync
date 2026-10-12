@@ -20,7 +20,7 @@ superseded_by:
   account before installation, and injects the credential only into bounded
   core GitHub API subprocess environments. Metadata and streamed release
   asset requests share the same attempt-scoped binding.
-- Inherited auth, host, repository, config-path, debug (including legacy
+- Inherited auth, host, repository, `GH_CONFIG_DIR`, debug (including legacy
   `DEBUG`), forced-terminal, pager and formatting overrides are cleared.
   Scheduled children disable telemetry logging and update notices.
   Empty/failed token lookup, malformed token, unverifiable identity,
@@ -32,6 +32,11 @@ superseded_by:
 - Existing `run-scheduled` argv remains valid after normal release
   propagation. Legacy jobs still require the existing audited migration.
   Manual `install`/`install-private` authentication remains unchanged.
+- The global pool follows gh's standard configuration lookup. Legitimate
+  `HOME` and `XDG_CONFIG_HOME` roots remain intact, as explicitly selected by
+  the user. Exact GitHub host/login/numeric ID is verified; credential-store
+  pathname attestation is not part of this binding. The scheduler never creates
+  an isolated `GH_CONFIG_DIR` or silently rewrites the account-home root.
 
 ## Validation
 
@@ -64,6 +69,19 @@ superseded_by:
   All five frozen source/test/lock contents were independently revalidated.
   [Repair validation receipt](../../../evidence/20261012-scheduled-github-output-controls.json)
   preserves this successor's actual coverage without replacing initial evidence.
+- Finding4249168489 correctly describes gh's global-root precedence, but its
+  suggested forced OS-account HOME is outside the selected design. The README
+  now names the narrower `GH_CONFIG_DIR` sanitization boundary. A mocked-child
+  regression preserves legitimate global roots across token lookup, identity
+  verification and release transport while retaining exact account selection
+  and an unchanged parent environment. No alternate real account pool is used.
+- Both native CPython 3.14.2 and declared CPython 3.9.6 completed all 13
+  focused account tests. The complete source-lock module passed 282 tests in
+  534.473 seconds, one skip, exit 0. Its supervisor exited 0 with incomplete
+  null; all five selected input contents were revalidated unchanged.
+  [Global-pool boundary validation](../../../evidence/20261012-scheduled-standard-global-pool.json)
+  records this documentation/test-only scope. The earlier 887-test pass remains
+  historical; no new 888-test affected-suite or hosted-CI pass is claimed.
 
 ## Delivery Boundary
 

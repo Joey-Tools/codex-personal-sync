@@ -446,7 +446,7 @@ can be reconstructed without guessing. A legacy `install` or
 
 Every `run-scheduled` execution uses the native global `gh auth` account pool
 for `github.com/JoeyTeng-Codex` (numeric user ID `263204028`), regardless of the
-active account. It clears inherited GitHub auth, host, repository, config-path,
+active account. It clears inherited GitHub auth, host, repository, `GH_CONFIG_DIR`,
 debug (including legacy `DEBUG`), forced-terminal, pager and formatting
 overrides. Scheduled children disable telemetry logging and update notices.
 It resolves `gh auth token --hostname github.com --user
@@ -458,6 +458,12 @@ invalid token and an unavailable or mismatched identity stop the attempt;
 there is no active-account fallback or `gh auth switch`. Provision the named
 account locally before enabling the scheduler. Manual `install` and
 `install-private` retain their existing authentication behavior.
+
+The account pool uses gh's standard global configuration lookup, including
+legitimate `XDG_CONFIG_HOME` and `HOME` settings. These roots are preserved, not
+silently replaced with the operating system's account-home path. The binding
+verifies the GitHub host, named login and numeric account ID; it does not pin or
+audit the credential-store pathname. No isolated `GH_CONFIG_DIR` is created.
 
 This binding applies to existing `run-scheduled` configurations after the
 updated canonical engine has reached the accepted toolbox release and native
