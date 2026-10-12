@@ -447,7 +447,9 @@ can be reconstructed without guessing. A legacy `install` or
 Every `run-scheduled` execution uses the native global `gh auth` account pool
 for `github.com/JoeyTeng-Codex` (numeric user ID `263204028`), regardless of the
 active account. It clears inherited GitHub auth, host, repository, config-path,
-and debug overrides, resolves `gh auth token --hostname github.com --user
+debug (including legacy `DEBUG`), forced-terminal, pager and formatting
+overrides. Scheduled children disable telemetry logging and update notices.
+It resolves `gh auth token --hostname github.com --user
 JoeyTeng-Codex`, and verifies that token with the core `gh api user` command.
 The token is passed only through the bounded GitHub subprocess environment,
 never through command arguments, scheduler files, runtime receipts, or the

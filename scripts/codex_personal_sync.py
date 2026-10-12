@@ -316,6 +316,20 @@ GH_AUTH_ENVIRONMENT_KEYS = frozenset(
         "GH_ENTERPRISE_TOKEN",
         "GITHUB_ENTERPRISE_TOKEN",
         "GH_DEBUG",
+        "DEBUG",
+        "GH_FORCE_TTY",
+        "GH_PAGER",
+        "PAGER",
+        "GH_MDWIDTH",
+        "GLAMOUR_STYLE",
+        "NO_COLOR",
+        "CLICOLOR",
+        "CLICOLOR_FORCE",
+        "GH_COLOR_LABELS",
+        "GH_ACCESSIBLE_COLORS",
+        "GH_ACCESSIBLE_PROMPTER",
+        "GH_SPINNER_DISABLED",
+        "GH_TELEMETRY",
     }
 )
 PUBLIC_OWNER = "public"
@@ -55485,6 +55499,9 @@ def _github_account_environment() -> dict[str, str]:
         if key not in GH_AUTH_ENVIRONMENT_KEYS
     }
     env["GH_PROMPT_DISABLED"] = "1"
+    env["GH_NO_UPDATE_NOTIFIER"] = "1"
+    env["GH_NO_EXTENSION_UPDATE_NOTIFIER"] = "1"
+    env["GH_TELEMETRY"] = "false"
     return env
 
 

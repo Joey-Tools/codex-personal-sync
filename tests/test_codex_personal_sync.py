@@ -14434,19 +14434,65 @@ class ScheduledGithubAccountTests(unittest.TestCase):
             ["auth", "token", "--hostname", "github.com", "--user", "JoeyTeng-Codex"],
         )
         self.assertTrue(
-            MODULE.GH_AUTH_ENVIRONMENT_KEYS.isdisjoint(lookup.kwargs["env"])
+            (MODULE.GH_AUTH_ENVIRONMENT_KEYS - {"GH_TELEMETRY"}).isdisjoint(
+                lookup.kwargs["env"]
+            )
         )
         self.assertEqual(lookup.kwargs["env"]["GH_PROMPT_DISABLED"], "1")
         self.assertEqual(identity.args[0], ["api", "user", "--hostname", "github.com"])
         self.assertEqual(identity.kwargs["env"]["GH_TOKEN"], self.selected_token)
         self.assertEqual(identity.kwargs["env"]["GH_HOST"], "github.com")
         self.assertTrue(
-            (MODULE.GH_AUTH_ENVIRONMENT_KEYS - {"GH_TOKEN", "GH_HOST"}).isdisjoint(
+            (MODULE.GH_AUTH_ENVIRONMENT_KEYS - {"GH_TOKEN", "GH_HOST", "GH_TELEMETRY"}).isdisjoint(
                 identity.kwargs["env"]
             )
         )
         self.assertEqual(lookup.kwargs["deadline"], identity.kwargs["deadline"])
         self.assertEqual(lookup.kwargs["stdout_limit"], MODULE.MAX_GH_TOKEN_BYTES)
+
+    def test_documented_output_and_debug_overrides_cannot_reach_scheduled_children(self) -> None:
+        overrides = {
+            "DEBUG": "true",
+            "GH_DEBUG": "api",
+            "GH_FORCE_TTY": "80",
+            "GH_PAGER": "fixture-pager",
+            "PAGER": "fixture-pager",
+            "GH_MDWIDTH": "40",
+            "GLAMOUR_STYLE": "dark",
+            "NO_COLOR": "1",
+            "CLICOLOR": "1",
+            "CLICOLOR_FORCE": "1",
+            "GH_COLOR_LABELS": "1",
+            "GH_ACCESSIBLE_COLORS": "1",
+            "GH_ACCESSIBLE_PROMPTER": "1",
+            "GH_SPINNER_DISABLED": "1",
+            "GH_TELEMETRY": "log",
+            "GH_NO_UPDATE_NOTIFIER": "0",
+            "GH_NO_EXTENSION_UPDATE_NOTIFIER": "0",
+        }
+        with (
+            mock.patch.dict(MODULE.os.environ, overrides),
+            mock.patch.object(
+                MODULE,
+                "_run_bounded_gh_process_impl",
+                side_effect=[*self.resolved(), MODULE._GhProcessResult(0, b"[]", b"")],
+            ) as run,
+        ):
+            before = dict(MODULE.os.environ)
+            with MODULE._scheduled_github_account():
+                self.assertEqual(MODULE._run_gh_json(["api", "repos/owner/repo/releases"]), [])
+            self.assertEqual(dict(MODULE.os.environ), before)
+        self.assertEqual(run.call_count, 3)
+        forced = {
+            "GH_TELEMETRY": "false",
+            "GH_NO_UPDATE_NOTIFIER": "1",
+            "GH_NO_EXTENSION_UPDATE_NOTIFIER": "1",
+        }
+        for call in run.call_args_list:
+            environment = call.kwargs["env"]
+            self.assertTrue((overrides.keys() - forced.keys()).isdisjoint(environment))
+            for key, value in forced.items():
+                self.assertEqual(environment[key], value)
 
     def test_missing_or_invalid_token_never_uses_active_account(self) -> None:
         for raw, status in [
@@ -14624,6 +14670,9 @@ class ScheduledGithubAccountTests(unittest.TestCase):
                 "#!" + sys.executable + "\n"
                 "import json, os, sys\n"
                 "args = sys.argv[1:]\n"
+                "assert not any(k in os.environ for k in ['DEBUG','GH_DEBUG','GH_FORCE_TTY','GH_PAGER','PAGER','GH_MDWIDTH','GLAMOUR_STYLE','NO_COLOR','CLICOLOR','CLICOLOR_FORCE','GH_COLOR_LABELS','GH_ACCESSIBLE_COLORS','GH_ACCESSIBLE_PROMPTER','GH_SPINNER_DISABLED'])\n"
+                "assert os.environ['GH_TELEMETRY'] == 'false'\n"
+                "assert os.environ['GH_NO_UPDATE_NOTIFIER'] == '1' and os.environ['GH_NO_EXTENSION_UPDATE_NOTIFIER'] == '1'\n"
                 "if args == ['auth','token','--hostname','github.com','--user','JoeyTeng-Codex']:\n"
                 "    assert not any(k in os.environ for k in ['GH_CONFIG_DIR','GH_HOST','GH_PATH','GH_REPO','GH_TOKEN','GITHUB_TOKEN','GH_ENTERPRISE_TOKEN','GITHUB_ENTERPRISE_TOKEN','GH_DEBUG'])\n"
                 "    print(os.environ['GH_FIXTURE_SELECTED'])\n"

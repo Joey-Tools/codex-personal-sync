@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-12
 updated: 2026-10-12
 branch: codex/scheduled-exact-github-account-20261012
-pr:
+pr: https://github.com/Joey-Tools/codex-personal-sync/pull/37
 supersedes: []
 superseded_by:
 ---
@@ -20,8 +20,10 @@ superseded_by:
   account before installation, and injects the credential only into bounded
   core GitHub API subprocess environments. Metadata and streamed release
   asset requests share the same attempt-scoped binding.
-- Inherited auth, host, repository, config-path, and debug overrides are
-  cleared. Empty/failed token lookup, malformed token, unverifiable identity,
+- Inherited auth, host, repository, config-path, debug (including legacy
+  `DEBUG`), forced-terminal, pager and formatting overrides are cleared.
+  Scheduled children disable telemetry logging and update notices.
+  Empty/failed token lookup, malformed token, unverifiable identity,
   and identity mismatch stop the attempt without active-account fallback.
 - No token is written into scheduler configuration, runtime receipts, command
   arguments, or the parent environment. Token diagnostics are redacted and
@@ -41,7 +43,7 @@ superseded_by:
 - Scheduler regression records account admission failure before invoking the
   installer. Existing offline scheduling fixtures isolate credentials from
   scheduling, attempt ownership, and completion-state tests.
-- Native CPython 3.14.2 completed all three affected modules: 886 tests in
+- Initial candidate `6858387` completed all three affected modules: 886 tests in
   730.765 seconds, 3 skips, exit 0. The bounded supervisor also exited 0 with
   no incomplete result; the raw log SHA-256 is
   `1303988565368647753575a3af37cb41e67d321f4ede45f074da33102b596225`.
@@ -51,6 +53,17 @@ superseded_by:
 - [Curated validation receipt](../../../evidence/20261012-scheduled-github-account.json)
   preserves the exact command, coverage, input hashes, and terminal without
   raw home data or credential values.
+- Applicable review finding4248581910 identified omitted supported output and
+  debug overrides. The repaired scope adds an independent literal control-list
+  regression across token lookup, identity and release API children, plus
+  actual metadata/asset child checks. Native CPython 3.14.2 and declared
+  CPython 3.9.6 each completed all 12 focused account tests.
+- The repaired scope completed all three affected modules again: 887 tests in
+  747.471 seconds, 3 skips, exit 0; supervisor 0 with incomplete null and log
+  SHA-256 `0988b1a62df8f68be8d5ea392801431726a4ffe1283bc7c6b4e01c2d9eb459f0`.
+  All five frozen source/test/lock contents were independently revalidated.
+  [Repair validation receipt](../../../evidence/20261012-scheduled-github-output-controls.json)
+  preserves this successor's actual coverage without replacing initial evidence.
 
 ## Delivery Boundary
 
