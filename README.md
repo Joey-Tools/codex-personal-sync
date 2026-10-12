@@ -444,6 +444,24 @@ The JSON report includes the audited `command`, `mode`, `repo`, `base_repo`,
 can be reconstructed without guessing. A legacy `install` or
 `install-private` command sets `migration_needed: true`.
 
+Every `run-scheduled` execution uses the native global `gh auth` account pool
+for `github.com/JoeyTeng-Codex` (numeric user ID `263204028`), regardless of the
+active account. It clears inherited GitHub auth, host, repository, config-path,
+and debug overrides, resolves `gh auth token --hostname github.com --user
+JoeyTeng-Codex`, and verifies that token with the core `gh api user` command.
+The token is passed only through the bounded GitHub subprocess environment,
+never through command arguments, scheduler files, runtime receipts, or the
+parent environment. Error diagnostics redact the selected token. A missing or
+invalid token and an unavailable or mismatched identity stop the attempt;
+there is no active-account fallback or `gh auth switch`. Provision the named
+account locally before enabling the scheduler. Manual `install` and
+`install-private` retain their existing authentication behavior.
+
+This binding applies to existing `run-scheduled` configurations after the
+updated canonical engine has reached the accepted toolbox release and native
+installation. Legacy `install`/`install-private` jobs still need the ordinary
+audited scheduler migration; no token or account-pool file is synchronized.
+
 A bare repair preserves an existing audited mode, repository, base repository,
 owner, and interval while migrating the command to the stable
 `run-scheduled` entrypoint. On macOS it also migrates an exact historical

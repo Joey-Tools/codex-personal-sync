@@ -1,0 +1,55 @@
+{
+  "additional_actual_checks": [
+    "Ruff on the three changed Python files",
+    "source-only compile of the three changed Python files",
+    "exact four-input hash revalidation",
+    "source-lock refresh and 11-source check",
+    "git diff --check",
+    "project-journal validation"
+  ],
+  "base_sha": "110f2df02ee6388835d1eb6635e09e7f838658fb",
+  "branch": "codex/scheduled-exact-github-account-20261012",
+  "command": [
+    "python3.14",
+    "-B",
+    "-m",
+    "unittest",
+    "tests.test_codex_personal_sync",
+    "tests.test_scheduler_doctor",
+    "tests.test_source_lock",
+    "-v"
+  ],
+  "coverage_limit": "The complete repository suite, remote account transport, CI and installed release acceptance were not run by this local gate.",
+  "github_account": {
+    "credential_values_included": false,
+    "hostname": "github.com",
+    "id": 263204028,
+    "login": "JoeyTeng-Codex",
+    "native_auth_changed": false
+  },
+  "input_sha256": {
+    "scripts/codex_personal_sync.py": "1ece84ff6ce53c1beac4b995d111ffafa5c03320d9c4a9165af15d274a9c1fca",
+    "sync-source-lock.json": "f02fd09a43aaf74b1954ab655307a02a2ccd613b0cecf6c3ecab1025429bed16",
+    "tests/test_codex_personal_sync.py": "4b70c216e4b67c36a0ef66a9ad629bf08ba1d1e871d6e97f7f0586442e65b4fa",
+    "tests/test_scheduler_doctor.py": "934b8dd5c65655299f05048d7cea359037eb82998197a136500463399d3d075a"
+  },
+  "runtime": "native macOS CPython 3.14.2",
+  "scope": "canonical local implementation; not remote review, CI or native installation",
+  "supervisor": {
+    "retained_byte_limit": 4194304,
+    "terminal": {
+      "bytes": 161023,
+      "exit_code": 0,
+      "incomplete": null,
+      "output": "full-affected-modules-01.log",
+      "seconds": 734.852,
+      "sha256": "1303988565368647753575a3af37cb41e67d321f4ede45f074da33102b596225",
+      "skips": 3,
+      "source": "Harvested PTY 13735 actual bounded supervisor terminal and raw unittest summary.",
+      "test_seconds": 730.765,
+      "tests": 886
+    },
+    "timeout_seconds": 2400
+  },
+  "version": 1
+}
