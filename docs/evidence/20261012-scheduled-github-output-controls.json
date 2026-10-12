@@ -1,0 +1,65 @@
+{
+  "base_sha": "110f2df02ee6388835d1eb6635e09e7f838658fb",
+  "behavior": "Scheduled gh children clear debug, forced-terminal, pager and formatting controls; telemetry and update-notice output are disabled. Exact native account selection and manual installation behavior are unchanged.",
+  "command": [
+    "python3.14",
+    "-B",
+    "-m",
+    "unittest",
+    "tests.test_codex_personal_sync",
+    "tests.test_scheduler_doctor",
+    "tests.test_source_lock",
+    "-v"
+  ],
+  "contract_source": "https://cli.github.com/manual/gh_help_environment",
+  "coverage_limit": "Complete affected modules and focused Python 3.9 compatibility only; not the complete repository suite, hosted CI, remote review or native release acceptance.",
+  "credentials_included": false,
+  "finding": {
+    "classification": "applicable P2; documented output/debug overrides were incompletely cleared",
+    "id": 4248581910,
+    "original_head": "6858387c196bbfe938936489a5278d11b54e5d34",
+    "review_id": 5491496793
+  },
+  "focused_compatibility": {
+    "CPython 3.14.2": {
+      "exit_code": 0,
+      "log_sha256": "fbfe527a9b9f1eb862de9ecdce16498e3959ba284a2dadaaedf53b27f5b79d00",
+      "tests": 12
+    },
+    "CPython 3.9.6": {
+      "exit_code": 0,
+      "log_sha256": "37d7e88269f7393f02e8b7389b2aad3bd72fa5a600be9d221e63e2a95cf6f17d",
+      "tests": 12
+    }
+  },
+  "input_contents_revalidated": true,
+  "input_sha256": {
+    "scripts/codex_personal_sync.py": "5b07f03d8ae0542ee956b330025023ba4ae6e4cb2d95813cdc47b788156faead",
+    "sync-source-lock.json": "379e82157dace24a60a89b7172c44d944643220aa7e76c2d6dcf614ba8e3d8b5",
+    "tests/test_codex_personal_sync.py": "45734a31dc1bef0c8a83ee9494a2ac7f0b4451d351123ce91ac79ad6b1663e99",
+    "tests/test_scheduler_doctor.py": "934b8dd5c65655299f05048d7cea359037eb82998197a136500463399d3d075a",
+    "tests/test_source_lock.py": "db6bc1e97b0d7206f24451c119a4d1ef9cb37e634e8ab750818699479ba6a9c1"
+  },
+  "native_auth_changed": false,
+  "pull_request": 37,
+  "repository": "Joey-Tools/codex-personal-sync",
+  "runtime": "Native macOS CPython 3.14.2",
+  "scope": "Canonical local implementation only; not current-head remote review, CI or native installation",
+  "supervisor": {
+    "retained_byte_limit": 4194304,
+    "terminal": {
+      "bytes": 161241,
+      "exit_code": 0,
+      "incomplete": null,
+      "output": "pr37-output-controls-complete-affected-modules-02.log",
+      "seconds": 756.082,
+      "sha256": "0988b1a62df8f68be8d5ea392801431726a4ffe1283bc7c6b4e01c2d9eb459f0",
+      "skips": 3,
+      "terminal_pty": 99411,
+      "test_seconds": 747.471,
+      "tests": 887
+    },
+    "timeout_seconds": 2400
+  },
+  "version": 1
+}
