@@ -7030,6 +7030,115 @@ while True:
         self._assert_cached_install_rejects_without_mutation(source, home, installed)
         self.assertEqual(self.exact_path_snapshot(external), before)
 
+    def test_cache_quarantine_preserves_early_parent_binding_error(self):
+        _source, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        (cache / "codex_personal_sync.cpython-313.pyc").write_bytes(b"generated")
+        releases_root = installed.parent
+        release_fd = MODULE._open_installed_release_directory_fd(
+            home,
+            MODULE.PUBLIC_OWNER,
+            SHA1,
+        )
+        try:
+            scan, _captured = MODULE._release_cache_repair_scan_from_directory_fd(
+                release_fd,
+                installed,
+                expected_owner_uid=(os.geteuid() if sys.platform == "darwin" else None),
+            )
+            before = snapshot_tree(installed)
+            real_bound = MODULE._bound_directory_matches
+
+            def reject_releases_binding(bound_home, path, directory_fd):
+                if path == releases_root:
+                    return False
+                return real_bound(bound_home, path, directory_fd)
+
+            with (
+                MODULE.installation_lock(home),
+                MODULE._release_cache_repair_scope(home),
+                mock.patch.object(
+                    MODULE,
+                    "_bound_directory_matches",
+                    side_effect=reject_releases_binding,
+                ),
+                self.assertRaises(MODULE.SyncError) as raised,
+            ):
+                MODULE._quarantine_release_cache_artifacts(
+                    home,
+                    MODULE.PUBLIC_OWNER,
+                    SHA1,
+                    installed,
+                    release_fd,
+                    scan,
+                    trusted_tree_digest=scan.identity[2],
+                    expected_owner_uid=(
+                        os.geteuid() if sys.platform == "darwin" else None
+                    ),
+                    repair_context={"quarantines": []},
+                )
+        finally:
+            os.close(release_fd)
+
+        self.assertEqual(
+            str(raised.exception),
+            f"release parent changed before cache repair: {releases_root}",
+        )
+        self.assertIsNone(raised.exception.code)
+        self.assertEqual(snapshot_tree(installed), before)
+
+    def test_cache_quarantine_preserves_early_quarantine_creation_error(self):
+        _source, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        (cache / "codex_personal_sync.cpython-313.pyc").write_bytes(b"generated")
+        release_fd = MODULE._open_installed_release_directory_fd(
+            home,
+            MODULE.PUBLIC_OWNER,
+            SHA1,
+        )
+        try:
+            scan, _captured = MODULE._release_cache_repair_scan_from_directory_fd(
+                release_fd,
+                installed,
+                expected_owner_uid=(os.geteuid() if sys.platform == "darwin" else None),
+            )
+            before = snapshot_tree(installed)
+            injected = MODULE.SyncError(
+                "injected quarantine-root creation failure",
+                code="cache-repair-probe",
+            )
+            with (
+                MODULE.installation_lock(home),
+                MODULE._release_cache_repair_scope(home),
+                mock.patch.object(
+                    MODULE,
+                    "_release_cache_quarantine_root",
+                    side_effect=injected,
+                ),
+                self.assertRaises(MODULE.SyncError) as raised,
+            ):
+                MODULE._quarantine_release_cache_artifacts(
+                    home,
+                    MODULE.PUBLIC_OWNER,
+                    SHA1,
+                    installed,
+                    release_fd,
+                    scan,
+                    trusted_tree_digest=scan.identity[2],
+                    expected_owner_uid=(
+                        os.geteuid() if sys.platform == "darwin" else None
+                    ),
+                    repair_context={"quarantines": []},
+                )
+        finally:
+            os.close(release_fd)
+
+        self.assertIs(raised.exception, injected)
+        self.assertEqual(raised.exception.code, "cache-repair-probe")
+        self.assertEqual(snapshot_tree(installed), before)
+
     def test_install_cache_repair_retains_quarantine_after_later_failure(self):
         source, home, installed = self._install_minimal_release_fixture()
         cache = installed / "scripts" / "__pycache__"
@@ -7554,6 +7663,225 @@ while True:
             self._cache_repair_batches(installed),
             {"payloads": (), "receipts": (), "markers": ()},
         )
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+
+    def test_install_cache_repair_round_trips_near_limit_marker_only(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        (cache / "codex_personal_sync.cpython-313.pyc").write_bytes(b"generated")
+        original_receipt_payload = MODULE._release_cache_repair_receipt_payload
+        original_internal_writer = MODULE._write_exclusive_internal_file
+        original_unlink = MODULE.os.unlink
+        receipt_limits: list[int] = []
+        receipt_write_limits: list[int | None] = []
+        marker_write_limits: list[int | None] = []
+        marker_observations: list[tuple[int, int, int]] = []
+        interrupted = False
+
+        class SimulatedProcessInterruption(BaseException):
+            pass
+
+        def set_exact_receipt_limit(record):
+            payload = original_receipt_payload(record)
+            receipt_limit = len(payload)
+            MODULE.MAX_RELEASE_CACHE_REPAIR_RECEIPT_BYTES = receipt_limit
+            MODULE.MAX_RELEASE_CACHE_REPAIR_MARKER_BYTES = (
+                3 * receipt_limit + 4 * 1024
+            )
+            receipt_limits.append(receipt_limit)
+            return payload
+
+        def capture_internal_write(
+            write_home,
+            path,
+            payload,
+            *,
+            maximum_bytes=None,
+        ):
+            if path.name.startswith(MODULE.RELEASE_CACHE_REPAIR_PREFIX) and path.name.endswith(
+                MODULE.RELEASE_CACHE_REPAIR_RECEIPT_SUFFIX
+            ):
+                receipt_write_limits.append(maximum_bytes)
+            if path.name.endswith(MODULE.RELEASE_CACHE_REPAIR_READY_SUFFIX):
+                marker_write_limits.append(maximum_bytes)
+            return original_internal_writer(
+                write_home,
+                path,
+                payload,
+                maximum_bytes=maximum_bytes,
+            )
+
+        def interrupt_before_marker_unlink(path, *args, **kwargs):
+            nonlocal interrupted
+            name = os.fsdecode(path)
+            if name.endswith(MODULE.RELEASE_CACHE_REPAIR_READY_SUFFIX) and not interrupted:
+                interrupted = True
+                marker_path = installed.parent / Path(name).name
+                marker_size = marker_path.stat().st_size
+                marker_observations.append(
+                    (
+                        marker_size,
+                        MODULE.MAX_RELEASE_CACHE_REPAIR_RECEIPT_BYTES,
+                        MODULE.MAX_RELEASE_CACHE_REPAIR_MARKER_BYTES,
+                    )
+                )
+                raise SimulatedProcessInterruption(
+                    "simulated interruption after receipt removal"
+                )
+            return original_unlink(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MAX_RELEASE_CACHE_REPAIR_RECEIPT_BYTES",
+                MODULE.MAX_RELEASE_CACHE_REPAIR_RECEIPT_BYTES,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MAX_RELEASE_CACHE_REPAIR_MARKER_BYTES",
+                MODULE.MAX_RELEASE_CACHE_REPAIR_MARKER_BYTES,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_release_cache_repair_receipt_payload",
+                side_effect=set_exact_receipt_limit,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_write_exclusive_internal_file",
+                side_effect=capture_internal_write,
+            ),
+        ):
+            with mock.patch.object(
+                MODULE.os,
+                "unlink",
+                side_effect=interrupt_before_marker_unlink,
+            ):
+                with self.assertRaises(MODULE.SyncError):
+                    self.run_quietly(
+                        MODULE.install_release_tree,
+                        source,
+                        home,
+                        SHA1,
+                        dry_run=False,
+                    )
+
+            self.assertTrue(interrupted)
+            self.assertTrue(receipt_limits)
+            self.assertEqual(receipt_write_limits, [receipt_limits[0]])
+            self.assertTrue(marker_write_limits)
+            marker_size, receipt_limit, marker_limit = marker_observations[0]
+            self.assertEqual(receipt_limit, receipt_limits[0])
+            self.assertEqual(marker_limit, 3 * receipt_limit + 4 * 1024)
+            self.assertGreater(marker_size, receipt_limit)
+            self.assertLessEqual(marker_size, marker_limit)
+            self.assertEqual(marker_write_limits, [marker_limit])
+
+            batches = self._cache_repair_batches(installed)
+            self.assertEqual(batches["payloads"], ())
+            self.assertEqual(batches["receipts"], ())
+            self.assertEqual(len(batches["markers"]), 1)
+            marker_only_snapshot = snapshot_tree(home)
+
+            releases_fd = MODULE._open_directory_beneath(home, installed.parent)
+            try:
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "MAX_RELEASE_CACHE_REPAIR_MARKER_BYTES",
+                        marker_size - 1,
+                    ),
+                    self.assertRaises(MODULE.SyncError),
+                ):
+                    MODULE._read_release_cache_repair_cleanup_marker(
+                        home,
+                        releases_fd,
+                        installed.parent,
+                        batches["markers"][0].name.removesuffix(
+                            MODULE.RELEASE_CACHE_REPAIR_READY_SUFFIX
+                        ),
+                    )
+            finally:
+                os.close(releases_fd)
+            self.assertEqual(snapshot_tree(home), marker_only_snapshot)
+
+            self.run_quietly(
+                MODULE.install_release_tree,
+                source,
+                home,
+                SHA1,
+                dry_run=True,
+            )
+            self.assertEqual(snapshot_tree(home), marker_only_snapshot)
+
+            self.run_quietly(
+                MODULE.install_release_tree,
+                source,
+                home,
+                SHA1,
+                dry_run=False,
+            )
+
+        self.assertEqual(
+            self._cache_repair_batches(installed),
+            {"payloads": (), "receipts": (), "markers": ()},
+        )
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+
+    def test_install_cache_repair_rejects_marker_over_configured_limit(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        (cache / "codex_personal_sync.cpython-313.pyc").write_bytes(b"generated")
+        original_receipt_payload = MODULE._release_cache_repair_receipt_payload
+
+        def set_marker_limit_to_receipt_size(record):
+            payload = original_receipt_payload(record)
+            MODULE.MAX_RELEASE_CACHE_REPAIR_RECEIPT_BYTES = len(payload)
+            MODULE.MAX_RELEASE_CACHE_REPAIR_MARKER_BYTES = len(payload)
+            return payload
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MAX_RELEASE_CACHE_REPAIR_RECEIPT_BYTES",
+                MODULE.MAX_RELEASE_CACHE_REPAIR_RECEIPT_BYTES,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MAX_RELEASE_CACHE_REPAIR_MARKER_BYTES",
+                MODULE.MAX_RELEASE_CACHE_REPAIR_MARKER_BYTES,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_release_cache_repair_receipt_payload",
+                side_effect=set_marker_limit_to_receipt_size,
+            ),
+        ):
+            with self.assertRaises(MODULE.SyncError) as raised:
+                self.run_quietly(
+                    MODULE.install_release_tree,
+                    source,
+                    home,
+                    SHA1,
+                    dry_run=False,
+                )
+
+        self.assertIn(
+            "release cache repair cleanup marker exceeds the size limit",
+            str(raised.exception),
+        )
+        payload_dir, receipt = self._assert_cache_repair_receipt(installed)
+        self.assertFalse((installed / "scripts" / "__pycache__").exists())
+        self.assertFalse(
+            (installed.parent / f"{payload_dir.name}.cleanup-ready").exists()
+        )
+        self.assertEqual(
+            [path.read_bytes() for path in payload_dir.rglob("*") if path.is_file()],
+            [b"generated"],
+        )
+        self.assertTrue(receipt.is_file())
         self.assertEqual(current_target(home), f"releases/{SHA1}")
 
     def test_install_cache_repair_rejects_unknown_orphan_batch(self):
@@ -15515,6 +15843,30 @@ while True:
             )
         self.assertEqual(published.payload, b"12345")
         self.assertEqual(source.stat().st_ino, destination.stat().st_ino)
+
+    def test_exclusive_internal_file_uses_default_and_explicit_size_limits(self) -> None:
+        home = self.root / "home" / ".codex"
+        path = home / "personal-sync" / "evidence" / "authority.json"
+        path.parent.mkdir(parents=True)
+
+        with (
+            mock.patch.object(MODULE, "MAX_MANAGED_STATE_BYTES", 4),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "exclusive internal authority exceeds 4 bytes",
+            ),
+        ):
+            MODULE._write_exclusive_internal_file(home, path, b"12345")
+        self.assertFalse(os.path.lexists(path))
+
+        with mock.patch.object(MODULE, "MAX_MANAGED_STATE_BYTES", 4):
+            snapshot = MODULE._write_exclusive_internal_file(
+                home,
+                path,
+                b"12345",
+                maximum_bytes=8,
+            )
+        self.assertEqual(snapshot.payload, b"12345")
 
     def test_regular_reconcile_publication_quarantines_destination_replacement(
         self,

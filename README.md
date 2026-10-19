@@ -453,6 +453,8 @@ objects outside the release, then repeats the original strict, cache-free
 release checks before continuing. Successful installation removes its isolated
 cache objects and receipt. Failure retains recovery evidence and reports its
 location; a later installation can resume an interrupted, receipt-bound repair.
+Retention pruning keeps releases still referenced by a valid repair receipt
+or cleanup marker, including inactive releases needed to finish recovery.
 Unknown or inconsistent recovery evidence remains in place and blocks
 mutation. A batch owned by the current installation must retain its bound
 payload and receipt; replaced evidence cannot enter restart recovery.

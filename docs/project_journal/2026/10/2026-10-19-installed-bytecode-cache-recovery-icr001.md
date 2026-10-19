@@ -30,6 +30,11 @@ superseded_by:
   replaced or missing evidence cannot fall through into restart recovery.
 - Reject invalid release input before recovery, and require real installation
   locks in mutating internal-helper callers.
+- Preserve releases referenced by valid repair controls during retention
+  pruning, including inactive releases, marker-only recovery, and committed
+  retention recovery while the original release is in quarantine.
+- Preserve early repair errors and reserve a bounded cleanup-marker envelope
+  large enough for every admitted receipt.
 
 ## Delivery
 
@@ -42,9 +47,13 @@ superseded_by:
 
 ## Validation
 
-- Python 3.13.0 main installer and locked preflight recovery regressions:
-  371 tests, 224.340 seconds, one skip, exit 0.
-- Native Python 3.9.6 cache regressions: 30 tests, 60.833 seconds, exit 0.
+- Python 3.13.0 installer, locked preflight, and input-order regressions:
+  381 tests, 220.939 seconds, one skip, exit 0.
+- Python 3.13.0 release-retention regressions: 39 tests, 96.104 seconds,
+  exit 0. The committed-quarantine recovery test failed before the fix and
+  passed after it.
+- Native Python 3.9.6: 34 installer cache regressions, nine retention cache
+  regressions, and the default/explicit writer-limit regression passed.
 - Input-order and locked-helper regressions: five test methods passed on
   Python 3.13.0 and 3.9.6, including all eight previously failing subcases.
 - Canonical source-lock verification passed for all eleven managed sources.
