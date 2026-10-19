@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-19
 updated: 2026-10-19
 branch: wip/installer-cache-repair
-pr:
+pr: https://github.com/Joey-Tools/codex-personal-sync/pull/38
 supersedes: []
 superseded_by:
 ---
@@ -21,6 +21,13 @@ superseded_by:
   scheduler tree baseline; preserve unproven installed state.
 - Keep dry-run observational and retain failed-repair evidence outside the
   installed release.
+- Persist cache identity, content, and access evidence before isolation so an
+  interrupted operation can resume under the installation lock. Preserve and
+  report unknown or invalid recovery state.
+- Require a strictly cache-free installed tree after isolation; a later cache
+  writer cannot reuse the observational preflight exception.
+- Bind active recovery batches to their original payload and receipt objects;
+  replaced or missing evidence cannot fall through into restart recovery.
 
 ## Delivery
 
@@ -33,19 +40,17 @@ superseded_by:
 
 ## Validation
 
-- Python 3.13.0 main installer module: 348 tests, 195.822 seconds, one skip,
-  exit 0. The initial fixture-only failure placed case homes outside the mocked
-  user home; the corrected fixture and entire main module were rerun.
-- Source-lock module: 282 tests, 642.705 seconds, one skip, exit 0.
-- Native Python 3.9.6 cache regressions: 17 tests, 23.898 seconds, exit 0.
-- Scheduler module: 276 tests, 19.455 seconds, one skip, exit 0.
-- The 11-source lock check, Python 3.9 syntax and in-memory compilation,
-  undefined-name checks, whitespace checks, and project-journal validation
-  passed. No full local repository-suite pass is claimed here.
-- Additional regression results and exact-head hosted CI/review evidence belong
-  to the delivery PR. A 1,297-test aggregate run exceeded its 1,800-second
-  deadline and is incomplete; subsequent verification uses independent bounded
-  groups with per-test diagnostics.
+- Python 3.13.0 main installer and locked preflight recovery regressions:
+  371 tests, 248.652 seconds, one skip, exit 0.
+- Native Python 3.9.6 cache regressions: 30 tests, 66.236 seconds, exit 0.
+- Complete source-lock module: 282 tests across four disjoint shards sharing
+  the same frozen source fingerprints and inventory, one skip, all exit 0.
+- Regression coverage includes interrupted isolation and cleanup, invalid
+  recovery controls, lock ownership, newly written caches after isolation,
+  and replacement of an active receipt with an identical-content new inode.
+- Python 3.9 syntax and in-memory compilation, undefined-name checks, and
+  whitespace checks passed. Complete exact-head CI and review evidence is
+  recorded in the delivery PR; a full local repository-suite pass is not claimed.
 
 ## Delivery Boundary
 

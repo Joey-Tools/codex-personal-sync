@@ -615,6 +615,14 @@ RETAINED_RELEASE_PIN_RE = re.compile(
 )
 MAX_RELEASE_RETENTION_RECORD_BYTES = 64 * 1024
 MAX_RELEASE_RETENTION_CANDIDATES = 1_000
+RELEASE_CACHE_REPAIR_PREFIX = ".cache-repair-"
+RELEASE_CACHE_REPAIR_RECEIPT_SUFFIX = ".json"
+RELEASE_CACHE_REPAIR_READY_SUFFIX = ".cleanup-ready"
+RELEASE_CACHE_REPAIR_BATCH_RE = re.compile(
+    r"^\.cache-repair-([0-9a-f]{40})-([1-9][0-9]*)-([0-9]+)-([0-9]+)$"
+)
+MAX_RELEASE_CACHE_REPAIR_BATCHES = MAX_ARCHIVE_MEMBERS
+MAX_RELEASE_CACHE_REPAIR_RECEIPT_BYTES = MAX_MANAGED_STATE_BYTES
 MAX_ACTIVE_SKILL_ENTRIES = 10_000
 MAX_SKILL_FRONTMATTER_BYTES = 64 * 1024
 RESERVED_EXTERNAL_SKILL_ROOTS = frozenset({".system"})
@@ -14328,7 +14336,8 @@ def _current_manifest_data(
         )
     except SyncError as error:
         raise SyncError(
-            f"current pointer references invalid release {owner}@{sha}: {error}"
+            f"current pointer references invalid release {owner}@{sha}: {error}",
+            code=error.code,
         ) from error
     if manifest.owner != owner:
         raise SyncError(
@@ -50642,12 +50651,53 @@ class _ReleaseCacheQuarantineArtifact:
 
 
 @dataclass(frozen=True)
+class _ReleaseCacheRepairPathEvidence:
+    kind: str
+    identity: tuple[int, int]
+    access_policy: tuple[int, int, int]
+    content_identity: bytes | None
+    member_names: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _ReleaseCacheRepairReceipt:
+    home: Path
+    releases_root: Path
+    batch_name: str
+    owner: str
+    sha: str
+    home_identity: tuple[int, int]
+    home_access_policy: tuple[int, int, int]
+    releases_root_identity: tuple[int, int]
+    releases_root_access_policy: tuple[int, int, int]
+    payload_identity: tuple[int, int]
+    payload_access_policy: tuple[int, int, int]
+    release_identity: tuple[int, int]
+    release_access_policy: tuple[int, int, int]
+    trusted_tree_digest: str
+    artifacts: tuple[_ReleaseCacheQuarantineArtifact, ...]
+    noncache: dict[PurePosixPath, _ReleaseCacheRepairPathEvidence]
+    payload: bytes
+    snapshot: ManagedStateFileSnapshot | None
+
+
+@dataclass(frozen=True)
+class _ReleaseCacheRepairMarker:
+    payload: bytes
+    snapshot: ManagedStateFileSnapshot
+    receipt_hash: str
+    receipt_snapshot: ManagedStateFileSnapshot
+    receipt_record: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class _ReleaseCacheQuarantine:
     home: Path
     path: Path
     parent: Path
     parent_identity: tuple[int, int]
     identity: tuple[int, int]
+    receipt: _ReleaseCacheRepairReceipt
     artifacts: tuple[_ReleaseCacheQuarantineArtifact, ...]
     artifact_names: tuple[str, ...]
     created_parent_directories: tuple[tuple[PurePosixPath, tuple[int, int]], ...]
@@ -53230,19 +53280,8 @@ def _release_cache_repair_scope(home: Path):
     try:
         try:
             yield context
-        except BaseException as error:
-            retained = [
-                str(quarantine.path)
-                for quarantine in context["quarantines"]
-            ]
-            if retained:
-                detail = "; cache repair evidence retained at " + ", ".join(retained)
-                raise SyncError(
-                    f"{error}{detail}",
-                    code=getattr(error, "code", None),
-                ) from error
-            raise
-        else:
+            if context["quarantines"] and _locked_sync_home_fd(home) is None:
+                raise SyncError("cache repair cleanup requires the installation lock")
             for quarantine in context["quarantines"]:
                 _cleanup_release_cache_quarantine(
                     quarantine,
@@ -53250,6 +53289,28 @@ def _release_cache_repair_scope(home: Path):
                         os.geteuid() if sys.platform == "darwin" else None
                     ),
                 )
+        except BaseException as error:
+            retained: list[str] = []
+            for quarantine in context["quarantines"]:
+                for suffix in ("", ".json", ".cleanup-ready"):
+                    evidence_path = quarantine.path.with_name(
+                        quarantine.path.name + suffix
+                    )
+                    try:
+                        os.lstat(evidence_path)
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        # An unreadable locator must not be reported as absent.
+                        pass
+                    retained.append(str(evidence_path))
+            if retained:
+                detail = "; cache repair evidence retained at " + ", ".join(retained)
+                raise SyncError(
+                    f"{error}{detail}",
+                    code=getattr(error, "code", None),
+                ) from error
+            raise
     finally:
         _RELEASE_CACHE_REPAIR_CONTEXT.reset(token)
 
@@ -53288,13 +53349,1967 @@ def _release_directory_is_present(home: Path, owner: str, sha: str) -> bool:
         _close_fd_quietly(releases_fd)
 
 
+def _release_cache_repair_failure(
+    code: str,
+    message: str,
+    locator: Path,
+) -> SyncError:
+    return SyncError(f"{message}; evidence retained at {locator}", code=code)
+
+
+def _release_cache_repair_control_path(
+    releases_root: Path,
+    batch_name: str,
+    suffix: str,
+) -> Path:
+    if RELEASE_CACHE_REPAIR_BATCH_RE.fullmatch(batch_name) is None:
+        raise SyncError(f"invalid cache repair batch name: {batch_name}")
+    return releases_root / f"{batch_name}{suffix}"
+
+
+def _release_cache_repair_path_text(path: PurePosixPath) -> str:
+    return path.as_posix() if path.parts else ""
+
+
+def _release_cache_repair_parse_path(raw: Any, *, allow_root: bool) -> PurePosixPath:
+    if not isinstance(raw, str) or "\\" in raw or raw.startswith("/"):
+        raise ValueError("release path is not a canonical relative POSIX path")
+    if raw == "":
+        if allow_root:
+            return PurePosixPath()
+        raise ValueError("release path is empty")
+    parsed = PurePosixPath(raw)
+    if (
+        parsed.as_posix() != raw
+        or not parsed.parts
+        or any(part in {"", ".", ".."} for part in parsed.parts)
+    ):
+        raise ValueError("release path is not canonical")
+    return parsed
+
+
+def _release_cache_repair_parse_identity(raw: Any) -> tuple[int, int]:
+    if (
+        not isinstance(raw, list)
+        or len(raw) != 2
+        or any(type(value) is not int or value < 0 for value in raw)
+    ):
+        raise ValueError("object identity is invalid")
+    return raw[0], raw[1]
+
+
+def _release_cache_repair_parse_access_policy(
+    raw: Any,
+) -> tuple[int, int, int]:
+    if (
+        not isinstance(raw, list)
+        or len(raw) != 3
+        or any(type(value) is not int or value < 0 for value in raw)
+        or raw[0] > 0o7777
+    ):
+        raise ValueError("access policy is invalid")
+    return raw[0], raw[1], raw[2]
+
+
+def _release_cache_repair_parse_content_identity(raw: Any) -> bytes | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or re.fullmatch(r"[0-9a-f]{80}", raw) is None:
+        raise ValueError("content identity is invalid")
+    return bytes.fromhex(raw)
+
+
+def _release_cache_repair_artifact_record(
+    artifact: _ReleaseCacheQuarantineArtifact,
+) -> dict[str, Any]:
+    return {
+        "path": _release_cache_repair_path_text(artifact.relative_path),
+        "kind": artifact.kind,
+        "identity": list(artifact.identity),
+        "access_policy": list(artifact.access_policy),
+        "content_identity": (
+            artifact.content_identity.hex()
+            if artifact.content_identity is not None
+            else None
+        ),
+        "member_names": list(artifact.member_names),
+        "members": [
+            {
+                "name": member.name,
+                "identity": list(member.identity),
+                "access_policy": list(member.access_policy),
+                "content_identity": member.content_identity.hex(),
+                "link_count": member.link_count,
+            }
+            for member in artifact.members
+        ],
+    }
+
+
+def _release_cache_repair_noncache_record(
+    noncache: dict[PurePosixPath, _ReleaseCacheRepairPathEvidence],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "path": _release_cache_repair_path_text(path),
+            "kind": evidence.kind,
+            "identity": list(evidence.identity),
+            "access_policy": list(evidence.access_policy),
+            "content_identity": (
+                evidence.content_identity.hex()
+                if evidence.content_identity is not None
+                else None
+            ),
+            "member_names": list(evidence.member_names),
+        }
+        for path, evidence in sorted(
+            noncache.items(),
+            key=lambda item: _release_cache_repair_path_text(item[0]),
+        )
+    ]
+
+
+def _release_cache_repair_receipt_record(
+    receipt: _ReleaseCacheRepairReceipt,
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "batch": receipt.batch_name,
+        "owner": receipt.owner,
+        "sha": receipt.sha,
+        "home_identity": list(receipt.home_identity),
+        "home_access_policy": list(receipt.home_access_policy),
+        "releases_root_identity": list(receipt.releases_root_identity),
+        "releases_root_access_policy": list(receipt.releases_root_access_policy),
+        "payload_identity": list(receipt.payload_identity),
+        "payload_access_policy": list(receipt.payload_access_policy),
+        "release_identity": list(receipt.release_identity),
+        "release_access_policy": list(receipt.release_access_policy),
+        "trusted_tree_digest": receipt.trusted_tree_digest,
+        "artifacts": [
+            _release_cache_repair_artifact_record(artifact)
+            for artifact in receipt.artifacts
+        ],
+        "noncache": _release_cache_repair_noncache_record(receipt.noncache),
+    }
+
+
+def _release_cache_repair_receipt_payload(
+    record: dict[str, Any],
+) -> bytes:
+    return _bounded_json_document(
+        record,
+        max_bytes=MAX_RELEASE_CACHE_REPAIR_RECEIPT_BYTES,
+        overflow_error="release cache repair receipt exceeds the size limit",
+    )
+
+
+def _release_cache_repair_snapshot_evidence(
+    snapshot: ManagedStateFileSnapshot,
+) -> dict[str, Any]:
+    if not _managed_state_snapshot_has_complete_file_evidence(snapshot):
+        raise SyncError("release cache repair control file evidence is incomplete")
+    if snapshot.file_identity is None or snapshot.parent_identity is None:
+        raise SyncError("release cache repair control file identity is incomplete")
+    if snapshot.link_count != 1:
+        raise SyncError("release cache repair control file has an unexpected hard link")
+    return {
+        "identity": list(snapshot.file_identity),
+        "mode": snapshot.mode,
+        "uid": snapshot.uid,
+        "gid": snapshot.gid,
+        "size": snapshot.size,
+        "link_count": snapshot.link_count,
+        "parent_identity": list(snapshot.parent_identity),
+    }
+
+
+def _release_cache_repair_parse_snapshot_evidence(
+    raw: Any,
+    *,
+    parent_identity: tuple[int, int],
+    expected_payload: bytes,
+) -> ManagedStateFileSnapshot:
+    required = {
+        "identity",
+        "mode",
+        "uid",
+        "gid",
+        "size",
+        "link_count",
+        "parent_identity",
+    }
+    if not isinstance(raw, dict) or set(raw) != required:
+        raise ValueError("receipt control-file snapshot fields are invalid")
+    identity = _release_cache_repair_parse_identity(raw["identity"])
+    recorded_parent = _release_cache_repair_parse_identity(raw["parent_identity"])
+    mode = raw["mode"]
+    uid = raw["uid"]
+    gid = raw["gid"]
+    size = raw["size"]
+    link_count = raw["link_count"]
+    if (
+        recorded_parent != parent_identity
+        or type(mode) is not int
+        or mode != 0o600
+        or type(uid) is not int
+        or uid != os.geteuid()
+        or type(gid) is not int
+        or gid < 0
+        or type(size) is not int
+        or size != len(expected_payload)
+        or type(link_count) is not int
+        or link_count != 1
+    ):
+        raise ValueError("receipt control-file access evidence is invalid")
+    return ManagedStateFileSnapshot(
+        exists=True,
+        payload=expected_payload,
+        mode=mode,
+        parent_identity=recorded_parent,
+        file_identity=identity,
+        file_type=stat.S_IFREG,
+        size=size,
+        uid=uid,
+        gid=gid,
+        link_count=link_count,
+    )
+
+
+def _release_cache_repair_parse_receipt_record(
+    record: Any,
+    *,
+    home: Path,
+    releases_root: Path,
+    batch_name: str,
+    payload: bytes,
+    snapshot: ManagedStateFileSnapshot | None,
+) -> _ReleaseCacheRepairReceipt:
+    expected_fields = {
+        "version",
+        "batch",
+        "owner",
+        "sha",
+        "home_identity",
+        "home_access_policy",
+        "releases_root_identity",
+        "releases_root_access_policy",
+        "payload_identity",
+        "payload_access_policy",
+        "release_identity",
+        "release_access_policy",
+        "trusted_tree_digest",
+        "artifacts",
+        "noncache",
+    }
+    if not isinstance(record, dict) or set(record) != expected_fields:
+        raise ValueError("receipt fields are invalid")
+    if type(record["version"]) is not int or record["version"] != 1:
+        raise ValueError("receipt version is unsupported")
+    if record["batch"] != batch_name:
+        raise ValueError("receipt batch does not match its path")
+    batch_match = RELEASE_CACHE_REPAIR_BATCH_RE.fullmatch(batch_name)
+    if batch_match is None or batch_match.group(1) != record["sha"]:
+        raise ValueError("receipt batch identity is invalid")
+    owner = _validate_owner(record["owner"], "cache repair receipt owner")
+    sha = _validate_release_sha(record["sha"], "cache repair receipt SHA")
+    if _releases_root(home, owner) != releases_root:
+        raise ValueError("receipt owner does not match its releases root")
+    trusted_tree_digest = record["trusted_tree_digest"]
+    if (
+        not isinstance(trusted_tree_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", trusted_tree_digest) is None
+    ):
+        raise ValueError("receipt trusted tree digest is invalid")
+    artifacts_raw = record["artifacts"]
+    noncache_raw = record["noncache"]
+    if (
+        not isinstance(artifacts_raw, list)
+        or not artifacts_raw
+        or len(artifacts_raw) > MAX_RELEASE_CACHE_REPAIR_BATCHES
+        or not isinstance(noncache_raw, list)
+        or not noncache_raw
+        or len(noncache_raw) > MAX_ARCHIVE_MEMBERS
+    ):
+        raise ValueError("receipt path evidence exceeds its limits")
+    artifacts: list[_ReleaseCacheQuarantineArtifact] = []
+    artifact_paths: set[PurePosixPath] = set()
+    prior_artifact_path: str | None = None
+    for artifact_raw in artifacts_raw:
+        if not isinstance(artifact_raw, dict) or set(artifact_raw) != {
+            "path",
+            "kind",
+            "identity",
+            "access_policy",
+            "content_identity",
+            "member_names",
+            "members",
+        }:
+            raise ValueError("receipt cache artifact fields are invalid")
+        relative_path = _release_cache_repair_parse_path(
+            artifact_raw["path"],
+            allow_root=False,
+        )
+        path_text = relative_path.as_posix()
+        if (
+            path_text in artifact_paths
+            or (prior_artifact_path is not None and path_text <= prior_artifact_path)
+            or not _release_tree_path_is_cache_artifact(relative_path)
+        ):
+            raise ValueError("receipt cache artifact path is invalid or duplicated")
+        prior_artifact_path = path_text
+        artifact_paths.add(relative_path)
+        kind = artifact_raw["kind"]
+        identity = _release_cache_repair_parse_identity(artifact_raw["identity"])
+        access_policy = _release_cache_repair_parse_access_policy(
+            artifact_raw["access_policy"]
+        )
+        content_identity = _release_cache_repair_parse_content_identity(
+            artifact_raw["content_identity"]
+        )
+        member_names_raw = artifact_raw["member_names"]
+        members_raw = artifact_raw["members"]
+        if not isinstance(member_names_raw, list) or not isinstance(members_raw, list):
+            raise ValueError("receipt cache artifact members are invalid")
+        if (
+            any(not isinstance(name, str) for name in member_names_raw)
+            or member_names_raw != sorted(set(member_names_raw))
+            or any(
+                name in {"", ".", ".."}
+                or "/" in name
+                or "\\" in name
+                or not name.endswith((".pyc", ".pyo"))
+                for name in member_names_raw
+            )
+        ):
+            raise ValueError("receipt cache member names are invalid")
+        members: list[_ReleaseCacheMemberEvidence] = []
+        prior_member_name: str | None = None
+        for member_raw in members_raw:
+            if not isinstance(member_raw, dict) or set(member_raw) != {
+                "name",
+                "identity",
+                "access_policy",
+                "content_identity",
+                "link_count",
+            }:
+                raise ValueError("receipt cache member evidence is invalid")
+            member_name = member_raw["name"]
+            member_content_identity = _release_cache_repair_parse_content_identity(
+                member_raw["content_identity"]
+            )
+            link_count = member_raw["link_count"]
+            if (
+                not isinstance(member_name, str)
+                or member_name not in member_names_raw
+                or (prior_member_name is not None and member_name <= prior_member_name)
+                or member_content_identity is None
+                or type(link_count) is not int
+                or link_count != 1
+            ):
+                raise ValueError("receipt cache member evidence is invalid")
+            prior_member_name = member_name
+            members.append(
+                _ReleaseCacheMemberEvidence(
+                    name=member_name,
+                    identity=_release_cache_repair_parse_identity(
+                        member_raw["identity"]
+                    ),
+                    access_policy=_release_cache_repair_parse_access_policy(
+                        member_raw["access_policy"]
+                    ),
+                    content_identity=member_content_identity,
+                    link_count=link_count,
+                )
+            )
+        if kind == "file":
+            if (
+                relative_path.parent.name == "__pycache__"
+                or content_identity is None
+                or member_names_raw
+                or members
+            ):
+                raise ValueError("receipt regular cache artifact is invalid")
+        elif kind == "directory":
+            if (
+                relative_path.name != "__pycache__"
+                or content_identity is not None
+                or tuple(member_names_raw) != tuple(member.name for member in members)
+            ):
+                raise ValueError("receipt cache directory artifact is invalid")
+        else:
+            raise ValueError("receipt cache artifact kind is invalid")
+        artifacts.append(
+            _ReleaseCacheQuarantineArtifact(
+                relative_path=relative_path,
+                kind=kind,
+                identity=identity,
+                access_policy=access_policy,
+                content_identity=content_identity,
+                member_names=tuple(member_names_raw),
+                members=tuple(members),
+            )
+        )
+    noncache: dict[PurePosixPath, _ReleaseCacheRepairPathEvidence] = {}
+    noncache_path_texts: set[str] = set()
+    prior_noncache_path: str | None = None
+    for evidence_raw in noncache_raw:
+        if not isinstance(evidence_raw, dict) or set(evidence_raw) != {
+            "path",
+            "kind",
+            "identity",
+            "access_policy",
+            "content_identity",
+            "member_names",
+        }:
+            raise ValueError("receipt non-cache evidence fields are invalid")
+        relative_path = _release_cache_repair_parse_path(
+            evidence_raw["path"],
+            allow_root=True,
+        )
+        path_text = _release_cache_repair_path_text(relative_path)
+        if (
+            path_text in noncache_path_texts
+            or (prior_noncache_path is not None and path_text <= prior_noncache_path)
+            or _release_tree_path_is_cache_artifact(relative_path)
+        ):
+            raise ValueError("receipt non-cache path is invalid or duplicated")
+        prior_noncache_path = path_text
+        noncache_path_texts.add(path_text)
+        kind = evidence_raw["kind"]
+        content_identity = _release_cache_repair_parse_content_identity(
+            evidence_raw["content_identity"]
+        )
+        member_names_raw = evidence_raw["member_names"]
+        if (
+            not isinstance(member_names_raw, list)
+            or any(not isinstance(name, str) for name in member_names_raw)
+            or member_names_raw != sorted(set(member_names_raw))
+            or any(
+                name in {"", ".", ".."}
+                or "/" in name
+                or "\\" in name
+                or name == "__pycache__"
+                or name.endswith((".pyc", ".pyo"))
+                for name in member_names_raw
+            )
+        ):
+            raise ValueError("receipt non-cache directory members are invalid")
+        if (
+            kind == "file"
+            and (content_identity is None or member_names_raw)
+        ) or (
+            kind == "directory"
+            and content_identity is not None
+        ) or kind not in {"file", "directory"}:
+            raise ValueError("receipt non-cache entry kind or content is invalid")
+        noncache[relative_path] = _ReleaseCacheRepairPathEvidence(
+            kind=kind,
+            identity=_release_cache_repair_parse_identity(evidence_raw["identity"]),
+            access_policy=_release_cache_repair_parse_access_policy(
+                evidence_raw["access_policy"]
+            ),
+            content_identity=content_identity,
+            member_names=tuple(member_names_raw),
+        )
+    root_evidence = noncache.get(PurePosixPath())
+    if root_evidence is None or root_evidence.kind != "directory":
+        raise ValueError("receipt lacks release root evidence")
+    home_identity = _release_cache_repair_parse_identity(record["home_identity"])
+    home_access_policy = _release_cache_repair_parse_access_policy(
+        record["home_access_policy"]
+    )
+    releases_root_identity = _release_cache_repair_parse_identity(
+        record["releases_root_identity"]
+    )
+    releases_root_access_policy = _release_cache_repair_parse_access_policy(
+        record["releases_root_access_policy"]
+    )
+    payload_identity = _release_cache_repair_parse_identity(record["payload_identity"])
+    payload_access_policy = _release_cache_repair_parse_access_policy(
+        record["payload_access_policy"]
+    )
+    release_identity = _release_cache_repair_parse_identity(record["release_identity"])
+    release_access_policy = _release_cache_repair_parse_access_policy(
+        record["release_access_policy"]
+    )
+    if (
+        root_evidence.identity != release_identity
+        or root_evidence.access_policy != release_access_policy
+        or releases_root_access_policy[0] != 0o700
+        or payload_access_policy[0] != 0o700
+    ):
+        raise ValueError("receipt root or private directory evidence is inconsistent")
+    return _ReleaseCacheRepairReceipt(
+        home=home,
+        releases_root=releases_root,
+        batch_name=batch_name,
+        owner=owner,
+        sha=sha,
+        home_identity=home_identity,
+        home_access_policy=home_access_policy,
+        releases_root_identity=releases_root_identity,
+        releases_root_access_policy=releases_root_access_policy,
+        payload_identity=payload_identity,
+        payload_access_policy=payload_access_policy,
+        release_identity=release_identity,
+        release_access_policy=release_access_policy,
+        trusted_tree_digest=trusted_tree_digest,
+        artifacts=tuple(artifacts),
+        noncache=noncache,
+        payload=payload,
+        snapshot=snapshot,
+    )
+
+
+def _release_cache_repair_read_control_snapshot(
+    home: Path,
+    path: Path,
+    parent_fd: int,
+    *,
+    locator: Path,
+) -> ManagedStateFileSnapshot:
+    try:
+        snapshot = _read_managed_state_file_snapshot(
+            home,
+            path,
+            parent_fd,
+            maximum_bytes=MAX_RELEASE_CACHE_REPAIR_RECEIPT_BYTES,
+        )
+        if not snapshot.exists:
+            return snapshot
+        if (
+            snapshot.file_type != stat.S_IFREG
+            or snapshot.mode != 0o600
+            or snapshot.uid != os.geteuid()
+            or snapshot.link_count != 1
+            or not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+            or snapshot.parent_identity != _directory_identity(parent_fd)
+        ):
+            raise SyncError("cache repair control file access evidence is invalid")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            path,
+            parent_fd,
+            snapshot,
+        )
+        return snapshot
+    except (OSError, SyncError) as error:
+        raise _release_cache_repair_failure(
+            "cache-repair-recovery-unreadable",
+            f"cannot safely read cache repair control file {path}: {error}",
+            locator,
+        ) from error
+
+
+def _read_release_cache_repair_receipt(
+    home: Path,
+    releases_root_fd: int,
+    releases_root: Path,
+    batch_name: str,
+) -> _ReleaseCacheRepairReceipt | None:
+    receipt_path = _release_cache_repair_control_path(
+        releases_root,
+        batch_name,
+        RELEASE_CACHE_REPAIR_RECEIPT_SUFFIX,
+    )
+    snapshot = _release_cache_repair_read_control_snapshot(
+        home,
+        receipt_path,
+        releases_root_fd,
+        locator=releases_root / batch_name,
+    )
+    if not snapshot.exists:
+        return None
+    assert snapshot.payload is not None
+    try:
+        record = _decode_managed_state_json(snapshot.payload, receipt_path)
+        receipt = _release_cache_repair_parse_receipt_record(
+            record,
+            home=home,
+            releases_root=releases_root,
+            batch_name=batch_name,
+            payload=snapshot.payload,
+            snapshot=snapshot,
+        )
+        if _release_cache_repair_receipt_payload(record) != snapshot.payload:
+            raise ValueError("receipt JSON is not in its canonical encoding")
+        return receipt
+    except (SyncError, ValueError, TypeError, KeyError, RecursionError) as error:
+        raise _release_cache_repair_failure(
+            "cache-repair-recovery-invalid",
+            f"cache repair receipt is invalid: {receipt_path}: {error}",
+            releases_root / batch_name,
+        ) from error
+
+
+def _write_release_cache_repair_control_file(
+    home: Path,
+    path: Path,
+    payload: bytes,
+    *,
+    locator: Path,
+) -> ManagedStateFileSnapshot:
+    try:
+        snapshot = _write_exclusive_internal_file(home, path, payload)
+        if (
+            snapshot.payload != payload
+            or snapshot.mode != 0o600
+            or snapshot.uid != os.geteuid()
+            or snapshot.file_type != stat.S_IFREG
+            or snapshot.link_count != 1
+            or not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+        ):
+            raise SyncError("cache repair control file failed read-back validation")
+        parent_fd = _open_directory_beneath(home, path.parent)
+        try:
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                path,
+                parent_fd,
+                snapshot,
+            )
+        finally:
+            _close_fd_quietly(parent_fd)
+        return snapshot
+    except (OSError, SyncError) as error:
+        raise _release_cache_repair_failure(
+            "cache-repair-recovery-unreadable",
+            f"could not durably publish cache repair control file {path}: {error}",
+            locator,
+        ) from error
+
+
+def _read_release_cache_repair_cleanup_marker(
+    home: Path,
+    releases_root_fd: int,
+    releases_root: Path,
+    batch_name: str,
+) -> _ReleaseCacheRepairMarker | None:
+    marker_path = _release_cache_repair_control_path(
+        releases_root,
+        batch_name,
+        RELEASE_CACHE_REPAIR_READY_SUFFIX,
+    )
+    snapshot = _release_cache_repair_read_control_snapshot(
+        home,
+        marker_path,
+        releases_root_fd,
+        locator=releases_root / batch_name,
+    )
+    if not snapshot.exists:
+        return None
+    assert snapshot.payload is not None
+    try:
+        marker_data = _decode_managed_state_json(snapshot.payload, marker_path)
+        if not isinstance(marker_data, dict) or set(marker_data) != {
+            "version",
+            "phase",
+            "batch",
+            "receipt_sha256",
+            "receipt_snapshot",
+            "receipt",
+        }:
+            raise ValueError("cleanup marker fields are invalid")
+        if (
+            type(marker_data["version"]) is not int
+            or marker_data["version"] != 1
+            or marker_data["phase"] != "cleanup-ready"
+            or marker_data["batch"] != batch_name
+            or not isinstance(marker_data["receipt_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", marker_data["receipt_sha256"]) is None
+            or not isinstance(marker_data["receipt"], dict)
+        ):
+            raise ValueError("cleanup marker authority is invalid")
+        receipt_payload = _release_cache_repair_receipt_payload(marker_data["receipt"])
+        if hashlib.sha256(receipt_payload).hexdigest() != marker_data["receipt_sha256"]:
+            raise ValueError("cleanup marker receipt hash does not match")
+        receipt_record = marker_data["receipt"]
+        # Parsing here validates the duplicated authority even when the original
+        # receipt has already been retired.
+        _release_cache_repair_parse_receipt_record(
+            receipt_record,
+            home=home,
+            releases_root=releases_root,
+            batch_name=batch_name,
+            payload=receipt_payload,
+            snapshot=None,
+        )
+        receipt_snapshot = _release_cache_repair_parse_snapshot_evidence(
+            marker_data["receipt_snapshot"],
+            parent_identity=_directory_identity(releases_root_fd),
+            expected_payload=receipt_payload,
+        )
+        return _ReleaseCacheRepairMarker(
+            payload=snapshot.payload,
+            snapshot=snapshot,
+            receipt_hash=marker_data["receipt_sha256"],
+            receipt_snapshot=receipt_snapshot,
+            receipt_record=receipt_record,
+        )
+    except (SyncError, ValueError, TypeError, KeyError, RecursionError) as error:
+        raise _release_cache_repair_failure(
+            "cache-repair-recovery-invalid",
+            f"cache repair cleanup marker is invalid: {marker_path}: {error}",
+            releases_root / batch_name,
+        ) from error
+
+
+def _release_cache_repair_publish_cleanup_marker(
+    receipt: _ReleaseCacheRepairReceipt,
+) -> _ReleaseCacheRepairMarker:
+    if receipt.snapshot is None:
+        raise SyncError("cache repair receipt snapshot is unavailable")
+    receipt_record = _release_cache_repair_receipt_record(receipt)
+    receipt_payload = _release_cache_repair_receipt_payload(receipt_record)
+    if receipt.payload != receipt_payload:
+        raise SyncError("cache repair receipt payload changed before cleanup")
+    marker_record = {
+        "version": 1,
+        "phase": "cleanup-ready",
+        "batch": receipt.batch_name,
+        "receipt_sha256": hashlib.sha256(receipt.payload).hexdigest(),
+        "receipt_snapshot": _release_cache_repair_snapshot_evidence(
+            receipt.snapshot
+        ),
+        "receipt": receipt_record,
+    }
+    marker_payload = _bounded_json_document(
+        marker_record,
+        max_bytes=MAX_RELEASE_CACHE_REPAIR_RECEIPT_BYTES,
+        overflow_error="release cache repair cleanup marker exceeds the size limit",
+    )
+    marker_path = _release_cache_repair_control_path(
+        receipt.releases_root,
+        receipt.batch_name,
+        RELEASE_CACHE_REPAIR_READY_SUFFIX,
+    )
+    marker_snapshot = _write_release_cache_repair_control_file(
+        receipt.home,
+        marker_path,
+        marker_payload,
+        locator=receipt.releases_root / receipt.batch_name,
+    )
+    parent_fd = _open_directory_beneath(receipt.home, receipt.releases_root)
+    try:
+        marker = _read_release_cache_repair_cleanup_marker(
+            receipt.home,
+            parent_fd,
+            receipt.releases_root,
+            receipt.batch_name,
+        )
+        if marker is None or not _managed_state_snapshot_matches_bound_file_evidence(
+            marker.snapshot,
+            marker_snapshot,
+        ):
+            raise SyncError("cache repair cleanup marker failed read-back validation")
+        return marker
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _release_cache_repair_noncache_from_scan(
+    scan: _ReleaseCacheRepairScan,
+) -> dict[PurePosixPath, _ReleaseCacheRepairPathEvidence]:
+    evidence: dict[PurePosixPath, _ReleaseCacheRepairPathEvidence] = {}
+    for relative_path, kind in scan.path_kinds.items():
+        source_snapshot = scan.source_snapshots.get(relative_path)
+        access_policy = scan.access_policies.get(relative_path)
+        if source_snapshot is None or access_policy is None:
+            raise SyncError(
+                "release cache repair scan lacks stable non-cache evidence: "
+                f"{relative_path}"
+            )
+        content_identity = (
+            source_snapshot.content_identity if kind == "file" else None
+        )
+        if kind == "file" and content_identity is None:
+            raise SyncError(
+                f"release cache repair scan lacks file content evidence: {relative_path}"
+            )
+        member_names = scan.source_members.get(relative_path, ()) if kind == "directory" else ()
+        evidence[relative_path] = _ReleaseCacheRepairPathEvidence(
+            kind=kind,
+            identity=(source_snapshot.device, source_snapshot.inode),
+            access_policy=access_policy,
+            content_identity=content_identity,
+            member_names=member_names,
+        )
+    return evidence
+
+
+def _release_cache_repair_require_directory_evidence(
+    home: Path,
+    directory: Path,
+    directory_fd: int,
+    *,
+    identity: tuple[int, int],
+    access_policy: tuple[int, int, int],
+    label: str,
+) -> None:
+    try:
+        metadata = os.fstat(directory_fd)
+    except OSError as error:
+        raise SyncError(f"{label} is unreadable: {directory}") from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino) != identity
+        or _release_cache_access_policy(metadata) != access_policy
+        or not _bound_directory_matches(home, directory, directory_fd)
+    ):
+        raise SyncError(f"{label} identity or access policy changed: {directory}")
+
+
+def _release_cache_repair_require_root_bindings(
+    receipt: _ReleaseCacheRepairReceipt,
+    releases_root_fd: int,
+    release_fd: int,
+) -> None:
+    home_fd = _locked_sync_home_fd(receipt.home)
+    opened_home_fd = False
+    if home_fd is None:
+        home_fd = _open_sync_home(receipt.home)
+        opened_home_fd = True
+    try:
+        _release_cache_repair_require_directory_evidence(
+            receipt.home,
+            receipt.home,
+            home_fd,
+            identity=receipt.home_identity,
+            access_policy=receipt.home_access_policy,
+            label="cache repair sync home",
+        )
+    finally:
+        if opened_home_fd:
+            _close_fd_quietly(home_fd)
+    _release_cache_repair_require_directory_evidence(
+        receipt.home,
+        receipt.releases_root,
+        releases_root_fd,
+        identity=receipt.releases_root_identity,
+        access_policy=receipt.releases_root_access_policy,
+        label="cache repair releases root",
+    )
+    release_root = receipt.releases_root / receipt.sha
+    _release_cache_repair_require_directory_evidence(
+        receipt.home,
+        release_root,
+        release_fd,
+        identity=receipt.release_identity,
+        access_policy=receipt.release_access_policy,
+        label="cache repair installed release",
+    )
+
+
+def _release_cache_repair_validate_live_scan(
+    receipt: _ReleaseCacheRepairReceipt,
+    releases_root_fd: int,
+    release_fd: int,
+    *,
+    expected_owner_uid: int | None,
+    allow_cache_subset: bool,
+) -> _ReleaseCacheRepairScan:
+    _release_cache_repair_require_root_bindings(
+        receipt,
+        releases_root_fd,
+        release_fd,
+    )
+    release_root = receipt.releases_root / receipt.sha
+    scan, _captured = _release_cache_repair_scan_from_directory_fd(
+        release_fd,
+        release_root,
+        expected_owner_uid=expected_owner_uid,
+    )
+    if scan.identity[1].owner != receipt.owner:
+        raise SyncError(
+            f"cache repair release owner changed: {release_root}",
+            code="immutable-release-drift",
+        )
+    if scan.identity[2] != receipt.trusted_tree_digest:
+        raise SyncError(
+            "cache repair installed tree no longer matches trusted digest: "
+            f"{release_root}",
+            code="immutable-release-drift",
+        )
+    observed_noncache = _release_cache_repair_noncache_from_scan(scan)
+    if observed_noncache != receipt.noncache:
+        raise SyncError(
+            "cache repair non-cache identity, content, members, or access policy "
+            f"changed: {release_root}",
+            code="immutable-release-drift",
+        )
+    expected_artifacts = {
+        artifact.relative_path: artifact for artifact in receipt.artifacts
+    }
+    observed_paths: set[PurePosixPath] = set()
+    for artifact in scan.artifacts:
+        expected = expected_artifacts.get(artifact.relative_path)
+        if expected is None or artifact != expected:
+            raise SyncError(
+                "cache repair artifact identity, content, or access policy changed: "
+                f"{release_root / Path(*artifact.relative_path.parts)}",
+                code="immutable-release-drift",
+            )
+        observed_paths.add(artifact.relative_path)
+    expected_paths = set(expected_artifacts)
+    if (allow_cache_subset and not observed_paths.issubset(expected_paths)) or (
+        not allow_cache_subset and observed_paths != expected_paths
+    ):
+        raise SyncError(
+            f"cache artifacts do not match the repair receipt: {release_root}",
+            code="immutable-release-drift",
+        )
+    return scan
+
+
+def _release_cache_repair_validate_terminal(
+    receipt: _ReleaseCacheRepairReceipt,
+    releases_root_fd: int,
+    release_fd: int,
+    *,
+    expected_owner_uid: int | None,
+) -> None:
+    _release_cache_repair_require_root_bindings(
+        receipt,
+        releases_root_fd,
+        release_fd,
+    )
+    release_root = receipt.releases_root / receipt.sha
+    strict_identity, _captured = (
+        _release_tree_identity_and_captured_files_from_directory_fd(
+            release_fd,
+            release_root,
+            require_sanitized_modes=True,
+            expected_owner_uid=expected_owner_uid,
+            capture_limits={},
+        )
+    )
+    if strict_identity[2] != receipt.trusted_tree_digest:
+        raise SyncError(
+            "strict cache repair terminal digest changed: "
+            f"{release_root}",
+            code="immutable-release-drift",
+        )
+    scan, _captured = _release_cache_repair_scan_from_directory_fd(
+        release_fd,
+        release_root,
+        expected_owner_uid=expected_owner_uid,
+    )
+    if scan.cache_paths:
+        raise SyncError(
+            f"cache artifacts remain in installed release: {release_root}",
+            code="immutable-release-drift",
+        )
+    if (
+        scan.identity[2] != receipt.trusted_tree_digest
+        or _release_cache_repair_noncache_from_scan(scan) != receipt.noncache
+    ):
+        raise SyncError(
+            "strict cache repair terminal non-cache evidence changed: "
+            f"{release_root}",
+            code="immutable-release-drift",
+        )
+
+
+def _release_cache_repair_new_receipt(
+    home: Path,
+    owner: str,
+    sha: str,
+    releases_root: Path,
+    batch_name: str,
+    releases_fd: int,
+    payload_fd: int,
+    release_fd: int,
+    scan: _ReleaseCacheRepairScan,
+    trusted_tree_digest: str,
+) -> _ReleaseCacheRepairReceipt:
+    home_fd = _locked_sync_home_fd(home)
+    if home_fd is None:
+        raise SyncError("cache repair receipt requires the installation lock")
+    opened_home_fd = False
+    try:
+        home_metadata = os.fstat(home_fd)
+        releases_metadata = os.fstat(releases_fd)
+        payload_metadata = os.fstat(payload_fd)
+        release_metadata = os.fstat(release_fd)
+        expected_owner_uid = os.geteuid() if sys.platform == "darwin" else None
+        if expected_owner_uid is not None:
+            home_metadata = _require_release_identity_fd_access_policy(
+                home_fd,
+                home,
+                expected_owner_uid,
+            )
+            releases_metadata = _require_release_identity_fd_access_policy(
+                releases_fd,
+                releases_root,
+                expected_owner_uid,
+            )
+            payload_metadata = _require_release_identity_fd_access_policy(
+                payload_fd,
+                releases_root / batch_name,
+                expected_owner_uid,
+            )
+            release_metadata = _require_release_identity_fd_access_policy(
+                release_fd,
+                releases_root / sha,
+                expected_owner_uid,
+            )
+        if (
+            not stat.S_ISDIR(home_metadata.st_mode)
+            or not stat.S_ISDIR(releases_metadata.st_mode)
+            or not stat.S_ISDIR(payload_metadata.st_mode)
+            or not stat.S_ISDIR(release_metadata.st_mode)
+            or stat.S_IMODE(payload_metadata.st_mode) != 0o700
+            or payload_metadata.st_uid != os.geteuid()
+            or _directory_member_names(payload_fd) != ()
+            or not _bound_directory_matches(home, releases_root, releases_fd)
+        ):
+            raise SyncError("cache repair batch roots failed identity validation")
+        root_snapshot = scan.source_snapshots.get(PurePosixPath())
+        root_access_policy = scan.access_policies.get(PurePosixPath())
+        if (
+            root_snapshot is None
+            or root_access_policy is None
+            or (root_snapshot.device, root_snapshot.inode)
+            != (release_metadata.st_dev, release_metadata.st_ino)
+            or root_access_policy != _release_cache_access_policy(release_metadata)
+        ):
+            raise SyncError("cache repair release scan root evidence is incomplete")
+        if (
+            not isinstance(trusted_tree_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", trusted_tree_digest) is None
+            or scan.identity[2] != trusted_tree_digest
+        ):
+            raise SyncError("cache repair trusted tree digest does not match its scan")
+        receipt = _ReleaseCacheRepairReceipt(
+            home=home,
+            releases_root=releases_root,
+            batch_name=batch_name,
+            owner=owner,
+            sha=sha,
+            home_identity=(home_metadata.st_dev, home_metadata.st_ino),
+            home_access_policy=_release_cache_access_policy(home_metadata),
+            releases_root_identity=(releases_metadata.st_dev, releases_metadata.st_ino),
+            releases_root_access_policy=_release_cache_access_policy(releases_metadata),
+            payload_identity=(payload_metadata.st_dev, payload_metadata.st_ino),
+            payload_access_policy=_release_cache_access_policy(payload_metadata),
+            release_identity=(release_metadata.st_dev, release_metadata.st_ino),
+            release_access_policy=_release_cache_access_policy(release_metadata),
+            trusted_tree_digest=trusted_tree_digest,
+            artifacts=tuple(
+                sorted(scan.artifacts, key=lambda item: item.relative_path.as_posix())
+            ),
+            noncache=_release_cache_repair_noncache_from_scan(scan),
+            payload=b"",
+            snapshot=None,
+        )
+        record = _release_cache_repair_receipt_record(receipt)
+        payload = _release_cache_repair_receipt_payload(record)
+        receipt_path = _release_cache_repair_control_path(
+            releases_root,
+            batch_name,
+            RELEASE_CACHE_REPAIR_RECEIPT_SUFFIX,
+        )
+        snapshot = _write_release_cache_repair_control_file(
+            home,
+            receipt_path,
+            payload,
+            locator=releases_root / batch_name,
+        )
+        return replace(receipt, payload=payload, snapshot=snapshot)
+    finally:
+        if opened_home_fd:
+            _close_fd_quietly(home_fd)
+
+
+def _release_cache_repair_groups(
+    names: tuple[str, ...],
+    releases_root: Path,
+) -> dict[str, set[str]]:
+    groups: dict[str, set[str]] = {}
+    for name in names:
+        if not name.startswith(RELEASE_CACHE_REPAIR_PREFIX):
+            continue
+        match = RELEASE_CACHE_REPAIR_BATCH_RE.fullmatch(name)
+        if match is not None:
+            batch_name = name
+            part = "payload"
+        elif name.endswith(RELEASE_CACHE_REPAIR_RECEIPT_SUFFIX):
+            batch_name = name[: -len(RELEASE_CACHE_REPAIR_RECEIPT_SUFFIX)]
+            part = "receipt"
+        elif name.endswith(RELEASE_CACHE_REPAIR_READY_SUFFIX):
+            batch_name = name[: -len(RELEASE_CACHE_REPAIR_READY_SUFFIX)]
+            part = "marker"
+        else:
+            raise _release_cache_repair_failure(
+                "cache-repair-recovery-required",
+                f"unrecognized cache repair batch entry retained: {name}",
+                releases_root / name,
+            )
+        if RELEASE_CACHE_REPAIR_BATCH_RE.fullmatch(batch_name) is None:
+            raise _release_cache_repair_failure(
+                "cache-repair-recovery-required",
+                f"unrecognized cache repair batch entry retained: {name}",
+                releases_root / name,
+            )
+        parts = groups.setdefault(batch_name, set())
+        if part in parts:
+            raise _release_cache_repair_failure(
+                "cache-repair-recovery-invalid",
+                f"duplicate cache repair batch slot retained: {name}",
+                releases_root / batch_name,
+            )
+        parts.add(part)
+    return groups
+
+
+def _release_cache_repair_root_candidates(
+    home: Path,
+) -> tuple[tuple[str, Path], ...]:
+    try:
+        owners = _known_owners(home)
+    except OSError as error:
+        raise SyncError(
+            f"cannot enumerate release cache repair roots below {home}: {error}",
+            code="cache-repair-recovery-unreadable",
+        ) from error
+    candidates: list[tuple[str, Path]] = []
+    for owner in sorted(owners, key=lambda value: (value != PUBLIC_OWNER, value)):
+        releases_root = _releases_root(home, owner)
+        try:
+            present = _ensure_safe_internal_directory(
+                home,
+                releases_root,
+                create=False,
+                allow_missing=True,
+            )
+        except OSError as error:
+            raise SyncError(
+                f"cannot inspect release cache repair root {releases_root}: {error}",
+                code="cache-repair-recovery-unreadable",
+            ) from error
+        if present:
+            candidates.append((owner, releases_root))
+    return tuple(candidates)
+
+
+def _observe_release_cache_repair_batches(home: Path) -> bool:
+    """Read-only, non-allocating signal for pending cache repair evidence."""
+    observed = False
+    for _owner, releases_root in _release_cache_repair_root_candidates(home):
+        releases_fd = -1
+        try:
+            releases_fd = _open_directory_beneath(home, releases_root)
+            if not _bound_directory_matches(home, releases_root, releases_fd):
+                raise SyncError(f"cache repair releases root changed: {releases_root}")
+            names = _directory_member_names(
+                releases_fd,
+                maximum_entries=MAX_RELEASE_CACHE_REPAIR_BATCHES,
+                overflow_message=(
+                    f"cache repair releases root exceeds the scan limit: {releases_root}"
+                ),
+            )
+            if any(name.startswith(RELEASE_CACHE_REPAIR_PREFIX) for name in names):
+                observed = True
+        except OSError as error:
+            raise SyncError(
+                f"cannot observe release cache repair evidence in {releases_root}: {error}",
+                code="cache-repair-recovery-unreadable",
+            ) from error
+        finally:
+            if releases_fd >= 0:
+                _close_fd_quietly(releases_fd)
+    return observed
+
+
+def _release_cache_repair_active_batch_matches(
+    home: Path,
+    releases_root: Path,
+    batch_name: str,
+    payload_identity: tuple[int, int] | None,
+    payload_access_policy: tuple[int, int, int] | None,
+    receipt: _ReleaseCacheRepairReceipt | None,
+    parts: set[str],
+) -> bool:
+    context = _RELEASE_CACHE_REPAIR_CONTEXT.get()
+    if not isinstance(context, dict):
+        return False
+    target_path = Path(os.path.abspath(os.fspath(releases_root / batch_name)))
+    for quarantine in context.get("quarantines", []):
+        if Path(os.path.abspath(os.fspath(quarantine.path))) != target_path:
+            continue
+
+        locator = releases_root / batch_name
+        active_home = context.get("home")
+        if (
+            not isinstance(active_home, Path)
+            or active_home != Path(os.path.abspath(os.fspath(home.expanduser())))
+        ):
+            raise _release_cache_repair_failure(
+                "cache-repair-recovery-invalid",
+                "active cache repair home binding changed",
+                locator,
+            )
+        active_receipt = quarantine.receipt
+        if (
+            Path(os.path.abspath(os.fspath(quarantine.parent)))
+            != Path(os.path.abspath(os.fspath(releases_root)))
+            or quarantine.parent_identity != active_receipt.releases_root_identity
+            or quarantine.identity != active_receipt.payload_identity
+            or active_receipt.home != active_home
+            or active_receipt.releases_root != releases_root
+            or active_receipt.batch_name != batch_name
+        ):
+            raise _release_cache_repair_failure(
+                "cache-repair-recovery-invalid",
+                "active cache repair object binding changed",
+                locator,
+            )
+        if not {"payload", "receipt"}.issubset(parts):
+            raise _release_cache_repair_failure(
+                "cache-repair-recovery-invalid",
+                "active cache repair payload or receipt is missing",
+                locator,
+            )
+        if (
+            payload_identity is None
+            or payload_access_policy is None
+            or receipt is None
+            or active_receipt.snapshot is None
+            or receipt.snapshot is None
+        ):
+            raise _release_cache_repair_failure(
+                "cache-repair-recovery-invalid",
+                "active cache repair identity or receipt evidence is incomplete",
+                locator,
+            )
+        try:
+            active_payload = _release_cache_repair_receipt_payload(
+                _release_cache_repair_receipt_record(active_receipt)
+            )
+            current_payload = _release_cache_repair_receipt_payload(
+                _release_cache_repair_receipt_record(receipt)
+            )
+        except (SyncError, TypeError, ValueError, KeyError, RecursionError) as error:
+            raise _release_cache_repair_failure(
+                "cache-repair-recovery-invalid",
+                f"active cache repair receipt evidence is invalid: {error}",
+                locator,
+            ) from error
+        if (
+            payload_identity != quarantine.identity
+            or payload_identity != active_receipt.payload_identity
+            or payload_identity != receipt.payload_identity
+            or payload_access_policy != active_receipt.payload_access_policy
+            or payload_access_policy != receipt.payload_access_policy
+            or active_receipt.owner != receipt.owner
+            or active_receipt.sha != receipt.sha
+            or active_receipt.releases_root_identity != receipt.releases_root_identity
+            or active_receipt.release_identity != receipt.release_identity
+            or active_receipt.release_access_policy != receipt.release_access_policy
+            or active_receipt.artifacts != quarantine.artifacts
+            or quarantine.artifact_names
+            != tuple(f"item-{index:05d}" for index in range(len(active_receipt.artifacts)))
+            or active_payload != active_receipt.payload
+            or current_payload != receipt.payload
+            or active_receipt.payload != receipt.payload
+            or not _managed_state_snapshot_matches_bound_file_evidence(
+                active_receipt.snapshot,
+                receipt.snapshot,
+            )
+        ):
+            raise _release_cache_repair_failure(
+                "cache-repair-recovery-invalid",
+                "active cache repair payload, receipt identity, content, or access policy changed",
+                locator,
+            )
+        return True
+    return False
+
+
+def _release_cache_repair_stat_optional(
+    parent_fd: int,
+    name: str,
+    display_path: Path,
+) -> os.stat_result | None:
+    try:
+        return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise SyncError(
+            f"cannot inspect cache repair evidence at {display_path}: {error}",
+            code="cache-repair-recovery-unreadable",
+        ) from error
+
+
+def _release_cache_repair_retained_locator(
+    receipt: _ReleaseCacheRepairReceipt,
+    releases_root_fd: int,
+) -> Path:
+    candidates = (
+        receipt.batch_name,
+        f"{receipt.batch_name}{RELEASE_CACHE_REPAIR_READY_SUFFIX}",
+        f"{receipt.batch_name}{RELEASE_CACHE_REPAIR_RECEIPT_SUFFIX}",
+    )
+    for name in candidates:
+        try:
+            os.stat(name, dir_fd=releases_root_fd, follow_symlinks=False)
+        except OSError:
+            continue
+        return receipt.releases_root / name
+    return receipt.releases_root / receipt.batch_name
+
+
+def _release_cache_repair_move_prepared_artifacts(
+    receipt: _ReleaseCacheRepairReceipt,
+    releases_root_fd: int,
+    release_fd: int,
+    payload_fd: int,
+    *,
+    expected_owner_uid: int | None,
+) -> None:
+    release_root = receipt.releases_root / receipt.sha
+    _release_cache_repair_validate_live_scan(
+        receipt,
+        releases_root_fd,
+        release_fd,
+        expected_owner_uid=expected_owner_uid,
+        allow_cache_subset=True,
+    )
+    observed_slots = _release_cache_repair_verify_payload_artifacts(
+        receipt,
+        payload_fd,
+        allow_cleanup_phase=False,
+        expected_owner_uid=expected_owner_uid,
+    )
+    for index, artifact in enumerate(receipt.artifacts):
+        source_present = _release_cache_repair_artifact_location(
+            release_fd,
+            artifact.relative_path,
+            artifact,
+            display_root=release_root,
+            expected_owner_uid=expected_owner_uid,
+        )
+        item_name = f"item-{index:05d}"
+        item_present = observed_slots.get(index) == item_name
+        if source_present == item_present:
+            raise _release_cache_repair_failure(
+                "cache-repair-recovery-invalid",
+                "prepared cache artifact must exist in exactly one authorized location",
+                receipt.releases_root / receipt.batch_name,
+            )
+        if not source_present:
+            continue
+        source_parent_fd, source_name = _open_relative_parent_fd(
+            release_fd,
+            artifact.relative_path,
+        )
+        try:
+            _release_cache_quarantine_artifact_matches_at(
+                source_parent_fd,
+                source_name,
+                artifact,
+                display_path=release_root / Path(*artifact.relative_path.parts),
+                expected_owner_uid=expected_owner_uid,
+            )
+            if not _bound_directory_matches(receipt.home, release_root, release_fd):
+                raise SyncError(f"installed release changed before cache recovery: {release_root}")
+            _rename_noreplace_at(source_parent_fd, source_name, payload_fd, item_name)
+            os.fsync(source_parent_fd)
+            os.fsync(payload_fd)
+            _release_cache_quarantine_artifact_matches_at(
+                payload_fd,
+                item_name,
+                artifact,
+                display_path=receipt.releases_root / receipt.batch_name / item_name,
+                expected_owner_uid=expected_owner_uid,
+            )
+        finally:
+            _close_fd_quietly(source_parent_fd)
+    _release_cache_repair_validate_terminal(
+        receipt,
+        releases_root_fd,
+        release_fd,
+        expected_owner_uid=expected_owner_uid,
+    )
+
+
+def _release_cache_repair_marker_only_retire(
+    receipt: _ReleaseCacheRepairReceipt,
+    marker: _ReleaseCacheRepairMarker,
+    releases_root_fd: int,
+    *,
+    expected_owner_uid: int | None,
+) -> None:
+    release_fd = _open_installed_release_directory_fd(
+        receipt.home,
+        receipt.owner,
+        receipt.sha,
+    )
+    try:
+        _release_cache_repair_validate_terminal(
+            receipt,
+            releases_root_fd,
+            release_fd,
+            expected_owner_uid=expected_owner_uid,
+        )
+    finally:
+        _close_fd_quietly(release_fd)
+    marker_path = _release_cache_repair_control_path(
+        receipt.releases_root,
+        receipt.batch_name,
+        RELEASE_CACHE_REPAIR_READY_SUFFIX,
+    )
+    current_marker = _read_release_cache_repair_cleanup_marker(
+        receipt.home,
+        releases_root_fd,
+        receipt.releases_root,
+        receipt.batch_name,
+    )
+    if (
+        current_marker is None
+        or current_marker.payload != marker.payload
+        or not _managed_state_snapshot_matches_bound_file_evidence(
+            current_marker.snapshot,
+            marker.snapshot,
+        )
+    ):
+        raise SyncError(f"cache repair marker changed before retirement: {marker_path}")
+    release_fd = _open_installed_release_directory_fd(
+        receipt.home,
+        receipt.owner,
+        receipt.sha,
+    )
+    try:
+        _release_cache_repair_validate_terminal(
+            receipt,
+            releases_root_fd,
+            release_fd,
+            expected_owner_uid=expected_owner_uid,
+        )
+    finally:
+        _close_fd_quietly(release_fd)
+    os.unlink(marker_path.name, dir_fd=releases_root_fd)
+    os.fsync(releases_root_fd)
+
+
+def _release_cache_repair_recover_group(
+    home: Path,
+    owner: str,
+    releases_root: Path,
+    releases_root_fd: int,
+    batch_name: str,
+    parts: set[str],
+    *,
+    expected_owner_uid: int | None,
+) -> bool:
+    locator = releases_root / batch_name
+    receipt = _read_release_cache_repair_receipt(
+        home,
+        releases_root_fd,
+        releases_root,
+        batch_name,
+    )
+    marker = _read_release_cache_repair_cleanup_marker(
+        home,
+        releases_root_fd,
+        releases_root,
+        batch_name,
+    )
+    payload_metadata = _release_cache_repair_stat_optional(
+        releases_root_fd,
+        batch_name,
+        locator,
+    )
+    payload_exists = payload_metadata is not None
+    actual_parts = set()
+    if payload_exists:
+        actual_parts.add("payload")
+    if receipt is not None:
+        actual_parts.add("receipt")
+    if marker is not None:
+        actual_parts.add("marker")
+    if actual_parts != parts:
+        raise _release_cache_repair_failure(
+            "cache-repair-recovery-invalid",
+            "cache repair control files changed during discovery",
+            locator,
+        )
+    if receipt is not None and (
+        receipt.owner != owner or receipt.releases_root != releases_root
+    ):
+        raise _release_cache_repair_failure(
+            "cache-repair-recovery-invalid",
+            "cache repair receipt owner does not match its releases root",
+            locator,
+        )
+    if receipt is not None and marker is not None and not (
+        _release_cache_repair_marker_matches_receipt(marker, receipt)
+    ):
+        raise _release_cache_repair_failure(
+            "cache-repair-recovery-invalid",
+            "cache repair cleanup marker does not match its receipt",
+            locator,
+        )
+    if _release_cache_repair_active_batch_matches(
+        home,
+        releases_root,
+        batch_name,
+        (
+            (payload_metadata.st_dev, payload_metadata.st_ino)
+            if payload_metadata is not None
+            else None
+        ),
+        (
+            _release_cache_access_policy(payload_metadata)
+            if payload_metadata is not None
+            else None
+        ),
+        receipt,
+        actual_parts,
+    ):
+        return False
+    if receipt is None:
+        if payload_exists:
+            raise _release_cache_repair_failure(
+                "cache-repair-recovery-required",
+                "cache repair payload has no authoritative receipt",
+                locator,
+            )
+        if marker is None:
+            raise _release_cache_repair_failure(
+                "cache-repair-recovery-required",
+                "cache repair batch has no authoritative receipt or ready marker",
+                locator,
+            )
+        receipt = _release_cache_repair_parse_receipt_record(
+            marker.receipt_record,
+            home=home,
+            releases_root=releases_root,
+            batch_name=batch_name,
+            payload=marker.receipt_snapshot.payload or b"",
+            snapshot=None,
+        )
+        if (
+            receipt.owner != owner
+            or receipt.releases_root != releases_root
+            or marker.receipt_hash != hashlib.sha256(receipt.payload).hexdigest()
+        ):
+            raise _release_cache_repair_failure(
+                "cache-repair-recovery-invalid",
+                "marker-only cache repair receipt binding is invalid",
+                locator,
+            )
+        _release_cache_repair_marker_only_retire(
+            receipt,
+            marker,
+            releases_root_fd,
+            expected_owner_uid=expected_owner_uid,
+        )
+        return True
+    if not payload_exists and marker is None:
+        raise _release_cache_repair_failure(
+            "cache-repair-recovery-invalid",
+            "prepared cache repair payload is missing without cleanup authorization",
+            locator,
+        )
+    release_fd = -1
+    payload_fd: int | None = None
+    try:
+        release_fd = _open_installed_release_directory_fd(home, owner, receipt.sha)
+        _release_cache_repair_require_root_bindings(
+            receipt,
+            releases_root_fd,
+            release_fd,
+        )
+        if marker is None:
+            if not payload_exists:
+                raise _release_cache_repair_failure(
+                    "cache-repair-recovery-invalid",
+                    "prepared cache repair payload is missing",
+                    locator,
+                )
+            payload_fd_result, _present = _release_cache_repair_verify_batch_directory(
+                receipt,
+                releases_root_fd,
+                allow_cleanup_phase=False,
+            )
+            assert payload_fd_result is not None
+            payload_fd = payload_fd_result
+            _release_cache_repair_move_prepared_artifacts(
+                receipt,
+                releases_root_fd,
+                release_fd,
+                payload_fd,
+                expected_owner_uid=expected_owner_uid,
+            )
+            marker = _release_cache_repair_publish_cleanup_marker(receipt)
+        else:
+            _release_cache_repair_validate_terminal(
+                receipt,
+                releases_root_fd,
+                release_fd,
+                expected_owner_uid=expected_owner_uid,
+            )
+            if payload_exists:
+                payload_fd_result, _present = _release_cache_repair_verify_batch_directory(
+                    receipt,
+                    releases_root_fd,
+                    allow_cleanup_phase=True,
+                )
+                assert payload_fd_result is not None
+                payload_fd = payload_fd_result
+                _release_cache_repair_verify_payload_artifacts(
+                    receipt,
+                    payload_fd,
+                    allow_cleanup_phase=True,
+                    expected_owner_uid=expected_owner_uid,
+                )
+        _release_cache_repair_cleanup_payload(
+            receipt,
+            releases_root_fd,
+            payload_fd,
+            marker,
+            expected_owner_uid=expected_owner_uid,
+        )
+        payload_fd = None
+        return True
+    except (OSError, SyncError) as error:
+        code = getattr(error, "code", None) or "cache-repair-recovery-invalid"
+        if str(locator) in str(error):
+            raise
+        raise _release_cache_repair_failure(
+            code,
+            f"cache repair recovery failed: {error}",
+            locator,
+        ) from error
+    finally:
+        if payload_fd is not None:
+            _close_fd_quietly(payload_fd)
+        if release_fd >= 0:
+            _close_fd_quietly(release_fd)
+
+
+def _recover_release_cache_repair_batches_unlocked(home: Path) -> bool:
+    if _locked_sync_home_fd(home) is None:
+        raise SyncError("release cache repair recovery requires the installation lock")
+    recovered = False
+    expected_owner_uid = os.geteuid() if sys.platform == "darwin" else None
+    for owner, releases_root in _release_cache_repair_root_candidates(home):
+        releases_fd = -1
+        try:
+            releases_fd = _open_directory_beneath(home, releases_root)
+            if not _bound_directory_matches(home, releases_root, releases_fd):
+                raise SyncError(f"cache repair releases root changed: {releases_root}")
+            names = _directory_member_names(
+                releases_fd,
+                maximum_entries=MAX_RELEASE_CACHE_REPAIR_BATCHES,
+                overflow_message=(
+                    f"cache repair releases root exceeds the recovery limit: {releases_root}"
+                ),
+            )
+            groups = _release_cache_repair_groups(names, releases_root)
+            for batch_name, parts in sorted(groups.items()):
+                recovered = _release_cache_repair_recover_group(
+                    home,
+                    owner,
+                    releases_root,
+                    releases_fd,
+                    batch_name,
+                    parts,
+                    expected_owner_uid=expected_owner_uid,
+                ) or recovered
+        except OSError as error:
+            raise SyncError(
+                f"cannot recover release cache repair evidence in {releases_root}: {error}",
+                code="cache-repair-recovery-unreadable",
+            ) from error
+        finally:
+            if releases_fd >= 0:
+                _close_fd_quietly(releases_fd)
+    return recovered
+
+
+def _release_cache_repair_artifact_location(
+    root_fd: int,
+    relative_path: PurePosixPath,
+    artifact: _ReleaseCacheQuarantineArtifact,
+    *,
+    display_root: Path,
+    expected_owner_uid: int | None,
+) -> bool:
+    parent_fd, name = _open_relative_parent_fd(root_fd, relative_path)
+    try:
+        metadata = _release_cache_repair_stat_optional(
+            parent_fd,
+            name,
+            display_root / Path(*relative_path.parts),
+        )
+        if metadata is None:
+            return False
+        if not (stat.S_ISREG(metadata.st_mode) if artifact.kind == "file" else stat.S_ISDIR(metadata.st_mode)):
+            raise SyncError(
+                "cache repair source artifact has an unsafe type: "
+                f"{display_root / Path(*relative_path.parts)}",
+                code="cache-repair-recovery-invalid",
+            )
+        _release_cache_quarantine_artifact_matches_at(
+            parent_fd,
+            name,
+            artifact,
+            display_path=display_root / Path(*relative_path.parts),
+            expected_owner_uid=expected_owner_uid,
+        )
+        return True
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _release_cache_repair_verify_batch_directory(
+    receipt: _ReleaseCacheRepairReceipt,
+    releases_root_fd: int,
+    *,
+    allow_cleanup_phase: bool,
+) -> tuple[int | None, bool]:
+    payload_path = receipt.releases_root / receipt.batch_name
+    metadata = _release_cache_repair_stat_optional(
+        releases_root_fd,
+        receipt.batch_name,
+        payload_path,
+    )
+    if metadata is None:
+        return None, False
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise _release_cache_repair_failure(
+            "cache-repair-recovery-invalid",
+            "cache repair payload is not a directory",
+            payload_path,
+        )
+    if (
+        (metadata.st_dev, metadata.st_ino) != receipt.payload_identity
+        or _release_cache_access_policy(metadata) != receipt.payload_access_policy
+    ):
+        raise _release_cache_repair_failure(
+            "cache-repair-recovery-invalid",
+            "cache repair payload identity or access policy changed",
+            payload_path,
+        )
+    try:
+        payload_fd = os.open(
+            receipt.batch_name,
+            _source_directory_flags(),
+            dir_fd=releases_root_fd,
+        )
+    except OSError as error:
+        raise _release_cache_repair_failure(
+            "cache-repair-recovery-unreadable",
+            f"cache repair payload is unreadable: {error}",
+            payload_path,
+        ) from error
+    try:
+        payload_metadata = os.fstat(payload_fd)
+        if (
+            (payload_metadata.st_dev, payload_metadata.st_ino)
+            != receipt.payload_identity
+            or _release_cache_access_policy(payload_metadata)
+            != receipt.payload_access_policy
+            or not _bound_directory_matches(receipt.home, payload_path, payload_fd)
+        ):
+            raise _release_cache_repair_failure(
+                "cache-repair-recovery-invalid",
+                "cache repair payload binding changed",
+                payload_path,
+            )
+        allowed_names: set[str] = set()
+        for index, _artifact in enumerate(receipt.artifacts):
+            allowed_names.add(f"item-{index:05d}")
+            if allow_cleanup_phase:
+                allowed_names.add(f"cleanup-{index:05d}")
+        names = _directory_member_names(
+            payload_fd,
+            maximum_entries=max(1, len(allowed_names)),
+            overflow_message=f"cache repair payload has unknown entries: {payload_path}",
+        )
+        if any(name not in allowed_names for name in names):
+            raise _release_cache_repair_failure(
+                "cache-repair-recovery-invalid",
+                "cache repair payload contains unknown entries",
+                payload_path,
+            )
+        by_slot: dict[int, set[str]] = {}
+        for name in names:
+            prefix, _, index_text = name.partition("-")
+            if prefix not in {"item", "cleanup"} or not index_text.isdigit():
+                raise _release_cache_repair_failure(
+                    "cache-repair-recovery-invalid",
+                    "cache repair payload contains an invalid slot name",
+                    payload_path,
+                )
+            slot = int(index_text)
+            by_slot.setdefault(slot, set()).add(prefix)
+        if any(len(states) != 1 for states in by_slot.values()):
+            raise _release_cache_repair_failure(
+                "cache-repair-recovery-invalid",
+                "cache repair payload has duplicate item and cleanup slots",
+                payload_path,
+            )
+        return payload_fd, True
+    except BaseException:
+        _close_fd_quietly(payload_fd)
+        raise
+
+
+def _release_cache_repair_verify_payload_artifacts(
+    receipt: _ReleaseCacheRepairReceipt,
+    payload_fd: int,
+    *,
+    allow_cleanup_phase: bool,
+    expected_owner_uid: int | None,
+) -> dict[int, str]:
+    names = _directory_member_names(
+        payload_fd,
+        maximum_entries=max(1, len(receipt.artifacts) * (2 if allow_cleanup_phase else 1)),
+        overflow_message="cache repair payload exceeds its retained-artifact limit",
+    )
+    expected_names: set[str] = set()
+    observed: dict[int, str] = {}
+    for index, artifact in enumerate(receipt.artifacts):
+        item_name = f"item-{index:05d}"
+        cleanup_name = f"cleanup-{index:05d}"
+        item_present = item_name in names
+        cleanup_present = cleanup_name in names
+        if item_present and cleanup_present:
+            raise _release_cache_repair_failure(
+                "cache-repair-recovery-invalid",
+                "cache repair payload has duplicate slots",
+                receipt.releases_root / receipt.batch_name,
+            )
+        if item_present:
+            expected_names.add(item_name)
+            observed[index] = item_name
+            _release_cache_quarantine_artifact_matches_at(
+                payload_fd,
+                item_name,
+                artifact,
+                display_path=receipt.releases_root / receipt.batch_name / item_name,
+                expected_owner_uid=expected_owner_uid,
+            )
+        elif cleanup_present:
+            if not allow_cleanup_phase:
+                raise _release_cache_repair_failure(
+                    "cache-repair-recovery-invalid",
+                    "prepared cache repair payload contains cleanup slots",
+                    receipt.releases_root / receipt.batch_name,
+                )
+            expected_names.add(cleanup_name)
+            observed[index] = cleanup_name
+            _release_cache_repair_artifact_matches_cleanup_at(
+                payload_fd,
+                cleanup_name,
+                artifact,
+                receipt=receipt,
+                index=index,
+                expected_owner_uid=expected_owner_uid,
+            )
+    if set(names) != expected_names:
+        raise _release_cache_repair_failure(
+            "cache-repair-recovery-invalid",
+            "cache repair payload names do not match its receipt",
+            receipt.releases_root / receipt.batch_name,
+        )
+    return observed
+
+
+def _release_cache_repair_artifact_matches_cleanup_at(
+    payload_fd: int,
+    cleanup_name: str,
+    artifact: _ReleaseCacheQuarantineArtifact,
+    *,
+    receipt: _ReleaseCacheRepairReceipt,
+    index: int,
+    expected_owner_uid: int | None,
+) -> None:
+    display_path = receipt.releases_root / receipt.batch_name / cleanup_name
+    if artifact.kind == "file":
+        _release_cache_quarantine_artifact_matches_at(
+            payload_fd,
+            cleanup_name,
+            artifact,
+            display_path=display_path,
+            expected_owner_uid=expected_owner_uid,
+        )
+        return
+    named_metadata = os.stat(
+        cleanup_name,
+        dir_fd=payload_fd,
+        follow_symlinks=False,
+    )
+    if not stat.S_ISDIR(named_metadata.st_mode) or (
+        named_metadata.st_dev,
+        named_metadata.st_ino,
+    ) != artifact.identity or _release_cache_access_policy(named_metadata) != artifact.access_policy:
+        raise SyncError(f"cache repair cleanup directory changed: {display_path}")
+    directory_fd = -1
+    try:
+        directory_fd = os.open(
+            cleanup_name,
+            _source_directory_flags(),
+            dir_fd=payload_fd,
+        )
+        names = _directory_member_names(
+            directory_fd,
+            maximum_entries=max(1, len(artifact.members) * 2),
+            overflow_message=f"cache repair cleanup directory changed: {display_path}",
+        )
+        expected: dict[str, _ReleaseCacheMemberEvidence] = {}
+        for member_index, member in enumerate(artifact.members):
+            expected[member.name] = member
+            expected[f"cleanup-{member_index:05d}"] = member
+        if any(name not in expected for name in names):
+            raise SyncError(f"cache repair cleanup directory has unknown names: {display_path}")
+        for member_index, member in enumerate(artifact.members):
+            original_present = member.name in names
+            cleanup_member_name = f"cleanup-{member_index:05d}"
+            cleanup_present = cleanup_member_name in names
+            if original_present and cleanup_present:
+                raise SyncError(
+                    f"cache repair cleanup directory has duplicate members: {display_path}"
+                )
+            if original_present:
+                name = member.name
+            elif cleanup_present:
+                name = cleanup_member_name
+            else:
+                # The durable cleanup-ready marker authorizes a missing member
+                # only after its own prior unlink has persisted.
+                continue
+            _release_cache_regular_member_matches_at(
+                directory_fd,
+                name,
+                identity=member.identity,
+                access_policy=member.access_policy,
+                content_identity=member.content_identity,
+                link_count=member.link_count,
+                display_path=display_path / name,
+                expected_owner_uid=expected_owner_uid,
+            )
+    except OSError as error:
+        raise SyncError(f"cache repair cleanup directory is unreadable: {display_path}") from error
+    finally:
+        if directory_fd >= 0:
+            _close_fd_quietly(directory_fd)
+
+
 def _release_cache_quarantine_root(
     home: Path,
     owner: str,
     sha: str,
     releases_fd: int,
     releases_root: Path,
-    artifacts: tuple[_ReleaseCacheQuarantineArtifact, ...],
+    release_fd: int,
+    scan: _ReleaseCacheRepairScan,
+    trusted_tree_digest: str,
     *,
     expected_owner_uid: int | None,
     repair_context: dict[str, Any],
@@ -53314,6 +55329,8 @@ def _release_cache_quarantine_root(
         raise SyncError(f"could not allocate cache quarantine under {releases_root}")
     quarantine_path = releases_root / quarantine_name
     quarantine_fd = -1
+    receipt_published = False
+    quarantine: _ReleaseCacheQuarantine | None = None
     try:
         os.fsync(releases_fd)
         quarantine_fd = os.open(
@@ -53337,27 +55354,61 @@ def _release_cache_quarantine_root(
             or _directory_member_names(quarantine_fd) != ()
         ):
             raise SyncError(f"cache quarantine directory is unsafe: {quarantine_path}")
+        receipt = _release_cache_repair_new_receipt(
+            home,
+            owner,
+            sha,
+            releases_root,
+            quarantine_name,
+            releases_fd,
+            quarantine_fd,
+            release_fd,
+            scan,
+            trusted_tree_digest,
+        )
+        receipt_published = True
         quarantine = _ReleaseCacheQuarantine(
             home=home,
             path=quarantine_path,
             parent=releases_root,
             parent_identity=_directory_identity(releases_fd),
             identity=(metadata.st_dev, metadata.st_ino),
-            artifacts=artifacts,
-            artifact_names=tuple(f"item-{index:05d}" for index in range(len(artifacts))),
+            receipt=receipt,
+            artifacts=receipt.artifacts,
+            artifact_names=tuple(
+                f"item-{index:05d}" for index in range(len(receipt.artifacts))
+            ),
             created_parent_directories=(),
         )
         repair_context["quarantines"].append(quarantine)
+        _release_cache_repair_validate_live_scan(
+            receipt,
+            releases_fd,
+            release_fd,
+            expected_owner_uid=expected_owner_uid,
+            allow_cache_subset=False,
+        )
         return quarantine
     except BaseException:
-        if quarantine_fd >= 0:
-            _close_fd_quietly(quarantine_fd)
-        try:
-            if quarantine_name is not None:
-                os.rmdir(quarantine_name, dir_fd=releases_fd)
-                os.fsync(releases_fd)
-        except OSError:
-            pass
+        if not receipt_published:
+            try:
+                receipt_metadata = (
+                    os.stat(
+                        quarantine_name + RELEASE_CACHE_REPAIR_RECEIPT_SUFFIX,
+                        dir_fd=releases_fd,
+                        follow_symlinks=False,
+                    )
+                    if quarantine_name is not None
+                    else None
+                )
+            except OSError:
+                receipt_metadata = None
+            try:
+                if quarantine_name is not None and receipt_metadata is None:
+                    os.rmdir(quarantine_name, dir_fd=releases_fd)
+                    os.fsync(releases_fd)
+            except OSError:
+                pass
         raise
     finally:
         if quarantine_fd >= 0:
@@ -53372,6 +55423,7 @@ def _quarantine_release_cache_artifacts(
     release_fd: int,
     scan: _ReleaseCacheRepairScan,
     *,
+    trusted_tree_digest: str,
     expected_owner_uid: int | None,
     repair_context: dict[str, Any],
 ) -> _ReleaseCacheQuarantine:
@@ -53387,7 +55439,9 @@ def _quarantine_release_cache_artifacts(
             sha,
             releases_fd,
             releases_root,
-            scan.artifacts,
+            release_fd,
+            scan,
+            trusted_tree_digest,
             expected_owner_uid=expected_owner_uid,
             repair_context=repair_context,
         )
@@ -53404,7 +55458,7 @@ def _quarantine_release_cache_artifacts(
         if not _bound_directory_matches(home, release_root, release_fd):
             raise SyncError(f"installed release changed before cache repair: {release_root}")
         for artifact, destination_name in zip(
-            scan.artifacts,
+            quarantine.artifacts,
             quarantine.artifact_names,
         ):
             source_parent_fd, source_name = _open_relative_parent_fd(
@@ -53444,12 +55498,241 @@ def _quarantine_release_cache_artifacts(
         if not _bound_directory_matches(home, release_root, release_fd):
             raise SyncError(f"installed release changed during cache repair: {release_root}")
         return quarantine
-    except BaseException:
+    except (OSError, SyncError) as error:
+        if quarantine is not None:
+            raise SyncError(
+                f"{error}; cache repair evidence retained at {quarantine.path}",
+                code=getattr(error, "code", None),
+            ) from error
         raise
     finally:
         if quarantine_fd >= 0:
             _close_fd_quietly(quarantine_fd)
         _close_fd_quietly(releases_fd)
+
+
+def _release_cache_repair_marker_matches_receipt(
+    marker: _ReleaseCacheRepairMarker,
+    receipt: _ReleaseCacheRepairReceipt,
+) -> bool:
+    if receipt.snapshot is None:
+        return False
+    try:
+        expected_payload = _release_cache_repair_receipt_payload(
+            _release_cache_repair_receipt_record(receipt)
+        )
+        expected_snapshot = _release_cache_repair_snapshot_evidence(receipt.snapshot)
+        marker_data = _decode_managed_state_json(
+            marker.payload,
+            receipt.releases_root
+            / f"{receipt.batch_name}{RELEASE_CACHE_REPAIR_READY_SUFFIX}",
+        )
+        return (
+            marker.receipt_hash == hashlib.sha256(receipt.payload).hexdigest()
+            and marker.receipt_hash == hashlib.sha256(expected_payload).hexdigest()
+            and _managed_state_snapshot_matches_bound_file_evidence(
+                marker.receipt_snapshot,
+                receipt.snapshot,
+            )
+            and marker_data.get("receipt_snapshot") == expected_snapshot
+        )
+    except (SyncError, AttributeError):
+        return False
+
+
+def _release_cache_repair_cleanup_payload(
+    receipt: _ReleaseCacheRepairReceipt,
+    releases_root_fd: int,
+    payload_fd: int | None,
+    marker: _ReleaseCacheRepairMarker,
+    *,
+    expected_owner_uid: int | None,
+) -> None:
+    release_fd = _open_installed_release_directory_fd(
+        receipt.home,
+        receipt.owner,
+        receipt.sha,
+    )
+    try:
+        _release_cache_repair_validate_terminal(
+            receipt,
+            releases_root_fd,
+            release_fd,
+            expected_owner_uid=expected_owner_uid,
+        )
+    finally:
+        _close_fd_quietly(release_fd)
+    if payload_fd is not None:
+        observed = _release_cache_repair_verify_payload_artifacts(
+            receipt,
+            payload_fd,
+            allow_cleanup_phase=True,
+            expected_owner_uid=expected_owner_uid,
+        )
+        payload_path = receipt.releases_root / receipt.batch_name
+        for index, artifact in enumerate(receipt.artifacts):
+            name = observed.get(index)
+            if name is None:
+                continue
+            cleanup_name = f"cleanup-{index:05d}"
+            if name != cleanup_name:
+                _rename_noreplace_at(payload_fd, name, payload_fd, cleanup_name)
+                os.fsync(payload_fd)
+            if artifact.kind == "file":
+                _release_cache_quarantine_artifact_matches_at(
+                    payload_fd,
+                    cleanup_name,
+                    artifact,
+                    display_path=payload_path / cleanup_name,
+                    expected_owner_uid=expected_owner_uid,
+                )
+                os.unlink(cleanup_name, dir_fd=payload_fd)
+                os.fsync(payload_fd)
+                continue
+            directory_fd = -1
+            try:
+                directory_fd = os.open(
+                    cleanup_name,
+                    _source_directory_flags(),
+                    dir_fd=payload_fd,
+                )
+                names = _directory_member_names(
+                    directory_fd,
+                    maximum_entries=max(1, len(artifact.members) * 2),
+                    overflow_message=(
+                        f"cache repair cleanup directory exceeds its limit: {payload_path / cleanup_name}"
+                    ),
+                )
+                allowed_names: set[str] = set()
+                for member_index, member in enumerate(artifact.members):
+                    member_cleanup_name = f"cleanup-{member_index:05d}"
+                    allowed_names.update((member.name, member_cleanup_name))
+                if any(member_name not in allowed_names for member_name in names):
+                    raise SyncError(
+                        f"cache repair cleanup directory has unknown names: {payload_path / cleanup_name}"
+                    )
+                for member_index, member in enumerate(artifact.members):
+                    member_cleanup_name = f"cleanup-{member_index:05d}"
+                    original_present = member.name in names
+                    cleanup_present = member_cleanup_name in names
+                    if original_present and cleanup_present:
+                        raise SyncError(
+                            f"cache repair cleanup directory has duplicate members: {payload_path / cleanup_name}"
+                        )
+                    if not original_present and not cleanup_present:
+                        continue
+                    source_name = member_cleanup_name if cleanup_present else member.name
+                    _release_cache_regular_member_matches_at(
+                        directory_fd,
+                        source_name,
+                        identity=member.identity,
+                        access_policy=member.access_policy,
+                        content_identity=member.content_identity,
+                        link_count=member.link_count,
+                        display_path=payload_path / cleanup_name / source_name,
+                        expected_owner_uid=expected_owner_uid,
+                    )
+                    if not cleanup_present:
+                        _rename_noreplace_at(
+                            directory_fd,
+                            source_name,
+                            directory_fd,
+                            member_cleanup_name,
+                        )
+                        os.fsync(directory_fd)
+                    _release_cache_regular_member_matches_at(
+                        directory_fd,
+                        member_cleanup_name,
+                        identity=member.identity,
+                        access_policy=member.access_policy,
+                        content_identity=member.content_identity,
+                        link_count=member.link_count,
+                        display_path=payload_path
+                        / cleanup_name
+                        / member_cleanup_name,
+                        expected_owner_uid=expected_owner_uid,
+                    )
+                    os.unlink(member_cleanup_name, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+                if _directory_member_names(directory_fd) != ():
+                    raise SyncError(
+                        f"cache repair cleanup directory has retained entries: {payload_path / cleanup_name}"
+                    )
+                os.fsync(directory_fd)
+            finally:
+                if directory_fd >= 0:
+                    _close_fd_quietly(directory_fd)
+            os.rmdir(cleanup_name, dir_fd=payload_fd)
+            os.fsync(payload_fd)
+        if _directory_member_names(payload_fd) != ():
+            raise SyncError(f"cache repair payload is not empty: {payload_path}")
+        os.fsync(payload_fd)
+        os.rmdir(receipt.batch_name, dir_fd=releases_root_fd)
+        os.fsync(releases_root_fd)
+
+    receipt_path = _release_cache_repair_control_path(
+        receipt.releases_root,
+        receipt.batch_name,
+        RELEASE_CACHE_REPAIR_RECEIPT_SUFFIX,
+    )
+    current_receipt = _read_release_cache_repair_receipt(
+        receipt.home,
+        releases_root_fd,
+        receipt.releases_root,
+        receipt.batch_name,
+    )
+    if current_receipt is not None:
+        if (
+            current_receipt.payload != receipt.payload
+            or current_receipt.snapshot is None
+            or receipt.snapshot is None
+            or not _managed_state_snapshot_matches_bound_file_evidence(
+                current_receipt.snapshot,
+                receipt.snapshot,
+            )
+        ):
+            raise SyncError(f"cache repair receipt changed before retirement: {receipt_path}")
+        os.unlink(receipt_path.name, dir_fd=releases_root_fd)
+        os.fsync(releases_root_fd)
+
+    marker_path = _release_cache_repair_control_path(
+        receipt.releases_root,
+        receipt.batch_name,
+        RELEASE_CACHE_REPAIR_READY_SUFFIX,
+    )
+    current_marker = _read_release_cache_repair_cleanup_marker(
+        receipt.home,
+        releases_root_fd,
+        receipt.releases_root,
+        receipt.batch_name,
+    )
+    if (
+        current_marker is None
+        or not _managed_state_snapshot_matches_bound_file_evidence(
+            current_marker.snapshot,
+            marker.snapshot,
+        )
+        or current_marker.payload != marker.payload
+    ):
+        raise SyncError(f"cache repair cleanup marker changed before retirement: {marker_path}")
+    release_fd = _open_installed_release_directory_fd(
+        receipt.home,
+        receipt.owner,
+        receipt.sha,
+    )
+    try:
+        # A second strict read just before the final authority is retired closes
+        # the window where new cache entries could be introduced during cleanup.
+        _release_cache_repair_validate_terminal(
+            receipt,
+            releases_root_fd,
+            release_fd,
+            expected_owner_uid=expected_owner_uid,
+        )
+    finally:
+        _close_fd_quietly(release_fd)
+    os.unlink(marker_path.name, dir_fd=releases_root_fd)
+    os.fsync(releases_root_fd)
 
 
 def _cleanup_release_cache_quarantine(
@@ -53458,125 +55741,101 @@ def _cleanup_release_cache_quarantine(
     expected_owner_uid: int | None,
 ) -> None:
     home = quarantine.home
+    if _locked_sync_home_fd(home) is None:
+        raise SyncError("cache repair cleanup requires the installation lock")
     parent_fd = _open_directory_beneath(home, quarantine.parent)
-    quarantine_fd = -1
+    payload_fd = -1
     try:
-        if (
-            _directory_identity(parent_fd) != quarantine.parent_identity
-            or not _bound_directory_matches(home, quarantine.parent, parent_fd)
-        ):
-            raise SyncError(
-                f"cache quarantine parent changed; evidence retained at {quarantine.path}"
-            )
-        quarantine_fd = os.open(
+        _release_cache_repair_require_directory_evidence(
+            home,
+            quarantine.parent,
+            parent_fd,
+            identity=quarantine.parent_identity,
+            access_policy=quarantine.receipt.releases_root_access_policy,
+            label="cache quarantine parent",
+        )
+        payload_fd = os.open(
             quarantine.path.name,
             _source_directory_flags(),
             dir_fd=parent_fd,
         )
         if (
-            _directory_identity(quarantine_fd) != quarantine.identity
-            or not _bound_directory_matches(home, quarantine.path, quarantine_fd)
+            _directory_identity(payload_fd) != quarantine.identity
+            or not _bound_directory_matches(home, quarantine.path, payload_fd)
         ):
-            raise SyncError(
-                f"cache quarantine changed; evidence retained at {quarantine.path}"
-            )
-        names = _directory_member_names(
-            quarantine_fd,
-            maximum_entries=len(quarantine.artifact_names),
-            overflow_message=(
-                f"cache quarantine contents changed; evidence retained at {quarantine.path}"
-            ),
+            raise SyncError(f"cache quarantine changed; evidence retained at {quarantine.path}")
+        release_fd = _open_installed_release_directory_fd(
+            home,
+            quarantine.receipt.owner,
+            quarantine.receipt.sha,
         )
-        if names != tuple(sorted(quarantine.artifact_names)):
-            raise SyncError(
-                f"cache quarantine contents changed; evidence retained at {quarantine.path}"
-            )
-        for index, (artifact, name) in enumerate(
-            zip(quarantine.artifacts, quarantine.artifact_names)
-        ):
-            _release_cache_quarantine_artifact_matches_at(
-                quarantine_fd,
-                name,
-                artifact,
-                display_path=quarantine.path / name,
+        try:
+            _release_cache_repair_validate_terminal(
+                quarantine.receipt,
+                parent_fd,
+                release_fd,
                 expected_owner_uid=expected_owner_uid,
             )
-            cleanup_name = f"cleanup-{index:05d}"
-            _rename_noreplace_at(quarantine_fd, name, quarantine_fd, cleanup_name)
-            os.fsync(quarantine_fd)
-            if artifact.kind == "file":
-                _release_cache_quarantine_artifact_matches_at(
-                    quarantine_fd,
-                    cleanup_name,
-                    artifact,
-                    display_path=quarantine.path / cleanup_name,
-                    expected_owner_uid=expected_owner_uid,
-                )
-                os.unlink(cleanup_name, dir_fd=quarantine_fd)
-                continue
-            directory_fd = os.open(
-                cleanup_name,
-                _source_directory_flags(),
-                dir_fd=quarantine_fd,
+        finally:
+            _close_fd_quietly(release_fd)
+        marker = _read_release_cache_repair_cleanup_marker(
+            home,
+            parent_fd,
+            quarantine.parent,
+            quarantine.path.name,
+        )
+        if marker is None:
+            _release_cache_repair_verify_payload_artifacts(
+                quarantine.receipt,
+                payload_fd,
+                allow_cleanup_phase=False,
+                expected_owner_uid=expected_owner_uid,
             )
-            try:
-                for member_index, member in enumerate(artifact.members):
-                    _release_cache_regular_member_matches_at(
-                        directory_fd,
-                        member.name,
-                        identity=member.identity,
-                        access_policy=member.access_policy,
-                        content_identity=member.content_identity,
-                        link_count=member.link_count,
-                        display_path=quarantine.path / cleanup_name / member.name,
-                        expected_owner_uid=expected_owner_uid,
-                    )
-                    member_cleanup_name = f"cleanup-{member_index:05d}"
-                    _rename_noreplace_at(
-                        directory_fd,
-                        member.name,
-                        directory_fd,
-                        member_cleanup_name,
-                    )
-                    _release_cache_regular_member_matches_at(
-                        directory_fd,
-                        member_cleanup_name,
-                        identity=member.identity,
-                        access_policy=member.access_policy,
-                        content_identity=member.content_identity,
-                        link_count=member.link_count,
-                        display_path=quarantine.path
-                        / cleanup_name
-                        / member_cleanup_name,
-                        expected_owner_uid=expected_owner_uid,
-                    )
-                    os.unlink(member_cleanup_name, dir_fd=directory_fd)
-                if _directory_member_names(directory_fd) != ():
-                    raise SyncError(
-                        f"cache quarantine directory contents changed; evidence retained at {quarantine.path}"
-                    )
-                os.fsync(directory_fd)
-            finally:
-                _close_fd_quietly(directory_fd)
-            os.rmdir(cleanup_name, dir_fd=quarantine_fd)
-        if _directory_member_names(quarantine_fd) != ():
-            raise SyncError(
-                f"cache quarantine contents changed; evidence retained at {quarantine.path}"
-            )
-        os.fsync(quarantine_fd)
-        _close_fd_quietly(quarantine_fd)
-        quarantine_fd = -1
-        os.rmdir(quarantine.path.name, dir_fd=parent_fd)
-        os.fsync(parent_fd)
+            marker = _release_cache_repair_publish_cleanup_marker(quarantine.receipt)
+        elif not _release_cache_repair_marker_matches_receipt(
+            marker,
+            quarantine.receipt,
+        ):
+            raise SyncError(f"cache quarantine cleanup marker changed: {quarantine.path}")
+        _release_cache_repair_verify_payload_artifacts(
+            quarantine.receipt,
+            payload_fd,
+            allow_cleanup_phase=True,
+            expected_owner_uid=expected_owner_uid,
+        )
+        _release_cache_repair_cleanup_payload(
+            quarantine.receipt,
+            parent_fd,
+            payload_fd,
+            marker,
+            expected_owner_uid=expected_owner_uid,
+        )
     except (OSError, SyncError) as error:
+        locator = quarantine.path
+        try:
+            os.stat(quarantine.path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError:
+            marker_name = f"{quarantine.path.name}{RELEASE_CACHE_REPAIR_READY_SUFFIX}"
+            try:
+                os.stat(marker_name, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError:
+                receipt_name = f"{quarantine.path.name}{RELEASE_CACHE_REPAIR_RECEIPT_SUFFIX}"
+                try:
+                    os.stat(receipt_name, dir_fd=parent_fd, follow_symlinks=False)
+                except OSError:
+                    pass
+                else:
+                    locator = quarantine.parent / receipt_name
+            else:
+                locator = quarantine.parent / marker_name
         raise SyncError(
             f"could not safely clear cache quarantine; evidence retained at "
-            f"{quarantine.path}: {error}",
+            f"{locator}: {error}",
             code=getattr(error, "code", None),
         ) from error
     finally:
-        if quarantine_fd >= 0:
-            _close_fd_quietly(quarantine_fd)
+        if payload_fd >= 0:
+            _close_fd_quietly(payload_fd)
         _close_fd_quietly(parent_fd)
 
 
@@ -53682,10 +55941,10 @@ def _prepare_installed_release_cache_repairs(
                     mismatch_message,
                     code="immutable-release-drift",
                 )
-            repair_context["baselines"][os.path.abspath(os.fspath(release_root))] = (
-                trusted_digest
-            )
             if not mutate:
+                repair_context["baselines"][os.path.abspath(os.fspath(release_root))] = (
+                    trusted_digest
+                )
                 continue
             quarantine = _quarantine_release_cache_artifacts(
                 home,
@@ -53694,26 +55953,25 @@ def _prepare_installed_release_cache_repairs(
                 release_root,
                 release_fd,
                 scan,
+                trusted_tree_digest=trusted_digest,
                 expected_owner_uid=(os.geteuid() if sys.platform == "darwin" else None),
                 repair_context=repair_context,
             )
             baseline_key = os.path.abspath(os.fspath(release_root))
-            previous_baseline = repair_context["baselines"].pop(baseline_key, None)
-            try:
-                strict_identity, _captured = (
-                    _release_tree_identity_and_captured_files_from_directory_fd(
-                        release_fd,
-                        release_root,
-                        require_sanitized_modes=True,
-                        expected_owner_uid=(
-                            os.geteuid() if sys.platform == "darwin" else None
-                        ),
-                        capture_limits={},
-                    )
+            # Cache filtering is an observational preflight exception. Every
+            # later validation in this mutation scope must remain strict.
+            repair_context["baselines"].pop(baseline_key, None)
+            strict_identity, _captured = (
+                _release_tree_identity_and_captured_files_from_directory_fd(
+                    release_fd,
+                    release_root,
+                    require_sanitized_modes=True,
+                    expected_owner_uid=(
+                        os.geteuid() if sys.platform == "darwin" else None
+                    ),
+                    capture_limits={},
                 )
-            finally:
-                if previous_baseline is not None:
-                    repair_context["baselines"][baseline_key] = previous_baseline
+            )
             if strict_identity[2] != trusted_digest:
                 raise SyncError(
                     "installed release strict revalidation did not match its trusted "
@@ -55427,6 +57685,7 @@ def _recover_pending_state_unlocked(
 ) -> bool:
     if _locked_sync_home_fd(home) is None:
         raise SyncError("pending recovery requires the installation lock")
+    recovered_cache_repair = _recover_release_cache_repair_batches_unlocked(home)
     # Publication recovery and the subsequent fence share the same lock.
     _recover_unconsumed_pending_terminal_progress_publications(home, cleanup_budget)
     _require_no_pending_unresolved_ticket_representations(home)
@@ -55444,7 +57703,8 @@ def _recover_pending_state_unlocked(
         home, loaded_state, initial_state_snapshot, dry_run=False,
     )
     return bool(
-        recovered_failed_move_isolation
+        recovered_cache_repair
+        or recovered_failed_move_isolation
         or recovered_retention_transaction is not None
         or recovered_pending_transaction
         or cleaned_pending_batches
@@ -55461,7 +57721,11 @@ def _preflight_pending_recovery(
     action_budget = cleanup_budget or PendingCleanupActionBudget(
         MAX_PENDING_CLEANUP_BATCHES_PER_RUN
     )
+    observed_cache_repair = _observe_release_cache_repair_batches(home)
     if dry_run:
+        if observed_cache_repair:
+            print("would inspect interrupted release cache repair under the install lock")
+            return True
         observed_publications = _observe_unconsumed_pending_terminal_progress_publications(home)
         _require_no_pending_unresolved_ticket_representations(
             home, dry_run=True, read_only_publication_batches=observed_publications,
@@ -55516,7 +57780,7 @@ def _preflight_pending_recovery(
                 "the install lock"
             )
         return True
-    if not _pending_recovery_is_observed(home):
+    if not observed_cache_repair and not _pending_recovery_is_observed(home):
         return False
     with installation_lock(home):
         return _recover_pending_state_unlocked(home, action_budget)
@@ -56165,6 +58429,8 @@ def _install_release_set_unlocked(
     cleanup_budget: PendingCleanupActionBudget | None = None,
 ) -> None:
     with _release_cache_repair_scope(home):
+        if not dry_run and not preflight_only:
+            _recover_release_cache_repair_batches_unlocked(home)
         return _install_release_set_unlocked_impl(
             home,
             releases,
@@ -56213,24 +58479,17 @@ def install_release_tree(
         )
     manifest = release_expectation[0][1]
     releases = [(source_root, sha, manifest, release_expectation)]
+    # Keep tolerant preflight evidence out of the later mutation scope.
     with _release_cache_repair_scope(home):
         if initial_cache_error is not None:
-            if dry_run:
-                _prepare_installed_release_cache_repairs(
-                    home,
-                    releases,
-                    mutate=False,
-                )
-            else:
-                with installation_lock(home):
-                    _prepare_installed_release_cache_repairs(
-                        home,
-                        releases,
-                        mutate=True,
-                    )
+            _prepare_installed_release_cache_repairs(
+                home,
+                releases,
+                mutate=False,
+            )
             pending_recovery = _preflight_pending_recovery(
                 home,
-                dry_run=dry_run,
+                dry_run=True,
                 cleanup_budget=action_budget,
             )
             if pending_recovery and dry_run:
@@ -56244,15 +58503,18 @@ def install_release_tree(
                 cleanup_budget=action_budget,
             )
             return
-        _install_release_set_unlocked(
-            home,
-            releases,
-            dry_run=True,
-            allow_cross_owner=manifest.owner != PUBLIC_OWNER,
-            preflight_only=True,
-            cleanup_budget=action_budget,
-        )
-        with installation_lock(home):
+        if initial_cache_error is None or not pending_recovery:
+            _install_release_set_unlocked(
+                home,
+                releases,
+                dry_run=True,
+                allow_cross_owner=manifest.owner != PUBLIC_OWNER,
+                preflight_only=True,
+                cleanup_budget=action_budget,
+            )
+    with installation_lock(home):
+        with _release_cache_repair_scope(home):
+            _recover_release_cache_repair_batches_unlocked(home)
             # A cooperative writer may have published recovery state after the
             # observational preflight. Recheck under the final mutation lock.
             _prepare_installed_release_cache_repairs(
@@ -58049,8 +60311,9 @@ def install_private_from_github(
                     )
             return
 
-        with _release_cache_repair_scope(home):
-            with installation_lock(home):
+        with installation_lock(home):
+            with _release_cache_repair_scope(home):
+                _recover_release_cache_repair_batches_unlocked(home)
                 _prepare_installed_release_cache_repairs(
                     home,
                     releases,

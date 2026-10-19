@@ -446,11 +446,18 @@ policy remain errors. Cache child-entry changes can alter directory timestamps;
 those timestamps alone do not prove replacement or source-content changes.
 
 The installer observes recovery during its read-only preflight and performs
-the mutation under the installation lock. It first isolates verified cache
-objects outside the release, then repeats the original strict release checks
-before continuing. Successful installation removes its isolated cache objects;
-failure retains recovery evidence and reports its location. `--dry-run` validates
-whether recovery is possible without creating, moving, or deleting any object.
+the entire repair and cleanup under the installation lock. Before moving any
+cache object, it durably records the verified release and cache evidence in a
+private receipt beside the isolation directory. It isolates verified cache
+objects outside the release, then repeats the original strict, cache-free
+release checks before continuing. Successful installation removes its isolated
+cache objects and receipt. Failure retains recovery evidence and reports its
+location; a later installation can resume an interrupted, receipt-bound repair.
+Unknown or inconsistent recovery evidence remains in place and blocks
+mutation. A batch owned by the current installation must retain its bound
+payload and receipt; replaced evidence cannot enter restart recovery.
+`--dry-run` validates cache drift or reports pending repair state
+without creating, moving, or deleting any object.
 Downloaded release packages must remain cache-free and are never sanitized by
 this recovery path. `doctor` remains observational.
 
