@@ -58428,6 +58428,7 @@ def _install_release_set_unlocked(
     preflight_only: bool = False,
     cleanup_budget: PendingCleanupActionBudget | None = None,
 ) -> None:
+    releases = _normalize_install_releases(releases)
     with _release_cache_repair_scope(home):
         if not dry_run and not preflight_only:
             _recover_release_cache_repair_batches_unlocked(home)

@@ -23,7 +23,7 @@
     "engine": {
       "mode": "0755",
       "path": "scripts/codex_personal_sync.py",
-      "sha256": "b8674d6e4123ffef305a85407b27cb98e24d8fde84c7444f9b12b91bd11ba5fd"
+      "sha256": "a6a234dda9e59a411cd337f1eba2142af12c0215d07579a2d72fa3152e9bf00f"
     },
     "engine_tests": {
       "mode": "0644",
@@ -43,7 +43,7 @@
     "pending_staging_cleanup_tests": {
       "mode": "0644",
       "path": "tests/test_pending_staging_cleanup.py",
-      "sha256": "cd9a07c0a5043a47195711dc9300d8683d8313efa4fa7fe4f66971ae1ba14b0f"
+      "sha256": "84f9465f3756afdc4a7c6379aac34ee3d80345ee96773de85341cde31f7b0c9d"
     },
     "quarantine_empty_batch_reclaim_tests": {
       "mode": "0644",
@@ -53,7 +53,7 @@
     "reconciliation_safety_tests": {
       "mode": "0644",
       "path": "tests/test_personal_sync_reconciliation_safety.py",
-      "sha256": "11a8566b60cc522452156516309474a2dba32fa0c7381808d492d66a7a3ff945"
+      "sha256": "89c105b9f057e1bec3e11069c5400916184a6c148afeacee9a332037fccb296c"
     },
     "regular_agent_materialization_tests": {
       "mode": "0644",

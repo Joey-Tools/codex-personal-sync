@@ -28,6 +28,8 @@ superseded_by:
   writer cannot reuse the observational preflight exception.
 - Bind active recovery batches to their original payload and receipt objects;
   replaced or missing evidence cannot fall through into restart recovery.
+- Reject invalid release input before recovery, and require real installation
+  locks in mutating internal-helper callers.
 
 ## Delivery
 
@@ -41,10 +43,11 @@ superseded_by:
 ## Validation
 
 - Python 3.13.0 main installer and locked preflight recovery regressions:
-  371 tests, 248.652 seconds, one skip, exit 0.
-- Native Python 3.9.6 cache regressions: 30 tests, 66.236 seconds, exit 0.
-- Complete source-lock module: 282 tests across four disjoint shards sharing
-  the same frozen source fingerprints and inventory, one skip, all exit 0.
+  371 tests, 224.340 seconds, one skip, exit 0.
+- Native Python 3.9.6 cache regressions: 30 tests, 60.833 seconds, exit 0.
+- Input-order and locked-helper regressions: five test methods passed on
+  Python 3.13.0 and 3.9.6, including all eight previously failing subcases.
+- Canonical source-lock verification passed for all eleven managed sources.
 - Regression coverage includes interrupted isolation and cleanup, invalid
   recovery controls, lock ownership, newly written caches after isolation,
   and replacement of an active receipt with an identical-content new inode.
