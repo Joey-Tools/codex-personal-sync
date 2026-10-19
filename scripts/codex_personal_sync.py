@@ -61,6 +61,10 @@ _INSTALL_RELEASE_OWNER_UID: ContextVar[int | None] = ContextVar(
     "install_release_owner_uid",
     default=None,
 )
+_RELEASE_CACHE_REPAIR_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
+    "release_cache_repair_context",
+    default=None,
+)
 MAX_JSON_INTEGER_DIGITS = 4300
 MAX_ARCHIVE_COMPRESSED_BYTES = 64 * 1024 * 1024
 MAX_ARCHIVE_CHECKSUM_BYTES = 64 * 1024
@@ -50606,6 +50610,50 @@ class _ReleaseSourceSnapshot:
 
 
 @dataclass(frozen=True)
+class _ReleaseCacheRepairScan:
+    identity: ReleaseTreeIdentity
+    cache_paths: tuple[PurePosixPath, ...]
+    path_kinds: dict[PurePosixPath, str]
+    source_snapshots: dict[PurePosixPath, _ReleaseSourceSnapshot]
+    source_members: dict[PurePosixPath, tuple[str, ...]]
+    access_policies: dict[PurePosixPath, tuple[int, int, int]]
+    link_counts: dict[PurePosixPath, int]
+    artifacts: tuple[_ReleaseCacheQuarantineArtifact, ...]
+
+
+@dataclass(frozen=True)
+class _ReleaseCacheMemberEvidence:
+    name: str
+    identity: tuple[int, int]
+    access_policy: tuple[int, int, int]
+    content_identity: bytes
+    link_count: int
+
+
+@dataclass(frozen=True)
+class _ReleaseCacheQuarantineArtifact:
+    relative_path: PurePosixPath
+    kind: str
+    identity: tuple[int, int]
+    access_policy: tuple[int, int, int]
+    content_identity: bytes | None
+    member_names: tuple[str, ...] = ()
+    members: tuple[_ReleaseCacheMemberEvidence, ...] = ()
+
+
+@dataclass(frozen=True)
+class _ReleaseCacheQuarantine:
+    home: Path
+    path: Path
+    parent: Path
+    parent_identity: tuple[int, int]
+    identity: tuple[int, int]
+    artifacts: tuple[_ReleaseCacheQuarantineArtifact, ...]
+    artifact_names: tuple[str, ...]
+    created_parent_directories: tuple[tuple[PurePosixPath, tuple[int, int]], ...]
+
+
+@dataclass(frozen=True)
 class _DarwinExtendedAclApi:
     acl_get_fd_np: Any
     acl_valid: Any
@@ -51619,6 +51667,32 @@ def _release_tree_identity_and_captured_files_from_directory_fd(
     capture_limits: dict[PurePosixPath, int],
 ) -> tuple[ReleaseTreeIdentity, dict[PurePosixPath, bytes]]:
     expected_owner_uid = _effective_release_identity_owner_uid(expected_owner_uid)
+    repair_context = _RELEASE_CACHE_REPAIR_CONTEXT.get()
+    repair_baselines = (
+        repair_context.get("baselines", {})
+        if require_sanitized_modes and isinstance(repair_context, dict)
+        else {}
+    )
+    repair_path = os.path.abspath(os.fspath(display_root))
+    trusted_baseline = (
+        repair_baselines.get(repair_path)
+        if isinstance(repair_baselines, dict)
+        else None
+    )
+    if isinstance(trusted_baseline, str):
+        scan, captured_files = _release_cache_repair_scan_from_directory_fd(
+            root_fd,
+            display_root,
+            expected_owner_uid=expected_owner_uid,
+            capture_limits=capture_limits,
+        )
+        if scan.identity[2] != trusted_baseline:
+            raise SyncError(
+                "existing release tree does not match its trusted baseline; "
+                f"preserving installed release: {display_root}",
+                code="immutable-release-drift",
+            )
+        return scan.identity, captured_files
     with _release_identity_owner_uid_scope(expected_owner_uid):
         (
             manifest_payload,
@@ -51920,6 +51994,22 @@ def _release_tree_path_is_cache_artifact(path: PurePosixPath) -> bool:
     )
 
 
+def _release_cache_artifact_source_path(
+    cache_path: PurePosixPath,
+) -> PurePosixPath | None:
+    if cache_path.parent.name == "__pycache__":
+        match = re.fullmatch(
+            r"(.+?)\.([A-Za-z0-9_-]+)(?:\.opt-[0-9]+)?\.(?:pyc|pyo)",
+            cache_path.name,
+        )
+        if match is None:
+            return None
+        return cache_path.parent.parent / f"{match.group(1)}.py"
+    if cache_path.name.endswith((".pyc", ".pyo")):
+        return cache_path.with_suffix(".py")
+    return None
+
+
 def _release_tree_snapshot_from_directory_fd(
     root_fd: int,
     display_root: Path,
@@ -51927,6 +52017,7 @@ def _release_tree_snapshot_from_directory_fd(
     require_sanitized_modes: bool,
     expected_owner_uid: int | None = None,
     capture_limits: dict[PurePosixPath, int],
+    cache_repair_evidence: dict[str, Any] | None = None,
 ) -> tuple[
     bytes,
     str,
@@ -51945,6 +52036,27 @@ def _release_tree_snapshot_from_directory_fd(
     source_members: dict[PurePosixPath, tuple[str, ...]] = {}
     captured_files: dict[PurePosixPath, bytes] = {}
     resource_budget = _ReleaseTreeResourceBudget()
+    cache_source_candidates: set[PurePosixPath] = set()
+    if cache_repair_evidence is not None:
+        cache_repair_evidence.update(
+            {
+                "cache_paths": [],
+                "cache_source_candidates": cache_source_candidates,
+                "path_kinds": path_kinds,
+                "source_snapshots": source_snapshots,
+                "source_members": source_members,
+                "access_policies": {},
+                "link_counts": {},
+                "artifacts": [],
+            }
+        )
+
+    def access_policy(metadata: os.stat_result) -> tuple[int, int, int]:
+        return (
+            stat.S_IMODE(metadata.st_mode),
+            metadata.st_uid,
+            metadata.st_gid,
+        )
 
     def normalized_mode(metadata: os.stat_result, display_path: Path) -> int:
         actual_mode = stat.S_IMODE(metadata.st_mode)
@@ -51994,6 +52106,10 @@ def _release_tree_snapshot_from_directory_fd(
         directory_snapshot = _release_source_snapshot(directory_metadata)
         source_snapshots[relative_root] = directory_snapshot
         path_kinds[relative_root] = "directory"
+        if cache_repair_evidence is not None:
+            cache_repair_evidence["access_policies"][relative_root] = access_policy(
+                directory_metadata
+            )
         directory_mode = normalized_mode(directory_metadata, display_directory)
         record(
             b"directory",
@@ -52010,11 +52126,424 @@ def _release_tree_snapshot_from_directory_fd(
             ),
         )
         resource_budget.reserve_path_entries(len(names))
-        source_members[relative_root] = names
+        source_members[relative_root] = (
+            tuple(
+                name
+                for name in names
+                if name != "__pycache__"
+                and not name.endswith((".pyc", ".pyo"))
+            )
+            if cache_repair_evidence is not None
+            else names
+        )
         for name in names:
             relative_path = _validated_release_tree_child_path(relative_root, name)
             display_path = display_root / Path(*relative_path.parts)
             if _release_tree_path_is_cache_artifact(relative_path):
+                if cache_repair_evidence is not None and name == "__pycache__":
+                    try:
+                        named_metadata = os.stat(
+                            name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                    except OSError as error:
+                        raise SyncError(
+                            f"cache artifact changed while scanning: {display_path}"
+                        ) from error
+                    if not stat.S_ISDIR(named_metadata.st_mode):
+                        raise SyncError(
+                            f"refusing unsafe cache artifact: {display_path}"
+                        )
+                    if (
+                        expected_owner_uid is not None
+                        and named_metadata.st_uid != expected_owner_uid
+                    ):
+                        raise _release_identity_policy_error(
+                            display_path,
+                            f"owner UID {named_metadata.st_uid} != expected UID "
+                            f"{expected_owner_uid}",
+                            mismatch=True,
+                        )
+                    cache_directory_fd = -1
+                    try:
+                        cache_directory_fd = os.open(
+                            name,
+                            _source_directory_flags(),
+                            dir_fd=directory_fd,
+                        )
+                        cache_directory_metadata = (
+                            _require_release_identity_fd_access_policy(
+                                cache_directory_fd,
+                                display_path,
+                                expected_owner_uid,
+                            )
+                            if expected_owner_uid is not None
+                            else os.fstat(cache_directory_fd)
+                        )
+                        if not stat.S_ISDIR(cache_directory_metadata.st_mode):
+                            raise SyncError(
+                                f"refusing unsafe cache artifact: {display_path}"
+                            )
+                        cache_directory_snapshot = _release_source_snapshot(
+                            cache_directory_metadata
+                        )
+                        _require_release_source_unchanged(
+                            _release_source_snapshot(named_metadata),
+                            cache_directory_metadata,
+                            display_path,
+                            ignore_ctime=expected_owner_uid is not None,
+                        )
+                        if (
+                            access_policy(cache_directory_metadata)
+                            != access_policy(named_metadata)
+                        ):
+                            raise SyncError(
+                                f"cache directory access policy changed: {display_path}"
+                            )
+                        directory_mode = normalized_mode(
+                            cache_directory_metadata,
+                            display_path,
+                        )
+                        cache_names = _directory_member_names(
+                            cache_directory_fd,
+                            maximum_entries=resource_budget.remaining_path_entries,
+                            overflow_message=(
+                                f"release tree exceeds {MAX_ARCHIVE_MEMBERS} "
+                                "path entry limit"
+                            ),
+                        )
+                        resource_budget.reserve_path_entries(len(cache_names))
+                        member_evidence: list[_ReleaseCacheMemberEvidence] = []
+                        cache_directory_relative = relative_path
+                        cache_repair_evidence["cache_paths"].append(
+                            cache_directory_relative
+                        )
+                        for cache_name in cache_names:
+                            cache_relative = _validated_release_tree_child_path(
+                                relative_path,
+                                cache_name,
+                            )
+                            if not cache_name.endswith((".pyc", ".pyo")):
+                                raise SyncError(
+                                    "immutable release drift: unexpected cache "
+                                    f"content: {display_root / Path(*cache_relative.parts)}",
+                                    code="immutable-release-drift",
+                                )
+                            child_metadata = os.stat(
+                                cache_name,
+                                dir_fd=cache_directory_fd,
+                                follow_symlinks=False,
+                            )
+                            if not stat.S_ISREG(child_metadata.st_mode):
+                                raise SyncError(
+                                    "refusing unsafe cache artifact: "
+                                    f"{display_root / Path(*cache_relative.parts)}"
+                                )
+                            if child_metadata.st_nlink != 1:
+                                raise SyncError(
+                                    "refusing cache artifact with unexpected hard links: "
+                                    f"{display_root / Path(*cache_relative.parts)}"
+                                )
+                            if (
+                                expected_owner_uid is not None
+                                and child_metadata.st_uid != expected_owner_uid
+                            ):
+                                raise _release_identity_policy_error(
+                                    display_root / Path(*cache_relative.parts),
+                                    f"owner UID {child_metadata.st_uid} != expected UID "
+                                    f"{expected_owner_uid}",
+                                    mismatch=True,
+                                )
+                            cache_snapshot = _release_source_snapshot(child_metadata)
+                            normalized_mode(child_metadata, display_root / Path(*cache_relative.parts))
+                            cache_file_fd = -1
+                            try:
+                                cache_file_fd, opened_cache_snapshot = (
+                                    _open_source_regular_file(
+                                        cache_directory_fd,
+                                        cache_name,
+                                        cache_snapshot,
+                                        display_root / Path(*cache_relative.parts),
+                                        ignore_ctime=expected_owner_uid is not None,
+                                    )
+                                )
+                                cache_access_metadata = (
+                                    _require_release_identity_fd_access_policy(
+                                        cache_file_fd,
+                                        display_root / Path(*cache_relative.parts),
+                                        expected_owner_uid,
+                                    )
+                                    if expected_owner_uid is not None
+                                    else os.fstat(cache_file_fd)
+                                )
+                                if (
+                                    access_policy(cache_access_metadata)
+                                    != access_policy(child_metadata)
+                                    or cache_access_metadata.st_nlink != 1
+                                ):
+                                    raise SyncError(
+                                        "cache artifact access policy changed before "
+                                        f"read: {display_root / Path(*cache_relative.parts)}"
+                                    )
+                                resource_budget.reserve_file_bytes(
+                                    opened_cache_snapshot.size,
+                                    display_root / Path(*cache_relative.parts),
+                                )
+                                cache_identity, _payload = _hash_exact_regular_file(
+                                    cache_file_fd,
+                                    opened_cache_snapshot,
+                                    display_root / Path(*cache_relative.parts),
+                                    capture_payload=False,
+                                )
+                                opened_cache_snapshot = replace(
+                                    opened_cache_snapshot,
+                                    content_identity=cache_identity,
+                                )
+                                terminal_metadata = (
+                                    _require_release_identity_fd_access_policy(
+                                        cache_file_fd,
+                                        display_root / Path(*cache_relative.parts),
+                                        expected_owner_uid,
+                                    )
+                                    if expected_owner_uid is not None
+                                    else os.fstat(cache_file_fd)
+                                )
+                                if (
+                                    not _release_source_matches(
+                                        opened_cache_snapshot,
+                                        terminal_metadata,
+                                        ignore_ctime=expected_owner_uid is not None,
+                                    )
+                                    or terminal_metadata.st_nlink != 1
+                                    or access_policy(terminal_metadata)
+                                    != access_policy(cache_access_metadata)
+                                ):
+                                    raise SyncError(
+                                        "cache artifact changed while scanning: "
+                                        f"{display_root / Path(*cache_relative.parts)}"
+                                    )
+                                current_named_metadata = os.stat(
+                                    cache_name,
+                                    dir_fd=cache_directory_fd,
+                                    follow_symlinks=False,
+                                )
+                                if (
+                                    not _release_source_matches(
+                                        opened_cache_snapshot,
+                                        current_named_metadata,
+                                        ignore_ctime=expected_owner_uid is not None,
+                                    )
+                                    or current_named_metadata.st_nlink != 1
+                                ):
+                                    raise SyncError(
+                                        "cache artifact changed while scanning: "
+                                        f"{display_root / Path(*cache_relative.parts)}"
+                                    )
+                            finally:
+                                if cache_file_fd >= 0:
+                                    _close_fd_quietly(cache_file_fd)
+                            source_snapshots[cache_relative] = opened_cache_snapshot
+                            cache_repair_evidence["access_policies"][cache_relative] = (
+                                access_policy(terminal_metadata)
+                            )
+                            cache_repair_evidence["link_counts"][cache_relative] = (
+                                terminal_metadata.st_nlink
+                            )
+                            cache_source_candidates.add(cache_relative)
+                            member_evidence.append(
+                                _ReleaseCacheMemberEvidence(
+                                    name=cache_name,
+                                    identity=(
+                                        terminal_metadata.st_dev,
+                                        terminal_metadata.st_ino,
+                                    ),
+                                    access_policy=access_policy(terminal_metadata),
+                                    content_identity=cache_identity,
+                                    link_count=terminal_metadata.st_nlink,
+                                )
+                            )
+                        current_cache_names = _directory_member_names(
+                            cache_directory_fd,
+                            maximum_entries=len(cache_names),
+                            overflow_message=(
+                                f"cache directory changed while scanning: {display_path}"
+                            ),
+                        )
+                        terminal_directory_metadata = (
+                            _require_release_identity_fd_access_policy(
+                                cache_directory_fd,
+                                display_path,
+                                expected_owner_uid,
+                            )
+                            if expected_owner_uid is not None
+                            else os.fstat(cache_directory_fd)
+                        )
+                        if (
+                            current_cache_names != cache_names
+                            or not _release_source_matches(
+                                cache_directory_snapshot,
+                                terminal_directory_metadata,
+                                ignore_ctime=expected_owner_uid is not None,
+                            )
+                            or access_policy(terminal_directory_metadata)
+                            != access_policy(cache_directory_metadata)
+                        ):
+                            raise SyncError(
+                                f"cache directory changed while scanning: {display_path}"
+                            )
+                        cache_repair_evidence["access_policies"][relative_path] = (
+                            access_policy(terminal_directory_metadata)
+                        )
+                        cache_repair_evidence["artifacts"].append(
+                            _ReleaseCacheQuarantineArtifact(
+                                relative_path=relative_path,
+                                kind="directory",
+                                identity=(
+                                    terminal_directory_metadata.st_dev,
+                                    terminal_directory_metadata.st_ino,
+                                ),
+                                access_policy=access_policy(terminal_directory_metadata),
+                                content_identity=None,
+                                member_names=cache_names,
+                                members=tuple(member_evidence),
+                            )
+                        )
+                    finally:
+                        if cache_directory_fd >= 0:
+                            _close_fd_quietly(cache_directory_fd)
+                    continue
+                if cache_repair_evidence is not None and relative_path.name.endswith(
+                    (".pyc", ".pyo")
+                ):
+                    try:
+                        named_metadata = os.stat(
+                            name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                    except OSError as error:
+                        raise SyncError(
+                            f"cache artifact changed while scanning: {display_path}"
+                        ) from error
+                    if not stat.S_ISREG(named_metadata.st_mode):
+                        raise SyncError(f"refusing unsafe cache artifact: {display_path}")
+                    if named_metadata.st_nlink != 1:
+                        raise SyncError(
+                            f"refusing cache artifact with unexpected hard links: {display_path}"
+                        )
+                    if (
+                        expected_owner_uid is not None
+                        and named_metadata.st_uid != expected_owner_uid
+                    ):
+                        raise _release_identity_policy_error(
+                            display_path,
+                            f"owner UID {named_metadata.st_uid} != expected UID "
+                            f"{expected_owner_uid}",
+                            mismatch=True,
+                        )
+                    normalized_mode(named_metadata, display_path)
+                    cache_snapshot = _release_source_snapshot(named_metadata)
+                    cache_file_fd = -1
+                    try:
+                        cache_file_fd, opened_cache_snapshot = _open_source_regular_file(
+                            directory_fd,
+                            name,
+                            cache_snapshot,
+                            display_path,
+                            ignore_ctime=expected_owner_uid is not None,
+                        )
+                        cache_access_metadata = (
+                            _require_release_identity_fd_access_policy(
+                                cache_file_fd,
+                                display_path,
+                                expected_owner_uid,
+                            )
+                            if expected_owner_uid is not None
+                            else os.fstat(cache_file_fd)
+                        )
+                        if (
+                            access_policy(cache_access_metadata)
+                            != access_policy(named_metadata)
+                            or cache_access_metadata.st_nlink != 1
+                        ):
+                            raise SyncError(
+                                f"cache artifact access policy changed before read: {display_path}"
+                            )
+                        resource_budget.reserve_file_bytes(
+                            opened_cache_snapshot.size,
+                            display_path,
+                        )
+                        cache_identity, _payload = _hash_exact_regular_file(
+                            cache_file_fd,
+                            opened_cache_snapshot,
+                            display_path,
+                            capture_payload=False,
+                        )
+                        opened_cache_snapshot = replace(
+                            opened_cache_snapshot,
+                            content_identity=cache_identity,
+                        )
+                        terminal_metadata = (
+                            _require_release_identity_fd_access_policy(
+                                cache_file_fd,
+                                display_path,
+                                expected_owner_uid,
+                            )
+                            if expected_owner_uid is not None
+                            else os.fstat(cache_file_fd)
+                        )
+                        if (
+                            not _release_source_matches(
+                                opened_cache_snapshot,
+                                terminal_metadata,
+                                ignore_ctime=expected_owner_uid is not None,
+                            )
+                            or terminal_metadata.st_nlink != 1
+                            or access_policy(terminal_metadata)
+                            != access_policy(cache_access_metadata)
+                        ):
+                            raise SyncError(
+                                f"cache artifact changed while scanning: {display_path}"
+                            )
+                        current_named_metadata = os.stat(
+                            name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                        if (
+                            not _release_source_matches(
+                                opened_cache_snapshot,
+                                current_named_metadata,
+                                ignore_ctime=expected_owner_uid is not None,
+                            )
+                            or current_named_metadata.st_nlink != 1
+                        ):
+                            raise SyncError(
+                                f"cache artifact changed while scanning: {display_path}"
+                            )
+                    finally:
+                        if cache_file_fd >= 0:
+                            _close_fd_quietly(cache_file_fd)
+                    source_snapshots[relative_path] = opened_cache_snapshot
+                    cache_repair_evidence["cache_paths"].append(relative_path)
+                    cache_repair_evidence["access_policies"][relative_path] = (
+                        access_policy(terminal_metadata)
+                    )
+                    cache_repair_evidence["link_counts"][relative_path] = (
+                        terminal_metadata.st_nlink
+                    )
+                    cache_source_candidates.add(relative_path)
+                    cache_repair_evidence["artifacts"].append(
+                        _ReleaseCacheQuarantineArtifact(
+                            relative_path=relative_path,
+                            kind="file",
+                            identity=(terminal_metadata.st_dev, terminal_metadata.st_ino),
+                            access_policy=access_policy(terminal_metadata),
+                            content_identity=cache_identity,
+                        )
+                    )
+                    continue
                 if require_sanitized_modes:
                     raise SyncError(
                         "immutable release drift: unexpected cache artifacts: "
@@ -52049,6 +52578,10 @@ def _release_tree_snapshot_from_directory_fd(
             source_snapshots[relative_path] = snapshot
             if stat.S_ISDIR(named_metadata.st_mode):
                 path_kinds[relative_path] = "directory"
+                if cache_repair_evidence is not None:
+                    cache_repair_evidence["access_policies"][relative_path] = (
+                        access_policy(named_metadata)
+                    )
                 child_fd = -1
                 try:
                     child_fd = os.open(
@@ -52084,6 +52617,14 @@ def _release_tree_snapshot_from_directory_fd(
                             f"{expected_owner_uid}",
                             mismatch=True,
                         )
+                    if (
+                        cache_repair_evidence is not None
+                        and access_policy(current_metadata)
+                        != access_policy(named_metadata)
+                    ):
+                        raise SyncError(
+                            f"release tree access policy changed while hashing: {display_path}"
+                        )
                     snapshot = _require_release_source_unchanged(
                         snapshot,
                         current_metadata,
@@ -52111,11 +52652,22 @@ def _release_tree_snapshot_from_directory_fd(
                     display_path,
                     ignore_ctime=expected_owner_uid is not None,
                 )
-                if expected_owner_uid is not None:
+                opened_access_metadata = (
                     _require_release_identity_fd_access_policy(
                         file_fd,
                         display_path,
                         expected_owner_uid,
+                    )
+                    if expected_owner_uid is not None
+                    else os.fstat(file_fd)
+                )
+                if (
+                    cache_repair_evidence is not None
+                    and access_policy(opened_access_metadata)
+                    != access_policy(named_metadata)
+                ):
+                    raise SyncError(
+                        f"release tree access policy changed before hashing: {display_path}"
                     )
                 resource_budget.reserve_file_bytes(
                     opened_snapshot.size,
@@ -52168,6 +52720,14 @@ def _release_tree_snapshot_from_directory_fd(
                     if expected_owner_uid is not None
                     else os.fstat(file_fd)
                 )
+                if (
+                    cache_repair_evidence is not None
+                    and access_policy(terminal_file_metadata)
+                    != access_policy(opened_access_metadata)
+                ):
+                    raise SyncError(
+                        f"release tree access policy changed while hashing: {display_path}"
+                    )
                 file_stage_rehash_used = False
                 (
                     opened_snapshot,
@@ -52197,6 +52757,14 @@ def _release_tree_snapshot_from_directory_fd(
                         f"{expected_owner_uid}",
                         mismatch=True,
                     )
+                if (
+                    cache_repair_evidence is not None
+                    and access_policy(current_metadata)
+                    != access_policy(opened_access_metadata)
+                ):
+                    raise SyncError(
+                        f"release tree access policy changed while hashing: {display_path}"
+                    )
                 (
                     opened_snapshot,
                     file_stage_rehash_used,
@@ -52211,6 +52779,10 @@ def _release_tree_snapshot_from_directory_fd(
                     operation="identity validation",
                 )
                 source_snapshots[relative_path] = opened_snapshot
+                if cache_repair_evidence is not None:
+                    cache_repair_evidence["access_policies"][relative_path] = (
+                        access_policy(terminal_file_metadata)
+                    )
                 record(
                     b"file",
                     relative_path,
@@ -52265,7 +52837,7 @@ def _release_tree_snapshot_from_directory_fd(
             _require_release_directory_members_unchanged(
                 directory_fd,
                 relative_root,
-                names,
+                source_members[relative_root],
                 source_snapshots,
                 (f"release tree directory changed while hashing: {display_directory}"),
             )
@@ -52282,6 +52854,15 @@ def _release_tree_snapshot_from_directory_fd(
                     f"release tree changed while hashing: {display_directory}"
                 )
         source_snapshots[relative_root] = directory_snapshot
+        if cache_repair_evidence is not None:
+            directory_access_policy = access_policy(terminal_directory_metadata)
+            if directory_access_policy != access_policy(directory_metadata):
+                raise SyncError(
+                    f"release tree access policy changed while hashing: {display_directory}"
+                )
+            cache_repair_evidence["access_policies"][relative_root] = (
+                directory_access_policy
+            )
 
     resource_budget.reserve_path_entries()
     try:
@@ -52292,6 +52873,21 @@ def _release_tree_snapshot_from_directory_fd(
         raise SyncError(
             f"release manifest is missing: {display_root / MANIFEST_RELATIVE_PATH}"
         )
+    if cache_repair_evidence is not None:
+        for cache_path in cache_source_candidates:
+            source_path = _release_cache_artifact_source_path(cache_path)
+            if source_path is None or path_kinds.get(source_path) != "file":
+                raise SyncError(
+                    "immutable release drift: cache artifact has no published "
+                    f"source file: {display_root / Path(*cache_path.parts)}",
+                    code="immutable-release-drift",
+                )
+        cache_repair_evidence["cache_paths"] = tuple(
+            sorted(
+                cache_repair_evidence["cache_paths"],
+                key=lambda path: path.as_posix(),
+            )
+        )
     return (
         manifest_payload,
         digest.hexdigest(),
@@ -52300,6 +52896,843 @@ def _release_tree_snapshot_from_directory_fd(
         source_members,
         captured_files,
     )
+
+
+def _release_cache_repair_scan_from_directory_fd(
+    root_fd: int,
+    display_root: Path,
+    *,
+    expected_owner_uid: int | None = None,
+    capture_limits: dict[PurePosixPath, int] | None = None,
+) -> tuple[_ReleaseCacheRepairScan, dict[PurePosixPath, bytes]]:
+    evidence: dict[str, Any] = {}
+    normalized_owner_uid = _effective_release_identity_owner_uid(expected_owner_uid)
+    with _release_identity_owner_uid_scope(normalized_owner_uid):
+        (
+            manifest_payload,
+            tree_digest,
+            path_kinds,
+            source_snapshots,
+            source_members,
+            captured_files,
+        ) = _release_tree_snapshot_from_directory_fd(
+            root_fd,
+            display_root,
+            require_sanitized_modes=True,
+            expected_owner_uid=normalized_owner_uid,
+            capture_limits=capture_limits or {},
+            cache_repair_evidence=evidence,
+        )
+    manifest_data = _decode_manifest_payload(
+        manifest_payload,
+        display_root / MANIFEST_RELATIVE_PATH,
+    )
+    manifest = _parse_manifest_data(manifest_data, path_kinds.get)
+    scan = _ReleaseCacheRepairScan(
+        identity=(manifest_data, manifest, tree_digest),
+        cache_paths=tuple(evidence["cache_paths"]),
+        path_kinds=path_kinds,
+        source_snapshots=source_snapshots,
+        source_members=source_members,
+        access_policies=evidence["access_policies"],
+        link_counts=evidence["link_counts"],
+        artifacts=tuple(evidence["artifacts"]),
+    )
+    return scan, captured_files
+
+
+def _release_cache_access_policy(
+    metadata: os.stat_result,
+) -> tuple[int, int, int]:
+    return stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid
+
+
+def _release_cache_regular_member_matches_at(
+    parent_fd: int,
+    name: str,
+    *,
+    identity: tuple[int, int],
+    access_policy: tuple[int, int, int],
+    content_identity: bytes,
+    link_count: int,
+    display_path: Path,
+    expected_owner_uid: int | None,
+) -> None:
+    try:
+        named_metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise SyncError(f"cache quarantine entry is unreadable: {display_path}") from error
+    if (
+        not stat.S_ISREG(named_metadata.st_mode)
+        or (named_metadata.st_dev, named_metadata.st_ino) != identity
+        or _release_cache_access_policy(named_metadata) != access_policy
+        or named_metadata.st_nlink != link_count
+        or link_count != 1
+    ):
+        raise SyncError(f"cache quarantine entry changed: {display_path}")
+    file_fd = -1
+    try:
+        file_fd = os.open(name, _source_regular_file_flags(), dir_fd=parent_fd)
+        opened_metadata = (
+            _require_release_identity_fd_access_policy(
+                file_fd,
+                display_path,
+                expected_owner_uid,
+            )
+            if expected_owner_uid is not None
+            else os.fstat(file_fd)
+        )
+        if (
+            not stat.S_ISREG(opened_metadata.st_mode)
+            or (opened_metadata.st_dev, opened_metadata.st_ino) != identity
+            or _release_cache_access_policy(opened_metadata) != access_policy
+            or opened_metadata.st_nlink != link_count
+        ):
+            raise SyncError(f"cache quarantine entry changed: {display_path}")
+        snapshot = _release_source_snapshot(opened_metadata)
+        observed_identity, _payload = _hash_exact_regular_file(
+            file_fd,
+            snapshot,
+            display_path,
+            capture_payload=False,
+        )
+        snapshot = replace(snapshot, content_identity=observed_identity)
+        if observed_identity != content_identity:
+            raise SyncError(f"cache quarantine entry content changed: {display_path}")
+        terminal_metadata = (
+            _require_release_identity_fd_access_policy(
+                file_fd,
+                display_path,
+                expected_owner_uid,
+            )
+            if expected_owner_uid is not None
+            else os.fstat(file_fd)
+        )
+        _require_release_source_unchanged(
+            snapshot,
+            terminal_metadata,
+            display_path,
+            ignore_ctime=True,
+            file_descriptor=file_fd,
+            expected_owner_uid=expected_owner_uid,
+            operation="cache quarantine validation",
+        )
+        current_named_metadata = os.stat(
+            name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            (current_named_metadata.st_dev, current_named_metadata.st_ino) != identity
+            or _release_cache_access_policy(current_named_metadata) != access_policy
+            or current_named_metadata.st_nlink != link_count
+        ):
+            raise SyncError(f"cache quarantine entry changed: {display_path}")
+    except OSError as error:
+        raise SyncError(f"cache quarantine entry is unreadable: {display_path}") from error
+    finally:
+        if file_fd >= 0:
+            _close_fd_quietly(file_fd)
+
+
+def _release_cache_quarantine_artifact_matches_at(
+    parent_fd: int,
+    name: str,
+    artifact: _ReleaseCacheQuarantineArtifact,
+    *,
+    display_path: Path,
+    expected_owner_uid: int | None,
+) -> None:
+    try:
+        named_metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise SyncError(f"cache quarantine entry is unreadable: {display_path}") from error
+    if artifact.kind == "file":
+        if artifact.content_identity is None:
+            raise SyncError(f"cache quarantine evidence is incomplete: {display_path}")
+        _release_cache_regular_member_matches_at(
+            parent_fd,
+            name,
+            identity=artifact.identity,
+            access_policy=artifact.access_policy,
+            content_identity=artifact.content_identity,
+            link_count=1,
+            display_path=display_path,
+            expected_owner_uid=expected_owner_uid,
+        )
+        return
+    if artifact.kind != "directory" or not stat.S_ISDIR(named_metadata.st_mode):
+        raise SyncError(f"cache quarantine entry changed: {display_path}")
+    if (
+        (named_metadata.st_dev, named_metadata.st_ino) != artifact.identity
+        or _release_cache_access_policy(named_metadata) != artifact.access_policy
+    ):
+        raise SyncError(f"cache quarantine directory changed: {display_path}")
+    directory_fd = -1
+    try:
+        directory_fd = os.open(name, _source_directory_flags(), dir_fd=parent_fd)
+        directory_metadata = (
+            _require_release_identity_fd_access_policy(
+                directory_fd,
+                display_path,
+                expected_owner_uid,
+            )
+            if expected_owner_uid is not None
+            else os.fstat(directory_fd)
+        )
+        if (
+            not stat.S_ISDIR(directory_metadata.st_mode)
+            or (directory_metadata.st_dev, directory_metadata.st_ino)
+            != artifact.identity
+            or _release_cache_access_policy(directory_metadata)
+            != artifact.access_policy
+        ):
+            raise SyncError(f"cache quarantine directory changed: {display_path}")
+        names = _directory_member_names(
+            directory_fd,
+            maximum_entries=len(artifact.member_names),
+            overflow_message=f"cache quarantine directory changed: {display_path}",
+        )
+        if names != artifact.member_names or len(artifact.members) != len(names):
+            raise SyncError(f"cache quarantine directory contents changed: {display_path}")
+        member_by_name = {member.name: member for member in artifact.members}
+        if set(member_by_name) != set(names):
+            raise SyncError(f"cache quarantine evidence is incomplete: {display_path}")
+        for member_name in names:
+            member = member_by_name[member_name]
+            _release_cache_regular_member_matches_at(
+                directory_fd,
+                member_name,
+                identity=member.identity,
+                access_policy=member.access_policy,
+                content_identity=member.content_identity,
+                link_count=member.link_count,
+                display_path=display_path / member_name,
+                expected_owner_uid=expected_owner_uid,
+            )
+        terminal_metadata = (
+            _require_release_identity_fd_access_policy(
+                directory_fd,
+                display_path,
+                expected_owner_uid,
+            )
+            if expected_owner_uid is not None
+            else os.fstat(directory_fd)
+        )
+        terminal_names = _directory_member_names(
+            directory_fd,
+            maximum_entries=len(artifact.member_names),
+            overflow_message=f"cache quarantine directory changed: {display_path}",
+        )
+        if (
+            terminal_names != artifact.member_names
+            or (terminal_metadata.st_dev, terminal_metadata.st_ino)
+            != artifact.identity
+            or _release_cache_access_policy(terminal_metadata)
+            != artifact.access_policy
+        ):
+            raise SyncError(f"cache quarantine directory changed: {display_path}")
+    except OSError as error:
+        raise SyncError(f"cache quarantine directory is unreadable: {display_path}") from error
+    finally:
+        if directory_fd >= 0:
+            _close_fd_quietly(directory_fd)
+
+
+def _release_cache_repair_scans_match_noncache(
+    before: _ReleaseCacheRepairScan,
+    after: _ReleaseCacheRepairScan,
+    display_root: Path,
+) -> None:
+    if before.identity[2] != after.identity[2]:
+        raise SyncError(
+            "existing release tree does not match its trusted baseline; "
+            f"preserving installed release: {display_root}",
+            code="immutable-release-drift",
+        )
+    noncache_paths = set(before.path_kinds)
+    if noncache_paths != set(after.path_kinds):
+        raise SyncError(
+            f"non-cache release paths changed during cache repair: {display_root}",
+            code="immutable-release-drift",
+        )
+    for relative_path in noncache_paths:
+        before_snapshot = before.source_snapshots.get(relative_path)
+        after_snapshot = after.source_snapshots.get(relative_path)
+        if before_snapshot is None or after_snapshot is None:
+            raise SyncError(
+                f"release identity evidence is incomplete: {display_root / Path(*relative_path.parts)}"
+            )
+        before_identity = (
+            before_snapshot.device,
+            before_snapshot.inode,
+            stat.S_IFMT(before_snapshot.mode),
+            stat.S_IMODE(before_snapshot.mode),
+        )
+        after_identity = (
+            after_snapshot.device,
+            after_snapshot.inode,
+            stat.S_IFMT(after_snapshot.mode),
+            stat.S_IMODE(after_snapshot.mode),
+        )
+        if before_identity != after_identity:
+            raise SyncError(
+                "non-cache release object changed during cache repair: "
+                f"{display_root / Path(*relative_path.parts)}",
+                code="immutable-release-drift",
+            )
+        if before.path_kinds[relative_path] == "file":
+            if (
+                before_snapshot.content_identity is None
+                or before_snapshot.content_identity != after_snapshot.content_identity
+            ):
+                raise SyncError(
+                    "non-cache release file content changed during cache repair: "
+                    f"{display_root / Path(*relative_path.parts)}",
+                    code="immutable-release-drift",
+                )
+    for relative_path in set(before.source_members) | set(after.source_members):
+        if before.source_members.get(relative_path) != after.source_members.get(
+            relative_path
+        ):
+            raise SyncError(
+                "non-cache release directory members changed during cache repair: "
+                f"{display_root / Path(*relative_path.parts)}",
+                code="immutable-release-drift",
+            )
+    for relative_path in noncache_paths:
+        if (
+            before.access_policies.get(relative_path)
+            != after.access_policies.get(relative_path)
+        ):
+            raise SyncError(
+                "non-cache release access policy changed during cache repair: "
+                f"{display_root / Path(*relative_path.parts)}",
+                code="immutable-release-drift",
+            )
+
+
+@contextlib.contextmanager
+def _release_cache_repair_scope(home: Path):
+    normalized_home = Path(os.path.abspath(os.fspath(home.expanduser())))
+    existing = _RELEASE_CACHE_REPAIR_CONTEXT.get()
+    if isinstance(existing, dict):
+        if existing.get("home") != normalized_home:
+            raise SyncError("cache repair scope cannot cross sync homes")
+        yield existing
+        return
+    context: dict[str, Any] = {
+        "home": normalized_home,
+        "baselines": {},
+        "quarantines": [],
+    }
+    token = _RELEASE_CACHE_REPAIR_CONTEXT.set(context)
+    try:
+        try:
+            yield context
+        except BaseException as error:
+            retained = [
+                str(quarantine.path)
+                for quarantine in context["quarantines"]
+            ]
+            if retained:
+                detail = "; cache repair evidence retained at " + ", ".join(retained)
+                raise SyncError(
+                    f"{error}{detail}",
+                    code=getattr(error, "code", None),
+                ) from error
+            raise
+        else:
+            for quarantine in context["quarantines"]:
+                _cleanup_release_cache_quarantine(
+                    quarantine,
+                    expected_owner_uid=(
+                        os.geteuid() if sys.platform == "darwin" else None
+                    ),
+                )
+    finally:
+        _RELEASE_CACHE_REPAIR_CONTEXT.reset(token)
+
+
+def _release_cache_repair_baseline_missing(owner: str, sha: str) -> SyncError:
+    return SyncError(
+        "no trusted installed release tree baseline is available for cache repair: "
+        f"{owner}@{sha}",
+        code="immutable-release-baseline-missing",
+    )
+
+
+def _release_directory_is_present(home: Path, owner: str, sha: str) -> bool:
+    releases_root = _releases_root(home, owner)
+    if not _ensure_safe_internal_directory(
+        home,
+        releases_root,
+        create=False,
+        allow_missing=True,
+    ):
+        return False
+    releases_fd = _open_directory_beneath(home, releases_root)
+    try:
+        if not _bound_directory_matches(home, releases_root, releases_fd):
+            raise SyncError(f"release root changed: {releases_root}")
+        try:
+            metadata = os.stat(sha, dir_fd=releases_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            raise SyncError(f"cannot inspect installed release: {owner}@{sha}") from error
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise SyncError(f"refusing unsafe installed release: {owner}@{sha}")
+        return True
+    finally:
+        _close_fd_quietly(releases_fd)
+
+
+def _release_cache_quarantine_root(
+    home: Path,
+    owner: str,
+    sha: str,
+    releases_fd: int,
+    releases_root: Path,
+    artifacts: tuple[_ReleaseCacheQuarantineArtifact, ...],
+    *,
+    expected_owner_uid: int | None,
+    repair_context: dict[str, Any],
+) -> _ReleaseCacheQuarantine:
+    quarantine_name: str | None = None
+    for attempt in range(100):
+        candidate = (
+            f".cache-repair-{sha}-{os.getpid()}-{time.time_ns()}-{attempt}"
+        )
+        try:
+            os.mkdir(candidate, 0o700, dir_fd=releases_fd)
+        except FileExistsError:
+            continue
+        quarantine_name = candidate
+        break
+    if quarantine_name is None:
+        raise SyncError(f"could not allocate cache quarantine under {releases_root}")
+    quarantine_path = releases_root / quarantine_name
+    quarantine_fd = -1
+    try:
+        os.fsync(releases_fd)
+        quarantine_fd = os.open(
+            quarantine_name,
+            _source_directory_flags(),
+            dir_fd=releases_fd,
+        )
+        metadata = (
+            _require_release_identity_fd_access_policy(
+                quarantine_fd,
+                quarantine_path,
+                expected_owner_uid,
+            )
+            if expected_owner_uid is not None
+            else os.fstat(quarantine_fd)
+        )
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or metadata.st_uid != os.geteuid()
+            or _directory_member_names(quarantine_fd) != ()
+        ):
+            raise SyncError(f"cache quarantine directory is unsafe: {quarantine_path}")
+        quarantine = _ReleaseCacheQuarantine(
+            home=home,
+            path=quarantine_path,
+            parent=releases_root,
+            parent_identity=_directory_identity(releases_fd),
+            identity=(metadata.st_dev, metadata.st_ino),
+            artifacts=artifacts,
+            artifact_names=tuple(f"item-{index:05d}" for index in range(len(artifacts))),
+            created_parent_directories=(),
+        )
+        repair_context["quarantines"].append(quarantine)
+        return quarantine
+    except BaseException:
+        if quarantine_fd >= 0:
+            _close_fd_quietly(quarantine_fd)
+        try:
+            if quarantine_name is not None:
+                os.rmdir(quarantine_name, dir_fd=releases_fd)
+                os.fsync(releases_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        if quarantine_fd >= 0:
+            _close_fd_quietly(quarantine_fd)
+
+
+def _quarantine_release_cache_artifacts(
+    home: Path,
+    owner: str,
+    sha: str,
+    release_root: Path,
+    release_fd: int,
+    scan: _ReleaseCacheRepairScan,
+    *,
+    expected_owner_uid: int | None,
+    repair_context: dict[str, Any],
+) -> _ReleaseCacheQuarantine:
+    releases_root = _releases_root(home, owner)
+    releases_fd = _open_directory_beneath(home, releases_root)
+    quarantine_fd = -1
+    try:
+        if not _bound_directory_matches(home, releases_root, releases_fd):
+            raise SyncError(f"release parent changed before cache repair: {releases_root}")
+        quarantine = _release_cache_quarantine_root(
+            home,
+            owner,
+            sha,
+            releases_fd,
+            releases_root,
+            scan.artifacts,
+            expected_owner_uid=expected_owner_uid,
+            repair_context=repair_context,
+        )
+        quarantine_fd = os.open(
+            quarantine.path.name,
+            _source_directory_flags(),
+            dir_fd=releases_fd,
+        )
+        if (
+            _directory_identity(quarantine_fd) != quarantine.identity
+            or not _bound_directory_matches(home, quarantine.path, quarantine_fd)
+        ):
+            raise SyncError(f"cache quarantine directory changed: {quarantine.path}")
+        if not _bound_directory_matches(home, release_root, release_fd):
+            raise SyncError(f"installed release changed before cache repair: {release_root}")
+        for artifact, destination_name in zip(
+            scan.artifacts,
+            quarantine.artifact_names,
+        ):
+            source_parent_fd, source_name = _open_relative_parent_fd(
+                release_fd,
+                artifact.relative_path,
+            )
+            display_path = release_root / Path(*artifact.relative_path.parts)
+            try:
+                _release_cache_quarantine_artifact_matches_at(
+                    source_parent_fd,
+                    source_name,
+                    artifact,
+                    display_path=display_path,
+                    expected_owner_uid=expected_owner_uid,
+                )
+                if not _bound_directory_matches(home, release_root, release_fd):
+                    raise SyncError(
+                        f"installed release changed before cache isolation: {release_root}"
+                    )
+                _rename_noreplace_at(
+                    source_parent_fd,
+                    source_name,
+                    quarantine_fd,
+                    destination_name,
+                )
+                os.fsync(source_parent_fd)
+                os.fsync(quarantine_fd)
+                _release_cache_quarantine_artifact_matches_at(
+                    quarantine_fd,
+                    destination_name,
+                    artifact,
+                    display_path=quarantine.path / destination_name,
+                    expected_owner_uid=expected_owner_uid,
+                )
+            finally:
+                _close_fd_quietly(source_parent_fd)
+        if not _bound_directory_matches(home, release_root, release_fd):
+            raise SyncError(f"installed release changed during cache repair: {release_root}")
+        return quarantine
+    except BaseException:
+        raise
+    finally:
+        if quarantine_fd >= 0:
+            _close_fd_quietly(quarantine_fd)
+        _close_fd_quietly(releases_fd)
+
+
+def _cleanup_release_cache_quarantine(
+    quarantine: _ReleaseCacheQuarantine,
+    *,
+    expected_owner_uid: int | None,
+) -> None:
+    home = quarantine.home
+    parent_fd = _open_directory_beneath(home, quarantine.parent)
+    quarantine_fd = -1
+    try:
+        if (
+            _directory_identity(parent_fd) != quarantine.parent_identity
+            or not _bound_directory_matches(home, quarantine.parent, parent_fd)
+        ):
+            raise SyncError(
+                f"cache quarantine parent changed; evidence retained at {quarantine.path}"
+            )
+        quarantine_fd = os.open(
+            quarantine.path.name,
+            _source_directory_flags(),
+            dir_fd=parent_fd,
+        )
+        if (
+            _directory_identity(quarantine_fd) != quarantine.identity
+            or not _bound_directory_matches(home, quarantine.path, quarantine_fd)
+        ):
+            raise SyncError(
+                f"cache quarantine changed; evidence retained at {quarantine.path}"
+            )
+        names = _directory_member_names(
+            quarantine_fd,
+            maximum_entries=len(quarantine.artifact_names),
+            overflow_message=(
+                f"cache quarantine contents changed; evidence retained at {quarantine.path}"
+            ),
+        )
+        if names != tuple(sorted(quarantine.artifact_names)):
+            raise SyncError(
+                f"cache quarantine contents changed; evidence retained at {quarantine.path}"
+            )
+        for index, (artifact, name) in enumerate(
+            zip(quarantine.artifacts, quarantine.artifact_names)
+        ):
+            _release_cache_quarantine_artifact_matches_at(
+                quarantine_fd,
+                name,
+                artifact,
+                display_path=quarantine.path / name,
+                expected_owner_uid=expected_owner_uid,
+            )
+            cleanup_name = f"cleanup-{index:05d}"
+            _rename_noreplace_at(quarantine_fd, name, quarantine_fd, cleanup_name)
+            os.fsync(quarantine_fd)
+            if artifact.kind == "file":
+                _release_cache_quarantine_artifact_matches_at(
+                    quarantine_fd,
+                    cleanup_name,
+                    artifact,
+                    display_path=quarantine.path / cleanup_name,
+                    expected_owner_uid=expected_owner_uid,
+                )
+                os.unlink(cleanup_name, dir_fd=quarantine_fd)
+                continue
+            directory_fd = os.open(
+                cleanup_name,
+                _source_directory_flags(),
+                dir_fd=quarantine_fd,
+            )
+            try:
+                for member_index, member in enumerate(artifact.members):
+                    _release_cache_regular_member_matches_at(
+                        directory_fd,
+                        member.name,
+                        identity=member.identity,
+                        access_policy=member.access_policy,
+                        content_identity=member.content_identity,
+                        link_count=member.link_count,
+                        display_path=quarantine.path / cleanup_name / member.name,
+                        expected_owner_uid=expected_owner_uid,
+                    )
+                    member_cleanup_name = f"cleanup-{member_index:05d}"
+                    _rename_noreplace_at(
+                        directory_fd,
+                        member.name,
+                        directory_fd,
+                        member_cleanup_name,
+                    )
+                    _release_cache_regular_member_matches_at(
+                        directory_fd,
+                        member_cleanup_name,
+                        identity=member.identity,
+                        access_policy=member.access_policy,
+                        content_identity=member.content_identity,
+                        link_count=member.link_count,
+                        display_path=quarantine.path
+                        / cleanup_name
+                        / member_cleanup_name,
+                        expected_owner_uid=expected_owner_uid,
+                    )
+                    os.unlink(member_cleanup_name, dir_fd=directory_fd)
+                if _directory_member_names(directory_fd) != ():
+                    raise SyncError(
+                        f"cache quarantine directory contents changed; evidence retained at {quarantine.path}"
+                    )
+                os.fsync(directory_fd)
+            finally:
+                _close_fd_quietly(directory_fd)
+            os.rmdir(cleanup_name, dir_fd=quarantine_fd)
+        if _directory_member_names(quarantine_fd) != ():
+            raise SyncError(
+                f"cache quarantine contents changed; evidence retained at {quarantine.path}"
+            )
+        os.fsync(quarantine_fd)
+        _close_fd_quietly(quarantine_fd)
+        quarantine_fd = -1
+        os.rmdir(quarantine.path.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except (OSError, SyncError) as error:
+        raise SyncError(
+            f"could not safely clear cache quarantine; evidence retained at "
+            f"{quarantine.path}: {error}",
+            code=getattr(error, "code", None),
+        ) from error
+    finally:
+        if quarantine_fd >= 0:
+            _close_fd_quietly(quarantine_fd)
+        _close_fd_quietly(parent_fd)
+
+
+def _prepare_installed_release_cache_repairs(
+    home: Path,
+    releases: list[
+        tuple[Path, str, ManifestData]
+        | tuple[Path, str, ManifestData, ReleaseTreeExpectation | None]
+    ],
+    *,
+    mutate: bool,
+) -> None:
+    repair_context = _RELEASE_CACHE_REPAIR_CONTEXT.get()
+    if not isinstance(repair_context, dict):
+        raise SyncError("installed cache repair requires an install scope")
+    home = home.expanduser()
+    normalized_releases = _normalize_install_releases(releases)
+    incoming = {
+        (manifest.owner, sha): (source_root, manifest, expectation)
+        for source_root, sha, manifest, expectation in normalized_releases
+    }
+    owners = _known_owners(
+        home,
+        {manifest.owner for _source_root, _sha, manifest, _expectation in normalized_releases},
+    )
+    candidates: set[tuple[str, str]] = set()
+    for owner in owners:
+        current_sha = _current_sha(home, owner)
+        if current_sha is not None:
+            candidates.add((owner, current_sha))
+    candidates.update(
+        key
+        for key in incoming
+        if _release_directory_is_present(home, key[0], key[1])
+    )
+    runtime_state: dict[str, Any] | None = None
+    for owner, sha in sorted(candidates):
+        release_root = _releases_root(home, owner) / sha
+        release_fd = _open_installed_release_directory_fd(home, owner, sha)
+        try:
+            if not _bound_directory_matches(home, release_root, release_fd):
+                raise SyncError(f"installed release changed before cache scan: {release_root}")
+            scan, _captured_files = _release_cache_repair_scan_from_directory_fd(
+                release_fd,
+                release_root,
+                expected_owner_uid=(os.geteuid() if sys.platform == "darwin" else None),
+            )
+            if scan.identity[1].owner != owner:
+                raise SyncError(
+                    f"release owner mismatch: expected {owner}, got {scan.identity[1].owner}",
+                    code="immutable-release-drift",
+                )
+            if not scan.cache_paths:
+                continue
+            source_tree_digest: str | None = None
+            source_release = incoming.get((owner, sha))
+            if source_release is not None:
+                source_root, source_manifest, source_expectation = source_release
+                if Path(os.path.abspath(source_root)) != Path(os.path.abspath(release_root)):
+                    verified_source = _source_release_identity(
+                        source_root,
+                        source_manifest,
+                        source_expectation,
+                    )
+                    if verified_source[0][1].owner != owner:
+                        raise SyncError(
+                            f"incoming release owner mismatch for {owner}@{sha}",
+                            code="immutable-release-drift",
+                        )
+                    source_tree_digest = verified_source[0][2]
+            if runtime_state is None:
+                runtime_state = _read_scheduler_runtime_state(home)
+            scheduler_digest: str | None = None
+            if (
+                runtime_state is not None
+                and runtime_state.get("last_success") is not None
+            ):
+                release_tree = runtime_state.get("release_trees", {}).get(owner)
+                if isinstance(release_tree, dict) and release_tree.get("sha") == sha:
+                    scheduler_digest = release_tree.get("tree_sha256")
+            if (
+                source_tree_digest is not None
+                and scheduler_digest is not None
+                and source_tree_digest != scheduler_digest
+            ):
+                raise SyncError(
+                    "existing release tree does not match incoming source; "
+                    f"preserving installed release {owner}@{sha}",
+                    code="immutable-release-drift",
+                )
+            trusted_digest = source_tree_digest or scheduler_digest
+            if trusted_digest is None:
+                raise _release_cache_repair_baseline_missing(owner, sha)
+            mismatch_message = (
+                "existing release tree does not match incoming source; "
+                f"preserving installed release {owner}@{sha}"
+                if source_tree_digest is not None
+                else "installed release tree does not match trusted scheduler baseline; "
+                f"preserving installed release {owner}@{sha}"
+            )
+            if scan.identity[2] != trusted_digest:
+                raise SyncError(
+                    mismatch_message,
+                    code="immutable-release-drift",
+                )
+            repair_context["baselines"][os.path.abspath(os.fspath(release_root))] = (
+                trusted_digest
+            )
+            if not mutate:
+                continue
+            quarantine = _quarantine_release_cache_artifacts(
+                home,
+                owner,
+                sha,
+                release_root,
+                release_fd,
+                scan,
+                expected_owner_uid=(os.geteuid() if sys.platform == "darwin" else None),
+                repair_context=repair_context,
+            )
+            baseline_key = os.path.abspath(os.fspath(release_root))
+            previous_baseline = repair_context["baselines"].pop(baseline_key, None)
+            try:
+                strict_identity, _captured = (
+                    _release_tree_identity_and_captured_files_from_directory_fd(
+                        release_fd,
+                        release_root,
+                        require_sanitized_modes=True,
+                        expected_owner_uid=(
+                            os.geteuid() if sys.platform == "darwin" else None
+                        ),
+                        capture_limits={},
+                    )
+                )
+            finally:
+                if previous_baseline is not None:
+                    repair_context["baselines"][baseline_key] = previous_baseline
+            if strict_identity[2] != trusted_digest:
+                raise SyncError(
+                    "installed release strict revalidation did not match its trusted "
+                    f"baseline: {release_root}",
+                    code="immutable-release-drift",
+                )
+            after_scan, _after_captured = _release_cache_repair_scan_from_directory_fd(
+                release_fd,
+                release_root,
+                expected_owner_uid=(os.geteuid() if sys.platform == "darwin" else None),
+            )
+            if after_scan.cache_paths:
+                raise SyncError(
+                    f"cache artifacts remain after isolation: {release_root}",
+                    code="immutable-release-drift",
+                )
+            _release_cache_repair_scans_match_noncache(scan, after_scan, release_root)
+        finally:
+            _close_fd_quietly(release_fd)
 
 
 def _release_tree_digest_from_directory_fd(
@@ -54089,7 +55522,14 @@ def _preflight_pending_recovery(
         return _recover_pending_state_unlocked(home, action_budget)
 
 
-def _install_release_set_unlocked(
+def _is_unexpected_installed_cache_error(error: SyncError) -> bool:
+    return (
+        error.code == "immutable-release-drift"
+        and "unexpected cache artifacts" in str(error)
+    )
+
+
+def _install_release_set_unlocked_impl(
     home: Path,
     releases: list[
         tuple[Path, str, ManifestData]
@@ -54132,6 +55572,11 @@ def _install_release_set_unlocked(
         return
     if not dry_run and not preflight_only:
         _cleanup_ready_pending_batches(home, budget=action_budget)
+    _prepare_installed_release_cache_repairs(
+        home,
+        releases,
+        mutate=not (dry_run or preflight_only),
+    )
     loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(home)
     (
         loaded_state,
@@ -54702,6 +56147,34 @@ def _install_release_set_unlocked(
         print("all managed symlinks already point at current")
 
 
+def _install_release_set_unlocked(
+    home: Path,
+    releases: list[
+        tuple[Path, str, ManifestData]
+        | tuple[
+            Path,
+            str,
+            ManifestData,
+            ReleaseTreeExpectation | None,
+        ]
+    ],
+    *,
+    dry_run: bool,
+    allow_cross_owner: bool,
+    preflight_only: bool = False,
+    cleanup_budget: PendingCleanupActionBudget | None = None,
+) -> None:
+    with _release_cache_repair_scope(home):
+        return _install_release_set_unlocked_impl(
+            home,
+            releases,
+            dry_run=dry_run,
+            allow_cross_owner=allow_cross_owner,
+            preflight_only=preflight_only,
+            cleanup_budget=cleanup_budget,
+        )
+
+
 def install_release_tree(
     source_root: Path,
     home: Path,
@@ -54716,14 +56189,19 @@ def install_release_tree(
     action_budget = cleanup_budget or PendingCleanupActionBudget(
         MAX_PENDING_CLEANUP_BATCHES_PER_RUN
     )
-    if (
-        _preflight_pending_recovery(
+    initial_cache_error: SyncError | None = None
+    try:
+        pending_recovery = _preflight_pending_recovery(
             home,
             dry_run=dry_run,
             cleanup_budget=action_budget,
         )
-        and dry_run
-    ):
+    except SyncError as error:
+        if not _is_unexpected_installed_cache_error(error):
+            raise
+        initial_cache_error = error
+        pending_recovery = False
+    if pending_recovery and dry_run:
         return
     if release_expectation is None:
         release_expectation = _source_release_identity(source_root, None)
@@ -54735,34 +56213,61 @@ def install_release_tree(
         )
     manifest = release_expectation[0][1]
     releases = [(source_root, sha, manifest, release_expectation)]
-    if dry_run:
+    with _release_cache_repair_scope(home):
+        if initial_cache_error is not None:
+            if dry_run:
+                _prepare_installed_release_cache_repairs(
+                    home,
+                    releases,
+                    mutate=False,
+                )
+            else:
+                with installation_lock(home):
+                    _prepare_installed_release_cache_repairs(
+                        home,
+                        releases,
+                        mutate=True,
+                    )
+            pending_recovery = _preflight_pending_recovery(
+                home,
+                dry_run=dry_run,
+                cleanup_budget=action_budget,
+            )
+            if pending_recovery and dry_run:
+                return
+        if dry_run:
+            _install_release_set_unlocked(
+                home,
+                releases,
+                dry_run=True,
+                allow_cross_owner=manifest.owner != PUBLIC_OWNER,
+                cleanup_budget=action_budget,
+            )
+            return
         _install_release_set_unlocked(
             home,
             releases,
             dry_run=True,
             allow_cross_owner=manifest.owner != PUBLIC_OWNER,
+            preflight_only=True,
             cleanup_budget=action_budget,
         )
-        return
-    _install_release_set_unlocked(
-        home,
-        releases,
-        dry_run=True,
-        allow_cross_owner=manifest.owner != PUBLIC_OWNER,
-        preflight_only=True,
-        cleanup_budget=action_budget,
-    )
-    with installation_lock(home):
-        # A cooperative writer may have published recovery state after the
-        # observational preflight. Recheck under the final mutation lock.
-        _recover_pending_state_unlocked(home, action_budget)
-        _install_release_set_unlocked(
-            home,
-            releases,
-            dry_run=False,
-            allow_cross_owner=manifest.owner != PUBLIC_OWNER,
-            cleanup_budget=action_budget,
-        )
+        with installation_lock(home):
+            # A cooperative writer may have published recovery state after the
+            # observational preflight. Recheck under the final mutation lock.
+            _prepare_installed_release_cache_repairs(
+                home,
+                releases,
+                mutate=True,
+            )
+            _recover_pending_state_unlocked(home, action_budget)
+            _install_release_set_unlocked(
+                home,
+                releases,
+                dry_run=False,
+                allow_cross_owner=manifest.owner != PUBLIC_OWNER,
+                cleanup_budget=action_budget,
+            )
 
 
 def _stage_release_tree_for_install(
@@ -56395,14 +57900,17 @@ def _download_and_extract_release_with_deadline(
 def install_from_github(repo: str, home: Path, *, dry_run: bool) -> None:
     home = home.expanduser()
     cleanup_budget = PendingCleanupActionBudget(MAX_PENDING_CLEANUP_BATCHES_PER_RUN)
-    if (
-        _preflight_pending_recovery(
+    try:
+        pending_recovery = _preflight_pending_recovery(
             home,
             dry_run=dry_run,
             cleanup_budget=cleanup_budget,
         )
-        and dry_run
-    ):
+    except SyncError as error:
+        if not _is_unexpected_installed_cache_error(error):
+            raise
+        pending_recovery = False
+    if pending_recovery and dry_run:
         return
     with temporary_archive_workspace(prefix="codex-personal-sync.") as workspace:
         temp_dir = workspace.path
@@ -56457,14 +57965,17 @@ def install_private_from_github(
 ) -> None:
     home = home.expanduser()
     cleanup_budget = PendingCleanupActionBudget(MAX_PENDING_CLEANUP_BATCHES_PER_RUN)
-    if (
-        _preflight_pending_recovery(
+    try:
+        pending_recovery = _preflight_pending_recovery(
             home,
             dry_run=dry_run,
             cleanup_budget=cleanup_budget,
         )
-        and dry_run
-    ):
+    except SyncError as error:
+        if not _is_unexpected_installed_cache_error(error):
+            raise
+        pending_recovery = False
+    if pending_recovery and dry_run:
         return
     owner = _validate_owner(owner)
     if owner == PUBLIC_OWNER:
@@ -56518,24 +58029,41 @@ def install_private_from_github(
                 f"base {base_spec.repo}@{base_release.assets.sha}, "
                 f"overlay {repo}@{overlay_release.assets.sha}"
             )
-            _install_release_set_unlocked(
-                home,
-                releases,
-                dry_run=True,
-                allow_cross_owner=True,
-                cleanup_budget=cleanup_budget,
-            )
+            with _release_cache_repair_scope(home):
+                _prepare_installed_release_cache_repairs(
+                    home,
+                    releases,
+                    mutate=False,
+                )
+                if not pending_recovery and not _preflight_pending_recovery(
+                    home,
+                    dry_run=True,
+                    cleanup_budget=cleanup_budget,
+                ):
+                    _install_release_set_unlocked(
+                        home,
+                        releases,
+                        dry_run=True,
+                        allow_cross_owner=True,
+                        cleanup_budget=cleanup_budget,
+                    )
             return
 
-        with installation_lock(home):
-            _recover_pending_state_unlocked(home, cleanup_budget)
-            _install_release_set_unlocked(
-                home,
-                releases,
-                dry_run=False,
-                allow_cross_owner=True,
-                cleanup_budget=cleanup_budget,
-            )
+        with _release_cache_repair_scope(home):
+            with installation_lock(home):
+                _prepare_installed_release_cache_repairs(
+                    home,
+                    releases,
+                    mutate=True,
+                )
+                _recover_pending_state_unlocked(home, cleanup_budget)
+                _install_release_set_unlocked(
+                    home,
+                    releases,
+                    dry_run=False,
+                    allow_cross_owner=True,
+                    cleanup_budget=cleanup_budget,
+                )
         print(
             "private layered install ok: "
             f"base {base_spec.repo}@{base_release.assets.sha}, "
