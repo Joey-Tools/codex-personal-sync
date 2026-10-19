@@ -430,6 +430,67 @@ Incremental append relies on cooperative writers holding the installation
 lock; it does not claim to detect a non-cooperative same-UID prefix write folded
 into this invocation's own append signal.
 
+## Installed bytecode cache recovery
+
+Installation can recover local Python bytecode caches from a managed release
+only when an independent baseline proves that the remaining release still
+matches its original content. Accepted baselines are an incoming verified
+package for the exact same owner and SHA, or the matching tree digest retained
+after a successful scheduled installation. A missing baseline, an owner/SHA
+mismatch, or a different non-cache tree digest stops recovery.
+
+Recovery recognizes bounded regular bytecode files and ordinary
+`__pycache__` directories containing only recognized bytecode files. Unknown
+files, symbolic links, special files, and changes to release content or access
+policy remain errors. Cache child-entry changes can alter directory timestamps;
+those timestamps alone do not prove replacement or source-content changes.
+
+The installer observes recovery during its read-only preflight and performs
+the entire repair and cleanup under the installation lock. Before moving any
+cache object, it durably records the verified release and cache evidence in a
+private receipt beside the isolation directory. It isolates verified cache
+objects outside the release, then repeats the original strict, cache-free
+release checks before continuing. Successful installation removes its isolated
+cache objects and receipt. Failure retains recovery evidence and reports its
+location; a later installation can resume an interrupted, receipt-bound repair.
+Retention pruning keeps releases still referenced by a valid repair receipt
+or cleanup marker, including inactive releases needed to finish recovery.
+Unknown or inconsistent recovery evidence remains in place and blocks
+mutation. A batch owned by the current installation must retain its bound
+payload and receipt; replaced evidence cannot enter restart recovery.
+`--dry-run` validates cache drift or reports pending repair state
+without creating, moving, or deleting any object.
+Downloaded release packages must remain cache-free and are never sanitized by
+this recovery path. `doctor` remains observational.
+
+Keep bytecode disabled at every runtime entrypoint, including Python children:
+use `-B` or `PYTHONDONTWRITEBYTECODE=1` before the first import. Disabling cache
+writes does not disable reading an existing cache. Avoid explicit bytecode
+compilation inside installed release trees.
+
+Healthy schedulers pick up the new engine through the normal public release
+and coupled private-overlay installation. An older installed engine that
+already rejects cache pollution cannot activate its replacement automatically.
+For that case, obtain and verify the current immutable public release through
+the normal release-download procedure, then invoke that release's engine
+directly. For a private installation, preserve the audited repository and owner:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -B \
+  /path/to/verified-release/scripts/codex_personal_sync.py install-private \
+  --repo Joey-Tools/codex-private-workflows \
+  --base-repo Joey-Tools/codex-toolbox \
+  --owner private
+```
+
+This bootstrap still requires a matching trusted baseline for each polluted
+existing release. If that baseline is unavailable, preserve the installation
+and its state for explicit recovery using the exact original release artifacts.
+
+Private installations receive an engine update only after the private release
+pins the public release containing it. Publishing the canonical source or a
+public release alone does not update an existing pinned private installation.
+
 ## Scheduler operator runbook
 
 Audit an existing host before changing it:
