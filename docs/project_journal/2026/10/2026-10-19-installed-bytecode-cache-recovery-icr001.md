@@ -3,7 +3,7 @@ id: 20261019-installed-bytecode-cache-recovery-icr001
 title: Installed Bytecode Cache Recovery
 status: completed
 created: 2026-10-19
-updated: 2026-10-19
+updated: 2026-11-16
 branch: wip/installer-cache-repair
 pr: https://github.com/Joey-Tools/codex-personal-sync/pull/38
 supersedes: []
@@ -35,6 +35,17 @@ superseded_by:
   retention recovery while the original release is in quarantine.
 - Preserve early repair errors and reserve a bounded cleanup-marker envelope
   large enough for every admitted receipt.
+
+## Existing Release-Parent Permissions
+
+- Recovery accepts an existing `0755` releases parent, matching the receipt
+  writer. It still validates the recorded object identities, content, and
+  access policies against the live filesystem; the quarantine payload remains
+  private (`0700`). No permission changes are needed for recovery.
+- The existing interrupted-move regression now uses a `0755` releases parent,
+  checks that dry-run preserves the retained evidence, and verifies successful
+  recovery preserves the parent mode. Other recovery cases retain their
+  existing coverage.
 
 ## Delivery
 
